@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app: sshd
+spec:
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: sshd
+  template:
+    metadata:
+      labels:
+        app: sshd
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: default
+      containers:
+        - name: app
+          image: {{ .Values.image }}
+          workingDir: "/"
+          ports:
+            - containerPort: 15022
+              name: ssh
+          env:
+            - name: GOTRACEBACK
+              value: "all"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 256Mi
+          volumeMounts:
+            - name: jwt-ssh-ca
+              mountPath: /var/run/secrets/tokens/ssh-ca
+              readOnly: true
+      volumes:
+        - name: jwt-ssh-ca
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  audience: ssh-ca
+                  expirationSeconds: 43200
+                  path: token

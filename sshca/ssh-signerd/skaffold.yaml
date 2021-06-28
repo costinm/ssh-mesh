@@ -1,0 +1,52 @@
+apiVersion: skaffold/v2beta10
+kind: Config
+metadata:
+  name:  ssh-ca
+
+build:
+  tagPolicy:
+    dateTime:
+      format: "2006-01-02_15-04"
+
+  artifacts:
+    - image: gcr.io/dmeshgate/ssh-ca
+      context: .
+
+      sync:
+        manual:
+          - src: "../../www/**"
+            dest: "www"
+
+      custom:
+        buildCommand: ../../bin/ko-build.sh
+        dependencies:
+          # Explicit - can also guess from Dockerfile
+          paths:
+            - "../**"
+            - "../../manifests/ssh-ca/**"
+
+deploy:
+#  kubectl:
+#    manifests:
+#      - ../../k8s/ugate/templates/*
+  helm:
+    releases:
+      - name: ssh-ca
+        namespace: ssh-ca
+        createNamespace: true
+        chartPath: ../../manifests/ssh-ca
+        artifactOverrides:
+          image: gcr.io/dmeshgate/ssh-ca
+
+portForward:
+  - resourceType: deployment
+    namespace: ssh-ca
+    resourceName: ssh-ca
+    port: 8080
+    localPort: 14021
+
+  - resourceType: deployment
+    namespace: ssh-ca
+    resourceName: ssh-ca
+    port: 8081
+    localPort: 14020

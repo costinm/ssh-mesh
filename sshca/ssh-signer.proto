@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package ssh;
+
+option go_package="github.com/costinm/cert-ssh/sshca";
+
+// Certificate request message.
+// In SSH, the user certificate includes:
+//  - public key and nonce
+//  - CertType = 1
+//  - KeyId - optional
+//  - ValidPrincipals[] - matched against user
+message SSHCertificateRequest {
+  // Public key to sign
+  string public = 1;
+
+  // hostname to sign
+  string hostname = 2;
+  string user = 3;
+
+  string keyId = 5;
+
+  // Optional: requested certificate validity period, in seconds.
+  int64 validity_duration = 4;
+
+  map<string, string> critical_options = 6;
+  map<string, string> extensions = 7;
+}
+
+// Certificate response message.
+message SSHCertificateResponse {
+  string host = 1;
+  string user = 2;
+  string root = 3;
+}
+
+// Service for managing certificates issued by the CA.
+service SSHCertificateService {
+  rpc CreateCertificate(SSHCertificateRequest) returns (SSHCertificateResponse) {
+  }
+}

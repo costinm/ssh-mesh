@@ -1,0 +1,8 @@
+apiVersion: v1
+name: sshd
+version: 0.1.1
+description: Cert-based SSHD, in go
+keywords:
+  - SSH
+  - Certificates
+engine: gotpl

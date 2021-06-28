@@ -1,0 +1,5 @@
+
+# helm upgrade --install --create-namespace sshca --namespace sshca manifests/ssh-ca/
+
+image: gcr.io/dmeshgate/sshd:latest
+

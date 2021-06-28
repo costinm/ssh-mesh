@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="ssh-gen" type="GoApplicationRunConfiguration" factoryName="Go Application">
+    <module name="cert-ssh" />
+    <working_directory value="$PROJECT_DIR$/testdata" />
+    <kind value="PACKAGE" />
+    <package value="github.com/costinm/cert-ssh/sshca/ssh-gen" />
+    <directory value="$PROJECT_DIR$" />
+    <filePath value="$PROJECT_DIR$/sshca/ssh-signer/ssh_signer.go" />
+    <method v="2" />
+  </configuration>
+</component>
