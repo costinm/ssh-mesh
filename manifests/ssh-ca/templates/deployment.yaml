@@ -35,6 +35,8 @@ spec:
           env:
             - name: GOTRACEBACK
               value: "all"
+            - name: DOMAIN
+              value: {{ .Values.domain }}
           resources:
             requests:
               cpu: 10m

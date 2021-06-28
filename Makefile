@@ -37,3 +37,7 @@ ssh/getcert-k8s: CRT=$(shell cat testdata/keygen/id_ecdsa.pub)
 ssh/getcert-k8s:
 	echo {\"public\":\"${CRT}\"} | \
  		grpcurl -plaintext  -d @   [::1]:14021 ssh.SSHCertificateService/CreateCertificate
+
+
+ssh/cr/ssh-ca:
+

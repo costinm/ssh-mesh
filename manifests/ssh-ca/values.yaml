@@ -3,4 +3,7 @@
 
 image: gcr.io/dmeshgate/ssh-signer:latest
 
+# Domain to use as suffix for the generated domain names.
+# Defaults to the trust domain
+domain: ""
 

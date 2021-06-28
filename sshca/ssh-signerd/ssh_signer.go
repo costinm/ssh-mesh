@@ -34,7 +34,7 @@ func main() {
 	sshs := &ssh.SSHSigner{
 	}
 
-	err := sshs.InitPrivate()
+	err := sshs.Init()
 	if err != nil {
 		panic(err)
 	}

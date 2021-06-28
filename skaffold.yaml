@@ -1,7 +1,7 @@
 apiVersion: skaffold/v2beta10
 kind: Config
 metadata:
-  name:  ssh-ca
+  name:  cert-ssh
 
 build:
 #  tagPolicy:
@@ -10,20 +10,26 @@ build:
 
   artifacts:
     - image: gcr.io/dmeshgate/ssh-ca
-      context: .
+      context: sshca/ssh-signerd
+#      sync:
+#        manual:
+#          - src: "../../www/**"
+#            dest: "www"
+      custom:
+        buildCommand: ./bin/ko-build.sh
+        dependencies:
+          paths:
+            - "sshca/**"
+            - "manifests/ssh-ca/**"
 
-      sync:
-        manual:
-          - src: "../../www/**"
-            dest: "www"
-
+    - image: gcr.io/dmeshgate/sshd
+      context: ssh/sshd
       custom:
         buildCommand: ../../bin/ko-build.sh
         dependencies:
           paths:
-            - "../../**"
-            - "../**"
-            - "../../manifests/ssh-ca/**"
+            - "ssh/**"
+            - "manifests/sshd/**"
 
 deploy:
   helm:
@@ -34,6 +40,13 @@ deploy:
         chartPath: ../../manifests/ssh-ca
         artifactOverrides:
           image: gcr.io/dmeshgate/ssh-ca
+      - name: sshd
+        namespace: sshd
+        createNamespace: true
+        chartPath: ../../manifests/sshd
+        artifactOverrides:
+          image: gcr.io/dmeshgate/sshd
+
 
 portForward:
   - resourceType: deployment
@@ -47,3 +60,9 @@ portForward:
     resourceName: ssh-ca
     port: 8081
     localPort: 14020
+
+  - resourceType: deployment
+    namespace: sshd
+    resourceName: sshd
+    port: 15022
+    localPort: 14022

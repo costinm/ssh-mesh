@@ -14,8 +14,8 @@ message SSHCertificateRequest {
   // Public key to sign
   string public = 1;
 
-  // hostname to sign
-  string hostname = 2;
+  // hostname to sign. Namespace and domain will be added
+  repeated string hostname = 2;
   string user = 3;
 
   string keyId = 5;
