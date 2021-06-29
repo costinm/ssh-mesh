@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -42,46 +43,49 @@ func GetSSHSignclient(sshCA string) (sshca.SSHCertificateServiceClient, *grpc.Cl
 	return c, conn, nil
 }
 
+// StartSSHDWithCA starts an in-process SSHD using the SSH CA. Fallback to self-signed keys if the CA is not available.
 func StartSSHDWithCA(ns string, sshCA string) error {
-	c, con, err := GetSSHSignclient(sshCA)
+	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	r, signer, err2 := GetCertHostSigner(sshCA,  privk1)
+	if err2 != nil {
+		signer, _ = gossh.NewSignerFromKey(privk1)
+	}
+
+	ssht, err := NewSSHTransport(signer, "", ns, r)
 	if err != nil {
 		return err
 	}
+	go ssht.Start()
+	return nil
+}
+
+func GetCertHostSigner(sshCA string, privk1 *ecdsa.PrivateKey) (string, gossh.Signer, error) {
+	c, con, err := GetSSHSignclient(sshCA)
+	if err != nil {
+		return "", nil, err
+	}
 	defer con.Close()
-	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	casigner1, _ := gossh.NewSignerFromKey(privk1)
-	//pk := privk1.Public().(*ecdsa.PublicKey)
-	//pkb := elliptic.Marshal(elliptic.P256(), pk.X, pk.Y)
-	//pubk := base64.StdEncoding.EncodeToString(pkb)
 	req := &sshca.SSHCertificateRequest{
 		Public: string(gossh.MarshalAuthorizedKey(casigner1.PublicKey())),
 	}
-	log.Println(req)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	r, err := c.CreateCertificate(ctx, req)
 	if err != nil {
 		log.Println("Error creating cert ", err)
-		return err
+		return "", nil, err
 	}
 
 	key, _, _, _, _ := gossh.ParseAuthorizedKey([]byte(r.Host))
 	cert, ok := key.(*gossh.Certificate)
-
-	fmt.Println(r.User)
-
 	if !ok {
-		return errors.New("unexpected cert")
+		return "", nil, errors.New("unexpected cert")
 	}
 	signer, _ := gossh.NewCertSigner(cert, casigner1)
-
-	ssht, err := NewSSHTransport(signer, "", ns, r.Root)
-	if err != nil {
-		return err
-	}
-	go ssht.Start()
-	return nil
+	return r.Root, signer, nil
 }
 
 
@@ -90,7 +94,6 @@ type Server struct {
 	Shell          string
 	AuthorizedKeys []gossh.PublicKey
 
-	clientConfig *gossh.ClientConfig
 	serverConfig *gossh.ServerConfig
 
 	signer gossh.Signer
@@ -111,25 +114,6 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 
 	s := &Server{
 		signer: signer,
-		clientConfig: &gossh.ClientConfig{
-			Auth: []gossh.AuthMethod{gossh.PublicKeys(signer)},
-			HostKeyCallback: func(hostname string, remote net.Addr, key gossh.PublicKey) error {
-				return nil
-			},
-			//Config: gossh.Config{
-			//	MACs: []string{
-			//		"hmac-sha2-256-etm@opengossh.com",
-			//		"hmac-sha2-256",
-			//		"hmac-sha1",
-			//		"hmac-sha1-96",
-			//	},
-			//	Ciphers: []string{
-			//		"aes128-gcm@opengossh.com",
-			//		"chacha20-poly1305@opengossh.com",
-			//		"aes128-ctr", "none",
-			//	},
-			//},
-		},
 		serverConfig: &gossh.ServerConfig{
 
 		},
@@ -142,11 +126,11 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 			},
 		},
 	}
-	//pk, err := LoadAuthorizedKeys(os.Getenv("HOME") + "/.ssh/authorized_keys")
-	//if err == nil {
-	//	s.AuthorizedKeys = pk
-	//}
-	extra := os.Getenv("AUTHORIZED")
+	pk, err := LoadAuthorizedKeys(os.Getenv("HOME") + "/.ssh/authorized_keys")
+	if err == nil {
+		s.AuthorizedKeys = pk
+	}
+	extra := os.Getenv("SSH_AUTHORIZED")
 	if extra != "" {
 		pubk, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
 		if err == nil {
@@ -160,7 +144,20 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 
 	s.forwardHandler = &ForwardedTCPHandler{}
 
-	s.serverConfig.PublicKeyCallback = s.CertChecker.Authenticate
+	s.serverConfig.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
+		p, err := s.CertChecker.Authenticate(conn, key)
+		if err == nil {
+			return p, nil
+		}
+		for _, k := range s.AuthorizedKeys {
+			if KeysEqual(key, k) {
+				return &gossh.Permissions{
+
+				}, nil
+			}
+		}
+		return nil, errors.New("No key found")
+	}
 	s.serverConfig.AddHostKey(signer)
 
 	// Once a ServerConfig has been configured, connections can be
@@ -172,6 +169,38 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 
 	return s, nil
 }
+
+// LoadAuthorizedKeys loads path as an array.
+// It will return nil if path doesn't exist.
+func LoadAuthorizedKeys(path string) ([]gossh.PublicKey, error) {
+	authorizedKeysBytes, err := ioutil.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	authorizedKeys := []gossh.PublicKey{}
+	for len(authorizedKeysBytes) > 0 {
+		pubKey, _, _, rest, err := gossh.ParseAuthorizedKey(authorizedKeysBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		authorizedKeys = append(authorizedKeys, pubKey)
+		authorizedKeysBytes = rest
+	}
+
+	if len(authorizedKeys) == 0 {
+		return nil, fmt.Errorf("%s was empty", path)
+	}
+
+	return authorizedKeys, nil
+}
+
+
 
 // KeysEqual is constant time compare of the keys to avoid timing attacks.
 func KeysEqual(ak, bk gossh.PublicKey) bool {

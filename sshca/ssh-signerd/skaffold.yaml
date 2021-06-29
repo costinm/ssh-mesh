@@ -4,24 +4,13 @@ metadata:
   name:  ssh-ca
 
 build:
-#  tagPolicy:
-#    dateTime:
-#      format: "2006-01-02_15-04"
-
   artifacts:
     - image: gcr.io/dmeshgate/ssh-ca
       context: .
-
-      sync:
-        manual:
-          - src: "../../www/**"
-            dest: "www"
-
       custom:
         buildCommand: ../../bin/ko-build.sh
         dependencies:
           paths:
-            - "../../**"
             - "../**"
             - "../../manifests/ssh-ca/**"
 
