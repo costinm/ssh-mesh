@@ -50,6 +50,7 @@ func StartSSHDWithCA(ns string, sshCA string) error {
 	r, signer, err2 := GetCertHostSigner(sshCA,  privk1)
 	if err2 != nil {
 		signer, _ = gossh.NewSignerFromKey(privk1)
+		log.Println("Cert signer not found, use private key", err2)
 	}
 
 	ssht, err := NewSSHTransport(signer, "", ns, r)
@@ -109,7 +110,7 @@ type Server struct {
 func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, error) {
 	pubk, _,_, _, err := gossh.ParseAuthorizedKey([]byte(root))
 	if err != nil {
-		return nil, err
+		log.Println("No root CA key")
 	}
 
 	s := &Server{
@@ -122,6 +123,9 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 		// Server cert checker
 		CertChecker: &gossh.CertChecker{
 			IsUserAuthority: func(auth gossh.PublicKey) bool {
+				if pubk == nil {
+					return false
+				}
 				return KeysEqual(auth, pubk)
 			},
 		},
@@ -130,11 +134,11 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 	if err == nil {
 		s.AuthorizedKeys = pk
 	}
-	extra := os.Getenv("SSH_AUTHORIZED")
+	extra := os.Getenv("SSH_AUTH")
 	if extra != "" {
-		pubk, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
+		pubk1, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
 		if err == nil {
-			s.AuthorizedKeys = append(s.AuthorizedKeys, pubk)
+			s.AuthorizedKeys = append(s.AuthorizedKeys, pubk1)
 		}
 	}
 
@@ -145,9 +149,11 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 	s.forwardHandler = &ForwardedTCPHandler{}
 
 	s.serverConfig.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
-		p, err := s.CertChecker.Authenticate(conn, key)
-		if err == nil {
-			return p, nil
+		if pubk != nil {
+			p, err := s.CertChecker.Authenticate(conn, key)
+			if err == nil {
+				return p, nil
+			}
 		}
 		for _, k := range s.AuthorizedKeys {
 			if KeysEqual(key, k) {
@@ -156,7 +162,7 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 				}, nil
 			}
 		}
-		return nil, errors.New("No key found")
+		return nil, errors.New("SSH connection: no key found")
 	}
 	s.serverConfig.AddHostKey(signer)
 
@@ -164,8 +170,10 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 	// accepted.
 	s.Listener, err = net.Listen("tcp", s.Address)
 	if err != nil {
+		log.Println("Failed to listend on ", s.Address, err)
 		return nil, err
 	}
+	log.Println("SSHD listening on ", s.Address)
 
 	return s, nil
 }
@@ -256,7 +264,7 @@ func (sshGate *Server) HandleServerConn(nConn net.Conn) {
 		//sshGate.metrics.Errors.Add(1)
 		return
 	}
-
+	log.Println("SSH connection from ", nConn.RemoteAddr())
 	// TODO: track the session, for direct use
 
 	ctx, cancel := context.WithCancel(context.Background())
