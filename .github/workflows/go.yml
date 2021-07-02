@@ -31,7 +31,7 @@ jobs:
       - name: Build
         run: |
           cd ./src/${{ github.event.repository.name }}
-          make deps/ko ko/sshca ko/sshd
+          KO_DOCKER_REPO=ghcr.io/costinm/sshca make deps/ko ko/sshca ko/sshd
 
   build-docker:
     name: Build-in-docker
