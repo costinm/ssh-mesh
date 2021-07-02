@@ -10,6 +10,8 @@ ko/sshca:
 ko/sshd:
 	cd ssh && ko publish --bare ./sshd -t latest
 
+deps/ko:
+	go mod init tmp; GOFLAGS= go get github.com/google/ko@v0.8.3
 
 # Use openssh client
 ssh/openssh-client:

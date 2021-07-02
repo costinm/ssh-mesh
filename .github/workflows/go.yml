@@ -19,7 +19,6 @@ jobs:
         with:
           path: ./src/${{ github.event.repository.name }}
 
-
       -
         name: Login to GitHub Container Registry
         uses: docker/login-action@v1
@@ -32,7 +31,7 @@ jobs:
       - name: Build
         run: |
           cd ./src/${{ github.event.repository.name }}
-          make ko/sshca
+          make deps/ko ko/sshca ko/sshd
 
   build-docker:
     name: Build-in-docker
