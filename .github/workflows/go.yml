@@ -16,7 +16,8 @@ jobs:
           go-version: 1.16
       - uses: actions/checkout@v2
       - uses: imjasonh/setup-ko@v0.4
-      - run: ko publish ./sshca/ssh-signerd
+      - run: cd sshca && ko publish ./ssh-signerd
+      - run: cd ssh && ko publish ./sshd
 
   build-docker:
     name: Build-in-docker
