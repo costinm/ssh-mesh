@@ -4,34 +4,19 @@ on: [push]
 env:
   GO111MODULE: on
 
+
 jobs:
+  # To compare the speed
   build-ko:
     name: Build with ko
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: 1.16.x
-
-      -
-        name: Checkout
-        uses: actions/checkout@v2
-        with:
-          path: ./src/${{ github.event.repository.name }}
-
-      -
-        name: Login to GitHub Container Registry
-        uses: docker/login-action@v1
-        with:
-          registry: ghcr.io
-          #username: ${{ github.actor }}
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build
-        run: |
-          cd ./src/${{ github.event.repository.name }}
-          KO_DOCKER_REPO=ghcr.io/costinm/sshca make deps/ko ko/sshca ko/sshd
+          go-version: 1.16
+      - uses: actions/checkout@v2
+      - uses: imjasonh/setup-ko@v0.4
+      - run: ko publish ./sshca/ssh-signerd
 
   build-docker:
     name: Build-in-docker
