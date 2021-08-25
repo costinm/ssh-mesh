@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/costinm/cert-ssh/sshca"
@@ -127,6 +128,66 @@ type Server struct {
 	Address        string
 	Listener       net.Listener
 	forwardHandler *ForwardedTCPHandler
+}
+
+// InitFromSecret is a helper method to init the sshd using a secret or CA address
+func InitFromSecret(sshCM map[string][]byte, ns string) {
+
+	var err2 error
+	var signer gossh.Signer
+	var r string
+
+	sshCA := sshCM["SSHCA_ADDR"]
+
+	var authKeys []gossh.PublicKey
+	for k, v := range sshCM {
+		if strings.HasPrefix(k, "authorized_key_") {
+				pubk1, _, _, _, err := gossh.ParseAuthorizedKey(v)
+			if err != nil {
+				log.Println("SSH_DEBUG: invalid ", k, err)
+			} else {
+				authKeys = append(authKeys, pubk1)
+			}
+		}
+	}
+
+	extra := os.Getenv("SSH_AUTH")
+	if extra != "" {
+		pubk1, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
+		if err != nil {
+			log.Println("SSH_DEBUG: invalid SSH_AUTH", err)
+		} else {
+			authKeys = append(authKeys, pubk1)
+		}
+	}
+
+	if len(authKeys) == 0 && sshCA== nil {
+		// No debug config, skip creating SSHD
+		return
+	}
+
+	// TODO: load private key and cert from secret, if present
+	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if sshCA != nil {
+		r, signer, err2 = GetCertHostSigner(string(sshCA),  privk1)
+		if err2 != nil {
+			log.Println("SSHCA failed, debug disabled ", string(sshCA), err2)
+			return
+		}
+	} else {
+		signer, _ = gossh.NewSignerFromKey(privk1)
+	}
+
+	ssht, err := NewSSHTransport(signer, "", ns, r)
+	if err != nil {
+		log.Println("SSH debug init failed", err)
+		return
+	}
+	if len(authKeys) != 0 {
+		ssht.AddAuthorizedKeys(authKeys)
+	}
+	go ssht.Start()
+
 }
 
 func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, error) {
@@ -368,6 +429,12 @@ func (scon *Server) handleServerConnRequests(ctx context.Context, reqs <-chan *g
 				r.Reply(false, nil)
 			}
 		}
+	}
+}
+
+func (srv *Server) AddAuthorizedKeys(keys []gossh.PublicKey) {
+	for _, k := range keys {
+		srv.AuthorizedKeys = append(srv.AuthorizedKeys, k)
 	}
 }
 
