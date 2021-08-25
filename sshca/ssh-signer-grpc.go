@@ -77,8 +77,8 @@ func (s *SSHSigner) CreateCertificate(ctx context.Context, in *SSHCertificateReq
 	// Debug/local dev
 	domain := []string{"localhost"}
 	user := "unauthenticated" // k8s convention
-	xfcc := md["x-forwarded-client-cert"]
 
+	xfcc := md["x-forwarded-client-cert"]
 	if xfcc != nil {
 		remoteID := RemoteIDmTLS(xfcc[len(xfcc) - 1])
 		sd := remoteID.TrustDomain

@@ -11,10 +11,6 @@ build:
   artifacts:
     - image: gcr.io/dmeshgate/ssh-ca
       context: sshca/ssh-signerd
-#      sync:
-#        manual:
-#          - src: "../../www/**"
-#            dest: "www"
       custom:
         buildCommand: ./bin/ko-build.sh
         dependencies:

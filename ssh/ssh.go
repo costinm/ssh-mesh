@@ -47,6 +47,28 @@ func GetSSHSignclient(sshCA string) (sshca.SSHCertificateServiceClient, *grpc.Cl
 func StartSSHDWithCA(ns string, sshCA string) error {
 	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 
+	var err2 error
+	var signer gossh.Signer
+	var r string
+	if sshCA != "" {
+		r, signer, err2 = GetCertHostSigner(sshCA,  privk1)
+	}
+	if err2 != nil {
+		signer, _ = gossh.NewSignerFromKey(privk1)
+		log.Println("SSH cert signer not found, use ephemeral private key", err2)
+	}
+
+	ssht, err := NewSSHTransport(signer, "", ns, r)
+	if err != nil {
+		return err
+	}
+	go ssht.Start()
+	return nil
+}
+
+func StartSSHDWithKeys(ns string, sshCA string) error {
+	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
 	r, signer, err2 := GetCertHostSigner(sshCA,  privk1)
 	if err2 != nil {
 		signer, _ = gossh.NewSignerFromKey(privk1)
@@ -108,9 +130,13 @@ type Server struct {
 }
 
 func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, error) {
-	pubk, _,_, _, err := gossh.ParseAuthorizedKey([]byte(root))
-	if err != nil {
-		log.Println("No root CA key")
+	var pubk gossh.PublicKey
+	var err error
+	if root != "" {
+		pubk, _, _, _, err = gossh.ParseAuthorizedKey([]byte(root))
+		if err != nil {
+			log.Println("No root CA key")
+		}
 	}
 
 	s := &Server{
@@ -130,16 +156,9 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 			},
 		},
 	}
-	pk, err := LoadAuthorizedKeys(os.Getenv("HOME") + "/.ssh/authorized_keys")
+	authorizedKeysBytes, err := ioutil.ReadFile(os.Getenv("HOME") + "/.ssh/authorized_keys")
 	if err == nil {
-		s.AuthorizedKeys = pk
-	}
-	extra := os.Getenv("SSH_AUTH")
-	if extra != "" {
-		pubk1, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
-		if err == nil {
-			s.AuthorizedKeys = append(s.AuthorizedKeys, pubk1)
-		}
+		s.AddAuthorizedFile(authorizedKeysBytes)
 	}
 
 	if s.Address == "" {
@@ -155,12 +174,13 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 				return p, nil
 			}
 		}
-		for _, k := range s.AuthorizedKeys {
-			if KeysEqual(key, k) {
-				return &gossh.Permissions{
-
-				}, nil
+		if s.AuthorizedKeys != nil {
+			for _, k := range s.AuthorizedKeys {
+				if KeysEqual(key, k) {
+					return &gossh.Permissions{
+					}, nil
 			}
+		}
 		}
 		return nil, errors.New("SSH connection: no key found")
 	}
@@ -178,34 +198,23 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 	return s, nil
 }
 
-// LoadAuthorizedKeys loads path as an array.
-// It will return nil if path doesn't exist.
-func LoadAuthorizedKeys(path string) ([]gossh.PublicKey, error) {
-	authorizedKeysBytes, err := ioutil.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-
-		return nil, err
+func (s *Server) AddAuthorized(extra string) {
+	pubk1, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
+	if err == nil {
+		s.AuthorizedKeys = append(s.AuthorizedKeys, pubk1)
 	}
+}
 
-	authorizedKeys := []gossh.PublicKey{}
-	for len(authorizedKeysBytes) > 0 {
-		pubKey, _, _, rest, err := gossh.ParseAuthorizedKey(authorizedKeysBytes)
+func (s *Server) AddAuthorizedFile(auth []byte) {
+	for len(auth) > 0 {
+		pubKey, _, _, rest, err := gossh.ParseAuthorizedKey(auth)
 		if err != nil {
-			return nil, err
+			return
 		}
 
-		authorizedKeys = append(authorizedKeys, pubKey)
-		authorizedKeysBytes = rest
+		s.AuthorizedKeys = append(s.AuthorizedKeys, pubKey)
+		auth = rest
 	}
-
-	if len(authorizedKeys) == 0 {
-		return nil, fmt.Errorf("%s was empty", path)
-	}
-
-	return authorizedKeys, nil
 }
 
 
