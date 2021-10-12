@@ -2,9 +2,6 @@ package ssh
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -15,103 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/costinm/cert-ssh/sshca"
 	gossh "golang.org/x/crypto/ssh"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	xdscreds "google.golang.org/grpc/credentials/xds"
 )
-
-func GetSSHSignclient(sshCA string) (sshca.SSHCertificateServiceClient, *grpc.ClientConn,  error){
-	creds := insecure.NewCredentials()
-
-	xdsBootstrap := os.Getenv("GRPC_XDS_BOOTSTRAP")
-	if xdsBootstrap != "" {
-		log.Println("Using xDS credentials...")
-		var err error
-		if creds, err = xdscreds.NewClientCredentials(xdscreds.ClientOptions{
-			FallbackCreds: insecure.NewCredentials(),
-		}); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	conn, err := grpc.Dial(sshCA, grpc.WithTransportCredentials(creds))
-	if err != nil {
-		return nil, nil, err
-	}
-	c := sshca.NewSSHCertificateServiceClient(conn)
-	return c, conn, nil
-}
-
-// StartSSHDWithCA starts an in-process SSHD using the SSH CA. Fallback to self-signed keys if the CA is not available.
-func StartSSHDWithCA(ns string, sshCA string) error {
-	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	var err2 error
-	var signer gossh.Signer
-	var r string
-	if sshCA != "" {
-		r, signer, err2 = GetCertHostSigner(sshCA,  privk1)
-	}
-	if err2 != nil {
-		signer, _ = gossh.NewSignerFromKey(privk1)
-		log.Println("SSH cert signer not found, use ephemeral private key", err2)
-	}
-
-	ssht, err := NewSSHTransport(signer, "", ns, r)
-	if err != nil {
-		return err
-	}
-	go ssht.Start()
-	return nil
-}
-
-func StartSSHDWithKeys(ns string, sshCA string) error {
-	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	r, signer, err2 := GetCertHostSigner(sshCA,  privk1)
-	if err2 != nil {
-		signer, _ = gossh.NewSignerFromKey(privk1)
-		log.Println("Cert signer not found, use private key", err2)
-	}
-
-	ssht, err := NewSSHTransport(signer, "", ns, r)
-	if err != nil {
-		return err
-	}
-	go ssht.Start()
-	return nil
-}
-
-func GetCertHostSigner(sshCA string, privk1 *ecdsa.PrivateKey) (string, gossh.Signer, error) {
-	c, con, err := GetSSHSignclient(sshCA)
-	if err != nil {
-		return "", nil, err
-	}
-	defer con.Close()
-	casigner1, _ := gossh.NewSignerFromKey(privk1)
-	req := &sshca.SSHCertificateRequest{
-		Public: string(gossh.MarshalAuthorizedKey(casigner1.PublicKey())),
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	r, err := c.CreateCertificate(ctx, req)
-	if err != nil {
-		log.Println("Error creating cert ", err)
-		return "", nil, err
-	}
-
-	key, _, _, _, _ := gossh.ParseAuthorizedKey([]byte(r.Host))
-	cert, ok := key.(*gossh.Certificate)
-	if !ok {
-		return "", nil, errors.New("unexpected cert")
-	}
-	signer, _ := gossh.NewCertSigner(cert, casigner1)
-	return r.Root, signer, nil
-}
-
 
 type Server struct {
 	Port           int
@@ -130,12 +32,10 @@ type Server struct {
 	forwardHandler *ForwardedTCPHandler
 }
 
-// InitFromSecret is a helper method to init the sshd using a secret or CA address
-func InitFromSecret(sshCM map[string][]byte, ns string) {
 
-	var err2 error
-	var signer gossh.Signer
-	var r string
+
+// InitFromSecret is a helper method to init the sshd using a secret or CA address
+func InitFromSecret(sshCM map[string][]byte, ns string, signer gossh.Signer, r string) error {
 
 	sshCA := sshCM["SSHCA_ADDR"]
 
@@ -163,31 +63,21 @@ func InitFromSecret(sshCM map[string][]byte, ns string) {
 
 	if len(authKeys) == 0 && sshCA== nil {
 		// No debug config, skip creating SSHD
-		return
+		return nil
 	}
 
 	// TODO: load private key and cert from secret, if present
-	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if sshCA != nil {
-		r, signer, err2 = GetCertHostSigner(string(sshCA),  privk1)
-		if err2 != nil {
-			log.Println("SSHCA failed, debug disabled ", string(sshCA), err2)
-			return
-		}
-	} else {
-		signer, _ = gossh.NewSignerFromKey(privk1)
-	}
-
 	ssht, err := NewSSHTransport(signer, "", ns, r)
 	if err != nil {
 		log.Println("SSH debug init failed", err)
-		return
+		return err
 	}
 	if len(authKeys) != 0 {
 		ssht.AddAuthorizedKeys(authKeys)
 	}
-	go ssht.Start()
 
+	go ssht.Start()
+	return nil
 }
 
 func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, error) {

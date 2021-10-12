@@ -2,15 +2,10 @@ package ssh
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"errors"
 	"log"
 	"net"
 	"time"
 
-	"github.com/costinm/cert-ssh/sshca"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -36,19 +31,24 @@ type Client struct {
 	RemoteAddr     net.Addr
 	config         *ssh.ClientConfig
 
-	CAKey ssh.PublicKey
-	CertChecker   *ssh.CertChecker
+	CAKey        ssh.PublicKey
+	CertChecker  *ssh.CertChecker
+	CertProvider func(ctx context.Context, sshCA string) (ssh.Signer, error)
 
 	//
 	// Ports map[string]string
 }
 
 func (c *Client) Start() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	if c.Signer == nil {
-		err := c.InitSigner(c.SSHCa)
+		signer, err :=  c.CertProvider(ctx, c.SSHCa)
 		if err != nil {
 			return err
 		}
+		c.Signer = signer
 	}
 	c.CertChecker = &ssh.CertChecker{
 		IsHostAuthority: func(auth ssh.PublicKey, addr string) bool {
@@ -83,38 +83,6 @@ func (c *Client) Start() error {
 	return nil
 }
 
-func (c *Client) InitSigner(sshCA string) error {
-	ssc, con, err := GetSSHSignclient(sshCA)
-	if err != nil {
-		return err
-	}
-	defer con.Close()
-
-	ephemeralPrivate, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	ephemeralSigner, _ := ssh.NewSignerFromKey(ephemeralPrivate)
-	req := &sshca.SSHCertificateRequest{
-		Public: string(ssh.MarshalAuthorizedKey(ephemeralSigner.PublicKey())),
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	certResponse, err := ssc.CreateCertificate(ctx, req)
-	if err != nil {
-		log.Println("Error creating cert ", err)
-		return err
-	}
-
-	key, _, _, _, _ := ssh.ParseAuthorizedKey([]byte(certResponse.User))
-	cert, ok := key.(*ssh.Certificate)
-	if !ok {
-		return errors.New("unexpected cert")
-	}
-	signer, _ := ssh.NewCertSigner(cert, ephemeralSigner)
-
-	c.Signer = signer
-	return nil
-}
 
 type RemoteExec struct {
 	ssh.Channel

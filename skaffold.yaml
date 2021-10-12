@@ -10,18 +10,19 @@ build:
 
   artifacts:
     - image: gcr.io/dmeshgate/ssh-ca
-      context: sshca/ssh-signerd
+      context: .
       custom:
-        buildCommand: ./bin/ko-build.sh
+        buildCommand: make push
         dependencies:
           paths:
+            - "ssh/**"
             - "sshca/**"
             - "manifests/ssh-ca/**"
 
     - image: gcr.io/dmeshgate/sshd
-      context: ssh/sshd
+      context: .
       custom:
-        buildCommand: ../../bin/ko-build.sh
+        buildCommand: make push
         dependencies:
           paths:
             - "ssh/**"

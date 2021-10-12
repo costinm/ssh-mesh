@@ -7,7 +7,10 @@ import (
 	"os"
 
 	ssh "github.com/costinm/cert-ssh/sshca"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/plugin/runmetrics"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/zpages"
 	gossh "golang.org/x/crypto/ssh"
@@ -17,6 +20,8 @@ import (
 	xdscreds "google.golang.org/grpc/credentials/xds"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/xds"
+
+	ocprom "contrib.go.opencensus.io/exporter/prometheus"
 )
 
 
@@ -27,6 +32,23 @@ func init() {
        if err := view.Register(ocgrpc.DefaultClientViews...); err != nil {
                log.Println("Failed to register ocgrpc server views: %v", err)
        }
+
+			 // Similar with pilot-agent
+			 registry := prometheus.NewRegistry()
+			 wrapped := prometheus.WrapRegistererWithPrefix("sshca_",
+					prometheus.Registerer(registry))
+			 wrapped.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+			 wrapped.MustRegister(collectors.NewGoCollector())
+
+			//promRegistry = registry
+			// go collector metrics collide with other metrics.
+			exporter, err := ocprom.NewExporter(ocprom.Options{Registry: registry,
+				Registerer: wrapped})
+			if err != nil {
+				log.Fatalf("could not setup exporter: %v", err)
+			}
+			view.RegisterExporter(exporter)
+
 }
 
 func main() {
@@ -51,7 +73,19 @@ func main() {
 		grpc.Creds(creds),
 		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
 	}
+	// ocgrpc adds ~300k
 
+	err = runmetrics.Enable(runmetrics.RunMetricOptions{
+		EnableCPU:    true,
+		EnableMemory: true,
+		Prefix:       "sshca/",
+	})
+	if err != nil {
+		log.Println(err)
+	}
+
+	// Adds about 10M to the binary. See ssh-signerd for the same gRPC service, without
+	// xds.
 	xdsBootstrap := os.Getenv("GRPC_XDS_BOOTSTRAP")
 	if xdsBootstrap != "" {
 		var err error
