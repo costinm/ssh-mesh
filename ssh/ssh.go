@@ -47,6 +47,7 @@ func InitFromSecret(sshCM map[string][]byte, ns string, signer gossh.Signer, r s
 				log.Println("SSH_DEBUG: invalid ", k, err)
 			} else {
 				authKeys = append(authKeys, pubk1)
+				log.Println("Adding authorized key", k, string(v))
 			}
 		}
 	}
@@ -66,7 +67,28 @@ func InitFromSecret(sshCM map[string][]byte, ns string, signer gossh.Signer, r s
 		return nil
 	}
 
-	// TODO: load private key and cert from secret, if present
+	// load private key and cert from secret, if present
+	ek := sshCM["id_ecdsa"]
+	if ek != nil {
+		pk, err := gossh.ParsePrivateKey(ek)
+		if err != nil {
+			log.Println("Failed to parse key ", err)
+		}
+		signer = pk
+	}
+	if signer == nil {
+		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if sshCA != nil {
+			r, signer, err2 = GetCertHostSigner(string(sshCA), privk1)
+			if err2 != nil {
+				log.Println("SSHCA failed, debug disabled ", string(sshCA), err2)
+				return
+			}
+		} else {
+			signer, _ = gossh.NewSignerFromKey(privk1)
+		}
+	}
+
 	ssht, err := NewSSHTransport(signer, "", ns, r)
 	if err != nil {
 		log.Println("SSH debug init failed", err)
@@ -133,6 +155,7 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 			}
 		}
 		}
+		//log.Println("SSH auth failure", key, s.AuthorizedKeys)
 		return nil, errors.New("SSH connection: no key found")
 	}
 	s.serverConfig.AddHostKey(signer)
