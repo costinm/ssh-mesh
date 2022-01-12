@@ -1,17 +1,58 @@
+ROOT_DIR?=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+OUT?=${ROOT_DIR}/../out/cert-ssh
 
-KO_DOCKER_REPO ?= gcr.io/dmeshgate/ssh-signerd
-export KO_DOCKER_REPO
+BASE_DISTROLESS?=gcr.io/distroless/static
+BASE_DEBUG?=ubuntu:bionic
+DOCKER_REPO?=gcr.io/dmeshgate/sshmesh
+
+export DOCKER_REPO
+
+GOPROXY?=https://proxy.golang.org
+export GOPROXY
+
+all: build push/gate push/sshd
+
+build:
+	mkdir -p ${OUT}/etc/ssl/certs/
+	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
+	mkdir -p ${OUT}/usr/local/bin
+	CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
+		-ldflags '-s -w -extldflags "-static"' \
+		-o ${OUT}/usr/local/bin/ \
+		./ssh/sshc ./ssh/sshd ./ssh/min ./ssh/casshc \
+		   ./sshca/ssh-signerd ./sshca/ssh-gen ./sshca/ssh-signerd-min ./sshca/ssh-signer-metrics
+	ls -l ${OUT}/usr/local/bin
 
 ko/build: ko/sshca ko/sshd
 
-ko/sshca:
-	cd sshca && ko publish --bare ./ssh-signerd -t latest
+docker:
+	docker build -t ${DOCKER_REPO}/sshd -f tools/docker/Dockerfile.sshd ${OUT}
+	docker build -t ${DOCKER_REPO}/mesh -f tools/docker/Dockerfile.sshmesh ${OUT}
 
-ko/sshd:
-	cd ssh && ko publish --bare ./sshd -t latest
+push/docker:
+	docker push ${DOCKER_REPO}/sshd
+	docker push ${DOCKER_REPO}/gate
 
-deps/ko:
-	go mod init tmp; GOFLAGS= go get github.com/google/ko@v0.8.3
+
+_push:
+	(export SSHDRAW=$(shell cd ${OUT} && tar -cf - etc ${PUSH_FILES} | \
+					  gcrane append -f - -b ${BASE_DISTROLESS} \
+						-t ${DOCKER_REPO}/gate-distroless:latest \
+					   ) && \
+	gcrane mutate $${SSHDRAW} --entrypoint /usr/local/bin/ssh-signerd && \
+	gcrane rebase --rebased ${DOCKER_REPO}/gate:latest \
+	   --original $${SSHDRAW} \
+	   --old_base ${BASE_DISTROLESS} \
+	   --new_base ${BASE_DEBUG} \
+	)
+
+# Append files to an existing container
+push/gate:
+	PUSH_FILES=usr/local/bin/ssh-signerd $(MAKE) _push
+
+push/sshd:
+	PUSH_FILES=usr/local/bin/sshd $(MAKE) _push
+
 
 # Use openssh client
 ssh/openssh-client:
@@ -40,6 +81,5 @@ ssh/getcert-k8s:
 	echo {\"public\":\"${CRT}\"} | \
  		grpcurl -plaintext  -d @   [::1]:14021 ssh.SSHCertificateService/CreateCertificate
 
-
-ssh/cr/ssh-ca:
-
+deps:
+	go install github.com/google/go-containerregistry/cmd/gcrane@latest

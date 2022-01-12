@@ -3,10 +3,11 @@ kind: Service
 metadata:
   name: sshd
 spec:
-  clusterIP: None
   ports:
     - port: 15022
       name: ssh
+    - port: 8080
+      name: http2
   selector:
     app: sshd
 ---

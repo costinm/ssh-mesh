@@ -3,7 +3,7 @@
     <module name="ssh-mesh" />
     <working_directory value="$PROJECT_DIR$/testdata" />
     <kind value="PACKAGE" />
-    <package value="github.com/costinm/cert-ssh/ssh/sshd" />
+    <package value="github.com/costinm/ssh-mesh/ssh/sshd" />
     <directory value="$PROJECT_DIR$" />
     <filePath value="$PROJECT_DIR$/ssh/sshd/sshd.go" />
     <method v="2" />

@@ -18,7 +18,9 @@ secret: init-keys
 	kubectl -n ${WORKLOAD_NAMESPACE} delete secret sshdebug || true
 	kubectl -n ${WORKLOAD_NAMESPACE} create secret generic \
  		sshdebug \
- 		--from-file=authorized_key_${USER}=${OUT}/ssh/authorized_keys \
+ 		--from-file=authorized_key=${OUT}/ssh/authorized_keys \
+ 		--from-file=cmd=cmd.json \
+ 		--from-file=ssd_config=sshd_config \
  		--from-file=id_ecdsa=${OUT}/ssh/id_ecdsa \
  		--from-file=id_ecdsa.pub=${OUT}/ssh/id_ecdsa.pub
 	rm -rf ${OUT}/ssh
@@ -35,4 +37,4 @@ config_dump: CR_URL=$(shell gcloud run services describe ${SERVICE} --format="va
 config_dump:
 	 ssh -F /dev/null -o StrictHostKeyChecking=no \
         -o "UserKnownHostsFile /dev/null" \
- 	    -o ProxyCommand='hbone ${CR_URL}/_hbone/22' -- sh curl localhost:15000/config_dump
+ 	    -o ProxyCommand='hbone ${CR_URL}/_hbone/22' -- sh curl localhost:15000/config_dump?include_eds
