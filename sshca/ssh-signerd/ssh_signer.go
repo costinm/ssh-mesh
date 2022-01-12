@@ -54,6 +54,7 @@ func main() {
 
 	xdsBootstrap := os.Getenv("GRPC_XDS_BOOTSTRAP")
 	if xdsBootstrap != "" {
+		// proxyless grpc
 		var err error
 		if creds, err = xdscreds.NewServerCredentials(xdscreds.ServerOptions{FallbackCreds: insecure.NewCredentials()}); err != nil {
 			log.Fatalf("failed to create server-side xDS credentials: %v", err)
@@ -64,6 +65,7 @@ func main() {
 		//reflection.Register(grpcServer)
 		go grpcServer.Serve(greeterLis)
 	} else {
+
 		grpcServer := grpc.NewServer(grpcOptions...)
 		ssh.RegisterSSHCertificateServiceServer(grpcServer, sshs)
 		admin.Register(grpcServer)
