@@ -1,17 +1,14 @@
-module github.com/costinm/cert-ssh
+module github.com/costinm/ssh-mesh
 
 go 1.16
 
 require (
-	go.opencensus.io v0.23.0
-	contrib.go.opencensus.io/exporter/prometheus v0.4.0
-	github.com/prometheus/client_golang v1.11.0
-
 	github.com/creack/pty v1.1.13
-
-	golang.org/x/crypto v0.0.0-20210503195802-e9a32991a82e
+	github.com/go-logr/logr v1.2.0
+	github.com/go-logr/zapr v1.2.0
 	github.com/pkg/sftp v1.13.1
-
-	google.golang.org/grpc v1.38.0
-	google.golang.org/protobuf v1.26.0
+	go.uber.org/zap v1.19.1
+	golang.org/x/crypto v0.0.0-20210503195802-e9a32991a82e
+	golang.org/x/sys v0.0.0-20210603081109-ebe580a85c40 // indirect
+	k8s.io/klog/v2 v2.30.0
 )

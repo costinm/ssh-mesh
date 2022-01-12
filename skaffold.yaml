@@ -1,65 +1,39 @@
-apiVersion: skaffold/v2beta10
+apiVersion: skaffold/v2beta19
 kind: Config
 metadata:
-  name:  cert-ssh
-
+  name: ssh-mesh
 build:
-#  tagPolicy:
-#    dateTime:
-#      format: "2006-01-02_15-04"
-
   artifacts:
-    - image: gcr.io/dmeshgate/ssh-ca
-      context: .
-      custom:
-        buildCommand: make push
-        dependencies:
-          paths:
-            - "ssh/**"
-            - "sshca/**"
-            - "manifests/ssh-ca/**"
-
-    - image: gcr.io/dmeshgate/sshd
-      context: .
-      custom:
-        buildCommand: make push
-        dependencies:
-          paths:
-            - "ssh/**"
-            - "manifests/sshd/**"
-
+  - image: gcr.io/dmeshgate/sshd
+    context: .
+    custom:
+      buildCommand: make push
+      dependencies:
+        paths:
+        - ssh/**
+        - manifests/sshd/**
 deploy:
   helm:
     releases:
-      - name: ssh-ca
-        namespace: ssh-ca
-        createNamespace: true
-        chartPath: ../../manifests/ssh-ca
-        artifactOverrides:
-          image: gcr.io/dmeshgate/ssh-ca
-      - name: sshd
-        namespace: sshd
-        createNamespace: true
-        chartPath: ../../manifests/sshd
-        artifactOverrides:
-          image: gcr.io/dmeshgate/sshd
-
-
+    - name: sshd
+      chartPath: ../../manifests/sshd
+      artifactOverrides:
+        image: gcr.io/dmeshgate/sshd
+      namespace: sshd
+      createNamespace: true
 portForward:
-  - resourceType: deployment
-    namespace: ssh-ca
-    resourceName: ssh-ca
-    port: 8080
-    localPort: 14021
-
-  - resourceType: deployment
-    namespace: ssh-ca
-    resourceName: ssh-ca
-    port: 8081
-    localPort: 14020
-
-  - resourceType: deployment
-    namespace: sshd
-    resourceName: sshd
-    port: 15022
-    localPort: 14022
+- resourceType: deployment
+  resourceName: ssh-ca
+  namespace: ssh-ca
+  port: 8080
+  localPort: 14021
+- resourceType: deployment
+  resourceName: ssh-ca
+  namespace: ssh-ca
+  port: 8081
+  localPort: 14020
+- resourceType: deployment
+  resourceName: sshd
+  namespace: sshd
+  port: 15022
+  localPort: 14022

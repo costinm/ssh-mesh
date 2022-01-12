@@ -2,6 +2,9 @@ package ssh
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -32,10 +35,12 @@ type Server struct {
 	forwardHandler *ForwardedTCPHandler
 }
 
-
+func NewSSHD(cfg func(string,string)string) (*Server,error) {
+	return nil, nil
+}
 
 // InitFromSecret is a helper method to init the sshd using a secret or CA address
-func InitFromSecret(sshCM map[string][]byte, ns string, signer gossh.Signer, r string) error {
+func InitFromSecret(sshCM map[string][]byte, ns string) error {
 
 	sshCA := sshCM["SSHCA_ADDR"]
 
@@ -66,6 +71,20 @@ func InitFromSecret(sshCM map[string][]byte, ns string, signer gossh.Signer, r s
 		// No debug config, skip creating SSHD
 		return nil
 	}
+	var r string
+	var signer gossh.Signer
+	var err error
+
+	if sshCA != nil {
+		r, signer, err = GetCertHostSigner(string(sshCA))
+	}
+	if err != nil {
+		// Use a self-signed cert
+		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		signer, _ = gossh.NewSignerFromKey(privk1)
+		log.Println("SSH cert signer not found, use ephemeral private key", err)
+	}
+
 
 	// load private key and cert from secret, if present
 	ek := sshCM["id_ecdsa"]
@@ -78,15 +97,7 @@ func InitFromSecret(sshCM map[string][]byte, ns string, signer gossh.Signer, r s
 	}
 	if signer == nil {
 		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if sshCA != nil {
-			r, signer, err2 = GetCertHostSigner(string(sshCA), privk1)
-			if err2 != nil {
-				log.Println("SSHCA failed, debug disabled ", string(sshCA), err2)
-				return
-			}
-		} else {
-			signer, _ = gossh.NewSignerFromKey(privk1)
-		}
+		signer, _ = gossh.NewSignerFromKey(privk1)
 	}
 
 	ssht, err := NewSSHTransport(signer, "", ns, r)

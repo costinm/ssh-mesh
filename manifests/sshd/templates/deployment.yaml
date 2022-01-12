@@ -25,8 +25,10 @@ spec:
           image: {{ .Values.image }}
           workingDir: "/"
           ports:
-            - containerPort: 15022
-              name: ssh
+          - containerPort: 8080
+            name: http2
+          - containerPort: 15022
+            name: ssh
           env:
             - name: GOTRACEBACK
               value: "all"
@@ -35,10 +37,19 @@ spec:
               cpu: 10m
               memory: 256Mi
           volumeMounts:
+            # Default 'RO' config source
+            - name: rootkey
+              mountPath: /var/run/secrets/ssh-ca
+              readOnly: true
             - name: jwt-ssh-ca
               mountPath: /var/run/secrets/tokens/ssh-ca
               readOnly: true
       volumes:
+        - name: rootkey
+          secret:
+            secretName: ssh-ca
+            optional: false
+
         - name: jwt-ssh-ca
           projected:
             defaultMode: 420

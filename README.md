@@ -71,7 +71,7 @@ All authentication is based on certificates - both host and user auth.
 # SSH_CA=sshca.example.com:443
 SSH_CA=localhost:14001
 
-go install github.com/costinm/cert-ssh/sshca/ssh-signer
+go install github.com/costinm/ssh-mesh/sshca/ssh-signer
 
 mkdir ${HOME}/.ssh/${SSH_CA}
 cd ${HOME}/.ssh/${SSH_CA}
