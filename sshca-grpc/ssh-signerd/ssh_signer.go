@@ -6,22 +6,24 @@ import (
 	"net/http"
 	"os"
 
-	ssh "github.com/costinm/ssh-mesh/sshca"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
+	sshca_grpc "github.com/costinm/ssh-mesh/sshca-grpc"
+
 	"go.opencensus.io/plugin/ocgrpc"
 	"go.opencensus.io/plugin/runmetrics"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/zpages"
-	gossh "golang.org/x/crypto/ssh"
+	ocprom "contrib.go.opencensus.io/exporter/prometheus"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/admin"
 	"google.golang.org/grpc/credentials/insecure"
 	xdscreds "google.golang.org/grpc/credentials/xds"
+
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/xds"
 
-	ocprom "contrib.go.opencensus.io/exporter/prometheus"
 )
 
 
@@ -53,7 +55,7 @@ func init() {
 
 func main() {
 
-	sshs := &ssh.SSHSigner{
+	sshs := &sshca_grpc.SSHSigner{
 	}
 
 	err := sshs.Init()
@@ -94,14 +96,16 @@ func main() {
 			log.Fatalf("failed to create server-side xDS credentials: %v", err)
 		}
 		grpcServer := xds.NewGRPCServer(grpcOptions...)
-		ssh.RegisterSSHCertificateServiceServer(grpcServer, sshs)
+		sshca_grpc.RegisterSSHCertificateServiceServer(grpcServer, sshs)
 		admin.Register(grpcServer)
 		//reflection.Register(grpcServer)
 		go grpcServer.Serve(greeterLis)
 	} else {
 
 		grpcServer := grpc.NewServer(grpcOptions...)
-		ssh.RegisterSSHCertificateServiceServer(grpcServer, sshs)
+		sshca_grpc.RegisterSSHCertificateServiceServer(grpcServer, sshs)
+
+		// ~200k
 		admin.Register(grpcServer)
 		reflection.Register(grpcServer)
 
@@ -118,8 +122,6 @@ func main() {
 	zpages.Handle(mux, "/debug")
 
 	log.Println("SSH signer started on ", servicePort)
-	log.Println(sshs.Root)
-	log.Println("@cert-authority * " + string(gossh.MarshalAuthorizedKey(sshs.Signer.PublicKey())))
 
 	http.ListenAndServe("127.0.0.1:8081", mux)
 }

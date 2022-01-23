@@ -5,7 +5,7 @@ import (
 	"net/http"
 
 	"github.com/costinm/krun/pkg/mesh"
-	"github.com/costinm/krun/pkg/uk8s"
+	urest "github.com/costinm/krun/pkg/uk8s"
 	"github.com/costinm/ssh-mesh/ssh"
 )
 
@@ -18,7 +18,7 @@ func main() {
 	defer cf()
 
 	// Init the mesh object, using env variables.
-	kr := mesh.New("")
+	kr := mesh.New()
 
 	// Init K8S - discovering using GCP API and env.
 	// Init K8S client, using official API server.

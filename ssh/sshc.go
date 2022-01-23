@@ -2,6 +2,11 @@ package ssh
 
 import (
 	"context"
+	"crypto"
+	"crypto/dsa"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"log"
 	"net"
 	"time"
@@ -130,4 +135,28 @@ func (c *Client) Exec(cmd string, env map[string]string) (*RemoteExec, error) {
 	}
 
 	return re, nil
+}
+
+// Convert from SSH to crypto
+func SSHKey2Crypto(keyRSA []byte) (crypto.PrivateKey, error) {
+	keyssh, err := ssh.ParseRawPrivateKey(keyRSA)
+	switch key := keyssh.(type) {
+	case *rsa.PrivateKey:
+		// PRIVATE_KEY - may return RSA or ecdsa
+		// RSA PRIVATE KEY
+		//auth.RSAPrivate = key
+		return key, nil
+	case *ecdsa.PrivateKey:
+		// EC PRIVATE KEY
+		return key, nil
+	case *dsa.PrivateKey:
+		// DSA PRIVATE KEY
+		return key, nil
+	case *ed25519.PrivateKey:
+		// OPENSSH PRIVATE KEY - may return rsa or ED25519
+		//auth.EDPrivate = key
+		return key, nil
+	}
+
+	return nil, err
 }

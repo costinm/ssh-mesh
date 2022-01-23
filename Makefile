@@ -16,11 +16,20 @@ build:
 	mkdir -p ${OUT}/etc/ssl/certs/
 	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
 	mkdir -p ${OUT}/usr/local/bin
-	CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
+	#CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time
+	go build \
+		-o ${OUT}/usr/local/bin/ \
+		./cmd/min ./cmd/ssh-gate-min ./cmd/sshd ./cmd/ssh-gate-min ./cmd/ssh-signerd-min
+	(cd sshca-grpc && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
 		-ldflags '-s -w -extldflags "-static"' \
 		-o ${OUT}/usr/local/bin/ \
-		./ssh/sshc ./ssh/sshd ./ssh/min ./ssh/casshc \
-		   ./sshca/ssh-signerd ./sshca/ssh-gen ./sshca/ssh-signerd-min ./sshca/ssh-signer-metrics
+		./ssh-signerd-min ./ssh-signer-proxyless ./ssh-signerd ./ssh-gen/ )
+	(cd cmd/sshgate && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
+		-ldflags '-s -w -extldflags "-static"' \
+		-o ${OUT}/usr/local/bin/ \
+		. )
+	ls -l ${OUT}/usr/local/bin
+	strip ${OUT}/usr/local/bin/*
 	ls -l ${OUT}/usr/local/bin
 
 ko/build: ko/sshca ko/sshd

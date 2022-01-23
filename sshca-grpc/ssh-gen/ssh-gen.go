@@ -5,19 +5,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"time"
 
-	ssh "github.com/costinm/ssh-mesh"
 	"go.opencensus.io/plugin/ocgrpc"
 	"go.opencensus.io/stats/view"
 
-	ssh "github.com/costinm/cert-ssh/sshca"
+	"github.com/costinm/ssh-mesh/sshca-grpc"
+
 	gossh "golang.org/x/crypto/ssh"
 
 	"google.golang.org/grpc"
@@ -73,47 +71,19 @@ func NewClient(ctx context.Context, sshURL string) (*grpc.ClientConn, error) {
 	return conn, err
 }
 
-func SignCert(ctx context.Context, c ssh.SSHCertificateServiceClient, privk1 *ecdsa.PrivateKey) (*ssh.SSHCertificateResponse, string, error) {
+func SignCert(ctx context.Context, c sshca_grpc.SSHCertificateServiceClient, privk1 *ecdsa.PrivateKey) (*sshca_grpc.SSHCertificateResponse, string, error) {
 	// Extract SSH-style public key associated with private
 	casigner1, _ := gossh.NewSignerFromKey(privk1)
 	pubString := string(gossh.MarshalAuthorizedKey(casigner1.PublicKey()))
 	user := cfg("USER", "default")
 
-	req := &ssh.SSHCertificateRequest{
+	req := &sshca_grpc.SSHCertificateRequest{
 		Public: pubString,
 		User: user,
 	}
 	r, err := c.CreateCertificate(ctx, req)
 
 	return r, pubString, err
-}
-
-func NewKeyPair() (*ecdsa.PrivateKey, error) {
-	key, err := ioutil.ReadFile("id_ecdsa")
-	if err != nil {
-		keyb, bl, err := pem.Decode(key)
-	}
-
-
-	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	ecb, _ := x509.MarshalECPrivateKey(privk1)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecb})
-
-	ioutil.WriteFile("id_ecdsa", key, 0700)
-	err = ioutil.WriteFile("id_ecdsa", keyPEM, 0700)
-	if err != nil {
-		return nil, err
-	}
-
-	casigner1, _ := gossh.NewSignerFromKey(privk1)
-	pubString := string(gossh.MarshalAuthorizedKey(casigner1.PublicKey()))
-	err = ioutil.WriteFile("id_ecdsa.pub", []byte(pubString), 0700)
-	if err != nil {
-		return nil, err
-	}
-
-	return privk1, nil
 }
 
 func main() {
@@ -128,12 +98,12 @@ func main() {
 	}
 	defer conn.Close()
 
-	c := ssh.NewSSHCertificateServiceClient(conn)
+	c := sshca_grpc.NewSSHCertificateServiceClient(conn)
 
 	// TODO: Read it from file, if it exists.
 	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 
-	r, pubString, err := SignCert(ctx, c, privk1)
+	r, _, err := SignCert(ctx, c, privk1)
 	if err != nil {
 		log.Println("Error creating cert ", err)
 		panic(err)
@@ -141,11 +111,6 @@ func main() {
 
 
 	if false {
-		err = ioutil.WriteFile("id_ecdsa-cert.pub", []byte(r.User), 0700)
-		if err != nil {
-			panic(err)
-		}
-
 		pubk, _, _, _, err := gossh.ParseAuthorizedKey([]byte(r.Root))
 		ak := "cert-authority " + string(gossh.MarshalAuthorizedKey(pubk))
 
@@ -160,10 +125,8 @@ func main() {
 			panic(err)
 		}
 	} else {
-
-		fmt.Println("#id_ecdsa\n", string(keyPEM), "\n#id_ecdsa.pub\n",
-			pubString, "\n#id_ecdsa-cert\n", r.User)
-		fmt.Println("SSHC: ...")
+		// Print user certificate - can be redirected to a file.
+		fmt.Println(r.User)
 	}
 }
 

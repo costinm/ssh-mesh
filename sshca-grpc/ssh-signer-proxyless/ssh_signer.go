@@ -5,14 +5,16 @@ import (
 	"net"
 
 	"github.com/costinm/ssh-mesh/sshca-grpc"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	xdscreds "google.golang.org/grpc/credentials/xds"
+	"google.golang.org/grpc/xds"
+
 )
 
-// This is a minimal gRPC server - signing SSH certificates. It is meant to run behind envoy, so no TLS or authz
-// It does extract the identity from the XFCC header.
-// ~9M stripped
+// Same as minimal, plus proxyless gRPC. No telemetry or any other extra plugin.
+//
 func main() {
 
 	sshs := &sshca_grpc.SSHSigner{
@@ -29,17 +31,21 @@ func main() {
 		log.Fatalf("net.Listen(tcp, %q) failed: %v", servicePort, err)
 	}
 
-	creds := insecure.NewCredentials()
+	// Replaces: creds := insecure.NewCredentials()
+	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
 
 	grpcOptions := []grpc.ServerOption{
 		grpc.Creds(creds),
 	}
 
-	grpcServer := grpc.NewServer(grpcOptions...)
+	// Replaces: grpc.NewServer(grpcOptions...)
+	grpcServer := xds.NewGRPCServer(grpcOptions...)
+
 	sshca_grpc.RegisterSSHCertificateServiceServer(grpcServer, sshs)
 
 	err = grpcServer.Serve(lis)
 	if err != nil {
+		// Will fail if GRPC_XDS_BOOTSTRAP is not set
 		panic(err)
 	}
 }
