@@ -35,7 +35,7 @@ type Server struct {
 	forwardHandler *ForwardedTCPHandler
 }
 
-func NewSSHD(cfg func(string,string)string) (*Server,error) {
+func NewSSHD(cfg func(string, string) string) (*Server, error) {
 	return nil, nil
 }
 
@@ -47,7 +47,7 @@ func InitFromSecret(sshCM map[string][]byte, ns string) error {
 	var authKeys []gossh.PublicKey
 	for k, v := range sshCM {
 		if strings.HasPrefix(k, "authorized_key_") {
-				pubk1, _, _, _, err := gossh.ParseAuthorizedKey(v)
+			pubk1, _, _, _, err := gossh.ParseAuthorizedKey(v)
 			if err != nil {
 				log.Println("SSH_DEBUG: invalid ", k, err)
 			} else {
@@ -67,7 +67,9 @@ func InitFromSecret(sshCM map[string][]byte, ns string) error {
 		}
 	}
 
-	if len(authKeys) == 0 && sshCA== nil {
+	sc := &SSHCAClient{}
+
+	if len(authKeys) == 0 && sshCA == nil {
 		// No debug config, skip creating SSHD
 		return nil
 	}
@@ -76,7 +78,7 @@ func InitFromSecret(sshCM map[string][]byte, ns string) error {
 	var err error
 
 	if sshCA != nil {
-		r, signer, err = GetCertHostSigner(string(sshCA))
+		r, signer, err = sc.GetCertHostSigner(string(sshCA))
 	}
 	if err != nil {
 		// Use a self-signed cert
@@ -84,7 +86,6 @@ func InitFromSecret(sshCM map[string][]byte, ns string) error {
 		signer, _ = gossh.NewSignerFromKey(privk1)
 		log.Println("SSH cert signer not found, use ephemeral private key", err)
 	}
-
 
 	// load private key and cert from secret, if present
 	ek := sshCM["id_ecdsa"]
@@ -125,10 +126,8 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 
 	s := &Server{
 		signer: signer,
-		serverConfig: &gossh.ServerConfig{
-
-		},
-		Port: 15022,
+		serverConfig: &gossh.ServerConfig{},
+		Port:  15022,
 		Shell: "/bin/bash",
 		// Server cert checker
 		CertChecker: &gossh.CertChecker{
@@ -161,10 +160,9 @@ func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, e
 		if s.AuthorizedKeys != nil {
 			for _, k := range s.AuthorizedKeys {
 				if KeysEqual(key, k) {
-					return &gossh.Permissions{
-					}, nil
+					return &gossh.Permissions{}, nil
+				}
 			}
-		}
 		}
 		//log.Println("SSH auth failure", key, s.AuthorizedKeys)
 		return nil, errors.New("SSH connection: no key found")
@@ -201,8 +199,6 @@ func (s *Server) AddAuthorizedFile(auth []byte) {
 		auth = rest
 	}
 }
-
-
 
 // KeysEqual is constant time compare of the keys to avoid timing attacks.
 func KeysEqual(ak, bk gossh.PublicKey) bool {
@@ -305,8 +301,8 @@ func (sshGate *Server) HandleServerConn(nConn net.Conn) {
 			// Used for messages.
 			s := &session{
 				Channel: ch,
-				conn: conn,
-				srv: sshGate,
+				conn:    conn,
+				srv:     sshGate,
 			}
 			go s.handleRequests(reqs)
 
@@ -316,9 +312,7 @@ func (sshGate *Server) HandleServerConn(nConn net.Conn) {
 		}
 	}
 
-
 }
-
 
 // Global requests
 func (scon *Server) handleServerConnRequests(ctx context.Context, reqs <-chan *gossh.Request, nConn net.Conn, conn *gossh.ServerConn) {
@@ -361,7 +355,6 @@ func (srv *Server) AddAuthorizedKeys(keys []gossh.PublicKey) {
 		srv.AuthorizedKeys = append(srv.AuthorizedKeys, k)
 	}
 }
-
 
 type execRequest struct {
 	Command string

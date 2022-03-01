@@ -12,7 +12,6 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-
 // sshd is a minimal binary providing a ssh server using optional mesh SSH certificates provided by a ssh mesh gateway.
 // It also includes a client that maintains connection and port forwarding with the gate.
 //
@@ -30,10 +29,10 @@ func main() {
 	//	CertProvider: ssh.InitSigner,
 	//}
 	sshc := &ssh.Client{
-		SSHCa: caAddr,
-		SSHD: sshGate,
+		SSHCa:     caAddr,
+		SSHD:      sshGate,
 		Namespace: ns,
-		CertProvider: ssh.InitSigner,
+		//CertProvider: ssh.InitSigner,
 	}
 	sshc.CertProvider = func(ctx context.Context, sshCA string) (gossh.Signer, error) {
 		ephemeralPrivate, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

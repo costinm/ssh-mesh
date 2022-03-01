@@ -49,7 +49,7 @@ func (c *Client) Start() error {
 	defer cancel()
 
 	if c.Signer == nil {
-		signer, err :=  c.CertProvider(ctx, c.SSHCa)
+		signer, err := c.CertProvider(ctx, c.SSHCa)
 		if err != nil {
 			return err
 		}
@@ -88,12 +88,10 @@ func (c *Client) Start() error {
 	return nil
 }
 
-
 type RemoteExec struct {
 	ssh.Channel
 	sessionServerReq <-chan *ssh.Request
 }
-
 
 // RFC 4254 Section 6.5.
 type execMsg struct {
@@ -109,7 +107,7 @@ func (c *Client) Exec(cmd string, env map[string]string) (*RemoteExec, error) {
 	}
 
 	re := &RemoteExec{
-		Channel: sessionCh,
+		Channel:          sessionCh,
 		sessionServerReq: sessionServerReq,
 	}
 

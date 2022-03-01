@@ -20,10 +20,12 @@ build:
 	go build \
 		-o ${OUT}/usr/local/bin/ \
 		./cmd/min ./cmd/ssh-gate-min ./cmd/sshd ./cmd/ssh-gate-min ./cmd/ssh-signerd-min
+
 	(cd sshca-grpc && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
 		-ldflags '-s -w -extldflags "-static"' \
 		-o ${OUT}/usr/local/bin/ \
-		./ssh-signerd-min ./ssh-signer-proxyless ./ssh-signerd ./ssh-gen/ )
+		./sshca-grpc-min ./sshca-grpc-proxyless ./sshca-grpc ./sshca-grpc-cli/ )
+
 	(cd cmd/sshgate && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
 		-ldflags '-s -w -extldflags "-static"' \
 		-o ${OUT}/usr/local/bin/ \
