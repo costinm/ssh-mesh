@@ -19,30 +19,15 @@ build:
 	#CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time
 	go build \
 		-o ${OUT}/usr/local/bin/ \
-		./cmd/min ./cmd/ssh-gate-min ./cmd/sshd ./cmd/ssh-gate-min ./cmd/ssh-signerd-min
+		./cmd/sshgate
 
-	(cd sshca-grpc && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
-		-ldflags '-s -w -extldflags "-static"' \
-		-o ${OUT}/usr/local/bin/ \
-		./sshca-grpc-min ./sshca-grpc-proxyless ./sshca-grpc ./sshca-grpc-cli/ )
-
-	(cd cmd/sshgate && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build \
-		-ldflags '-s -w -extldflags "-static"' \
-		-o ${OUT}/usr/local/bin/ \
-		. )
-	ls -l ${OUT}/usr/local/bin
-	strip ${OUT}/usr/local/bin/*
-	ls -l ${OUT}/usr/local/bin
-
-ko/build: ko/sshca ko/sshd
-
-docker:
-	docker build -t ${DOCKER_REPO}/sshd -f tools/docker/Dockerfile.sshd ${OUT}
-	docker build -t ${DOCKER_REPO}/mesh -f tools/docker/Dockerfile.sshmesh ${OUT}
-
-push/docker:
-	docker push ${DOCKER_REPO}/sshd
-	docker push ${DOCKER_REPO}/gate
+#docker:
+#	docker build -t ${DOCKER_REPO}/sshd -f tools/docker/Dockerfile.sshd ${OUT}
+#	docker build -t ${DOCKER_REPO}/mesh -f tools/docker/Dockerfile.sshmesh ${OUT}
+#
+#push/docker:
+#	docker push ${DOCKER_REPO}/sshd
+#	docker push ${DOCKER_REPO}/gate
 
 
 _push:
@@ -50,7 +35,7 @@ _push:
 					  gcrane append -f - -b ${BASE_DISTROLESS} \
 						-t ${DOCKER_REPO}/gate-distroless:latest \
 					   ) && \
-	gcrane mutate $${SSHDRAW} --entrypoint /usr/local/bin/ssh-signerd && \
+	gcrane mutate $${SSHDRAW} --entrypoint ${PUSH_FILES} && \
 	gcrane rebase --rebased ${DOCKER_REPO}/gate:latest \
 	   --original $${SSHDRAW} \
 	   --old_base ${BASE_DISTROLESS} \
@@ -59,18 +44,18 @@ _push:
 
 # Append files to an existing container
 push/gate:
-	PUSH_FILES=usr/local/bin/ssh-signerd $(MAKE) _push
+	PUSH_FILES=usr/local/bin/sshgate $(MAKE) _push
 
-push/sshd:
-	PUSH_FILES=usr/local/bin/sshd $(MAKE) _push
+#push/sshd:
+#	PUSH_FILES=usr/local/bin/sshd $(MAKE) _push
 
 
 # Use openssh client
 ssh/openssh-client:
 	ssh -v  -p 15022  \
-		-o "UserKnownHostsFile sshca/testdata/known-hosts" \
+		-o "UserKnownHostsFile ssh/testdata/known-hosts" \
 		-o StrictHostKeyChecking=yes \
-		-i sshca/testdata/id_ecdsa \
+		-i ssh/testdata/id_ecdsa \
 		localhost env
 
 ssh/keygen:
@@ -86,11 +71,6 @@ ssh/getcert:
 
 	echo {\"public\":\"${CRT}\"} | \
  		grpcurl -plaintext  -d @   [::1]:8080 ssh.SSHCertificateService/CreateCertificate
-
-ssh/getcert-k8s: CRT=$(shell cat testdata/keygen/id_ecdsa.pub)
-ssh/getcert-k8s:
-	echo {\"public\":\"${CRT}\"} | \
- 		grpcurl -plaintext  -d @   [::1]:14021 ssh.SSHCertificateService/CreateCertificate
 
 deps:
 	go install github.com/google/go-containerregistry/cmd/gcrane@latest

@@ -1,6 +1,0 @@
-FROM ubuntu:bionic AS sshca
-
-COPY ssh-signerd /ko-app/ssh-signerd
-
-WORKDIR /
-ENTRYPOINT ["/ko-app/ssh-signerd"]

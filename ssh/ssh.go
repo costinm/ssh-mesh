@@ -13,205 +13,64 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh"
 )
 
-type Server struct {
+const version = "SSH-2.0-cert-ssh"
+
+type TransportConfig struct {
 	Port           int
 	Shell          string
-	AuthorizedKeys []gossh.PublicKey
+	AuthorizedKeys []ssh.PublicKey
 
-	serverConfig *gossh.ServerConfig
+	SignerHost   ssh.Signer
+	SignerClient ssh.Signer
+}
 
-	signer gossh.Signer
+type Transport struct {
+	*TransportConfig
+
+	serverConfig *ssh.ServerConfig
+
+	forwards map[string]net.Listener
+	sync.Mutex
 
 	// HandleConn can be used to overlay a SSH conn.
 
-	CertChecker    *gossh.CertChecker
-	Address        string
-	Listener       net.Listener
-	forwardHandler *ForwardedTCPHandler
+	CertChecker *ssh.CertChecker
+	Address     string
+	Listener    net.Listener
+
+	// Client is a SSH client, using Istio-like certificates.
+	// By default will get a client cert, using the Istio identity,
+	// and connect to the specified SSHD.
+	//
+	// Will also forward the HBONE ports.
+	SSHCa     string
+	SSHD      string
+	Namespace string
+	User      string
+
+	client *ssh.Client
+	config *ssh.ClientConfig
+
+	CAKey             ssh.PublicKey
+	ClientCertChecker *ssh.CertChecker
+	CertProvider      func(ctx context.Context, sshCA string) (ssh.Signer, error)
+
+	//
+	// Ports map[string]string
 }
 
-func NewSSHD(cfg func(string, string) string) (*Server, error) {
-	return nil, nil
-}
-
-// InitFromSecret is a helper method to init the sshd using a secret or CA address
-func InitFromSecret(sshCM map[string][]byte, ns string) error {
-
-	sshCA := sshCM["SSHCA_ADDR"]
-
-	var authKeys []gossh.PublicKey
-	for k, v := range sshCM {
-		if strings.HasPrefix(k, "authorized_key_") {
-			pubk1, _, _, _, err := gossh.ParseAuthorizedKey(v)
-			if err != nil {
-				log.Println("SSH_DEBUG: invalid ", k, err)
-			} else {
-				authKeys = append(authKeys, pubk1)
-				log.Println("Adding authorized key", k, string(v))
-			}
-		}
-	}
-
-	extra := os.Getenv("SSH_AUTH")
-	if extra != "" {
-		pubk1, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
-		if err != nil {
-			log.Println("SSH_DEBUG: invalid SSH_AUTH", err)
-		} else {
-			authKeys = append(authKeys, pubk1)
-		}
-	}
-
-	sc := &SSHCAClient{}
-
-	if len(authKeys) == 0 && sshCA == nil {
-		// No debug config, skip creating SSHD
-		return nil
-	}
-	var r string
-	var signer gossh.Signer
-	var err error
-
-	if sshCA != nil {
-		r, signer, err = sc.GetCertHostSigner(string(sshCA))
-	}
-	if err != nil {
-		// Use a self-signed cert
-		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		signer, _ = gossh.NewSignerFromKey(privk1)
-		log.Println("SSH cert signer not found, use ephemeral private key", err)
-	}
-
-	// load private key and cert from secret, if present
-	ek := sshCM["id_ecdsa"]
-	if ek != nil {
-		pk, err := gossh.ParsePrivateKey(ek)
-		if err != nil {
-			log.Println("Failed to parse key ", err)
-		}
-		signer = pk
-	}
-	if signer == nil {
-		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		signer, _ = gossh.NewSignerFromKey(privk1)
-	}
-
-	ssht, err := NewSSHTransport(signer, "", ns, r)
-	if err != nil {
-		log.Println("SSH debug init failed", err)
-		return err
-	}
-	if len(authKeys) != 0 {
-		ssht.AddAuthorizedKeys(authKeys)
-	}
-
-	go ssht.Start()
-	return nil
-}
-
-func NewSSHTransport(signer gossh.Signer, name, domain, root string) (*Server, error) {
-	var pubk gossh.PublicKey
-	var err error
-	if root != "" {
-		pubk, _, _, _, err = gossh.ParseAuthorizedKey([]byte(root))
-		if err != nil {
-			log.Println("No root CA key")
-		}
-	}
-
-	s := &Server{
-		signer: signer,
-		serverConfig: &gossh.ServerConfig{},
-		Port:  15022,
-		Shell: "/bin/bash",
-		// Server cert checker
-		CertChecker: &gossh.CertChecker{
-			IsUserAuthority: func(auth gossh.PublicKey) bool {
-				if pubk == nil {
-					return false
-				}
-				return KeysEqual(auth, pubk)
-			},
-		},
-	}
-	authorizedKeysBytes, err := ioutil.ReadFile(os.Getenv("HOME") + "/.ssh/authorized_keys")
-	if err == nil {
-		s.AddAuthorizedFile(authorizedKeysBytes)
-	}
-
-	if s.Address == "" {
-		s.Address = ":15022"
-	}
-
-	s.forwardHandler = &ForwardedTCPHandler{}
-
-	s.serverConfig.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
-		if pubk != nil {
-			p, err := s.CertChecker.Authenticate(conn, key)
-			if err == nil {
-				return p, nil
-			}
-		}
-		if s.AuthorizedKeys != nil {
-			for _, k := range s.AuthorizedKeys {
-				if KeysEqual(key, k) {
-					return &gossh.Permissions{}, nil
-				}
-			}
-		}
-		//log.Println("SSH auth failure", key, s.AuthorizedKeys)
-		return nil, errors.New("SSH connection: no key found")
-	}
-	s.serverConfig.AddHostKey(signer)
-
-	// Once a ServerConfig has been configured, connections can be
-	// accepted.
-	s.Listener, err = net.Listen("tcp", s.Address)
-	if err != nil {
-		log.Println("Failed to listend on ", s.Address, err)
-		return nil, err
-	}
-	log.Println("SSHD listening on ", s.Address)
-
-	return s, nil
-}
-
-func (s *Server) AddAuthorized(extra string) {
-	pubk1, _, _, _, err := gossh.ParseAuthorizedKey([]byte(extra))
-	if err == nil {
-		s.AuthorizedKeys = append(s.AuthorizedKeys, pubk1)
-	}
-}
-
-func (s *Server) AddAuthorizedFile(auth []byte) {
-	for len(auth) > 0 {
-		pubKey, _, _, rest, err := gossh.ParseAuthorizedKey(auth)
-		if err != nil {
-			return
-		}
-
-		s.AuthorizedKeys = append(s.AuthorizedKeys, pubKey)
-		auth = rest
-	}
-}
-
-// KeysEqual is constant time compare of the keys to avoid timing attacks.
-func KeysEqual(ak, bk gossh.PublicKey) bool {
-
-	//avoid panic if one of the keys is nil, return false instead
-	if ak == nil || bk == nil {
-		return false
-	}
-
-	a := ak.Marshal()
-	b := bk.Marshal()
-	return (len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1)
-}
+var (
+	ServerChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel){}
+	ServerRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request) (bool, []byte){}
+	ClientChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel){}
+	ClientRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request){}
+)
 
 //func (srv *Server) getServer(signer ssh.Signer) *ssh.Server {
 //	forwardHandler := &ssh.ForwardedTCPHandler{}
@@ -228,26 +87,326 @@ func KeysEqual(ak, bk gossh.PublicKey) bool {
 //	}
 //}
 
-func (t *Server) Start() {
+// InitFromSecret is a helper method to init the sshd using a secret or CA address
+func InitFromSecret(sshCM map[string][]byte, ns string) error {
+
+	sshCA := sshCM["SSHCA_ADDR"]
+
+	var authKeys []ssh.PublicKey
+	for k, v := range sshCM {
+		if strings.HasPrefix(k, "authorized_key_") {
+			pubk1, _, _, _, err := ssh.ParseAuthorizedKey(v)
+			if err != nil {
+				log.Println("SSH_DEBUG: invalid ", k, err)
+			} else {
+				authKeys = append(authKeys, pubk1)
+				log.Println("Adding authorized key", k, string(v))
+			}
+		}
+	}
+
+	extra := os.Getenv("SSH_AUTH")
+	if extra != "" {
+		pubk1, _, _, _, err := ssh.ParseAuthorizedKey([]byte(extra))
+		if err != nil {
+			log.Println("SSH_DEBUG: invalid SSH_AUTH", err)
+		} else {
+			authKeys = append(authKeys, pubk1)
+		}
+	}
+
+	if len(authKeys) == 0 && sshCA == nil {
+		// No debug config, skip creating SSHD
+		return nil
+	}
+	//var r string
+	var signer ssh.Signer
+	var err error
+
+	//if sshCA != nil {
+	//	sc := &SSHCAClient{
+	//		Addr: string(sshCA),
+	//	}
+	//	r, signer, _, err = sc.GetCertHostSigner()
+	//}
+	if err != nil {
+		// Use a self-signed cert
+		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		signer, _ = ssh.NewSignerFromKey(privk1)
+		log.Println("SSH cert signer not found, use ephemeral private key", err)
+	}
+
+	// load private key and cert from secret, if present
+	ek := sshCM["id_ecdsa"]
+	if ek != nil {
+		pk, err := ssh.ParsePrivateKey(ek)
+		if err != nil {
+			log.Println("Failed to parse key ", err)
+		}
+		signer = pk
+	}
+	if signer == nil {
+		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		signer, _ = ssh.NewSignerFromKey(privk1)
+	}
+
+	ssht, err := NewSSHTransport(&TransportConfig{
+		SignerHost: signer,
+	})
+	if err != nil {
+		log.Println("SSH debug init failed", err)
+		return err
+	}
+	if len(authKeys) != 0 {
+		ssht.AddAuthorizedKeys(authKeys)
+	}
+
+	go ssht.Start()
+	return nil
+}
+
+func New() *Transport {
+	t := &Transport{}
+	return t
+}
+
+func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
+	var pubk ssh.PublicKey
+	var err error
+	//if root != "" {
+	//	pubk, _, _, _, err = ssh.ParseAuthorizedKey([]byte(root))
+	//	if err != nil {
+	//		log.Println("No root CA key")
+	//	}
+	//}
+
+	if tc.Port == 0 {
+		tc.Port = 15022
+	}
+	if tc.Shell == "" {
+		// TODO: detect
+		tc.Shell = "/bin/bash"
+	}
+
+	s := &Transport{
+		TransportConfig: tc,
+
+		serverConfig: &ssh.ServerConfig{},
+		//Port:         15022,
+		//Shell:        "/bin/bash",
+		// Server cert checker
+		CertChecker: &ssh.CertChecker{
+			IsUserAuthority: func(auth ssh.PublicKey) bool {
+				if pubk == nil {
+					return false
+				}
+				return KeysEqual(auth, pubk)
+			},
+		},
+	}
+	authorizedKeysBytes, err := ioutil.ReadFile(os.Getenv("HOME") + "/.ssh/authorized_keys")
+	if err == nil {
+		s.AddAuthorizedFile(authorizedKeysBytes)
+	}
+
+	if s.Address == "" {
+		s.Address = ":15022"
+	}
+
+	s.serverConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		if pubk != nil {
+			p, err := s.CertChecker.Authenticate(conn, key)
+			if err == nil {
+				return p, nil
+			}
+		}
+		if s.AuthorizedKeys != nil {
+			for _, k := range s.AuthorizedKeys {
+				if KeysEqual(key, k) {
+					return &ssh.Permissions{}, nil
+				}
+			}
+		}
+		//log.Println("SSH auth failure", key, s.AuthorizedKeys)
+		return nil, errors.New("SSH connection: no key found")
+	}
+	s.serverConfig.AddHostKey(tc.SignerHost)
+
+	// Once a ServerConfig has been configured, connections can be
+	// accepted.
+	s.Listener, err = net.Listen("tcp", s.Address)
+	if err != nil {
+		log.Println("Failed to listend on ", s.Address, err)
+		return nil, err
+	}
+	log.Println("SSHD listening on ", s.Address)
+
+	return s, nil
+}
+
+func (ssht *Transport) AddAuthorized(extra string) {
+	pubk1, _, _, _, err := ssh.ParseAuthorizedKey([]byte(extra))
+	if err == nil {
+		ssht.AuthorizedKeys = append(ssht.AuthorizedKeys, pubk1)
+	}
+}
+
+func (ssht *Transport) AddAuthorizedFile(auth []byte) {
+	for len(auth) > 0 {
+		pubKey, _, _, rest, err := ssh.ParseAuthorizedKey(auth)
+		if err != nil {
+			return
+		}
+
+		ssht.AuthorizedKeys = append(ssht.AuthorizedKeys, pubKey)
+		auth = rest
+	}
+}
+
+// KeysEqual is constant time compare of the keys to avoid timing attacks.
+func KeysEqual(ak, bk ssh.PublicKey) bool {
+
+	//avoid panic if one of the keys is nil, return false instead
+	if ak == nil || bk == nil {
+		return false
+	}
+
+	a := ak.Marshal()
+	b := bk.Marshal()
+	return (len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1)
+}
+
+func (ssht *Transport) Start() {
 	go func() {
 		for {
-			nConn, err := t.Listener.Accept()
+			nConn, err := ssht.Listener.Accept()
 			if err != nil {
 				log.Println("failed to accept incoming connection ", err)
 				time.Sleep(10 * time.Second)
 				continue
 			}
-			go t.HandleServerConn(nConn)
+			go ssht.HandleServerConn(nConn)
 		}
 	}()
 }
 
+// SSHConn can be a Client or server ssh connection.
+type SSHConn struct {
+	// ServerConn - also has Permission
+	sc *ssh.ServerConn
+	// SSH Client - only when acting as Dial
+	// few internal fields in addition to ssh.Conn:
+	// - forwards
+	// - channelHandlers
+	scl *ssh.Client
+
+	closed chan struct{}
+
+	// Original con, with remote/local addr
+	wsCon net.Conn
+
+	inChans <-chan ssh.NewChannel
+	req     <-chan *ssh.Request
+
+	LastSeen    time.Time
+	ConnectTime time.Time
+
+	// Includes the private key of this node
+	t *Transport // transport.Transport
+
+	RemoteKey      ssh.PublicKey
+	RemoteHostname string
+	RemoteAddr     net.Addr
+}
+
+// Also implements gossh.Channel - add SendRequest and Stderr, as well as CloseWrite
+type sshstream struct {
+	ssh.Channel
+	con *SSHConn
+}
+
+// OpenStream creates a new stream.
+// This uses the same channel in both directions.
+func (c *SSHConn) OpenStream(n string, data []byte) (*sshstream, error) {
+	if c.sc != nil {
+		// Doesn't work with regular ssh clients - this is an extension
+		s, r, err := c.sc.OpenChannel(n, data)
+		if err != nil {
+			return nil, err
+		}
+		go ssh.DiscardRequests(r)
+		return &sshstream{Channel: s, con: c}, nil
+	} else {
+		s, r, err := c.scl.OpenChannel(n, data)
+		if err != nil {
+			return nil, err
+		}
+		go ssh.DiscardRequests(r)
+		return &sshstream{Channel: s, con: c}, nil
+	}
+}
+
+// DialConn wrapps a netConn with a SSH client connections.
+func (ssht *Transport) DialConn(ctx context.Context, host string, nc net.Conn) (*SSHConn, *ssh.Client, error) {
+	c := &SSHConn{
+		closed: make(chan struct{}),
+		t:      ssht,
+		wsCon:  nc,
+	}
+	c.ConnectTime = time.Now()
+
+	cc, chans, reqs, err := ssh.NewClientConn(nc, host,
+		&ssh.ClientConfig{
+			Auth:          ssht.config.Auth,
+			Config:        ssht.config.Config,
+			ClientVersion: version,
+			Timeout:       3 * time.Second,
+			User:          ssht.User,
+			// hostname is passed back from addr, empty string
+			HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+				err := ssht.CertChecker.CheckHostKey(hostname, remote, key)
+				if err != nil {
+					return err
+				}
+				c.RemoteKey = key
+				c.RemoteAddr = remote
+				c.RemoteHostname = hostname
+
+				return nil
+			},
+		})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Using a ssh.Client is possible - but may complicate things. The client
+	// is handling reqs, chans for the connection directly.
+	// It is the only way to use the Session implementation in the core library.
+	// client extends ssh.Conn - but it should not be used directly for session or accept requests.
+	client := ssh.NewClient(cc, chans, reqs)
+	c.scl = client
+
+	// The client adds "forwarded-tcpip" and "forwarded-streamlocal" when ListenTCP is called.
+	// This in turns sends "tcpip-forward" command, with IP:port
+	// The method returns a Listener, with port set.
+
+	// Extension: clients also forward streams from servers.
+	go func() {
+		dtcp := client.HandleChannelOpen("direct-tcpip")
+		for newChannel := range dtcp {
+			directTcpipHandler(ctx, ssht, cc, newChannel)
+		}
+	}()
+
+	return c, client, nil
+}
+
 // Handles a connection as SSH server, using a net.Conn - which might be tunneled over other transports.
 // SSH handles multiplexing and packets.
-func (sshGate *Server) HandleServerConn(nConn net.Conn) {
+func (ssht *Transport) HandleServerConn(nConn net.Conn) {
 	// Before use, a handshake must be performed on the incoming
 	// net.Conn. Handshake results in conn.Permissions.
-	conn, chans, globalSrvReqs, err := gossh.NewServerConn(nConn, sshGate.serverConfig)
+	conn, chans, globalSrvReqs, err := ssh.NewServerConn(nConn, ssht.serverConfig)
 	if err != nil {
 		nConn.Close()
 		log.Println("SSHD: handshake error ", err, nConn.RemoteAddr())
@@ -264,58 +423,29 @@ func (sshGate *Server) HandleServerConn(nConn net.Conn) {
 		cancel()
 	}()
 
-	go sshGate.handleServerConnRequests(ctx, globalSrvReqs, nConn, conn)
+	go ssht.handleServerConnRequests(ctx, globalSrvReqs, nConn, conn)
 
-	// Service the incoming Channel channel.
-	// Each channel is a stream - shell, exec, local TCP forward.
+	// Service the incoming channels (stream in H2).
+	// Each channel is a stream - shell, exec, sftp, local TCP forward.
 	for newChannel := range chans {
 		switch newChannel.ChannelType() {
 		case "direct-tcpip":
-			// When remote starts with a -L PORT:host:port, and connects to port
-			var req channelOpenDirectMsg
-			//scon.gate.localFwdS.Total.Add(1)
-			err := gossh.Unmarshal(newChannel.ExtraData(), &req)
-			if err != nil {
-				log.Println("malformed-tcpip-request", err)
-				newChannel.Reject(gossh.UnknownChannelType, "invalid data")
-				continue
-			}
-
-			// TODO: allow connections to mesh VIPs
-			//if role == ROLE_GUEST &&
-			//		req.Rport != SSH_MESH_PORT && req.Rport != H2_MESH_PORT {
-			//	newChannel.Reject(ssh.Prohibited,
-			//		"only authorized users can proxy " +
-			//				scon.VIP6.String())
-			//	continue
-			//}
-			//log.Println("-L: forward request", req.Laddr, req.Lport, req.Raddr, req.Rport, role)
-
-			go DirectTCPIPHandler(ctx, sshGate, conn, newChannel)
-			//scon.handleDirectTcpip(newChannel, req.Raddr, req.Rport, req.Laddr, req.Lport)
-			//conId++
+			directTcpipHandler(ctx, ssht, conn, newChannel)
 
 		case "session":
-			// session channel - the main interface for shell, exec
-			ch, reqs, _ := newChannel.Accept()
-			// Used for messages.
-			s := &session{
-				Channel: ch,
-				conn:    conn,
-				srv:     sshGate,
-			}
-			go s.handleRequests(reqs)
+			sessionHandler(ctx, ssht, conn, newChannel)
 
 		default:
 			fmt.Println("SSHD: unknown channel Rejected", newChannel.ChannelType())
-			newChannel.Reject(gossh.UnknownChannelType, "unknown channel type")
+			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 		}
 	}
 
 }
 
-// Global requests
-func (scon *Server) handleServerConnRequests(ctx context.Context, reqs <-chan *gossh.Request, nConn net.Conn, conn *gossh.ServerConn) {
+// Handle global requests on a server connection.
+func (ssht *Transport) handleServerConnRequests(ctx context.Context, reqs <-chan *ssh.Request, nConn net.Conn,
+	conn *ssh.ServerConn) {
 	for r := range reqs {
 		// Global types.
 		switch r.Type {
@@ -323,50 +453,30 @@ func (scon *Server) handleServerConnRequests(ctx context.Context, reqs <-chan *g
 		// SSHClientConn clients will only accept back connections with this particular host:port, and srcIP:srcPort.
 		// Other reverse accept ports can be opened as well.
 		case "tcpip-forward":
-			var req tcpipForwardRequest
-			err := gossh.Unmarshal(r.Payload, &req)
-			if err != nil {
-				log.Println("malformed-tcpip-request", err)
-				r.Reply(false, nil)
-				continue
-			}
-
-			go scon.forwardHandler.HandleSSHRequest(ctx, scon, r, conn)
-
+			ok, pl := tcpipForwardHandler(ctx, ssht, conn, r)
+			r.Reply(ok, pl)
 			continue
-
+		case "cancel-tcpip-forward":
+			ok, pl := cancelTcpipForwardHandler(ctx, ssht, conn, r)
+			r.Reply(ok, pl)
+			continue
 		case "keepalive@openssh.com":
 			//n.LastSeen = time.Now()
-			//log.Println("SSHD: client keepalive", n.VIP)
 			r.Reply(true, nil)
 
 		default:
 			log.Println("SSHD: unknown global REQUEST ", r.Type)
 			if r.WantReply {
-				log.Println(r.Type)
 				r.Reply(false, nil)
 			}
 		}
 	}
 }
 
-func (srv *Server) AddAuthorizedKeys(keys []gossh.PublicKey) {
+func (ssht *Transport) AddAuthorizedKeys(keys []ssh.PublicKey) {
 	for _, k := range keys {
-		srv.AuthorizedKeys = append(srv.AuthorizedKeys, k)
+		ssht.AuthorizedKeys = append(ssht.AuthorizedKeys, k)
 	}
-}
-
-type execRequest struct {
-	Command string
-}
-
-type tcpipForwardRequest struct {
-	BindIP   string
-	BindPort uint32
-}
-
-type tcpipForwardResponse struct {
-	BoundPort uint32
 }
 
 // "forwarded-tcp" or "-R" - reverse, ssh-server-accepted connections sent to client.
@@ -391,5 +501,3 @@ type channelOpenDirectMsg struct {
 	Laddr string
 	Lport uint32
 }
-
-

@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -37,6 +38,20 @@ var (
 	ErrEOF = errors.New("EOF")
 )
 
+func init() {
+	ServerChannelHandlers["session"] = sessionHandler
+}
+
+func sessionHandler(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel) {
+	ch, reqs, _ := newChannel.Accept()
+	// Used for messages.
+	s := &session{
+		Channel: ch,
+		conn:    conn,
+		srv:     ssht,
+	}
+	go s.handleRequests(reqs)
+}
 
 func getExitStatusFromError(err error) int {
 	if err == nil {
@@ -175,6 +190,7 @@ func handleNoTTY(cmd *exec.Cmd, s *session) error {
 
 	return nil
 }
+
 type Signal string
 
 // Window represents the size of a PTY window.
@@ -193,25 +209,23 @@ type Pty struct {
 type session struct {
 	sync.Mutex
 	ssh.Channel
-	conn              *ssh.ServerConn
+	conn *ssh.ServerConn
 
 	//handler           Handler
 	//subsystemHandlers map[string]SubsystemHandler
-	srv *Server
+	srv *Transport
 
-	handled           bool
-	exited            bool
-	pty               *Pty
-	winch             chan Window
-	env               []string
+	handled bool
+	exited  bool
+	pty     *Pty
+	winch   chan Window
+	env     []string
 	//ptyCb             PtyCallback
-	rawCmd            string
-	subsystem         string
-	sigCh             chan<- Signal
-	sigBuf            []Signal
-	breakCh           chan<- bool
-
-
+	rawCmd    string
+	subsystem string
+	sigCh     chan<- Signal
+	sigBuf    []Signal
+	breakCh   chan<- bool
 }
 
 func (sess *session) Write(p []byte) (n int, err error) {
@@ -274,7 +288,7 @@ func (sess *session) Break(c chan<- bool) {
 
 const maxSigBufSize = 128
 
-
+// handle requests on the "session" stream.
 func (sess *session) handleRequests(reqs <-chan *ssh.Request) {
 	for req := range reqs {
 		switch req.Type {
@@ -300,7 +314,7 @@ func (sess *session) handleRequests(reqs <-chan *ssh.Request) {
 			req.Reply(true, nil)
 
 			go func() {
-				sess.srv.connectionHandler(sess)
+				sess.srv.execHandler(sess)
 				sess.Exit(0)
 			}()
 		case "subsystem":
@@ -410,7 +424,8 @@ func (sess *session) handleRequests(reqs <-chan *ssh.Request) {
 	}
 }
 
-func (srv *Server) connectionHandler(s *session) {
+// Handle exec and shell commands.
+func (ssht *Transport) execHandler(s *session) {
 	defer func() {
 		s.Close()
 		log.Println("session closed")
@@ -418,7 +433,7 @@ func (srv *Server) connectionHandler(s *session) {
 
 	log.Printf("starting ssh session with command '%+v'", s.rawCmd)
 
-	cmd := srv.buildCmd(s)
+	cmd := ssht.buildCmd(s)
 
 	//if ssh.AgentRequested(s) {
 	//	log.Println("agent requested")
@@ -446,6 +461,7 @@ func (srv *Server) connectionHandler(s *session) {
 	}
 
 	log.Println("handling non PTY session")
+
 	if err := handleNoTTY(cmd, s); err != nil {
 		sendErrAndExit(s, err)
 		return
@@ -453,7 +469,6 @@ func (srv *Server) connectionHandler(s *session) {
 
 	s.Exit(0)
 }
-
 
 func sftpHandler(sess *session) {
 	debugStream := ioutil.Discard
@@ -476,14 +491,14 @@ func sftpHandler(sess *session) {
 	}
 }
 
-func (srv Server) buildCmd(s *session) *exec.Cmd {
+func (ssht Transport) buildCmd(s *session) *exec.Cmd {
 	var cmd *exec.Cmd
 
 	if len(s.rawCmd) == 0 {
-		cmd = exec.Command(srv.Shell)
+		cmd = exec.Command(ssht.Shell)
 	} else {
 		args := []string{"-c", s.rawCmd}
-		cmd = exec.Command(srv.Shell, args...)
+		cmd = exec.Command(ssht.Shell, args...)
 	}
 
 	cmd.Env = append(cmd.Env, os.Environ()...)
@@ -557,4 +572,59 @@ func parseUint32(in []byte) (uint32, []byte, bool) {
 		return 0, nil, false
 	}
 	return binary.BigEndian.Uint32(in), in[4:], true
+}
+
+type RemoteExec struct {
+	ssh.Channel
+	sessionServerReq <-chan *ssh.Request
+}
+
+// RFC 4254 Section 6.5.
+type execMsg struct {
+	Command string
+}
+
+// TODO: client side sftp.
+
+// Exec opens a client session channel for a command.
+func (ssht *SSHConn) Exec(cmd string, env map[string]string) (*RemoteExec, error) {
+	if ssht.scl == nil {
+		return nil, errors.New("Only for client connections")
+	}
+	sessionCh, sessionServerReq, err := ssht.scl.OpenChannel("session", nil)
+	if err != nil {
+		log.Println("Error opening session", err)
+		ssht.scl.Close()
+		return nil, err
+	}
+
+	re := &RemoteExec{
+		Channel:          sessionCh,
+		sessionServerReq: sessionServerReq,
+	}
+
+	// serverReq will be used only to notity that the session is over, may receive keepalives
+	go func() {
+		for msg := range sessionServerReq {
+			// TODO: exit-status, exit-signal messages
+			log.Println("SSHC: /ssh/srvmsg session message from server ", msg.Type, msg)
+			if msg.WantReply {
+				msg.Reply(false, nil)
+			}
+		}
+	}()
+
+	req := execMsg{
+		Command: cmd,
+	}
+
+	// TODO: send env first
+
+	ok, err := sessionCh.SendRequest("exec", true, ssh.Marshal(&req))
+	if err == nil && !ok {
+		log.Println("SSHC: Message channel failed", err)
+		return nil, err
+	}
+
+	return re, nil
 }
