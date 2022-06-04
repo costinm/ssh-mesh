@@ -4,39 +4,28 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/GoogleCloudPlatform/cloud-run-mesh/pkg/mesh"
-	urest "github.com/costinm/krun/pkg/urest"
 	"github.com/costinm/ssh-mesh/ssh"
 )
 
-// SSH CA, proxyless:
-// - uses hbone for transport (mTLS)
-// - metrics
+// SSH gateway and CA, minimal.
+//
+// - use standard ssh config files - can be mounted from a Secret or local files
+// - 'admin' can create certificates, using ssh command
+// - all authorized users can forward
 func main() {
-	ctx, cf := context.WithCancel(context.Background())
+	_, cf := context.WithCancel(context.Background())
 	defer cf()
-
-	// Init the mesh object, using env variables.
-	kr := mesh.New()
-
-	// Init K8S - discovering using GCP API and env.
-	// Init K8S client, using official API server.
-	// Will attempt to use GCP API to load metadata and populate the fields
-	_, err := urest.K8SClient(ctx, &urest.MeshSettings{ProjectId: kr.ProjectId})
-	if err != nil {
-		panic(err)
-	}
 
 	sshs := &ssh.SSHCA{}
 
-	err = sshs.Init()
+	err := sshs.Init()
 	if err != nil {
 		panic(err)
 	}
 
 	mux := &http.ServeMux{}
 
-	mux.Handle("/sshca/CreateCertificate", sshs)
+	//mux.Handle("/sshca/CreateCertificate", sshs)
 
 	http.ListenAndServe(":8080", mux)
 }

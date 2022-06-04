@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -53,41 +52,6 @@ type SSHCAClient struct {
 	Addr       string
 }
 
-func Cfg(key, def string) string {
-	res := os.Getenv(key)
-	if res == "" {
-		return def
-	}
-	return res
-}
-
-func InitSigner(ctx context.Context, sshCA string) (ssh.Signer, error) {
-	ephemeralPrivate, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	ephemeralSigner, _ := ssh.NewSignerFromKey(ephemeralPrivate)
-	req := &CertificateRequest{
-		Public: string(ssh.MarshalAuthorizedKey(ephemeralSigner.PublicKey())),
-	}
-
-	sc := &SSHCAClient{
-		HttpClient: http.DefaultClient,
-		Addr:       sshCA,
-	}
-	certResponse, err := sc.CreateCertificate(ctx, req)
-	if err != nil {
-		log.Println("Error creating cert ", err)
-		return nil, err
-	}
-
-	key, _, _, _, _ := ssh.ParseAuthorizedKey([]byte(certResponse.User))
-	cert, ok := key.(*ssh.Certificate)
-	if !ok {
-		return nil, errors.New("unexpected cert")
-	}
-	signer, _ := ssh.NewCertSigner(cert, ephemeralSigner)
-
-	return signer, nil
-}
-
 func (sc *SSHCAClient) CreateCertificate(ctx context.Context, req *CertificateRequest) (*CertificateResponse, error) {
 	reqB, err := json.Marshal(req)
 	if err != nil {
@@ -114,7 +78,7 @@ func (sc *SSHCAClient) CreateCertificate(ctx context.Context, req *CertificateRe
 	return &cres, nil
 }
 
-func (sc *SSHCAClient) GetCertHostSigner(sshCA string) (string, ssh.Signer, error) {
+func (sc *SSHCAClient) GetCertHostSigner() (string, ssh.Signer, ssh.Signer, error) {
 	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	casigner1, _ := ssh.NewSignerFromKey(privk1)
 	req := &CertificateRequest{
@@ -127,14 +91,21 @@ func (sc *SSHCAClient) GetCertHostSigner(sshCA string) (string, ssh.Signer, erro
 	r, err := sc.CreateCertificate(ctx, req)
 	if err != nil {
 		log.Println("Error creating cert ", err)
-		return "", nil, err
+		return "", nil, nil, err
 	}
 
 	key, _, _, _, _ := ssh.ParseAuthorizedKey([]byte(r.Host))
 	cert, ok := key.(*ssh.Certificate)
 	if !ok {
-		return "", nil, errors.New("unexpected cert")
+		return "", nil, nil, errors.New("unexpected cert")
 	}
 	signer, _ := ssh.NewCertSigner(cert, casigner1)
-	return r.Root, signer, nil
+
+	ukey, _, _, _, _ := ssh.ParseAuthorizedKey([]byte(r.Host))
+	ucert, ok := ukey.(*ssh.Certificate)
+	if !ok {
+		return "", nil, nil, errors.New("unexpected cert")
+	}
+	usigner, _ := ssh.NewCertSigner(ucert, casigner1)
+	return r.Root, signer, usigner, nil
 }

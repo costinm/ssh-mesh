@@ -1,7 +1,0 @@
-## Same base as Istio debug
-FROM ubuntu:bionic AS sshd
-
-COPY usr/local/bin/sshd /usr/local/bin/sshd
-
-WORKDIR /
-ENTRYPOINT ["/usr/local/bin/sshd"]
