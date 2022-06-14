@@ -38,11 +38,11 @@ var (
 	ErrEOF = errors.New("EOF")
 )
 
-func init() {
-	ServerChannelHandlers["session"] = sessionHandler
-}
+//func init() {
+//	ServerChannelHandlers["session"] = sessionHandler
+//}
 
-func sessionHandler(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel) {
+func sessionHandler(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel) {
 	ch, reqs, _ := newChannel.Accept()
 	// Used for messages.
 	s := &session{
@@ -209,7 +209,7 @@ type Pty struct {
 type session struct {
 	sync.Mutex
 	ssh.Channel
-	conn *ssh.ServerConn
+	conn ssh.Conn
 
 	//handler           Handler
 	//subsystemHandlers map[string]SubsystemHandler

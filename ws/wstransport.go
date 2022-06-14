@@ -1,5 +1,14 @@
 package ws
 
+import (
+	"github.com/gorilla/websocket"
+	"net/http"
+)
+
+func Server(w http.Response, r *http.Request) {
+	u := websocket.Upgrader{}
+}
+
 // "golang.org/x/net/websocket" - not supported. Dial only text frames.
 //
 //func Server() http.Handler {

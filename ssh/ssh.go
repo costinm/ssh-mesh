@@ -8,10 +8,12 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +28,22 @@ type TransportConfig struct {
 	Shell          string
 	AuthorizedKeys []ssh.PublicKey
 
+	// TODO: limit by domain ?
+	AuthorizedCA []ssh.PublicKey
+
 	SignerHost   ssh.Signer
 	SignerClient ssh.Signer
+	Address      string
+	Namespace    string
+	User         string
+	TrustDomain  string
+
+	CertProvider func(ctx context.Context, sshCA string) (ssh.Signer, error)
+	CertChecker  *ssh.CertChecker
+	Listener     net.Listener
+	RootCA       []string
+
+	Forward func(context.Context, string, io.ReadWriteCloser)
 }
 
 type Transport struct {
@@ -38,38 +54,31 @@ type Transport struct {
 	forwards map[string]net.Listener
 	sync.Mutex
 
-	// HandleConn can be used to overlay a SSH conn.
-
-	CertChecker *ssh.CertChecker
-	Address     string
-	Listener    net.Listener
-
 	// Client is a SSH client, using Istio-like certificates.
 	// By default will get a client cert, using the Istio identity,
 	// and connect to the specified SSHD.
 	//
 	// Will also forward the HBONE ports.
-	SSHCa     string
-	SSHD      string
-	Namespace string
-	User      string
+	SSHCa string
+	SSHD  string
 
 	client *ssh.Client
 	config *ssh.ClientConfig
 
 	CAKey             ssh.PublicKey
 	ClientCertChecker *ssh.CertChecker
-	CertProvider      func(ctx context.Context, sshCA string) (ssh.Signer, error)
 
 	//
 	// Ports map[string]string
 }
 
 var (
-	ServerChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel){}
-	ServerRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request) (bool, []byte){}
-	ClientChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel){}
-	ClientRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request){}
+//ServerChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel){}
+//ServerRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request) (bool, []byte){}
+// Only if using the raw client - using the high level object for now, not attempting
+// any fancy use of the protocol - only one minimal extension.
+//ClientChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel){}
+//ClientRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request){}
 )
 
 //func (srv *Server) getServer(signer ssh.Signer) *ssh.Server {
@@ -89,6 +98,7 @@ var (
 
 // InitFromSecret is a helper method to init the sshd using a secret or CA address
 func InitFromSecret(sshCM map[string][]byte, ns string) error {
+	tc := &TransportConfig{}
 
 	sshCA := sshCM["SSHCA_ADDR"]
 
@@ -142,10 +152,11 @@ func InitFromSecret(sshCM map[string][]byte, ns string) error {
 		pk, err := ssh.ParsePrivateKey(ek)
 		if err != nil {
 			log.Println("Failed to parse key ", err)
+		} else {
+			tc.SignerHost = pk
 		}
-		signer = pk
 	}
-	if signer == nil {
+	if tc.SignerHost == nil {
 		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		signer, _ = ssh.NewSignerFromKey(privk1)
 	}
@@ -165,24 +176,9 @@ func InitFromSecret(sshCM map[string][]byte, ns string) error {
 	return nil
 }
 
-func New() *Transport {
-	t := &Transport{}
-	return t
-}
-
 func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
-	var pubk ssh.PublicKey
 	var err error
-	//if root != "" {
-	//	pubk, _, _, _, err = ssh.ParseAuthorizedKey([]byte(root))
-	//	if err != nil {
-	//		log.Println("No root CA key")
-	//	}
-	//}
 
-	if tc.Port == 0 {
-		tc.Port = 15022
-	}
 	if tc.Shell == "" {
 		// TODO: detect
 		tc.Shell = "/bin/bash"
@@ -195,26 +191,53 @@ func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
 		//Port:         15022,
 		//Shell:        "/bin/bash",
 		// Server cert checker
-		CertChecker: &ssh.CertChecker{
-			IsUserAuthority: func(auth ssh.PublicKey) bool {
-				if pubk == nil {
-					return false
+	}
+
+	s.CertChecker = &ssh.CertChecker{
+		IsUserAuthority: func(auth ssh.PublicKey) bool {
+			if s.AuthorizedCA == nil {
+				return false
+			}
+			for _, pubk := range s.AuthorizedCA {
+				if KeysEqual(auth, pubk) {
+					return true
 				}
-				return KeysEqual(auth, pubk)
-			},
+			}
+			return false
+		},
+		IsHostAuthority: func(auth ssh.PublicKey, user string) bool {
+			if s.AuthorizedCA == nil {
+				return false
+			}
+			for _, pubk := range s.AuthorizedCA {
+				if KeysEqual(auth, pubk) {
+					return true
+				}
+			}
+			return false
 		},
 	}
+
+	for _, v := range tc.RootCA {
+		pubk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(v))
+		if err != nil {
+			log.Println("No root CA key")
+			continue
+		}
+		s.AuthorizedCA = append(s.AuthorizedCA, pubk)
+	}
+
 	authorizedKeysBytes, err := ioutil.ReadFile(os.Getenv("HOME") + "/.ssh/authorized_keys")
 	if err == nil {
 		s.AddAuthorizedFile(authorizedKeysBytes)
 	}
 
 	if s.Address == "" {
-		s.Address = ":15022"
+		s.Address = ":" + strconv.Itoa(s.Port)
 	}
 
 	s.serverConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-		if pubk != nil {
+		if s.AuthorizedCA != nil {
 			p, err := s.CertChecker.Authenticate(conn, key)
 			if err == nil {
 				return p, nil
@@ -234,12 +257,16 @@ func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
 
 	// Once a ServerConfig has been configured, connections can be
 	// accepted.
-	s.Listener, err = net.Listen("tcp", s.Address)
-	if err != nil {
-		log.Println("Failed to listend on ", s.Address, err)
-		return nil, err
+	if s.Listener == nil {
+		s.Listener, err = net.Listen("tcp", s.Address)
+		if err != nil {
+			log.Println("Failed to listend on ", s.Address, err)
+			return nil, err
+		}
+		if strings.HasSuffix(s.Address, ":0") {
+			s.Address = s.Listener.Addr().String()
+		}
 	}
-	log.Println("SSHD listening on ", s.Address)
 
 	return s, nil
 }
@@ -295,9 +322,8 @@ type SSHConn struct {
 	// ServerConn - also has Permission
 	sc *ssh.ServerConn
 	// SSH Client - only when acting as Dial
-	// few internal fields in addition to ssh.Conn:
-	// - forwards
-	// - channelHandlers
+	// This is required for sftp or for using session - using the raw client
+	// connection is more flexible.
 	scl *ssh.Client
 
 	closed chan struct{}
@@ -355,26 +381,27 @@ func (ssht *Transport) DialConn(ctx context.Context, host string, nc net.Conn) (
 	}
 	c.ConnectTime = time.Now()
 
-	cc, chans, reqs, err := ssh.NewClientConn(nc, host,
-		&ssh.ClientConfig{
-			Auth:          ssht.config.Auth,
-			Config:        ssht.config.Config,
-			ClientVersion: version,
-			Timeout:       3 * time.Second,
-			User:          ssht.User,
-			// hostname is passed back from addr, empty string
-			HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-				err := ssht.CertChecker.CheckHostKey(hostname, remote, key)
-				if err != nil {
-					return err
-				}
-				c.RemoteKey = key
-				c.RemoteAddr = remote
-				c.RemoteHostname = hostname
+	clientCfg := &ssh.ClientConfig{
+		Auth:          []ssh.AuthMethod{ssh.PublicKeys(ssht.SignerClient)}, //ssht.config.Auth,
+		Config:        ssht.serverConfig.Config,
+		ClientVersion: version,
+		Timeout:       3 * time.Second,
+		User:          ssht.User,
+		// hostname is passed back from addr, empty string
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			err := ssht.CertChecker.CheckHostKey(hostname, remote, key)
+			if err != nil {
+				return err
+			}
+			c.RemoteKey = key
+			c.RemoteAddr = remote
+			c.RemoteHostname = hostname
 
-				return nil
-			},
-		})
+			return nil
+		},
+	}
+	cc, chans, reqs, err := ssh.NewClientConn(nc, host,
+		clientCfg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -385,7 +412,6 @@ func (ssht *Transport) DialConn(ctx context.Context, host string, nc net.Conn) (
 	// client extends ssh.Conn - but it should not be used directly for session or accept requests.
 	client := ssh.NewClient(cc, chans, reqs)
 	c.scl = client
-
 	// The client adds "forwarded-tcpip" and "forwarded-streamlocal" when ListenTCP is called.
 	// This in turns sends "tcpip-forward" command, with IP:port
 	// The method returns a Listener, with port set.
@@ -487,17 +513,4 @@ type forwardTCPIPChannelRequest struct {
 	ForwardPort uint32
 	OriginIP    string
 	OriginPort  uint32
-}
-
-// RFC 4254 7.2 - direct-tcpip
-// -L or -D, or egress. Client using VPN as an egress gateway.
-// Raddr can be a string (hostname) or IP.
-// Laddr is typically 127.0.0.1 (unless ssh has an open socks, and other machines use it)
-//
-type channelOpenDirectMsg struct {
-	Raddr string
-	Rport uint32
-
-	Laddr string
-	Lport uint32
 }

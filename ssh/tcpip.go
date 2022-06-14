@@ -19,21 +19,15 @@ const (
 	forwardedTCPChannelType = "forwarded-tcpip"
 )
 
-func init() {
-	ServerChannelHandlers["direct-tcpip"] = directTcpipHandler
-	ServerRequestHandlers["tcpip-forward"] = tcpipForwardHandler
-	ServerRequestHandlers["cancel-tcpip-forward"] = cancelTcpipForwardHandler
-}
+//func init() {
+//	ServerChannelHandlers["direct-tcpip"] = directTcpipHandler
+//	ServerRequestHandlers["tcpip-forward"] = tcpipForwardHandler
+//	ServerRequestHandlers["cancel-tcpip-forward"] = cancelTcpipForwardHandler
+//}
 
 // When client starts with a -L CPORT:host:port, and connects to CPORT
 // Also when client uses socks for dynamic forwards.
 func directTcpipHandler(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel) {
-	var req channelOpenDirectMsg
-	err := ssh.Unmarshal(newChannel.ExtraData(), &req)
-	if err != nil {
-		newChannel.Reject(ssh.UnknownChannelType, "invalid data")
-		return
-	}
 
 	// TODO: allow connections to mesh VIPs
 	//if role == ROLE_GUEST &&
@@ -50,7 +44,10 @@ func directTcpipHandler(ctx context.Context, ssht *Transport, conn ssh.Conn, new
 	//conId++
 }
 
-// direct-tcpip data struct as specified in RFC4254, Section 7.2
+// RFC 4254 7.2 - direct-tcpip
+// -L or -D, or egress. Client using VPN as an egress gateway.
+// Raddr can be a string (hostname) or IP.
+// Laddr is typically 127.0.0.1 (unless ssh has an open socks, and other machines use it)
 type localForwardChannelData struct {
 	DestAddr string
 	DestPort uint32
@@ -72,13 +69,18 @@ func DirectTCPIPHandler(ctx context.Context, srv *Transport, conn ssh.Conn, newC
 		newChan.Reject(ssh.ConnectionFailed, "error parsing forward data: "+err.Error())
 		return
 	}
-
-	//if srv.LocalPortForwardingCallback == nil || !srv.LocalPortForwardingCallback(ctx, d.DestAddr, d.DestPort) {
-	//	newChan.Reject(gossh.Prohibited, "port forwarding is disabled")
-	//	return
-	//}
-
 	dest := net.JoinHostPort(d.DestAddr, strconv.FormatInt(int64(d.DestPort), 10))
+
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+
+	if srv.Forward != nil {
+		srv.Forward(ctx, dest, ch)
+		return
+	}
 
 	var dialer net.Dialer
 	dconn, err := dialer.DialContext(ctx, "tcp", dest)
@@ -86,13 +88,6 @@ func DirectTCPIPHandler(ctx context.Context, srv *Transport, conn ssh.Conn, newC
 		newChan.Reject(ssh.ConnectionFailed, err.Error())
 		return
 	}
-
-	ch, reqs, err := newChan.Accept()
-	if err != nil {
-		dconn.Close()
-		return
-	}
-	go ssh.DiscardRequests(reqs)
 
 	go func() {
 		defer ch.Close()

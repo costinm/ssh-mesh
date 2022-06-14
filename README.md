@@ -1,83 +1,47 @@
 # cert-ssh
 
-This is an opinionated set of SSH tools, intended for use with 
-Istio, CloudRun, mobile and other environments, with a Istio-like
-certificate-based infrastructure.
+This is an opinionated SSH library, with a Istio-like
+certificate-based infrastructure and hbone-compatible transport.
 
-The SSH CA maintains a root CA (backed by a k8s Secret), and signs
-host and user certificates based on the K8S JWT or istio mTLS 
-certificate.
+The SSH CA maintains a root CA (backed by a k8s or other Secret), and signs
+host and user certificates. The format is similar with Spiffe:
+
+  ${KSA}@${Namespace}.svc.${TrustDomain}
+  ${KSA}.${Namespace}.svc.${TrustDomain}
 
 The client (sshc), server(sshd) use the SSH CA to setup the config.
-Both are equivalent and exchangeable with OpenSSH (TODO: dropbear).
-A CLI command is provided to initiate config for OpenSSH.
 
-# ssh-signerd
+Library can interoperate with OpenSSH and dropbear clients and servers.
 
-Signs SSH certificates for host and client.
+Both client and server can wrap a net.Conn - which may be a tunnel.
+
+# Mesh communication
+
+Client will initiate a forward accept, with :0 port. Server will accept
+forward request of this type but will not open new ports.
+
+Clients can register in discovery the assigned IP and port - if the
+server is ssh-mesh, it will be the HBONE port, if it is a regular 
+ssh server - a random port. 
+
+The forwarded requests are expected to be HTTP/2 / TLS, with SNI 
+header encoding the destination.
+
+# Certificate signing
 
 This is similar with Istiod/Citadel signing of workload certificates,
-but for SSH certificates.
+but for SSH certificates. The library only provides signing primitives, 
+it is intentded as an extension to an Istio-compatible signer.
 
 Authentication uses same K8S JWT token as Istiod-CA.
-
 In a secure network (Wireguard, IPSec, other secure CNIs and VPNs) the 
 token is not required - the certificate will be issued for the 
 IP address, which is expected to be secure and stable. 
-
-
-Host certs use the canonical service, namespace and domain.
-User certs use the KSA, namespace and domain.
-
-
-
-## Istio integration  
-
-The components are intended to be used with Istio, which provides
-the identity and security for the SSH cert signing. 
-
-
-
-```shell
-
-```
-
-## CloudRun
-
-All 3 components can also be used with CloudRun, either directly
-or using Istio. 
-
-```shell
-
-```
-
-
-
-# Code organization
-
-- sshca - gRPC client and server for signing SSH certificates.
-Because the signing code is very small and doesn't add deps, it is in the same directory.
-  
-- sshd - ssh server, with exec, shell ('pty'), port forwarding and sftp support.
-All authentication is based on certificates - both host and user auth.
-  
-- sshca/ssh-signer - CLI to generate ssh configs for typical SSH client.
 
 # Usage with Openssh
 
 
 ```shell
-# Use real domain ( with real certificate )
-# SSH_CA=sshca.example.com:443
-SSH_CA=localhost:14001
-
-go install github.com/costinm/ssh-mesh/sshca/ssh-signer
-
-mkdir ${HOME}/.ssh/${SSH_CA}
-cd ${HOME}/.ssh/${SSH_CA}
-
-# Will create both user and host config files for ssh
-ssh-signer
 
 ssh -v  -p 15022   -i id_ecdsa  -o "UserKnownHostsFile known_hosts" costin@localhost
 
@@ -85,3 +49,11 @@ ssh -v  -p 15022   -i id_ecdsa  -o "UserKnownHostsFile known_hosts" costin@local
 # -F /dev/null -o "UserKnownHostsFile /dev/null" -o StrictHostKeyChecking=no
 ```
 
+# Alternatives
+
+- use an extension is appealing - for example allow servers to initiate direct-tcpip 
+channels will make the code simpler. However interop with existing ssh tools is the
+main goal - otherwise H2/H3 should be used.
+
+- provide a rich API with support for global requests, extensions, etc - nice but 
+not required.

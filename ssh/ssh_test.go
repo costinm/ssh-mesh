@@ -31,28 +31,37 @@ func TestE2E(t *testing.T) {
 	// TODO: P2: load/save root
 	// TODO: P2: http interface for CA
 	abc, err := net.Dial("tcp", "localhost:11002")
-	ac, asshC, err := alice.DialConn(ctx, "bob", abc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac, asshC, err := alice.DialConn(ctx, "bob.test.svc.cluster.local:11002", abc)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	log.Println(ac.RemoteKey, bob.SignerHost.PublicKey())
 	// Dial from bob...
 	//asshC.Dial()
 
 	// TODO: extend with custom message handlers, both ends.
-	ok, res, err := asshC.SendRequest("test", true, []byte{1})
-	log.Println(ok, res)
+	//ok, res, err := asshC.SendRequest("test", true, []byte{1})
+	log.Println(asshC)
 
-	abs, err := ac.OpenStream("direct-tcpip", ssh.Marshal(&forwardTCPIPChannelRequest{}))
-	log.Println(abs)
+	abs, err := ac.OpenStream("direct-tcpip", ssh.Marshal(
+		&forwardTCPIPChannelRequest{}))
+	log.Println(abs, err)
 }
+
+var domain = "test.svc.cluster.local"
 
 func initTransport(ca *SSHCA, s string, i int) (*Transport, error) {
 	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	casigner1, _ := ssh.NewSignerFromKey(privk1)
-	_, hch, err := ca.Sign(casigner1.PublicKey(), ssh.HostCert, []string{s + ".test.svc.cluster.local"})
+	_, hch, err := ca.Sign(casigner1.PublicKey(), ssh.HostCert, []string{s + "." + domain})
 	if err != nil {
 		return nil, err
 	}
-	_, hcc, err := ca.Sign(casigner1.PublicKey(), ssh.UserCert, []string{s + "@test.svc.cluster.local"})
+	_, hcc, err := ca.Sign(casigner1.PublicKey(), ssh.UserCert, []string{s + "@" + domain})
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +76,9 @@ func initTransport(ca *SSHCA, s string, i int) (*Transport, error) {
 	alice, err := NewSSHTransport(&TransportConfig{
 		SignerHost:   aliceSigner,
 		SignerClient: aliceSignerC,
+		User:         s + "@" + domain,
 		Port:         i,
+		AuthorizedCA: []ssh.PublicKey{ca.Signer.PublicKey()},
 	})
 	if err != nil {
 		return nil, err
