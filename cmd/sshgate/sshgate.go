@@ -23,8 +23,7 @@ func main() {
 	}
 
 	mux := &http.ServeMux{}
-
-	//mux.Handle("/sshca/CreateCertificate", sshs)
+	mux.Handle("/sshca/CreateCertificate", sshs)
 
 	http.ListenAndServe(":8080", mux)
 }

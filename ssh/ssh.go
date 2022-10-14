@@ -73,12 +73,12 @@ type Transport struct {
 }
 
 var (
-//ServerChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel){}
-//ServerRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request) (bool, []byte){}
+// ServerChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn ssh.Stream, newChannel ssh.NewChannel){}
+// ServerRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request) (bool, []byte){}
 // Only if using the raw client - using the high level object for now, not attempting
 // any fancy use of the protocol - only one minimal extension.
-//ClientChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel){}
-//ClientRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request){}
+// ClientChannelHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel){}
+// ClientRequestHandlers = map[string]func(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, r *ssh.Request){}
 )
 
 //func (srv *Server) getServer(signer ssh.Signer) *ssh.Server {
@@ -171,7 +171,7 @@ func InitFromSecret(sshCM map[string][]byte, ns string) error {
 	if len(authKeys) != 0 {
 		ssht.AddAuthorizedKeys(authKeys)
 	}
-
+	log.Println("Starting SSHD on 15022 with ", authKeys)
 	go ssht.Start()
 	return nil
 }
@@ -409,7 +409,7 @@ func (ssht *Transport) DialConn(ctx context.Context, host string, nc net.Conn) (
 	// Using a ssh.Client is possible - but may complicate things. The client
 	// is handling reqs, chans for the connection directly.
 	// It is the only way to use the Session implementation in the core library.
-	// client extends ssh.Conn - but it should not be used directly for session or accept requests.
+	// client extends ssh.Stream - but it should not be used directly for session or accept requests.
 	client := ssh.NewClient(cc, chans, reqs)
 	c.scl = client
 	// The client adds "forwarded-tcpip" and "forwarded-streamlocal" when ListenTCP is called.
@@ -431,7 +431,7 @@ func (ssht *Transport) DialConn(ctx context.Context, host string, nc net.Conn) (
 // SSH handles multiplexing and packets.
 func (ssht *Transport) HandleServerConn(nConn net.Conn) {
 	// Before use, a handshake must be performed on the incoming
-	// net.Conn. Handshake results in conn.Permissions.
+	// net.Stream. Handshake results in conn.Permissions.
 	conn, chans, globalSrvReqs, err := ssh.NewServerConn(nConn, ssht.serverConfig)
 	if err != nil {
 		nConn.Close()

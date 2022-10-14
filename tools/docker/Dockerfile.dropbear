@@ -1,4 +1,4 @@
-## Same base as Istio proxyless
+## Same base as Istio proxyless - install dropbear and add it to distroless
 FROM debian:11-slim  AS base
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-install -y dropbear

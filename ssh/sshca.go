@@ -21,6 +21,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
+// SSHCA is a CA for SSH certificates, modeled after Istio CA
 type SSHCA struct {
 	Root   string
 	Signer gossh.Signer
@@ -81,6 +82,8 @@ func (s *SSHCA) InitRoot() error {
 	return nil
 }
 
+// No authentication ! This relies on the platform ( Sidecar, CloudRun ) to
+// perform authentication. Must only be used in a mesh environment.
 func (s *SSHCA) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	data, err := io.ReadAll(request.Body)
 	if err != nil {
