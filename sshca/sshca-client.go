@@ -1,4 +1,4 @@
-package ssh
+package sshca
 
 import (
 	"bytes"
@@ -18,10 +18,10 @@ import (
 
 // Certificate request message.
 // In SSH, the user certificate includes:
-//  - public key and nonce
-//  - CertType = 1
-//  - KeyId - optional
-//  - ValidPrincipals[] - matched against user
+//   - public key and nonce
+//   - CertType = 1
+//   - KeyId - optional
+//   - ValidPrincipals[] - matched against user
 type CertificateRequest struct {
 
 	// Public key to sign

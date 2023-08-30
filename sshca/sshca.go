@@ -1,4 +1,4 @@
-package ssh
+package sshca
 
 import (
 	"context"
@@ -15,8 +15,8 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"log/slog"
 	"net/http"
-	"os"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -28,34 +28,26 @@ type SSHCA struct {
 	Domain string
 }
 
+const keyFile = "ca-key.pem"
+
 // Init will load the private key
 // By default will use ./var/run/secrets/ssh-ca
 // This can be overridden using SSH_CA_DIR env.
 func (s *SSHCA) Init(rootca_dir string) error {
 	// Alternative would be ${HOME}/.ssh/ssh-ca/id_ecdsa file.
-	var rootca_file = rootca_dir + "/id_ecdsa"
+	var rootca_file = rootca_dir + "/" + keyFile
 
-	var privk *ecdsa.PrivateKey
+	//var privk *ecdsa.PrivateKey
 	var casigner gossh.Signer
 
 	keyB, err := ioutil.ReadFile(rootca_file)
-	if err == nil {
-		casigner, err = gossh.ParsePrivateKey(keyB)
+	if err != nil {
+		return err
 	}
-
-	if err != nil || casigner == nil {
-		pwd, _ := os.Getwd()
-		log.Println("Failed to read key, generating", err, pwd, os.Environ())
-		s.InitRoot()
-		privk, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		casigner, _ = gossh.NewSignerFromKey(privk)
-		ecb, _ := x509.MarshalECPrivateKey(privk)
-		keyB := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecb})
-		os.MkdirAll(rootca_dir, 0700)
-		err = ioutil.WriteFile(rootca_file, keyB, 0700)
-		if err != nil {
-			log.Println("Failed to save private, using in-memory ", err)
-		}
+	// OR load a ecdsa.PrivateKey and use gossh.NewSignerFromKey(privk)
+	casigner, err = gossh.ParsePrivateKey(keyB)
+	if err != nil {
+		return err
 	}
 
 	s.Root = "cert-authority " + string(gossh.MarshalAuthorizedKey(casigner.PublicKey()))
@@ -69,10 +61,6 @@ func (s *SSHCA) LoadRoot(privk *ecdsa.PrivateKey) error {
 	s.Signer = casigner
 
 	return err
-}
-
-func (s *SSHCA) SaveRoot(dir string) error {
-	return nil
 }
 
 func (s *SSHCA) InitRoot() error {
@@ -138,7 +126,8 @@ func (s *SSHCA) CreateCertificate(ctx context.Context, in *CertificateRequest, r
 	if err != nil {
 		return nil, err
 	}
-	log.Println("Creating certificate for ", domain, user, in.Public)
+	slog.InfoContext(ctx, "SSH cert create", "domain", domain,
+		"user", user, "public", in.Public)
 	h, _, err := s.Sign(pub, gossh.HostCert, domain)
 	return &CertificateResponse{
 		Host: string(h),
