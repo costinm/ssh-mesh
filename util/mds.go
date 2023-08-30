@@ -1,0 +1,63 @@
+package util
+
+import (
+	"context"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"golang.org/x/exp/slog"
+)
+
+// POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/service-<GCP project number>@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken
+// Content-Type: application/json
+// Authorization: Bearer <federated token>
+//
+//	{
+//	 "Delegates": [],
+//	 "Scope": [
+//	     https://www.googleapis.com/auth/cloud-platform
+//	 ],
+//	}
+func GetTokenAud(aud string) (string, error) {
+
+	// TODO: check well-known files
+	if _, err := os.Stat("/var/run/secrets/tokens/istio"); err == nil {
+		fmt.Printf("Istio token file exists\n")
+	}
+
+	t0 := time.Now()
+	mdsBase := os.Getenv("GCE_METADATA_HOST")
+	if mdsBase == "" {
+		mdsBase = "169.254.169.254"
+	}
+	if !strings.Contains(mdsBase, "/") {
+		mdsBase = "http://" + mdsBase + "/computeMetadata/v1/"
+	}
+	ctx, cf := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cf()
+	req, err := http.NewRequestWithContext(ctx, "GET", mdsBase+fmt.Sprintf("instance/service-accounts/default/identity?audience=%s", aud), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata server responeded with code=%d %s", resp.StatusCode, resp.Status)
+	}
+	defer resp.Body.Close()
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	slog.Debug("MDS_TOKEN", time.Since(t0))
+
+	return strings.TrimSpace(string(b)), err
+}
