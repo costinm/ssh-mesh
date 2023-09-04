@@ -51,4 +51,4 @@ jobs:
         name: push
         uses:  gcr.io/wlhe-cr/crm-builder@latest
         run:
-          make all
+          make all DOCKER_REPO=ghcr.io/costinm/ssh-mesh
