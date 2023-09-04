@@ -1,7 +1,7 @@
 apiVersion: v1
-name: sshd
+name: sshc
 version: 0.1.1
-description: Cert-based SSHD, in go
+description: Cert-based SSH client
 keywords:
   - SSH
   - Certificates

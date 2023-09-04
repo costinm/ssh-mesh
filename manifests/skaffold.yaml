@@ -2,38 +2,39 @@ apiVersion: skaffold/v2beta19
 kind: Config
 metadata:
   name: ssh-mesh
-build:
-  artifacts:
-  - image: gcr.io/dmeshgate/sshd
-    context: .
-    custom:
-      buildCommand: make push
-      dependencies:
-        paths:
-        - ssh/**
-        - manifests/sshd/**
+#build:
+#  artifacts:
+#  - image: gcr.io/dmeshgate/sshc
+#    context: ..
+#    custom:
+#      buildCommand: make build gcp/push
+#      dependencies:
+#        paths:
+#        - sshc/**
+#        - manifests/sshd/**
 deploy:
   helm:
     releases:
-    - name: sshd
-      chartPath: ../../manifests/sshd
-      artifactOverrides:
-        image: gcr.io/dmeshgate/sshd
-      namespace: sshd
+    - name: sshc
+      chartPath: sshc
+      #artifactOverrides:
+      #  image: gcr.io/dmeshgate/sshc:latest
+
+      namespace: sshc
       createNamespace: true
-portForward:
-- resourceType: deployment
-  resourceName: ssh-ca
-  namespace: ssh-ca
-  port: 8080
-  localPort: 14021
-- resourceType: deployment
-  resourceName: ssh-ca
-  namespace: ssh-ca
-  port: 8081
-  localPort: 14020
-- resourceType: deployment
-  resourceName: sshd
-  namespace: sshd
-  port: 15022
-  localPort: 14022
+#portForward:
+#- resourceType: deployment
+#  resourceName: ssh-ca
+#  namespace: ssh-ca
+#  port: 8080
+#  localPort: 14021
+#- resourceType: deployment
+#  resourceName: ssh-ca
+#  namespace: ssh-ca
+#  port: 8081
+#  localPort: 14020
+#- resourceType: deployment
+#  resourceName: sshd
+#  namespace: sshd
+#  port: 15022
+#  localPort: 14022

@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sshd
+data:
+  id_ecdsa: "{{ genPrivateKey "ecdsa" | b64enc }}"
+
+  # ["/usr/sbin/sshd","-f", "/var/run/secrets/sshd/sshd_config", "-e", "-D"]
+  sshd_config: |
+    Port 15022
+    AddressFamily any
+    ListenAddress 0.0.0.0
+    ListenAddress ::
+    Protocol 2
+    LogLevel INFO
+
+    HostKey /var/run/secrets/sshd/id_ecdsa
+
+    PermitRootLogin yes
+
+    AuthorizedKeysFile	/var/run/secrets/sshd/authorized_keys
+
+    PasswordAuthentication no
+    PermitUserEnvironment yes
+
+    AcceptEnv LANG LC_*
+    PrintMotd no
+
+    Subsystem	sftp	/usr/lib/openssh/sftp-server
+
+---
