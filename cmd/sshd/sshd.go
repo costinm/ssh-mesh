@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,22 +12,18 @@ import (
 	"github.com/costinm/ssh-mesh/sshc"
 	"github.com/costinm/ssh-mesh/sshd"
 	"github.com/costinm/ssh-mesh/util"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"golang.org/x/crypto/ssh"
 )
 
-// Connect to a SSH server and keeps the connection alive.
-// Sish is one such server, providing a lot of interesting features.
-// Works with regular sshd - but only for one connection, since it'll forward
-// remote port 22.
+// SSHD is an extended version of the mesh ssh service, intended for jump (gateway) and CA servers.
+// Like SSHC, it can maintain a connection to an upstream host.
+// Like SSHC, it can act as a middle jump server for clients authenticating with the CA or JWTs
 //
-// Can optionally start a local sshd server, with sshfs included.
-//
-// Can optionally start a jump host/server, using same protocol.
-//
-// Equivalent with
-// SSH_ADKPASS_REQUIRE=force
-// SSH_ASKPASS=gcloud auth print-identity-token $GSA --audiences=https://host
+// It also includes a H2C server (and TODO: HTTPS) routing requests.
+// It adds a K8S controller watching EndpointSlice and tracking clients.
 func main() {
 	configF := util.MainStart()
 
@@ -53,6 +50,7 @@ func main() {
 		go sshc.StayConnected(addr)
 	}
 
+	var st *sshd.Transport
 	// Default is to start a sshd on 15022.
 	st, err := sshd.NewSSHTransport(&sshd.TransportConfig{})
 
@@ -78,7 +76,7 @@ func main() {
 			st.AuthorizedCA = append(st.AuthorizedCA, pubk)
 		}
 
-		go st.Start()
+		st.Start()
 	}
 
 	// Start a small http server, for status.
@@ -88,8 +86,24 @@ func main() {
 		go func() {
 			mux := http.NewServeMux()
 			st.InitMux(mux)
-			http.ListenAndServe(haddr, mux)
+
+			// Adds about 400k to binary size
+			h2ch := h2c.NewHandler(mux, &http2.Server{})
+
+			http.ListenAndServe(haddr, h2ch)
 		}()
+	}
+
+	socksAddr := configF("socksAddr")
+	if socksAddr != "" {
+
+	}
+
+	tproxyAddr := configF("tproxyAddr")
+	if tproxyAddr != "" {
+		util.IptablesCapture(tproxyAddr, func(nc net.Conn, dest, la *net.TCPAddr) {
+
+		})
 	}
 
 	// Log the start

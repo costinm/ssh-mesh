@@ -19,21 +19,25 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-type SSHCStatus struct {
+type SSHClientConf struct {
 	// Last time connected
-	LastConnected time.Time
-	User          string
+	User   string
+	Signer ssh.Signer
+
+	// Hostname to use when binding. If not set, will use os.Hostname or guess from service/instance
+	Hostname string
 }
 
 type SSHC struct {
-	SSHCStatus
-	Signer ssh.Signer
+	*SSHClientConf
+
+	LastConnected time.Time
 
 	Forwards map[string]string
 
-	cc    ssh.Conn
-	chans <-chan ssh.NewChannel
-	reqs  <-chan *ssh.Request
+	SSHConn ssh.Conn
+	chans   <-chan ssh.NewChannel
+	reqs    <-chan *ssh.Request
 
 	con net.Conn
 
@@ -42,17 +46,21 @@ type SSHC struct {
 	CertChecker  *ssh.CertChecker
 
 	ServerKey ssh.PublicKey
+	SSHClient *ssh.Client
+
+	// Last received remote key
+	RemoteKey ssh.PublicKey
 }
 
-func (sc *SSHC) Dial(addr string) (*ssh.Client, error) {
+func (sc *SSHC) Dial(addr string) error {
 	tcon, err := net.Dial("tcp", addr)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	return sc.DialConn(tcon, addr)
 }
 
-func (sc *SSHC) DialConn(tcon net.Conn, addr string) (*ssh.Client, error) {
+func (sc *SSHC) DialConn(tcon net.Conn, addr string) error {
 	sc.con = tcon
 	if sc.User == "" {
 		sc.User = "jwt"
@@ -90,7 +98,7 @@ func (sc *SSHC) DialConn(tcon net.Conn, addr string) (*ssh.Client, error) {
 		// hostname is passed back from addr, empty string
 		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 			slog.Info("Host", "host", hostname, "addr", remote, "key", key)
-
+			sc.RemoteKey = key
 			if sc.ServerKey != nil {
 				if KeysEqual(key, sc.ServerKey) {
 					return nil
@@ -111,9 +119,9 @@ func (sc *SSHC) DialConn(tcon net.Conn, addr string) (*ssh.Client, error) {
 
 	cc, chans, reqs, err := ssh.NewClientConn(tcon, addr, clientCfg)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	sc.cc = cc
+	sc.SSHConn = cc
 	sc.chans = chans
 	sc.reqs = reqs
 
@@ -124,7 +132,7 @@ func (sc *SSHC) DialConn(tcon net.Conn, addr string) (*ssh.Client, error) {
 	//
 	// It is the only way to use the Session implementation in the core library - which is equivalent to OpenChannel("session")
 	c := ssh.NewClient(cc, chans, reqs)
-
+	sc.SSHClient = c
 	// The client adds "forwarded-tcpip" and "forwarded-streamlocal" when ListenTCP is called.
 	// This in turns sends "tcpip-forward" command, with IP:port
 	// The method returns a Listener, with port set.
@@ -144,7 +152,7 @@ func (sc *SSHC) DialConn(tcon net.Conn, addr string) (*ssh.Client, error) {
 	//	}
 	//}()
 
-	return c, nil
+	return nil
 }
 
 // KeysEqual is constant time compare of the keys to avoid timing attacks.
@@ -176,7 +184,7 @@ func (c *SSHC) ListenTCP(domain string, port uint32) error {
 		port,
 	}
 	// send message
-	ok, resp, err := c.cc.SendRequest("tcpip-forward", true, ssh.Marshal(&m))
+	ok, resp, err := c.SSHConn.SendRequest("tcpip-forward", true, ssh.Marshal(&m))
 	if err != nil {
 		return err
 	}
@@ -268,13 +276,18 @@ func (sc *SSHC) HandleStream(ch io.ReadWriteCloser, fwto forwardedTCPPayload) {
 
 }
 
-func NewSSHC() (*SSHC, error) {
-	privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	casigner1, _ := ssh.NewSignerFromKey(privk1)
-
+func NewSSHC(cf *SSHClientConf) (*SSHC, error) {
+	if cf == nil {
+		cf = &SSHClientConf{}
+	}
 	sshc := &SSHC{
-		Signer:   casigner1,
-		Forwards: map[string]string{},
+		SSHClientConf: cf,
+		Forwards:      map[string]string{},
+	}
+
+	if cf.Signer == nil {
+		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		cf.Signer, _ = ssh.NewSignerFromKey(privk1)
 	}
 
 	return sshc, nil
@@ -293,13 +306,16 @@ func (sshc *SSHC) StayConnected(addr string) {
 
 	for {
 		t0 := time.Now()
-		c, err := sshc.Dial(addr)
+		err := sshc.Dial(addr)
 		if err != nil {
 			slog.Info("Dial_error", "err", err, "addr", addr)
 			time.Sleep(3 * time.Second)
 			continue
 		}
 		t1 := time.Now()
+		c := sshc.SSHClient
+
+		// Open a session - sish sends logs and info
 		go func() {
 			sc, r, err := c.OpenChannel("session", nil)
 			if err != nil {
