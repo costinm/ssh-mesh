@@ -6,28 +6,22 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"time"
 
 	ssh "golang.org/x/crypto/ssh"
+	"golang.org/x/exp/slog"
 )
 
 // Handle TCP forward.
 //
-// based on gliderlabs - will probably be replaced with the more
+// based on gliderlabs, sish - will probably be replaced with the more
 // efficient impl from wpgate.
 
-const (
-	forwardedTCPChannelType = "forwarded-tcpip"
-)
-
-//func init() {
-//	ServerChannelHandlers["direct-tcpip"] = directTcpipHandler
-//	ServerRequestHandlers["tcpip-forward"] = tcpipForwardHandler
-//	ServerRequestHandlers["cancel-tcpip-forward"] = cancelTcpipForwardHandler
-//}
-
-// When client starts with a -L CPORT:host:port, and connects to CPORT
-// Also when client uses socks for dynamic forwards.
-func directTcpipHandler(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel) {
+// - When client starts with a -L CPORT:host:port, and connects to CPORT
+// - Also when client uses socks for dynamic forwards.
+// - jump (-J)
+func directTcpipHandler(ctx context.Context, ssht *Transport, conn ssh.Conn,
+	newChannel ssh.NewChannel) {
 
 	// TODO: allow connections to mesh VIPs
 	//if role == ROLE_GUEST &&
@@ -76,7 +70,35 @@ func DirectTCPIPHandler(ctx context.Context, srv *Transport, conn ssh.Conn, newC
 		return
 	}
 	go ssh.DiscardRequests(reqs)
+	t0 := time.Now()
 
+	if d.DestPort == 22 {
+		if rc, ok := srv.jumpHosts.Load(d.DestAddr); ok {
+			conn, _ := rc.(*ssh.ServerConn)
+			payload := ssh.Marshal(&remoteForwardChannelData{
+				DestAddr:   d.DestAddr,
+				DestPort:   22,
+				OriginAddr: d.OriginAddr,
+				OriginPort: d.OriginPort,
+			})
+			sch, reqs, err := conn.OpenChannel("forwarded-tcpip", payload)
+			if err != nil {
+				// TODO: log failure to open channel
+				log.Println(err)
+				ch.Close()
+				return
+			}
+			go ssh.DiscardRequests(reqs)
+
+			go proxy(ch, sch, func() {
+				slog.Info("direct-tcpip jump", "to", d.DestAddr, "from", "",
+					"dur", time.Since(t0))
+			})
+			return
+		}
+	}
+
+	// Generic handler for all forwards. If not set, use Dial()
 	if srv.Forward != nil {
 		srv.Forward(ctx, dest, ch)
 		return
@@ -89,6 +111,11 @@ func DirectTCPIPHandler(ctx context.Context, srv *Transport, conn ssh.Conn, newC
 		return
 	}
 
+	go proxy(ch, dconn, func() {
+		slog.Info("direct-tcpip", "to", d.DestAddr, "from", "",
+			"dur", time.Since(t0))
+	})
+
 	go func() {
 		defer ch.Close()
 		defer dconn.Close()
@@ -98,6 +125,19 @@ func DirectTCPIPHandler(ctx context.Context, srv *Transport, conn ssh.Conn, newC
 		defer ch.Close()
 		defer dconn.Close()
 		io.Copy(dconn, ch)
+	}()
+}
+
+func proxy(ch io.ReadWriteCloser, sch io.ReadWriteCloser, onDone func()) {
+	go func() {
+		defer ch.Close()
+		defer sch.Close()
+		io.Copy(ch, sch)
+	}()
+	go func() {
+		defer ch.Close()
+		defer sch.Close()
+		io.Copy(sch, ch)
 	}()
 }
 
@@ -123,7 +163,13 @@ type remoteForwardChannelData struct {
 }
 
 // tcpip-forward is used by clients to request servers accept and use forwarded-tcpip.
-func tcpipForwardHandler(ctx context.Context, srv *Transport, conn *ssh.ServerConn, req *ssh.Request) (bool, []byte) {
+//
+// This has few special ports:
+//   - 22 - any client asking for SSH forwarding will be multiplexed as a jump host.
+//     Hostname based on credentials.
+//   - 80/443 - TODO, based on SISH - similar multiplexing
+func tcpipForwardHandler(ctx context.Context, srv *Transport,
+	conn *ssh.ServerConn, req *ssh.Request) (bool, []byte) {
 	srv.Lock()
 	if srv.forwards == nil {
 		srv.forwards = make(map[string]net.Listener)
@@ -135,11 +181,19 @@ func tcpipForwardHandler(ctx context.Context, srv *Transport, conn *ssh.ServerCo
 		// TODO: log parse failure
 		return false, []byte{}
 	}
-	//if srv.ReversePortForwardingCallback == nil || !srv.ReversePortForwardingCallback(ctx, reqPayload.BindAddr, reqPayload.BindPort) {
-	//	return false, []byte("port forwarding is disabled")
-	//}
+	if reqPayload.BindPort == 22 {
+		srv.jumpHosts.Store(reqPayload.BindAddr, conn)
+		return true, ssh.Marshal(&remoteForwardSuccess{reqPayload.BindPort})
+	}
+	if reqPayload.BindPort == 80 {
+		srv.httpHosts.Store(reqPayload.BindAddr, conn)
+		return true, ssh.Marshal(&remoteForwardSuccess{reqPayload.BindPort})
+	}
+
 	addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
+
 	ln, err := net.Listen("tcp", addr)
+
 	if err != nil {
 		// TODO: log listen failure
 		return false, []byte{}
@@ -198,6 +252,7 @@ func tcpipForwardHandler(ctx context.Context, srv *Transport, conn *ssh.ServerCo
 		delete(srv.forwards, addr)
 		srv.Unlock()
 	}()
+
 	return true, ssh.Marshal(&remoteForwardSuccess{uint32(destPort)})
 }
 
@@ -207,6 +262,12 @@ func cancelTcpipForwardHandler(ctx context.Context, srv *Transport, conn *ssh.Se
 		// TODO: log parse failure
 		return false, []byte{}
 	}
+
+	if reqPayload.BindPort == 22 {
+		srv.jumpHosts.Delete(reqPayload.BindAddr)
+		return true, nil
+	}
+
 	addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 	srv.Lock()
 	ln, ok := srv.forwards[addr]

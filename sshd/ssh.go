@@ -14,12 +14,14 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/costinm/ssh-mesh/util"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -55,6 +57,10 @@ type Transport struct {
 	serverConfig *ssh.ServerConfig
 
 	forwards map[string]net.Listener
+
+	jumpHosts sync.Map //[string,*ssh.Client]
+	httpHosts sync.Map //[string,*ssh.Client]
+
 	sync.Mutex
 
 	// Client is a SSH client, using Istio-like certificates.
@@ -76,77 +82,77 @@ type Transport struct {
 }
 
 // InitFromSecret is a helper method to init the sshd using a secret or CA address
-func InitFromSecret(sshCM map[string][]byte, ns string) error {
-	tc := &TransportConfig{}
-
-	sshCA := sshCM["SSHCA_ADDR"]
-
-	var authKeys []ssh.PublicKey
-	for k, v := range sshCM {
-		if strings.HasPrefix(k, "authorized_key_") {
-			pubk1, _, _, _, err := ssh.ParseAuthorizedKey(v)
-			if err != nil {
-				log.Println("SSH_DEBUG: invalid ", k, err)
-			} else {
-				authKeys = append(authKeys, pubk1)
-				log.Println("Adding authorized key", k, string(v))
-			}
-		}
-	}
-
-	extra := os.Getenv("SSH_AUTH")
-	if extra != "" {
-		pubk1, _, _, _, err := ssh.ParseAuthorizedKey([]byte(extra))
-		if err != nil {
-			log.Println("SSH_DEBUG: invalid SSH_AUTH", err)
-		} else {
-			authKeys = append(authKeys, pubk1)
-		}
-	}
-
-	if len(authKeys) == 0 && sshCA == nil {
-		// No debug config, skip creating SSHD
-		return nil
-	}
-	var signer ssh.Signer
-	var err error
-
-	if err != nil {
-		// Use a self-signed cert
-		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		signer, _ = ssh.NewSignerFromKey(privk1)
-		log.Println("SSH cert signer not found, use ephemeral private key", err)
-	}
-
-	// load private key and cert from secret, if present
-	ek := sshCM["id_ecdsa"]
-	if ek != nil {
-		pk, err := ssh.ParsePrivateKey(ek)
-		if err != nil {
-			log.Println("Failed to parse key ", err)
-		} else {
-			tc.SignerHost = pk
-		}
-	}
-	if tc.SignerHost == nil {
-		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		signer, _ = ssh.NewSignerFromKey(privk1)
-	}
-
-	ssht, err := NewSSHTransport(&TransportConfig{
-		SignerHost: signer,
-	})
-	if err != nil {
-		log.Println("SSH debug init failed", err)
-		return err
-	}
-	if len(authKeys) != 0 {
-		ssht.AddAuthorizedKeys(authKeys)
-	}
-	log.Println("Starting SSHD on 15022 with ", authKeys)
-	go ssht.Start()
-	return nil
-}
+//func InitFromSecret(sshCM map[string][]byte, ns string) error {
+//	tc := &TransportConfig{}
+//
+//	sshCA := sshCM["SSHCA_ADDR"]
+//
+//	var authKeys []ssh.PublicKey
+//	for k, v := range sshCM {
+//		if strings.HasPrefix(k, "authorized_key_") {
+//			pubk1, _, _, _, err := ssh.ParseAuthorizedKey(v)
+//			if err != nil {
+//				log.Println("SSH_DEBUG: invalid ", k, err)
+//			} else {
+//				authKeys = append(authKeys, pubk1)
+//				log.Println("Adding authorized key", k, string(v))
+//			}
+//		}
+//	}
+//
+//	extra := os.Getenv("SSH_AUTH")
+//	if extra != "" {
+//		pubk1, _, _, _, err := ssh.ParseAuthorizedKey([]byte(extra))
+//		if err != nil {
+//			log.Println("SSH_DEBUG: invalid SSH_AUTH", err)
+//		} else {
+//			authKeys = append(authKeys, pubk1)
+//		}
+//	}
+//
+//	if len(authKeys) == 0 && sshCA == nil {
+//		// No debug config, skip creating SSHD
+//		return nil
+//	}
+//	var signer ssh.Signer
+//	var err error
+//
+//	if err != nil {
+//		// Use a self-signed cert
+//		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+//		signer, _ = ssh.NewSignerFromKey(privk1)
+//		log.Println("SSH cert signer not found, use ephemeral private key", err)
+//	}
+//
+//	// load private key and cert from secret, if present
+//	ek := sshCM["id_ecdsa"]
+//	if ek != nil {
+//		pk, err := ssh.ParsePrivateKey(ek)
+//		if err != nil {
+//			log.Println("Failed to parse key ", err)
+//		} else {
+//			tc.SignerHost = pk
+//		}
+//	}
+//	if tc.SignerHost == nil {
+//		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+//		signer, _ = ssh.NewSignerFromKey(privk1)
+//	}
+//
+//	ssht, err := NewSSHTransport(&TransportConfig{
+//		SignerHost: signer,
+//	})
+//	if err != nil {
+//		log.Println("SSH debug init failed", err)
+//		return err
+//	}
+//	if len(authKeys) != 0 {
+//		ssht.AddAuthorizedKeys(authKeys)
+//	}
+//	log.Println("Starting SSHD on 15022 with ", authKeys)
+//	go ssht.Start()
+//	return nil
+//}
 
 func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
 	var err error
@@ -187,6 +193,11 @@ func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
 		},
 	}
 
+	if tc.SignerHost == nil {
+		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		tc.SignerHost, _ = ssh.NewSignerFromKey(privk1)
+	}
+
 	for _, v := range tc.RootCA {
 		pubk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(v))
 		if err != nil {
@@ -201,8 +212,13 @@ func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
 		s.AddAuthorizedFile(authorizedKeysBytes)
 	}
 
-	if s.Address == "" {
-		s.Address = ":" + strconv.Itoa(s.Port)
+	s.serverConfig.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		tok, e := util.CheckJwt(string(password))
+		if e == nil {
+			return &ssh.Permissions{Extensions: map[string]string{"sub": tok}}, nil
+		}
+
+		return nil, errors.New("Invalid password")
 	}
 
 	s.serverConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -212,6 +228,7 @@ func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
 				return p, nil
 			}
 		}
+		// The authorized keys are associated with the owner/admin
 		if s.AuthorizedKeys != nil {
 			for _, k := range s.AuthorizedKeys {
 				if strings.Contains(k.Type(), "cert") {
@@ -226,27 +243,13 @@ func NewSSHTransport(tc *TransportConfig) (*Transport, error) {
 					}
 				}
 				if KeysEqual(key, k) {
-					return &ssh.Permissions{}, nil
+					return &ssh.Permissions{Extensions: map[string]string{"sub": "admin"}}, nil
 				}
 			}
 		}
-		//log.Println("SSH auth failure", key, s.AuthorizedKeys)
 		return nil, errors.New("SSH connection: no key found")
 	}
 	s.serverConfig.AddHostKey(tc.SignerHost)
-
-	// Once a ServerConfig has been configured, connections can be
-	// accepted.
-	if s.Listener == nil {
-		s.Listener, err = net.Listen("tcp", s.Address)
-		if err != nil {
-			log.Println("Failed to listend on ", s.Address, err)
-			return nil, err
-		}
-		if strings.HasSuffix(s.Address, ":0") {
-			s.Address = s.Listener.Addr().String()
-		}
-	}
 
 	return s, nil
 }
@@ -283,7 +286,24 @@ func KeysEqual(ak, bk ssh.PublicKey) bool {
 	return (len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1)
 }
 
-func (ssht *Transport) Start() {
+func (ssht *Transport) Start() (net.Listener, error) {
+	if ssht.Address == "" {
+		ssht.Address = ":" + strconv.Itoa(ssht.Port)
+	}
+	s := ssht
+	var err error
+	// Once a ServerConfig has been configured, connections can be
+	// accepted.
+	if s.Listener == nil {
+		s.Listener, err = net.Listen("tcp", s.Address)
+		if err != nil {
+			log.Println("Failed to listend on ", s.Address, err)
+			return nil, err
+		}
+		if strings.HasSuffix(s.Address, ":0") {
+			s.Address = s.Listener.Addr().String()
+		}
+	}
 	go func() {
 		for {
 			nConn, err := ssht.Listener.Accept()
@@ -295,9 +315,10 @@ func (ssht *Transport) Start() {
 			go ssht.HandleServerConn(nConn)
 		}
 	}()
+	return s.Listener, nil
 }
 
-// SSHConn can be a Client or server ssh connection.
+// SSHConn is a server ssh connection.
 type SSHConn struct {
 	// ServerConn - also has Permission
 	sc *ssh.ServerConn
@@ -352,45 +373,6 @@ func (c *SSHConn) OpenStream(n string, data []byte) (*sshstream, error) {
 	}
 }
 
-// DialConn wrapps a netConn with a SSH client connections.
-func (ssht *Transport) DialConn(ctx context.Context, host string, nc net.Conn) (*SSHConn, *ssh.Client, error) {
-	c := &SSHConn{
-		closed: make(chan struct{}),
-		t:      ssht,
-		wsCon:  nc,
-	}
-	c.ConnectTime = time.Now()
-
-	clientCfg := &ssh.ClientConfig{
-		Auth:          []ssh.AuthMethod{ssh.PublicKeys(ssht.SignerClient)}, //ssht.config.Auth,
-		Config:        ssht.serverConfig.Config,
-		ClientVersion: version,
-		Timeout:       3 * time.Second,
-		User:          ssht.User,
-		// hostname is passed back from addr, empty string
-		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			err := ssht.CertChecker.CheckHostKey(hostname, remote, key)
-			if err != nil {
-				return err
-			}
-			c.RemoteKey = key
-			c.RemoteAddr = remote
-			c.RemoteHostname = hostname
-
-			return nil
-		},
-	}
-	cc, chans, reqs, err := ssh.NewClientConn(nc, host, clientCfg)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	client := ssh.NewClient(cc, chans, reqs)
-	c.scl = client
-
-	return c, client, nil
-}
-
 // Handles a connection as SSH server, using a net.Conn - which might be tunneled over other transports.
 // SSH handles multiplexing and packets.
 func (ssht *Transport) HandleServerConn(nConn net.Conn) {
@@ -431,7 +413,6 @@ func (ssht *Transport) HandleServerConn(nConn net.Conn) {
 			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 		}
 	}
-
 }
 
 // Handle global requests on a server connection.
@@ -478,4 +459,39 @@ type forwardTCPIPChannelRequest struct {
 	ForwardPort uint32
 	OriginIP    string
 	OriginPort  uint32
+}
+
+func (st *Transport) InitMux(mux *http.ServeMux) {
+	mux.HandleFunc("/_ssh/key", func(writer http.ResponseWriter, request *http.Request) {
+		keyb := ssh.MarshalAuthorizedKey(st.SignerHost.PublicKey())
+		writer.Write(keyb)
+	})
+	mux.HandleFunc("/_ssh/tun", func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(200)
+		st.HandleServerConn(util.NewStreamServerRequest(request, writer))
+	})
+	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+		host := request.Host
+		fmt.Fprintf(writer, "host: %s, req: %s, headers: %v", host, request.RequestURI, request.Header)
+	})
+	mux.HandleFunc("/echo", func(writer http.ResponseWriter, request *http.Request) {
+		host := request.Host
+		fmt.Fprintf(writer, "host: %s, req: %s, headers: %v", host, request.RequestURI, request.Header)
+		b := make([]byte, 1024)
+		for {
+			n, err := request.Body.Read(b)
+			if err != nil {
+				fmt.Fprintf(writer, "Err %v", err)
+				return
+			}
+			log.Println(b[0:n])
+			writer.Write(b[0:n])
+		}
+	})
+	mux.HandleFunc("/wait", func(writer http.ResponseWriter, request *http.Request) {
+		host := request.Host
+		fmt.Fprintf(writer, "host: %s, req: %s, headers: %v", host, request.RequestURI, request.Header)
+		time.Sleep(60 * time.Second)
+	})
+
 }

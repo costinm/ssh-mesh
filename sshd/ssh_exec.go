@@ -1,13 +1,11 @@
 package sshd
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"log/slog"
 	"os"
@@ -16,10 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
-	"github.com/creack/pty"
-	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -39,19 +34,87 @@ var (
 	ErrEOF = errors.New("EOF")
 )
 
-//func init() {
-//	ServerChannelHandlers["session"] = sessionHandler
-//}
-
-func sessionHandler(ctx context.Context, ssht *Transport, conn ssh.Conn, newChannel ssh.NewChannel) {
+// sessionHandler handles the "session" channel.
+// Based on build flags, it may handle sftp, PTY channels and exec.
+// TODO: If "exec" is called, it may invoke http handlers and handle
+// internal console/logs
+func sessionHandler(ctx context.Context, ssht *Transport, conn *ssh.ServerConn, newChannel ssh.NewChannel) {
 	ch, reqs, _ := newChannel.Accept()
-	// Used for messages.
-	s := &session{
+
+	sess := &ptySession{
 		Channel: ch,
 		conn:    conn,
-		srv:     ssht,
 	}
-	go s.handleRequests(reqs)
+
+	// Requests are actively used.
+	// Extension: shell/exec can be called multiple times on a channel.
+	// Standard clients won't do this - no harm to skip an extra call.
+	go func() {
+		t0 := time.Now()
+		for req := range reqs {
+			switch req.Type {
+			// shell has no args, should run a default shell
+			// exec may be a command (/..) or may need to be evaluated.
+			case "shell", "exec":
+				// This is normally the last command in a channel.
+				// Env and pty are called first.
+				//
+				var payload = struct{ Value string }{}
+				ssh.Unmarshal(req.Payload, &payload)
+				sess.rawCmd = payload.Value
+				req.Reply(true, nil)
+
+				if conn.Permissions.Extensions["sub"] != "admin" {
+					go func() {
+						sess.Write([]byte("Dummy session"))
+						d := make([]byte, 1024)
+						for {
+							_, err := sess.Read(d)
+							if err != nil {
+								break
+							}
+						}
+						slog.Info("ssh_exec_log", "dur", time.Since(t0), "cmd", sess.rawCmd,
+							"type", req.Type)
+						exit(ch, 0)
+					}()
+					continue
+				}
+
+				go func() {
+					ssht.execHandler(sess)
+					slog.Info("ssh_exec", "dur", time.Since(t0), "cmd", sess.rawCmd,
+						"type", req.Type)
+					exit(ch, 0)
+				}()
+			case "subsystem":
+				subsystemHandler(req, conn, ch)
+			case "env":
+				var kv KV
+				// Typical: LANG
+				ssh.Unmarshal(req.Payload, &kv)
+				sess.env = append(sess.env, fmt.Sprintf("%s=%s", kv.Key, kv.Value))
+				req.Reply(true, nil)
+			default:
+				// Typical pty-req, only for shell ( no params)
+				sess.handleRequest(req)
+			}
+		}
+
+	}()
+}
+
+type KV struct {
+	Key, Value string
+}
+
+func exit(sess ssh.Channel, code int) error {
+	status := struct{ Status uint32 }{uint32(code)}
+	_, err := sess.SendRequest("exit-status", false, ssh.Marshal(&status))
+	if err != nil {
+		return err
+	}
+	return sess.Close()
 }
 
 func getExitStatusFromError(err error) int {
@@ -76,65 +139,18 @@ func getExitStatusFromError(err error) int {
 	return waitStatus.ExitStatus()
 }
 
-func setWinsize(f *os.File, w, h int) {
-	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
-		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
-}
-
-func handlePTY(cmd *exec.Cmd, s *session, ptyReq Pty, winCh <-chan Window) error {
-	if len(ptyReq.Term) > 0 {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
-	}
-
-	f, err := pty.Start(cmd)
-	if err != nil {
-		log.Println("failed to start pty session", err)
-		return err
-	}
-
-	go func() {
-		for win := range winCh {
-			setWinsize(f, win.Width, win.Height)
-		}
-	}()
-
-	go func() {
-		io.Copy(f, s) // stdin
-	}()
-
-	waitCh := make(chan struct{})
-	go func() {
-		defer close(waitCh)
-		io.Copy(s, f) // stdout
-	}()
-
-	if err := cmd.Wait(); err != nil {
-		log.Println("pty command failed while waiting", err)
-		return err
-	}
-
-	select {
-	case <-waitCh:
-		log.Println("stdout finished")
-	case <-time.NewTicker(1 * time.Second).C:
-		log.Println("stdout didn't finish after 1s")
-	}
-
-	return nil
-}
-
-func sendErrAndExit(s *session, err error) {
+func sendErrAndExit(s ssh.Channel, err error) {
 	msg := strings.TrimPrefix(err.Error(), "exec: ")
 	if _, err := s.Stderr().Write([]byte(msg)); err != nil {
 		log.Println("failed to write error back to session", err)
 	}
 
-	if err := s.Exit(getExitStatusFromError(err)); err != nil {
+	if err := exit(s, getExitStatusFromError(err)); err != nil {
 		log.Println(err, "pty session failed to exit")
 	}
 }
 
-func handleNoTTY(cmd *exec.Cmd, s *session) error {
+func handleNoTTY(cmd *exec.Cmd, s ssh.Channel) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Println(err, "couldn't get StdoutPipe")
@@ -192,245 +208,8 @@ func handleNoTTY(cmd *exec.Cmd, s *session) error {
 	return nil
 }
 
-type Signal string
-
-// Window represents the size of a PTY window.
-type Window struct {
-	Width  int
-	Height int
-}
-
-// Pty represents a PTY request and configuration.
-type Pty struct {
-	Term   string
-	Window Window
-	// HELP WANTED: terminal modes!
-}
-
-type session struct {
-	sync.Mutex
-	ssh.Channel
-	conn ssh.Conn
-
-	//handler           Handler
-	//subsystemHandlers map[string]SubsystemHandler
-	srv *Transport
-
-	handled bool
-	exited  bool
-
-	pty *Pty
-
-	winch chan Window
-	env   []string
-	//ptyCb             PtyCallback
-	rawCmd    string
-	subsystem string
-	sigCh     chan<- Signal
-	sigBuf    []Signal
-	breakCh   chan<- bool
-}
-
-func (sess *session) Write(p []byte) (n int, err error) {
-	if sess.pty != nil {
-		m := len(p)
-		// normalize \n to \r\n when pty is accepted.
-		// this is a hardcoded shortcut since we don't support terminal modes.
-		p = bytes.Replace(p, []byte{'\n'}, []byte{'\r', '\n'}, -1)
-		p = bytes.Replace(p, []byte{'\r', '\r', '\n'}, []byte{'\r', '\n'}, -1)
-		n, err = sess.Channel.Write(p)
-		if n > m {
-			n = m
-		}
-		return
-	}
-	return sess.Channel.Write(p)
-}
-
-func (sess *session) Exit(code int) error {
-	sess.Lock()
-	defer sess.Unlock()
-	if sess.exited {
-		return errors.New("Session.Exit called multiple times")
-	}
-	sess.exited = true
-
-	status := struct{ Status uint32 }{uint32(code)}
-	_, err := sess.SendRequest("exit-status", false, ssh.Marshal(&status))
-	if err != nil {
-		return err
-	}
-	return sess.Close()
-}
-
-func (sess *session) Pty() (Pty, <-chan Window, bool) {
-	if sess.pty != nil {
-		return *sess.pty, sess.winch, true
-	}
-	return Pty{}, sess.winch, false
-}
-
-func (sess *session) Signals(c chan<- Signal) {
-	sess.Lock()
-	defer sess.Unlock()
-	sess.sigCh = c
-	if len(sess.sigBuf) > 0 {
-		go func() {
-			for _, sig := range sess.sigBuf {
-				sess.sigCh <- sig
-			}
-		}()
-	}
-}
-
-func (sess *session) Break(c chan<- bool) {
-	sess.Lock()
-	defer sess.Unlock()
-	sess.breakCh = c
-}
-
-const maxSigBufSize = 128
-
-// handle requests on the "session" stream.
-func (sess *session) handleRequests(reqs <-chan *ssh.Request) {
-	t0 := time.Now()
-	for req := range reqs {
-		switch req.Type {
-		case "shell", "exec":
-			if sess.handled {
-				req.Reply(false, nil)
-				continue
-			}
-
-			var payload = struct{ Value string }{}
-			ssh.Unmarshal(req.Payload, &payload)
-			sess.rawCmd = payload.Value
-
-			//// If there's a session policy callback, we need to confirm before
-			//// accepting the session.
-			//if sess.sessReqCb != nil && !sess.sessReqCb(sess, req.Type) {
-			//	sess.rawCmd = ""
-			//	req.Reply(false, nil)
-			//	continue
-			//}
-
-			sess.handled = true
-			req.Reply(true, nil)
-
-			go func() {
-				sess.srv.execHandler(sess)
-				log.Println("exec Session done", time.Since(t0), sess.rawCmd)
-				sess.Exit(0)
-			}()
-		case "subsystem":
-			if sess.handled {
-				req.Reply(false, nil)
-				continue
-			}
-
-			var payload = struct{ Value string }{}
-			ssh.Unmarshal(req.Payload, &payload)
-			sess.subsystem = payload.Value
-
-			//// If there's a session policy callback, we need to confirm before
-			//// accepting the session.
-			//if sess.sessReqCb != nil && !sess.sessReqCb(sess, req.Type) {
-			//	sess.rawCmd = ""
-			//	req.Reply(false, nil)
-			//	continue
-			//}
-
-			if "sftp" == payload.Value {
-				sess.handled = true
-				req.Reply(true, nil)
-
-				go func() {
-					sftpHandler(sess)
-					sess.Exit(0)
-				}()
-			} else {
-				req.Reply(false, nil)
-				continue
-			}
-		case "env":
-			if sess.handled {
-				req.Reply(false, nil)
-				continue
-			}
-			var kv struct{ Key, Value string }
-			ssh.Unmarshal(req.Payload, &kv)
-			sess.env = append(sess.env, fmt.Sprintf("%s=%s", kv.Key, kv.Value))
-			req.Reply(true, nil)
-		case "signal":
-			var payload struct{ Signal string }
-			ssh.Unmarshal(req.Payload, &payload)
-			sess.Lock()
-			if sess.sigCh != nil {
-				sess.sigCh <- Signal(payload.Signal)
-			} else {
-				if len(sess.sigBuf) < maxSigBufSize {
-					sess.sigBuf = append(sess.sigBuf, Signal(payload.Signal))
-				}
-			}
-			sess.Unlock()
-		case "pty-req":
-			if sess.handled || sess.pty != nil {
-				req.Reply(false, nil)
-				continue
-			}
-			ptyReq, ok := parsePtyRequest(req.Payload)
-			if !ok {
-				req.Reply(false, nil)
-				continue
-			}
-			//if sess.ptyCb != nil {
-			//	ok := sess.ptyCb(sess.ctx, ptyReq)
-			//	if !ok {
-			//		req.Reply(false, nil)
-			//		continue
-			//	}
-			//}
-			sess.pty = &ptyReq
-			sess.winch = make(chan Window, 1)
-			sess.winch <- ptyReq.Window
-			defer func() {
-				// when reqs is closed
-				close(sess.winch)
-			}()
-			req.Reply(ok, nil)
-		case "window-change":
-			if sess.pty == nil {
-				req.Reply(false, nil)
-				continue
-			}
-			win, ok := parseWinchRequest(req.Payload)
-			if ok {
-				sess.pty.Window = win
-				sess.winch <- win
-			}
-			req.Reply(ok, nil)
-		//case agentRequestType:
-		//	// TODO: option/callback to allow agent forwarding
-		//	SetAgentRequested(sess.ctx)
-		//	req.Reply(true, nil)
-		case "break":
-			ok := false
-			sess.Lock()
-			if sess.breakCh != nil {
-				sess.breakCh <- true
-				ok = true
-			}
-			req.Reply(ok, nil)
-			sess.Unlock()
-		default:
-			// TODO: debug log
-			req.Reply(false, nil)
-		}
-	}
-}
-
 // Handle exec and shell commands.
-func (ssht *Transport) execHandler(s *session) {
+func (ssht *Transport) execHandler(s *ptySession) {
 	t0 := time.Now()
 	defer func() {
 		s.Close()
@@ -440,15 +219,17 @@ func (ssht *Transport) execHandler(s *session) {
 
 	cmd := ssht.buildCmd(s)
 
-	ptyReq, winCh, isPty := s.Pty()
-	if isPty {
-		if err := handlePTY(cmd, s, ptyReq, winCh); err != nil {
-			sendErrAndExit(s, err)
+	if true {
+		ok, err := s.handlePTY(cmd)
+		if ok {
+			if err != nil {
+				sendErrAndExit(s, err)
+				return
+			}
+
+			exit(s, 0)
 			return
 		}
-
-		s.Exit(0)
-		return
 	}
 
 	if err := handleNoTTY(cmd, s); err != nil {
@@ -456,31 +237,10 @@ func (ssht *Transport) execHandler(s *session) {
 		return
 	}
 
-	s.Exit(0)
+	exit(s, 0)
 }
 
-func sftpHandler(sess *session) {
-	debugStream := ioutil.Discard
-	serverOptions := []sftp.ServerOption{
-		sftp.WithDebug(debugStream),
-	}
-	server, err := sftp.NewServer(
-		sess,
-		serverOptions...,
-	)
-	if err != nil {
-		log.Printf("sftp server init error: %s\n", err)
-		return
-	}
-	if err := server.Serve(); err == io.EOF {
-		server.Close()
-		log.Println("sftp client exited session.")
-	} else if err != nil {
-		log.Println("sftp server completed with error:", err)
-	}
-}
-
-func (ssht Transport) buildCmd(s *session) *exec.Cmd {
+func (ssht *Transport) buildCmd(s *ptySession) *exec.Cmd {
 	var cmd *exec.Cmd
 
 	if len(s.rawCmd) == 0 {
@@ -493,53 +253,7 @@ func (ssht Transport) buildCmd(s *session) *exec.Cmd {
 	cmd.Env = append(cmd.Env, os.Environ()...)
 	cmd.Env = append(cmd.Env, s.env...)
 
-	//fmt.Println(cmd.String())
 	return cmd
-}
-
-func parsePtyRequest(s []byte) (pty Pty, ok bool) {
-	term, s, ok := parseString(s)
-	if !ok {
-		return
-	}
-	width32, s, ok := parseUint32(s)
-	if !ok {
-		return
-	}
-	height32, _, ok := parseUint32(s)
-	if !ok {
-		return
-	}
-	pty = Pty{
-		Term: term,
-		Window: Window{
-			Width:  int(width32),
-			Height: int(height32),
-		},
-	}
-	return
-}
-
-func parseWinchRequest(s []byte) (win Window, ok bool) {
-	width32, s, ok := parseUint32(s)
-	if width32 < 1 {
-		ok = false
-	}
-	if !ok {
-		return
-	}
-	height32, _, ok := parseUint32(s)
-	if height32 < 1 {
-		ok = false
-	}
-	if !ok {
-		return
-	}
-	win = Window{
-		Width:  int(width32),
-		Height: int(height32),
-	}
-	return
 }
 
 func parseString(in []byte) (out string, rest []byte, ok bool) {

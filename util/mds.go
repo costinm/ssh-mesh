@@ -9,8 +9,11 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/exp/slog"
 )
+
+const tokenFile = "/var/run/secrets/tokens/ssh/token"
 
 // POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/service-<GCP project number>@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken
 // Content-Type: application/json
@@ -25,8 +28,13 @@ import (
 func GetTokenAud(aud string) (string, error) {
 
 	// TODO: check well-known files
-	if _, err := os.Stat("/var/run/secrets/tokens/istio"); err == nil {
-		fmt.Printf("Istio token file exists\n")
+	if _, err := os.Stat(tokenFile); err == nil {
+		data, err := ioutil.ReadFile(tokenFile)
+		if err != nil {
+			log.Println("Failed to read token file", err)
+		} else {
+			return string(data), nil
+		}
 	}
 
 	t0 := time.Now()

@@ -12,6 +12,25 @@ import (
 
 var startupTime = time.Now()
 
+// MainStart is an opinionated startup - configures build in components.
+func MainStart() func(string) string {
+	jsh := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		AddSource: false,
+		Level:     slog.LevelDebug,
+	})
+	slog.SetDefault(slog.New(jsh))
+	return GetString
+}
+
+// Main config helper - base implementation for minimal deps CLI.
+//
+// Larger binaries should use viper - which provides support for:
+// - ini, json, yaml, java properties
+// - remote providers (with encryption) - built in etcd3, consul, firestore
+func GetString(key string) string {
+	return os.Getenv(key)
+}
+
 func MainEnd() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
