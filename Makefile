@@ -1,22 +1,9 @@
 include tools/common.mk
 
-#ROOT_DIR?=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
-#OUT?=${ROOT_DIR}/../out/cert-ssh
-
-
 # Base image -
 BASE_DEBUG?=ubuntu:bionic
 
 REGION?=us-central1
-
-# Where to push
-# For github:
-DOCKER_REPO?=ghcr.io/costinm/ssh-mesh
-#DOCKER_REPO?=costinm
-export DOCKER_REPO
-
-GOPROXY?=https://proxy.golang.org
-export GOPROXY
 
 all: all/sshd
 

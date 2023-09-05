@@ -42,3 +42,6 @@ jobs:
         name: push
         run:
           make deps all DOCKER_REPO=ghcr.io/costinm/ssh-mesh
+
+      - name: 'Dependency Review'
+        uses: actions/dependency-review-action@v3

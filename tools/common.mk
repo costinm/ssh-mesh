@@ -18,11 +18,18 @@ OUT?=${BUILD_DIR}/${REPO}
 GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build -ldflags '-s -w -extldflags "-static"' -o ${OUT}/
 
 # Requires docker login ghcr.io -u vi USERNAME -p TOKEN
-DOCKER_REPO?=ghcr.io/costinm
+DOCKER_REPO?=ghcr.io/costinm/${REPO}
+
 BASE_DISTROLESS?=gcr.io/distroless/static
 BASE_IMAGE?=debian:testing-slim
 
+# For github:
+#DOCKER_REPO?=costinm
 
+GOPROXY?=https://proxy.golang.org
+
+export GOPROXY
+export DOCKER_REPO
 export PATH:=$(PATH):${HOME}/go/bin
 
 echo:
@@ -49,6 +56,7 @@ TAG?=latest
 # - DOCKER_REPO - base for the docker, /CMD:tag will be added
 # - BASE_IMAGE - where to add the files.
 _crane_push:
+	env
 	(export SSHDRAW=$(shell cd ${OUT} && tar -cf - etc usr/local/bin/${CMD} ${PUSH_FILES} | \
 					  gcrane append -f - -b ${BASE_DEBUG} -t ${DOCKER_REPO}/${CMD}:${TAG} ) && \
 	gcrane mutate $${SSHDRAW} -t ${DOCKER_REPO}/${CMD}:${TAG} --entrypoint /usr/local/bin/${CMD} \
