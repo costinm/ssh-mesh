@@ -18,7 +18,7 @@ export DOCKER_REPO
 GOPROXY?=https://proxy.golang.org
 export GOPROXY
 
-all: build push/gate push/sshd
+all: all/sshd
 
 build: CMD=sshc
 build: _build
@@ -101,26 +101,23 @@ cr/wait:
 cr/echo:
 	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  -H "Content-Type: application/octet-stream" --data-binary @/dev/stdin  --output - ${CR_URL}/echo
 
-crssh:
+# SSH into the cludrun service
+cr/ssh:
 	ssh -o StrictHostKeyChecking=no  -J localhost:2222 sshc.${SSHD} -v
 
 # SSH to the CR service using a h2 tunnel.
 # Works if sshd is handling the h2 port, may forward to the app.
-# Useful if scaled to zero
-pcrssh:
+# Useful if scaled to zero, doesn't require maintaining an open connection (but random clone)
+cr/h2ssh:
 	ssh -o ProxyCommand="${HOME}/go/bin/h2t ${CR_URL}_ssh/tun" \
         -o StrictHostKeyChecking=no \
-         -o UserKnownHostsFile=/dev/null -o "SetEnv a=b" \
+        -o UserKnownHostsFile=/dev/null \
+        -o "SetEnv a=b" \
          sshc.${SSHD} -v
 
+# Using the test certs:
 #		-o "UserKnownHostsFile ssh/testdata/known-hosts" \
 #		-i ssh/testdata/id_ecdsa \
-
-# Use openssh client
-ssh/openssh-client:
-	ssh -v  -p 15022  \
-		-o StrictHostKeyChecking=no \
-		localhost env
 
 ssh:
 	 ssh -o StrictHostKeyChecking=no  -J localhost:2222 sshc.${SSHD} -v
