@@ -18,7 +18,7 @@ OUT?=${BUILD_DIR}/${REPO}
 GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build -ldflags '-s -w -extldflags "-static"' -o ${OUT}/
 
 # Requires docker login ghcr.io -u USERNAME -p TOKEN
-DOCKER_REPO?=ghcr.io/costinm/${REPO}
+DOCKER_REPO?=ghcr.io/costinm
 
 BASE_DISTROLESS?=gcr.io/distroless/static
 BASE_IMAGE?=debian:testing-slim
