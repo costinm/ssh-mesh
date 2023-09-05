@@ -1,13 +1,20 @@
 ROOT_DIR?=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 OUT?=${ROOT_DIR}/../out/cert-ssh
 
+-include ${HOME}/.local.mk
+
+
 BASE_DISTROLESS?=gcr.io/distroless/static
 
 # Base image -
 BASE_DEBUG?=ubuntu:bionic
 
+REGION?=us-central1
+
 # Where to push
+# For github:
 DOCKER_REPO?=ghcr.io/costinm/ssh-mesh
+#DOCKER_REPO?=costinm
 export DOCKER_REPO
 
 GOPROXY?=https://proxy.golang.org
@@ -15,74 +22,110 @@ export GOPROXY
 
 all: build push/gate push/sshd
 
-build:
+build: CMD=sshc
+build: _build
+
+build/sshd: CMD=sshd
+build/sshd: _build
+
+# Expected sizes:
+# v1:
+# - sshc 9.8M->6.6M
+# - sshd + h2c: 10.3/6.9
+
+# Build a command under cmd/CMD
+# Params:
+# - CMD
+#
+_build:
 	mkdir -p ${OUT}/etc/ssl/certs/
 	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
 	mkdir -p ${OUT}/usr/local/bin
-	#CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time
-	cd cmd/sshc && go build \
-		-o ${OUT}/usr/local/bin/ \
-		.
-
-#docker:
-#	docker build -t ${DOCKER_REPO}/sshd -f tools/docker/Dockerfile.sshd ${OUT}
-#	docker build -t ${DOCKER_REPO}/mesh -f tools/docker/Dockerfile.sshmesh ${OUT}
-#
-#push/docker:
-#	docker push ${DOCKER_REPO}/sshd
-#	docker push ${DOCKER_REPO}/gate
+	cd cmd/${CMD} && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 go build \
+		-o ${OUT}/usr/local/bin/ .
+	ls -l ${OUT}/usr/local/bin/${CMD}
+	strip ${OUT}/usr/local/bin/${CMD}
+	ls -l ${OUT}/usr/local/bin/${CMD}
 
 
+TAG?=latest
+
+# Push a docker image
+# Params:
+# - CMD
+# - PUSH_FILES - extras
+# - DOCKER_REPO - base, CMD:tag will be added
 _push:
-	(export SSHDRAW=$(shell cd ${OUT} && tar -cf - etc ${PUSH_FILES} | \
-					  gcrane append -f - -b ${BASE_DEBUG} \
-						-t ${DOCKER_REPO}/sshc:latest \
-					   ) && \
-	gcrane mutate $${SSHDRAW} --entrypoint /${PUSH_FILES} \
+	(export SSHDRAW=$(shell cd ${OUT} && tar -cf - etc usr/local/bin/${CMD} ${PUSH_FILES} | \
+					  gcrane append -f - -b ${BASE_DEBUG} -t ${DOCKER_REPO}/${CMD}:${TAG} ) && \
+	gcrane mutate $${SSHDRAW} -t ${DOCKER_REPO}/${CMD}:${TAG} --entrypoint /usr/local/bin/${CMD} \
 	)
 
-#	 && \
-#	\
-#	gcrane rebase --rebased ${DOCKER_REPO}/gate-distroless:latest \
-#	   --original $${SSHDRAW} \
-#	   --old_base ${BASE_DEBUG} \
-#	   --new_base ${BASE_DISTROLESS} \
-#	)
 
 # Append files to an existing container
-push/gate:
-	PUSH_FILES=usr/local/bin/sshc $(MAKE) _push
+push/sshc:
+	CMD=sshc $(MAKE) _push
+
+push/sshd:
+	CMD=sshd $(MAKE) _push
 
 # Push to a GCR repo for CR
-gcp/push: DOCKER_REPO=gcr.io/dmeshgate/sshmesh
-gcp/push: push
+# Using artifact registry - 0.5G free, 0.10/G after
 
-push: build push/gate
+#gcp/push: DOCKER_REPO=us-central1-docker.pkg.dev/${PROJECT_ID}/sshmesh
 
-#push/sshd:
-#	PUSH_FILES=usr/local/bin/sshd $(MAKE) _push
+push: build push/sshc
 
+all/sshd: build/sshd push/sshd
+
+# Replace the CR service
 cr/replace:
-	gcloud alpha run services replace manifests/cloudrun.yaml
+	DEPLOY=$(shell date) envsubst manifests/cloudrun.yaml | \
+     gcloud alpha run services replace -
+     # manifests/cloudrun.yaml
 
-cr: gcp/push cr/replace
+# Build, push to gcr.io, update the cloudrun service
+# Cloudrun requires gcr or artifact registry
+cr: DOCKER_REPO=gcr.io/${PROJECT_ID?}/sshmesh
+cr: all/sshd cr/replace
 
-REGION?=us-central1
 crauth:
 	gcloud run services add-iam-policy-binding  --region ${REGION} sshc  \
-      --member="user:costin@gmail.com" \
+      --member="user:${GCLOUD_USER}" \
       --role='roles/run.invoker'
 	gcloud run services add-iam-policy-binding  --region ${REGION} sshc  \
       --member="allUsers" \
       --role='roles/run.invoker'
 
 
-crcurl:
-	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)" https://sshc-yydsuf6tpq-uc.a.run.app/
+CR_URL?=$(shell gcloud run services --project ${PROJECT_ID} --region ${REGION} describe ${SERVICE} --format="value(status.address.url)")
+
+cr/info:
+cr/info:
+	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}/
+
+cr/key:
+	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}/_ssh/key
 
 
-crssh: crcurl
-	ssh -o StrictHostKeyChecking=no  -J localhost:2222 sshc.s.webinf.duckdns.org -v
+
+cr/wait:
+	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}/wait
+
+cr/echo:
+	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  -H "Content-Type: application/octet-stream" --data-binary @/dev/stdin  --output - ${CR_URL}/echo
+
+crssh:
+	ssh -o StrictHostKeyChecking=no  -J localhost:2222 sshc.${SSHD} -v
+
+# SSH to the CR service using a h2 tunnel.
+# Works if sshd is handling the h2 port, may forward to the app.
+# Useful if scaled to zero
+pcrssh:
+	ssh -o ProxyCommand="${HOME}/go/bin/h2t ${CR_URL}_ssh/tun" \
+        -o StrictHostKeyChecking=no \
+         -o UserKnownHostsFile=/dev/null -o "SetEnv a=b" \
+         sshc.${SSHD} -v
 
 #		-o "UserKnownHostsFile ssh/testdata/known-hosts" \
 #		-i ssh/testdata/id_ecdsa \
@@ -94,7 +137,7 @@ ssh/openssh-client:
 		localhost env
 
 ssh:
-	 ssh -o StrictHostKeyChecking=no  -J localhost:2222 sshc.s.webinf.duckdns.org -v
+	 ssh -o StrictHostKeyChecking=no  -J localhost:2222 sshc.${SSHD} -v
 
 
 ssh/keygen:
@@ -114,8 +157,6 @@ ssh/getcert:
 deps:
 	go install github.com/google/go-containerregistry/cmd/gcrane@latest
 
-PROJECT_ID?=dmeshgate
-CONFIG_PROJECT_ID?=dmeshgate
 WORKLOAD_NAMESPACE=sshc
 
 
@@ -148,3 +189,23 @@ gcp/setup:
 gcp/secret:
 	gcloud secrets create mesh --replication-policy="automatic"
 	gcloud secrets versions add mesh --data-file="/path/to/file.txt"
+
+# Helper to create a secret for the debug endpoint.
+init-keys:
+	mkdir -p ${OUT}/ssh
+	(cd ${OUT}/ssh; ssh-keygen -t ecdsa -f id_ecdsa -N "")
+	cp ${HOME}/.ssh/id_ecdsa.pub ${OUT}/ssh/authorized_keys
+
+WORKLOAD_NAMESPACE?=default
+
+k8s/secret: init-keys
+	kubectl -n ${WORKLOAD_NAMESPACE} delete secret sshdebug || true
+	kubectl -n ${WORKLOAD_NAMESPACE} create secret generic \
+ 		sshdebug \
+ 		--from-file=authorized_key=${OUT}/ssh/authorized_keys \
+ 		--from-file=cmd=cmd.json \
+ 		--from-file=ssd_config=sshd_config \
+ 		--from-file=id_ecdsa=${OUT}/ssh/id_ecdsa \
+ 		--from-file=id_ecdsa.pub=${OUT}/ssh/id_ecdsa.pub
+	rm -rf ${OUT}/ssh
+
