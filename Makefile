@@ -1,10 +1,8 @@
-ROOT_DIR?=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
-OUT?=${ROOT_DIR}/../out/cert-ssh
+include tools/common.mk
 
--include ${HOME}/.local.mk
+#ROOT_DIR?=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+#OUT?=${ROOT_DIR}/../out/cert-ssh
 
-
-BASE_DISTROLESS?=gcr.io/distroless/static
 
 # Base image -
 BASE_DEBUG?=ubuntu:bionic
@@ -48,26 +46,14 @@ _build:
 	ls -l ${OUT}/usr/local/bin/${CMD}
 
 
-TAG?=latest
-
-# Push a docker image
-# Params:
-# - CMD
-# - PUSH_FILES - extras
-# - DOCKER_REPO - base, CMD:tag will be added
-_push:
-	(export SSHDRAW=$(shell cd ${OUT} && tar -cf - etc usr/local/bin/${CMD} ${PUSH_FILES} | \
-					  gcrane append -f - -b ${BASE_DEBUG} -t ${DOCKER_REPO}/${CMD}:${TAG} ) && \
-	gcrane mutate $${SSHDRAW} -t ${DOCKER_REPO}/${CMD}:${TAG} --entrypoint /usr/local/bin/${CMD} \
-	)
 
 
 # Append files to an existing container
 push/sshc:
-	CMD=sshc $(MAKE) _push
+	CMD=sshc $(MAKE) _crane_push
 
 push/sshd:
-	CMD=sshd $(MAKE) _push
+	CMD=sshd $(MAKE) _crane_push
 
 # Push to a GCR repo for CR
 # Using artifact registry - 0.5G free, 0.10/G after
@@ -80,13 +66,13 @@ all/sshd: build/sshd push/sshd
 
 # Replace the CR service
 cr/replace:
-	DEPLOY=$(shell date) envsubst manifests/cloudrun.yaml | \
+	cat manifests/cloudrun.yaml | \
+	DEPLOY="$(shell date +%H%M)" envsubst | \
      gcloud alpha run services replace -
-     # manifests/cloudrun.yaml
 
 # Build, push to gcr.io, update the cloudrun service
 # Cloudrun requires gcr or artifact registry
-cr: DOCKER_REPO=gcr.io/${PROJECT_ID?}/sshmesh
+cr: DOCKER_REPO=gcr.io/${PROJECT_ID}/sshmesh
 cr: all/sshd cr/replace
 
 crauth:
@@ -153,9 +139,6 @@ ssh/getcert:
 
 	echo {\"public\":\"${CRT}\"} | \
  		grpcurl -plaintext  -d @   [::1]:8080 ssh.SSHCertificateService/CreateCertificate
-
-deps:
-	go install github.com/google/go-containerregistry/cmd/gcrane@latest
 
 WORKLOAD_NAMESPACE=sshc
 

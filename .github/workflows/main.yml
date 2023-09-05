@@ -9,19 +9,18 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
+  build-docker:
+    name: Build-in-docker
     runs-on: ubuntu-latest
     steps:
       -
         name: Checkout
         uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-      -
-        name: Set up Go
-        uses: actions/setup-go@v2
+
+      - uses: actions/setup-go@v2
         with:
           go-version: 1.21
+
       -
         name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v2
@@ -32,14 +31,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  build-docker:
-    name: Build-in-docker
-    runs-on: ubuntu-latest
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v2
-
       -
         name: Login to GitHub Container Registry
         uses: docker/login-action@v1
@@ -49,6 +40,5 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       -
         name: push
-        uses:  gcr.io/wlhe-cr/crm-builder@latest
         run:
-          make all DOCKER_REPO=ghcr.io/costinm/ssh-mesh
+          make deps all DOCKER_REPO=ghcr.io/costinm/ssh-mesh

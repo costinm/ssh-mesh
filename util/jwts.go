@@ -3,10 +3,11 @@ package util
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/coreos/go-oidc"
 )
@@ -70,26 +71,43 @@ type k8sClaims struct {
 	Namespace string
 }
 
+type jwtRaw struct {
+	Iss string `json:"iss,omitempty"`
+}
+
 func CheckJwt(password string) (tok string, e error) {
 	// Validate a JWT as password.
 	// Alternative: JWKS_URL and NewRemoteKeySet
 	// TODO: init at startup, reuse
-	for _, verifier := range jwtProviders {
-		idt, err := verifier.Verify(context.Background(), string(password))
-		if err == nil {
-			// claims - tricky to extract
-			j, _ := parseJWT(string(password))
-			claims := &k8sClaims{}
-			idt.Claims(claims)
-			slog.Info("AuthJwt", "token", j, "iss", idt.Issuer,
-				"aud", idt.Audience, "sub", idt.Subject,
-				"err", err, "claims", claims) // , "tok", string(password))
-
-			return idt.Subject, nil
-		} else {
-			slog.Info("JWT failed", err, time.Now())
-			e = err
-		}
+	body, err := parseJWT(password)
+	if err != nil {
+		return "", err
 	}
+	var jwtRaw jwtRaw
+	err = json.Unmarshal(body, &jwtRaw)
+	if err != nil {
+		return "", err
+	}
+	verifier := jwtProviders[jwtRaw.Iss]
+	if verifier == nil {
+		return "", errors.New("Unknown issuer " + jwtRaw.Iss)
+	}
+	//	for _, verifier := range jwtProviders {
+	idt, err := verifier.Verify(context.Background(), string(password))
+	if err == nil {
+		// claims - tricky to extract
+		j, _ := parseJWT(string(password))
+		claims := &k8sClaims{}
+		idt.Claims(claims)
+		slog.Info("AuthJwt", "token", j, "iss", idt.Issuer,
+			"aud", idt.Audience, "sub", idt.Subject,
+			"err", err, "claims", claims) // , "tok", string(password))
+
+		return idt.Subject, nil
+	} else {
+		slog.Info("JWT failed", "error", err, "pass", password)
+		e = err
+	}
+	//}
 	return
 }
