@@ -17,7 +17,7 @@ OUT?=${BUILD_DIR}/${REPO}
 # Debian 11 is based on 2.31, testing is 2.36
 GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build -ldflags '-s -w -extldflags "-static"' -o ${OUT}/
 
-# Requires docker login ghcr.io -u vi USERNAME -p TOKEN
+# Requires docker login ghcr.io -u USERNAME -p TOKEN
 DOCKER_REPO?=ghcr.io/costinm/${REPO}
 
 BASE_DISTROLESS?=gcr.io/distroless/static
