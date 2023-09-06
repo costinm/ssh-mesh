@@ -12,6 +12,9 @@ jobs:
   build-docker:
     name: Build-in-docker
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       -
         name: Checkout
