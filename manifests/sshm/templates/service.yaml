@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 15022
+      name: ssh-mesh
+    - port: 22
+      name: ssh
+      targetPort: 15022
+    - port: 80
+      name: http
+      targetPort: 15080
+    - port: 443
+      name: https
+    - port: 15443
+      name: http2
+  selector:
+    app:  {{ .Release.Name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+  name: {{ .Release.Name }}-ilb
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 22
+      name: ssh
+      targetPort: 2222
+    - port: 80
+      name: http
+      targetPort: 8080
+    - port: 443
+      name: https
+      targetPort: 8443
+  selector:
+    app: {{ .Release.Name }}
+---

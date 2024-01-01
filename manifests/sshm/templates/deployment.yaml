@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: {{ .Release.Name }}
   labels:
-    app: sshc
+    app: {{ .Release.Name }}
 spec:
   replicas: 1
   strategy:
@@ -12,11 +12,11 @@ spec:
       maxUnavailable: 1
   selector:
     matchLabels:
-      app: sshc
+      app: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        app: sshc
+        app: {{ .Release.Name }}
         sidecar.istio.io/inject: "false"
     spec:
       serviceAccountName: default
@@ -29,13 +29,15 @@ spec:
             name: http2
           - containerPort: 15022
             name: ssh
-          args:
-            - /usr/local/bin/sshc
+          #args:
+          #  - /usr/local/bin/sshd
           env:
-            - name: SSHD
-              value: s.webinf.duckdns.org:2222
+{{/*            - name: SSHD*/}}
+{{/*              value: s.webinf.duckdns.org:2222*/}}
+{{/*            - name: CFG_DIR*/}}
+{{/*              value: "/var/run/sshd"*/}}
             - name: SSH_AUTHORIZED_KEY
-              value: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15"
+              value: {{ .Values.sshOwner }}
             - name: GOTRACEBACK
               value: "all"
           resources:
@@ -43,6 +45,9 @@ spec:
               cpu: 10m
               memory: 256Mi
           volumeMounts:
+            - name: sshm
+              mountPath: /var/run/secrets/sshm
+              readOnly: false
             - name: jwt-ssh-ca
               mountPath: /var/run/secrets/tokens/ssh
               readOnly: true
@@ -60,14 +65,20 @@ spec:
             defaultMode: 420
             sources:
               - serviceAccountToken:
-                  audience: ssh-ca
+                  audience: ssh://ca
                   expirationSeconds: 43200
                   path: token
+
+        - name: sshm
+          configMap:
+            name: sshd
+            optional: true
 
         - name: rootkey
           secret:
             secretName: ssh-ca
-            optional: false
+            optional: true
+
         - name: mesh
           secret:
             secretName: mesh

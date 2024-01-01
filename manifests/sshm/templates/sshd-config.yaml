@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sshd
+data:
+  id_ecdsa: |
+    {{genPrivateKey "ecdsa" | b64enc }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sshd
+data:
+  sshm.json: |
+    {  "caDir": "/var/run/secrets/ssh-ca",
+       "issuers": [
+        "https://accounts.google.com",
+        "https://container.googleapis.com/v1/projects/costin-asm1/locations/us-central1-c/clusters/big1"
+      ],
+      "owner_key": [
+        "{{.Values.sshOwner}}"
+      ],
+      "port": 15022,
+      "trustDomain": "{{ .Values.domain }}"
+    }
+
+  sshd_config: |
+
+    # ["/usr/sbin/sshd","-f", "/var/run/secrets/sshd/sshd_config", "-e", "-D"]
+    Port 15022
+    AddressFamily any
+    ListenAddress 0.0.0.0
+    ListenAddress ::
+    Protocol 2
+    LogLevel INFO
+
+    HostKey /var/run/secrets/sshd/id_ecdsa
+
+    PermitRootLogin yes
+
+    AuthorizedKeysFile	/var/run/secrets/sshd/authorized_keys
+
+    PasswordAuthentication no
+    PermitUserEnvironment yes
+
+    AcceptEnv LANG LC_*
+    PrintMotd no
+
+    Subsystem	sftp	/usr/lib/openssh/sftp-server
+
+---

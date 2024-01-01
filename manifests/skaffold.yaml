@@ -2,32 +2,69 @@ apiVersion: skaffold/v2beta19
 kind: Config
 metadata:
   name: ssh-mesh
-#build:
-#  artifacts:
-#  - image: gcr.io/dmeshgate/sshc
-#    context: ..
-#    custom:
-#      buildCommand: make build gcp/push
-#      dependencies:
-#        paths:
-#        - sshc/**
-#        - manifests/sshd/**
+build:
+  local:
+    push: true
+
+  artifacts:
+    # ghcr.io doesn't work in some places.
+    # The github actions will create images there too.
+    - image: docker.io/costinm/sshm
+      context: ..
+      custom:
+        buildCommand: DOCKER_REPO=docker.io/costinm make all/sshm
+        dependencies:
+          paths:
+            - cmd/**
+            - sshd/*.go
+            - manifests/sshm/**
+    - image: docker.io/costinm/sshc
+      #image: gcr.io/dmeshgate/sshc
+      context: ..
+      custom:
+        buildCommand: DOCKER_REPO=docker.io/costinm make all/sshc
+        dependencies:
+          paths:
+          - cmd/**
+          - sshd/*.go
+          - manifests/sshm/**
 deploy:
   helm:
     releases:
-    - name: sshc
-      chartPath: sshc
-      #artifactOverrides:
-      #  image: gcr.io/dmeshgate/sshc:latest
+      - name: sshd
+        chartPath: sshm
+        setValueTemplates:
+          image: "{{.IMAGE_FULLY_QUALIFIED_docker_io_costinm_sshm}}"
 
-      namespace: sshc
-      createNamespace: true
+        #artifactOverrides:
+        #  image: gcr.io/dmeshgate/sshc:latest
+        namespace: istio-system
+        createNamespace: true
+
+profiles:
+  - name: home
+    deploy:
+      helm:
+        releases:
+          - name: sshd
+            chartPath: sshm
+            namespace: istio-system
+            createNamespace: true
+  - name: gcp1
+    deploy:
+      helm:
+        releases:
+          - name: sshd
+            chartPath: sshm
+            namespace: istio-system
+            createNamespace: true
+
 #portForward:
 #- resourceType: deployment
-#  resourceName: ssh-ca
-#  namespace: ssh-ca
-#  port: 8080
-#  localPort: 14021
+#  resourceName: sshd
+#  namespace: istio-system
+#  port: 15022
+#  localPort: 14022
 #- resourceType: deployment
 #  resourceName: ssh-ca
 #  namespace: ssh-ca

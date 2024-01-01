@@ -1,0 +1,10 @@
+
+# helm upgrade --install --create-namespace sshca --namespace sshca manifests/ssh-ca/
+
+#image: gcr.io/dmeshgate/sshmesh/sshc:latest
+#image: ghcr.io/costinm/ssh-mesh/sshc:latest
+image: costinm/sshm:latest
+image.client: costinm/sshc:latest
+
+sshOwner: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15"
+domain: "sshmesh.duckdns.org"
