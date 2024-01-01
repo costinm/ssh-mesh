@@ -5,13 +5,23 @@ BASE_DEBUG?=ubuntu:bionic
 
 REGION?=us-central1
 
-all: all/sshd
+all: all/sshm all/sshc
 
-build: CMD=sshc
-build: _build
+build: build/sshc build/sshm
 
-build/sshd: CMD=sshd
-build/sshd: _build
+build/sshc: CMD=sshc
+build/sshc:
+	mkdir -p ${OUT}
+	(cd cmd && ${GOSTATIC} -o ${OUT}/sshc ./sshc)
+
+build/sshm: CMD=sshm
+build/sshm:
+	mkdir -p ${OUT}
+	(cd cmd && ${GOSTATIC} -o ${OUT}/${CMD} ./sshm)
+	ls -l ${OUT}/${CMD}
+	strip ${OUT}/${CMD}
+	ls -l ${OUT}/${CMD}
+
 
 # Expected sizes:
 # v1:
@@ -26,8 +36,7 @@ _build:
 	mkdir -p ${OUT}/etc/ssl/certs/
 	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
 	mkdir -p ${OUT}/usr/local/bin
-	cd cmd/${CMD} && CGO_ENABLED=0  GOOS=linux GOARCH=amd64 go build \
-		-o ${OUT}/usr/local/bin/ .
+	cd cmd/${CMD} && ${GOSTATIC} -o ${OUT}/usr/local/bin/${CMD} .
 	ls -l ${OUT}/usr/local/bin/${CMD}
 	strip ${OUT}/usr/local/bin/${CMD}
 	ls -l ${OUT}/usr/local/bin/${CMD}
@@ -37,19 +46,20 @@ _build:
 
 # Append files to an existing container
 push/sshc:
-	CMD=sshc $(MAKE) _crane_push
+	$(MAKE) _push BIN=sshc BASE_IMAGE=${BASE_DISTROLESS} GIT_REPO=ssh-mesh
 
-push/sshd:
-	CMD=sshd $(MAKE) _crane_push
+push/sshm:
+	$(MAKE) _push BIN=sshm BASE_IMAGE=${BASE_DISTROLESS} GIT_REPO=ssh-mesh
 
 # Push to a GCR repo for CR
 # Using artifact registry - 0.5G free, 0.10/G after
 
 #gcp/push: DOCKER_REPO=us-central1-docker.pkg.dev/${PROJECT_ID}/sshmesh
 
-push: build push/sshc
+push: push/sshc push/sshm
 
-all/sshd: build/sshd push/sshd
+all/sshm: build/sshm push/sshm
+all/sshc: build/sshc push/sshc
 
 # Replace the CR service
 cr/replace:
@@ -60,7 +70,7 @@ cr/replace:
 # Build, push to gcr.io, update the cloudrun service
 # Cloudrun requires gcr or artifact registry
 cr: DOCKER_REPO=gcr.io/${PROJECT_ID}/sshmesh
-cr: all/sshd cr/replace
+cr: all/sshm cr/replace
 
 crauth:
 	gcloud run services add-iam-policy-binding  --region ${REGION} sshc  \
@@ -75,7 +85,7 @@ CR_URL?=$(shell gcloud run services --project ${PROJECT_ID} --region ${REGION} d
 
 cr/info:
 cr/info:
-	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}/
+	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}
 
 cr/key:
 	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}/_ssh/key
@@ -98,7 +108,6 @@ cr/ssh:
 cr/h2ssh:
 	ssh -o ProxyCommand="${HOME}/go/bin/h2t ${CR_URL}_ssh/tun" \
         -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
         -o "SetEnv a=b" \
          sshc.${SSHD} -v
 
