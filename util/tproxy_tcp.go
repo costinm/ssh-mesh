@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"syscall"
@@ -41,7 +42,8 @@ func ListenTProxy(network string, laddr *net.TCPAddr) (*net.TCPListener, error) 
 	defer fileDescriptorSource.Close()
 
 	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
-		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
+		slog.Info("Tproxy disabled", "err", err)
+		//return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
 	}
 
 	return listener, nil
@@ -51,7 +53,7 @@ func IptablesCapture(addr string, ug func(nc net.Conn, dest, la *net.TCPAddr)) e
 	na, err := net.ResolveTCPAddr("tcp", addr)
 	nl, err := ListenTProxy("tcp", na)
 	if err != nil {
-		log.Println("Failed to listen", err)
+		log.Println("Failed to capture tproxy", err)
 		return err
 	}
 	for {

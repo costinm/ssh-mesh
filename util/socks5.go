@@ -104,7 +104,7 @@ func Sock5Capture(addr string, cb func(s *Socks, c net.Conn)) (net.Listener, err
 			brin := NewBufferReader(c)
 			HandleSocks(brin, s, c)
 			//
-			cb(s, c)
+			go cb(s, c)
 		}
 	}()
 

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Statistics for streams and hosts
+// Stats holds telemetry for a stream or peer.
 type Stats struct {
 	Open time.Time
 
@@ -27,8 +27,9 @@ type Stats struct {
 	RcvdPackets int
 }
 
+// StreamState provides metadata around a stream.
+//
 // Stream is a net.Conn with metadata.
-// Stream state has metadata about the stream - outside of headers.
 type StreamState struct {
 	// Stream MuxID - odd for streams initiated from server (push and reverse)
 	// Unique withing a mux connection.
@@ -58,6 +59,7 @@ type StreamState struct {
 
 type StreamHttpServer struct {
 	StreamState
+
 	Request        *http.Request
 	TLS            *tls.ConnectionState
 	ResponseWriter http.ResponseWriter

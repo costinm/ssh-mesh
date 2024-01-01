@@ -1,1 +1,0 @@
-["/usr/sbin/sshd","-f", "/var/run/secrets/sshd/sshd_config", "-e", "-D"]
