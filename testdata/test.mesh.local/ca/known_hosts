@@ -1,0 +1,3 @@
+
+@cert-authority * ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCF2VAJ6LKzapahP5jaR/syCIhOMi127IoRcO/WQUJD3reYD47huen//JwQCtY+x7NDf1/C4Oxx+1enRjONfud0= ca.test.mesh.local
+

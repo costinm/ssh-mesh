@@ -1,0 +1,16 @@
+Port 15022
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+Protocol 2
+LogLevel INFO
+HostKey /sshm/ssh_host_ecdsa_key
+TrustedUserCAKeys /sshm/ssh_user_key.pub
+AuthorizedKeysFile	/sshm/authorized_keys
+PermitRootLogin yes
+PasswordAuthentication no
+UsePAM no
+PermitUserEnvironment yes
+AcceptEnv LANG LC_*
+PrintMotd no
+Subsystem	sftp	/usr/lib/openssh/sftp-server

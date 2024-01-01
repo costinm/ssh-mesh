@@ -1,100 +1,141 @@
 package main
 
 import (
+	"context"
 	"log"
 	"log/slog"
-	"net/http"
+	"net"
 	"os"
-	"strconv"
-	"strings"
+	"time"
 
-	"github.com/costinm/ssh-mesh/sshc"
-	"github.com/costinm/ssh-mesh/sshd"
+	sshd "github.com/costinm/ssh-mesh"
+	"github.com/costinm/ssh-mesh/sshdebug"
 	"github.com/costinm/ssh-mesh/util"
-
-	"golang.org/x/crypto/ssh"
 )
 
 // Connect to a SSH server and keeps the connection alive.
-// Sish is one such server, providing a lot of interesting features.
-// Works with regular sshd - but only for one connection, since it'll forward
-// remote port 22.
 //
-// Can optionally start a local sshd server, with sshfs included.
+// Works with regular sshd - but only one client can do a remote forward for port
+// 22/80/443.
 //
-// Can optionally start a jump host/server, using same protocol.
+// The ssh-mesh (and sish, others) servers will multiplex 22, 80 and 443, allowing
+// a remote to open a connection to the client workload.
 //
-// Equivalent with
+// Can optionally start a local sshd server, with sshfs included, allowing debug
+// access for a specific admin identity.
+//
+// Can optionally start a local jump host/server, for accessing other local ports,
+// for networking or debug.
+//
+// # The ssh-mesh server also accepts JWTs instead of passwords, Equivalent with
+//
 // SSH_ADKPASS_REQUIRE=force
-// SSH_ASKPASS=gcloud auth print-identity-token $GSA --audiences=https://host
+// SSH_ASKPASS=gcloud auth print-identity-token $GSA --audiences=https://$HOST
+// ssh $HOST -R ... -L ...
 func main() {
-	configF := util.MainStart()
+	cfg := &sshd.SSHConfig{}
+	util.MainStart("sshmc", cfg)
 
-	var pubk ssh.PublicKey
-	authca := configF("SSH_AUTHORIZED_CA")
-	if authca != "" {
-		pubk, _, _, _, _ = ssh.ParseAuthorizedKey([]byte(authca))
+	if cfg.SocksAddr == "" {
+		cfg.SocksAddr = "127.0.0.1:14080"
 	}
+	if cfg.TProxyAddr == "" {
+		cfg.TProxyAddr = ":14001"
+	}
+	if cfg.Address == "" {
+		cfg.Address = ":14022"
+	}
+	if cfg.SSHD == "" {
+		cfg.SSHD = os.Getenv("SSHD")
+	}
+	EnvSSH(cfg)
+
+	// TODO: if key and certs are missing in config but a URL is specified, fetch the private key and certs
+	// ( a 'metadata' bootstrap/launcher should be run first to get all secret and config bits )
+
+	// Transport handles both server and client.
+	// Will auto generate key if not set.
+	st, err := sshd.NewSSHMesh(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx := context.Background()
 
 	// Server providing reverse tunneling and jump host.
-	addr := configF("SSHD")
-	if addr != "" {
-		sshc, err := sshc.NewSSHC(&sshc.SSHClientConf{})
-		if err != nil {
-			log.Fatal(err)
-		}
-		// If not set - skip checking the host key. This is normally very dangerous,
-		// but ok if we're just forwarding encrypted connections ( a jump host ).
+	if cfg.SSHD != "" {
 		// TODO: list of ssh servers for redundancy
-		// TODO: use https to fetch the server public key
-		if pubk != nil {
-			sshc.AuthorizedCA = append(sshc.AuthorizedCA, pubk)
-		}
-		go sshc.StayConnected(addr)
-	}
-
-	// Default is to start a sshd on 15022.
-	st, err := sshd.NewSSHTransport(&sshd.TransportConfig{})
-
-	sshdPort := configF("SSHD_PORT")
-	if sshdPort != "" {
-		p, _ := strconv.Atoi(sshdPort)
-		st.Port = p
+		sshc, err := st.Client(ctx, cfg.SSHD)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		iss := configF("SSHD_ISSUERS")
-		util.InitJWT(strings.Split(iss, ","))
-
-		// Add the authorized keys for incoming SSH
-		authc := configF("SSH_AUTHORIZED_KEY")
-		if authc != "" {
-			st.AddAuthorized(authc)
-		}
-
-		// Add authorized CA users
-		if pubk != nil {
-			st.AuthorizedCA = append(st.AuthorizedCA, pubk)
-		}
-
-		go st.Start()
+		go sshc.StayConnected(cfg.SSHD)
 	}
 
-	// Start a small http server, for status.
-	// Tunneling of h2 or ws: different project or extension (ugate?), too many deps.
-	haddr := configF("SSHD_HTTP")
-	if haddr != "" {
+	// Start internal SSHD/SFTP, only admin can connect.
+	// Better option is to install dropbear and start real sshd.
+	// Will probably remove this - useful for static binary
+	st.ChannelHandlers["session"] = sshdebug.SessionHandler
+
+	// Start a SSH mesh node. This allows other authorized local nodes to jump and a debug
+	// interface.
+	_, err = st.Start()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// TODO: based on config, forward few local ports.
+
+	// Client connections forwarded - similar to -D
+
+	util.Sock5Capture(cfg.SocksAddr, func(s *util.Socks, c net.Conn) {
+		t0 := time.Now()
+		dest := s.Dest
+		if dest == "" {
+			dest = s.DestAddr.String()
+		}
+		pp, err := st.Proxy(ctx, dest, c)
+		if err != nil {
+			slog.Info("SocksDialError", "err", err, "dest", dest)
+		}
+
 		go func() {
-			mux := http.NewServeMux()
-			st.InitMux(mux)
-			http.ListenAndServe(haddr, mux)
+			pp.ProxyTo(c)
+			slog.Info("socks",
+				"to", dest,
+				"dur", time.Since(t0),
+				//"dial", pp.sch.RemoteAddr(),
+				"in", pp.InBytes,
+				"out", pp.OutBytes,
+				"ierr", pp.InErr,
+				"oerr", pp.OutErr)
 		}()
-	}
 
-	// Log the start
-	hn, _ := os.Hostname()
-	slog.Info("sshd-start", "hostaddr", haddr,
-		"sshd", addr, "hostname", hn, "env", os.Environ())
+	})
+
+	// Same for TProxy
+	util.IptablesCapture(cfg.TProxyAddr, func(c net.Conn, destA, la *net.TCPAddr) {
+		ctx := context.Background()
+		t0 := time.Now()
+		dest := destA.String()
+		pp, err := st.Proxy(ctx, dest, c)
+		if err != nil {
+			slog.Info("TProxyDialError", "err", err, "dest", dest)
+		}
+
+		go func() {
+			pp.ProxyTo(c)
+			slog.Info("socks",
+				"to", dest,
+				"dur", time.Since(t0),
+				//"dial", pp.sch.RemoteAddr(),
+				"in", pp.InBytes,
+				"out", pp.OutBytes,
+				"ierr", pp.InErr,
+				"oerr", pp.OutErr)
+		}()
+	})
+
+	// TODO: debug trace
 	util.MainEnd()
 }

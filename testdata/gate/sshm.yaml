@@ -1,0 +1,16 @@
+# Commented config file.
+
+GCE_METADATA_HOST: 127.0.0.1:15014
+
+owner_key:
+  - ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15
+
+issuers:
+  - https://accounts.google.com
+  - https://container.googleapis.com/v1/projects/costin-asm1/locations/us-central1-c/clusters/big1
+
+port: 2223
+
+caDir: /home/costin/.ssh/
+
+trustDomain: s.webinf.duckdns.org
