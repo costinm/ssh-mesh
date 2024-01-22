@@ -5,13 +5,33 @@ import (
 	"io/ioutil"
 	"log"
 
-	"github.com/pkg/sftp"
+	"github.com/costinm/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
-// The 'sftp' package is a great client - but the server is quite limited. No good way to chroot or use a specific
-// base dir, generate dynamic files, control access, UIDs, etc.
-// Better option is to just install dropbear or openssh binaries for servers - or use 9p or nfs over a tunnel.
+/*
+The 'sftp' package is a great client - but the server is quite limited. No good way to chroot or use a specific
+base dir, generate dynamic files, control access, UIDs, etc.
+Better option is to just install dropbear or openssh binaries for servers - or use 9p or nfs over a tunnel.
+
+Fork: add base dir
+
+Low level interface: os.Stat, os.File, etc
+Alternatives: io/fs/Fs() -
+
+Client side: https://github.com/kubernetes/kops/blob/master/util/pkg/vfs/sshfs.go
+https://github.com/kubernetes/kops/blob/master/util/pkg/vfs/vfs.go - as a VFS interface for k8s
+
+6-year old https://github.com/nxsre/sshfs-go - FUSE client
+
+On WRT or linux - can use openssh-sftp-server ( no dropbear equivalent )
+opkg install openssh-sftp-server
+
+Note: openssh client for scp uses sftp, needs "-O" for old scp.
+
+SCP is based on BSD RCP. It is based on 'exec scp'. No dir listing.
+
+*/
 
 // TODO: remove
 

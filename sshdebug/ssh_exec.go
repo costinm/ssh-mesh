@@ -45,7 +45,7 @@ func SessionHandler(ctx context.Context, sconn *sshd.SSHSMux, newChannel ssh.New
 	ssht := sconn.SSHServer
 	conn := sconn.ServerConn
 
-	isOwner := conn.Permissions.Extensions["sub"] == "admin"
+	isOwner := conn.Permissions.Extensions["role"] == "admin"
 
 	env := []*KV{}
 

@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -26,7 +25,13 @@ type SSHCMux struct {
 	Mux
 	*SSHConfig
 
-	*Dest
+	// If set, a persistent connection will be maintained and
+	// - mux reverseForwards registered for 22, 80, 443
+	// - accept streams and trust auth
+	Waypoint bool
+
+	// TODO: CIDR/Networks
+	ReverseForwards map[string]string
 
 	LastConnected time.Time
 
@@ -46,11 +51,20 @@ type SSHCMux struct {
 
 	// Last received remote key (should be a Certificate)
 	RemoteKey ssh.PublicKey
+	mds       *util.MDS
 }
 
 // Dial opens one SSH connection to addr.
 // It blocks until the handshake is done.
 func (sc *SSHCMux) Dial(ctx context.Context, addr string) error {
+	if strings.HasPrefix(addr, "https://") {
+		tcon, err := util.NewStreamH2(ctx, addr, "localhost:15022", sc.mds)
+		if err != nil {
+			return err
+		}
+		return sc.DialConn(ctx, tcon, addr)
+	}
+
 	tcon, err := net.Dial("tcp", addr)
 	if err != nil {
 		return err
@@ -65,27 +79,13 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 		sc.Id = "jwt"
 	}
 
-	mdsBase := os.Getenv("GCE_METADATA_HOST")
-	if mdsBase == "" {
-		mdsBase = "169.254.169.254"
+	if sc.SignerClient == nil {
+		return errors.New("Invalid client key")
 	}
-	if !strings.Contains(mdsBase, "/") {
-		mdsBase = "http://" + mdsBase + "/computeMetadata/v1/"
-	}
-	mds := &util.MDS{
-		MDSBase: mdsBase,
-		Client:  http.DefaultClient,
-	}
+
 
 	clientCfg := &ssh.ClientConfig{
 		Auth: []ssh.AuthMethod{
-			ssh.PasswordCallback(func() (secret string, err error) {
-				t, err := mds.GetTokenAud("ssh://" + addr)
-				if err != nil {
-					return "", err
-				}
-				return t, nil
-			}),
 			ssh.PublicKeys(sc.SignerClient),
 		},
 		Config: ssh.Config{},
@@ -109,6 +109,16 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 			slog.Info("SSHC rejected host", "host", hostname, "addr", remote, "key", key)
 			return errors.New("Server not authenticated")
 		},
+	}
+
+	if sc.mds != nil {
+		clientCfg.Auth = append(clientCfg.Auth, ssh.PasswordCallback(func() (secret string, err error) {
+			t, err := sc.mds.GetToken(ctx, "ssh://" + addr)
+			if err != nil {
+				return "", err
+			}
+			return t, nil
+		}))
 	}
 
 	cc, chans, reqs, err := ssh.NewClientConn(tcon, addr, clientCfg)

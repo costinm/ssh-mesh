@@ -1,8 +1,8 @@
 {
-  "GCE_METADATA_HOST": "http://127.0.0.1:15014/computeMetadata/v1/",
-  "issuers": [
-    "https://accounts.google.com",
-    "https://container.googleapis.com/v1/projects/costin-asm1/locations/us-central1-c/clusters/big1"
+  "token_source": "http://127.0.0.1:15014/computeMetadata/v1/",
+  "trust": [
+    {"issuer":"https://accounts.google.com"},
+    {"issuer":"https://container.googleapis.com/v1/projects/costin-asm1/locations/us-central1-c/clusters/big1"}
   ],
   "owner_key": [
     "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15"

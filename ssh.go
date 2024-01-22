@@ -13,7 +13,6 @@ import (
 	"log"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -30,122 +29,7 @@ import (
 // verify the key by fetching it from github.com/keys/USER.key
 // Further with SSH we can treat the key as a signer for derived keys (CA).
 
-type Dest struct {
-	// Addr is a FQDN with optional port.
-	// The server is expected to have a SSH certificate for this name,
-	// and may have this a DNS as well.
-	Addr string
 
-	VIP string
-
-	// If set, a persistent connection will be maintained and
-	// - mux reverseForwards registered for 22, 80, 443
-	// - accept streams and trust auth
-	Waypoint bool
-
-	// If set, this service will be used for egress to the list of
-	// address suffixes - it is an east-west gateway.
-	// If "*" is the only value, it is a default egress gateway.
-	Egress []string
-
-	// TODO: CIDR/Networks
-	ReverseForwards map[string]string
-
-	// Forwards include the explicit port reverseForwards (-L)
-	Forwards map[string]string
-}
-
-// Endpoints maps workload or LB addresses to a service name.
-// This is used instead of DNS - may be loaded from K8S EndpointSlices
-// or XDS.
-type Endpoints struct {
-	// FQDN of the destination (Dest), as set in certificates.
-	Service string
-
-	// IP:ports or hostnames or backend services implementing the service.
-	Addr []string
-}
-
-// SSHConfig is the configuration for the SSH mesh node.
-//
-// Regular ssh has configs scattered in multiple places and in
-// special formats. This combines all configs in a struct that is
-// easier to handle in a k8s Secret or env variable passed to a container.
-type SSHConfig struct {
-
-	// Mesh identity is mapped to a FQDN based on 'id, namespace, domain'
-	// They default to $(hostname), default, mesh.internal.
-	Id        string `json:"id,omitempty"`
-	Namespace string `json:"ns,omitempty"`
-	Domain    string `json:"domain,omitempty"`
-
-	// Issuers is a list of OIDC issuers for JWT auth.
-	// The JWT tokens are sent as passwords - this works with regular ssh
-	// clients.
-	//
-	// Audience will be ssh:FQDN
-	// TODO: allow a node to self-sign JWTs and certs for subdomains.
-	Issuers []string `json:"issuers,omitempty"`
-
-	Upstream map[string]Dest `json:"upstream,omitempty"`
-
-	// Parent SSHD - if set a persistent connection should be maintained (if needed ?)
-	SSHD string
-
-	// Address to listen on as SSH. Will default to 14022 for regular nodes and
-	// 15022 for gateways.
-	Address string `json:"sshd_addr,omitempty"`
-
-	// H2CAddr is the address a server will listen as H2C.
-	// This is used with K8S and other H2 gateways.
-	// The tunnel is created on "/" with POST method.
-	//
-	// Currently only on 'gateways' by default, adds to binary size.
-	H2CAddr string `json:"h2c-addr,omitempty"`
-
-	//
-	// For client nodes, open a socks server (similar to -D).
-	//
-	SocksAddr string
-
-	TProxyAddr string
-
-	// AuthorizedKeys is the same as authorized_keys file.
-	AuthorizedKeys string `json:"authorized_keys,omitempty"`
-
-	// Private is the private key, in PEM format.
-	// For mesh we use one workload identity (verified by this private key) for all protocols.
-	// We use tls.key for compatibility with K8S/CertManager secrets.
-	Private    string `json:"tls.key,omitempty"`
-	CertHost   string
-	CertClient string
-
-	// Map of public key to user ID.
-	// Key is the marshalled public key (from authorized_keys), value is the user ID (comment)
-	UsersKeys map[string]string `json:"user_keys,omitempty"`
-
-	SignerHost   ssh.Signer `json:"-"`
-	SignerClient ssh.Signer `json:"-"`
-
-	// Forward is a function that will proxy a stream to a destination.
-	// If missing, it will be dialed.
-	// Used on a server for all client forwarding - except locally connected clients.
-	Forward func(context.Context, string, io.ReadWriteCloser) `json:"-"`
-
-	// WIP: Internally defined commands.
-	InternalCommands map[string]*Command `json:"-"`
-
-	KeyHost *ecdsa.PrivateKey `json:"-"`
-
-	// Root CA keys - will be authorized to connect and create tunnels, not get shell.
-	AuthorizedCA []ssh.PublicKey `json:"-"`
-
-	// WIP: Custom channel handlers.
-	ChannelHandlers map[string]func(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChannel) `json:"-"`
-
-	// TokenChecker will verify the password field - as a JWT or other forms.
-	TokenChecker func(password string) (claims map[string]string, e error) `json:"-"`
-}
 
 type Command struct {
 	Run func(env map[string]string, args []string, in io.Reader, out io.WriteCloser, err io.WriteCloser)
@@ -183,6 +67,24 @@ type SSHMesh struct {
 	sync.Mutex
 }
 
+func (ss *SSHMesh) StayConnected(ctx context.Context) {
+	for addr, d:=range ss.Dst {
+		a := d.Addr
+		if a == "" {
+			a = addr
+		}
+		if d.Proto == "ssh-upstream" {
+			// TODO: list of ssh servers for redundancy
+			sshc, err := ss.Client(ctx, a)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			go sshc.StayConnected(a)
+		}
+	}
+}
+
 // Client returns a SSH client for a destination.
 // It may be disconnected - first call is always disconnected.
 func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
@@ -190,18 +92,18 @@ func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
 	if cp == nil {
 		c := &SSHCMux{
 			SSHConfig: ss.SSHConfig,
-			Dest: &Dest{
 				ReverseForwards: map[string]string{},
-			},
 			AuthorizedCA: ss.AuthorizedCA,
 		}
 		c.CertChecker = ss.CertChecker
 
+		c.mds = util.NewMDSClient(ss.SSHConfig.TokenProvider)
 		ss.Clients.Store(dst, c)
 		cp = c
 
 		// TODO: ping, detect terminations.
 	}
+
 
 	c := cp.(*SSHCMux)
 	return c, nil
@@ -254,6 +156,11 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 		reverseForwards: map[string]net.Listener{},
 	}
 
+	// TODO: if key and certs are missing in config but a URL is specified, fetch the
+	//  private key and certs
+	// ( a 'metadata' bootstrap/launcher should be run first to get all secret and config bits )
+
+
 	if tc.SignerHost == nil {
 		if tc.Private != "" {
 			k, err := ssh.ParseRawPrivateKey([]byte(tc.Private))
@@ -284,9 +191,9 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 			}
 
 		} else {
-			slog.Info("Generate private key")
 			privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			tc.SignerHost, _ = ssh.NewSignerFromKey(privk1)
+			tc.SignerClient = tc.SignerHost
 			tc.KeyHost = privk1
 		}
 	}
@@ -358,8 +265,9 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 			//	if s.authorizedKeys != nil {
 			keys := string(key.Marshal())
 			user := s.UsersKeys[keys]
+			log.Println("User key auth ", user)
 			if user != "" {
-				return &ssh.Permissions{Extensions: map[string]string{"sub": user}}, nil
+				return &ssh.Permissions{Extensions: map[string]string{"sub": user, "role": "admin"}}, nil
 			}
 			//for _, k := range s.authorizedKeys {
 			//if strings.Contains(k.Type(), "cert") {
@@ -381,6 +289,8 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 			return nil, errors.New("SSHD: no key found")
 		},
 	}
+	s.serverConfig.AddHostKey(s.SignerHost)
+
 
 	s.serverConfig.PublicKeyCallback = s.CertChecker.Authenticate
 
@@ -400,8 +310,10 @@ func (ssht *SSHMesh) AddAuthorizedFile(auth []byte) {
 		//if strings.Contains(pubk1.Type(), "cert") {
 		if slices.Contains(options, "cert-authority") {
 			ssht.AuthorizedCA = append(ssht.AuthorizedCA, pubKey)
+			slog.Info("Authorized CA", "key", pubKey)
 		} else {
 			ssht.UsersKeys[string(pubKey.Marshal())] = comm
+			slog.Info("Authorized user", "key", comm)
 		}
 		auth = rest
 	}
@@ -420,20 +332,18 @@ func KeysEqual(ak, bk ssh.PublicKey) bool {
 }
 
 func (ssht *SSHMesh) Start() (net.Listener, error) {
-	ssht.serverConfig.AddHostKey(ssht.SignerHost)
 
-	s := ssht
 	var err error
 	// Once a ServerConfig has been configured, connections can be
 	// accepted.
-	if s.Listener == nil {
-		s.Listener, err = net.Listen("tcp", s.Address)
+	if ssht.Listener == nil {
+		ssht.Listener, err = net.Listen("tcp", ssht.Address)
 		if err != nil {
-			log.Println("Failed to listend on ", s.Address, err)
+			log.Println("Failed to listend on ", ssht.Address, err)
 			return nil, err
 		}
-		if strings.HasSuffix(s.Address, ":0") {
-			s.Address = s.Listener.Addr().String()
+		if strings.HasSuffix(ssht.Address, ":0") {
+			ssht.Address = ssht.Listener.Addr().String()
 		}
 	}
 	go func() {
@@ -447,7 +357,7 @@ func (ssht *SSHMesh) Start() (net.Listener, error) {
 			go ssht.HandleServerConn(nConn)
 		}
 	}()
-	return s.Listener, nil
+	return ssht.Listener, nil
 }
 
 type Mux struct {
@@ -529,7 +439,7 @@ func (ssht *SSHMesh) HandleServerConn(nConn net.Conn) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ssht.connectedClientNodes.Store(conn.User, acceptedSSHMux)
+	ssht.connectedClientNodes.Store(conn.User(), acceptedSSHMux)
 
 	defer func() {
 		// remote addr is from nConn
@@ -596,41 +506,6 @@ func (ssht *SSHMesh) handleServerConnRequests(ctx context.Context, reqs <-chan *
 			}
 		}
 	}
-}
-
-func (st *SSHMesh) InitMux(mux *http.ServeMux) {
-	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-		writer.WriteHeader(200)
-
-		host := request.Host
-		cc, _ := st.connectedClientNodes.Load(host)
-		if cc != nil {
-			payload := ssh.Marshal(&remoteForwardChannelData{
-				DestAddr:   "",
-				DestPort:   uint32(80),
-				OriginAddr: request.RemoteAddr,
-				OriginPort: uint32(1234),
-			})
-			ch, reqs, err := cc.(*SSHSMux).ServerConn.OpenChannel("forwarded-tcpip", payload)
-			if err != nil {
-				writer.WriteHeader(500)
-				return
-			}
-			go ssh.DiscardRequests(reqs)
-
-			// TODO: create a H2C or HTTP connection to the host.
-			//
-
-			ch.Close()
-		}
-
-		if request.URL.Path == "/" {
-			slog.Info("Req", "req", request)
-			st.HandleServerConn(util.NewStreamServerRequest(request, writer))
-			return
-		}
-		slog.Info("Req", "req", request)
-	})
 }
 
 // Sign will sign a certificate

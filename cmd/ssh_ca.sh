@@ -235,17 +235,17 @@ EOF
 
   ssh-keygen -s ${CA_DIR}/id_ecdsa -m PEM  -I ${h} -n ${u} ${d}/id_ecdsa.pub
 
- grep "$CA" $d/known_hosts > /dev/null
+ grep "$CA" $d/known_hosts > /dev/null 2>&1
  if [ $? != "0" ]; then
    echo -e "\n@cert-authority * ${CA}\n" >> $d/known_hosts
  fi
- grep "$CA" $d/authorized_keys > /dev/null
+ grep "$CA" $d/authorized_keys > /dev/null 2>&1
  if [ $? != "0" ]; then
    echo -e "\ncert-authority ${CA}\n" >> $d/authorized_keys
  fi
 
-  # To keep it simple, assume the configs are mounted on /sshm
-  local mntdir=/sshm
+  # To keep it simple, assume the configs are mounted on /.sshm
+  local mntdir=/.sshm
 
  # On each pod/workload, expect the secret to be mounted on /var/run/secrets/ssh
  # This is a user-space sshd.

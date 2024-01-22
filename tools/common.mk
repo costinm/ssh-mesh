@@ -23,12 +23,18 @@ GIT_REPO?=${REPO}
 # Skaffold can pass this
 # When running pods, label skaffold.dev/run-id is set and used for log watching
 IMAGE_TAG?=latest
+export IMAGE_TAG
 
+# Default is the ghcr.io - easiest to login from github actions.
 DOCKER_REPO?=ghcr.io/costinm/${GIT_REPO}
 
-BASE_DISTROLESS?=gcr.io/distroless/static
-BASE_IMAGE?=debian:testing-slim
+# Image part
+DOCKER_IMAGE?=${BIN}
 
+BASE_DISTROLESS?=gcr.io/distroless/static
+
+# Does not include the TLS keys !
+BASE_IMAGE?=debian:testing-slim
 
 export PATH:=$(PATH):${HOME}/go/bin
 
@@ -66,17 +72,31 @@ echo:
 # 2. Send it as DOCKER_REPO/BIN:latest - using BASE_IMAGE as base
 # 3. Save the SHA-based result as IMG
 # 4. Set /BIN as entrypoint and tag again
-_push: IMAGE?=${DOCKER_REPO}/${BIN}:${IMAGE_TAG}
+_push: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
+_push: IMG1:=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} usr/local/bin/${BIN} etc/ssl/certs | gcrane append -f - \
+       -b ${BASE_IMAGE} -t ${IMAGE} )
+_push: IMG:=$(shell gcrane mutate ${IMG1} -t ${IMAGE} \
+              	  --entrypoint /usr/local/bin/${BIN} )
 _push:
+	@echo Building ${IMAGE}
+	@echo TmpImage: ${IMG1}
+	@echo out: ${IMG}
+	@echo ${IMG} > ${OUT}/.image
+
+
+_push2: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
+_push2:
 	echo ${IMAGE}
-	(export IMG=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} ${BIN} | \
-    					  gcrane append -f - -b ${BASE_IMAGE} \
-					 			-t ${IMAGE} \
+	(export IMG=$(shell cd ${OUT} && \
+        tar -cf - ${PUSH_FILES} ${BIN} etc/ssl/certs | \
+    	   gcrane append -f - -b ${BASE_IMAGE} \
+					 		  -t ${IMAGE} \
     					   ) && \
-    	gcrane mutate $${IMG} -t ${IMAGE} -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}" --entrypoint /${BIN} \
+    	gcrane mutate $${IMG} -t ${IMAGE} \
+    	  --entrypoint /usr/local/bin/${BIN} \
     	)
 
-
+# TODO: add labels like    	  -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}"
 
 # To create a second image with a different base without uploading the tar again:
 #	gcrane rebase --rebased ${DOCKER_REPO}/gate:latest \
@@ -97,12 +117,25 @@ _oci_local: build
 	docker build -t costinm/hbone:${IMAGE_TAG} -f tools/Dockerfile ${OUT}/
 
 
-.go-build:
-	(cd cmd/${NAME} && go build -o ${OUT}/${NAME} .)
-
 deps:
 	go install github.com/google/go-containerregistry/cmd/gcrane@latest
 
 _cloudrun:
 	gcloud alpha run services replace ${MANIFEST} \
 		  --platform managed --project ${PROJECT_ID} --region ${REGION}
+
+# Build a command under cmd/BIN, placing it in $OUT/usr/local/bin/$BIN
+#
+# Also copies ssl certs
+#
+# Params:
+# - BIN
+#
+# Expects go.mod in cmd/ or cmd/BIN directory.
+_build:
+	mkdir -p ${OUT}/etc/ssl/certs/
+	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
+	mkdir -p ${OUT}/usr/local/bin
+	cd cmd/${BIN} && ${GOSTATIC} -o ${OUT}/usr/local/bin/${BIN} .
+
+

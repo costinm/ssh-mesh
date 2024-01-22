@@ -1,3 +1,5 @@
+# Mounted under /var/run/secrets/sshd
+#
 apiVersion: v1
 kind: Secret
 metadata:

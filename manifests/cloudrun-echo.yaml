@@ -39,13 +39,8 @@ spec:
 #                  secretKeyRef:
 #                    key: "1"
 #                    name: mesh
-            # Running standalone, provide a basic http server
-            - name: SSHD_HTTP
-              value: ":15008"
-            - name: SSHD_PORT
-              value: "15022"
             - name: SSHD
-              value: s.webinf.duckdns.org:2222
+              value: s.webinf.duckdns.org:15022
             - name: SSH_AUTHORIZED_KEY
               value: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15"
             - name: DEPLOY

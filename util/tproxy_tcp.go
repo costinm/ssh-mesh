@@ -12,7 +12,7 @@ import (
 	"unsafe"
 )
 
-// Based on https://github.com/LiamHaworth/go-tproxy/blob/master/tproxy_tcp.go
+// Based on https://github.com/LiamHaworth/go-tproxy/blob/master/tproxy_tcp.go and many others
 
 // AcceptTProxy will accept a TCP connection
 // and wrap it to a TProxy connection to provide
@@ -42,39 +42,57 @@ func ListenTProxy(network string, laddr *net.TCPAddr) (*net.TCPListener, error) 
 	defer fileDescriptorSource.Close()
 
 	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
-		slog.Info("Tproxy disabled", "err", err)
+		slog.Info("Tproxy disabled - running in REDIRECT mode", "err", err)
 		//return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
 	}
 
 	return listener, nil
 }
 
-func IptablesCapture(addr string, ug func(nc net.Conn, dest, la *net.TCPAddr)) error {
+func IptablesCapture(addr string, ug func(nc net.Conn, dest, la *net.TCPAddr)) (*net.TCPListener, error) {
 	na, err := net.ResolveTCPAddr("tcp", addr)
 	nl, err := ListenTProxy("tcp", na)
 	if err != nil {
 		log.Println("Failed to capture tproxy", err)
-		return err
+		return nil, err
 	}
-	for {
-		remoteConn, err := AcceptTProxy(nl)
-		//ugate.VarzAccepted.Add(1)
-		if ne, ok := err.(net.Error); ok {
-			//ugate.VarzAcceptErr.Add(1)
-			if ne.Temporary() {
-				time.Sleep(100 * time.Millisecond)
-				continue
+	localPort := nl.Addr().(*net.TCPAddr).Port
+	go func() {
+		for {
+			remoteConn, err := AcceptTProxy(nl)
+			log.Println("ACCEPTED TPROXY")
+
+			//ugate.VarzAccepted.Add(1)
+			if ne, ok := err.(net.Error); ok {
+				//ugate.VarzAcceptErr.Add(1)
+				if ne.Temporary() {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
 			}
-		}
-		if err != nil {
-			log.Println("Accept error, closing iptables listener ", err)
-			return err
-		}
+			if err != nil {
+				log.Println("Accept error, closing iptables listener ", err)
+				return
+			}
+			dst := remoteConn.LocalAddr().(*net.TCPAddr)
+			log.Println("RECEIVED TPROXY", dst)
+			if dst.Port == localPort {
+				realAddr, err := GetREDIRECTOriginalDst(remoteConn)
+				if err != nil {
+					return
+				}
+				dst = realAddr
+				if realAddr.Port == localPort {
+					log.Println("No redirect or looping ", err)
+					return
+				}
+			}
 
-		ug(remoteConn, remoteConn.LocalAddr().(*net.TCPAddr), remoteConn.RemoteAddr().(*net.TCPAddr))
-	}
+			ug(remoteConn, dst, remoteConn.RemoteAddr().(*net.TCPAddr))
+		}
+	}()
 
-	return nil
+	return nl, nil
 }
 
 // Status:

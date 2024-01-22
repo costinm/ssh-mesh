@@ -1,110 +1,73 @@
 include tools/common.mk
 
-# Base image -
-BASE_DEBUG?=ubuntu:bionic
-
 REGION?=us-central1
 
-all: all/sshm all/sshc
+all: all/sshm
 
-build: build/sshc build/sshm
+build: build/sshm
 
-build/sshc: CMD=sshc
-build/sshc:
-	mkdir -p ${OUT}
-	(cd cmd && ${GOSTATIC} -o ${OUT}/sshc ./sshc)
+build/sshm: BIN=sshm
+build/sshm: _build
 
-build/sshm: CMD=sshm
-build/sshm:
-	mkdir -p ${OUT}
-	(cd cmd && ${GOSTATIC} -o ${OUT}/${CMD} ./sshm)
-	ls -l ${OUT}/${CMD}
-	strip ${OUT}/${CMD}
-	ls -l ${OUT}/${CMD}
 
+all/fortio: BIN=sshm
+all/fortio: DOCKER_IMAGE=fortio-sshm
+all/fortio:
+	#$(MAKE) _push BASE_IMAGE=fortio/fortio:latest BIN=sshc
+	docker build -t costinm/fortio-sshm:latest -f manifests/Dockerfile.fortio manifests/
+	docker push costinm/fortio-sshm:latest
 
 # Expected sizes:
 # v1:
 # - sshc 9.8M->6.6M
 # - sshd + h2c: 10.3/6.9
 
-# Build a command under cmd/CMD
-# Params:
-# - CMD
-#
-_build:
-	mkdir -p ${OUT}/etc/ssl/certs/
-	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
-	mkdir -p ${OUT}/usr/local/bin
-	cd cmd/${CMD} && ${GOSTATIC} -o ${OUT}/usr/local/bin/${CMD} .
-	ls -l ${OUT}/usr/local/bin/${CMD}
-	strip ${OUT}/usr/local/bin/${CMD}
-	ls -l ${OUT}/usr/local/bin/${CMD}
-
-
-
-
-# Append files to an existing container
-push/sshc:
-	$(MAKE) _push BIN=sshc BASE_IMAGE=${BASE_DISTROLESS} GIT_REPO=ssh-mesh
-
 push/sshm:
-	$(MAKE) _push BIN=sshm BASE_IMAGE=${BASE_DISTROLESS} GIT_REPO=ssh-mesh
+	$(MAKE) _push BIN=sshm
 
-# Push to a GCR repo for CR
-# Using artifact registry - 0.5G free, 0.10/G after
-
-#gcp/push: DOCKER_REPO=us-central1-docker.pkg.dev/${PROJECT_ID}/sshmesh
-
-push: push/sshc push/sshm
+push: push/sshm
 
 all/sshm: build/sshm push/sshm
-all/sshc: build/sshc push/sshc
 
 # Replace the CR service
 cr/replace:
 	cat manifests/cloudrun.yaml | \
-	DEPLOY="$(shell date +%H%M)" envsubst | \
+	DEPLOY="$(shell date +%H%M)" IMG="$(shell cat ${OUT}/.image)" envsubst | \
      gcloud alpha run services replace -
 
 # Build, push to gcr.io, update the cloudrun service
 # Cloudrun requires gcr or artifact registry
-cr: DOCKER_REPO=gcr.io/${PROJECT_ID}/sshmesh
+
 cr: all/sshm cr/replace
 
+
+crbindings: REGION=us-central1
+crbindings:
+	gcloud run services add-iam-policy-binding  --project ${PROJECT_ID} --region ${REGION} sshc  \
+      --member="serviceAccount:k8s-fortio@costin-asm1.iam.gserviceaccount.com" \
+      --role='roles/run.invoker'
+
+
 crauth:
-	gcloud run services add-iam-policy-binding  --region ${REGION} sshc  \
+	gcloud run services add-iam-policy-binding  --project ${PROJECT_ID} --region ${REGION} sshc  \
       --member="user:${GCLOUD_USER}" \
       --role='roles/run.invoker'
-	gcloud run services add-iam-policy-binding  --region ${REGION} sshc  \
+
+crauth/all: REGION=us-central1
+crauth/all:
+	gcloud run services add-iam-policy-binding   --project ${PROJECT_ID} --region ${REGION} sshc  \
       --member="allUsers" \
       --role='roles/run.invoker'
 
 
-CR_URL?=$(shell gcloud run services --project ${PROJECT_ID} --region ${REGION} describe ${SERVICE} --format="value(status.address.url)")
+# SSH via a local jumphost
+jssh:
+	ssh -o StrictHostKeyChecking=no  -J localhost:15022 sshc.${SSHD} -v
 
-cr/info:
-cr/info:
-	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}
-
-cr/key:
-	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}/_ssh/key
-
-
-
-cr/wait:
-	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  --output - ${CR_URL}/wait
-
-cr/echo:
-	curl -v -H"Authorization: Bearer $(shell gcloud auth print-identity-token)"  -H "Content-Type: application/octet-stream" --data-binary @/dev/stdin  --output - ${CR_URL}/echo
-
-# SSH into the cludrun service
-cr/ssh:
-	ssh -o StrictHostKeyChecking=no  -J localhost:2222 sshc.${SSHD} -v
-
-# SSH to the CR service using a h2 tunnel.
+# SSH to a CR service using a h2 tunnel.
 # Works if sshd is handling the h2 port, may forward to the app.
 # Useful if scaled to zero, doesn't require maintaining an open connection (but random clone)
+cr/h2ssh: CR_URL?=$(shell gcloud run services --project ${PROJECT_ID} --region ${REGION} describe ${SERVICE} --format="value(status.address.url)")
 cr/h2ssh:
 	ssh -o ProxyCommand="${HOME}/go/bin/h2t ${CR_URL}_ssh/tun" \
         -o StrictHostKeyChecking=no \
@@ -184,4 +147,17 @@ k8s/secret: init-keys
  		--from-file=id_ecdsa=${OUT}/ssh/id_ecdsa \
  		--from-file=id_ecdsa.pub=${OUT}/ssh/id_ecdsa.pub
 	rm -rf ${OUT}/ssh
+
+
+perf-test-setup:
+    # Using goben instead of iperf3
+	goben -defaultPort :5201 &
+
+perf-test:
+	# -passiveClient -passiveServer
+	goben -hosts localhost:15201  -tls=false -totalDuration 3s
+
+perf-test-setup-iperf:
+    # Using goben instead of iperf3
+	iperf3 -s -d &
 

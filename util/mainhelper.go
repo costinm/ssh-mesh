@@ -26,15 +26,6 @@ func FindConfig(base string, s string) []byte {
 		return []byte(basecfg)
 	}
 
-	// Explicitly set
-	//cfgDir := os.Getenv("CFG_DIR")
-	//if cfgDir != "" {
-	//	fb, err := os.ReadFile(cfgDir + base + ".json")
-	//	if err == nil {
-	//		return fb
-	//	}
-	//}
-
 	fb, err := os.ReadFile("./" + base + s)
 	if err == nil {
 		return fb
@@ -44,12 +35,6 @@ func FindConfig(base string, s string) []byte {
 	if err == nil {
 		return fb
 	}
-
-	//fb, err = os.ReadFile(os.Getenv("HOME") + "/.config/" +
-	//	base + "/" + base + ".json")
-	//if err == nil {
-	//	return fb
-	//}
 
 	// Also look in the .ssh directory - this is mainly for secrets.
 	fb, err = os.ReadFile(os.Getenv("HOME") + "/.ssh/" + base + s)
@@ -71,10 +56,13 @@ func FindConfig(base string, s string) []byte {
 // Larger binaries should use viper - which provides support for:
 // - ini, json, yaml, java properties
 // - remote providers (with encryption) - built in etcd3, consul, firestore
-func MainStart(base string, out interface{}) {
+func MainStart(base string, out interface{}) error {
 	basecfg := FindConfig(base, ".json")
 	if basecfg != nil {
-		json.Unmarshal([]byte(basecfg), out)
+		err := json.Unmarshal([]byte(basecfg), out)
+		if err !=  nil {
+			return err
+		}
 	}
 
 	// Quick hack to load environment variables into the config struct.
@@ -86,9 +74,12 @@ func MainStart(base string, out interface{}) {
 			envm[kv[0]] = kv[1]
 		}
 	}
-	envb, _ := json.Marshal(envm)
+	envb, err := json.Marshal(envm)
+	if err != nil {
+		log.Println("Failed to overlay env", envl, err, envb)
+	}
 
-	json.Unmarshal(envb, out)
+	return json.Unmarshal(envb, out)
 }
 
 // Main config helper - base implementation for minimal deps CLI.

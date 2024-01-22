@@ -131,6 +131,8 @@ func (p *Proxy) ProxyTo(ch io.ReadWriteCloser) {
 
 func (srv *SSHMesh) Proxy(ctx context.Context, dest string, ch io.ReadWriteCloser) (*Proxy, error) {
 	var dialer net.Dialer
+	// TODO: never dial port 80 ( or the list of HTTP ports) from a local capturing service.
+	// Must go to SSH or HTTPS port.
 	dconn, err := dialer.DialContext(ctx, "tcp", dest)
 	if err != nil {
 		return nil, err
