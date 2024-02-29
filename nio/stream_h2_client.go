@@ -1,26 +1,97 @@
-package util
+package nio
 
 import (
 	"context"
 	"crypto/tls"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
 	"time"
 )
 
+const ConnectOverrideHeader = "x-host"
+
+// TokenSource is a common interface for anything returning Bearer or other kind of tokens.
+type TokenSource interface {
+	// GetToken for a given audience.
+	GetToken(context.Context, string) (string, error)
+}
+
+type H2Dialer struct {
+	MDS TokenSource
+	H2TunURL string
+	HttpClient *http.Client
+}
+
+func NewH2Dialer(tunURL string) (*H2Dialer) {
+	return &H2Dialer{
+		H2TunURL: tunURL,
+		HttpClient:  http.DefaultClient,
+	}
+}
+
+func (h2d *H2Dialer) DialContext(ctx context.Context, net, addr string) (net.Conn, error) {
+	r, w := io.Pipe()
+	req, _ := http.NewRequest("POST", h2d.H2TunURL, r)
+
+	// TODO: JWT from MDS
+	if h2d.MDS != nil {
+		t, err := h2d.MDS.GetToken(ctx, addr)
+		if err != nil {
+			return nil, err
+		}
+		if t != "" {
+			req.Header["authorization"] = []string{"Bearer " + t}
+		}
+	}
+	req.Header[ConnectOverrideHeader] = []string{addr}
+
+	// HBone uses CONNECT IP:port - we need to use POST and can't use the header. For now use x-host
+
+	res, err := h2d.HttpClient.Do(req)
+	if err != nil {
+		if res == nil {
+			log.Println("H2T error", err)
+		} else {
+			log.Println("H2T error", err, res.StatusCode, res.Header)
+		}
+		return nil, err
+	}
+
+	log.Println("H2T", res.StatusCode, res.Header)
+
+	return newStreamHttpRequest(w, req, res), nil
+}
+
+// NewStreamH2 creates a H2 stream using POST.
+//
+// Will use the token provider if not nil.
+func NewStreamH2(ctx context.Context, hc *http.Client, addr string, tcpaddr string, mds TokenSource) (*StreamHttpClient, error) {
+	hd := &H2Dialer{
+		HttpClient: hc,
+		MDS: mds,
+		H2TunURL: addr,
+	}
+	nc, err := hd.DialContext(ctx, "tcp", tcpaddr)
+	if err != nil {
+		return nil, err
+	}
+
+	return nc.(*StreamHttpClient), err
+}
 
 type StreamHttpClient struct {
 	StreamState
 
 	Request        *http.Request
-	TLS        *tls.ConnectionState
 	Response   *http.Response
 	ReadCloser func()
 
 	// Writer side of the request pipe
-	RequestWriter  io.WriteCloser
+	TLS           *tls.ConnectionState
+	RequestInPipe io.WriteCloser
 }
 
 func (s *StreamHttpClient) Context() context.Context {
@@ -40,47 +111,30 @@ func newStreamHttpRequest(rw io.WriteCloser,  r *http.Request, w *http.Response)
 
 		Request:       r,
 		Response:      w,
-		RequestWriter: rw,
+		RequestInPipe: rw,
 		// TODO: extract from JWT, reconstruct
 		TLS: r.TLS,
 		//Dest:    r.Host,
 	}
 }
 
-const ConnectOverrideHeader = "x-host"
-
-// TokenSource is a common interface for anything returning Bearer or other kind of tokens.
-type TokenSource interface {
-	// GetToken for a given audience.
-	GetToken(context.Context, string) (string, error)
+// NewStreamRequest creates a Stream based on the result of a RoundTrip.
+// out is typically the pipe used by request to send bytes.
+// TODO: abstract the pipe and the roundtrip call.
+func NewStreamRequest(r *http.Request, out io.WriteCloser, w *http.Response) Stream { // *StreamHttpClient {
+	return &StreamHttpClient{
+		StreamState: StreamState{Stats: Stats{Open: time.Now()}},
+		//OutHeader:   w.Header,
+		Request: r,
+		//In:          w.Body, // Input from remote http
+		RequestInPipe: out, //
+		//TLS:         r.TLS,
+		Response: w,
+		//Dest:        r.Host,
+	}
 }
 
-// NewStreamH2 creates a H2 stream using POST.
-//
-// Will use the token provider if not nil.
-func NewStreamH2(ctx context.Context, addr string, tcpaddr string, mds TokenSource) (*StreamHttpClient, error) {
 
-	r, w := io.Pipe()
-	req, _ := http.NewRequest("POST", addr, r)
-	// TODO: JWT from MDS
-	if mds != nil {
-		t, err := mds.GetToken(ctx, addr)
-		if err != nil {
-			return nil, err
-		}
-		req.Header["authorization"] = []string{"Bearer " + t}
-	}
-	req.Header[ConnectOverrideHeader] = []string{tcpaddr}
-
-	// HBone uses CONNECT IP:port - we need to use POST and can't use the header. For now use x-host
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	return newStreamHttpRequest(w, req, res), nil
-}
 
 func (s *StreamHttpClient) Read(b []byte) (n int, err error) {
 	// TODO: update stats
@@ -88,7 +142,7 @@ func (s *StreamHttpClient) Read(b []byte) (n int, err error) {
 }
 
 func (s *StreamHttpClient) Write(b []byte) (n int, err error) {
-	n, err = s.RequestWriter.Write(b)
+	n, err = s.RequestInPipe.Write(b)
 	if err != nil {
 		s.WriteErr = err
 		return n, err
@@ -122,7 +176,7 @@ func (s *StreamHttpClient) CloseWrite() error {
 	// That means HTTP2 TCP servers provide no way to send a FIN from server, without
 	// having the request fully read.
 	// This works for H2 with the current library - but very tricky, if not set as trailer.
-	s.RequestWriter.Close()
+	s.RequestInPipe.Close()
 	return nil
 }
 
@@ -159,7 +213,7 @@ func (s *StreamHttpClient) State() *StreamState {
 }
 
 func (s *StreamHttpClient) Header() http.Header {
-	return nil // s.Response.Header()
+	return s.Response.Header
 }
 
 func (s *StreamHttpClient) RequestHeader() http.Header {

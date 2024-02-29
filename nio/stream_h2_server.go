@@ -1,4 +1,4 @@
-package util
+package nio
 
 import (
 	"context"
@@ -14,6 +14,8 @@ type StreamHttpServer struct {
 	Request        *http.Request
 	TLS            *tls.ConnectionState
 	ResponseWriter http.ResponseWriter
+
+	// If set, the function will be called when Close() is called.
 	ReadCloser     func()
 }
 

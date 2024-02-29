@@ -34,7 +34,9 @@ DOCKER_IMAGE?=${BIN}
 BASE_DISTROLESS?=gcr.io/distroless/static
 
 # Does not include the TLS keys !
-BASE_IMAGE?=debian:testing-slim
+#BASE_IMAGE?=debian:testing-slim
+# Alpine based, full of debug tools.
+BASE_IMAGE?=nicolaka/netshoot
 
 export PATH:=$(PATH):${HOME}/go/bin
 
@@ -72,29 +74,38 @@ echo:
 # 2. Send it as DOCKER_REPO/BIN:latest - using BASE_IMAGE as base
 # 3. Save the SHA-based result as IMG
 # 4. Set /BIN as entrypoint and tag again
+#
+# Makefile magic: ":=" is evaluated once when the rule is read, so we can't use it here
+# With "=" it's evaluate multiple times if used as in push3
+# Turns out the simplest solution is to just use temp files.
+.ONESHELL:
 _push: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
-_push: IMG1:=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} usr/local/bin/${BIN} etc/ssl/certs | gcrane append -f - \
-       -b ${BASE_IMAGE} -t ${IMAGE} )
-_push: IMG:=$(shell gcrane mutate ${IMG1} -t ${IMAGE} \
-              	  --entrypoint /usr/local/bin/${BIN} )
 _push:
-	@echo Building ${IMAGE}
-	@echo TmpImage: ${IMG1}
-	@echo out: ${IMG}
-	@echo ${IMG} > ${OUT}/.image
+	cd ${OUT} && tar -cf - ${PUSH_FILES} usr/local/bin/${BIN} etc/ssl/certs | gcrane append -f - \
+       -b ${BASE_IMAGE} -t ${IMAGE} > ${OUT}/.image1.${BIN} && \
+	echo $(shell cat ${OUT}/.image1.${BIN}) $(shell echo ${OUT}/.image1.${BIN}) && \
+	gcrane mutate `cat ${OUT}/.image1.${BIN}` -t ${IMAGE} --entrypoint /usr/local/bin/${BIN} > ${OUT}/.image
 
 
-_push2: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
-_push2:
-	echo ${IMAGE}
-	(export IMG=$(shell cd ${OUT} && \
-        tar -cf - ${PUSH_FILES} ${BIN} etc/ssl/certs | \
-    	   gcrane append -f - -b ${BASE_IMAGE} \
-					 		  -t ${IMAGE} \
-    					   ) && \
-    	gcrane mutate $${IMG} -t ${IMAGE} \
-    	  --entrypoint /usr/local/bin/${BIN} \
-    	)
+#_push3: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
+#_push3: IMG1=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} usr/local/bin/${BIN} etc/ssl/certs | gcrane append -f - \
+#       -b ${BASE_IMAGE} -t ${IMAGE} )
+#_push3: IMG=$(shell gcrane mutate ${IMG1} -t ${IMAGE} --entrypoint /usr/local/bin/${BIN} )
+#_push3:
+#	@echo ${IMG} > ${OUT}/.image
+
+#
+#_push2: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
+#_push2:
+#	echo ${IMAGE}
+#	(export IMG=$(shell cd ${OUT} && \
+#        tar -cf - ${PUSH_FILES} ${BIN} etc/ssl/certs | \
+#    	   gcrane append -f - -b ${BASE_IMAGE} \
+#					 		  -t ${IMAGE} \
+#    					   ) && \
+#    	gcrane mutate $${IMG} -t ${IMAGE} \
+#    	  --entrypoint /usr/local/bin/${BIN} \
+#    	)
 
 # TODO: add labels like    	  -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}"
 

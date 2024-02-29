@@ -40,43 +40,18 @@ var (
 // TODO: If "exec" is called, it may invoke http handlers and handle
 // internal console/logs
 func SessionHandler(ctx context.Context, sconn *sshd.SSHSMux, newChannel ssh.NewChannel) {
+	conn := sconn.ServerConn
+	isOwner := conn.Permissions.Extensions["role"] == "admin"
+
+	env := []*sshd.KV{}
+	if !isOwner {
+		sshd.SessionHandler(ctx, sconn, newChannel)
+		return
+	}
+
 	ch, reqs, _ := newChannel.Accept()
 
 	ssht := sconn.SSHServer
-	conn := sconn.ServerConn
-
-	isOwner := conn.Permissions.Extensions["role"] == "admin"
-
-	env := []*KV{}
-
-	if !isOwner {
-		for req := range reqs {
-			switch req.Type {
-			case "shell", "exec":
-				// This is normally the last command in a channel.
-				// Env and pty are called first.
-				//
-				var payload = struct{ Value string }{}
-				ssh.Unmarshal(req.Payload, &payload)
-				req.Reply(true, nil)
-
-				go execHandlerInternal(ssht, conn, ch, env, payload.Value)
-			case "env":
-				var kv KV
-				// Typical: LANG
-				ssh.Unmarshal(req.Payload, &kv)
-				env = append(env, &kv)
-				if req.WantReply {
-					req.Reply(true, nil)
-				}
-			default:
-				if req.WantReply {
-					req.Reply(true, nil)
-				}
-			}
-		}
-		return
-	}
 
 	sess := &ptySession{
 		Channel: ch,
@@ -106,7 +81,7 @@ func SessionHandler(ctx context.Context, sconn *sshd.SSHSMux, newChannel ssh.New
 		case "subsystem":
 			subsystemHandler(req, conn, ch)
 		case "env":
-			var kv KV
+			var kv sshd.KV
 			// Typical: LANG
 			ssh.Unmarshal(req.Payload, &kv)
 			env = append(env, &kv)
@@ -122,9 +97,6 @@ func SessionHandler(ctx context.Context, sconn *sshd.SSHSMux, newChannel ssh.New
 
 }
 
-type KV struct {
-	Key, Value string
-}
 
 func exit(sess ssh.Channel, code int) error {
 	status := struct{ Status uint32 }{uint32(code)}
@@ -224,7 +196,7 @@ func handleNoTTY(cmd *exec.Cmd, s ssh.Channel) error {
 }
 
 func execHandlerInternal(ssht *sshd.SSHMesh, conn *ssh.ServerConn,
-	ch ssh.Channel, env []*KV, rawCmd string) {
+	ch ssh.Channel, env []*sshd.KV, rawCmd string) {
 	t0 := time.Now()
 	defer func() {
 		slog.Info("sshd_exec_close", "dur", time.Since(t0),
@@ -254,7 +226,7 @@ func execHandlerInternal(ssht *sshd.SSHMesh, conn *ssh.ServerConn,
 // Regular users have access to a restricted set of internal commands
 // When the server is a real dropbear/sshd, this is handled with the
 // native ssh permission system.
-func execHandler(ssht *sshd.SSHMesh, conn *ssh.ServerConn, s *ptySession, env []*KV, raw string) {
+func execHandler(ssht *sshd.SSHMesh, conn *ssh.ServerConn, s *ptySession, env []*sshd.KV, raw string) {
 	t0 := time.Now()
 	defer func() {
 		s.Close()
@@ -285,7 +257,7 @@ func execHandler(ssht *sshd.SSHMesh, conn *ssh.ServerConn, s *ptySession, env []
 	exit(s, 0)
 }
 
-func buildCmd(ssht *sshd.SSHMesh, env []*KV, rawCmd string) *exec.Cmd {
+func buildCmd(ssht *sshd.SSHMesh, env []*sshd.KV, rawCmd string) *exec.Cmd {
 	// TODO: differentiate between admin and user - run as UID if not admin.
 	// ( assuming the command is run as regular user)
 	var cmd *exec.Cmd

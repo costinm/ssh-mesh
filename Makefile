@@ -33,7 +33,15 @@ all/sshm: build/sshm push/sshm
 cr/replace:
 	cat manifests/cloudrun.yaml | \
 	DEPLOY="$(shell date +%H%M)" IMG="$(shell cat ${OUT}/.image)" envsubst | \
-     gcloud alpha run services replace -
+     gcloud alpha run --project ${PROJECT_ID} services replace -
+
+cr/fortio:
+	cat manifests/cloudrun-fortio.yaml | \
+	DEPLOY="$(shell date +%H%M)" IMG="$(shell cat ${OUT}/.image)" envsubst | \
+     gcloud alpha run --project ${PROJECT_ID} services replace -
+
+proxy/fortio:
+	gcloud run services proxy costin-fortio --region us-central1 --port 8082
 
 # Build, push to gcr.io, update the cloudrun service
 # Cloudrun requires gcr or artifact registry
@@ -44,9 +52,8 @@ cr: all/sshm cr/replace
 crbindings: REGION=us-central1
 crbindings:
 	gcloud run services add-iam-policy-binding  --project ${PROJECT_ID} --region ${REGION} sshc  \
-      --member="serviceAccount:k8s-fortio@costin-asm1.iam.gserviceaccount.com" \
+      --member="serviceAccount:k8s-default@${PROJECT_ID}.iam.gserviceaccount.com" \
       --role='roles/run.invoker'
-
 
 crauth:
 	gcloud run services add-iam-policy-binding  --project ${PROJECT_ID} --region ${REGION} sshc  \

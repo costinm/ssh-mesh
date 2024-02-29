@@ -1,7 +1,9 @@
+# Example of a standalone cloudrun app ( istio echo ) with an added sshm process.
+# In this example the ssh process is not exposed over H2 tunnel - but uses a jump host.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: sshc
+  name: echo-jumphost
   labels:
     cloud.googleapis.com/location: us-central1
   annotations:
@@ -21,37 +23,17 @@ spec:
         autoscaling.knative.dev/maxScale: '1'
         run.googleapis.com/cpu-throttling: 'false'
     spec:
-      containerConcurrency: 10
+      containerConcurrency: 1000
       timeoutSeconds: 900
       containers:
-        - #image: costinm/sshm:${IMAGE_TAG} # 8037272ad2b1
+        - name: app
           image: ${IMG}
-          #latest
-          imagePullPolicy: Always
-          ports:
-
-          # Setting the port to 15082 will use sshm H2 listener, which forwards to
-          # 8080 unless it's a tunnel or special request
-          - name: h2c
-            containerPort: 15082
-
+          # The start command is modified to start sshd first - which in turn starts the server.
+          command: [ "/usr/local/bin/sshd", "/usr/local/bin/server" ]
           env:
-            # 'sshm' env is json, containing the config options
-#            - name: sshm
-#              value: |
-#                {
-#                 "authorized_keys":"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15\ncert-authority ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDu9dWIA381ojxsUS8i0VJv0ED5Ac2zRFX1JijLjAO5HywPJ5a3CMM0NrXH5GqSoyDB/j92/Ta/f0QFAQZDhiFQ= ca.s.webinf.duckdns.org",
-#                }
-
             # Maintain a connection to this server.
             - name: SSHD
               value: costin15.webinf.duckdns.org:15022
-
-            - name: SSH_DEFAULT_H2
-              value: https://httpbin.org
-
-            - name: SSH_DEFAULT_HTTP
-              value: https://httpbin.org
 
             # Allow shell access for the users authenticated with the key.
             # Allow forwarding for users with keys signed by the CA or using JWTs

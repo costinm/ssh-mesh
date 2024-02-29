@@ -5,9 +5,10 @@ import (
 	"crypto/ecdsa"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/costinm/meshauth"
-	"github.com/costinm/ssh-mesh/util"
+	"github.com/costinm/meshauth/util"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -17,22 +18,12 @@ import (
 // special formats. This combines all configs in a struct that is
 // easier to handle in a k8s Secret or env variable passed to a container.
 type SSHConfig struct {
-
-	// Mesh identity of the node is mapped to a FQDN - first component is the id.
-	// Defaults to $(hostname)
-	Id        string `json:"id,omitempty"`
-
-
-	// AuthConfig defines trust sources for the server, to support JWT auth.
+	// AuthnConfig defines trust sources for the server, to support JWT auth.
 	// The JWT tokens are sent as passwords - this works with regular ssh
 	// clients.
 	// Audience should be ssh://FQDN, but can be configured.
-	meshauth.MeshAuthCfg
-
-
-	// Parent SSHD - if set a persistent connection should be maintained (if needed ?)
-	// Deprecated - Dst
-	SSHD string
+	// Name should be the hostname or unique - will be used as user ID too.
+	meshauth.MeshCfg
 
 	// Address to listen on as SSH. Will default to 14022 for regular nodes and
 	// 15022 for gateways.
@@ -56,19 +47,18 @@ type SSHConfig struct {
 	// The keys are used as 'trusted sources' for authentication. Any user key can be used for shell/debug access.
 	// The CA keys are allowed to connect - but can get a shell only if 'role=admin' is present in the cert.
 	//
-	// If empty, the SSH_AUTHORIZED_KESY env is used, falling back to authorized_kesy in current dir and $HOME/.ssh
+	// If empty, the SSH_AUTHORIZED_KESY env is used, falling back to authorized_keys in current dir and $HOME/.ssh
 	AuthorizedKeys string `json:"authorized_keys,omitempty"`
 
 	// Private is the private key, in PEM format.
 	// For mesh we use one workload identity (verified by this private key) for all protocols.
 	// We use tls.key for compatibility with K8S/CertManager secrets.
-	// Deprecated - Credentials
 	Private    string `json:"tls.key,omitempty"`
 
 	// Deprecated - Credentials
-	CertHost   string
+	CertHost   string `json:"ssh.crt,omitempty"`
 	// Deprecated - Credentials
-	CertClient string
+	CertClient string `json:"ssh-client.crt,omitempty"`
 
 	// Map of public key to user ID.
 	// Key is the marshalled public key (from authorized_keys), value is the user ID (comment)
@@ -99,7 +89,7 @@ type SSHConfig struct {
 
 
 
-// Load the standard SSH files - from:
+// SetCert the standard SSH files - from:
 // - env
 // - config dir
 // - current working dir
@@ -128,6 +118,31 @@ func EnvSSH(config *SSHConfig) {
 	cert_c := util.FindConfig("id_ecdsa_cert.pub", "")
 	if cert_c != nil {
 		config.CertClient = string(cert_c)
+	}
+
+	tc := config
+	ks := os.Getenv("K_SERVICE")
+	if ks != "" {
+		sn := ks
+		verNsName := strings.SplitN(ks, "--", 2)
+		if len(verNsName) > 1 {
+			sn = verNsName[1]
+		}
+		tc.Name = sn
+	}
+
+	if config.Name == "" {
+		config.Name, _ = os.Hostname()
+		if strings.Contains(config.Name, ".") {
+			parts := strings.SplitN(tc.Name, ".", 2)
+			config.Name = parts[0]
+			if tc.Domain == "" {
+				tc.Domain = parts[1]
+			}
+		}
+	}
+	if tc.Domain == "" {
+		tc.Domain = "mesh.internal"
 	}
 
 	// TODO: load the cert from file !

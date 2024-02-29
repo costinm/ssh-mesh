@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/costinm/ssh-mesh/util"
+	"github.com/costinm/ssh-mesh/nio"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -31,7 +31,7 @@ func (st *SSHMesh) InitMux(mux *http.ServeMux) {
 			if host == "localhost:15022" {
 				// Process as an in-process SSH connection.
 				writer.WriteHeader(200)
-				st.HandleServerConn(util.NewStreamServerRequest(request, writer))
+				st.HandleServerConn(nio.NewStreamServerRequest(request, writer))
 				return
 			}
 
@@ -67,11 +67,11 @@ func (st *SSHMesh) InitMux(mux *http.ServeMux) {
 		// WIP: forward to localhost or other destinations
 		rt := http.DefaultClient
 
-		preq := util.CreateUpstreamRequest(writer, request)
+		preq := nio.CreateUpstreamRequest(writer, request)
 		preq.URL, _ = url.Parse("http://localhost:8080")
 		pres, err := rt.Do(preq)
 
-		util.SendBackResponse(writer, preq, pres, err)
+		nio.SendBackResponse(writer, preq, pres, err)
 
 		slog.Info("Req", "req", request)
 		// TODO: apply any authz from the mesh config

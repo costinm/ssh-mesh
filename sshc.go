@@ -6,14 +6,15 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"log/slog"
 
-	"github.com/costinm/ssh-mesh/util"
+	meshauth_util "github.com/costinm/meshauth/util"
+	"github.com/costinm/ssh-mesh/nio"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -51,14 +52,14 @@ type SSHCMux struct {
 
 	// Last received remote key (should be a Certificate)
 	RemoteKey ssh.PublicKey
-	mds       *util.MDS
+	mds       *meshauth_util.MDS
 }
 
 // Dial opens one SSH connection to addr.
 // It blocks until the handshake is done.
 func (sc *SSHCMux) Dial(ctx context.Context, addr string) error {
 	if strings.HasPrefix(addr, "https://") {
-		tcon, err := util.NewStreamH2(ctx, addr, "localhost:15022", sc.mds)
+		tcon, err := nio.NewStreamH2(ctx, http.DefaultClient, addr, "localhost:15022", sc.mds)
 		if err != nil {
 			return err
 		}
@@ -75,10 +76,6 @@ func (sc *SSHCMux) Dial(ctx context.Context, addr string) error {
 func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) error {
 	sc.NetConn = tcon
 
-	if sc.Id == "" {
-		sc.Id = "jwt"
-	}
-
 	if sc.SignerClient == nil {
 		return errors.New("Invalid client key")
 	}
@@ -91,7 +88,7 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 		Config: ssh.Config{},
 		//ClientVersion: version,
 		Timeout: 3 * time.Second,
-		User:    sc.Id, // first principal in the certificate
+		User:    sc.Name,
 
 		// hostname is passed back from addr, empty string
 		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
@@ -121,7 +118,7 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 		}))
 	}
 
-	cc, chans, reqs, err := ssh.NewClientConn(tcon, addr, clientCfg)
+	cc, chans, reqs, err := ssh.Ncd ewClientConn(tcon, addr, clientCfg)
 	if err != nil {
 		return err
 	}
@@ -297,30 +294,37 @@ func (sc *SSHCMux) Proxy(ch io.ReadWriteCloser, dstp string, s string) {
 	})
 }
 
-// StayConnected will maintain an active connection, typically with an egress or ingress gateway.
+// StayConnected will maintain an active connection, typically with a jump host.
+//
 // 'addr' is the IP:port to connect to - not the 'canonical' service.
-// TODO: create or use UDS for multiplex.
 func (sshc *SSHCMux) StayConnected(addr string) {
+	// TODO: create or use UDS for multiplex.
 	sshDomain, _, _ := net.SplitHostPort(addr)
 
-	hn := os.Getenv("SSH_HOSTNAME")
-	if hn == "" {
-		hn, _ = os.Hostname()
-	}
-	if hn == "localhost" {
-		hn = os.Getenv("K_SERVICE")
-	}
+	//hn := os.Getenv("SSH_HOSTNAME")
+	//if hn == "" {
+	//	hn, _ = os.Hostname()
+	//}
+	//if hn == "localhost" {
+	//	hn = os.Getenv("K_SERVICE")
+	//}
 
 	ctx := context.Background()
+	backoff := 1000 * time.Millisecond
 
 	for {
 		t0 := time.Now()
+
 		err := sshc.Dial(ctx, addr)
 		if err != nil {
 			slog.Info("Dial_error", "err", err, "addr", addr)
-			time.Sleep(3 * time.Second)
+			if backoff < 15 * time.Minute {
+				backoff = 2 * backoff
+			}
+			time.Sleep(backoff)
 			continue
 		}
+
 		t1 := time.Now()
 		c := sshc.SSHClient
 
@@ -333,7 +337,7 @@ func (sshc *SSHCMux) StayConnected(addr string) {
 		// (no automatic jump-host / waypoint feature ).
 		slog.Info("JumpHost", "port", port, "addr", addr)
 
-		crv := os.Getenv("K_REVISION")
+		crv := sshc.SSHConfig.Name // os.Getenv("K_REVISION")
 		if crv != "" {
 			_, err = sshc.ListenTCP(crv+"."+sshDomain, 22)
 			if err != nil {
@@ -343,20 +347,21 @@ func (sshc *SSHCMux) StayConnected(addr string) {
 
 		for k, _ := range sshc.ReverseForwards {
 			kp, _ := strconv.Atoi(k)
-			_, err = sshc.ListenTCP(hn+"."+sshDomain, uint32(kp))
+			_, err = sshc.ListenTCP(crv+"."+sshDomain, uint32(kp))
 			if err != nil {
 				log.Println("Failed to forward", err)
 			}
 		}
 
-		slog.Info("SSH_CONNECTED", "hostname", hn, "domain", sshDomain,
+		slog.Info("SSHC_CONNECTED", "hostname", addr, "domain", sshDomain,
 			"dial_time", t1.Sub(t0),
 			"con_time", time.Since(t0))
 
-		c.Wait()
-		slog.Info("SSH_DISCONNECTED", "hostname", hn, "domain", sshDomain, "dur", time.Since(t0))
-	}
+		backoff = 1000 * time.Millisecond
 
+		c.Wait()
+		slog.Info("SSHC_DISCONNECTED", "hostname", addr, "domain", sshDomain, "dur", time.Since(t0))
+	}
 }
 
 // OpenStream creates a new stream.

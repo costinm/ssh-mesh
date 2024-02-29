@@ -1,0 +1,73 @@
+# Example of a standalone cloudrun app ( istio echo ) with a ssh sidecar.
+# In this example user can use ssh-over-http2 to connect to the SSH using the Cloudrun frontend.
+# The single-container example us based on a jump-host SSH server.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: echo-sidecar
+  labels:
+    cloud.googleapis.com/location: us-central1
+  annotations:
+    run.googleapis.com/launch-stage: ALPHA
+    run.googleapis.com/ingress: all
+    run.googleapis.com/ingress-status: all
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+
+        # Attach to the VPC (no connector)
+        run.googleapis.com/network-interfaces: '[{"network": "default", "subnetwork": "default"}]'
+
+        autoscaling.knative.dev/minScale: '0'
+        autoscaling.knative.dev/maxScale: '1'
+        run.googleapis.com/cpu-throttling: 'false'
+        run.googleapis.com/container-dependencies: '{"app":["sshm"]}'
+    spec:
+      containerConcurrency: 1000
+      timeoutSeconds: 900
+      containers:
+        # Echo app - listening on 8080 (and other ports)
+        - name: app
+          image: gcr.io/istio-testing/app:latest
+        # SSH server - by default forwards to 8080
+        # Can also tunnel to the other ports of the app, and can provide SSH access.
+        # Cloudrun will send traffic to sshm first.
+        - name: sshm
+          image: ${IMG}
+          ports:
+          # Setting the port to 15082 will use sshm H2 listener, which forwards to
+          # 8080 unless it's a tunnel or special request
+          - name: h2c
+            containerPort: 15082
+
+          env:
+            # Allow shell access for the users authenticated with the key.
+            # Allow forwarding for users with keys signed by the CA or using JWTs
+            - name: SSH_AUTHORIZED_KEYS
+              value: |
+                ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15
+                cert-authority ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDu9dWIA381ojxsUS8i0VJv0ED5Ac2zRFX1JijLjAO5HywPJ5a3CMM0NrXH5GqSoyDB/j92/Ta/f0QFAQZDhiFQ= ca.s.webinf.duckdns.org
+
+            - name: DEPLOY
+              value: "${DEPLOY}"
+
+            - name: SSH_DEFAULT_H2
+              value: https://httpbin.org
+
+            - name: SSH_DEFAULT_HTTP
+              value: https://httpbin.org
+
+            # 'sshm' env is json, containing the config options
+          #            - name: sshm
+          #              value: |
+          #                {
+          #                 "authorized_keys":"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15\ncert-authority ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDu9dWIA381ojxsUS8i0VJv0ED5Ac2zRFX1JijLjAO5HywPJ5a3CMM0NrXH5GqSoyDB/j92/Ta/f0QFAQZDhiFQ= ca.s.webinf.duckdns.org",
+          #                }
+
+
+          resources:
+            limits:
+              cpu: '1'
+              memory: 1G

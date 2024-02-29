@@ -1,4 +1,4 @@
-package util
+package nio
 
 import (
 	"errors"
@@ -131,7 +131,7 @@ func GetREDIRECTOriginalDst(clientConn *net.TCPConn) (rawaddr *net.TCPAddr, err 
 
 	// net.TCPConn.File() will cause the receiver's (clientConn) socket to be placed in blocking mode.
 	// The workaround is to take the File returned by .File(), do getsockopt() to get the original
-	// destination, then create a new *net.TCPConn by calling net.Stream.FileConn().  The new TCPConn
+	// destination, then create a new *net.TCPConn by calling net.InOutStream.FileConn().  The new TCPConn
 	// will be in non-blocking mode.  What a pain.
 	clientConnFile, err := clientConn.File()
 	if err != nil {

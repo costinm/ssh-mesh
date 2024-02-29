@@ -1,4 +1,4 @@
-package util
+package nio
 
 import (
 	"context"
@@ -7,8 +7,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-
-	"github.com/costinm/ugate/nio"
 )
 
 // Helpers for HTTP proxy.
@@ -182,7 +180,7 @@ func SendBackResponse(w http.ResponseWriter, r *http.Request,
 	CopyResponseHeaders(w.Header(), res.Header)
 	w.WriteHeader(res.StatusCode)
 
-	s1 := &nio.ReaderCopier{
+	s1 := &ReaderCopier{
 		Out: w,
 		In:  res.Body,
 	}

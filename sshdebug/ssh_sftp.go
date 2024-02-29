@@ -40,11 +40,6 @@ func subsystemHandler(req *ssh.Request, conn *ssh.ServerConn, ch ssh.Channel) {
 	var payload = struct{ Value string }{}
 	ssh.Unmarshal(req.Payload, &payload)
 
-	if conn.Permissions.Extensions["sub"] != "admin" {
-		req.Reply(false, nil)
-		return
-	}
-
 	if "sftp" == payload.Value {
 		req.Reply(true, nil)
 		go func() {

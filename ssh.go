@@ -20,7 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/costinm/ssh-mesh/util"
+	"github.com/costinm/meshauth"
+	meshauth_util "github.com/costinm/meshauth/util"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -97,7 +98,7 @@ func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
 		}
 		c.CertChecker = ss.CertChecker
 
-		c.mds = util.NewMDSClient(ss.SSHConfig.TokenProvider)
+		c.mds = meshauth_util.NewMDSClient(ss.SSHConfig.TokenProvider)
 		ss.Clients.Store(dst, c)
 		cp = c
 
@@ -180,7 +181,7 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 				}
 				tc.SignerClient, err = ssh.NewCertSigner(cert.(*ssh.Certificate), tc.SignerClient)
 				crt := cert.(*ssh.Certificate)
-				tc.Id = crt.ValidPrincipals[0]
+				tc.Name = crt.ValidPrincipals[0]
 			}
 			if tc.CertHost != "" {
 				cert, err := ssh.ParsePublicKey([]byte(tc.CertHost))
@@ -198,22 +199,16 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 		}
 	}
 
-	if tc.Id == "" {
-		tc.Id, _ = os.Hostname()
-		if strings.Contains(tc.Id, ".") {
-			parts := strings.SplitN(tc.Id, ".", 2)
-			tc.Id = parts[0]
-			if tc.Domain == "" {
-				tc.Domain = parts[1]
-			}
-		}
-	}
-	if tc.Domain == "" {
-		tc.Domain = "mesh.internal"
-	}
-
 	if tc.AuthorizedKeys != "" {
 		s.AddAuthorizedFile([]byte(tc.AuthorizedKeys))
+	}
+	if len(tc.AuthnConfig.Issuers) > 0 {
+		authn := meshauth.NewAuthn(&tc.MeshCfg.AuthnConfig)
+		err := authn.FetchAllKeys(context.Background(), tc.AuthnConfig.Issuers)
+		if err != nil {
+			log.Println("Issuers", err)
+		}
+		tc.TokenChecker = authn.CheckJwtMap
 	}
 
 	if tc.TokenChecker != nil {
@@ -258,6 +253,9 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 			if user != "" {
 				return nil
 			}
+			fp := ssh.FingerprintSHA256(key)
+			slog.Info("Host auth", "fp", fp, "id", user, "auth",
+				string(ssh.MarshalAuthorizedKey(key)), "host", hostname, "remote", remote)
 			return nil
 		},
 		UserKeyFallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -265,27 +263,12 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 			//	if s.authorizedKeys != nil {
 			keys := string(key.Marshal())
 			user := s.UsersKeys[keys]
-			log.Println("User key auth ", user)
+			fp := ssh.FingerprintSHA256(key)
 			if user != "" {
-				return &ssh.Permissions{Extensions: map[string]string{"sub": user, "role": "admin"}}, nil
+				// TODO: add public key
+				return &ssh.Permissions{Extensions: map[string]string{"sub": user,
+					"role": "admin", "fp": fp}}, nil
 			}
-			//for _, k := range s.authorizedKeys {
-			//if strings.Contains(k.Type(), "cert") {
-			//	cc := ssh.CertChecker{}
-			//	cc.IsUserAuthority = func(ck ssh.PublicKey) bool {
-			//		return bytes.Equal(ck.Marshal(), k.Marshal())
-			//	}
-			//	// cert permissions returned
-			//	p, err := cc.Authenticate(conn, key)
-			//	if err == nil {
-			//		return p, err
-			//	}
-			//}
-			//if KeysEqual(key, k) {
-			//	return &ssh.Permissions{Extensions: map[string]string{"sub": "admin"}}, nil
-			//}
-			//}
-			//}
 			return nil, errors.New("SSHD: no key found")
 		},
 	}
@@ -310,10 +293,8 @@ func (ssht *SSHMesh) AddAuthorizedFile(auth []byte) {
 		//if strings.Contains(pubk1.Type(), "cert") {
 		if slices.Contains(options, "cert-authority") {
 			ssht.AuthorizedCA = append(ssht.AuthorizedCA, pubKey)
-			slog.Info("Authorized CA", "key", pubKey)
 		} else {
 			ssht.UsersKeys[string(pubKey.Marshal())] = comm
-			slog.Info("Authorized user", "key", comm)
 		}
 		auth = rest
 	}
@@ -387,6 +368,7 @@ type SSHSMux struct {
 	// For server-side sessions, this is the last active session.
 	// With multiplexing, multiple sessions may be in effect.
 	SessionStream ssh.Channel
+	FQDN          string
 }
 
 // Stream is a client or server stream - 'Channel' in SSH terms.
@@ -420,6 +402,8 @@ func (ssht *SSHMesh) HandleServerConn(nConn net.Conn) {
 			NetConn:     nConn,
 		},
 		SSHServer: ssht,
+
+
 	}
 
 	// Before use, a handshake must be performed on the incoming
@@ -439,13 +423,30 @@ func (ssht *SSHMesh) HandleServerConn(nConn net.Conn) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ssht.connectedClientNodes.Store(conn.User(), acceptedSSHMux)
+	sub := conn.Permissions.Extensions["sub"]
+	// convert email to DNS
+	sub = strings.Replace(sub, "@", ".", 1)
+	if strings.HasSuffix(sub, "-compute.developer.gserviceaccount.com") {
+		// Project number replacement
+		// This domain is shared by all workloads using the default service account.
+		sub = strings.Replace(sub, "-compute.developer.gserviceaccount.com", ".pn.mesh.internal", 1)
+	}
+	if strings.HasSuffix(sub, ".iam.gserviceaccount.com") {
+		// Project number replacement
+		// Shared by all workloads using the custom GSA
+		sub = strings.Replace(sub, ".iam.gserviceaccount.com", ".p.mesh.internal", 1)
+	}
+
+	acceptedSSHMux.FQDN = conn.User() + "." + sub
+
+	ssht.connectedClientNodes.Store(acceptedSSHMux.FQDN, acceptedSSHMux)
+
 
 	defer func() {
 		// remote addr is from nConn
 		// User is the authenticated user - from the client cert.
 		//
-		ssht.connectedClientNodes.Delete(conn.User())
+		ssht.connectedClientNodes.Delete(acceptedSSHMux.FQDN)
 		slog.Info("SSHD_CONN",
 			"remote", nConn.RemoteAddr(),
 			"user", conn.User(),
@@ -456,12 +457,18 @@ func (ssht *SSHMesh) HandleServerConn(nConn net.Conn) {
 
 	go ssht.handleServerConnRequests(ctx, globalSrvReqs, nConn, acceptedSSHMux)
 
+	slog.Info("SSHD_CONN_START",
+		"remote", nConn.RemoteAddr(),
+		"user", conn.User(),
+		"fqdn", acceptedSSHMux.FQDN,
+		"perm", conn.Permissions, "d", time.Since(acceptedSSHMux.ConnectTime))
+
 	// Service the incoming channels (stream in H2).
 	// Each channel is a stream - shell, exec, sftp, local TCP forward.
 	for newChannel := range chans {
 		switch newChannel.ChannelType() {
 		case "direct-tcpip":
-			go DirectTCPIPHandler(ctx, ssht, newChannel)
+			go DirectTCPIPHandler(ctx, acceptedSSHMux, ssht, newChannel)
 
 		default:
 			chandler := ssht.ChannelHandlers[newChannel.ChannelType()]

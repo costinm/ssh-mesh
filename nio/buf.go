@@ -1,8 +1,10 @@
-package util
+package nio
 
 import (
+	"bufio"
 	"encoding/binary"
 	"io"
+	"net"
 )
 
 // Similar uses:
@@ -339,8 +341,11 @@ type BufferReader struct {
 	Buffer *Buffer
 }
 
-// NewBufferReader returns a buffer associated with a reader.
+// NewBufferReader adds a buffer associated with a reader.
 // Read will first consume the buffer.
+// The BufferReader can peek and parse the input.
+// Once the bufer is read, Read() will directly use the stream unless Peek
+// methods are used.
 func NewBufferReader(in io.Reader) *BufferReader {
 	b := GetBuffer(0, 0)
 	return &BufferReader{Buffer: b, Reader: in}
@@ -408,4 +413,37 @@ func (s *BufferReader) Close() error {
 
 func (s *BufferReader) Read(d []byte) (int, error) {
 	return s.Buffer.ReadBlocking(s.Reader, d)
+}
+
+// From x/http2/h2c
+
+func newBufConn(conn net.Conn, rw *bufio.ReadWriter) net.Conn {
+	rw.Flush()
+	if rw.Reader.Buffered() == 0 {
+		// If there's no buffered data to be read,
+		// we can just discard the bufio.ReadWriter.
+		return conn
+	}
+	return &bufConn{conn, rw.Reader}
+}
+
+// bufConn wraps a net.Conn, but reads drain the bufio.Reader first.
+type bufConn struct {
+	net.Conn
+	*bufio.Reader
+}
+
+func (c *bufConn) Read(p []byte) (int, error) {
+	if c.Reader == nil {
+		return c.Conn.Read(p)
+	}
+	n := c.Reader.Buffered()
+	if n == 0 {
+		c.Reader = nil
+		return c.Conn.Read(p)
+	}
+	if n < len(p) {
+		p = p[:n]
+	}
+	return c.Reader.Read(p)
 }

@@ -1,4 +1,4 @@
-package util
+package nio
 
 import (
 	"sync"
@@ -59,15 +59,6 @@ func PutDataBufferChunk(p []byte) {
 	}
 	// odd buffers sizes will go to GC
 }
-
-// Old style buffer pool
-
-var (
-	// createBuffer to get a buffer. io.Copy uses 32k.
-	bufferPoolCopy = sync.Pool{New: func() interface{} {
-		return make([]byte, 16*64*1024) // 1M
-	}}
-)
 
 var ioPool = &BufferPool{
 	pool: sync.Pool{New: func() interface{} {

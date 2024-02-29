@@ -1,4 +1,4 @@
-package util
+package nio
 
 import (
 	"encoding/binary"

@@ -10,10 +10,11 @@ import (
 	"time"
 
 	"github.com/costinm/meshauth"
+	meshauth_util "github.com/costinm/meshauth/util"
 
 	sshd "github.com/costinm/ssh-mesh"
 	"github.com/costinm/ssh-mesh/sshdebug"
-	"github.com/costinm/ssh-mesh/util"
+	"github.com/costinm/ssh-mesh/nio"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -48,12 +49,12 @@ func main() {
 	ctx := context.Background()
 
 	cfg := &sshd.SSHConfig{
-		MeshAuthCfg: meshauth.MeshAuthCfg {
+		MeshCfg: meshauth.MeshCfg{
 			Dst: map[string]*meshauth.Dest{},
 			Listeners: map[string]*meshauth.PortListener{},
 		},
 	}
-	err := util.MainStart("sshm", cfg)
+	err := meshauth_util.MainStart("sshm", cfg)
 	if err != nil {
 		panic(err)
 	}
@@ -62,21 +63,8 @@ func main() {
 
 	// Issuers are trusted to sign both JWTs and ssh certs.
 	//
-	authn := meshauth.NewAuthn(&cfg.MeshAuthCfg.AuthConfig)
-	if len(cfg.AuthConfig.Issuers) > 0 {
-		err := authn.FetchAllKeys(ctx, cfg.AuthConfig.Issuers)
-		if err != nil {
-			log.Println("Issuers", err)
-		}
-		cfg.TokenChecker = authn.CheckJwtMap
-	}
 
-	cfg.AuthConfig.Issuers = append(cfg.AuthConfig.Issuers,
-		&meshauth.TrustConfig{
-			Issuer: "https://accounts.google.com",
-	})
-
-	log.Println("Starting with ", cfg)
+	// log.Println("Starting with ", cfg)
 	// Start the SSH main object.
 	st, err := sshd.NewSSHMesh(cfg)
 	if err != nil {
@@ -117,11 +105,11 @@ func main() {
 
 
 	// TODO: debug trace
-	util.MainEnd()
+	meshauth_util.MainEnd()
 }
 
 func initTProxy(cfg *sshd.SSHConfig, st *sshd.SSHMesh) (*net.TCPListener, error) {
-	return util.IptablesCapture(cfg.TProxyAddr, func(c net.Conn, destA, la *net.TCPAddr) {
+	return nio.IptablesCapture(cfg.TProxyAddr, func(c net.Conn, destA, la *net.TCPAddr) {
 		ctx := context.Background()
 		t0 := time.Now()
 		dest := destA.String()
@@ -145,7 +133,7 @@ func initTProxy(cfg *sshd.SSHConfig, st *sshd.SSHMesh) (*net.TCPListener, error)
 }
 
 func initSocks(cfg *sshd.SSHConfig, st *sshd.SSHMesh, ctx context.Context) (net.Listener, error) {
-	return util.Sock5Capture(cfg.SocksAddr, func(s *util.Socks, c net.Conn) {
+	return nio.Sock5Capture(cfg.SocksAddr, func(s *nio.Socks, c net.Conn) {
 		t0 := time.Now()
 		dest := s.Dest
 		if dest == "" {
@@ -171,7 +159,7 @@ func initSocks(cfg *sshd.SSHConfig, st *sshd.SSHMesh, ctx context.Context) (net.
 }
 
 func initH2(st *sshd.SSHMesh, cfg *sshd.SSHConfig) {
-	// Load Http/h2 handlers (tunnel, etc)
+	// SetCert Http/h2 handlers (tunnel, etc)
 	mux := http.NewServeMux()
 
 	st.InitMux(mux)
@@ -188,6 +176,16 @@ func initH2(st *sshd.SSHMesh, cfg *sshd.SSHConfig) {
 }
 
 func initDefaults(cfg *sshd.SSHConfig) {
+	// Detect cloudrun
+	ks := os.Getenv("K_SERVICE")
+	if ks != "" {
+		cfg.AuthnConfig.Issuers = append(cfg.AuthnConfig.Issuers,
+			&meshauth.TrustConfig{
+				Issuer: "https://accounts.google.com",
+			})
+	}
+
+
 	// TODO: use same defaults as ztunnel
 	if cfg.Listeners["socks"] == nil {
 		cfg.Listeners["socks"] = &meshauth.PortListener{
@@ -216,6 +214,6 @@ func initDefaults(cfg *sshd.SSHConfig) {
 		}
 	}
 
-	// Load additional config from .ssh directory (running on a VM)
+	// SetCert additional config from .ssh directory (running on a VM)
 	sshd.EnvSSH(cfg)
 }

@@ -44,7 +44,7 @@ type localForwardChannelData struct {
 // avoid an extra TCP connection.
 //
 // Laddr is typically 127.0.0.1 (unless ssh has an open socks, and other machines use it)
-func DirectTCPIPHandler(ctx context.Context, srv *SSHMesh, newChan ssh.NewChannel) {
+func DirectTCPIPHandler(ctx context.Context, mux *SSHSMux, srv *SSHMesh, newChan ssh.NewChannel) {
 	d := localForwardChannelData{}
 	if err := ssh.Unmarshal(newChan.ExtraData(), &d); err != nil {
 		newChan.Reject(ssh.ConnectionFailed, "error parsing forward data: "+err.Error())
@@ -65,6 +65,8 @@ func DirectTCPIPHandler(ctx context.Context, srv *SSHMesh, newChan ssh.NewChanne
 
 	if d.DestPort == 22 || d.DestPort == 15022 {
 		if rc, ok := srv.connectedClientNodes.Load(d.DestAddr); ok {
+			slog.Info("Forward-local", "dst", dest, "from", "")
+
 			conn, _ := rc.(*SSHSMux)
 			payload := ssh.Marshal(&remoteForwardChannelData{
 				DestAddr:   d.DestAddr,
@@ -92,9 +94,13 @@ func DirectTCPIPHandler(ctx context.Context, srv *SSHMesh, newChan ssh.NewChanne
 
 	// Generic handler for all reverseForwards. If not set, use Dial()
 	if srv.Forward != nil {
+		slog.Info("Forward1", "dst", dest, "from", "")
+
 		srv.Forward(ctx, dest, ch)
 		return
 	}
+
+	slog.Info("Forward", "dst", dest, "from", "")
 
 	var dialer net.Dialer
 	dconn, err := dialer.DialContext(ctx, "tcp", dest)
