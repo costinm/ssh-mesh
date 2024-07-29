@@ -751,7 +751,7 @@ func (s *InOutStream) ReadFrom(cin io.Reader) (n int64, err error) {
 	// TCP conn ReadFrom fallbacks to Copy without recycling the buffer
 	if CanSplice(cin, s.Out) {
 		if wt, ok := s.Out.(io.ReaderFrom); ok {
-			VarzReadFromC.Add(1)
+			//VarzReadFromC.Add(1)
 			n, err = wt.ReadFrom(cin)
 			s.SentPackets++
 			s.SentBytes += int(n)
@@ -899,7 +899,7 @@ func (s *InOutStream) WriteTo(w io.Writer) (n int64, err error) {
 
 	if CanSplice(s.In, w) {
 		if wt, ok := w.(io.ReaderFrom); ok {
-			VarzReadFromC.Add(1)
+			//VarzReadFromC.Add(1)
 			n, err = wt.ReadFrom(s.In)
 			s.RcvdPackets++
 			s.RcvdBytes += int(n)

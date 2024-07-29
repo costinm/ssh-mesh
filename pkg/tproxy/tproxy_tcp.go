@@ -1,6 +1,7 @@
-package nio
+package tproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -29,7 +30,7 @@ func AcceptTProxy(l *net.TCPListener) (*net.TCPConn, error) {
 // ListenTProxy will construct a new TCP listener
 // socket with the Linux IP_TRANSPARENT option
 // set on the underlying socket
-func ListenTProxy(network string, laddr *net.TCPAddr) (*net.TCPListener, error) {
+func ListenTProxy(ctx context.Context, network string, laddr *net.TCPAddr) (*net.TCPListener, error) {
 	listener, err := net.ListenTCP(network, laddr)
 	if err != nil {
 		return nil, err
@@ -42,16 +43,16 @@ func ListenTProxy(network string, laddr *net.TCPAddr) (*net.TCPListener, error) 
 	defer fileDescriptorSource.Close()
 
 	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
-		slog.Info("Tproxy disabled - running in REDIRECT mode", "err", err)
+		slog.InfoContext(ctx, "Tproxy disabled - running in REDIRECT mode", "err", err)
 		//return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
 	}
 
 	return listener, nil
 }
 
-func IptablesCapture(addr string, ug func(nc net.Conn, dest, la *net.TCPAddr)) (*net.TCPListener, error) {
+func IptablesCapture(ctx context.Context, addr string, ug func(nc net.Conn, dest, la *net.TCPAddr)) (*net.TCPListener, error) {
 	na, err := net.ResolveTCPAddr("tcp", addr)
-	nl, err := ListenTProxy("tcp", na)
+	nl, err := ListenTProxy(ctx, "tcp", na)
 	if err != nil {
 		log.Println("Failed to capture tproxy", err)
 		return nil, err

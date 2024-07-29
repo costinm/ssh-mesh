@@ -1,0 +1,10 @@
+defaultBaseImage:  nicolaka/netshoot
+#defaultBaseImage: gcr.io/distroless/static-debian11:latest
+builds:
+  - env:
+      - CGO_ENABLED=0
+    flags:
+      - -v
+    ldflags:
+      - -s
+      - -w

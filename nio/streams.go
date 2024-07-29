@@ -3,11 +3,14 @@ package nio
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"expvar"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +37,39 @@ type Stream interface {
 	//context.Context
 	StreamMeta
 	ContextGetter
+}
+
+
+// Streams tracks active streams. Some streams are long-lived and used to mux other streams.
+//
+type Streams struct {
+
+	active sync.Map // streamID -> Stream
+}
+
+func (ug *Streams) OnStream(str Stream) {
+}
+
+// Called at the end of the connection handling. After this point
+// nothing should use or refer to the connection, both proxy directions
+// should already be closed for write or fully closed.
+func (ug *Streams) OnStreamDone(str Stream) {
+	if r := recover(); r != nil {
+		debug.PrintStack()
+
+		// find out exactly what the error was and set err
+		var err error
+
+		switch x := r.(type) {
+		case string:
+			err = errors.New(x)
+		case error:
+			err = x
+		default:
+			err = errors.New("Unknown panic")
+		}
+		slog.WarnContext(str.Context(), "panic", "err", err)
+	}
 }
 
 
@@ -196,10 +232,10 @@ var (
 
 // Varz interface.
 // Varz is a wrapper for atomic operation, with a json http interface.
-// Prometheus, OTel etc can directly use them.
+// MetricReader, OTel etc can directly use them.
 var (
 	// Number of copy operations using slice.
-	VarzReadFromC = expvar.NewInt("io_copy_slice_total")
+	//Varz/ReadFromC = expvar.NewInt("io_copy_slice_total2")
 )
 
 var StreamId uint32
@@ -227,7 +263,7 @@ func (s *ReaderCopier) Copy(ch chan int, close bool) {
 			s.rstWriter(err)
 			s.Err = err
 		}
-		VarzReadFromC.Add(1)
+		//VarzReadFromC.Add(1)
 		return
 	}
 

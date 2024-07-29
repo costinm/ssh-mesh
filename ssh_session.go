@@ -22,6 +22,7 @@ import (
 //
 // Inside a session - ~. close, ~B break, ~C CLI, ~# connections, ~? help
 
+// Basic untrusted session handler.
 func SessionHandler(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChannel) {
 	ch, reqs, _ := newChannel.Accept()
 
@@ -81,17 +82,16 @@ func (c *SSHSMux) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 	panic("implement me")
 }
 
+// Called for Methods: Setstat, Rename, Rmdir, Mkdir, Link, Symlink, Remove
 func (c *SSHSMux) Filecmd(request *sftp.Request) error {
 	//TODO implement me
 	panic("implement me")
 }
 
-
 func (c *SSHSMux) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	//TODO implement me
 	panic("implement me")
 }
-
 
 
 func (c *SSHSMux) Fileread(request *sftp.Request) (io.ReaderAt, error) {

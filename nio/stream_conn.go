@@ -76,11 +76,20 @@ func (s *StreamConn) Context() context.Context {
 	return s.ctx
 }
 
+// NewStreamConn creates the Stream wrapper around a net.Conn
+// If tls.Conn, will also set the TLS field (which can also be set for other
+// streams ).
 func NewStreamConn(r net.Conn) *StreamConn { // *StreamHttpServer {
-	return &StreamConn{
+
+	ss := &StreamConn{
 		//StreamId: int(atomic.AddUint32(&nio.StreamId, 1)),
 		StreamState: StreamState{Stats: Stats{Open: time.Now()}},
 		Conn:        r,
 	}
+	if tc, ok := r.(*tls.Conn); ok {
+		cs := tc.ConnectionState()
+		ss.TLS = &cs
+	}
+	return ss
 }
 

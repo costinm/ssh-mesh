@@ -6,12 +6,17 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"log"
+	"os"
 	"testing"
 
+	"github.com/costinm/meshauth"
 	"golang.org/x/crypto/ssh"
 )
+
 
 func TestE2E(t *testing.T) {
 	ctx := context.Background()
@@ -26,7 +31,7 @@ func TestE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	bob.Address = ":11122"
-	l, err := bob.Start()
+	l, err := bob.ListenAndStart()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +50,7 @@ func TestE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log.Println(acc.RemoteKey, bob.SignerHost.PublicKey())
+	log.Println(acc.RemoteKey, bob.Signer.PublicKey())
 
 	// RoundTripStart from bob...
 	//asshC.RoundTripStart()
@@ -64,10 +69,16 @@ var domain = "test.mesh.local"
 // InitMeshNode provisions an ephemeral mesh node for testing.
 // Should do the same as the ssh-keygen script.
 func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
+	ma := meshauth.New(nil)
+	ma.InitSelfSignedFromPEMKey("")
+
 	// ssh-keygen
 	nodePrivate, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
 	encodedKey, _ := x509.MarshalECPrivateKey(nodePrivate)
 	privatePEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: encodedKey})
+
+	ma.Priv = string(privatePEM)
 
 	nodeSSHSigner, _ := ssh.NewSignerFromKey(nodePrivate)
 
@@ -81,18 +92,37 @@ func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
 	_, hcc, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.UserCert,
 		[]string{name + "@" + domain})
 
-	node, err := NewSSHMesh(
-		&SSHConfig{
-			Private:        string(privatePEM),
-			CertClient:     string(hcc.Marshal()),
-			CertHost:       string(hch.Marshal()),
-			AuthorizedKeys: string(ca.SignerHost.PublicKey().Marshal()),
-			//Id:             name,
-			//Domain:         domain,
-		})
+	node, err := NewSSHMesh(ma)
 	if err != nil {
 		return nil, err
 	}
 
+	node.SetKeys(ma.Priv, base64.StdEncoding.EncodeToString(hch.Marshal()),
+		base64.StdEncoding.EncodeToString(hcc.Marshal()))
+
+
 	return node, nil
+}
+
+// NewNode creates a new SSH mesh node, based on a config location.
+//
+// For testing and apps using multiple nodes.
+//
+// TODO: support URLs (with JWT auth) and dirs
+func NewNode(loc string) (*SSHMesh, error) {
+
+	ma := meshauth.New(nil)
+
+	sshmf := loc
+	if loc[len(loc)-1] == '/' {
+		sshmf = loc + "sshm.json"
+		// TODO: dir, load dest from files.
+	}
+	cfgdata, err := os.ReadFile(sshmf)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal(cfgdata, ma.MeshCfg)
+
+	return NewSSHMesh(ma)
 }

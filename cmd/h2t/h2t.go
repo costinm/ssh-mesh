@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
-	"golang.org/x/net/http2"
 	"io"
 	"log"
 	"net"
@@ -12,12 +11,14 @@ import (
 	"os"
 	"strings"
 
-	meshauth_util "github.com/costinm/meshauth/util"
-	"github.com/costinm/ssh-mesh/util"
+	"github.com/costinm/meshauth"
+	"github.com/costinm/ssh-mesh/nio"
+	"golang.org/x/net/http2"
 )
 
 var (
 	//h2c_addr = flag.String("h2c", "", "H2C address")
+
 	h2c = flag.Bool("h2c", false, "Use H2C")
 )
 
@@ -40,14 +41,15 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
+
 	if len(flag.Args()) == 0 {
 		log.Fatal("Args: url")
 	}
+
 	// URL or hostname
 	url := flag.Args()[0]
 
-
-	mds := meshauth_util.NewMDSClient("")
+	ma, err := meshauth.FromEnv(ctx, nil, "")
 
 	client := http.DefaultClient
 	if *h2c {
@@ -61,7 +63,6 @@ func main() {
 				},
 			},
 		}
-		mds = nil
 	}
 
 	// The URL can be explicit
@@ -69,8 +70,7 @@ func main() {
 		url = "https://" + url
 	}
 
-	log.Println("Connecting to ", url, mds)
-	sc, err := nio.NewStreamH2(ctx, client, url, "localhost:15022",  mds)
+	sc, err := nio.NewStreamH2(ctx, client, url, "localhost:15022",  ma)
 	if err != nil {
 		log.Fatal(err)
 	}

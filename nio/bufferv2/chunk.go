@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/costinm/ugate/bufferv2/bits"
+	"github.com/costinm/ssh-mesh/nio/bufferv2/bits"
 )
 
 const (

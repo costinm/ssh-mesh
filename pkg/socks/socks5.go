@@ -1,12 +1,16 @@
-package nio
+package socks
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"strconv"
 	"time"
+
+	"github.com/costinm/meshauth"
+	"github.com/costinm/ssh-mesh/nio"
 )
 
 // Egress capture using SOCKS5, for whitebox mode.
@@ -83,6 +87,30 @@ type Socks struct {
 	Writer   io.WriteCloser
 }
 
+func RegisterFn(l *meshauth.Module) error {
+	if l.Address == "" {
+		l.Address = "127.0.0.1:15008"
+	}
+	ll, err := Sock5Capture(l.Address, func(s *Socks, c net.Conn) {
+		//t0 := time.Now()
+		dest := s.Dest
+		if dest == "" {
+			dest = s.DestAddr.String()
+		}
+		nc, err := l.Mesh.DialContext(context.Background(), "tcp", s.Dest)
+		if err != nil {
+			s.PostDialHandler(nil, err)
+			return
+		}
+		s.PostDialHandler(nc.LocalAddr(), nil)
+
+		nio.Proxy(nc, c, c, s.Dest)
+		return
+	})
+	l.NetListener = ll
+	return err
+}
+
 func Sock5Capture(addr string, cb func(s *Socks, c net.Conn)) (net.Listener, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -101,7 +129,7 @@ func Sock5Capture(addr string, cb func(s *Socks, c net.Conn)) (net.Listener, err
 				return
 			}
 			s := &Socks{Writer: c}
-			brin := NewBufferReader(c)
+			brin := nio.NewBufferReader(c)
 			HandleSocks(brin, s, c)
 			//
 			go cb(s, c)
@@ -143,7 +171,7 @@ func (s *Socks) PostDialHandler(localAddr net.Addr, err error) {
 	s.Writer.Write(r[0:off])
 }
 
-func HandleSocks(br *BufferReader, s *Socks, w io.WriteCloser) (err error) {
+func HandleSocks(br *nio.BufferReader, s *Socks, w io.WriteCloser) (err error) {
 	// Fill the read buffer with one Read.
 	// Typically 3-4 bytes unless client is eager.
 

@@ -3,6 +3,7 @@ package ssh_mesh
 import (
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 
 	"github.com/costinm/ssh-mesh/nio"
@@ -10,13 +11,11 @@ import (
 )
 
 // InitMux add the H2 functions
-//
 func (st *SSHMesh) InitMux(mux *http.ServeMux) {
-	mux.HandleFunc("/_debug/", func(writer http.ResponseWriter, request *http.Request) {
-		// TODO
-	})
+	u, _ := url.Parse("http://127.0.0.1:8080")
+	localReverseProxyH1 := httputil.NewSingleHostReverseProxy(u)
 
-	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("/tun/", func(writer http.ResponseWriter, request *http.Request) {
 		// Override - when running in serverless or a gateway with fixed hostname
 		hosts := request.Header.Get("x-host")
 
@@ -65,13 +64,14 @@ func (st *SSHMesh) InitMux(mux *http.ServeMux) {
 		}
 
 		// WIP: forward to localhost or other destinations
-		rt := http.DefaultClient
+		//rt := http.DefaultClient
+		//preq := nio.CreateUpstreamRequest(writer, request)
+		//preq.URL, _ = url.Parse("http://127.0.0.1:8080")
+		//pres, err := rt.Do(preq)
+		//
+		//nio.SendBackResponse(writer, preq, pres, err)
 
-		preq := nio.CreateUpstreamRequest(writer, request)
-		preq.URL, _ = url.Parse("http://localhost:8080")
-		pres, err := rt.Do(preq)
-
-		nio.SendBackResponse(writer, preq, pres, err)
+		localReverseProxyH1.ServeHTTP(writer, request)
 
 		slog.Info("Req", "req", request)
 		// TODO: apply any authz from the mesh config

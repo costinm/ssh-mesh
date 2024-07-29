@@ -6,14 +6,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"net"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -21,7 +19,7 @@ import (
 	"time"
 
 	"github.com/costinm/meshauth"
-	meshauth_util "github.com/costinm/meshauth/util"
+	"github.com/costinm/meshauth/pkg/oidc"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -39,8 +37,11 @@ type Command struct {
 // SSHMesh is a minimal L4S (ambient) mesh implementation based on SSH,
 // and compatible with standard SSH clients and servers.
 type SSHMesh struct {
-	*SSHConfig
+	Mesh *meshauth.Mesh
 
+	// Address to listen on as SSH. Will default to 14022 for regular nodes and
+	// 15022 for gateways.
+	Address string `json:"sshd_addr,omitempty"`
 	Listener    net.Listener     `json:"-"`
 	CertChecker *ssh.CertChecker `json:"-"`
 
@@ -65,26 +66,73 @@ type SSHMesh struct {
 
 	ConnectErrors atomic.Int64
 
+
+	// Map of public key to user ID.
+	// Key is the marshalled public key (from authorized_keys), value is the user ID (comment)
+	UsersKeys map[string]string `json:"-"`
+
+	// Signer is the 'workload identity' signer. It is using the main workload
+	// private key (workload key), but with a host certificate.
+	Signer       ssh.Signer `json:"-"`
+
+	// SignerClient is a client workload identity - using the SA cert when
+	// a CA is used. Otherwise, same as Signer.
+	SignerClient ssh.Signer `json:"-"`
+
+	// Forward is a function that will proxy a stream to a destination.
+	// If missing, it will be dialed.
+	// Used on a server for all client forwarding - except locally connected clients.
+	Forward func(context.Context, string, io.ReadWriteCloser) `json:"-"`
+
+	// WIP: Internally defined commands.
+	InternalCommands map[string]*Command `json:"-"`
+
+
+	// Root CA keys - will be authorized to connect and create tunnels, not get shell.
+	AuthorizedCA []ssh.PublicKey `json:"-"`
+
+	// WIP: Custom channel handlers.
+	ChannelHandlers map[string]func(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChannel) `json:"-"`
+
+	// TokenChecker will verify the password field - as a JWT or other forms.
+	TokenChecker func(password string) (claims map[string]string, e error) `json:"-"`
+
+	// Deprecated - Credentials
+	CertHost   string `json:"ssh.crt,omitempty"`
+	// Deprecated - Credentials
+	CertClient string `json:"ssh-client.crt,omitempty"`
+
+
+	// AuthorizedKeys is the same as authorized_keys file.
+	// The keys are used as 'trusted sources' for authentication. Any user key can be used for shell/debug access.
+	// The CA keys are allowed to connect - but can get a shell only if 'role=admin' is present in the cert.
+	//
+	// If empty, the SSH_AUTHORIZED_KESY env is used, falling back to authorized_keys in current dir and $HOME/.ssh
+	AuthorizedKeys string `json:"authorized_keys,omitempty"`
+
 	sync.Mutex
 }
 
-func (ss *SSHMesh) StayConnected(ctx context.Context) {
-	for addr, d:=range ss.Dst {
-		a := d.Addr
-		if a == "" {
-			a = addr
-		}
-		if d.Proto == "ssh-upstream" {
-			// TODO: list of ssh servers for redundancy
-			sshc, err := ss.Client(ctx, a)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			go sshc.StayConnected(a)
-		}
-	}
-}
+// StayConnected will keep the SSH node connected with any 'ssh-upstream'
+// destination in the config.
+// Does not support reloading yet.
+//func (ss *SSHMesh) StayConnected(ctx context.Context) {
+//	for addr, d:=range ss.Mesh.Dst {
+//		a := d.Addr
+//		if a == "" {
+//			a = addr
+//		}
+//		if d.Proto == "ssh-upstream" {
+//			// TODO: list of ssh servers for redundancy
+//			sshc, err := ss.Client(ctx, a)
+//			if err != nil {
+//				log.Fatal(err)
+//			}
+//
+//			go sshc.StayConnected(a)
+//		}
+//	}
+//}
 
 // Client returns a SSH client for a destination.
 // It may be disconnected - first call is always disconnected.
@@ -92,13 +140,14 @@ func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
 	cp, _ := ss.Clients.Load(dst)
 	if cp == nil {
 		c := &SSHCMux{
-			SSHConfig: ss.SSHConfig,
+			SSHMesh: ss,
 				ReverseForwards: map[string]string{},
 			AuthorizedCA: ss.AuthorizedCA,
 		}
 		c.CertChecker = ss.CertChecker
 
-		c.mds = meshauth_util.NewMDSClient(ss.SSHConfig.TokenProvider)
+		// Will be used with tunnels
+		c.mds = ss.Mesh
 		ss.Clients.Store(dst, c)
 		cp = c
 
@@ -110,27 +159,44 @@ func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
 	return c, nil
 }
 
-// NewNode creates a new SSH mesh node, based on a config location.
-//
-// TODO: support URLs (with JWT auth) and dirs
-func NewNode(loc string) (*SSHMesh, error) {
-	sshmf := loc
-	if loc[len(loc)-1] == '/' {
-		sshmf = loc + "sshm.json"
-		// TODO: dir, load dest from files.
-	}
-	cfgdata, err := os.ReadFile(sshmf)
-	if err != nil {
-		return nil, err
-	}
-	sshcfg := &SSHConfig{}
-	json.Unmarshal(cfgdata, sshcfg)
 
-	return NewSSHMesh(sshcfg)
+func (s *SSHMesh) SetKeys(priv string, hostc string, clientc string) (*SSHMesh, error) {
+	ma := s.Mesh
+	if ma.Priv != "" {
+		k, err := ssh.ParseRawPrivateKey([]byte(ma.Priv))
+		if err != nil {
+			return nil, err
+		}
+		s.Signer, _ = ssh.NewSignerFromKey(k)
+		s.SignerClient = s.Signer
+
+		if s.CertClient != "" {
+			cert, err := ssh.ParsePublicKey([]byte(s.CertClient))
+			if err != nil {
+				return nil, err
+			}
+			s.SignerClient, err = ssh.NewCertSigner(cert.(*ssh.Certificate), s.SignerClient)
+			crt := cert.(*ssh.Certificate)
+			s.Mesh.Name = crt.ValidPrincipals[0]
+		}
+		if s.CertHost != "" {
+			cert, err := ssh.ParsePublicKey([]byte(s.CertHost))
+			if err != nil {
+				return nil, err
+			}
+			s.Signer, err = ssh.NewCertSigner(cert.(*ssh.Certificate), s.Signer)
+		}
+
+	} else {
+		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		s.Signer, _ = ssh.NewSignerFromKey(privk1)
+		s.SignerClient = s.Signer
+	}
+	return s, nil
 }
 
-// NewSSHMesh initializes a node using the ssh configuration.
-// The config may include a private key (it should be loaded from a secret).
+// NewSSHMesh creates the SSHMesh object.
+// Must call SetKeys() or FromEnv() before using it.
 //
 // If the key is missing, a self-signed key is generated.
 //
@@ -140,81 +206,40 @@ func NewNode(loc string) (*SSHMesh, error) {
 // - optimized for the use of a CA for both client and server.
 //
 // TODO: As a server, it can also prove its workload ID with a JWT and jumpstart known_hosts !
-func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
-	if tc.InternalCommands == nil {
-		tc.InternalCommands = map[string]*Command{}
-	}
-	if tc.UsersKeys == nil {
-		tc.UsersKeys = map[string]string{}
-	}
-	if tc.ChannelHandlers == nil {
-		tc.ChannelHandlers = map[string]func(ctx context.Context, ssht *SSHSMux, newChannel ssh.NewChannel){}
-	}
-
+func NewSSHMesh(ma *meshauth.Mesh) (*SSHMesh, error) {
 	s := &SSHMesh{
-		SSHConfig:       tc,
-		serverConfig:    &ssh.ServerConfig{},
-		reverseForwards: map[string]net.Listener{},
+		Mesh:             ma,
+		serverConfig:     &ssh.ServerConfig{},
+		reverseForwards:  map[string]net.Listener{},
+		InternalCommands: map[string]*Command{},
+		UsersKeys:        map[string]string{},
+		ChannelHandlers:  map[string]func(ctx context.Context, ssht *SSHSMux, newChannel ssh.NewChannel){},
 	}
 
 	// TODO: if key and certs are missing in config but a URL is specified, fetch the
 	//  private key and certs
 	// ( a 'metadata' bootstrap/launcher should be run first to get all secret and config bits )
 
+	pk := meshauth.SignerFromKey(ma.Cert.PrivateKey)
+	s.Signer, _ = ssh.NewSignerFromSigner(pk)
+	s.SignerClient = s.Signer
 
-	if tc.SignerHost == nil {
-		if tc.Private != "" {
-			k, err := ssh.ParseRawPrivateKey([]byte(tc.Private))
-			if err != nil {
-				return nil, err
-			}
-			if privk1, ok := k.(*ecdsa.PrivateKey); ok {
-				tc.KeyHost = privk1
-			}
-			tc.SignerHost, _ = ssh.NewSignerFromKey(k)
-			tc.SignerClient = tc.SignerHost
-
-			if tc.CertClient != "" {
-				cert, err := ssh.ParsePublicKey([]byte(tc.CertClient))
-				if err != nil {
-					return nil, err
-				}
-				tc.SignerClient, err = ssh.NewCertSigner(cert.(*ssh.Certificate), tc.SignerClient)
-				crt := cert.(*ssh.Certificate)
-				tc.Name = crt.ValidPrincipals[0]
-			}
-			if tc.CertHost != "" {
-				cert, err := ssh.ParsePublicKey([]byte(tc.CertHost))
-				if err != nil {
-					return nil, err
-				}
-				tc.SignerHost, err = ssh.NewCertSigner(cert.(*ssh.Certificate), tc.SignerHost)
-			}
-
-		} else {
-			privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-			tc.SignerHost, _ = ssh.NewSignerFromKey(privk1)
-			tc.SignerClient = tc.SignerHost
-			tc.KeyHost = privk1
-		}
+	if s.AuthorizedKeys != "" {
+		s.AddAuthorizedFile([]byte(s.AuthorizedKeys))
 	}
-
-	if tc.AuthorizedKeys != "" {
-		s.AddAuthorizedFile([]byte(tc.AuthorizedKeys))
-	}
-	if len(tc.AuthnConfig.Issuers) > 0 {
-		authn := meshauth.NewAuthn(&tc.MeshCfg.AuthnConfig)
-		err := authn.FetchAllKeys(context.Background(), tc.AuthnConfig.Issuers)
+	if len(s.Mesh.AuthnConfig.Issuers) > 0 {
+		authn := oidc.NewAuthn(&s.Mesh.MeshCfg.AuthnConfig)
+		err := authn.FetchAllKeys(context.Background(), s.Mesh.AuthnConfig.Issuers)
 		if err != nil {
 			log.Println("Issuers", err)
 		}
-		tc.TokenChecker = authn.CheckJwtMap
+		s.TokenChecker = authn.CheckJwtMap
 	}
 
-	if tc.TokenChecker != nil {
+	if s.TokenChecker != nil {
 		// Extension: allow JWT authentication. Normally client certs are used for SSH.
 		s.serverConfig.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			tok, e := tc.TokenChecker(string(password))
+			tok, e := s.TokenChecker(string(password))
 			if e == nil {
 				return &ssh.Permissions{Extensions: tok}, nil
 			}
@@ -272,12 +297,17 @@ func NewSSHMesh(tc *SSHConfig) (*SSHMesh, error) {
 			return nil, errors.New("SSHD: no key found")
 		},
 	}
-	s.serverConfig.AddHostKey(s.SignerHost)
-
-
+	s.serverConfig.AddHostKey(s.Signer)
 	s.serverConfig.PublicKeyCallback = s.CertChecker.Authenticate
 
 	return s, nil
+}
+
+func (ssht *SSHMesh) PubString() {
+	casigner1 := ssht.Signer
+	pubString := string(ssh.MarshalAuthorizedKey(casigner1.PublicKey()))
+
+	fmt.Println(pubString)
 }
 
 // AddAuthorizedFile will load the ssh "authorized_files" content.
@@ -311,8 +341,22 @@ func KeysEqual(ak, bk ssh.PublicKey) bool {
 	b := bk.Marshal()
 	return (len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1)
 }
+func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
+	go func() {
+		for {
+			nConn, err := ssht.Listener.Accept()
+			if err != nil {
+				log.Println("failed to accept incoming connection ", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			go ssht.HandleServerConn(nConn)
+		}
+	}()
+	return nil
+}
 
-func (ssht *SSHMesh) Start() (net.Listener, error) {
+func (ssht *SSHMesh) ListenAndStart() (net.Listener, error) {
 
 	var err error
 	// Once a ServerConfig has been configured, connections can be
@@ -327,58 +371,9 @@ func (ssht *SSHMesh) Start() (net.Listener, error) {
 			ssht.Address = ssht.Listener.Addr().String()
 		}
 	}
-	go func() {
-		for {
-			nConn, err := ssht.Listener.Accept()
-			if err != nil {
-				log.Println("failed to accept incoming connection ", err)
-				time.Sleep(10 * time.Second)
-				continue
-			}
-			go ssht.HandleServerConn(nConn)
-		}
-	}()
-	return ssht.Listener, nil
-}
 
-type Mux struct {
-	// LastSeen    time.Time
-	ConnectTime time.Time
-	// network stream
-	// May be an original con with net.Conn with remote/local addr
-	NetConn io.ReadWriteCloser
-}
-
-// SSHSMux is a server ssh connection.
-type SSHSMux struct {
-	Mux
-	// ServerConn - also has Permission
-	ServerConn *ssh.ServerConn
-
-	//inChans <-chan ssh.NewChannel
-	//req     <-chan *ssh.Request
-
-	// Includes the private key of this node
-	SSHServer *SSHMesh // transport.SSHMesh
-
-	RemoteKey ssh.PublicKey
-	//RemoteHostname string
-	//RemoteAddr     net.Addr
-
-	// For server-side sessions, this is the last active session.
-	// With multiplexing, multiple sessions may be in effect.
-	SessionStream ssh.Channel
-	FQDN          string
-}
-
-// Stream is a client or server stream - 'Channel' in SSH terms.
-//
-// Also implements gossh.Channel - add SendRequest and Stderr, as well as CloseWrite
-type Stream struct {
-	ssh.Channel
-
-	serverMux *SSHSMux
-	clientMux *SSHCMux
+	err  = ssht.Start(context.Background())
+	return ssht.Listener, err
 }
 
 // OpenStream creates a new stream.
@@ -515,31 +510,3 @@ func (ssht *SSHMesh) handleServerConnRequests(ctx context.Context, reqs <-chan *
 	}
 }
 
-// Sign will sign a certificate
-// Each host can sign - the resulting cert should be under the host
-// trust.
-func (s *SSHMesh) Sign(pub ssh.PublicKey, certType uint32,
-	names []string) ([]byte, *ssh.Certificate, error) {
-	cert := &ssh.Certificate{
-		ValidPrincipals: names,
-		Key:             pub,
-		ValidBefore:     ssh.CertTimeInfinity,
-		CertType:        certType,
-	}
-	err := cert.SignCert(rand.Reader, s.SignerHost)
-	if err != nil {
-		return nil, nil, err
-	}
-	// This is a public key
-	return ssh.MarshalAuthorizedKey(cert), cert, nil
-}
-
-// SignCert signs an arbitrary certificate.
-func (s *SSHMesh) SignCert(cert *ssh.Certificate) ([]byte, error) {
-	err := cert.SignCert(rand.Reader, s.SignerHost)
-	if err != nil {
-		return nil, err
-	}
-	// This is a public key
-	return ssh.MarshalAuthorizedKey(cert), nil
-}

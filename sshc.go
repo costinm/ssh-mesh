@@ -13,53 +13,21 @@ import (
 
 	"log/slog"
 
-	meshauth_util "github.com/costinm/meshauth/util"
 	"github.com/costinm/ssh-mesh/nio"
 	"golang.org/x/crypto/ssh"
 )
 
 // Client side of SSH mesh.
-//
 
-// SSHCMux is a multiplexed client connection to a single destination.
-type SSHCMux struct {
-	Mux
-	*SSHConfig
 
-	// If set, a persistent connection will be maintained and
-	// - mux reverseForwards registered for 22, 80, 443
-	// - accept streams and trust auth
-	Waypoint bool
-
-	// TODO: CIDR/Networks
-	ReverseForwards map[string]string
-
-	LastConnected time.Time
-
-	// The SSH Conn object
-	SSHConn ssh.Conn
-
-	chans <-chan ssh.NewChannel
-	reqs  <-chan *ssh.Request
-
-	// TODO: limit by domain ?
-	AuthorizedCA []ssh.PublicKey
-
-	// Same as the transport
-	CertChecker *ssh.CertChecker
-
-	SSHClient *ssh.Client
-
-	// Last received remote key (should be a Certificate)
-	RemoteKey ssh.PublicKey
-	mds       *meshauth_util.MDS
-}
-
-// Dial opens one SSH connection to addr.
-// It blocks until the handshake is done.
+// Dial opens one TCP or H2 connection to addr.
+// It blocks until the SSH handshake is done.
 func (sc *SSHCMux) Dial(ctx context.Context, addr string) error {
+
 	if strings.HasPrefix(addr, "https://") {
-		tcon, err := nio.NewStreamH2(ctx, http.DefaultClient, addr, "localhost:15022", sc.mds)
+		// 'nio' has wrappers for streaming over h2 and h2c
+		//
+		tcon, err := nio.NewStreamH2(ctx, http.DefaultClient, addr, sshVip, sc.mds)
 		if err != nil {
 			return err
 		}
@@ -76,11 +44,6 @@ func (sc *SSHCMux) Dial(ctx context.Context, addr string) error {
 func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) error {
 	sc.NetConn = tcon
 
-	if sc.SignerClient == nil {
-		return errors.New("Invalid client key")
-	}
-
-
 	clientCfg := &ssh.ClientConfig{
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(sc.SignerClient),
@@ -88,7 +51,7 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 		Config: ssh.Config{},
 		//ClientVersion: version,
 		Timeout: 3 * time.Second,
-		User:    sc.Name,
+		User:    sc.Mesh.Name,
 
 		// hostname is passed back from addr, empty string
 		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
@@ -110,7 +73,7 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 
 	if sc.mds != nil {
 		clientCfg.Auth = append(clientCfg.Auth, ssh.PasswordCallback(func() (secret string, err error) {
-			t, err := sc.mds.GetToken(ctx, "ssh://" + addr)
+			t, err := sc.mds.GetToken(ctx, "ssh://"+addr)
 			if err != nil {
 				return "", err
 			}
@@ -118,7 +81,7 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 		}))
 	}
 
-	cc, chans, reqs, err := ssh.Ncd ewClientConn(tcon, addr, clientCfg)
+	cc, chans, reqs, err := ssh.NewClientConn(tcon, addr, clientCfg)
 	if err != nil {
 		return err
 	}
@@ -301,14 +264,6 @@ func (sshc *SSHCMux) StayConnected(addr string) {
 	// TODO: create or use UDS for multiplex.
 	sshDomain, _, _ := net.SplitHostPort(addr)
 
-	//hn := os.Getenv("SSH_HOSTNAME")
-	//if hn == "" {
-	//	hn, _ = os.Hostname()
-	//}
-	//if hn == "localhost" {
-	//	hn = os.Getenv("K_SERVICE")
-	//}
-
 	ctx := context.Background()
 	backoff := 1000 * time.Millisecond
 
@@ -318,7 +273,7 @@ func (sshc *SSHCMux) StayConnected(addr string) {
 		err := sshc.Dial(ctx, addr)
 		if err != nil {
 			slog.Info("Dial_error", "err", err, "addr", addr)
-			if backoff < 15 * time.Minute {
+			if backoff < 15*time.Minute {
 				backoff = 2 * backoff
 			}
 			time.Sleep(backoff)
@@ -337,7 +292,7 @@ func (sshc *SSHCMux) StayConnected(addr string) {
 		// (no automatic jump-host / waypoint feature ).
 		slog.Info("JumpHost", "port", port, "addr", addr)
 
-		crv := sshc.SSHConfig.Name // os.Getenv("K_REVISION")
+		crv := sshc.Mesh.Name // os.Getenv("K_REVISION")
 		if crv != "" {
 			_, err = sshc.ListenTCP(crv+"."+sshDomain, 22)
 			if err != nil {

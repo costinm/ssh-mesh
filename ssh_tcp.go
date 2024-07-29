@@ -123,7 +123,7 @@ type Proxy struct {
 	OutErr, InErr     error
 }
 
-func (p *Proxy) ProxyTo(ch io.ReadWriteCloser) {
+func (p *Proxy) ProxyTo(ch io.ReadWriteCloser)   error {
 	c := make(chan error, 1)
 	go func() {
 		p.OutBytes, p.OutErr = io.Copy(p.sch, ch)
@@ -133,6 +133,12 @@ func (p *Proxy) ProxyTo(ch io.ReadWriteCloser) {
 	defer p.sch.Close()
 
 	p.InBytes, p.InErr = io.Copy(ch, p.sch)
+	err := <- c
+	if err == nil {
+		err = p.InErr
+	}
+
+	return err
 }
 
 func (srv *SSHMesh) Proxy(ctx context.Context, dest string, ch io.ReadWriteCloser) (*Proxy, error) {
