@@ -1,0 +1,67 @@
+# gcloud alpha run services replace cloudrun.yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: sshc
+  labels:
+    cloud.googleapis.com/location: us-central1
+  annotations:
+    run.googleapis.com/launch-stage: ALPHA
+    run.googleapis.com/ingress: all
+    run.googleapis.com/ingress-status: all
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/network-interfaces: '[{"network": "default", "subnetwork": "default"}]'
+        autoscaling.knative.dev/minScale: '0'
+        run.googleapis.com/execution-environment: gen2
+        autoscaling.knative.dev/maxScale: '1'
+        run.googleapis.com/cpu-throttling: 'false'
+    spec:
+      containerConcurrency: 10
+      timeoutSeconds: 900
+      serviceAccountName: k8s-sshc
+      containers:
+        - image: gcr.io/dmeshgate/sshmesh/sshd:latest
+          args: ["/usr/local/bin/sshd"]
+          ports:
+          - name: h2c
+            containerPort: 15008
+          env:
+#            - name: SSHD
+#              valueFrom:
+#                  secretKeyRef:
+#                    key: "1"
+#                    name: mesh
+            # Running standalone, provide a basic http server
+            - name: SSHD_HTTP
+              value: ":15008"
+            - name: SSHD_PORT
+              value: "15022"
+            - name: SSHD
+              value: s.webinf.duckdns.org:2222
+            - name: SSH_AUTHORIZED_KEY
+              value: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15"
+            - name: DEPLOY
+              value: ${DEPLOY}
+          volumeMounts:
+          # /var/run/secrets fails with /var/run already exists
+          - mountPath: /mesh
+            name: mesh
+          resources:
+            limits:
+              cpu: '1'
+              memory: 1G
+      volumes:
+        - name: mesh
+          secret:
+#            items:
+#              - key: "1"
+#                path: mesh
+            secretName: mesh
+
+  traffic:
+    - percent: 100
+      latestRevision: true

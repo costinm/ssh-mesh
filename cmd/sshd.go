@@ -7,7 +7,7 @@ import (
 	"net"
 
 	"github.com/costinm/meshauth"
-	"github.com/costinm/meshauth/pkg/oidc"
+	"github.com/costinm/meshauth/pkg/tokens"
 	sshd "github.com/costinm/ssh-mesh"
 	"github.com/costinm/ssh-mesh/nio"
 	"github.com/costinm/ssh-mesh/sshdebug"
@@ -30,7 +30,7 @@ func NewSSHMesh(mod *meshauth.Module) error {
 	st.Address = mod.Address
 
 	// Configure JWT authenticators - will be used to verify incoming tokens
-	authn := oidc.NewAuthn(&mod.Mesh.MeshCfg.AuthnConfig)
+	authn := tokens.NewAuthn(&mod.Mesh.MeshCfg.AuthnConfig)
 	if len(mod.Mesh.AuthnConfig.Issuers) > 0 {
 		err := authn.FetchAllKeys(ctx, mod.Mesh.AuthnConfig.Issuers)
 		if err != nil {

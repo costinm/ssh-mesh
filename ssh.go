@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/costinm/meshauth"
-	"github.com/costinm/meshauth/pkg/oidc"
+	"github.com/costinm/meshauth/pkg/tokens"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -228,7 +228,7 @@ func NewSSHMesh(ma *meshauth.Mesh) (*SSHMesh, error) {
 		s.AddAuthorizedFile([]byte(s.AuthorizedKeys))
 	}
 	if len(s.Mesh.AuthnConfig.Issuers) > 0 {
-		authn := oidc.NewAuthn(&s.Mesh.MeshCfg.AuthnConfig)
+		authn := tokens.NewAuthn(&s.Mesh.MeshCfg.AuthnConfig)
 		err := authn.FetchAllKeys(context.Background(), s.Mesh.AuthnConfig.Issuers)
 		if err != nil {
 			log.Println("Issuers", err)
