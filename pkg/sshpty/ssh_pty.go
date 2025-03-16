@@ -1,4 +1,6 @@
-package sshdebug
+//+build !nopty
+
+package sshpty
 
 import (
 	"bytes"
@@ -14,8 +16,10 @@ import (
 	"unsafe"
 
 	"github.com/creack/pty"
+
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slog"
+
+	"log/slog"
 )
 
 // PTY is used to allow exec shells.
@@ -24,27 +28,26 @@ import (
 
 // TODO: remove
 
-type Signal string
+type PTY struct {
+	sync.Mutex
+	ssh.Channel
+	Conn *ssh.ServerConn
 
-// Window represents the size of a PTY window.
-type Window struct {
-	Width  int
-	Height int
+	env    []string
+	RawCmd string
+
+	handled bool
+	exited  bool
+
+	PTY *Pty
+
+	winch   chan Window
+	sigCh   chan<- Signal
+	sigBuf  []Signal
+	breakCh chan<- bool
 }
 
-// Pty represents a PTY request and configuration.
-type Pty struct {
-	Term   string
-	Window Window
-	// HELP WANTED: terminal modes!
-}
-
-func setWinsize(f *os.File, w, h int) {
-	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
-		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
-}
-
-func (s *ptySession) handlePTY(cmd *exec.Cmd) (bool, error) {
+func (s *PTY) Exec(cmd *exec.Cmd) (bool, error) {
 	ptyReq, winCh, isPty := s.Pty()
 	if !isPty {
 		return false, nil
@@ -90,27 +93,30 @@ func (s *ptySession) handlePTY(cmd *exec.Cmd) (bool, error) {
 	return true, nil
 }
 
-type ptySession struct {
-	sync.Mutex
-	ssh.Channel
-	conn *ssh.ServerConn
 
-	env    []string
-	rawCmd string
+type Signal string
 
-	handled bool
-	exited  bool
-
-	pty *Pty
-
-	winch   chan Window
-	sigCh   chan<- Signal
-	sigBuf  []Signal
-	breakCh chan<- bool
+// Window represents the size of a PTY window.
+type Window struct {
+	Width  int
+	Height int
 }
 
-func (sess *ptySession) Write(p []byte) (n int, err error) {
-	if sess.pty != nil {
+// Pty represents a PTY request and configuration.
+type Pty struct {
+	Term   string
+	Window Window
+	// HELP WANTED: terminal modes!
+}
+
+func setWinsize(f *os.File, w, h int) {
+	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
+		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
+}
+
+
+func (sess *PTY) Write(p []byte) (n int, err error) {
+	if sess.PTY != nil {
 		m := len(p)
 		// normalize \n to \r\n when pty is accepted.
 		// this is a hardcoded shortcut since we don't support terminal modes.
@@ -125,14 +131,14 @@ func (sess *ptySession) Write(p []byte) (n int, err error) {
 	return sess.Channel.Write(p)
 }
 
-func (sess *ptySession) Pty() (Pty, <-chan Window, bool) {
-	if sess.pty != nil {
-		return *sess.pty, sess.winch, true
+func (sess *PTY) Pty() (Pty, <-chan Window, bool) {
+	if sess.PTY != nil {
+		return *sess.PTY, sess.winch, true
 	}
 	return Pty{}, sess.winch, false
 }
 
-func (sess *ptySession) Close() error {
+func (sess *PTY) Close() error {
 	// when reqs is closed
 	if sess.winch != nil {
 		close(sess.winch)
@@ -141,7 +147,7 @@ func (sess *ptySession) Close() error {
 	return sess.Channel.Close()
 }
 
-func (sess *ptySession) Signals(c chan<- Signal) {
+func (sess *PTY) Signals(c chan<- Signal) {
 	sess.Lock()
 	defer sess.Unlock()
 	sess.sigCh = c
@@ -154,7 +160,7 @@ func (sess *ptySession) Signals(c chan<- Signal) {
 	}
 }
 
-func (sess *ptySession) Break(c chan<- bool) {
+func (sess *PTY) Break(c chan<- bool) {
 	sess.Lock()
 	defer sess.Unlock()
 	sess.breakCh = c
@@ -162,7 +168,7 @@ func (sess *ptySession) Break(c chan<- bool) {
 
 const maxSigBufSize = 128
 
-func (sess *ptySession) handleRequest(req *ssh.Request) {
+func (sess *PTY) HandleSSHRequest(req *ssh.Request) {
 	switch req.Type {
 	case "signal":
 		var payload struct{ Signal string }
@@ -186,7 +192,7 @@ func (sess *ptySession) handleRequest(req *ssh.Request) {
 		req.Reply(ok, nil)
 		sess.Unlock()
 	case "pty-req":
-		if sess.pty != nil {
+		if sess.PTY != nil {
 			req.Reply(false, nil)
 			return
 		}
@@ -195,18 +201,18 @@ func (sess *ptySession) handleRequest(req *ssh.Request) {
 			req.Reply(false, nil)
 			return
 		}
-		sess.pty = &ptyReq
+		sess.PTY = &ptyReq
 		sess.winch = make(chan Window, 1)
 		sess.winch <- ptyReq.Window
 		req.Reply(ok, nil)
 	case "window-change":
-		if sess.pty == nil {
+		if sess.PTY == nil {
 			req.Reply(false, nil)
 			return
 		}
 		win, ok := parseWinchRequest(req.Payload)
 		if ok {
-			sess.pty.Window = win
+			sess.PTY.Window = win
 			sess.winch <- win
 		}
 		req.Reply(ok, nil)
@@ -217,8 +223,8 @@ func (sess *ptySession) handleRequest(req *ssh.Request) {
 	}
 }
 
-// handle requests on the "ptySession" stream.
-func (sess *ptySession) handleRequests(reqs <-chan *ssh.Request) {
+// handle requests on the "PTY" stream.
+func (sess *PTY) handleRequests(reqs <-chan *ssh.Request) {
 }
 
 func parseString(in []byte) (out string, rest []byte, ok bool) {

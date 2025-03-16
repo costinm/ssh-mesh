@@ -4,25 +4,28 @@ This is an opinionated SSH library and L4 proxy, with a Istio-like
 certificate and JWT based authentication and providing a secure L4 transport.
 
 The implementation is compatible with OpenSSH, dropbear and other libraries
-and clients/servers. 
+and clients/servers - and also supports HTTP/2 and HTTP/3 tunneling. 
 
-Special features for sshm in gateway mode:
-- allows multiple clients to remote forward 22, 80 and 443
+A ssh-mesh node includes both client and server - the node can auto-connect to
+other nodes as a client and forward the port 22 or 5022
+
+Features for ssh-mesh server side:
+- allows multiple clients to 'remote forward' (-R) ports 22, 80 and 443
 - allows the password to be a JWT token with audience ssh://HOSTNAME, issued
   by one of the configured issuers (with normalization for k8s and google tokens)
-- certificate based authentication
+- X509 certificate based authentication
 
-In progress/TODO:
-- auto-register the forwarding clients in EndpointSlice and support sharding (for scale).
-  Until this is done - a single (large) instance must be run per IP. In K8S it 
-  means 1 replica if LoadBalancer service is used.
-
-Special features for sshm in workload mode:
+Features for ssh-mesh client side:
 - auto-register the forwarding ports and maintains connection. This is optional
   and should be used for CloudRun or home machines behind a firewall.
 - can chain a second command, so it can be added to a docker image and Pod.
 - includes a sshd server and exec/shell for the configured owner key, equivalent
   to running openssh or dropbear ssh server with custom config and as regular user.
+
+In progress/TODO:
+- auto-register the forwarding clients in EndpointSlice and support sharding (for scale).
+  Until this is done - a single (large) instance must be run per IP. In K8S it 
+  means 1 replica if LoadBalancer service is used.
 
 A SSH CA maintains a root CA (backed by a k8s or other Secret), and signs
 host and user certificates. The format has same information as Istio Spiffe,
@@ -82,6 +85,9 @@ main goal - otherwise H2/H3 should be used.
 
 - provide a rich API with support for global requests, extensions, etc - nice but 
 not required.
+
+- SSH3 - it doesn't use the original SSH protocol, not compatible with ssh clients/servers.
+The idea of using both SSH keys and X509, JWTs - and HTTP/2 and HTTP/3 is 
 
 # SSH certificates - manually 
 

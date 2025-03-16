@@ -7,13 +7,16 @@ import (
 	"net/url"
 
 	"github.com/costinm/ssh-mesh/nio"
+
 	"golang.org/x/crypto/ssh"
 )
 
-// InitMux add the H2 functions
+// InitMux add the H2 functions on a mux.
 func (st *SSHMesh) InitMux(mux *http.ServeMux) {
 	u, _ := url.Parse("http://127.0.0.1:8080")
 	localReverseProxyH1 := httputil.NewSingleHostReverseProxy(u)
+
+	// TODO: option for h2 proxy
 
 	mux.HandleFunc("/tun/", func(writer http.ResponseWriter, request *http.Request) {
 		// Override - when running in serverless or a gateway with fixed hostname
@@ -30,7 +33,10 @@ func (st *SSHMesh) InitMux(mux *http.ServeMux) {
 			if host == "localhost:15022" {
 				// Process as an in-process SSH connection.
 				writer.WriteHeader(200)
-				st.HandleServerConn(nio.NewStreamServerRequest(request, writer))
+				st.HandleServerConn(&SSHSMux{
+					NetConn: nio.NewStreamServerRequest(request, writer),
+					// TODO: use a different serverConfig that lets HTTP handle all authn, get authn from the http request
+				})
 				return
 			}
 

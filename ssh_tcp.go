@@ -9,8 +9,9 @@ import (
 	"strconv"
 	"time"
 
+	"log/slog"
+
 	ssh "golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slog"
 )
 
 // TCP forwarding - server side.

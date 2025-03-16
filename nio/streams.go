@@ -30,7 +30,6 @@ type ContextGetter interface {
 	Context() context.Context
 }
 
-
 // Stream interface extends net.Conn with a context and metadata.
 type Stream interface {
 	net.Conn
@@ -39,11 +38,8 @@ type Stream interface {
 	ContextGetter
 }
 
-
 // Streams tracks active streams. Some streams are long-lived and used to mux other streams.
-//
 type Streams struct {
-
 	active sync.Map // streamID -> Stream
 }
 
@@ -72,7 +68,6 @@ func (ug *Streams) OnStreamDone(str Stream) {
 	}
 }
 
-
 type StreamMeta interface {
 	State() *StreamState
 
@@ -85,8 +80,6 @@ type StreamMeta interface {
 
 	TLSConnectionState() *tls.ConnectionState
 }
-
-
 
 var (
 	VarzSErrRead  = expvar.NewInt("ugate_srv_err_read_total")
@@ -114,7 +107,6 @@ var (
 // httptrace:
 // WithClientTrace(ctx, trace) Context
 // ContextClientTrace(ctx) -> *ClientTrace
-
 
 // Stats holds telemetry for a stream or peer.
 type Stats struct {
@@ -158,14 +150,7 @@ type StreamState struct {
 
 	// Original or infered destination.
 	Dest string
-
-	// Source - should be a FQDN hostname.
-	//Src string
-
-	// Extracted source identity.
-	//SrcID []string
 }
-
 
 // TODO: benchmark different sizes.
 var Debug = false
@@ -229,17 +214,15 @@ var (
 	}}
 )
 
-
 // Varz interface.
 // Varz is a wrapper for atomic operation, with a json http interface.
 // MetricReader, OTel etc can directly use them.
 var (
-	// Number of copy operations using slice.
-	//Varz/ReadFromC = expvar.NewInt("io_copy_slice_total2")
+// Number of copy operations using slice.
+// Varz/ReadFromC = expvar.NewInt("io_copy_slice_total2")
 )
 
 var StreamId uint32
-
 
 // Copy will copy src to dst, using a pooled intermediary buffer.
 //
@@ -456,36 +439,35 @@ func closeWriter(dst io.Writer) error {
 
 // HandshakeTimeout wraps tlsConn.Handshake with a timeout, to prevent hanging connection.
 //func HandshakeTimeout(tlsConn *tls.Conn, d time.Duration, plainConn net.Conn) error {
-	//ctx, cf := context.WithTimeout(context.Background(), 3 * time.Second)
-	//defer cf()
-	//
-	//err := tlsConn.HandshakeContext(ctx)
-	//errc := make(chan error, 2)
-	//var timer *time.Timer // for canceling TLS handshake
-	//if d == 0 {
-	//	d = 3 * time.Second
-	//}
-	//timer = time.AfterFunc(d, func() {
-	//	errc <- tlsHandshakeTimeoutError{}
-	//})
-	//go func() {
-	//	err := tlsConn.Handshake()
-	//	if timer != nil {
-	//		timer.Stop()
-	//	}
-	//	errc <- err
-	//}()
-	//if err := <-errc; err != nil {
-	//	if plainConn != nil {
-	//		plainConn.Close()
-	//	} else {
-	//		tlsConn.Close()
-	//	}
-	//	return err
-	//}
-	//return nil
+//ctx, cf := context.WithTimeout(context.Background(), 3 * time.Second)
+//defer cf()
+//
+//err := tlsConn.HandshakeContext(ctx)
+//errc := make(chan error, 2)
+//var timer *time.Timer // for canceling TLS handshake
+//if d == 0 {
+//	d = 3 * time.Second
 //}
-
+//timer = time.AfterFunc(d, func() {
+//	errc <- tlsHandshakeTimeoutError{}
+//})
+//go func() {
+//	err := tlsConn.Handshake()
+//	if timer != nil {
+//		timer.Stop()
+//	}
+//	errc <- err
+//}()
+//if err := <-errc; err != nil {
+//	if plainConn != nil {
+//		plainConn.Close()
+//	} else {
+//		tlsConn.Close()
+//	}
+//	return err
+//}
+//return nil
+//}
 
 // ErrDeadlineExceeded is returned for an expired deadline.
 // This is exported by the os package as os.ErrDeadlineExceeded.
@@ -502,6 +484,4 @@ func (e *DeadlineExceededError) Error() string   { return "i/o timeout" }
 func (e *DeadlineExceededError) Timeout() bool   { return true }
 func (e *DeadlineExceededError) Temporary() bool { return true }
 
-
 // Basic net.Conn stream.
-

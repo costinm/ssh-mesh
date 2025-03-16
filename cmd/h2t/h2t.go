@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"io"
 	"log"
@@ -11,18 +10,17 @@ import (
 	"os"
 	"strings"
 
-	"github.com/costinm/meshauth"
-	"github.com/costinm/ssh-mesh/nio"
-	"golang.org/x/net/http2"
+	"github.com/costinm/ssh-mesh/pkg/h2stream"
+	"github.com/costinm/ssh-mesh/pkg/tokens"
 )
 
 var (
-	//h2c_addr = flag.String("h2c", "", "H2C address")
+	token = flag.String("token", "", "token to use")
 
-	h2c = flag.Bool("h2c", false, "Use H2C")
 )
 
-// h2t is a minimal TCP tunnel over h2 (like Istio Ambient), forwarding stdin.
+// h2t is a minimal TCP tunnel over h2 (like Istio Ambient),
+// forwarding stdin/stdout
 //
 // Expects proper certificates ( TODO: document how to add a custom
 // CA to the VM roots or use option to specify )
@@ -30,7 +28,12 @@ var (
 // Unfortunately curl doesn't support streaming - if it did, this could
 // be done with a curl command.
 //
-// Mainly intended for SSH and debugging.
+// Mainly intended for SSH and debugging ambient-like tunnels.
+//
+// The host certificate validation is handled by h2t - so no need to save
+// or check host cert at SSH level (unless you don't trust the http gateway).
+// This is convenient for serverless or K8S Pods - no need for
+// additional secret storage.
 //
 // Example:
 //
@@ -49,36 +52,54 @@ func main() {
 	// URL or hostname
 	url := flag.Args()[0]
 
-	ma, err := meshauth.FromEnv(ctx, nil, "")
+	// TokenSource
+	// Will use MDS, k8s, cloud or other sources to get
+	// JWTs.
+	ma := &tokens.TokenExec{}
 
+	// This works great for https. No support for plain h2 - but h2 would be
+	// used in a mesh, where you don't need the H2 tunneling of SSH in the first
+	// place - since the purpose is to deal with H2 Gateways where normal TCP is
+	// blocked
 	client := http.DefaultClient
-	if *h2c {
-		// Can't do h2c using the std client - need custom code.
-		client = &http.Client{
-			Transport: &http2.Transport{
-				AllowHTTP: true,
-				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, network, addr)
-				},
-			},
-		}
-	}
 
 	// The URL can be explicit
 	if !strings.Contains(url, "://") {
 		url = "https://" + url
 	}
 
-	sc, err := nio.NewStreamH2(ctx, client, url, "localhost:15022",  ma)
+	port := os.Getenv("H2T_PORT")
+	if port != "" {
+		l, err := net.Listen("tcp", port)
+		if err != nil {
+			panic(err)
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					panic(err)
+				}
+				go func() {
+					sc, err := h2stream.NewStreamH2(ctx, client, url, "localhost:15022", ma)
+					if err != nil {
+						log.Fatal(err)
+					}
+					go func() {
+						io.Copy(sc, conn)
+					}()
+
+					io.Copy(conn, sc)
+				}()
+			}
+		}
+	}
+
+	sc, err := h2stream.NewStreamH2(ctx, client, url, "localhost:15022", ma)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	go func() {
 		io.Copy(sc, os.Stdin)
 	}()
-
 
 	io.Copy(os.Stdout, sc)
 }

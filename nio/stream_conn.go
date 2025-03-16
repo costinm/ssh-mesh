@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// StreamConn wraps a net.Conn or a tls connection
+// StreamConn wraps a net.Conn or a tls connection, implements net.Conn
 type StreamConn struct {
 	StreamState
 

@@ -19,28 +19,49 @@ type TokenSource interface {
 	GetToken(context.Context, string) (string, error)
 }
 
+type TokenChecker interface {
+	Check(token string) (claims map[string]string, e error)
+}
+
+type ContextDialer interface {
+	// Dial with a context based on tls package - 'once successfully
+	// connected, any expiration of the context will not affect the
+	// connection'.
+	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
+}
+
 type H2Dialer struct {
 	MDS TokenSource
 	H2TunURL string
+
+	// TODO: just RoundTripper.
 	HttpClient *http.Client
 }
 
-func NewH2Dialer(tunURL string) (*H2Dialer) {
-	return &H2Dialer{
-		H2TunURL: tunURL,
-		HttpClient:  http.DefaultClient,
+func (h2d *H2Dialer) DialContext(ctx context.Context, net, addr string) (net.Conn, error) {
+
+	// Using pipe: 345Mbps
+	//
+	// Not using:  440Mbps.
+	// The QUIC read buffer is 8k
+
+	r, w := io.Pipe()
+
+	req, res, err := h2d.CopyTo(ctx, net, addr, r)
+	if err != nil {
+		return nil, err
 	}
+	return newStreamHttpRequest(w, req, res), nil
 }
 
-func (h2d *H2Dialer) DialContext(ctx context.Context, net, addr string) (net.Conn, error) {
-	r, w := io.Pipe()
+func (h2d *H2Dialer) CopyTo(ctx context.Context, net, addr string, r io.Reader) (*http.Request, *http.Response, error) {
 	req, _ := http.NewRequest("POST", h2d.H2TunURL, r)
 
 	// TODO: JWT from MDS
 	if h2d.MDS != nil {
 		t, err := h2d.MDS.GetToken(ctx, addr)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if t != "" {
 			req.Header["authorization"] = []string{"Bearer " + t}
@@ -49,6 +70,9 @@ func (h2d *H2Dialer) DialContext(ctx context.Context, net, addr string) (net.Con
 	req.Header[ConnectOverrideHeader] = []string{addr}
 
 	// HBone uses CONNECT IP:port - we need to use POST and can't use the header. For now use x-host
+	if h2d.HttpClient == nil {
+		h2d.HttpClient = http.DefaultClient
+	}
 
 	res, err := h2d.HttpClient.Do(req)
 	if err != nil {
@@ -57,12 +81,12 @@ func (h2d *H2Dialer) DialContext(ctx context.Context, net, addr string) (net.Con
 		} else {
 			log.Println("H2T error", err, res.StatusCode, res.Header)
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
 	log.Println("H2T", res.StatusCode, res.Header)
 
-	return newStreamHttpRequest(w, req, res), nil
+	return req, res, nil
 }
 
 // NewStreamH2 creates a H2 stream using POST.
@@ -104,6 +128,7 @@ func (s *StreamHttpClient) Context() context.Context {
 // Server validates method, path and scheme=http|https. Req.Body is a pipe - similar with what we use for egress.
 // Request context is based on stream context, which is a 'with cancel' based on the serverConn baseCtx.
 func newStreamHttpRequest(rw io.WriteCloser,  r *http.Request, w *http.Response) *StreamHttpClient { // *StreamHttpClient {
+
 	slog.Info("H2C-client", "res", w.Header,"rs", w.Status, "sc", w.StatusCode)
 	return &StreamHttpClient{
 		//StreamId: int(atomic.AddUint32(&nio.StreamId, 1)),

@@ -13,7 +13,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/costinm/meshauth"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -41,10 +40,14 @@ func TestE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	//acc := &SSHCMux{Address: "bob.test.mesh.local"}
+	//acc.SSHMesh = alice
+	//
 	acc, err := alice.Client(ctx, "bob.test.mesh.local")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	err = acc.Dial(ctx, l.Addr().String()) // "127.0.0.1:11122")
 	if err != nil {
 		t.Fatal(err)
@@ -69,8 +72,7 @@ var domain = "test.mesh.local"
 // InitMeshNode provisions an ephemeral mesh node for testing.
 // Should do the same as the ssh-keygen script.
 func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
-	ma := meshauth.New(nil)
-	ma.InitSelfSignedFromPEMKey("")
+	//ma := meshauth.New()
 
 	// ssh-keygen
 	nodePrivate, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -78,7 +80,8 @@ func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
 	encodedKey, _ := x509.MarshalECPrivateKey(nodePrivate)
 	privatePEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: encodedKey})
 
-	ma.Priv = string(privatePEM)
+	priv := string(privatePEM)
+	//ma.Cert.InitSelfSignedFromPEMKey(string(privatePEM), "")
 
 	nodeSSHSigner, _ := ssh.NewSignerFromKey(nodePrivate)
 
@@ -92,13 +95,11 @@ func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
 	_, hcc, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.UserCert,
 		[]string{name + "@" + domain})
 
-	node, err := NewSSHMesh(ma)
-	if err != nil {
-		return nil, err
-	}
+	node := New()
 
-	node.SetKeys(ma.Priv, base64.StdEncoding.EncodeToString(hch.Marshal()),
-		base64.StdEncoding.EncodeToString(hcc.Marshal()))
+	node.SetKeySSH(priv)
+	node.CertHost = base64.StdEncoding.EncodeToString(hch.Marshal())
+	node.CertClient = base64.StdEncoding.EncodeToString(hcc.Marshal())
 
 
 	return node, nil
@@ -111,8 +112,7 @@ func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
 // TODO: support URLs (with JWT auth) and dirs
 func NewNode(loc string) (*SSHMesh, error) {
 
-	ma := meshauth.New(nil)
-
+	m := New()
 	sshmf := loc
 	if loc[len(loc)-1] == '/' {
 		sshmf = loc + "sshm.json"
@@ -122,7 +122,7 @@ func NewNode(loc string) (*SSHMesh, error) {
 	if err != nil {
 		return nil, err
 	}
-	json.Unmarshal(cfgdata, ma.MeshCfg)
+	json.Unmarshal(cfgdata, m)
 
-	return NewSSHMesh(ma)
+	return m, nil
 }

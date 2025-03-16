@@ -15,6 +15,10 @@ import (
 
 // Based on https://github.com/LiamHaworth/go-tproxy/blob/master/tproxy_tcp.go and many others
 
+type TProxy struct {
+
+}
+
 // AcceptTProxy will accept a TCP connection
 // and wrap it to a TProxy connection to provide
 // TProxy functionality
@@ -42,9 +46,9 @@ func ListenTProxy(ctx context.Context, network string, laddr *net.TCPAddr) (*net
 	}
 	defer fileDescriptorSource.Close()
 
-	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
-		slog.InfoContext(ctx, "Tproxy disabled - running in REDIRECT mode", "err", err)
-		//return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
+	// Allow socket to bind on any port.
+	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err == nil {
+		slog.InfoContext(ctx, "TPROXY enabled")
 	}
 
 	return listener, nil
@@ -61,7 +65,6 @@ func IptablesCapture(ctx context.Context, addr string, ug func(nc net.Conn, dest
 	go func() {
 		for {
 			remoteConn, err := AcceptTProxy(nl)
-			log.Println("ACCEPTED TPROXY")
 
 			//ugate.VarzAccepted.Add(1)
 			if ne, ok := err.(net.Error); ok {
@@ -76,7 +79,10 @@ func IptablesCapture(ctx context.Context, addr string, ug func(nc net.Conn, dest
 				return
 			}
 			dst := remoteConn.LocalAddr().(*net.TCPAddr)
-			log.Println("RECEIVED TPROXY", dst)
+			slog.Info("ACCEPTED_TPROXY", "addr", remoteConn.RemoteAddr(), "dst", dst)
+
+			// Redirect capture - for tproxy the destination port is the target
+			// (we don't support sending to the capture port, it's reserved)
 			if dst.Port == localPort {
 				realAddr, err := GetREDIRECTOriginalDst(remoteConn)
 				if err != nil {

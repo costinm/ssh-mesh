@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/costinm/meshauth"
 	"github.com/costinm/ssh-mesh/nio"
 )
 
@@ -81,44 +80,79 @@ const (
       DST.PORT desired destination port in network octet order
 */
 
-type Socks struct {
+type SocksConn struct {
 	Dest     string
 	DestAddr *net.TCPAddr
-	Writer   io.WriteCloser
+
+	Conn net.Conn
+
+	Socks *Socks
 }
 
-func RegisterFn(l *meshauth.Module) error {
-	if l.Address == "" {
-		l.Address = "127.0.0.1:15008"
+func (s *SocksConn) Run() {
+
+	brin := nio.NewBufferReader(s.Conn)
+
+	s.HandleSocks(brin, s.Conn)
+
+	//t0 := time.Now()
+	dest := s.Dest
+	if dest == "" {
+		dest = s.DestAddr.String()
 	}
-	ll, err := Sock5Capture(l.Address, func(s *Socks, c net.Conn) {
-		//t0 := time.Now()
-		dest := s.Dest
-		if dest == "" {
-			dest = s.DestAddr.String()
-		}
-		nc, err := l.Mesh.DialContext(context.Background(), "tcp", s.Dest)
-		if err != nil {
-			s.PostDialHandler(nil, err)
-			return
-		}
-		s.PostDialHandler(nc.LocalAddr(), nil)
-
-		nio.Proxy(nc, c, c, s.Dest)
-		return
-	})
-	l.NetListener = ll
-	return err
-}
-
-func Sock5Capture(addr string, cb func(s *Socks, c net.Conn)) (net.Listener, error) {
-	l, err := net.Listen("tcp", addr)
+	nc, err := s.Socks.Dialer.DialContext(context.Background(), "tcp", s.Dest)
 	if err != nil {
-		return nil, err
+		s.PostDialHandler(nil, err)
+		return
 	}
-	go func() {
+	s.PostDialHandler(nc.LocalAddr(), nil)
+
+	nio.Proxy(nc, s.Conn, s.Conn, s.Dest)
+}
+
+type Socks struct {
+	//Address string `json:"address,omitempty"`
+
+	// NetListener and Dialer can be set by the user.
+	NetListener net.Listener `json:"-"`
+	Dialer ContextDialer `json:"-"`
+}
+
+type ContextDialer interface {
+	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
+}
+
+
+func (l *Socks) Start(ctx context.Context) error {
+	//if l.Address == "" {
+	//	l.Address = "127.0.0.1:15008"
+	//}
+	//if l.NetListener == nil {
+	//	listener, err := net.Listen("tcp", l.Address)
+	//	if err != nil {
+	//		return err
+	//	}
+	//	l.NetListener = listener
+	//}
+	if l.Dialer == nil {
+		l.Dialer = &net.Dialer{}
+	}
+	go l.Sock5Capture()
+	return nil
+}
+
+func (l *Socks) With(_, dep any) {
+	if netDialer, ok := dep.(ContextDialer); ok {
+		l.Dialer = netDialer
+	}
+	if netDialer, ok := dep.(net.Listener); ok {
+		l.NetListener = netDialer
+	}
+}
+
+func (l *Socks) Sock5Capture()  {
 		for {
-			c, err := l.Accept()
+			c, err := l.NetListener.Accept()
 			if err != nil {
 				if ne, ok := err.(interface {
 					Temporary() bool
@@ -128,24 +162,20 @@ func Sock5Capture(addr string, cb func(s *Socks, c net.Conn)) (net.Listener, err
 				}
 				return
 			}
-			s := &Socks{Writer: c}
-			brin := nio.NewBufferReader(c)
-			HandleSocks(brin, s, c)
-			//
-			go cb(s, c)
-		}
-	}()
+			s := &SocksConn{Conn: c, Socks: l}
 
-	return l, nil
+			//
+			go s.Run()
+		}
 }
 
 // Must be called before sending any data, to send the local addr used when
 // dialing. This is rarely used - tproxy doesn't send anything back either.
-func (s *Socks) PostDialHandler(localAddr net.Addr, err error) {
+func (s *SocksConn) PostDialHandler(localAddr net.Addr, err error) {
 	if err != nil {
 		// TODO: write error code
-		s.Writer.Write([]byte{5, 1})
-		s.Writer.Close()
+		s.Conn.Write([]byte{5, 1})
+		s.Conn.Close()
 		return
 	}
 	// Not accurate for tcp-over-http.
@@ -168,10 +198,10 @@ func (s *Socks) PostDialHandler(localAddr net.Addr, err error) {
 	}
 	binary.BigEndian.PutUint16(r[off:], uint16(tcpAddr.Port))
 	off += 2
-	s.Writer.Write(r[0:off])
+	s.Conn.Write(r[0:off])
 }
 
-func HandleSocks(br *nio.BufferReader, s *Socks, w io.WriteCloser) (err error) {
+func (s *SocksConn) HandleSocks(br *nio.BufferReader, w io.WriteCloser) (err error) {
 	// Fill the read buffer with one Read.
 	// Typically 3-4 bytes unless client is eager.
 

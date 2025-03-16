@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// StreamHttpServer implements net.Conn on top of a H2 stream.
 type StreamHttpServer struct {
 	StreamState
 
@@ -16,7 +17,7 @@ type StreamHttpServer struct {
 	ResponseWriter http.ResponseWriter
 
 	// If set, the function will be called when Close() is called.
-	ReadCloser     func()
+	ReadCloser func()
 }
 
 func (s *StreamHttpServer) Context() context.Context {
@@ -129,6 +130,10 @@ func (s *StreamHttpServer) RequestHeader() http.Header {
 	return s.Request.Header
 }
 
+// TLSConnectionState implements the tls.Conn interface.
+// By default uses the request TLS state, but can be replaced
+// with a synthetic one (for example with ztunnel or other split
+// TLS).
 func (s *StreamHttpServer) TLSConnectionState() *tls.ConnectionState {
 	return s.TLS
 }

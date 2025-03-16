@@ -20,14 +20,74 @@ import (
 // Client side of SSH mesh.
 
 
+// SSHCMux is a multiplexed client connection to a single destination.
+// That corresponds to a H2 connection - it is possible to have multiple
+// SSHCMux connections to the same destination at the same time.
+type SSHCMux struct {
+	// LastSeen    time.Time
+	ConnectTime time.Time `json:"-"`
+
+	User string `json:"user,omitempty"`
+
+	// network stream
+	// May be an original con with net.Conn with remote/local addr
+	NetConn io.ReadWriteCloser `json:"-"`
+
+	// Dependency to the transport (doesn't have to be listenining)
+	*SSHMesh `json:"-"`
+
+	// If set, a persistent connection will be maintained and
+	// - mux reverseForwards registered for 22, 80, 443
+	// - accept streams and trust auth
+	Waypoint bool
+
+	Address string `json:"address,omitempty"`
+
+	// TODO: CIDR/Networks
+	ReverseForwards map[string]string
+
+	LastConnected time.Time `json:"-"`
+
+	// The SSH Conn, client and internal objects
+	SSHClient *ssh.Client `json:"-"`
+	SSHConn ssh.Conn `json:"-"`
+
+	chans <-chan ssh.NewChannel
+	reqs  <-chan *ssh.Request
+
+	// TODO: limit by domain ?
+	// Normally this is the 'mesh roots' for certificates.
+	// AuthorizedCA []ssh.PublicKey `json:"-"`
+
+	// Last received remote key (should be a Certificate)
+	RemoteKey ssh.PublicKey `json:"-"`
+}
+
+func (sc *SSHCMux) Init(ctx context.Context) {
+	if sc.ReverseForwards == nil {
+		sc.ReverseForwards = make(map[string]string)
+	}
+	if sc.User == "" {
+		sc.User = "mesh"
+	}
+}
+
+// sshVip is used when tunneling SSH connections over H2, to allow the
+// server to determine it's a SSH connection to the built-in SSH server.
+// H2 tunnels can forward to any port, including 22 - this allows skipping
+// the TCP part and using in-process.
+const sshVip = "localhost:15022"
+
+
 // Dial opens one TCP or H2 connection to addr.
 // It blocks until the SSH handshake is done.
 func (sc *SSHCMux) Dial(ctx context.Context, addr string) error {
+	sc.Init(ctx)
 
 	if strings.HasPrefix(addr, "https://") {
 		// 'nio' has wrappers for streaming over h2 and h2c
 		//
-		tcon, err := nio.NewStreamH2(ctx, http.DefaultClient, addr, sshVip, sc.mds)
+		tcon, err := nio.NewStreamH2(ctx, http.DefaultClient, addr, sshVip, sc.TokenSource)
 		if err != nil {
 			return err
 		}
@@ -51,18 +111,18 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 		Config: ssh.Config{},
 		//ClientVersion: version,
 		Timeout: 3 * time.Second,
-		User:    sc.Mesh.Name,
+		User:    sc.User,
 
 		// hostname is passed back from addr, empty string
 		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			if sc.CertChecker != nil {
-				err := sc.CertChecker.CheckHostKey(hostname, remote, key)
+			if sc.SSHMesh.CertChecker != nil {
+				err := sc.SSHMesh.CertChecker.CheckHostKey(hostname, remote, key)
 				if err == nil {
 					return err
 				}
 			}
 			// Not in mesh mode - allow any hosts, they're only used for jumping, not trusted.
-			if len(sc.AuthorizedCA) == 0 {
+			if len(sc.SSHMesh.AuthorizedCA) == 0 {
 				slog.Info("Permissive/test host, no CA", "host", hostname, "addr", remote, "key", key)
 				return nil
 			}
@@ -71,9 +131,9 @@ func (sc *SSHCMux) DialConn(ctx context.Context, tcon net.Conn, addr string) err
 		},
 	}
 
-	if sc.mds != nil {
+	if sc.SSHMesh.TokenSource != nil {
 		clientCfg.Auth = append(clientCfg.Auth, ssh.PasswordCallback(func() (secret string, err error) {
-			t, err := sc.mds.GetToken(ctx, "ssh://"+addr)
+			t, err := sc.SSHMesh.TokenSource.GetToken(ctx, "ssh://"+addr)
 			if err != nil {
 				return "", err
 			}
@@ -260,8 +320,9 @@ func (sc *SSHCMux) Proxy(ch io.ReadWriteCloser, dstp string, s string) {
 // StayConnected will maintain an active connection, typically with a jump host.
 //
 // 'addr' is the IP:port to connect to - not the 'canonical' service.
-func (sshc *SSHCMux) StayConnected(addr string) {
+func (sshc *SSHCMux) StayConnected() {
 	// TODO: create or use UDS for multiplex.
+	addr := sshc.Address
 	sshDomain, _, _ := net.SplitHostPort(addr)
 
 	ctx := context.Background()
@@ -292,7 +353,7 @@ func (sshc *SSHCMux) StayConnected(addr string) {
 		// (no automatic jump-host / waypoint feature ).
 		slog.Info("JumpHost", "port", port, "addr", addr)
 
-		crv := sshc.Mesh.Name // os.Getenv("K_REVISION")
+		crv := sshc.User // os.Getenv("K_REVISION")
 		if crv != "" {
 			_, err = sshc.ListenTCP(crv+"."+sshDomain, 22)
 			if err != nil {

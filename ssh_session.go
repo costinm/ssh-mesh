@@ -2,15 +2,37 @@ package ssh_mesh
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log"
-	"log/slog"
+	"os"
+	"os/exec"
+	"sync/atomic"
 
-	"github.com/pkg/sftp"
-
+	"github.com/costinm/ssh-mesh/pkg/sshpty"
 	"golang.org/x/crypto/ssh"
 )
+
+
+
+
+// Represents a user properties. User name will be in the ssh login, basic auth,sub of JWT tokens, cert.
+// Can also be loaded on demand from storage.
+type User struct {
+
+}
+
+var id uint32
+
+
+// Based on okteto code: https://raw.githubusercontent.com/okteto/remote/main/pkg/ssh/ssh.go
+// Removed deps on logger, integrated with ugate.
+
+// Handles PTY/noPTY shell sessions and sftp.
+
+// gliderlabs: current version doesn't work with certs. config() method requires a PublicKeyHandler, which
+// doesn't have a reference to the conn ( because gliderlabs decided to invent it's 'better' interface ).
+// In general the interface and abstractions are too complex and not needed.
+
 
 // WIP: The SSH 'gateway' will not have a real shell / sftp session (except for debug). Instead, the session is used as a
 // general purpose communication.
@@ -24,33 +46,62 @@ import (
 
 // Basic untrusted session handler.
 func SessionHandler(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChannel) {
+
+	conn := sconn.ServerConn
+	isOwner := conn.Permissions.Extensions["role"] == "admin"
+
 	ch, reqs, _ := newChannel.Accept()
 
 	env := []*KV{}
 
+	ssht := sconn.SSHServer
+
+	sess := &sshpty.PTY{
+		Channel: ch,
+		Conn:    conn,
+	}
+
 	for req := range reqs {
 		// "shell", "exec", "env", "subsystem"
 		// For pty: signal, break, pty-req, window-change
-		slog.Info("ssh-session", "type", req.Type)
+		//slog.Info("ssh-session", "type", req.Type)
 
 		switch req.Type {
 		case "shell", "exec":
 			// This is normally the last command in a channel.
 			// Env and pty are called first.
+			// Depending on user and settings, only specific commands are allowed.
+			// For shell - a generic event stream will be used for untrusted users (default)
 			//
+			// exec may be a command (/..) or may need to be evaluated.
+			// as a shell.
+
 			var payload = struct{ Value string }{}
 			ssh.Unmarshal(req.Payload, &payload)
 			req.Reply(true, nil)
+			if isOwner {
+				go execHandler(ssht, conn, sess, env, payload.Value)
+			} else {
+				sid := atomic.AddUint32(&id, 1)
+				e := &Exec{In: ch, Out: ch, id: sid,
+					sconn: sconn,
+					kv: env,
+					cmd: payload.Value,
+				}
+				sconn.m.Lock()
+				sconn.SessionStream[sid] = e
+				sconn.m.Unlock()
 
-			sconn.SessionStream = ch
-			go execHandlerInternal(ch, env, payload.Value)
+				go e.execHandlerInternal(ch, env, payload.Value)
+			}
+
 		case "subsystem":
 			var payload = struct{ Value string }{}
 			ssh.Unmarshal(req.Payload, &payload)
 			if "sftp" != payload.Value {
 				req.Reply(false, nil)
 			} else {
-				sftpHandler(req, sconn, ch)
+				go SFTPHandler(req, sconn, ch)
 			}
 		case "env":
 			var kv KV
@@ -61,58 +112,34 @@ func SessionHandler(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChann
 				req.Reply(true, nil)
 			}
 		default:
-			if req.WantReply {
-				req.Reply(true, nil)
-			}
+			// Typical pty-req, only for shell ( no params)
+			sess.HandleSSHRequest(req)
 		}
 	}
 }
 
-func sftpHandler(req *ssh.Request, sconn *SSHSMux, ch ssh.Channel) {
-	sftp.NewRequestServer(ch, sftp.Handlers{
-		FileGet:  sconn,
-		FilePut:  sconn,
-		FileCmd:  sconn,
-		FileList: sconn,
-	})
+var ftpHandler func(closer io.ReadWriteCloser)
+
+func SFTPHandler(req *ssh.Request, sconn *SSHSMux, ch ssh.Channel) {
+	path := "/usr/lib/openssh/sftp-server"
+	// Run the SFTP server as a command, with in and out redirected
+	// to the channel
+
+	// -e = stderr instead of syslog
+	// -d PATH - chroot
+	// -R - read only
+	//
+	cmd := exec.Command(path, "-e", "-d", "/tmp")
+	cmd.Env = []string{}
+	cmd.Stdin = ch
+	cmd.Stdout = ch
+	cmd.Stderr = os.Stderr
+	cmd.Start()
+
+	cmd.Wait()
+	// TODO: run sftp
 }
 
-func (c *SSHSMux) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
-	//TODO implement me
-	panic("implement me")
-}
-
-// Called for Methods: Setstat, Rename, Rmdir, Mkdir, Link, Symlink, Remove
-func (c *SSHSMux) Filecmd(request *sftp.Request) error {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (c *SSHSMux) Filewrite(request *sftp.Request) (io.WriterAt, error) {
-	//TODO implement me
-	panic("implement me")
-}
-
-
-func (c *SSHSMux) Fileread(request *sftp.Request) (io.ReaderAt, error) {
-	//TODO implement me
-	panic("implement me")
-}
-
-
-func execHandlerInternal(ch ssh.Channel, kv []*KV, cmd string) {
-	fmt.Fprint(ch, "{}\n")
-	// Logs or other info can be sent
-
-	data := make([]byte, 1024)
-	for {
-		n, err := ch.Read(data)
-		if err != nil {
-			return
-		}
-		slog.Info("ssh-session-in", "data", string(data[0:n]))
-	}
-}
 
 
 type KV struct {
