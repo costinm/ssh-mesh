@@ -2,12 +2,7 @@ package ssh
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"log"
 	"os"
 	"testing"
@@ -33,7 +28,7 @@ func TestE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	alice, err := InitMeshNode(ca, "alice", domain)
+	alice := InitMeshNode(ca, "alice", domain)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,38 +64,25 @@ var domain = "test.mesh.local"
 
 // InitMeshNode provisions an ephemeral mesh node for testing.
 // Should do the same as the ssh-keygen script.
-func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
+func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh) {
 	node := New()
-
-	// ssh-keygen
-	nodePrivate, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	encodedKey, _ := x509.MarshalECPrivateKey(nodePrivate)
-	privatePEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: encodedKey})
-
-	priv := string(privatePEM)
-	node.Key = priv
-
-	nodeSSHSigner, _ := ssh.NewSignerFromKey(nodePrivate)
-
-	// Sign the 2 certs
-	hch, _, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.HostCert,
-		[]string{name + "." + domain, name, name + "@" + domain})
-	if err != nil {
-		return nil, err
-	}
-
-	hcc, _, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.UserCert,
-		[]string{name + "@" + domain})
-
-
-	//node.SetKeySSH(priv)
-	node.CertHost = string(hch)
-	node.CertClient = string(hcc)
 
 	node.Address = ":0"
 
-	return node, node.Provision(context.Background())
+	node.Provision(context.Background())
+
+	// Sign the 2 certs
+	hch, _, _ := ca.Sign(node.Signer.PublicKey(), ssh.HostCert,
+		[]string{name + "." + domain, name, name + "@" + domain})
+
+	hcc, _, _ := ca.Sign(node.Signer.PublicKey(), ssh.UserCert,
+		[]string{name + "@" + domain})
+
+
+	node.SetCertHost(string(hch))
+	node.SetCertClient(string(hcc))
+
+	return node
 }
 
 // NewNode creates a new SSH mesh node, based on a config location.

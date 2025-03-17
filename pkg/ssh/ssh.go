@@ -56,7 +56,8 @@ type SSHMesh struct {
 	// If empty, the SSH_AUTHORIZED_KEYS env is used, falling back to authorized_keys in $HOME/.ssh (if FromEnv is called)
 	AuthorizedKeys string `json:"authorized_keys,omitempty"`
 
-	// Default user for outgoing connections, accepted default user. This is the base name.
+	// User is in email format, as expected by the SSH client certificates.
+	//
 	User       string `json:"id,omitempty"`
 	Domain       string `json:"namespace,omitempty"`
 
@@ -211,6 +212,8 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 	var err error
 
 	if ssht.Key != "" {
+		//encodedKey, _ := x509.MarshalECPrivateKey(nodePrivate)
+		//privatePEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: encodedKey})
 		err = ssht.SetKeySSH(ssht.Key)
 		if err != nil {
 			return err
@@ -224,23 +227,10 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 		s.SignerClient = s.Signer
 	}
 	if s.CertClient != "" {
-		// Client and host certificates are in the authorized key format ( like the .pub files)
-		cert, _, _, _, err := ssh.ParseAuthorizedKey([]byte(s.CertClient))
-		//cert, err := ssh.ParsePublicKey([]byte(s.CertClient))
-		if err != nil {
-			return err
-		}
-		s.SignerClient, err = ssh.NewCertSigner(cert.(*ssh.Certificate), s.SignerClient)
-		crt := cert.(*ssh.Certificate)
-		s.User = crt.ValidPrincipals[0]
+		s.SetCertClient(s.CertClient)
 	}
 	if s.CertHost != "" {
-		cert, _, _, _, err := ssh.ParseAuthorizedKey([]byte(s.CertClient))
-		//cert, err := ssh.ParsePublicKey([]byte(s.CertHost))
-		if err != nil {
-			return  err
-		}
-		s.SignerHost, err = ssh.NewCertSigner(cert.(*ssh.Certificate), s.Signer)
+		ssht.SetCertHost(s.CertHost)
 	}
 
 	if ssht.Listener == nil {
@@ -280,17 +270,8 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 	// The 'mesh' implementation also allows arbitrary keys - with only mesh forwarding ability.
 	s.CertChecker = &ssh.CertChecker{
 		// Check 'signed certificate' - server side. The certificate should contain user, extensions like a JWT.
-		IsUserAuthority: func(auth ssh.PublicKey) bool {
-			if s.AuthorizedCA == nil {
-				return false
-			}
-			for _, pubk := range s.AuthorizedCA {
-				if KeysEqual(auth, pubk) {
-					return true
-				}
-			}
-			return false
-		},
+		IsUserAuthority: s.isUserAuthority,
+
 		// Authorized keys or unknown users. The claims are in the authorized file.
 		UserKeyFallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			// The authorized keys are associated with the owner/admin
@@ -309,17 +290,8 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 		},
 
 		// Used by clients authenticating the host.
-		IsHostAuthority: func(auth ssh.PublicKey, user string) bool {
-			if s.AuthorizedCA == nil {
-				return false
-			}
-			for _, pubk := range s.AuthorizedCA {
-				if KeysEqual(auth, pubk) {
-					return true
-				}
-			}
-			return false
-		},
+		IsHostAuthority: ssht.isHostAuthority,
+
 		// Host verification by client
 		HostKeyFallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 			// If the server has one of the authorized keys - allow it.
@@ -337,9 +309,9 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 	}
 	if s.SignerHost != nil {
 		s.serverConfig.AddHostKey(s.SignerHost)
-	} else {
-		s.serverConfig.AddHostKey(s.Signer)
 	}
+	s.serverConfig.AddHostKey(s.Signer)
+
 	s.serverConfig.PublicKeyCallback = s.CertChecker.Authenticate
 
 	return nil
