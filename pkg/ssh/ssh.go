@@ -1,4 +1,4 @@
-package ssh_mesh
+package ssh
 
 import (
 	"context"
@@ -37,17 +37,35 @@ type Command struct {
 // SSHMesh is a minimal L4S (ambient) mesh implementation based on SSH,
 // and compatible with standard SSH clients and servers.
 type SSHMesh struct {
-
-	// TokenSource, if set, will inject JWT tokens in outgoing H2 and use them as 
-	// passwords for SSH connections.
-	TokenSource nio.TokenSource `json:"-"`
-
-	// Can be set to a custom dialer, for example for mesh protocol tunneling.
-	Dialer nio.ContextDialer `json:"-"`
-
 	// Address to listen on as SSH. Will default to 14022 for regular nodes and
 	// 15022 for gateways.
 	Address string `json:"address,omitempty"`
+
+	KeepAlive map[string]*SSHCMux `json:"connect,omitempty"`
+
+	CertClient string `json:"id_ecdsa_cert.pub,omitempty"`
+	CertHost string `json:"cert_host.pub,omitempty"`
+
+	// Primary key - in PEM format (also used for mTLS)
+	Key string `json:"tls.key,omitempty"`
+
+	// AuthorizedKeys is the same as authorized_keys file.
+	// The keys are used as 'trusted sources' for authentication. Any user key can be used for shell/debug access.
+	// The CA keys are allowed to connect - but can get a shell only if 'role=admin' is present in the cert.
+	//
+	// If empty, the SSH_AUTHORIZED_KEYS env is used, falling back to authorized_keys in $HOME/.ssh (if FromEnv is called)
+	AuthorizedKeys string `json:"authorized_keys,omitempty"`
+
+	// Default user for outgoing connections, accepted default user. This is the base name.
+	User       string `json:"id,omitempty"`
+	Domain       string `json:"namespace,omitempty"`
+
+	// Can be set to a custom dialer, for example for mesh protocol tunneling.
+	Dialer ContextDialer `json:"-"`
+
+	// Can be set to a custom dialer, for example for mesh protocol tunneling.
+	H2Dialer ContextDialer `json:"-"`
+
 
 	Listener net.Listener `json:"-"`
 
@@ -74,8 +92,6 @@ type SSHMesh struct {
 	// Key is the marshalled public key (from authorized_keys), value is the user ID (comment)
 	UsersKeys map[string]string `json:"-"`
 
-	KeepAlive map[string]*SSHCMux `json:"connect,omitempty"`
-
 	// Signer is the 'workload identity' signer. It is using the main workload
 	// private key (workload key), but with a host certificate.
 	Signer ssh.Signer `json:"-"`
@@ -83,6 +99,7 @@ type SSHMesh struct {
 	// SignerClient is a client workload identity - using the SA cert when
 	// a CA is used. Otherwise, same as Signer.
 	SignerClient ssh.Signer `json:"-"`
+	SignerHost ssh.Signer `json:"-"`
 
 	// Forward is a function that will proxy a stream to a destination.
 	// If missing, it will be dialed.
@@ -98,30 +115,33 @@ type SSHMesh struct {
 	// WIP: Custom channel handlers.
 	ChannelHandlers map[string]func(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChannel) `json:"-"`
 
-	Issuers []string `json:"issuers,omitempty"`
-
 	// TokenChecker will verify the password field - as a JWT or other forms.
-	TokenChecker nio.TokenChecker `json:"-"`
-
-	// Deprecated - Credentials
-	CertHost string `json:"ssh.crt,omitempty"`
-	// Deprecated - Credentials
-	CertClient string `json:"ssh-client.crt,omitempty"`
-
-	// AuthorizedKeys is the same as authorized_keys file.
-	// The keys are used as 'trusted sources' for authentication. Any user key can be used for shell/debug access.
-	// The CA keys are allowed to connect - but can get a shell only if 'role=admin' is present in the cert.
-	//
-	// If empty, the SSH_AUTHORIZED_KEYS env is used, falling back to authorized_keys in $HOME/.ssh (if FromEnv is called)
-	AuthorizedKeys string `json:"authorized_keys,omitempty"`
+	TokenChecker TokenChecker `json:"-"`
+	// TokenSource will provide passwords or tokens.
+	// Normally SSH is cert based - but in some cases all we get is a token. For example K8S, Cloudrun, etc.
+	TokenSource TokenSource `json:"-"`
 
 	sync.Mutex `json:"-"`
 	private    *ecdsa.PrivateKey
-
-	// Default user for outgoing connections, accepted default user.
-	User       string `json:"user,omitempty"`
 }
 
+type ContextDialer interface {
+	// Dial with a context based on tls package - 'once successfully
+	// connected, any expiration of the context will not affect the
+	// connection'.
+	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
+}
+
+type TokenChecker interface {
+	Check(token string) (claims map[string]string, e error)
+}
+
+
+// TokenSource is a common interface for anything returning Bearer or other kind of tokens.
+type TokenSource interface {
+	// GetToken for a given audience.
+	GetToken(context.Context, string) (string, error)
+}
 // StayConnected will keep the SSH node connected with any 'ssh-upstream'
 // destination in the config.
 // Does not support reloading yet.
@@ -158,7 +178,7 @@ func (s *SSHMesh) SetKeySSH(sshk string) error {
 }
 
 // Cert.PrivateKey can be used as a source, if one is loaded.
-func (s *SSHMesh) SetKeyCryto(cpk crypto.PrivateKey) {
+func (s *SSHMesh) SetKeyCrypto(cpk crypto.PrivateKey) {
 	// Currently only using ECDSA keys
 	s.private = cpk.(*ecdsa.PrivateKey)
 	s.Signer, _ = ssh.NewSignerFromSigner(s.private)
@@ -175,13 +195,11 @@ func New() *SSHMesh {
 		UsersKeys:        map[string]string{},
 		ChannelHandlers:  map[string]func(ctx context.Context, ssht *SSHSMux, newChannel ssh.NewChannel){},
 	}
-	// Can be set to sshdebug.SessionHandler
-	s.ChannelHandlers["session"] = SessionHandler
 
 	return s
 }
 
-func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
+func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 	if ssht.AuthorizedKeys != "" {
 		ssht.AddAuthorizedFile([]byte(ssht.AuthorizedKeys))
 	}
@@ -189,8 +207,15 @@ func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
 	if ssht.Dialer == nil {
 		ssht.Dialer = &net.Dialer{}
 	}
-	ssht.FromEnv()
+
 	var err error
+
+	if ssht.Key != "" {
+		err = ssht.SetKeySSH(ssht.Key)
+		if err != nil {
+			return err
+		}
+	}
 
 	if ssht.private == nil {
 		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -198,9 +223,10 @@ func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
 		s.Signer, _ = ssh.NewSignerFromKey(privk1)
 		s.SignerClient = s.Signer
 	}
-
 	if s.CertClient != "" {
-		cert, err := ssh.ParsePublicKey([]byte(s.CertClient))
+		// Client and host certificates are in the authorized key format ( like the .pub files)
+		cert, _, _, _, err := ssh.ParseAuthorizedKey([]byte(s.CertClient))
+		//cert, err := ssh.ParsePublicKey([]byte(s.CertClient))
 		if err != nil {
 			return err
 		}
@@ -209,14 +235,13 @@ func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
 		s.User = crt.ValidPrincipals[0]
 	}
 	if s.CertHost != "" {
-		cert, err := ssh.ParsePublicKey([]byte(s.CertHost))
+		cert, _, _, _, err := ssh.ParseAuthorizedKey([]byte(s.CertClient))
+		//cert, err := ssh.ParsePublicKey([]byte(s.CertHost))
 		if err != nil {
 			return  err
 		}
-		s.Signer, err = ssh.NewCertSigner(cert.(*ssh.Certificate), s.Signer)
+		s.SignerHost, err = ssh.NewCertSigner(cert.(*ssh.Certificate), s.Signer)
 	}
-
-
 
 	if ssht.Listener == nil {
 		ssht.Listener, err = net.Listen("tcp", ssht.Address)
@@ -226,20 +251,19 @@ func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
 	}
 
 	ssht.Forward = func(ctx context.Context, host string, closer io.ReadWriteCloser) {
-		str := nio.GetStream(closer, closer)
+		//str := nio.GetStream(closer, closer)
 		//defer ug.OnStreamDone(str)
 		//ug.OnStream(str)
 
-		str.Dest = host
-		nc, err := ssht.Dialer.DialContext(ctx, "tcp", str.Dest)
+		//str.Dest = host
+
+		nc, err := ssht.Dialer.DialContext(ctx, "tcp", host)
 		if err != nil {
 			return
 		}
 
-		nio.Proxy(nc, str, str, str.Dest)
+		nio.Proxy(nc, closer, closer, host)
 	}
-
-
 
 	if s.TokenChecker != nil {
 		// Extension: allow JWT authentication. Normally client certs are used for SSH.
@@ -311,12 +335,24 @@ func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
 		},
 
 	}
-	s.serverConfig.AddHostKey(s.Signer)
+	if s.SignerHost != nil {
+		s.serverConfig.AddHostKey(s.SignerHost)
+	} else {
+		s.serverConfig.AddHostKey(s.Signer)
+	}
 	s.serverConfig.PublicKeyCallback = s.CertChecker.Authenticate
 
+	return nil
+}
+
+func (ssht*SSHMesh) Start(ctx context.Context) ( error) {
 	if ssht.Listener == nil {
-		return errors.New("no listener")
+		err := ssht.Provision(ctx)
+		if err != nil {
+			return err
+		}
 	}
+
 	go func() {
 		for {
 			nConn, err := ssht.Listener.Accept()
@@ -336,7 +372,6 @@ func (ssht *SSHMesh) Start(ctx context.Context) ( error) {
 		go sshc.StayConnected()
 	}
 
-
 	return nil
 }
 
@@ -348,6 +383,7 @@ func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
 	c := &SSHCMux{
 		SSHMesh: ss,
 		Address: dst,
+		User: ss.User,
 	}
 
 	return c, nil
@@ -476,7 +512,11 @@ type SSHSMux struct {
 	FQDN          string
 }
 
+func (ssht *SSHMesh) HandleAccepted(nc net.Conn) error {
 
+	ssht.HandleServerConn(&SSHSMux{NetConn: nc})
+	return nil
+}
 
 
 // Handles a connection as SSH server, using a net.Conn - which might be tunneled over other transports.
@@ -550,7 +590,12 @@ func (ssht *SSHMesh) HandleServerConn(acceptedSSHMux *SSHSMux) {
 		switch newChannel.ChannelType() {
 		case "direct-tcpip":
 			go DirectTCPIPHandler(ctx, acceptedSSHMux, ssht, newChannel)
-
+		case "session":
+			s := &SSHSession{
+			ssht: ssht,
+			sshMux: acceptedSSHMux,
+			}
+			s.Handle(ctx, newChannel)
 		default:
 			chandler := ssht.ChannelHandlers[newChannel.ChannelType()]
 			if chandler != nil {
@@ -596,3 +641,25 @@ func (ssht *SSHMesh) handleServerConnRequests(ctx context.Context, reqs <-chan *
 	}
 }
 
+func (st *SSHMesh) DialMeta(ctx context.Context, host string, orig string) (io.ReadWriteCloser, error) {
+
+	cc, _ := st.connectedClientNodes.Load(host)
+
+	if cc != nil {
+		payload := ssh.Marshal(&remoteForwardChannelData{
+			DestAddr:   "",
+			DestPort:   uint32(80),
+			OriginAddr: orig,
+			OriginPort: uint32(1234),
+		})
+		ch, reqs, err := cc.(*SSHSMux).ServerConn.OpenChannel("forwarded-tcpip", payload)
+		if err != nil {
+			return nil, err
+		}
+		go ssh.DiscardRequests(reqs)
+
+		return ch, nil
+	}
+
+	return nil, nil
+}

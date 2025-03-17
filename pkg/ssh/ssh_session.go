@@ -1,14 +1,16 @@
-package ssh_mesh
+package ssh
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
+	"sync"
 	"sync/atomic"
 
-	"github.com/costinm/ssh-mesh/pkg/sshpty"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -33,6 +35,28 @@ var id uint32
 // doesn't have a reference to the conn ( because gliderlabs decided to invent it's 'better' interface ).
 // In general the interface and abstractions are too complex and not needed.
 
+// SSHSession is a multiplexed connection, like TCP forwarding, but with extra packets for executing commands.
+//
+type SSHSession struct {
+	ssht   *SSHMesh
+	sshMux *SSHSMux
+
+	Channel ssh.Channel
+
+	sigCh chan<- string
+
+	sync.RWMutex
+
+	sigBuf  []string
+	breakCh chan<- bool
+
+	PTY *Pty
+	tty *os.File
+}
+
+func (sess *SSHSession) Close() error {
+	return nil
+}
 
 // WIP: The SSH 'gateway' will not have a real shell / sftp session (except for debug). Instead, the session is used as a
 // general purpose communication.
@@ -43,23 +67,19 @@ var id uint32
 // If ssh is piped, a terminal will not be allocated - but no flushing seems to happen.
 //
 // Inside a session - ~. close, ~B break, ~C CLI, ~# connections, ~? help
-
-// Basic untrusted session handler.
-func SessionHandler(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChannel) {
+func (sess *SSHSession) Handle(ctx context.Context, newChannel ssh.NewChannel) {
+	sconn := sess.sshMux
 
 	conn := sconn.ServerConn
 	isOwner := conn.Permissions.Extensions["role"] == "admin"
 
 	ch, reqs, _ := newChannel.Accept()
+  sess.Channel = ch
 
 	env := []*KV{}
 
 	ssht := sconn.SSHServer
 
-	sess := &sshpty.PTY{
-		Channel: ch,
-		Conn:    conn,
-	}
 
 	for req := range reqs {
 		// "shell", "exec", "env", "subsystem"
@@ -80,7 +100,7 @@ func SessionHandler(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChann
 			ssh.Unmarshal(req.Payload, &payload)
 			req.Reply(true, nil)
 			if isOwner {
-				go execHandler(ssht, conn, sess, env, payload.Value)
+				go execHandler(ch, ssht, conn, sess, env, payload.Value)
 			} else {
 				sid := atomic.AddUint32(&id, 1)
 				e := &Exec{In: ch, Out: ch, id: sid,
@@ -103,6 +123,8 @@ func SessionHandler(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChann
 			} else {
 				go SFTPHandler(req, sconn, ch)
 			}
+
+			// All other messages are optional and sent before shell/exec
 		case "env":
 			var kv KV
 			// Typical: LANG
@@ -111,12 +133,135 @@ func SessionHandler(ctx context.Context, sconn *SSHSMux, newChannel ssh.NewChann
 			if req.WantReply {
 				req.Reply(true, nil)
 			}
+		case "signal":
+			var payload struct{ Signal string }
+			ssh.Unmarshal(req.Payload, &payload)
+			sess.Lock()
+			if sess.sigCh != nil {
+				sess.sigCh <- payload.Signal
+			} else {
+				if len(sess.sigBuf) < 32 {
+					sess.sigBuf = append(sess.sigBuf, payload.Signal)
+				}
+			}
+			sess.Unlock()
+		case "break":
+			ok := false
+			sess.Lock()
+			if sess.breakCh != nil {
+				sess.breakCh <- true
+				ok = true
+			}
+			req.Reply(ok, nil)
+			sess.Unlock()
+		case "pty-req":
+			ptyReq, ok := parsePtyRequest(req.Payload)
+			if !ok {
+				req.Reply(false, nil)
+				return
+			}
+			sess.PTY = &ptyReq
+			req.Reply(ok, nil)
+		case "window-change":
+			if sess.PTY == nil {
+				req.Reply(false, nil)
+				return
+			}
+			win, ok := parseWinchRequest(req.Payload)
+			if ok {
+				sess.PTY.Window = win
+				if sess.tty != nil {
+					setWinsize(sess.tty, win.Width, win.Height)
+				}
+			}
+			req.Reply(ok, nil)
+
 		default:
-			// Typical pty-req, only for shell ( no params)
-			sess.HandleSSHRequest(req)
+			slog.Info("unknown session req", "type", req.Type)
+			req.Reply(false, nil)
 		}
 	}
 }
+
+// Window represents the size of a PTY window.
+type Window struct {
+	Width  int
+	Height int
+}
+
+// Pty represents a PTY request and configuration.
+type Pty struct {
+	Term   string
+	Window Window
+	// HELP WANTED: terminal modes!
+}
+
+func parsePtyRequest(s []byte) (pty Pty, ok bool) {
+	term, s, ok := parseString(s)
+	if !ok {
+		return
+	}
+	width32, s, ok := parseUint32(s)
+	if !ok {
+		return
+	}
+	height32, _, ok := parseUint32(s)
+	if !ok {
+		return
+	}
+	pty = Pty{
+		Term: term,
+		Window: Window{
+			Width:  int(width32),
+			Height: int(height32),
+		},
+	}
+	return
+}
+
+func parseString(in []byte) (out string, rest []byte, ok bool) {
+	if len(in) < 4 {
+		return
+	}
+	length := binary.BigEndian.Uint32(in)
+	if uint32(len(in)) < 4+length {
+		return
+	}
+	out = string(in[4 : 4+length])
+	rest = in[4+length:]
+	ok = true
+	return
+}
+
+func parseUint32(in []byte) (uint32, []byte, bool) {
+	if len(in) < 4 {
+		return 0, nil, false
+	}
+	return binary.BigEndian.Uint32(in), in[4:], true
+}
+
+func parseWinchRequest(s []byte) (win Window, ok bool) {
+	width32, s, ok := parseUint32(s)
+	if width32 < 1 {
+		ok = false
+	}
+	if !ok {
+		return
+	}
+	height32, _, ok := parseUint32(s)
+	if height32 < 1 {
+		ok = false
+	}
+	if !ok {
+		return
+	}
+	win = Window{
+		Width:  int(width32),
+		Height: int(height32),
+	}
+	return
+}
+
 
 var ftpHandler func(closer io.ReadWriteCloser)
 

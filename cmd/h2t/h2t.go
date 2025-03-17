@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/costinm/ssh-mesh/pkg/h2stream"
+	"github.com/costinm/ssh-mesh/pkg/h2"
 	"github.com/costinm/ssh-mesh/pkg/tokens"
 )
 
@@ -79,7 +79,7 @@ func main() {
 					panic(err)
 				}
 				go func() {
-					sc, err := h2stream.NewStreamH2(ctx, client, url, "localhost:15022", ma)
+					sc, err := h2.NewStreamH2(ctx, client, url, "localhost:15022", ma)
 					if err != nil {
 						log.Fatal(err)
 					}
@@ -93,7 +93,7 @@ func main() {
 		}
 	}
 
-	sc, err := h2stream.NewStreamH2(ctx, client, url, "localhost:15022", ma)
+	sc, err := h2.NewStreamH2(ctx, client, url, "localhost:15022", ma)
 	if err != nil {
 		log.Fatal(err)
 	}

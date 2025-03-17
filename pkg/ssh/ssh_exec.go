@@ -1,4 +1,4 @@
-package ssh_mesh
+package ssh
 
 import (
 	"fmt"
@@ -11,8 +11,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
-	"github.com/costinm/ssh-mesh/pkg/sshpty"
+	"github.com/creack/pty"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -80,36 +81,129 @@ func (e *Exec) execHandlerInternal(ch ssh.Channel, kv []*KV, cmd string) {
 // Regular users have access to a restricted set of internal commands
 // When the server is a real dropbear/sshd, this is handled with the
 // native ssh permission system.
-func execHandler(ssht *SSHMesh, conn *ssh.ServerConn, s *sshpty.PTY, env []*KV, raw string) {
+func execHandler(ch ssh.Channel, ssht *SSHMesh, conn *ssh.ServerConn, s *SSHSession, env []*KV, raw string) {
 
 	t0 := time.Now()
 	defer func() {
 		s.Close()
 		slog.Info("sshd_exec_close", "dur", time.Since(t0),
-			"cmd", s.RawCmd)
+			"cmd", raw)
 	}()
 
 	cmd := buildCmd(ssht, env, raw)
 
+	if s.PTY != nil && len(s.PTY.Term) > 0 {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", s.PTY.Term))
+	}
+	// This is done for both PTY package and default
 	if s.PTY != nil {
-		ok, err := s.Exec(cmd)
-		if ok {
-			if err != nil {
-				sendErrAndExit(s, err)
-				return
-			}
-
-			exit(s, 0)
-			return
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
 		}
+		cmd.SysProcAttr.Setsid = true
+		cmd.SysProcAttr.Setctty = true
 	}
 
-	if err := handleNoTTY(cmd, s); err != nil {
-		sendErrAndExit(s, err)
+	if s.PTY != nil {
+		// A PTY request is set and we have a pty handler
+		f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(s.PTY.Window.Height), Cols: uint16(s.PTY.Window.Height)})
+		defer f.Close()
+		s.tty = f
+		if err != nil {
+			sendErrAndExit(ch, err)
+			return
+		}
+		go func() {
+			io.Copy(f, ch) // stdin
+		}()
+
+		waitCh := make(chan struct{})
+
+		go func() {
+			defer close(waitCh)
+			io.Copy(ch, f) // stdout and stderr - with pty we can't split
+		}()
+
+		if err := cmd.Wait(); err != nil {
+			exerr := err.(*exec.ExitError)
+			log.Println("pty command failed while waiting", err)
+			exit(ch, exerr.ExitCode())
+			return
+		}
+
+		exit(ch, 0)
+
 		return
 	}
 
+	err := handleNoTTY(cmd, ch)
+	if err != nil {
+		sendErrAndExit(ch, err)
+	}
+}
+
+func handleNoTTY(cmd *exec.Cmd, s ssh.Channel) error {
+	// Creates a os.Pipe. returns the reader side. Also handles the childIOFiles/parentIOPipes, to be closed at end.
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	if err = cmd.Start(); err != nil {
+		log.Println(err, "couldn't start nopty command '%s'", cmd.String())
+		return err
+	}
+
+	go func() {
+		defer stdin.Close()
+		if _, err := io.Copy(stdin, s); err != nil {
+			log.Println(err, "failed to write session to stdin.")
+		}
+	}()
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(s, stdout); err != nil {
+			log.Println(err, "failed to write stdout to session.")
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(s.Stderr(), stderr); err != nil {
+			log.Println(err, "failed to write stderr to session.")
+		}
+	}()
+
+	if err := cmd.Wait(); err != nil {
+		exerr := err.(*exec.ExitError)
+		log.Println("pty command failed while waiting", err)
+		exit(s, exerr.ExitCode())
+		return err
+	}
+
+	wg.Wait()
 	exit(s, 0)
+	return nil
+}
+
+
+func setWinsize(f *os.File, w, h int) {
+	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
+		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
 }
 
 
@@ -182,60 +276,6 @@ func buildCmd(ssht *SSHMesh, env []*KV, rawCmd string) *exec.Cmd {
 	return cmd
 }
 
-
-
-func handleNoTTY(cmd *exec.Cmd, s ssh.Channel) error {
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-
-	if err = cmd.Start(); err != nil {
-		log.Println(err, "couldn't start nopty command '%s'", cmd.String())
-		return err
-	}
-
-	go func() {
-		defer stdin.Close()
-		if _, err := io.Copy(stdin, s); err != nil {
-			log.Println(err, "failed to write session to stdin.")
-		}
-	}()
-
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(s, stdout); err != nil {
-			log.Println(err, "failed to write stdout to session.")
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(s.Stderr(), stderr); err != nil {
-			log.Println(err, "failed to write stderr to session.")
-		}
-	}()
-
-	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
-		log.Println(err, "command failed while waiting")
-		return err
-	}
-
-	return nil
-}
+// StartWithSize starts the command with a pty - normally creack/pty, but avoiding the dep in this package.
+var StartWithSize func(cmd *exec.Cmd,  w, h, x, y uint16) (*os.File, error)
 

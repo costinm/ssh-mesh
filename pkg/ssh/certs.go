@@ -1,8 +1,8 @@
-package ssh_mesh
+package ssh
 
 import (
-	"crypto"
 	"crypto/rand"
+
 	"golang.org/x/crypto/ssh"
 )
 
@@ -46,17 +46,7 @@ func (s *SSHMesh) SignCert(cert *ssh.Certificate) ([]byte, error) {
 	return ssh.MarshalAuthorizedKey(cert), nil
 }
 
-type SSHCA struct {
-	Signer ssh.Signer
-}
 
-func NewSSHCA(privk crypto.PrivateKey) *SSHCA {
-	//privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	signer, _ := ssh.NewSignerFromKey(privk)
-	return &SSHCA{Signer: signer}
-}
+//	return "cert-authority " + string(ssh.MarshalAuthorizedKey(s.Signer.PublicKey()))
 
-func (s *SSHCA) AuthorizedKey() string {
-	return "cert-authority " + string(ssh.MarshalAuthorizedKey(s.Signer.PublicKey()))
-}
 

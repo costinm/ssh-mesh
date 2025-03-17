@@ -12,6 +12,21 @@ import (
 	"time"
 )
 
+// Tokens handle authentication using tokens instead of certificates.
+// It covers the most common cases:
+// - exec
+// - GCP-like MDS
+// - WIP: OAuth2 refresh tokens
+// - WIP: cert-based self-signed tokens
+//
+// Main use case for tokens is 'over http2' tunnels, when direct connectivity is not possible.
+// Second use case is for exchanging a platform credential to SSH and TLS certificates.
+//
+// For SSH and Istio mesh, certificates are the 'native' authentication.
+//
+// SSH can also handle tokens in the 'password' field - by setting a TokenVerifier on server and TokenSource on
+// client.
+
 // TokenExec is the config for an exec-based token source, using a subset
 // of kubeconfig. In k8s, pkg/client/auth/exec is handling this, it has a cache
 // and other fancy features.

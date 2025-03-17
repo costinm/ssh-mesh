@@ -12,8 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	ssh_mesh "github.com/costinm/ssh-mesh"
+	"github.com/costinm/ssh-mesh/pkg/h2"
 	"github.com/costinm/ssh-mesh/pkg/socks"
+	ssh_mesh "github.com/costinm/ssh-mesh/pkg/ssh"
 	"github.com/costinm/ssh-mesh/pkg/tproxy"
 )
 
@@ -55,8 +56,14 @@ func main() {
 	h2s.Protocols.SetUnencryptedHTTP2(true)
 	h2s.Protocols.SetHTTP1(true)
 
+	h2srv := &h2.H2{
+		DialMeta: ssht.DialMeta,
+		SSHStreamHandler: ssht.HandleAccepted,
+	}
+
+	ssht.H2Dialer = h2srv
 	// TODO: add a forward to a local app
-	ssht.InitMux(mux)
+	h2srv.InitMux(mux)
 
 	//authn, err := appinit.Get[nio.TokenChecker](ctx, cs, "authn")
 	//if authn != nil {

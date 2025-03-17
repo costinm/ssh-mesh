@@ -1,4 +1,5 @@
 {
+  "address": ":11122",
   "id": "bob",
   "namespace": "default",
   "tls.key": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIGwdzkmyyg03hxhCTzwQg+fFscpbagJ3Mm+aQEX0TVzAoAoGCCqGSM49\nAwEHoUQDQgAEnOBRgsn0mE1ISvFOl0KA5RSr7+YvSo84P1r7+lTcdEvBkmap74JV\nHiJgbgO8K9pKg6wfe360DWS3cf4qUjLw0Q==\n-----END EC PRIVATE KEY-----\n",

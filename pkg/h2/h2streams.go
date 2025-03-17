@@ -1,4 +1,4 @@
-package nio
+package h2
 
 import (
 	"context"
@@ -8,10 +8,54 @@ import (
 	"time"
 )
 
+// StreamState provides metadata about a stream.
+//
+// It includes errors, stats, other metadata.
+// The Stream interface wraps a net.Conn with context and state.
+type StreamState struct {
+	// InOutStream MuxID - odd for streams initiated from server (push and reverse)
+	// Unique withing a mux connection.
+	//MuxID uint32
+
+	// It is the key in the Active table.
+	// Streams may also have local ids associated with the transport.
+	StreamId string
+
+	// WritErr indicates that Write failed - timeout or a RST closing the stream.
+	WriteErr error `json:"-"`
+	// ReadErr, if not nil, indicates that Read() failed - connection was closed with RST
+	// or timedout instead of FIN
+	ReadErr error `json:"-"`
+
+	Stats
+
+	// Original or infered destination.
+	Dest string
+}
+
+// Stats holds telemetry for a stream or peer.
+type Stats struct {
+	Open time.Time
+
+	// last receive from local (and send to remote)
+	LastWrite time.Time
+
+	// last receive from remote (and send to local)
+	LastRead time.Time
+
+	// Sent from client to server ( client is initiator of the proxy )
+	SentBytes   int
+	SentPackets int
+
+	// Received from server to client
+	RcvdBytes   int
+	RcvdPackets int
+}
+
+
 // StreamHttpServer implements net.Conn on top of a H2 stream.
 type StreamHttpServer struct {
 	StreamState
-
 	Request        *http.Request
 	TLS            *tls.ConnectionState
 	ResponseWriter http.ResponseWriter

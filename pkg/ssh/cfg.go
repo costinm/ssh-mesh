@@ -1,4 +1,4 @@
-package ssh_mesh
+package ssh
 
 import (
 	"os"

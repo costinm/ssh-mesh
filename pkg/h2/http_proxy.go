@@ -1,4 +1,4 @@
-package nio
+package h2
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/costinm/ssh-mesh/nio"
 )
 
 // Helpers for HTTP proxy.
@@ -180,7 +182,7 @@ func SendBackResponse(w http.ResponseWriter, r *http.Request,
 	CopyResponseHeaders(w.Header(), res.Header)
 	w.WriteHeader(res.StatusCode)
 
-	s1 := &ReaderCopier{
+	s1 := &nio.ReaderCopier{
 		Out: w,
 		In:  res.Body,
 	}

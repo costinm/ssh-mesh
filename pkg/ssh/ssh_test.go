@@ -1,4 +1,4 @@
-package ssh_mesh
+package ssh
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"log"
@@ -20,16 +19,15 @@ import (
 func TestE2E(t *testing.T) {
 	ctx := context.Background()
 
-	ca, err := NewNode("testdata/test.mesh.local/ca/sshm.json")
+	ca, err := NewNode("../../testdata/test.mesh.local/ca/sshm.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	bob, err := NewNode("testdata/test.mesh.local/bob/sshm.json")
+	bob, err := NewNode("../../testdata/test.mesh.local/b.bob/sshm.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	bob.Address = ":11122"
 	l, err := bob.ListenAndStart()
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +70,7 @@ var domain = "test.mesh.local"
 // InitMeshNode provisions an ephemeral mesh node for testing.
 // Should do the same as the ssh-keygen script.
 func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
-	//ma := meshauth.New()
+	node := New()
 
 	// ssh-keygen
 	nodePrivate, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -81,28 +79,28 @@ func InitMeshNode(ca *SSHMesh, name string, domain string) (*SSHMesh, error) {
 	privatePEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: encodedKey})
 
 	priv := string(privatePEM)
-	//ma.Cert.InitSelfSignedFromPEMKey(string(privatePEM), "")
+	node.Key = priv
 
 	nodeSSHSigner, _ := ssh.NewSignerFromKey(nodePrivate)
 
 	// Sign the 2 certs
-	_, hch, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.HostCert,
+	hch, _, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.HostCert,
 		[]string{name + "." + domain, name, name + "@" + domain})
 	if err != nil {
 		return nil, err
 	}
 
-	_, hcc, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.UserCert,
+	hcc, _, err := ca.Sign(nodeSSHSigner.PublicKey(), ssh.UserCert,
 		[]string{name + "@" + domain})
 
-	node := New()
 
-	node.SetKeySSH(priv)
-	node.CertHost = base64.StdEncoding.EncodeToString(hch.Marshal())
-	node.CertClient = base64.StdEncoding.EncodeToString(hcc.Marshal())
+	//node.SetKeySSH(priv)
+	node.CertHost = string(hch)
+	node.CertClient = string(hcc)
 
+	node.Address = ":0"
 
-	return node, nil
+	return node, node.Provision(context.Background())
 }
 
 // NewNode creates a new SSH mesh node, based on a config location.
@@ -124,5 +122,5 @@ func NewNode(loc string) (*SSHMesh, error) {
 	}
 	json.Unmarshal(cfgdata, m)
 
-	return m, nil
+	return m, m.Provision(context.Background())
 }

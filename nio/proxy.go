@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	"log"
-	"net"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -15,7 +14,9 @@ var ProxyCnt atomic.Int32
 // Proxy forwards from nc to in/w.
 // outConn is typically the result of DialContext - egressing.
 // dest is used for logging and tracking.
-func Proxy(outConn net.Conn, in io.Reader, w io.Writer, dest string) error {
+//
+// in and w are the local streams or accepted connection.
+func Proxy(outConn io.ReadWriteCloser, in io.Reader, w io.Writer, dest string) error {
 	t1 := time.Now()
 
 	ch := make(chan int)

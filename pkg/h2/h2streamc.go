@@ -1,4 +1,4 @@
-package h2stream
+package h2
 
 import (
 	"context"
@@ -16,6 +16,10 @@ type TokenSource interface {
 }
 
 const ConnectOverrideHeader = "x-host"
+
+func (st *H2) DialContext(ctx context.Context, net, addr string) (net.Conn, error) {
+	return NewStreamH2(ctx, http.DefaultClient, addr, "", st.TokenSource)
+}
 
 // NewStreamH2 creates a H2 stream using POST.
 //
@@ -64,6 +68,7 @@ func NewStreamH2(ctx context.Context, hc *http.Client, addr string, tcpaddr stri
 }
 
 type StreamHttpClient struct {
+	StreamState
 
 	Request        *http.Request
 	Response   *http.Response
@@ -80,11 +85,16 @@ func (s *StreamHttpClient) Read(b []byte) (n int, err error) {
 func (s *StreamHttpClient) Write(b []byte) (n int, err error) {
 	n, err = s.RequestInPipe.Write(b)
 	if err != nil {
+		s.WriteErr = err
 		return n, err
 	}
 	//if f, ok := s.ResponseWriter.(http.Flusher); ok {
 	//	f.Flush()
 	//}
+	s.SentBytes += n
+	s.SentPackets++
+	s.LastWrite = time.Now()
+
 	return
 }
 
@@ -135,3 +145,16 @@ func (s *StreamHttpClient) SetReadDeadline(t time.Time) error {
 func (s *StreamHttpClient) SetWriteDeadline(t time.Time) error {
 	return nil
 }
+
+func (s *StreamHttpClient) State() *StreamState {
+	return &s.StreamState
+}
+
+func (s *StreamHttpClient) Header() http.Header {
+	return s.Response.Header
+}
+
+func (s *StreamHttpClient) RequestHeader() http.Header {
+	return s.Request.Header
+}
+

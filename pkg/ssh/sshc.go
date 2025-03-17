@@ -1,4 +1,4 @@
-package ssh_mesh
+package ssh
 
 import (
 	"context"
@@ -6,14 +6,12 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"log/slog"
 
-	"github.com/costinm/ssh-mesh/nio"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -79,15 +77,15 @@ func (sc *SSHCMux) Init(ctx context.Context) {
 const sshVip = "localhost:15022"
 
 
-// Dial opens one TCP or H2 connection to addr.
+// Dial opens one TCP or H2 connection to addr, and starts SSH handshake.
 // It blocks until the SSH handshake is done.
+//
+// addr can be a https:// address or a hostname.
 func (sc *SSHCMux) Dial(ctx context.Context, addr string) error {
 	sc.Init(ctx)
 
 	if strings.HasPrefix(addr, "https://") {
-		// 'nio' has wrappers for streaming over h2 and h2c
-		//
-		tcon, err := nio.NewStreamH2(ctx, http.DefaultClient, addr, sshVip, sc.TokenSource)
+		tcon, err := sc.H2Dialer.DialContext(ctx, "http", addr)
 		if err != nil {
 			return err
 		}
