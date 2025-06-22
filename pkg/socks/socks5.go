@@ -21,17 +21,18 @@ import (
 // used only for local connections, in cases nftables/iptables
 // are not available.
 type Socks struct {
-	Dialer      nio.ContextDialer `json:"-"`
+	OnConn func(nc net.Conn, dest string, la *net.TCPAddr, postDial func(net.Addr, error))
+
+	Dialer nio.ContextDialer `json:"-"`
 }
 
-
-func (l *Socks) ServeTCP(ctx context.Context, c net.Conn) error { 	if l.Dialer == nil {
-	l.Dialer = &net.Dialer{}
-}
+func (l *Socks) ServeTCP(ctx context.Context, c net.Conn) error {
+	if l.Dialer == nil {
+		l.Dialer = &net.Dialer{}
+	}
 	s := &SocksConn{Conn: c, Socks: l}
 	return s.Run()
 }
-
 
 // TODO: tor extensions
 // - send client data in advance, forward to the server
@@ -111,10 +112,8 @@ func (s *SocksConn) Run() error {
 
 	s.parse(brin, s.Conn)
 
-	//t0 := time.Now()
-	dest := s.Dest
-	if dest == "" {
-		dest = s.DestAddr.String()
+	if s.Dest == "" {
+		s.Dest = s.DestAddr.String()
 	}
 	nc, err := s.Socks.Dialer.DialContext(context.Background(), "tcp", s.Dest)
 	if err != nil {
@@ -125,7 +124,6 @@ func (s *SocksConn) Run() error {
 
 	return nio.Proxy(nc, s.Conn, s.Conn, s.Dest)
 }
-
 
 // Must be called before sending any data, to send the local addr used when
 // dialing. This is rarely used - tproxy doesn't send anything back either.

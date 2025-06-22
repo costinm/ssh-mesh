@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 
 	"github.com/costinm/ssh-mesh"
 )
@@ -32,15 +34,23 @@ TODO:
 //
 // Accepts connections using SSH_AUTHORIZED_KEYS, certs or a GCP-style metadata server.
 //
-// This includes the meshauth packages and config.
-//
+
 // SSH_ADKPASS_REQUIRE=force
 // SSH_ASKPASS=gcloud auth print-identity-token $GSA --audiences=https://$HOST
 // ssh $HOST -R ... -L ...
 func main() {
 	ctx := context.Background()
 
-	ssh_mesh.RunSSH(ctx)
+	s := ssh_mesh.NewSSHM()
+	s.SSH.FromEnv()
+
+	err := s.Provision(ctx)
+	if err != nil {
+		fmt.Printf("SSHMesh error %v", err)
+		os.Exit(1)
+	}
+
+	s.Start(ctx)
 
 	ssh_mesh.WaitEnd()
 }

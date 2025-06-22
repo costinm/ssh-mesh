@@ -7,10 +7,9 @@ import (
 )
 
 // RequestContext is a context associated with a request (HTTP, connection).
-// This may be derived from a MeshContext, or wrap a context created by a framework.
 type RequestContext struct {
 	Context context.Context
-	Start time.Time
+	Start   time.Time
 
 	Error error
 
@@ -21,7 +20,7 @@ type RequestContext struct {
 	Client string
 
 	// Peer is the peer identity - usually from mTLS client cert.
-	Peer   string
+	Peer string
 }
 
 func (a *RequestContext) Deadline() (deadline time.Time, ok bool) {
@@ -40,8 +39,8 @@ func (a *RequestContext) Err() error {
 // Otherwise, will pass to parent.
 func (a *RequestContext) Value(key any) any {
 	switch key {
-	case "client": return a.Client
+	case "client":
+		return a.Client
 	}
 	return a.Context.Value(key)
 }
-

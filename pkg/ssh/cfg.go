@@ -5,9 +5,17 @@ import (
 )
 
 // FromEnv is called to load private key and configs from file or env variables.
+// Not useful for a library - only as a main app.
+//
+// It will use the same key for clients and servers.
+// Existing $HOME/.ssh is used unless SSHM_CFGDIR is set.
+//
+// Configs:
+// - id_ecdsa and id_ecdsa_{host,cert}.pub (optional)
+// - authorzied_keys
 func (sshMesh *SSHMesh) FromEnv() {
 	sshMesh.Address = ":15022"
-	home := os.Getenv("CFG_DIR")
+	home := os.Getenv("SSHM_CFGDIR")
 	if home == "" {
 		home = os.Getenv("HOME")
 	}

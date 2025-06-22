@@ -136,6 +136,7 @@ func (r *H2) Provision(ctx context.Context) error {
 			h, err := r.ResourceStore.Resource(ctx, v)
 			if err != nil {
 				writer.WriteHeader(500)
+				fmt.Fprintln(writer, "Missing handler", v)
 				return
 			}
 			// TODO: if v is http or https - plug in a proxy
@@ -170,7 +171,7 @@ func (r *H2) Start() error {
 	//		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
 	//	}
 
-	r.Logger.Info("h2/start")
+	r.Logger.Info("h2/start", r.Addr)
 	go r.Serve(r.NetListener)
 	return nil
 }
@@ -313,4 +314,25 @@ func (st *H2) InitMux(mux *http.ServeMux) {
 
 	// TODO: option for h2 proxy
 	mux.Handle("/", localReverseProxyH1)
+}
+
+type Proxy1 struct {
+	URL   string
+	proxy *httputil.ReverseProxy
+
+	// TODO: wrap authn, authz ?
+}
+
+func (p *Proxy1) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if p.proxy == nil {
+		u, err := url.Parse(p.URL)
+		if err != nil {
+			writer.WriteHeader(500)
+			fmt.Fprintln(writer, "Invalid proxy URL", p.URL, err)
+			return
+		}
+		proxy := httputil.NewSingleHostReverseProxy(u)
+		p.proxy = proxy
+	}
+	p.proxy.ServeHTTP(writer, request)
 }

@@ -13,6 +13,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/costinm/ssh-mesh/nio"
+	"github.com/costinm/ssh-mesh/pkg/h2"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -476,9 +478,16 @@ type SSHSMux struct {
 }
 
 func (sshMesh *SSHMesh) HandleAccepted(nc net.Conn) error {
-
 	sshMesh.HandleServerConn(&SSHSMux{NetConn: nc})
 	return nil
+}
+
+// ServeHTTP is the main function implemented by SSH for HTTP purpose.
+// It will take the H2 request and treat it as a TCP connection.
+// HandleAccepted is handling accepted TCP connections.
+func (sshMesh *SSHMesh) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	nc := h2.NewStreamServerRequest(request, writer)
+	sshMesh.HandleServerConn(&SSHSMux{NetConn: nc})
 }
 
 // Handles a connection as SSH server, using a net.Conn - which might be tunneled over other transports.

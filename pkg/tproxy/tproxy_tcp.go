@@ -11,21 +11,20 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/costinm/ssh-mesh/nio"
 )
 
 // Based on https://github.com/LiamHaworth/go-tproxy/blob/master/tproxy_tcp.go and many others
 
+// TProxy captures streams using TPROXY or REDIRECT, and forwards them using
+//
+//	a Dialer or OnConn callback.
 type TProxy struct {
-	Addr        string
-	OnConn      func(nc net.Conn, dest, la *net.TCPAddr)
-	NetListener *net.TCPListener
-	Dialer      ContextDialer `json:"-"`
-}
+	// If not set, 127.0.0.1:15006
+	Addr string
 
-type ContextDialer interface {
-	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
+	NetListener *net.TCPListener
+
+	OnConn func(nc net.Conn, dest string, la *net.TCPAddr, postDial func(net.Addr, error))
 }
 
 func (t *TProxy) Provision(ctx context.Context) error {
@@ -33,6 +32,10 @@ func (t *TProxy) Provision(ctx context.Context) error {
 		t.Addr = "127.0.0.1:15006"
 	}
 	na, err := net.ResolveTCPAddr("tcp", t.Addr)
+	if err != nil {
+		log.Println("Failed to configure tproxy", err)
+		return err
+	}
 	nl, err := listenTProxy(ctx, "tcp", na)
 	if err != nil {
 		log.Println("Failed to capture tproxy", err)
@@ -59,7 +62,6 @@ func (t *TProxy) Start(ctx context.Context) {
 				return
 			}
 			dst := remoteConn.LocalAddr().(*net.TCPAddr)
-			slog.Info("ACCEPTED_TPROXY", "addr", remoteConn.RemoteAddr(), "dst", dst)
 
 			// Redirect capture - for tproxy the destination port is the target
 			// (we don't support sending to the capture port, it's reserved)
@@ -75,14 +77,10 @@ func (t *TProxy) Start(ctx context.Context) {
 				}
 			}
 
+			slog.Info("ACCEPTED_TPROXY", "addr", remoteConn.RemoteAddr(), "dst", dst)
+
 			if t.OnConn != nil {
-				t.OnConn(remoteConn, dst, remoteConn.RemoteAddr().(*net.TCPAddr))
-			} else if t.Dialer != nil {
-				nc, err := t.Dialer.DialContext(context.Background(), "tcp", dst.String())
-				if err != nil {
-					remoteConn.Close()
-				}
-				nio.Proxy(nc, remoteConn, remoteConn, dst.String())
+				t.OnConn(remoteConn, dst.String(), remoteConn.RemoteAddr().(*net.TCPAddr), nil)
 			}
 		}
 	}()
