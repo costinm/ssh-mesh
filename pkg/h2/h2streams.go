@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+
+const ConnectOverrideHeader = "x-host"
+
 // StreamState provides metadata about a stream.
 //
 // It includes errors, stats, other metadata.

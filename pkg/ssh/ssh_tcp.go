@@ -117,42 +117,42 @@ func DirectTCPIPHandler(ctx context.Context, mux *SSHSMux, srv *SSHMesh, newChan
 	})
 }
 
-type Proxy struct {
-	sch io.ReadWriteCloser
+//type Proxy struct {
+//	sch io.ReadWriteCloser
+//
+//	OutBytes, InBytes int64
+//	OutErr, InErr     error
+//}
+//
+//func (p *Proxy) ProxyTo(ch io.ReadWriteCloser)   error {
+//	c := make(chan error, 1)
+//	go func() {
+//		p.OutBytes, p.OutErr = io.Copy(p.sch, ch)
+//		c <- p.OutErr
+//	}()
+//	defer ch.Close()
+//	defer p.sch.Close()
+//
+//	p.InBytes, p.InErr = io.Copy(ch, p.sch)
+//	err := <- c
+//	if err == nil {
+//		err = p.InErr
+//	}
+//
+//	return err
+//}
 
-	OutBytes, InBytes int64
-	OutErr, InErr     error
-}
-
-func (p *Proxy) ProxyTo(ch io.ReadWriteCloser)   error {
-	c := make(chan error, 1)
-	go func() {
-		p.OutBytes, p.OutErr = io.Copy(p.sch, ch)
-		c <- p.OutErr
-	}()
-	defer ch.Close()
-	defer p.sch.Close()
-
-	p.InBytes, p.InErr = io.Copy(ch, p.sch)
-	err := <- c
-	if err == nil {
-		err = p.InErr
-	}
-
-	return err
-}
-
-func (srv *SSHMesh) Proxy(ctx context.Context, dest string, ch io.ReadWriteCloser) (*Proxy, error) {
-	var dialer net.Dialer
-	// TODO: never dial port 80 ( or the list of HTTP ports) from a local capturing service.
-	// Must go to SSH or HTTPS port.
-	dconn, err := dialer.DialContext(ctx, "tcp", dest)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Proxy{sch: dconn}, nil
-}
+//func (srv *SSHMesh) Proxy(ctx context.Context, dest string, ch io.ReadWriteCloser) (*Proxy, error) {
+//	var dialer net.Dialer
+//	// TODO: never dial port 80 ( or the list of HTTP ports) from a local capturing service.
+//	// Must go to SSH or HTTPS port.
+//	dconn, err := dialer.DialContext(ctx, "tcp", dest)
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	return &Proxy{sch: dconn}, nil
+//}
 
 func proxy(ch io.ReadWriteCloser, sch io.ReadWriteCloser, onDone func(error, error, int64, int64)) {
 	var nin, nout int64
@@ -219,6 +219,9 @@ func tcpipForwardHandler(ctx context.Context, srv *SSHMesh, conn *SSHSMux, req *
 		return true, ssh.Marshal(&remoteForwardSuccess{reqPayload.BindPort})
 	}
 	if reqPayload.BindPort == 80 {
+		return true, ssh.Marshal(&remoteForwardSuccess{reqPayload.BindPort})
+	}
+	if reqPayload.BindPort == 443 {
 		return true, ssh.Marshal(&remoteForwardSuccess{reqPayload.BindPort})
 	}
 

@@ -10,12 +10,12 @@ DOMAIN = FQDN for the generated identities. Defaults to "hostname -d" (domainnam
          of current host.
 BASE = base of the config filesystem. Defaults to ${HOME}/.ssh
 
-Configs for each hostname will be under BASE_DIR/DOMAIN/NAME
+Configs for each hostname will be under $BASE/$DOMAIN/$NAME
 
 Commands:
 
-ca - creates a CA for the domain, under CA_DIR/DOMAIN/ca/
-mesh NAME - creates workload identity, under CA_DIR/DOMAIN/NAME
+ca - creates a CA for the domain, under $BASE/$DOMAIN/ca/
+mesh NAME - creates workload identity, under $BASE/$DOMAIN/$NAME
 
 
 EOF
@@ -23,7 +23,7 @@ EOF
 }
 
 # For testdata:
-# export BASE=`pwd`/sshd/testdata
+# export BASE=`pwd`/testdata
 # export DOMAIN=test.mesh.internal
 
 # Domain of the CA host - may have istio-system namespace
@@ -74,14 +74,23 @@ function ca() {
     echo -e "\n@cert-authority * ${CA}\n" >> ${CA_DIR}/known_hosts
   fi
 
+  ssh2tlsCA $d
+  _conf ca $d $CA
+
+}
+
+# Convert a ssh key generated with `ssh-keygen -q -t ecdsa -m PKCS8` to a self-signed CA cert.
+function ssh2tlsCA() {
+  local d=${1:-CA_DIR}
+
   # tls.key, tls.crt, ca.crt are used by CertManager, K8S and Istio
   # BEGIN EC PRIVATE KEY block
   cp $d/id_ecdsa $d/tls.key
   #openssl ecparam -name prime256v1 -genkey -noout -out ${CA_DIR}/tls.key
   # BEGIN PUBLIC KEY block
-  openssl ec -in ${CA_DIR}/tls.key -pubout -out ${CA_DIR}/tls.pub
+  openssl ec -in ${d}/tls.key -pubout -out ${Cd}/tls.pub
 
-  cat << EOF > ${CA_DIR}/csr.conf
+  cat << EOF > ${d}/csr.conf
 [ req ]
 encrypt_key = no
 prompt = no
@@ -102,24 +111,23 @@ O = ${DOMAIN}
 CN = ${DOMAIN}
 EOF
 
-  openssl req -new -sha256 -key ${CA_DIR}/tls.key -config ${CA_DIR}/csr.conf -out ${CA_DIR}/tls.csr
+  openssl req -new -sha256 -key ${d}/tls.key -config ${d}/csr.conf -out ${d}/tls.csr
   openssl x509 -req -sha256 -days 365 \
-     -signkey ${CA_DIR}/tls.key \
+     -signkey ${d}/tls.key \
      -extensions req_ext -extfile ${d}/csr.conf \
      -in ${d}/tls.csr \
      -out ${d}/tls.crt
 
   cp $d/id_ecdsa.pub $d/ssh_host_ecdsa_key.pub
-  ssh-keygen -s ${CA_DIR}/id_ecdsa -m PEM -h -I ${h} -n ${h} ${d}/ssh_host_ecdsa_key.pub
+  ssh-keygen -s ${d}/id_ecdsa -m PEM -h -I ${h} -n ${h} ${d}/ssh_host_ecdsa_key.pub
   cp $d/id_ecdsa.pub $d/host.pub
-  ssh-keygen -s ${CA_DIR}/id_ecdsa -m PEM -h -I ${h} -n ${h} ${d}/host.pub
+  ssh-keygen -s ${d}/id_ecdsa -m PEM -h -I ${h} -n ${h} ${d}/host.pub
 
-  ssh-keygen -s ${CA_DIR}/id_ecdsa -m PEM  -I ${h} -n ${u} ${d}/id_ecdsa.pub
+  ssh-keygen -s ${d}/id_ecdsa -m PEM  -I ${h} -n ${u} ${d}/id_ecdsa.pub
 
-#  openssl pkcs12 -export -inkey ${CA_DIR}/tls.key -in ${CA_DIR}/tls.crt \
-#    -out ${CA_DIR}/tls.pfx
+#  openssl pkcs12 -export -inkey ${d}/tls.key -in ${d}/tls.crt \
+#    -out ${d}/tls.pfx
 
-  _conf ca $d $CA
 }
 
 

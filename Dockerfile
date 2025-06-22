@@ -18,5 +18,5 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o sshm ./cmd/sshm
 FROM nicolaka/netshoot
 
 # ~400k - compared to 4.3M (2.9 stripped)
-COPY --from=build /src/sshm /bin/sshm
-ENTRYPOINT ["/bin/sshm"]
+COPY --from=build /src/sshm /ko-app/sshm
+ENTRYPOINT ["/ko-app/sshm"]

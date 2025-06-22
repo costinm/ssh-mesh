@@ -1,4 +1,5 @@
 defaultBaseImage:  nicolaka/netshoot
+# /ko-app/sshm
 #defaultBaseImage: gcr.io/distroless/static-debian11:latest
 builds:
   - env:

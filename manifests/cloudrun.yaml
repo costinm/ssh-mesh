@@ -1,9 +1,8 @@
-# Example of a standalone cloudrun app ( istio echo ) with an added sshm process.
-# In this example the ssh process is not exposed over H2 tunnel - but uses a jump host.
+# Standalone ssh mesh jumphost - will just forward SSH requests.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: echo-jumphost
+  name: sshm
   labels:
     cloud.googleapis.com/location: us-central1
   annotations:
@@ -22,18 +21,30 @@ spec:
         autoscaling.knative.dev/minScale: '0'
         autoscaling.knative.dev/maxScale: '1'
         run.googleapis.com/cpu-throttling: 'false'
+        # If adding more images/containers
+        #run.googleapis.com/container-dependencies: '{"app":["sshm"]}'
+
     spec:
       containerConcurrency: 1000
       timeoutSeconds: 900
+      #serviceAccountName: k8s-sshc
       containers:
         - name: app
-          image: ${IMG}
+          image: costinm/sshm:latest # ${IMG}
           # The start command is modified to start sshd first - which in turn starts the server.
-          command: [ "/usr/local/bin/sshd", "/usr/local/bin/server" ]
+          #command: [ "/usr/local/bin/sshd", "/usr/local/bin/server" ]
+          ports:
+            - name: h2c
+              containerPort: 15028
           env:
             # Maintain a connection to this server.
-            - name: SSHD
-              value: costin15.webinf.duckdns.org:15022
+            #- name: SSH_UPSTREAM
+            #  value: costin15.webinf.duckdns.org:15022
+            - name: SSH_DEFAULT_H2
+              value: https://httpbin.org
+
+            - name: SSH_DEFAULT_HTTP
+              value: https://httpbin.org
 
             # Allow shell access for the users authenticated with the key.
             # Allow forwarding for users with keys signed by the CA or using JWTs
@@ -44,8 +55,31 @@ spec:
 
             - name: DEPLOY
               value: "${DEPLOY}"
+#            - name: SSHD
+#              valueFrom:
+#                  secretKeyRef:
+#                    key: "1"
+#                    name: mesh
+#          volumeMounts:
+#            # /var/run/secrets fails with /var/run already exists
+#            - mountPath: /mesh
+#              name: mesh
+#          resources:
+#            limits:
+#              cpu: '1'
+#              memory: 1G
+#      volumes:
+#        - name: mesh
+#          secret:
+#            #            items:
+#            #              - key: "1"
+#            #                path: mesh
+#            secretName: mesh
 
           resources:
             limits:
               cpu: '1'
               memory: 1G
+  traffic:
+    - percent: 100
+      latestRevision: true

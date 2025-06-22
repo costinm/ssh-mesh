@@ -16,24 +16,31 @@ import (
 
 var (
 	token = flag.String("token", "", "token to use")
-
 )
 
-// h2t is a minimal TCP tunnel over h2 (like Istio Ambient),
-// forwarding stdin/stdout
+/*
+TODO:
+- pass the socket
+- verify it works with MCP
+- implement equivalent of control socket
+*/
+
+// h2t is a minimal TCP tunnel over h2 (like Istio Ambient), forwarding stdin/stdout or creating a local listener
+// and forwarding all requests.
 //
-// Expects proper certificates ( TODO: document how to add a custom
+// On the server side, any URL can be used with H2 (H2C in case of CloudRun).
+//
+// Expects proper certificates on the server ( TODO: document how to add a custom
 // CA to the VM roots or use option to specify )
 //
 // Unfortunately curl doesn't support streaming - if it did, this could
 // be done with a curl command.
 //
-// Mainly intended for SSH and debugging ambient-like tunnels.
+// Mainly intended as SSH ProxyCommand and debugging ambient-like tunnels.
 //
 // The host certificate validation is handled by h2t - so no need to save
 // or check host cert at SSH level (unless you don't trust the http gateway).
-// This is convenient for serverless or K8S Pods - no need for
-// additional secret storage.
+// This is convenient for serverless or K8S Pods - no need for additional secret storage.
 //
 // Example:
 //
@@ -53,8 +60,7 @@ func main() {
 	url := flag.Args()[0]
 
 	// TokenSource
-	// Will use MDS, k8s, cloud or other sources to get
-	// JWTs.
+	// May use MDS, k8s, cloud or other sources to get JWTs.
 	ma := &tokens.TokenExec{}
 
 	// This works great for https. No support for plain h2 - but h2 would be
@@ -73,27 +79,28 @@ func main() {
 		l, err := net.Listen("tcp", port)
 		if err != nil {
 			panic(err)
-			for {
-				conn, err := l.Accept()
+		}
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				panic(err)
+			}
+			go func() {
+				sc, err := h2.NewStreamH2(ctx, client.Transport, url, "localhost:15022", ma)
 				if err != nil {
-					panic(err)
+					log.Fatal(err)
 				}
 				go func() {
-					sc, err := h2.NewStreamH2(ctx, client, url, "localhost:15022", ma)
-					if err != nil {
-						log.Fatal(err)
-					}
-					go func() {
-						io.Copy(sc, conn)
-					}()
-
-					io.Copy(conn, sc)
+					io.Copy(sc, conn)
 				}()
-			}
+
+				io.Copy(conn, sc)
+			}()
 		}
+		return
 	}
 
-	sc, err := h2.NewStreamH2(ctx, client, url, "localhost:15022", ma)
+	sc, err := h2.NewStreamH2(ctx, client.Transport, url, "localhost:15022", ma)
 	if err != nil {
 		log.Fatal(err)
 	}

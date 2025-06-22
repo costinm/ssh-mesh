@@ -9,22 +9,10 @@ import (
 	"time"
 )
 
-// TokenSource is a common interface for anything returning Bearer or other kind of tokens.
-type TokenSource interface {
-	// GetToken for a given audience.
-	GetToken(context.Context, string) (string, error)
-}
-
-const ConnectOverrideHeader = "x-host"
-
-func (st *H2) DialContext(ctx context.Context, net, addr string) (net.Conn, error) {
-	return NewStreamH2(ctx, http.DefaultClient, addr, "", st.TokenSource)
-}
-
 // NewStreamH2 creates a H2 stream using POST.
 //
 // Will use the token provider if not nil.
-func NewStreamH2(ctx context.Context, hc *http.Client, addr string, tcpaddr string, mds TokenSource) (*StreamHttpClient, error) {
+func NewStreamH2(ctx context.Context, hc http.RoundTripper, addr string, tcpaddr string, mds TokenSource) (*StreamHttpClient, error) {
 
 	r, w := io.Pipe()
 
@@ -43,11 +31,8 @@ func NewStreamH2(ctx context.Context, hc *http.Client, addr string, tcpaddr stri
 	req.Header[ConnectOverrideHeader] = []string{addr}
 
 	// HBone uses CONNECT IP:port - we need to use POST and can't use the header. For now use x-host
-	if hc == nil {
-		hc = http.DefaultClient
-	}
 
-	res, err := hc.Do(req)
+	res, err := hc.RoundTrip(req)
 	if err != nil {
 		if res == nil {
 			log.Println("H2T error", err)
@@ -57,12 +42,11 @@ func NewStreamH2(ctx context.Context, hc *http.Client, addr string, tcpaddr stri
 		return nil, err
 	}
 
-	log.Println("H2T", res.StatusCode, res.Header)
-
+	// log.Println("H2T", res.StatusCode, res.Header)
 
 	return &StreamHttpClient{
-		Request: req,
-		Response: res,
+		Request:       req,
+		Response:      res,
 		RequestInPipe: w,
 	}, err
 }
@@ -70,12 +54,11 @@ func NewStreamH2(ctx context.Context, hc *http.Client, addr string, tcpaddr stri
 type StreamHttpClient struct {
 	StreamState
 
-	Request        *http.Request
-	Response   *http.Response
+	Request  *http.Request
+	Response *http.Response
 
 	RequestInPipe io.WriteCloser
 }
-
 
 func (s *StreamHttpClient) Read(b []byte) (n int, err error) {
 	// TODO: update stats
@@ -157,4 +140,3 @@ func (s *StreamHttpClient) Header() http.Header {
 func (s *StreamHttpClient) RequestHeader() http.Header {
 	return s.Request.Header
 }
-

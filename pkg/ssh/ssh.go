@@ -28,8 +28,6 @@ import (
 // verify the key by fetching it from github.com/keys/USER.key
 // Further with SSH we can treat the key as a signer for derived keys (CA).
 
-
-
 type Command struct {
 	Run func(env map[string]string, args []string, in io.Reader, out io.WriteCloser, err io.WriteCloser)
 }
@@ -39,12 +37,12 @@ type Command struct {
 type SSHMesh struct {
 	// Address to listen on as SSH. Will default to 14022 for regular nodes and
 	// 15022 for gateways.
-	Address string `json:"address,omitempty"`
+	Address string `json:"addr,omitempty"`
 
 	KeepAlive map[string]*SSHCMux `json:"connect,omitempty"`
 
 	CertClient string `json:"id_ecdsa_cert.pub,omitempty"`
-	CertHost string `json:"cert_host.pub,omitempty"`
+	CertHost   string `json:"cert_host.pub,omitempty"`
 
 	// Primary key - in PEM format (also used for mTLS)
 	Key string `json:"tls.key,omitempty"`
@@ -58,15 +56,14 @@ type SSHMesh struct {
 
 	// User is in email format, as expected by the SSH client certificates.
 	//
-	User       string `json:"id,omitempty"`
-	Domain       string `json:"namespace,omitempty"`
+	User   string `json:"id,omitempty"`
+	Domain string `json:"namespace,omitempty"`
 
 	// Can be set to a custom dialer, for example for mesh protocol tunneling.
 	Dialer ContextDialer `json:"-"`
 
 	// Can be set to a custom dialer, for example for mesh protocol tunneling.
 	H2Dialer ContextDialer `json:"-"`
-
 
 	Listener net.Listener `json:"-"`
 
@@ -100,7 +97,7 @@ type SSHMesh struct {
 	// SignerClient is a client workload identity - using the SA cert when
 	// a CA is used. Otherwise, same as Signer.
 	SignerClient ssh.Signer `json:"-"`
-	SignerHost ssh.Signer `json:"-"`
+	SignerHost   ssh.Signer `json:"-"`
 
 	// Forward is a function that will proxy a stream to a destination.
 	// If missing, it will be dialed.
@@ -124,6 +121,8 @@ type SSHMesh struct {
 
 	sync.Mutex `json:"-"`
 	private    *ecdsa.PrivateKey
+
+	Logger *slog.Logger
 }
 
 type ContextDialer interface {
@@ -137,12 +136,12 @@ type TokenChecker interface {
 	Check(token string) (claims map[string]string, e error)
 }
 
-
 // TokenSource is a common interface for anything returning Bearer or other kind of tokens.
 type TokenSource interface {
 	// GetToken for a given audience.
 	GetToken(context.Context, string) (string, error)
 }
+
 // StayConnected will keep the SSH node connected with any 'ssh-upstream'
 // destination in the config.
 // Does not support reloading yet.
@@ -164,30 +163,29 @@ type TokenSource interface {
 //	}
 //}
 
-
-func (s *SSHMesh) SetKeySSH(sshk string) error {
+func (sshMesh *SSHMesh) SetKeySSH(sshk string) error {
 	k, err := ssh.ParseRawPrivateKey([]byte(sshk))
 	if err != nil {
 		return err
 	}
 	// Currently only ecdsa keys are used
-	s.private = k.(*ecdsa.PrivateKey)
+	sshMesh.private = k.(*ecdsa.PrivateKey)
 
-	s.Signer, _ = ssh.NewSignerFromKey(k)
-	s.SignerClient = s.Signer
+	sshMesh.Signer, _ = ssh.NewSignerFromKey(k)
+	sshMesh.SignerClient = sshMesh.Signer
 	return nil
 }
 
 // Cert.PrivateKey can be used as a source, if one is loaded.
-func (s *SSHMesh) SetKeyCrypto(cpk crypto.PrivateKey) {
+func (sshMesh *SSHMesh) SetKeyCrypto(cpk crypto.PrivateKey) {
 	// Currently only using ECDSA keys
-	s.private = cpk.(*ecdsa.PrivateKey)
-	s.Signer, _ = ssh.NewSignerFromSigner(s.private)
-	s.SignerClient = s.Signer
+	sshMesh.private = cpk.(*ecdsa.PrivateKey)
+	sshMesh.Signer, _ = ssh.NewSignerFromSigner(sshMesh.private)
+	sshMesh.SignerClient = sshMesh.Signer
 }
 
 func New() *SSHMesh {
-	s := &SSHMesh {
+	s := &SSHMesh{
 		Address: ":15022",
 
 		serverConfig:     &ssh.ServerConfig{},
@@ -195,32 +193,33 @@ func New() *SSHMesh {
 		InternalCommands: map[string]*Command{},
 		UsersKeys:        map[string]string{},
 		ChannelHandlers:  map[string]func(ctx context.Context, ssht *SSHSMux, newChannel ssh.NewChannel){},
+		Logger:           slog.Default(),
 	}
 
 	return s
 }
 
-func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
-	if ssht.AuthorizedKeys != "" {
-		ssht.AddAuthorizedFile([]byte(ssht.AuthorizedKeys))
+func (sshMesh *SSHMesh) Provision(ctx context.Context) error {
+	if sshMesh.AuthorizedKeys != "" {
+		sshMesh.AddAuthorizedFile([]byte(sshMesh.AuthorizedKeys))
 	}
-	s := ssht
-	if ssht.Dialer == nil {
-		ssht.Dialer = &net.Dialer{}
+	s := sshMesh
+	if sshMesh.Dialer == nil {
+		sshMesh.Dialer = &net.Dialer{}
 	}
 
 	var err error
 
-	if ssht.Key != "" {
+	if sshMesh.Key != "" {
 		//encodedKey, _ := x509.MarshalECPrivateKey(nodePrivate)
 		//privatePEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: encodedKey})
-		err = ssht.SetKeySSH(ssht.Key)
+		err = sshMesh.SetKeySSH(sshMesh.Key)
 		if err != nil {
 			return err
 		}
 	}
 
-	if ssht.private == nil {
+	if sshMesh.private == nil {
 		privk1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		s.private = privk1
 		s.Signer, _ = ssh.NewSignerFromKey(privk1)
@@ -230,24 +229,24 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 		s.SetCertClient(s.CertClient)
 	}
 	if s.CertHost != "" {
-		ssht.SetCertHost(s.CertHost)
+		sshMesh.SetCertHost(s.CertHost)
 	}
 
-	if ssht.Listener == nil {
-		ssht.Listener, err = net.Listen("tcp", ssht.Address)
+	if sshMesh.Listener == nil {
+		sshMesh.Listener, err = net.Listen("tcp", sshMesh.Address)
 		if err != nil {
 			return err
 		}
 	}
 
-	ssht.Forward = func(ctx context.Context, host string, closer io.ReadWriteCloser) {
+	sshMesh.Forward = func(ctx context.Context, host string, closer io.ReadWriteCloser) {
 		//str := nio.GetStream(closer, closer)
 		//defer ug.OnStreamDone(str)
 		//ug.OnStream(str)
 
 		//str.Dest = host
 
-		nc, err := ssht.Dialer.DialContext(ctx, "tcp", host)
+		nc, err := sshMesh.Dialer.DialContext(ctx, "tcp", host)
 		if err != nil {
 			return
 		}
@@ -290,7 +289,7 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 		},
 
 		// Used by clients authenticating the host.
-		IsHostAuthority: ssht.isHostAuthority,
+		IsHostAuthority: sshMesh.isHostAuthority,
 
 		// Host verification by client
 		HostKeyFallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
@@ -305,7 +304,6 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 				string(ssh.MarshalAuthorizedKey(key)), "host", hostname, "remote", remote)
 			return nil
 		},
-
 	}
 	if s.SignerHost != nil {
 		s.serverConfig.AddHostKey(s.SignerHost)
@@ -317,9 +315,9 @@ func (ssht *SSHMesh) Provision(ctx context.Context) ( error) {
 	return nil
 }
 
-func (ssht*SSHMesh) Start(ctx context.Context) ( error) {
-	if ssht.Listener == nil {
-		err := ssht.Provision(ctx)
+func (sshMesh *SSHMesh) Start(ctx context.Context) error {
+	if sshMesh.Listener == nil {
+		err := sshMesh.Provision(ctx)
 		if err != nil {
 			return err
 		}
@@ -327,19 +325,21 @@ func (ssht*SSHMesh) Start(ctx context.Context) ( error) {
 
 	go func() {
 		for {
-			nConn, err := ssht.Listener.Accept()
+			nConn, err := sshMesh.Listener.Accept()
 			if err != nil {
 				log.Println("failed to accept incoming connection ", err)
 				time.Sleep(10 * time.Second)
 				continue
 			}
-			go ssht.HandleServerConn(&SSHSMux{NetConn: nConn})
+			go sshMesh.HandleServerConn(&SSHSMux{NetConn: nConn})
 		}
 	}()
+	sshMesh.Logger.Info("start_ssh", "addr", sshMesh.Listener.Addr().String())
 
-	for k, sshc := range ssht.KeepAlive {
-		sshc.SSHMesh = ssht
+	for k, sshc := range sshMesh.KeepAlive {
+		sshc.SSHMesh = sshMesh
 		sshc.Address = k
+		sshMesh.Logger.Info("start_ssh", "addr", sshMesh.Listener.Addr().String())
 
 		go sshc.StayConnected()
 	}
@@ -347,20 +347,18 @@ func (ssht*SSHMesh) Start(ctx context.Context) ( error) {
 	return nil
 }
 
-
 // Client returns a SSH client for a destination.
 // It may be disconnected - first call is always disconnected.
-func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
+func (sshMesh *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
 
 	c := &SSHCMux{
-		SSHMesh: ss,
+		SSHMesh: sshMesh,
 		Address: dst,
-		User: ss.User,
+		User:    sshMesh.User,
 	}
 
 	return c, nil
 }
-
 
 // NewSSHMesh creates the SSHMesh object.
 // Must call SetKeys() or FromEnv() before using it.
@@ -374,8 +372,8 @@ func (ss *SSHMesh) Client(ctx context.Context, dst string) (*SSHCMux, error) {
 //
 // TODO: As a server, it can also prove its workload ID with a JWT and jumpstart known_hosts !
 
-func (ssht *SSHMesh) PubString() {
-	casigner1 := ssht.Signer
+func (sshMesh *SSHMesh) PubString() {
+	casigner1 := sshMesh.Signer
 	pubString := string(ssh.MarshalAuthorizedKey(casigner1.PublicKey()))
 
 	fmt.Println(pubString)
@@ -385,7 +383,7 @@ func (ssht *SSHMesh) PubString() {
 //
 // All CAs are added separately, and will also be used for host authorization.
 // The 'comment' field is saved - and will be used as 'user' when public key auth is using that key.
-func (ssht *SSHMesh) AddAuthorizedFile(auth []byte) {
+func (sshMesh *SSHMesh) AddAuthorizedFile(auth []byte) {
 	for len(auth) > 0 {
 		pubKey, comm, options, rest, err := ssh.ParseAuthorizedKey(auth)
 		if err != nil {
@@ -393,9 +391,9 @@ func (ssht *SSHMesh) AddAuthorizedFile(auth []byte) {
 		}
 		//if strings.Contains(pubk1.Type(), "cert") {
 		if slices.Contains(options, "cert-authority") {
-			ssht.AuthorizedCA = append(ssht.AuthorizedCA, pubKey)
+			sshMesh.AuthorizedCA = append(sshMesh.AuthorizedCA, pubKey)
 		} else {
-			ssht.UsersKeys[string(pubKey.Marshal())] = comm
+			sshMesh.UsersKeys[string(pubKey.Marshal())] = comm
 		}
 		auth = rest
 	}
@@ -413,26 +411,25 @@ func KeysEqual(ak, bk ssh.PublicKey) bool {
 	return (len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1)
 }
 
-func (ssht *SSHMesh) ListenAndStart() (net.Listener, error) {
+func (sshMesh *SSHMesh) ListenAndStart() (net.Listener, error) {
 
 	var err error
 	// Once a ServerConfig has been configured, connections can be
 	// accepted.
-	if ssht.Listener == nil {
-		ssht.Listener, err = net.Listen("tcp", ssht.Address)
+	if sshMesh.Listener == nil {
+		sshMesh.Listener, err = net.Listen("tcp", sshMesh.Address)
 		if err != nil {
-			log.Println("Failed to listend on ", ssht.Address, err)
+			log.Println("Failed to listend on ", sshMesh.Address, err)
 			return nil, err
 		}
-		if strings.HasSuffix(ssht.Address, ":0") {
-			ssht.Address = ssht.Listener.Addr().String()
+		if strings.HasSuffix(sshMesh.Address, ":0") {
+			sshMesh.Address = sshMesh.Listener.Addr().String()
 		}
 	}
 
-	err  = ssht.Start(context.Background())
-	return ssht.Listener, err
+	err = sshMesh.Start(context.Background())
+	return sshMesh.Listener, err
 }
-
 
 // Stream is a client or server stream - 'Channel' in SSH terms.
 //
@@ -444,7 +441,6 @@ type Stream struct {
 	serverMux *SSHSMux
 	clientMux *SSHCMux
 }
-
 
 // OpenStream creates a new stream.
 // This uses the same channel in both directions.
@@ -471,42 +467,36 @@ type SSHSMux struct {
 	NetConn net.Conn `json:"-"`
 
 	// ServerConn - also has Permission
-	ServerConn *ssh.ServerConn  `json:"-"`
+	ServerConn *ssh.ServerConn `json:"-"`
 
 	RemoteKey ssh.PublicKey `json:"-"`
 	//RemoteHostname string
 	//RemoteAddr     net.Addr
-
-	// For server-side sessions, this is the last active session.
-	// With multiplexing, multiple sessions may be in effect.
-	SessionStream map[uint32]*Exec `json:"-"`
-  m sync.RWMutex
-	FQDN          string
+	FQDN string
 }
 
-func (ssht *SSHMesh) HandleAccepted(nc net.Conn) error {
+func (sshMesh *SSHMesh) HandleAccepted(nc net.Conn) error {
 
-	ssht.HandleServerConn(&SSHSMux{NetConn: nc})
+	sshMesh.HandleServerConn(&SSHSMux{NetConn: nc})
 	return nil
 }
 
-
 // Handles a connection as SSH server, using a net.Conn - which might be tunneled over other transports.
 // SSH handles multiplexing and packets.
-func (ssht *SSHMesh) HandleServerConn(acceptedSSHMux *SSHSMux) {
+func (sshMesh *SSHMesh) HandleServerConn(acceptedSSHMux *SSHSMux) {
 	acceptedSSHMux.ConnectTime = time.Now()
-	acceptedSSHMux.SSHServer =  ssht
+	acceptedSSHMux.SSHServer = sshMesh
 
 	nConn := acceptedSSHMux.NetConn
 
 	// Before use, a handshake must be performed on the incoming
 	// net.Stream. Handshake results in conn.Permissions.
-	conn, chans, globalSrvReqs, err := ssh.NewServerConn(nConn, ssht.serverConfig)
+	conn, chans, globalSrvReqs, err := ssh.NewServerConn(nConn, sshMesh.serverConfig)
 	if err != nil {
 		nConn.Close()
 		//log.Println("SSHD: handshake error ", err, nConn.RemoteAddr(),
 		//	nConn.LocalAddr())
-		ssht.ConnectErrors.Add(1)
+		sshMesh.ConnectErrors.Add(1)
 		return
 	}
 
@@ -532,14 +522,13 @@ func (ssht *SSHMesh) HandleServerConn(acceptedSSHMux *SSHSMux) {
 
 	acceptedSSHMux.FQDN = conn.User() + "." + sub
 
-	ssht.connectedClientNodes.Store(acceptedSSHMux.FQDN, acceptedSSHMux)
-
+	sshMesh.connectedClientNodes.Store(acceptedSSHMux.FQDN, acceptedSSHMux)
 
 	defer func() {
 		// remote addr is from nConn
 		// User is the authenticated user - from the client cert.
 		//
-		ssht.connectedClientNodes.Delete(acceptedSSHMux.FQDN)
+		sshMesh.connectedClientNodes.Delete(acceptedSSHMux.FQDN)
 		slog.Info("SSHD_CONN",
 			"remote", nConn.RemoteAddr(),
 			"user", conn.User(),
@@ -548,7 +537,7 @@ func (ssht *SSHMesh) HandleServerConn(acceptedSSHMux *SSHSMux) {
 		cancel()
 	}()
 
-	go ssht.handleServerConnRequests(ctx, globalSrvReqs, nConn, acceptedSSHMux)
+	go sshMesh.handleServerConnRequests(ctx, globalSrvReqs, nConn, acceptedSSHMux)
 
 	slog.Info("SSHD_CONN_START",
 		"remote", nConn.RemoteAddr(),
@@ -561,15 +550,15 @@ func (ssht *SSHMesh) HandleServerConn(acceptedSSHMux *SSHSMux) {
 	for newChannel := range chans {
 		switch newChannel.ChannelType() {
 		case "direct-tcpip":
-			go DirectTCPIPHandler(ctx, acceptedSSHMux, ssht, newChannel)
+			go DirectTCPIPHandler(ctx, acceptedSSHMux, sshMesh, newChannel)
 		case "session":
 			s := &SSHSession{
-			ssht: ssht,
-			sshMux: acceptedSSHMux,
+				ssht:   sshMesh,
+				sshMux: acceptedSSHMux,
 			}
 			s.Handle(ctx, newChannel)
 		default:
-			chandler := ssht.ChannelHandlers[newChannel.ChannelType()]
+			chandler := sshMesh.ChannelHandlers[newChannel.ChannelType()]
 			if chandler != nil {
 				go chandler(ctx, acceptedSSHMux, newChannel)
 			} else {
@@ -583,7 +572,7 @@ func (ssht *SSHMesh) HandleServerConn(acceptedSSHMux *SSHSMux) {
 }
 
 // Handle global requests on a server connection.
-func (ssht *SSHMesh) handleServerConnRequests(ctx context.Context, reqs <-chan *ssh.Request, nConn net.Conn, conn *SSHSMux) {
+func (sshMesh *SSHMesh) handleServerConnRequests(ctx context.Context, reqs <-chan *ssh.Request, nConn net.Conn, conn *SSHSMux) {
 	for r := range reqs {
 		// Global types.
 		switch r.Type {
@@ -591,11 +580,11 @@ func (ssht *SSHMesh) handleServerConnRequests(ctx context.Context, reqs <-chan *
 		// SSHClientConn clients will only accept back connections with this particular host:port, and srcIP:srcPort.
 		// Other reverse accept ports can be opened as well.
 		case "tcpip-forward":
-			ok, pl := tcpipForwardHandler(ctx, ssht, conn, r)
+			ok, pl := tcpipForwardHandler(ctx, sshMesh, conn, r)
 			r.Reply(ok, pl)
 			continue
 		case "cancel-tcpip-forward":
-			ok, pl := cancelTcpipForwardHandler(ctx, ssht, conn, r)
+			ok, pl := cancelTcpipForwardHandler(ctx, sshMesh, conn, r)
 			r.Reply(ok, pl)
 			continue
 		case "keepalive@openssh.com":
@@ -613,9 +602,11 @@ func (ssht *SSHMesh) handleServerConnRequests(ctx context.Context, reqs <-chan *
 	}
 }
 
-func (st *SSHMesh) DialMeta(ctx context.Context, host string, orig string) (io.ReadWriteCloser, error) {
+// DialHTTP will forward an HTTP connection to a client that opened a -R connection.
+// The host must match the 'canonical' hostname of the client.
+func (sshMesh *SSHMesh) DialHTTP(ctx context.Context, host string, orig string) (io.ReadWriteCloser, error) {
 
-	cc, _ := st.connectedClientNodes.Load(host)
+	cc, _ := sshMesh.connectedClientNodes.Load(host)
 
 	if cc != nil {
 		payload := ssh.Marshal(&remoteForwardChannelData{

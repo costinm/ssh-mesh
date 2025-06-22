@@ -1,12 +1,13 @@
 # Using native ssh for mesh
 
-SSH has been used for secure communication for a very long time, including 
-tunnels and remote file access.
+SSH has been used for secure communication for a very long time, including tunnels and remote file access. OpenSSH and Dropbear are
+good enough for small servers - including OpenWRT routers or small 
+containers using SSH mainly for control and management.
 
 ## File access
 
-- create users like 'restic'
-- create a dir, owned by root - /z/backup
+- create user - $USER
+- create a dir, owned by root - $FILE_ROOT
 - create the home dir - owned by user, with authorized keys
 
 
@@ -14,8 +15,8 @@ tunnels and remote file access.
 UsePAM no
 
 
-Match User restic
-  ChrootDirectory /z/backup
+Match User $USER
+  ChrootDirectory $FILE_ROOT
   ForceCommand internal-sftp
   AllowTcpForwarding no
   X11Forwarding no
@@ -25,8 +26,3 @@ Match User restic
   
   
 ```
-
-# SFTP
-
-Using the new go os.Root doesn't seem to work - it requires the paths to 
-be relative.

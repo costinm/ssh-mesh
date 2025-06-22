@@ -1,5 +1,27 @@
 # Other implementations and docs
 
+- https://openwrt.org/docs/guide-user/services/ssh/sshtunnel - OpenWRT client side, with dropbear or openssh.
+- https://github.com/yurt-page/awesome-tunneling#ssh-services - linked from there.
+- https://github.com/fasmide/remotemoe  - has free server too
+- 
+- https://ssh-j.com/ - dropbear based, jump host only (.ru domain, on tor too), ssh only.
+  `ssh any-username@ssh-j.com -N -R laptop-behind-nat:22:localhost:22` - recommends sish
+
+- sish is hosted (free/paid $2/mo, with storge) - interesting extra services:
+  - pipes - pubsub over ssh: `ssh HOST pub topic`, `ssho HOST sub topic`
+    - "-b=false" - pub doesn't block waiting for a sub
+    - "sub -k" - keep sub alive even if pub exists (default: notified the pub is out)
+    - "pipe" command - just a 2way pipe between 2 clients
+    - web interface as well, websocket too  
+  - pastebin - stored files, just "echo foo" | ssh pipes...
+- srv.us 
+  - accepts github/gitlabs identities (authorized keys -> user name) 
+  - either github or sha(pubkey) based FQDNS
+  - single host
+  - certbot for DNS certs (cloudflare)
+  - super simple file: https://github.com/pcarrier/srv.us/blob/main/backend/main.go
+
+
 - https://github.com/Netflix/bless - python, AWS lambda
   - KMS used for the root CA, `ssh-keygen -t rsa -b 4096 -m PEM -f bless-ca- -C "SSH CA Key"`
   - JSON input ('bastion_user', 'bastion_user_ip' 'remote_usernames', 'bastion_ips', 

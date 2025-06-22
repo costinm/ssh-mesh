@@ -3,55 +3,67 @@ package ssh
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"os"
 	"os/exec"
-	"sync"
-	"sync/atomic"
+	"strings"
+	"syscall"
+	"time"
 
+	"github.com/kr/pty"
 	"golang.org/x/crypto/ssh"
 )
 
+// SSHSession is a net connection (H2 stream equivalent), but with
+// extra packets for executing commands including SFTP and an extra
+// stderr stream.
+//
+// This is closer to a WebSocket in binary mode: packets, can multiplex
+// sub-channels and commands - flow control is like H2, both on stream and
+// mux.
+//
+// The actual execution is in the exec.go -
+type SSHSession struct {
+	ssht *SSHMesh
 
+	// This is the parent multiplexed connection.
+	sshMux *SSHSMux
 
+	Channel ssh.Channel
 
-// Represents a user properties. User name will be in the ssh login, basic auth,sub of JWT tokens, cert.
-// Can also be loaded on demand from storage.
-type User struct {
+	// Window keeps getting update during execution.
+	PTY *Pty
 
+	tty *os.File
+
+	Env []*KV
+
+	Cmd *exec.Cmd
 }
-
-var id uint32
-
 
 // Based on okteto code: https://raw.githubusercontent.com/okteto/remote/main/pkg/ssh/ssh.go
 // Removed deps on logger, integrated with ugate.
-
 // Handles PTY/noPTY shell sessions and sftp.
 
 // gliderlabs: current version doesn't work with certs. config() method requires a PublicKeyHandler, which
 // doesn't have a reference to the conn ( because gliderlabs decided to invent it's 'better' interface ).
 // In general the interface and abstractions are too complex and not needed.
 
-// SSHSession is a multiplexed connection, like TCP forwarding, but with extra packets for executing commands.
-//
-type SSHSession struct {
-	ssht   *SSHMesh
-	sshMux *SSHSMux
-
-	Channel ssh.Channel
-
-	sigCh chan<- string
-
-	sync.RWMutex
-
-	sigBuf  []string
-	breakCh chan<- bool
-
-	PTY *Pty
-	tty *os.File
+var signals = map[ssh.Signal]int{
+	ssh.SIGABRT: 6,
+	ssh.SIGALRM: 14,
+	ssh.SIGFPE:  8,
+	ssh.SIGHUP:  1,
+	ssh.SIGILL:  4,
+	ssh.SIGINT:  2,
+	ssh.SIGKILL: 9,
+	ssh.SIGPIPE: 13,
+	ssh.SIGQUIT: 3,
+	ssh.SIGSEGV: 11,
+	ssh.SIGTERM: 15,
 }
 
 func (sess *SSHSession) Close() error {
@@ -68,28 +80,22 @@ func (sess *SSHSession) Close() error {
 //
 // Inside a session - ~. close, ~B break, ~C CLI, ~# connections, ~? help
 func (sess *SSHSession) Handle(ctx context.Context, newChannel ssh.NewChannel) {
-	sconn := sess.sshMux
+	ch, reqs, err := newChannel.Accept()
+	if err != nil {
+		slog.Warn("SSHErrorAccept", "err", err)
+		return
+	}
+	sess.Channel = ch
 
-	conn := sconn.ServerConn
-	isOwner := conn.Permissions.Extensions["role"] == "admin"
-
-	ch, reqs, _ := newChannel.Accept()
-  sess.Channel = ch
-
-	env := []*KV{}
-
-	ssht := sconn.SSHServer
-
-
+	// Typical order:
+	// - env, [ pty-req, window-change]
+	// - shell/exec
+	// - signal, break
 	for req := range reqs {
 		// "shell", "exec", "env", "subsystem"
 		// For pty: signal, break, pty-req, window-change
-		//slog.Info("ssh-session", "type", req.Type)
-
 		switch req.Type {
 		case "shell", "exec":
-			// This is normally the last command in a channel.
-			// Env and pty are called first.
 			// Depending on user and settings, only specific commands are allowed.
 			// For shell - a generic event stream will be used for untrusted users (default)
 			//
@@ -99,29 +105,15 @@ func (sess *SSHSession) Handle(ctx context.Context, newChannel ssh.NewChannel) {
 			var payload = struct{ Value string }{}
 			ssh.Unmarshal(req.Payload, &payload)
 			req.Reply(true, nil)
-			if isOwner {
-				go execHandler(ch, ssht, conn, sess, env, payload.Value)
-			} else {
-				sid := atomic.AddUint32(&id, 1)
-				e := &Exec{In: ch, Out: ch, id: sid,
-					sconn: sconn,
-					kv: env,
-					cmd: payload.Value,
-				}
-				sconn.m.Lock()
-				sconn.SessionStream[sid] = e
-				sconn.m.Unlock()
-
-				go e.execHandlerInternal(ch, env, payload.Value)
-			}
+			go sess.execHandler(ch, payload.Value)
 
 		case "subsystem":
 			var payload = struct{ Value string }{}
 			ssh.Unmarshal(req.Payload, &payload)
-			if "sftp" != payload.Value {
+			if payload.Value != "sftp" {
 				req.Reply(false, nil)
 			} else {
-				go SFTPHandler(req, sconn, ch)
+				go sess.SFTPHandler(ctx, req)
 			}
 
 			// All other messages are optional and sent before shell/exec
@@ -129,31 +121,25 @@ func (sess *SSHSession) Handle(ctx context.Context, newChannel ssh.NewChannel) {
 			var kv KV
 			// Typical: LANG
 			ssh.Unmarshal(req.Payload, &kv)
-			env = append(env, &kv)
+			sess.Env = append(sess.Env, &kv)
 			if req.WantReply {
 				req.Reply(true, nil)
 			}
 		case "signal":
+			// This is sent after shell/exec
 			var payload struct{ Signal string }
 			ssh.Unmarshal(req.Payload, &payload)
-			sess.Lock()
-			if sess.sigCh != nil {
-				sess.sigCh <- payload.Signal
-			} else {
-				if len(sess.sigBuf) < 32 {
-					sess.sigBuf = append(sess.sigBuf, payload.Signal)
+			if sess.Cmd != nil && sess.Cmd.Process != nil {
+				sv := signals[ssh.Signal(payload.Signal)]
+				if sv != 0 {
+					sess.Cmd.Process.Signal(syscall.Signal(sv))
 				}
 			}
-			sess.Unlock()
 		case "break":
-			ok := false
-			sess.Lock()
-			if sess.breakCh != nil {
-				sess.breakCh <- true
-				ok = true
+			if sess.Cmd != nil && sess.Cmd.Process != nil {
+				sess.Cmd.Process.Signal(syscall.SIGINT)
 			}
-			req.Reply(ok, nil)
-			sess.Unlock()
+			req.Reply(true, nil)
 		case "pty-req":
 			ptyReq, ok := parsePtyRequest(req.Payload)
 			if !ok {
@@ -181,19 +167,6 @@ func (sess *SSHSession) Handle(ctx context.Context, newChannel ssh.NewChannel) {
 			req.Reply(false, nil)
 		}
 	}
-}
-
-// Window represents the size of a PTY window.
-type Window struct {
-	Width  int
-	Height int
-}
-
-// Pty represents a PTY request and configuration.
-type Pty struct {
-	Term   string
-	Window Window
-	// HELP WANTED: terminal modes!
 }
 
 func parsePtyRequest(s []byte) (pty Pty, ok bool) {
@@ -262,10 +235,101 @@ func parseWinchRequest(s []byte) (win Window, ok bool) {
 	return
 }
 
+func exit(sess ssh.Channel, code int) error {
+	status := struct{ Status uint32 }{uint32(code)}
+	_, err := sess.SendRequest("exit-status", false, ssh.Marshal(&status))
+	if err != nil {
+		return err
+	}
+	return sess.Close()
+}
+
+// Handle exec and shell commands.
+// "raw" is the string command - like a URL, but with space separators.
+//
+// "admin" ( owner key or user ID in a client cert) can run shell session
+// or run any command.
+//
+// Regular users have access to a restricted set of internal commands
+// When the server is a real dropbear/sshd, this is handled with the
+// native ssh permission system.
+func (s *SSHSession) execHandler(ch ssh.Channel, raw string) {
+	conn := s.sshMux.ServerConn
+	isOwner := conn.Permissions.Extensions["role"] == "admin"
+
+	if !isOwner {
+		fmt.Fprintln(ch, "Only owner can run commands", conn.RemoteAddr(), conn.Permissions.Extensions, conn.User())
+		ch.Close()
+		return
+	}
+	t0 := time.Now()
+	defer func() {
+		s.Close()
+		slog.Info("sshd_exec_close", "dur", time.Since(t0),
+			"cmd", raw)
+	}()
+
+	cmd := buildCmd(s.Env, raw)
+	s.Cmd = cmd
+	if s.PTY == nil {
+		err := handleNoTTY(cmd, ch, ch, ch.Stderr())
+		if err != nil {
+			sendErrAndExit(ch, err)
+		} else {
+			exit(ch, 0)
+		}
+		return
+	}
+
+	if len(s.PTY.Term) > 0 {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", s.PTY.Term))
+	}
+
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setsid = true
+	cmd.SysProcAttr.Setctty = true
+
+	// A PTY request is set and we have a pty handler
+	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(s.PTY.Window.Height), Cols: uint16(s.PTY.Window.Height)})
+	if err != nil {
+		sendErrAndExit(ch, err)
+		return
+	}
+	s.tty = f
+	defer f.Close()
+
+	go func() {
+		io.Copy(f, ch) // stdin
+	}()
+	go func() {
+		io.Copy(ch, f) // stdout and stderr - with pty we can't split
+	}()
+
+	if err := cmd.Wait(); err != nil {
+		exerr := err.(*exec.ExitError)
+		exit(ch, exerr.ExitCode())
+		return
+	}
+
+	exit(ch, 0)
+}
+
+func sendErrAndExit(s ssh.Channel, err error) {
+	msg := strings.TrimPrefix(err.Error(), "exec: ")
+	if _, err := s.Stderr().Write([]byte(msg)); err != nil {
+		log.Println("failed to write error back to session", err)
+	}
+
+	if err := exit(s, getExitStatusFromError(err)); err != nil {
+		log.Println(err, "pty session failed to exit")
+	}
+}
 
 var ftpHandler func(closer io.ReadWriteCloser)
 
-func SFTPHandler(req *ssh.Request, sconn *SSHSMux, ch ssh.Channel) {
+func (s *SSHSession) SFTPHandler(ctx context.Context, req *ssh.Request) {
 	path := "/usr/lib/openssh/sftp-server"
 	// Run the SFTP server as a command, with in and out redirected
 	// to the channel
@@ -276,42 +340,11 @@ func SFTPHandler(req *ssh.Request, sconn *SSHSMux, ch ssh.Channel) {
 	//
 	cmd := exec.Command(path, "-e", "-d", "/tmp")
 	cmd.Env = []string{}
-	cmd.Stdin = ch
-	cmd.Stdout = ch
+	cmd.Stdin = s.Channel
+	cmd.Stdout = s.Channel
 	cmd.Stderr = os.Stderr
 	cmd.Start()
 
 	cmd.Wait()
 	// TODO: run sftp
-}
-
-
-
-type KV struct {
-	Key, Value string
-}
-
-func (sshc *SSHCMux) ClientSession() {
-	c := sshc.SSHClient
-
-	// Open a session )
-	go func() {
-		sc, r, err := c.OpenChannel("session", nil)
-		if err != nil {
-			log.Println("Failed to open session", err)
-			return
-		}
-		go ssh.DiscardRequests(r)
-		data := make([]byte, 1024)
-		for {
-			n, err := sc.Read(data)
-			if err != nil {
-				log.Println("Failed to read", err)
-				return
-			}
-			log.Println("IN:", string(data[0:n]))
-		}
-
-	}()
-
 }

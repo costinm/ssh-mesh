@@ -35,9 +35,9 @@ import (
 // The output from K8S command is also a json, with 'status.token' and optional status.ClientCertificateData,
 // ClientKeyData, ExpirationTimestamp
 type TokenExec struct {
-	Command string `json:"command,omitempty"`
-	Args []string `json:"args,omitempty"`
-	Env []ExecEnvVar `json:"env,omitempty"`
+	Command string       `json:"command,omitempty"`
+	Args    []string     `json:"args,omitempty"`
+	Env     []ExecEnvVar `json:"env,omitempty"`
 }
 
 type ExecEnvVar struct {
@@ -45,12 +45,15 @@ type ExecEnvVar struct {
 	Value string `json:"value"`
 }
 
-func (e *TokenExec) GetToken(ctx context.Context, aud string) (string,error) {
-	cmd := exec.Command("gcloud", "auth", "print-access-token", "--audience", aud)
-
-	if e.Command != "" {
-		cmd = exec.Command(e.Command, e.Args...)
+func (e *TokenExec) GetToken(ctx context.Context, aud string) (string, error) {
+	if e.Command == "" {
+		e.Command = "gcloud"
+		e.Args = []string{"auth", "print-access-token", "--audience"}
 	}
+
+	args := append(e.Args, aud)
+	cmd := exec.Command(e.Command, args...)
+
 	for _, env := range e.Env {
 		cmd.Env = append(cmd.Env, env.Name+"="+env.Value)
 	}
@@ -59,7 +62,6 @@ func (e *TokenExec) GetToken(ctx context.Context, aud string) (string,error) {
 	cmd.Stdout = bb
 	cmd.Run()
 
-
 	return bb.String(), nil
 }
 
@@ -67,7 +69,7 @@ type MDS struct {
 	Addr string
 }
 
-func (m *MDS) GetToken(ctx context.Context, aud string) (string,error) {
+func (m *MDS) GetToken(ctx context.Context, aud string) (string, error) {
 
 	if m.Addr == "" {
 		m.Addr = os.Getenv("GCE_METADATA_HOST")

@@ -17,7 +17,6 @@ import (
 
 // Client side of SSH mesh.
 
-
 // SSHCMux is a multiplexed client connection to a single destination.
 // That corresponds to a H2 connection - it is possible to have multiple
 // SSHCMux connections to the same destination at the same time.
@@ -48,7 +47,7 @@ type SSHCMux struct {
 
 	// The SSH Conn, client and internal objects
 	SSHClient *ssh.Client `json:"-"`
-	SSHConn ssh.Conn `json:"-"`
+	SSHConn   ssh.Conn    `json:"-"`
 
 	chans <-chan ssh.NewChannel
 	reqs  <-chan *ssh.Request
@@ -75,7 +74,6 @@ func (sc *SSHCMux) Init(ctx context.Context) {
 // H2 tunnels can forward to any port, including 22 - this allows skipping
 // the TCP part and using in-process.
 const sshVip = "localhost:15022"
-
 
 // Dial opens one TCP or H2 connection to addr, and starts SSH handshake.
 // It blocks until the SSH handshake is done.
@@ -441,4 +439,29 @@ type RemoteExec struct {
 // RFC 4254 Section 6.5.
 type execMsg struct {
 	Command string
+}
+
+func (sshc *SSHCMux) ClientSession() {
+	c := sshc.SSHClient
+
+	// Open a session )
+	go func() {
+		sc, r, err := c.OpenChannel("session", nil)
+		if err != nil {
+			log.Println("Failed to open session", err)
+			return
+		}
+		go ssh.DiscardRequests(r)
+		data := make([]byte, 1024)
+		for {
+			n, err := sc.Read(data)
+			if err != nil {
+				log.Println("Failed to read", err)
+				return
+			}
+			log.Println("IN:", string(data[0:n]))
+		}
+
+	}()
+
 }

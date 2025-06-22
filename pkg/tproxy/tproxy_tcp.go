@@ -11,64 +11,44 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/costinm/ssh-mesh/nio"
 )
 
 // Based on https://github.com/LiamHaworth/go-tproxy/blob/master/tproxy_tcp.go and many others
 
 type TProxy struct {
-
+	Addr        string
+	OnConn      func(nc net.Conn, dest, la *net.TCPAddr)
+	NetListener *net.TCPListener
+	Dialer      ContextDialer `json:"-"`
 }
 
-// AcceptTProxy will accept a TCP connection
-// and wrap it to a TProxy connection to provide
-// TProxy functionality
-func AcceptTProxy(l *net.TCPListener) (*net.TCPConn, error) {
-	tcpConn, err := l.AcceptTCP()
-	if err != nil {
-		return nil, err
-	}
-
-	return tcpConn, nil
+type ContextDialer interface {
+	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
 }
 
-// ListenTProxy will construct a new TCP listener
-// socket with the Linux IP_TRANSPARENT option
-// set on the underlying socket
-func ListenTProxy(ctx context.Context, network string, laddr *net.TCPAddr) (*net.TCPListener, error) {
-	listener, err := net.ListenTCP(network, laddr)
-	if err != nil {
-		return nil, err
+func (t *TProxy) Provision(ctx context.Context) error {
+	if t.Addr == "" {
+		t.Addr = "127.0.0.1:15006"
 	}
-
-	fileDescriptorSource, err := listener.File()
-	if err != nil {
-		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("get file descriptor: %s", err)}
-	}
-	defer fileDescriptorSource.Close()
-
-	// Allow socket to bind on any port.
-	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err == nil {
-		slog.InfoContext(ctx, "TPROXY enabled")
-	}
-
-	return listener, nil
-}
-
-func IptablesCapture(ctx context.Context, addr string, ug func(nc net.Conn, dest, la *net.TCPAddr)) (*net.TCPListener, error) {
-	na, err := net.ResolveTCPAddr("tcp", addr)
-	nl, err := ListenTProxy(ctx, "tcp", na)
+	na, err := net.ResolveTCPAddr("tcp", t.Addr)
+	nl, err := listenTProxy(ctx, "tcp", na)
 	if err != nil {
 		log.Println("Failed to capture tproxy", err)
-		return nil, err
+		return err
 	}
-	localPort := nl.Addr().(*net.TCPAddr).Port
+	t.NetListener = nl
+	return nil
+}
+
+func (t *TProxy) Start(ctx context.Context) {
+	localPort := t.NetListener.Addr().(*net.TCPAddr).Port
 	go func() {
 		for {
-			remoteConn, err := AcceptTProxy(nl)
+			remoteConn, err := acceptTProxy(t.NetListener)
 
-			//ugate.VarzAccepted.Add(1)
 			if ne, ok := err.(net.Error); ok {
-				//ugate.VarzAcceptErr.Add(1)
 				if ne.Temporary() {
 					time.Sleep(100 * time.Millisecond)
 					continue
@@ -95,11 +75,52 @@ func IptablesCapture(ctx context.Context, addr string, ug func(nc net.Conn, dest
 				}
 			}
 
-			ug(remoteConn, dst, remoteConn.RemoteAddr().(*net.TCPAddr))
+			if t.OnConn != nil {
+				t.OnConn(remoteConn, dst, remoteConn.RemoteAddr().(*net.TCPAddr))
+			} else if t.Dialer != nil {
+				nc, err := t.Dialer.DialContext(context.Background(), "tcp", dst.String())
+				if err != nil {
+					remoteConn.Close()
+				}
+				nio.Proxy(nc, remoteConn, remoteConn, dst.String())
+			}
 		}
 	}()
+}
 
-	return nl, nil
+// AcceptTProxy will accept a TCP connection
+// and wrap it to a TProxy connection to provide
+// TProxy functionality
+func acceptTProxy(l *net.TCPListener) (*net.TCPConn, error) {
+	tcpConn, err := l.AcceptTCP()
+	if err != nil {
+		return nil, err
+	}
+
+	return tcpConn, nil
+}
+
+// ListenTProxy will construct a new TCP listener
+// socket with the Linux IP_TRANSPARENT option
+// set on the underlying socket
+func listenTProxy(ctx context.Context, network string, laddr *net.TCPAddr) (*net.TCPListener, error) {
+	listener, err := net.ListenTCP(network, laddr)
+	if err != nil {
+		return nil, err
+	}
+
+	fileDescriptorSource, err := listener.File()
+	if err != nil {
+		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("get file descriptor: %s", err)}
+	}
+	defer fileDescriptorSource.Close()
+
+	// Allow socket to bind on any port.
+	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err == nil {
+		slog.InfoContext(ctx, "TPROXY enabled")
+	}
+
+	return listener, nil
 }
 
 // Status:
