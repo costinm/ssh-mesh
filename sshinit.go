@@ -48,6 +48,7 @@ func NewSSHM() *SSHM {
 	}
 }
 
+// OnConn is called when a new SSH connection is established.
 func OnConn(remoteConn net.Conn, dst string, la *net.TCPAddr, postDial func(net.Addr, error)) {
 	d := &net.Dialer{}
 	nc, err := d.DialContext(context.Background(), "tcp",

@@ -345,7 +345,23 @@ function gcp_ca() {
     --role='roles/secretmanager.secretVersionAdder'
 }
 
+ecdh_test() {
+  openssl genpkey -out alice.pem -algorithm EC \
+  -pkeyopt ec_paramgen_curve:P-256 \
+  -pkeyopt ec_param_enc:named_curve
+  openssl pkey -pubout -in alice.pem -out alice.pub
+  openssl genpkey -out bob.pem -algorithm EC \
+    -pkeyopt ec_paramgen_curve:P-256 \
+    -pkeyopt ec_param_enc:named_curve
+  openssl pkey -pubout -in bob.pem -out bob.pub
 
+  # Derive does ECDH. 
+  # pkeyutl also has -sign and -verify. EC doesn't support direct encrypt (like RSA).
+  # 25519 has derive, sign, verify.
+  openssl pkeyutl -derive -out alicebob.key -inkey alice.pem -peerkey bob.pub
+  openssl pkeyutl -derive -out bobalice.key -inkey bob.pem -peerkey alice.pub
+  cmp alicebob.key bobalice.key
+}
 
 
 CMD=$1
