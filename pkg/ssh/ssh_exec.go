@@ -146,6 +146,8 @@ func buildCmd(env []*KV, rawCmd string) *exec.Cmd {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k.Key, k.Value))
 	}
 
+	cmd.SysProcAttr = &syscall.SysProcAttr{Unshareflags: syscall.CLONE_NEWNS}
+
 	return cmd
 }
 

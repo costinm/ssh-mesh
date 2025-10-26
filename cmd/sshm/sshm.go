@@ -35,6 +35,11 @@ TODO:
 // Accepts connections using SSH_AUTHORIZED_KEYS, certs or a GCP-style metadata server.
 //
 
+// export Module
+func Module(ctx context.Context) any {
+	return ssh_mesh.NewSSHM()
+}
+
 // SSH_ADKPASS_REQUIRE=force
 // SSH_ASKPASS=gcloud auth print-identity-token $GSA --audiences=https://$HOST
 // ssh $HOST -R ... -L ...

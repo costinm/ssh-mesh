@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -284,9 +285,12 @@ func (sshMesh *SSHMesh) Provision(ctx context.Context) error {
 
 			if user != "" {
 				// TODO: add public key
-				return &ssh.Permissions{Extensions: map[string]string{"sub": user,
-					"role": "admin", "fp": fp}}, nil
+				return &ssh.Permissions{
+					Extensions: map[string]string{"sub": user,
+						"role": "admin", "fp": fp}}, nil
 			}
+
+			log.Println("Unknown key", base64.RawURLEncoding.EncodeToString(key.Marshal()))
 			return nil, errors.New("SSHD: no key found")
 		},
 

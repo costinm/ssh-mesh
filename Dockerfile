@@ -1,6 +1,5 @@
 FROM golang:1.24.1-alpine AS build
 
-COPY . /src
 WORKDIR /src
 
 # Copy go.mod and go.sum to cache dependencies
@@ -10,7 +9,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy the source code into the container
-COPY . .
+COPY . ./
 
 # Build the Go application
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o sshm ./cmd/sshm

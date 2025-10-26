@@ -10,4 +10,7 @@ authors = [
     { name = "Costin Manolache", email = "costin@gmail.com" }
 ]
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "paramiko>=2.7.0",
+    "cryptography>=3.0.0",
+]

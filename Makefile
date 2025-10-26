@@ -21,6 +21,14 @@ GCLOUD_USER=$(shell gcloud config get-value account)
 
 GO_HOME ?= ${HOME}/go
 
+mod:
+	go mod tidy
+	go build -buildmode=c-shared  ./cmd/sshm
+
+plugin:
+	go mod tidy
+	go build -buildmode=plugin -o $(BINARY)_plugin.so ./cmd/sshm
+
 # Build ssh-mesh using ko
 # Simpler:	KO_DOCKER_REPO=costinm ko build --tags latest --sbom none -B --push=true cmd/sshm
 pushx:
