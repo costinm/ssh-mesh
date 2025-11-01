@@ -89,7 +89,6 @@ func New() *H2 {
 	h2.Server.Handler = h2.Mux
 	h2.Protocols.SetUnencryptedHTTP2(true)
 	h2.Protocols.SetHTTP1(true)
-
 	return h2
 }
 
@@ -110,6 +109,9 @@ func (r *H2) Provision(ctx context.Context) error {
 	if r.Addr == "" {
 		r.Addr = ":15082"
 	}
+	if r.Logger == nil {
+		r.Logger = slog.Default()
+	}
 	r.clients = map[string]*H2C{}
 	if r.Mux == nil {
 		r.Mux = http.NewServeMux()
@@ -129,8 +131,9 @@ func (r *H2) Provision(ctx context.Context) error {
 		r.NetListener = l
 	}
 
-	r.Logger = r.Logger.With("addr", r.NetListener.Addr().String())
-
+	if r.Logger != nil {
+		r.Logger = r.Logger.With("addr", r.NetListener.Addr().String())
+	}
 	for k, v := range r.Routes {
 		r.Mux.HandleFunc(k, func(writer http.ResponseWriter, request *http.Request) {
 			h, err := r.ResourceStore.Resource(ctx, v)
@@ -171,7 +174,7 @@ func (r *H2) Start() error {
 	//		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
 	//	}
 
-	r.Logger.Info("h2/start", r.Addr)
+	r.Logger.Info("ssh-h2/start")
 	go r.Serve(r.NetListener)
 	return nil
 }
