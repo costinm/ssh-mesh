@@ -1,3 +1,6 @@
+//go:build !android
+// +build !android
+
 package tproxy
 
 import (
@@ -14,6 +17,9 @@ import (
 )
 
 // Based on https://github.com/LiamHaworth/go-tproxy/blob/master/tproxy_tcp.go and many others
+
+// Doesn't compile with gomobile - syscall.SYS_GETSOCKOPT - and
+// it is not needed, using LWIP with VPN API.
 
 // TProxy captures streams using TPROXY or REDIRECT, and forwards them using
 //

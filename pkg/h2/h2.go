@@ -184,15 +184,15 @@ func (r *H2) WithResourceStore(rs ResourceStore) {
 }
 
 func (st *H2) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	start := time.Now()
+	// actx := &nio.RequestContext{
+	// 	Context: request.Context(),
 
-	actx := &nio.RequestContext{
-		Context: request.Context(),
-
-		Start: time.Now(),
-	}
-	if st.Logger != nil {
-		actx.Logger = st.Logger.With("url", request.URL)
-	}
+	// 	Start: time.Now(),
+	// }
+	// if st.Logger != nil {
+	// 	actx.Logger = st.Logger.With("url", request.URL)
+	// }
 
 	defer func() {
 		// TODO: add it to an event buffer
@@ -200,7 +200,7 @@ func (st *H2) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			st.Logger.InfoContext(request.Context(), "REQUEST",
 				//"remoteID", RemoteID,
 				//"SAN", SAN,
-				"request", request.URL, "time", time.Since(actx.Start))
+				"request", request.URL, "time", time.Since(start))
 		}
 		if r := recover(); r != nil {
 			// TODO: this should go to utel tracing (via slog interface)
@@ -238,7 +238,7 @@ func (st *H2) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// other keys in a normal request context:
 	// - http-server (*http.Server)
 	// - local-addr - *net.TCPAddr
-	st.Mux.ServeHTTP(writer, request.WithContext(actx))
+	st.Mux.ServeHTTP(writer, request) // .WithContext(actx))
 
 }
 

@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/costinm/ssh-mesh"
+	ssh_mesh "github.com/costinm/ssh-mesh"
+	"github.com/costinm/ssh-mesh/cmd"
 )
 
 /*
@@ -57,7 +58,7 @@ func main() {
 
 	s.Start(ctx)
 
-	ssh_mesh.WaitEnd()
+	cmd.WaitEnd()
 }
 
 //  - sshc 9.8M->6.6M

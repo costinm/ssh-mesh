@@ -1,11 +1,13 @@
 package gosftp
 
 import (
+	"context"
 	"io"
 	"io/ioutil"
 	"log"
 
 	"github.com/costinm/sftp"
+	sshm "github.com/costinm/ssh-mesh/pkg/ssh"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -48,23 +50,15 @@ of a 'real root FS', only for interop with unix tools.
 
 */
 
-func subsystemHandler(req *ssh.Request, conn *ssh.ServerConn, ch ssh.Channel) {
-	// Instead of 'exec'/'shell' - this is mainly 'sftp'
-	var payload = struct{ Value string }{}
-	ssh.Unmarshal(req.Payload, &payload)
-
-	if payload.Value == "sftp" {
-		req.Reply(true, nil)
-		go func() {
-			sftpHandler(ch)
-			exit(ch, 0)
-		}()
-	} else {
-		req.Reply(false, nil)
+// init will register the golang SFTP implementation, replacing
+// the default. The package needs to be imported.
+func init() {
+	sshm.SftpHandler = func(ctx context.Context, s *sshm.SSHSession, req *ssh.Request) int {
+		return sftpHandler(s.Channel)
 	}
 }
 
-func sftpHandler(sess io.ReadWriteCloser) {
+func sftpHandler(sess io.ReadWriteCloser) int {
 	debugStream := ioutil.Discard
 	serverOptions := []sftp.ServerOption{
 		sftp.WithDebug(debugStream),
@@ -75,21 +69,14 @@ func sftpHandler(sess io.ReadWriteCloser) {
 	)
 	if err != nil {
 		log.Printf("sftp server init error: %s\n", err)
-		return
+		return 1
 	}
 	if err := server.Serve(); err == io.EOF {
 		server.Close()
 		log.Println("sftp client exited session.")
 	} else if err != nil {
 		log.Println("sftp server completed with error:", err)
+		return 2
 	}
-}
-
-func exit(sess ssh.Channel, code int) error {
-	status := struct{ Status uint32 }{uint32(code)}
-	_, err := sess.SendRequest("exit-status", false, ssh.Marshal(&status))
-	if err != nil {
-		return err
-	}
-	return sess.Close()
+	return 0
 }

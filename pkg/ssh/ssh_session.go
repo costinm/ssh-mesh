@@ -111,6 +111,10 @@ func (sess *SSHSession) Handle(ctx context.Context, newChannel ssh.NewChannel) {
 			var payload = struct{ Value string }{}
 			ssh.Unmarshal(req.Payload, &payload)
 			if payload.Value != "sftp" {
+				// TODO: we could add a custom subsystem handler, but
+				// using regular sessions is cleaner and more consistent
+				// with H2. I think subsystem could be deprecated and should
+				// only be used for SFTP.
 				req.Reply(false, nil)
 			} else {
 				go sess.SFTPHandler(ctx, req)
@@ -271,6 +275,7 @@ func (s *SSHSession) execHandler(ch ssh.Channel, raw string) {
 
 	cmd := buildCmd(s.Env, raw)
 	s.Cmd = cmd
+	
 	if s.PTY == nil {
 		err := handleNoTTY(cmd, ch, ch, ch.Stderr())
 		if err != nil {
@@ -327,10 +332,19 @@ func sendErrAndExit(s ssh.Channel, err error) {
 	}
 }
 
-var ftpHandler func(closer io.ReadWriteCloser)
+var SftpHandler func(ctx context.Context, s *SSHSession, req *ssh.Request) int
+var SftpPath = os.Getenv("SFTP_PATH")
 
 func (s *SSHSession) SFTPHandler(ctx context.Context, req *ssh.Request) {
-	path := "/usr/lib/openssh/sftp-server"
+	if SftpHandler != nil {
+		code := SftpHandler(ctx, s, req)
+		exit(s.Channel, code)
+		return
+	}
+	if SftpPath == "" {
+		SftpPath = "/usr/lib/openssh/sftp-server"
+	}
+	path := SftpPath
 	// Run the SFTP server as a command, with in and out redirected
 	// to the channel
 

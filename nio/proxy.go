@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"log/slog"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -65,13 +66,17 @@ func Proxy(outConn io.ReadWriteCloser, in io.Reader, w io.Writer, dest string) e
 	err := proxyError(s1.Err, s2.Err, s1.InError, s2.InError)
 
 	if dest != "" {
-		log.Println("proxy-copy-done", ids,
-			dest,
+		slog.Info("proxy-copy-done",
+			"id", ids,
+			"dest", dest,
 			//"conTime", t1.Sub(t0),
 			"dur", time.Since(t1),
-			"maxRead", s1.MaxRead, s2.MaxRead,
-			"readCnt", s1.ReadCnt, s2.ReadCnt,
-			"avgCnt", int(s1.Written)/(s1.ReadCnt+1), int(s2.Written)/(s2.ReadCnt+1),
+			"maxReadOut", s1.MaxRead,
+			"maxReadIn", s2.MaxRead,
+			"readCntOut", s1.ReadCnt,
+			"readCntIn", s2.ReadCnt,
+			"avgCnt", int(s1.Written)/(s1.ReadCnt+1),
+			"avgCntIn", int(s2.Written)/(s2.ReadCnt+1),
 			"in", s1.Written,
 			"out", s2.Written,
 			"err", err)
