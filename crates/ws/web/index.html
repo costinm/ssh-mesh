@@ -7,7 +7,10 @@
     <h1>WebSocket Client Test</h1>
     <div id="status">Connecting...</div>
     <div id="clients"></div>
-    <button onclick="sendMessage()">Send Message</button>
+    <button onclick="sendMessage()">Send Message to All</button>
+    <button onclick="listClients()">List Clients</button>
+    <input type="text" id="client_id" placeholder="Client ID for direct message">
+    <button onclick="sendToClient()">Send Message to Client</button>
     <script>
         const ws = new WebSocket('ws://localhost:8083/ws');
         
@@ -17,6 +20,11 @@
         
         ws.onmessage = function(event) {
             document.getElementById('status').innerHTML = 'Received: ' + event.data;
+            // When we receive a client list, update the UI
+            if (event.data.startsWith('CLIENTS:')) {
+                const clients = event.data.substring(8).split(',');
+                updateClientsList(clients);
+            }
         };
         
         ws.onclose = function(event) {
@@ -24,7 +32,25 @@
         };
         
         function sendMessage() {
-            ws.send('Hello WebSocket!');
+            ws.send('BROADCAST:Hello WebSocket!');
+        }
+        
+        function listClients() {
+            ws.send('LIST_CLIENTS');
+        }
+        
+        function sendToClient() {
+            const clientId = document.getElementById('client_id').value;
+            if (clientId) {
+                ws.send(`DIRECT:${clientId}:Hello Direct Message!`);
+            }
+        }
+        
+        function updateClientsList(clients) {
+            const clientsDiv = document.getElementById('clients');
+            clientsDiv.innerHTML = '<h2>Connected Clients:</h2><ul>' + 
+                clients.map(client => `<li>${client}</li>`).join('') + 
+                '</ul>';
         }
     </script>
 </body>

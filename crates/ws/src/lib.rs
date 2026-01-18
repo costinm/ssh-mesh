@@ -1,22 +1,46 @@
 use bytes::Bytes;
 use fastwebsockets::{upgrade, Frame, Payload, WebSocket};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use log::{error, info};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use log::{error, info};
+
+type Handler = Arc<
+    dyn Fn(
+            Request<Incoming>,
+            Arc<WSServer>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Response<Full<Bytes>>, hyper::Error>> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct WSServer {
     clients: Arc<Mutex<HashMap<String, WebSocket<TokioIo<hyper::upgrade::Upgraded>>>>>,
+    handlers: Arc<Mutex<HashMap<String, Handler>>>,
+}
+
+impl Default for WSServer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WSServer {
     pub fn new() -> Self {
         Self {
             clients: Arc::new(Mutex::new(HashMap::new())),
+            handlers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -63,6 +87,73 @@ impl WSServer {
 
         Ok(())
     }
+
+    pub async fn add_handler<F>(&self, path: String, handler: F)
+    where
+        F: Fn(
+                Request<Incoming>,
+                Arc<WSServer>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<Response<Full<Bytes>>, hyper::Error>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.handlers.lock().await.insert(path, Arc::new(handler));
+    }
+
+    pub async fn remove_handler(&self, path: &str) {
+        self.handlers.lock().await.remove(path);
+    }
+
+    pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        info!("Server listening on http://{}", addr);
+
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let server = Arc::new(WSServer {
+                clients: self.clients.clone(),
+                handlers: self.handlers.clone(),
+            });
+
+            tokio::task::spawn(async move {
+                let io = TokioIo::new(stream);
+                let server_clone = server.clone();
+                let service = hyper::service::service_fn(move |req| {
+                    handle_request(req, server_clone.clone())
+                });
+
+                let conn = ConnBuilder::new(TokioExecutor::new());
+                let conn = conn.serve_connection_with_upgrades(io, service);
+
+                if let Err(err) = conn.await {
+                    error!("Error serving connection: {:?}", err);
+                }
+            });
+        }
+    }
+}
+
+async fn handle_request(
+    req: Request<Incoming>,
+    server: Arc<WSServer>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let path = req.uri().path();
+
+    let handlers = server.handlers.lock().await;
+    if let Some(handler) = handlers.get(path) {
+        let handler = handler.clone();
+        drop(handlers);
+        return handler(req, server).await;
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Full::from("Not Found"))
+        .unwrap())
 }
 
 pub async fn handle_websocket(
@@ -88,7 +179,6 @@ pub async fn handle_websocket_upgrade(
     // Check if this is a WebSocket upgrade request
     info!("New WebSocket connection handler isupgrade");
     if upgrade::is_upgrade_request(&req) {
-
         let (response, fut) = match upgrade::upgrade(&mut req) {
             Ok((response, fut)) => (response, fut),
             Err(_e) => {
@@ -133,5 +223,174 @@ pub async fn handle_websocket_upgrade(
             .status(StatusCode::BAD_REQUEST)
             .body(Full::from("Expected WebSocket upgrade"))
             .unwrap())
+    }
+}
+
+#[derive(Deserialize)]
+struct SendMessageRequest {
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ClientsResponse {
+    clients: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct MessageResponse {
+    success: bool,
+}
+
+pub async fn handle_list_clients(
+    _req: Request<Incoming>,
+    server: Arc<WSServer>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let clients = server.list_clients().await;
+    let response = ClientsResponse { clients };
+
+    match serde_json::to_string(&response) {
+        Ok(json) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Full::from(json))
+            .unwrap()),
+        Err(_) => Ok(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::from("Failed to serialize response"))
+            .unwrap()),
+    }
+}
+
+pub async fn handle_remove_client(
+    req: Request<Incoming>,
+    server: Arc<WSServer>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let path_parts: Vec<&str> = req.uri().path().split('/').collect();
+
+    if path_parts.len() < 4 {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Full::from("Missing client ID"))
+            .unwrap());
+    }
+
+    let client_id = path_parts[3];
+    server.remove_client(client_id).await;
+
+    let response = MessageResponse { success: true };
+    match serde_json::to_string(&response) {
+        Ok(json) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Full::from(json))
+            .unwrap()),
+        Err(_) => Ok(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::from("Failed to serialize response"))
+            .unwrap()),
+    }
+}
+
+pub async fn handle_send_message(
+    req: Request<Incoming>,
+    server: Arc<WSServer>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let path = req.uri().path().to_string();
+    let path_parts: Vec<&str> = path.split('/').collect();
+
+    if path_parts.len() < 4 {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Full::from("Missing client ID"))
+            .unwrap());
+    }
+
+    let client_id = path_parts[3];
+
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::from("Failed to read request body"))
+                .unwrap());
+        }
+    };
+
+    let send_req: SendMessageRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::from("Invalid JSON"))
+                .unwrap());
+        }
+    };
+
+    match server.send_to_client(client_id, &send_req.message).await {
+        Ok(_) => {
+            let response = MessageResponse { success: true };
+            match serde_json::to_string(&response) {
+                Ok(json) => Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Full::from(json))
+                    .unwrap()),
+                Err(_) => Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::from("Failed to serialize response"))
+                    .unwrap()),
+            }
+        }
+        Err(e) => Ok(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::from(format!("Failed to send message: {}", e)))
+            .unwrap()),
+    }
+}
+
+pub async fn handle_broadcast(
+    req: Request<Incoming>,
+    server: Arc<WSServer>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::from("Failed to read request body"))
+                .unwrap());
+        }
+    };
+
+    let send_req: SendMessageRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::from("Invalid JSON"))
+                .unwrap());
+        }
+    };
+
+    match server.broadcast_message(&send_req.message).await {
+        Ok(_) => {
+            let response = MessageResponse { success: true };
+            match serde_json::to_string(&response) {
+                Ok(json) => Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Full::from(json))
+                    .unwrap()),
+                Err(_) => Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::from("Failed to serialize response"))
+                    .unwrap()),
+            }
+        }
+        Err(e) => Ok(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::from(format!("Failed to broadcast message: {}", e)))
+            .unwrap()),
     }
 }

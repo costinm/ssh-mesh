@@ -188,7 +188,7 @@ impl ProcMon {
         Ok(())
     }
 
-    /// Retrieve a process by PID.
+    /// Retrieve a cached process by PID.
     #[instrument(skip(self), fields(pid = pid))]
     pub fn get_process(&self, pid: u32) -> Option<ProcessInfo> {
         trace!("Getting process by PID: {}", pid);
