@@ -46,12 +46,11 @@ impl WSServer {
 
     pub async fn add_client(&self, id: String, ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>) {
         debug!("Adding client: {}", id);
-        self.clients.lock().await.insert(id.clone(), ws);
-        info!(
-            "Client added: {}, total clients: {}",
-            id,
-            self.clients.lock().await.len()
-        );
+        {
+            self.clients.lock().await.insert(id.clone(), ws);
+        }
+        let new_count = self.clients.lock().await.len();
+        info!("Client added: {}, total clients: {}", id, new_count);
     }
 
     pub async fn get_client_count(&self) -> usize {
