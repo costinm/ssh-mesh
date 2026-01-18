@@ -1,6 +1,8 @@
 # WebSocket Server Crate
 
-This crate provides a WebSocket server implementation with client management capabilities.
+This crate provides a WebSocket server implementation with client management capabilities. Refactored to a separate package because 
+I always have trouble setting the right config, it is also pretty 
+generic boilerplate.
 
 ## Features
 
@@ -8,6 +10,7 @@ This crate provides a WebSocket server implementation with client management cap
 - Add/remove/list clients
 - Send messages to specific clients or broadcast to all clients
 - Proper connection handling and cleanup
+- Start the HTTP server on a port with the right config.
 
 ## Usage
 
