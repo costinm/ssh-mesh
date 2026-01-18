@@ -254,7 +254,7 @@ use hyper::Uri;
 pub async fn static_file_handler(uri: Uri) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() {
-        "index.html"
+        "chat.html"
     } else {
         path
     };
@@ -268,8 +268,8 @@ pub async fn static_file_handler(uri: Uri) -> Response<Body> {
             .header("Content-Type", mime_type.as_ref())
             .body(Body::from(content))
             .unwrap()
-    } else if path == "index.html" {
-        let content = include_str!("../web/index.html");
+    } else if path == "chat.html" {
+        let content = include_str!("../web/chat.html");
         Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html")

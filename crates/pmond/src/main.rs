@@ -1,10 +1,10 @@
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use axum::serve;
 use log::{error, info};
 use pmond::ProcMon;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::time::{sleep, Duration};
+use ws::WSServer;
 
 mod handlers;
 
@@ -29,28 +29,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("PMON process monitor started successfully");
 
+    // Create a new WebSocket server
+    let ws_server = Arc::new(WSServer::new());
+
+    // Start the periodic broadcast task
+    start_periodic_broadcast(ws_server.clone(), proc_mon.clone());
+
     // Set up HTTP server
     let addr = "127.0.0.1:8081";
     let listener = TcpListener::bind(addr).await?;
     info!("Listening on http://{}", addr);
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let proc_mon = proc_mon.clone();
+    // Create the Axum app
+    let app = handlers::app(proc_mon, ws_server);
 
-        tokio::task::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req| {
-                let proc_mon = proc_mon.clone();
-                async move { handlers::http_service(req, proc_mon).await }
-            });
+    // Run the server
+    serve(listener, app.into_make_service()).await?;
 
-            let conn = ConnBuilder::new(TokioExecutor::new());
-            let conn = conn.serve_connection_with_upgrades(io, service);
+    Ok(())
+}
 
-            if let Err(err) = conn.await {
-                error!("Error serving connection: {:?}", err);
+/// Periodically broadcasts the process list to all connected clients.
+fn start_periodic_broadcast(ws_server: Arc<WSServer>, proc_mon: Arc<ProcMon>) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(2)).await;
+            let processes = proc_mon.get_all_processes();
+            match serde_json::to_string(&processes) {
+                Ok(json) => {
+                    if let Err(e) = ws_server.broadcast_message(&json).await {
+                        error!("Failed to broadcast process list: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize process list: {}", e);
+                }
             }
-        });
-    }
+        }
+    });
 }
