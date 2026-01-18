@@ -24,6 +24,12 @@ axum = "0.7"
 axum-extra = { version = "0.9", features = ["typed-routing"] }
 tower = { version = "0.5", features = ["util"] }
 tower-service = "0.3"
+tracing-opentelemetry = "0.24.0"
+opentelemetry = { version = "0.23.0" }
+opentelemetry_sdk = { version = "0.23.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.16.0", features = ["http-json"] }
+tower-http = { version = "0.5.2", features = ["trace"] }
+mime_guess = "2.0.5"
 
 [dev-dependencies]
 tokio-tungstenite = { version = "0.23.1", features = ["native-tls"] }

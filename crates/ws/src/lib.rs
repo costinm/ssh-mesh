@@ -249,6 +249,40 @@ pub async fn handle_send_message(
     }
 }
 
+use hyper::Uri;
+
+pub async fn static_file_handler(uri: Uri) -> Response<Body> {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() {
+        "index.html"
+    } else {
+        path
+    };
+
+    let web_path = format!("web/{}", path);
+
+    if let Ok(content) = tokio::fs::read_to_string(&web_path).await {
+        let mime_type = mime_guess::from_path(path).first_or_text_plain();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", mime_type.as_ref())
+            .body(Body::from(content))
+            .unwrap()
+    } else if path == "index.html" {
+        let content = include_str!("../web/index.html");
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html")
+            .body(Body::from(content))
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Not Found"))
+            .unwrap()
+    }
+}
+
 pub async fn handle_broadcast(
     State(server): State<Arc<WSServer>>,
     Json(payload): Json<SendMessageRequest>,
