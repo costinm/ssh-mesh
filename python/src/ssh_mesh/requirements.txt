@@ -1,5 +1,0 @@
-paramiko>=2.7.0
-types-paramiko
-cryptography>=3.0.0
-pytest>=6.0
-pytest-asyncio>=0.18.0

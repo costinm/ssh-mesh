@@ -6,7 +6,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use log::{error, info};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -177,11 +177,17 @@ pub async fn handle_websocket_upgrade(
     server: Arc<WSServer>,
 ) -> Result<Response<Full<bytes::Bytes>>, hyper::Error> {
     // Check if this is a WebSocket upgrade request
-    info!("New WebSocket connection handler isupgrade");
+    debug!(
+        "WebSocket upgrade requested, is_upgrade: {}",
+        upgrade::is_upgrade_request(&req)
+    );
+    debug!("Headers: {:?}", req.headers());
+
     if upgrade::is_upgrade_request(&req) {
         let (response, fut) = match upgrade::upgrade(&mut req) {
             Ok((response, fut)) => (response, fut),
-            Err(_e) => {
+            Err(e) => {
+                error!("WebSocket upgrade failed: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::from("WebSocket upgrade failed"))
@@ -197,10 +203,14 @@ pub async fn handle_websocket_upgrade(
                 .unwrap()
                 .as_secs()
         );
+        info!("WebSocket upgrade successful, client ID: {}", client_id);
 
         tokio::task::spawn(async move {
             let ws = match fut.await {
-                Ok(ws) => ws,
+                Ok(ws) => {
+                    info!("WebSocket connection established for {}", client_id);
+                    ws
+                }
                 Err(e) => {
                     error!("Error upgrading to WebSocket: {}", e);
                     return;
@@ -208,7 +218,7 @@ pub async fn handle_websocket_upgrade(
             };
 
             if let Err(e) = handle_websocket(ws, server, client_id).await {
-                error!("Error in WebSocket connection: {}", e);
+                error!("Error in WebSocket connection for {}: {}", client_id, e);
             }
         });
 
@@ -217,7 +227,9 @@ pub async fn handle_websocket_upgrade(
         let response = Response::from_parts(parts, Full::from(Bytes::new()));
         Ok(response)
     } else {
-        info!("New WebSocket connection not upgrade started");
+        warn!("Request is not a WebSocket upgrade");
+        debug!("Request method: {}", req.method());
+        debug!("Request URI: {}", req.uri());
 
         Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -245,19 +257,30 @@ pub async fn handle_list_clients(
     _req: Request<Incoming>,
     server: Arc<WSServer>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    debug!("handle_list_clients called");
     let clients = server.list_clients().await;
+    debug!("Clients count: {}", clients.len());
+    for client in &clients {
+        debug!("Client: {}", client);
+    }
     let response = ClientsResponse { clients };
 
     match serde_json::to_string(&response) {
-        Ok(json) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .body(Full::from(json))
-            .unwrap()),
-        Err(_) => Ok(Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::from("Failed to serialize response"))
-            .unwrap()),
+        Ok(json) => {
+            debug!("Clients response: {}", json);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Full::from(json))
+                .unwrap())
+        }
+        Err(e) => {
+            error!("Failed to serialize clients response: {}", e);
+            Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::from("Failed to serialize response"))
+                .unwrap())
+        }
     }
 }
 
@@ -265,9 +288,12 @@ pub async fn handle_remove_client(
     req: Request<Incoming>,
     server: Arc<WSServer>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let path_parts: Vec<&str> = req.uri().path().split('/').collect();
+    let path = req.uri().path();
+    debug!("handle_remove_client called with path: {}", path);
+    let path_parts: Vec<&str> = path.split('/').collect();
 
     if path_parts.len() < 4 {
+        warn!("Invalid path, not enough parts: {:?}", path_parts);
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Full::from("Missing client ID"))
@@ -275,19 +301,26 @@ pub async fn handle_remove_client(
     }
 
     let client_id = path_parts[3];
+    debug!("Removing client: {}", client_id);
     server.remove_client(client_id).await;
 
     let response = MessageResponse { success: true };
     match serde_json::to_string(&response) {
-        Ok(json) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .body(Full::from(json))
-            .unwrap()),
-        Err(_) => Ok(Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::from("Failed to serialize response"))
-            .unwrap()),
+        Ok(json) => {
+            debug!("Remove client response: {}", json);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Full::from(json))
+                .unwrap())
+        }
+        Err(e) => {
+            error!("Failed to serialize remove client response: {}", e);
+            Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::from("Failed to serialize response"))
+                .unwrap())
+        }
     }
 }
 
@@ -295,10 +328,13 @@ pub async fn handle_send_message(
     req: Request<Incoming>,
     server: Arc<WSServer>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let path = req.uri().path().to_string();
+    let path = req.uri().path();
+    debug!("handle_send_message called with path: {}", path);
     let path_parts: Vec<&str> = path.split('/').collect();
+    debug!("Path parts: {:?}", path_parts);
 
     if path_parts.len() < 4 {
+        warn!("Invalid path, not enough parts: {:?}", path_parts);
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Full::from("Missing client ID"))
@@ -306,10 +342,17 @@ pub async fn handle_send_message(
     }
 
     let client_id = path_parts[3];
+    debug!("Target client ID: {}", client_id);
 
     let body = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            debug!("Request body length: {} bytes", bytes.len());
+            debug!("Request body: {:?}", String::from_utf8_lossy(&bytes));
+            bytes
+        }
+        Err(e) => {
+            error!("Failed to read request body: {}", e);
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::from("Failed to read request body"))
@@ -318,8 +361,13 @@ pub async fn handle_send_message(
     };
 
     let send_req: SendMessageRequest = match serde_json::from_slice(&body) {
-        Ok(req) => req,
-        Err(_) => {
+        Ok(req) => {
+            debug!("Parsed message request: message='{}'", req.message);
+            req
+        }
+        Err(e) => {
+            error!("Failed to parse JSON: {}", e);
+            error!("Raw body: {:?}", String::from_utf8_lossy(&body));
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::from("Invalid JSON"))
@@ -327,25 +375,42 @@ pub async fn handle_send_message(
         }
     };
 
+    let current_clients = server.list_clients().await;
+    debug!("Current clients: {:?}", current_clients);
+    debug!(
+        "Target client exists: {}",
+        current_clients.contains(&client_id.to_string())
+    );
+
     match server.send_to_client(client_id, &send_req.message).await {
         Ok(_) => {
+            debug!("Message sent successfully to {}", client_id);
             let response = MessageResponse { success: true };
             match serde_json::to_string(&response) {
-                Ok(json) => Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "application/json")
-                    .body(Full::from(json))
-                    .unwrap()),
-                Err(_) => Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::from("Failed to serialize response"))
-                    .unwrap()),
+                Ok(json) => {
+                    debug!("Send message response: {}", json);
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/json")
+                        .body(Full::from(json))
+                        .unwrap())
+                }
+                Err(e) => {
+                    error!("Failed to serialize response: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Full::from("Failed to serialize response"))
+                        .unwrap())
+                }
             }
         }
-        Err(e) => Ok(Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::from(format!("Failed to send message: {}", e)))
-            .unwrap()),
+        Err(e) => {
+            error!("Failed to send message to {}: {}", client_id, e);
+            Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::from(format!("Failed to send message: {}", e)))
+                .unwrap())
+        }
     }
 }
 
@@ -353,9 +418,19 @@ pub async fn handle_broadcast(
     req: Request<Incoming>,
     server: Arc<WSServer>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    debug!("handle_broadcast called");
     let body = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            debug!("Broadcast request body length: {} bytes", bytes.len());
+            debug!(
+                "Broadcast request body: {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+            bytes
+        }
+        Err(e) => {
+            error!("Failed to read broadcast request body: {}", e);
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::from("Failed to read request body"))
@@ -364,8 +439,13 @@ pub async fn handle_broadcast(
     };
 
     let send_req: SendMessageRequest = match serde_json::from_slice(&body) {
-        Ok(req) => req,
-        Err(_) => {
+        Ok(req) => {
+            debug!("Parsed broadcast request: message='{}'", req.message);
+            req
+        }
+        Err(e) => {
+            error!("Failed to parse broadcast JSON: {}", e);
+            error!("Raw body: {:?}", String::from_utf8_lossy(&body));
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::from("Invalid JSON"))
@@ -373,24 +453,37 @@ pub async fn handle_broadcast(
         }
     };
 
+    let current_clients = server.list_clients().await;
+    debug!("Broadcasting to {} clients", current_clients.len());
+
     match server.broadcast_message(&send_req.message).await {
         Ok(_) => {
+            debug!("Broadcast sent successfully");
             let response = MessageResponse { success: true };
             match serde_json::to_string(&response) {
-                Ok(json) => Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "application/json")
-                    .body(Full::from(json))
-                    .unwrap()),
-                Err(_) => Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::from("Failed to serialize response"))
-                    .unwrap()),
+                Ok(json) => {
+                    debug!("Broadcast response: {}", json);
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/json")
+                        .body(Full::from(json))
+                        .unwrap())
+                }
+                Err(e) => {
+                    error!("Failed to serialize broadcast response: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Full::from("Failed to serialize response"))
+                        .unwrap())
+                }
             }
         }
-        Err(e) => Ok(Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::from(format!("Failed to broadcast message: {}", e)))
-            .unwrap()),
+        Err(e) => {
+            error!("Failed to broadcast message: {}", e);
+            Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::from(format!("Failed to broadcast message: {}", e)))
+                .unwrap())
+        }
     }
 }

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use ws::WSServer;
 
 #[tokio::test]
@@ -40,4 +41,41 @@ async fn test_server_functionality_with_curl_commands() {
 
     // Test the server can be instantiated and used properly
     assert!(server.list_clients().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_web_api_list_clients() {
+    let server = WSServer::new();
+    let server = Arc::new(server);
+
+    let clients = server.list_clients().await;
+    assert_eq!(clients.len(), 0);
+}
+
+#[tokio::test]
+async fn test_web_api_broadcast() {
+    let server = WSServer::new();
+    let server = Arc::new(server);
+
+    let result = server.broadcast_message("test broadcast").await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_web_api_send_to_client() {
+    let server = WSServer::new();
+    let server = Arc::new(server);
+
+    let result = server.send_to_client("test_client", "test message").await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_web_api_remove_client() {
+    let server = WSServer::new();
+    let server = Arc::new(server);
+
+    server.remove_client("test_client").await;
+    let clients = server.list_clients().await;
+    assert!(clients.is_empty());
 }
