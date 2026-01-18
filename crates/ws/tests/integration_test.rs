@@ -1,81 +1,151 @@
+use futures_util::StreamExt;
+use reqwest::StatusCode;
 use std::sync::Arc;
-use ws::WSServer;
+use tokio::net::TcpListener;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
+use ws::{ClientsResponse, SendMessageRequest, WSServer};
 
-#[tokio::test]
-async fn test_server_creation() {
-    let server = WSServer::new();
-    assert!(server.list_clients().await.is_empty());
+async fn spawn_app() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Arc::new(WSServer::new());
+
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(root_handler))
+        .route("/ws", axum::routing::get(ws::handle_websocket_upgrade))
+        .route("/api/clients", axum::routing::get(ws::handle_list_clients))
+        .route(
+            "/api/clients/:id",
+            axum::routing::delete(ws::handle_remove_client),
+        )
+        .route(
+            "/api/clients/:id/message",
+            axum::routing::post(ws::handle_send_message),
+        )
+        .route("/api/broadcast", axum::routing::post(ws::handle_broadcast))
+        .with_state(server);
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    format!("ws://{}", addr)
+}
+
+async fn root_handler() -> impl axum::response::IntoResponse {
+    "Hello from test server"
 }
 
 #[tokio::test]
-async fn test_server_methods() {
-    let server = WSServer::new();
+async fn test_websocket_operations() {
+    let base_addr = spawn_app().await;
+    let http_base_addr = base_addr.replace("ws://", "http://");
 
-    // Test list clients
-    let clients = server.list_clients().await;
-    assert_eq!(clients.len(), 0);
+    // Connect client 1
+    let (mut client1, _) = connect_async(format!("{}/ws", base_addr)).await.unwrap();
+    // Connect client 2
+    let (mut client2, _) = connect_async(format!("{}/ws", base_addr)).await.unwrap();
 
-    // Test broadcast message (shouldn't crash with no clients)
-    server.broadcast_message("test").await.unwrap();
-}
+    // Give some time for connections to be registered
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-#[tokio::test]
-async fn test_server_functionality_with_curl_commands() {
-    // Note: This test verifies the functionality that would be used with curl commands:
-    // curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Host: localhost:8080" -H "Origin: http://localhost:8080" http://localhost:8080/ws
-    //
-    // This test does not actually run curl commands but tests that the server would respond correctly to such commands.
+    let http_client = reqwest::Client::new();
 
-    let server = WSServer::new();
+    // 1. List clients
+    let response = http_client
+        .get(format!("{}/api/clients", http_base_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let clients_response: ClientsResponse = response.json().await.unwrap();
+    assert_eq!(clients_response.clients.len(), 2);
+    let client1_id = clients_response
+        .clients
+        .iter()
+        .find(|id| id.starts_with("client_"))
+        .cloned()
+        .unwrap();
+    let client2_id = clients_response
+        .clients
+        .iter()
+        .find(|id| *id != &client1_id)
+        .cloned()
+        .unwrap();
 
-    // Test that server methods can be called without panicking
-    let clients = server.list_clients().await;
-    assert_eq!(clients.len(), 0);
+    // 2. Send to client 1
+    let message_to_client1 = "Hello client 1";
+    let payload = SendMessageRequest {
+        message: message_to_client1.to_string(),
+    };
+    let response = http_client
+        .post(format!(
+            "{}/api/clients/{}/message",
+            http_base_addr, client1_id
+        ))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
-    // Test sending to non-existent client (should not panic)
-    let result = server.send_to_client("nonexistent", "test").await;
-    assert!(result.is_ok()); // Should not panic, even though client doesn't exist
+    // Verify client 1 received the message
+    let msg1 = client1.next().await.unwrap().unwrap();
+    assert_eq!(msg1, WsMessage::Text(message_to_client1.to_string()));
 
-    // Test broadcast to no clients (should not panic)
-    server.broadcast_message("test").await.unwrap();
+    // 3. Broadcast
+    let broadcast_message = "Hello everyone";
+    let payload = SendMessageRequest {
+        message: broadcast_message.to_string(),
+    };
+    let response = http_client
+        .post(format!("{}/api/broadcast", http_base_addr))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
-    // Test the server can be instantiated and used properly
-    assert!(server.list_clients().await.is_empty());
-}
+    // Verify both clients received the broadcast
+    let msg_b1 = client1.next().await.unwrap().unwrap();
+    assert_eq!(msg_b1, WsMessage::Text(broadcast_message.to_string()));
+    let msg_b2 = client2.next().await.unwrap().unwrap();
+    assert_eq!(msg_b2, WsMessage::Text(broadcast_message.to_string()));
 
-#[tokio::test]
-async fn test_web_api_list_clients() {
-    let server = WSServer::new();
-    let server = Arc::new(server);
+    // 4. Remove client 2
+    let response = http_client
+        .delete(format!("{}/api/clients/{}", http_base_addr, client2_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
-    let clients = server.list_clients().await;
-    assert_eq!(clients.len(), 0);
-}
+    // Give some time for removal
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-#[tokio::test]
-async fn test_web_api_broadcast() {
-    let server = WSServer::new();
-    let server = Arc::new(server);
+    // 5. List clients again
+    let response = http_client
+        .get(format!("{}/api/clients", http_base_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let clients_response: ClientsResponse = response.json().await.unwrap();
+    assert_eq!(clients_response.clients.len(), 1);
+    assert_eq!(clients_response.clients[0], client1_id);
 
-    let result = server.broadcast_message("test broadcast").await;
-    assert!(result.is_ok());
-}
+    // 6. Close connection from client 1
+    client1.close(None).await.unwrap();
+    // Give some time for the server to detect disconnection
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-#[tokio::test]
-async fn test_web_api_send_to_client() {
-    let server = WSServer::new();
-    let server = Arc::new(server);
-
-    let result = server.send_to_client("test_client", "test message").await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_web_api_remove_client() {
-    let server = WSServer::new();
-    let server = Arc::new(server);
-
-    server.remove_client("test_client").await;
-    let clients = server.list_clients().await;
-    assert!(clients.is_empty());
+    // 7. List clients for the last time
+    let response = http_client
+        .get(format!("{}/api/clients", http_base_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let clients_response: ClientsResponse = response.json().await.unwrap();
+    assert_eq!(clients_response.clients.len(), 0);
 }
