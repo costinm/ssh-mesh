@@ -1,3 +1,4 @@
+use log::{debug, info};
 use nix::sys::socket::{bind, recv, send, NetlinkAddr};
 use nix::unistd::getpid;
 use std::collections::HashMap;
@@ -8,7 +9,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use log::{debug, info};
 
 use crate::proc::{read_process_info_from_proc, ProcessInfo};
 use crate::psi::{PressureType, PsiWatcher};

@@ -1,4 +1,3 @@
-[workspace]
 [package]
 name = "pmond"
 version = "0.1.0"

@@ -1,10 +1,10 @@
-use std::path::PathBuf;
-use std::env;
-use log::{info, error};
-use tracing_subscriber;
 use anyhow::Error;
+use log::{error, info};
+use std::env;
+use std::path::PathBuf;
+use tracing_subscriber;
 
-use russhd::{run_ssh_server, SshServer, get_port_from_env};
+use russhd::{get_port_from_env, run_ssh_server, SshServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -21,7 +21,10 @@ async fn main() -> Result<(), Error> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"));
 
-    info!("Starting SSH server on port {} with base directory: {:?}", ssh_port, base_dir);
+    info!(
+        "Starting SSH server on port {} with base directory: {:?}",
+        ssh_port, base_dir
+    );
 
     // Create SSH server instance
     let server = SshServer::new(0, None, base_dir);

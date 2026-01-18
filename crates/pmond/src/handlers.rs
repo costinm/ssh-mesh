@@ -1,14 +1,14 @@
 use crate::ProcMon;
-use hyper::{body::Incoming, Request, Response, StatusCode};
-use http_body_util::Full;
-use hyper_util::rt::TokioIo;
 use bytes::Bytes;
+use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket};
+use http_body_util::Full;
+use hyper::{body::Incoming, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use log::{debug, error, info};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use fastwebsockets::{upgrade, OpCode, Payload, Frame, WebSocket};
 
 /// HTTP handler for /_ps endpoint - returns all processes as JSON
 pub async fn handle_ps_request(
@@ -244,15 +244,13 @@ pub async fn handle_websocket_upgrade(
         let (parts, _body) = response.into_parts();
         let response = Response::from_parts(parts, Full::new(Bytes::new()));
         Ok(response)
-    }
-    else {
+    } else {
         Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Full::new(bytes::Bytes::from("Expected WebSocket upgrade")))
             .unwrap())
     }
 }
-
 
 /// Main HTTP service function that routes requests
 pub async fn http_service(

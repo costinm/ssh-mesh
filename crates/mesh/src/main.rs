@@ -1,20 +1,24 @@
-use crate::http::{get_port_from_env, H2Server};
 use clap::Parser;
+
 use echo_service;
+
 use lmesh::LocalDiscovery;
+
 use log::{error, info};
+
 #[cfg(feature = "pmon")]
 use pmon;
 #[cfg(feature = "pmon")]
 use pmon::proc::ProcMon;
+
 use std::process;
 use std::sync::Arc;
 
 #[cfg(feature = "ssh")]
 use russhd::{run_ssh_server, SshServer};
 
-#[cfg(feature = "zssh")]
-use zsshd::{run_zssh_server, ZsshServer};
+use sshmesh::ca::CA;
+use sshmesh::http::{get_port_from_env, H2Server};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -177,7 +181,7 @@ async fn main() {
             }
 
             // Create CA and register certificate handler
-            let ca = match crate::ca::CA::new(base_dir.clone()) {
+            let ca = match CA::new(base_dir.clone()) {
                 Ok(ca) => Arc::new(ca),
                 Err(e) => {
                     error!("Failed to create CA: {}", e);
@@ -201,45 +205,6 @@ async fn main() {
                             error!("SSH server failed: {}", e);
                         }
                     },
-                }
-            }
-
-            // Run HTTP server and ZSSH server concurrently
-            #[cfg(feature = "zssh")]
-            {
-                // Get ZSSH port from environment or use default
-                let zssh_port = get_port_from_env("ZSSH_PORT", 5222);
-
-                // Get base directory from environment or use home directory as default
-                let base_dir = std::env::var("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-
-                // Create ZsshServer instance
-                let zssh_server = ZsshServer::new(base_dir);
-
-                info!("Starting ZSSH server on port {}", zssh_port);
-
-                // Run both servers concurrently
-                tokio::select! {
-                    http_result = h2_server.run() => {
-                        if let Err(e) = http_result {
-                            error!("HTTP/2 server failed: {}", e);
-                        }
-                    },
-                    zssh_result = run_zssh_server(zssh_port, &zssh_server) => {
-                        if let Err(e) = zssh_result {
-                            error!("ZSSH server failed: {}", e);
-                        }
-                    }
-                }
-            }
-
-            #[cfg(not(feature = "zssh"))]
-            {
-                // Run HTTP server only
-                if let Err(e) = h2_server.run().await {
-                    error!("HTTP/2 server failed: {}", e);
                 }
             }
         }

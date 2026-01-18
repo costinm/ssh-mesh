@@ -1,11 +1,11 @@
 // NetLink echo server/client implementation
-use std::time::Duration;
-use clap::Parser;
 use anyhow::Result;
-use std::process;
-use std::io;
-use std::thread;
+use clap::Parser;
 use libc;
+use std::io;
+use std::process;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -41,7 +41,6 @@ pub struct Netlink {
 
 impl Netlink {
     pub fn new(_server_pid: Option<u32>) -> Result<Self> {
-        
         let sock_fd = unsafe {
             libc::socket(
                 libc::AF_NETLINK as i32,
@@ -68,7 +67,9 @@ impl Netlink {
             )
         };
         if bind_result < 0 {
-            unsafe { libc::close(sock_fd); }
+            unsafe {
+                libc::close(sock_fd);
+            }
             return Err(anyhow::anyhow!(
                 "Failed to bind NetLink socket: {}",
                 io::Error::last_os_error()
@@ -176,7 +177,7 @@ impl Netlink {
 
 // Wrapper for client
 pub fn run_client(args: &Args) -> Result<()> {
-    let netlink = Netlink::new( Some(args.server_pid))?;
+    let netlink = Netlink::new(Some(args.server_pid))?;
     let response = netlink.client_send(args.server_pid, "Hello NetLink!")?;
     println!("Received: {}", response);
     Ok(())
@@ -191,8 +192,8 @@ pub fn run_server(args: Args) -> Result<()> {
 
 #[test]
 pub fn test_netlink_communication() -> Result<()> {
-    use nix::unistd::{fork, ForkResult};
     use nix::sys::wait::waitpid;
+    use nix::unistd::{fork, ForkResult};
 
     println!("Testing NetLink communication...");
 
@@ -209,8 +210,8 @@ pub fn test_netlink_communication() -> Result<()> {
                 message_size: 100,
                 benchmark: false,
             };
-            let netlink = Netlink::new( None)?;
-            
+            let netlink = Netlink::new(None)?;
+
             // Handle one message and exit
             let mut buf = vec![0u8; args.buffer_size];
             let mut sender_addr: libc::sockaddr = unsafe { std::mem::zeroed() };
@@ -245,25 +246,29 @@ pub fn test_netlink_communication() -> Result<()> {
             thread::sleep(Duration::from_millis(100)); // Give child time to start and bind
 
             let args = Args {
-                protocol: 31, 
+                protocol: 31,
                 buffer_size: 1024,
                 server_pid: child.as_raw() as u32,
                 iterations: 1,
                 message_size: 100,
                 benchmark: false,
             };
-            
-            let netlink = Netlink::new( Some(args.server_pid))?;
+
+            let netlink = Netlink::new(Some(args.server_pid))?;
             let test_message = "NetLink test message";
             let response = netlink.client_send(args.server_pid, test_message)?;
 
             if response != test_message {
-                return Err(anyhow::anyhow!("Received wrong message content: expected {}, got {}", test_message, response));
+                return Err(anyhow::anyhow!(
+                    "Received wrong message content: expected {}, got {}",
+                    test_message,
+                    response
+                ));
             }
 
             println!("✅ NetLink communication test passed!");
             println!("   Successfully sent and received: {}", response);
-            
+
             // Wait for child to exit
             waitpid(child, None)?;
         }
@@ -272,4 +277,3 @@ pub fn test_netlink_communication() -> Result<()> {
 
     Ok(())
 }
-

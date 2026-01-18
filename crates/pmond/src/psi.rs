@@ -23,7 +23,6 @@ pub enum PressureType {
     Memory,
     Cpu,
     Io,
-    
 }
 
 struct Watch {

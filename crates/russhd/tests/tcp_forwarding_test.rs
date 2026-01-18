@@ -1,18 +1,18 @@
-use std::net::TcpListener;
-use tokio::net::TcpStream;
-use std::io::{Read, Write};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::time::Duration;
-use std::thread;
 use anyhow::Result;
-use ssh_key::{Algorithm, PrivateKey, LineEnding};
-use std::process::{Child, Command};
+use log::info;
+use once_cell::sync::Lazy;
+use ssh_key::{Algorithm, LineEnding, PrivateKey};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use tokio::time::timeout;
-use log::{info};
-use once_cell::sync::Lazy;
+use std::process::{Child, Command};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 static INIT_LOGGING: Lazy<()> = Lazy::new(|| {
     tracing_subscriber::fmt()
@@ -115,20 +115,26 @@ where
 async fn test_local_tcp_forwarding() -> Result<()> {
     run_test_with_timeout(|| async {
         let setup = setup_test_environment().await?;
-        
+
         let echo_port = find_free_port()?;
         start_echo_server(echo_port);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let local_forward_port = find_free_port()?;
         let mut ssh_client_process = Command::new("ssh")
-            .arg("-o").arg("StrictHostKeyChecking=no")
-            .arg("-o").arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
             .arg("-v")
-            .arg("-i").arg(&setup.client_key_path)
-            .arg("-p").arg(setup.ssh_port.to_string())
-            .arg("-L").arg(format!("{}:127.0.0.1:{}", local_forward_port, echo_port))
-            .arg("-l").arg("testuser")
+            .arg("-i")
+            .arg(&setup.client_key_path)
+            .arg("-p")
+            .arg(setup.ssh_port.to_string())
+            .arg("-L")
+            .arg(format!("{}:127.0.0.1:{}", local_forward_port, echo_port))
+            .arg("-l")
+            .arg("testuser")
             .arg("127.0.0.1")
             .arg("-N") // Do not execute a remote command.
             .spawn()?;
@@ -142,21 +148,22 @@ async fn test_local_tcp_forwarding() -> Result<()> {
 
         let mut buffer = [0; 1024];
         let n = stream.read(&mut buffer).await?;
-        
+
         assert_eq!(&buffer[..n], message);
 
         ssh_client_process.kill()?;
         setup.server_handle.abort();
 
         Ok(())
-    }).await
+    })
+    .await
 }
 
 #[tokio::test]
 async fn test_remote_tcp_forwarding() -> Result<()> {
     run_test_with_timeout(|| async {
         let setup = setup_test_environment().await?;
-        
+
         // This echo server is on the "client" side.
         let echo_port = find_free_port()?;
         start_echo_server(echo_port);
@@ -166,13 +173,22 @@ async fn test_remote_tcp_forwarding() -> Result<()> {
         let remote_forward_port = find_free_port()?;
 
         let mut ssh_client_process: Child = Command::new("ssh")
-            .arg("-o").arg("StrictHostKeyChecking=no")
-            .arg("-o").arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
             .arg("-v")
-            .arg("-i").arg(&setup.client_key_path)
-            .arg("-p").arg(setup.ssh_port.to_string())
-            .arg("-R").arg(format!("127.0.0.1:{}:127.0.0.1:{}", remote_forward_port, echo_port))
-            .arg("-l").arg("testuser")
+            .arg("-i")
+            .arg(&setup.client_key_path)
+            .arg("-p")
+            .arg(setup.ssh_port.to_string())
+            .arg("-R")
+            .arg(format!(
+                "127.0.0.1:{}:127.0.0.1:{}",
+                remote_forward_port, echo_port
+            ))
+            .arg("-l")
+            .arg("testuser")
             .arg("127.0.0.1")
             .arg("-N") // Do not execute a remote command.
             .spawn()?;
@@ -191,12 +207,13 @@ async fn test_remote_tcp_forwarding() -> Result<()> {
         let mut buffer = [0; 1024];
         let n = stream.read(&mut buffer).await?;
         info!("REMOTE TEST: Read from server port {}", remote_forward_port);
-        
+
         assert_eq!(&buffer[..n], message);
 
         ssh_client_process.kill()?;
         setup.server_handle.abort();
 
         Ok(())
-    }).await
+    })
+    .await
 }
