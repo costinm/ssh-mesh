@@ -215,29 +215,38 @@ async fn handle_request(
 }
 
 pub async fn handle_websocket(
-    mut ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
+    ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
     server: Arc<WSServer>,
     client_id: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Handling WebSocket connection: {}", client_id);
+    server.add_client(client_id.clone(), ws).await;
 
-    // Keep connection alive - listen for incoming messages
+    let mut clients = server.clients.lock().await;
     loop {
-        match ws.read_frame().await {
-            Ok(frame) => {
-                debug!(
-                    "Received frame from {}: opcode={:?}, fin={}",
-                    client_id, frame.opcode, frame.fin
-                );
-                if frame.fin {
-                    debug!("Frame from {} is final", client_id);
+        if let Some(ws) = clients.get_mut(&client_id) {
+            match ws.read_frame().await {
+                Ok(frame) => {
+                    debug!(
+                        "Received frame from {}: opcode={:?}, fin={}",
+                        client_id, frame.opcode, frame.fin
+                    );
+                    if frame.fin {
+                        debug!("Frame from {} is final", client_id);
+                    }
+                }
+                Err(e) => {
+                    debug!("WebSocket read error for {}: {}", client_id, e);
+                    drop(clients);
+                    server.remove_client(&client_id).await;
+                    return Err(e.into());
                 }
             }
-            Err(e) => {
-                debug!("WebSocket read error for {}: {}", client_id, e);
-                server.remove_client(&client_id).await;
-                return Err(e.into());
-            }
+        } else {
+            debug!("Client {} not found in clients map", client_id);
+            drop(clients);
+            server.remove_client(&client_id).await;
+            return Ok(());
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
