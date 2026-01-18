@@ -45,11 +45,27 @@ impl WSServer {
     }
 
     pub async fn add_client(&self, id: String, ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>) {
-        self.clients.lock().await.insert(id, ws);
+        debug!("Adding client: {}", id);
+        self.clients.lock().await.insert(id.clone(), ws);
+        info!(
+            "Client added: {}, total clients: {}",
+            id,
+            self.clients.lock().await.len()
+        );
+    }
+
+    pub async fn get_client_count(&self) -> usize {
+        self.clients.lock().await.len()
     }
 
     pub async fn remove_client(&self, id: &str) {
+        debug!("Removing client: {}", id);
         self.clients.lock().await.remove(id);
+        info!(
+            "Client removed: {}, remaining clients: {}",
+            id,
+            self.clients.lock().await.len()
+        );
     }
 
     pub async fn list_clients(&self) -> Vec<String> {
@@ -61,30 +77,66 @@ impl WSServer {
         id: &str,
         message: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(ws) = self.clients.lock().await.get_mut(id) {
+        debug!(
+            "Attempting to send to client '{}': message='{}'",
+            id, message
+        );
+        let mut clients = self.clients.lock().await;
+        if let Some(ws) = clients.get_mut(id) {
+            debug!("Client '{}' found, sending frame", id);
             let frame = Frame::text(Payload::from(message.as_bytes()));
-            ws.write_frame(frame).await?;
+            match ws.write_frame(frame).await {
+                Ok(_) => {
+                    debug!("Frame sent successfully to client '{}'", id);
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to write frame to client '{}': {}", id, e);
+                    Err(e.into())
+                }
+            }
+        } else {
+            warn!("Client '{}' not found, cannot send message", id);
+            warn!(
+                "Available clients: {:?}",
+                clients.keys().collect::<Vec<_>>()
+            );
+            debug!("Message not sent (client not found)");
+            Ok(())
         }
-        Ok(())
     }
 
     pub async fn broadcast_message(&self, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("Broadcasting message: '{}'", message);
         let mut clients = self.clients.lock().await;
+        let total_clients = clients.len();
+        debug!("Broadcasting to {} clients", total_clients);
         let mut ids_to_remove = Vec::new();
 
         for (id, ws) in clients.iter_mut() {
+            debug!("Sending broadcast to client: {}", id);
             let frame = Frame::text(Payload::from(message.as_bytes()));
             if let Err(e) = ws.write_frame(frame).await {
-                error!("Failed to send message to client {}: {}", id, e);
+                error!("Failed to send broadcast to client {}: {}", id, e);
                 ids_to_remove.push(id.clone());
+            } else {
+                debug!("Broadcast sent to client: {}", id);
             }
         }
 
         // Clean up disconnected clients
-        for id in ids_to_remove {
-            clients.remove(&id);
+        if !ids_to_remove.is_empty() {
+            warn!("Removing {} disconnected clients", ids_to_remove.len());
+            for id in &ids_to_remove {
+                clients.remove(id);
+            }
         }
 
+        info!(
+            "Broadcast complete: sent to {}/{} clients",
+            total_clients - ids_to_remove.len(),
+            total_clients
+        );
         Ok(())
     }
 
@@ -142,14 +194,20 @@ async fn handle_request(
     server: Arc<WSServer>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
+    let method = req.method();
+    debug!("Incoming request: {} {}", method, path);
+    debug!("Headers: {:?}", req.headers());
 
     let handlers = server.handlers.lock().await;
     if let Some(handler) = handlers.get(path) {
+        debug!("Found handler for path: {}", path);
         let handler = handler.clone();
         drop(handlers);
         return handler(req, server).await;
     }
 
+    debug!("No handler found for path: {}", path);
+    warn!("Returning 404 for path: {}", path);
     Ok(Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Full::from("Not Found"))
@@ -157,18 +215,31 @@ async fn handle_request(
 }
 
 pub async fn handle_websocket(
-    ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
+    mut ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
     server: Arc<WSServer>,
     client_id: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("New WebSocket connection: {}", client_id);
+    info!("Handling WebSocket connection: {}", client_id);
 
-    // Add client to server
-    server.add_client(client_id.clone(), ws).await;
-
-    // Keep connection alive - in a real implementation, you would listen for messages
+    // Keep connection alive - listen for incoming messages
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        match ws.read_frame().await {
+            Ok(frame) => {
+                debug!(
+                    "Received frame from {}: opcode={:?}, fin={}",
+                    client_id, frame.opcode, frame.fin
+                );
+                if frame.fin {
+                    debug!("Frame from {} is final", client_id);
+                }
+            }
+            Err(e) => {
+                debug!("WebSocket read error for {}: {}", client_id, e);
+                server.remove_client(&client_id).await;
+                return Err(e.into());
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -217,8 +288,12 @@ pub async fn handle_websocket_upgrade(
                 }
             };
 
+            let client_id_clone = client_id.clone();
             if let Err(e) = handle_websocket(ws, server, client_id).await {
-                error!("Error in WebSocket connection for {}: {}", client_id, e);
+                error!(
+                    "Error in WebSocket connection for {}: {}",
+                    client_id_clone, e
+                );
             }
         });
 
@@ -328,7 +403,7 @@ pub async fn handle_send_message(
     req: Request<Incoming>,
     server: Arc<WSServer>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
     debug!("handle_send_message called with path: {}", path);
     let path_parts: Vec<&str> = path.split('/').collect();
     debug!("Path parts: {:?}", path_parts);
@@ -360,7 +435,7 @@ pub async fn handle_send_message(
         }
     };
 
-    let send_req: SendMessageRequest = match serde_json::from_slice(&body) {
+    let send_req: SendMessageRequest = match serde_json::from_slice::<SendMessageRequest>(&body) {
         Ok(req) => {
             debug!("Parsed message request: message='{}'", req.message);
             req
@@ -438,7 +513,7 @@ pub async fn handle_broadcast(
         }
     };
 
-    let send_req: SendMessageRequest = match serde_json::from_slice(&body) {
+    let send_req: SendMessageRequest = match serde_json::from_slice::<SendMessageRequest>(&body) {
         Ok(req) => {
             debug!("Parsed broadcast request: message='{}'", req.message);
             req

@@ -9,7 +9,9 @@ use ws::WSServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Debug)
+        .init();
 
     let http_port = env::var("HTTP_PORT")
         .map(|port| port.parse::<u16>().unwrap_or(8083))
