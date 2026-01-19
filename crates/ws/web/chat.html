@@ -217,7 +217,7 @@
     </div>
     
     <script>
-        const wsUrl = 'ws://localhost:8083/ws';
+        const wsUrl = `ws://${window.location.host}/ws`;
         console.log('Connecting to WebSocket:', wsUrl);
         const ws = new WebSocket(wsUrl);
         let selectedClient = null;
