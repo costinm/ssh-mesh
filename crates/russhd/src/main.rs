@@ -1,16 +1,12 @@
 use anyhow::Error;
 use log::{error, info};
 use pmond::ProcMon;
-use russhd::{get_port_from_env, run_ssh_server, SshServer, AppState, handlers};
+use russhd::{get_port_from_env, handlers, run_ssh_server, AppState, SshServer};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use ws::WSServer;
-
-
-
-
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -39,7 +35,7 @@ async fn main() -> Result<(), Error> {
     // Create ProcMon instance
     let proc_mon = Arc::new(ProcMon::new()?);
     proc_mon.listen(true)?;
-    proc_mon.start(true, true)?;
+    /////XXXX proc_mon.start(true, true)?;
 
     // Create WebSocket server instance
     let ws_server = Arc::new(WSServer::new());

@@ -32,7 +32,9 @@ struct TestSetup {
 async fn setup_test_environment() -> Result<TestSetup> {
     Lazy::force(&INIT_LOGGING);
 
-    let temp_dir = tempfile::Builder::new().prefix("russhd-api-test").tempdir()?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("russhd-api-test")
+        .tempdir()?;
     let base_dir = temp_dir.path().to_path_buf();
     std::fs::create_dir_all(base_dir.join(".ssh"))?;
 
@@ -50,8 +52,17 @@ async fn setup_test_environment() -> Result<TestSetup> {
         public_key_openssh.as_bytes(),
     )?;
 
-    let ssh_port = find_free_port()?;
-    let http_port = find_free_port()?;
+    // Bind HTTP listener here to ensure we have the port
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let http_port = http_listener.local_addr()?.port();
+
+    // Find a free SSH port that is different from HTTP port
+    let mut ssh_port = find_free_port()?;
+    while ssh_port == http_port {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ssh_port = find_free_port()?;
+    }
+
     let server_base_dir = base_dir.clone();
 
     let server_handle = tokio::spawn(async move {
@@ -65,18 +76,20 @@ async fn setup_test_environment() -> Result<TestSetup> {
         let ssh_server_clone = ssh_server.clone();
         tokio::spawn(async move {
             let config = ssh_server_clone.get_config();
-            if let Err(e) = russhd::run_ssh_server(ssh_port, config, (*ssh_server_clone).clone()).await {
+            if let Err(e) =
+                russhd::run_ssh_server(ssh_port, config, (*ssh_server_clone).clone()).await
+            {
                 eprintln!("SSH server failed: {}", e);
             }
         });
 
         let app = russhd::handlers::app(app_state);
-        let addr = format!("127.0.0.1:{}", http_port);
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-        axum::serve(listener, app.into_make_service()).await.unwrap();
+        axum::serve(http_listener, app.into_make_service())
+            .await
+            .unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     Ok(TestSetup {
         _temp_dir: temp_dir,
@@ -103,7 +116,10 @@ async fn test_client_api() -> Result<()> {
 
         // 1. Initially, no clients should be connected
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", setup.http_port))
+            .get(format!(
+                "http://127.0.0.1:{}/api/ssh/clients",
+                setup.http_port
+            ))
             .send()
             .await?
             .json()
@@ -113,13 +129,20 @@ async fn test_client_api() -> Result<()> {
         // 2. Connect an SSH client
         let mut ssh_client_process = Command::new("ssh")
             .arg("-v") // Enable verbose logging for client debugging
-            .arg("-o").arg("StrictHostKeyChecking=no")
-            .arg("-o").arg("UserKnownHostsFile=/dev/null")
-            .arg("-o").arg("ControlMaster=no")
-            .arg("-o").arg("ControlPath=none")
-            .arg("-i").arg(setup.client_key_path.to_str().unwrap())
-            .arg("-p").arg(setup.ssh_port.to_string())
-            .arg("-l").arg("testuser")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg("-o")
+            .arg("ControlPath=none")
+            .arg("-i")
+            .arg(setup.client_key_path.to_str().unwrap())
+            .arg("-p")
+            .arg(setup.ssh_port.to_string())
+            .arg("-l")
+            .arg("testuser")
             .arg("127.0.0.1")
             .arg("-N") // Do not execute a remote command, just connect.
             .spawn()?;
@@ -129,17 +152,19 @@ async fn test_client_api() -> Result<()> {
 
         // 3. Verify the client is listed in the API
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", setup.http_port))
+            .get(format!(
+                "http://127.0.0.1:{}/api/ssh/clients",
+                setup.http_port
+            ))
             .send()
             .await?
             .json()
             .await?;
-        
+
         let clients = res.as_object().unwrap();
         assert_eq!(clients.len(), 1); // Should have 1 client now
         let client_info = clients.values().next().unwrap();
         assert_eq!(client_info["user"], "testuser");
-
 
         // 4. Disconnect the client
         ssh_client_process.kill()?;
@@ -150,12 +175,112 @@ async fn test_client_api() -> Result<()> {
 
         // 5. Verify the client is no longer listed
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", setup.http_port))
+            .get(format!(
+                "http://127.0.0.1:{}/api/ssh/clients",
+                setup.http_port
+            ))
             .send()
             .await?
             .json()
             .await?;
         assert!(res.as_object().unwrap().is_empty());
+
+        setup.server_handle.abort();
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_client_api_over_http2() -> Result<()> {
+    run_test_with_timeout(|| async {
+        let setup = setup_test_environment().await?;
+        let client = reqwest::Client::new();
+
+        // 1. Initially, no clients should be connected
+        let res: Value = client
+            .get(format!(
+                "http://127.0.0.1:{}/api/ssh/clients",
+                setup.http_port
+            ))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert!(res.as_object().unwrap().is_empty());
+
+        // 2. Connect an SSH client via HTTP/2 proxy (H2C)
+
+        // Use the h2t binary built by cargo
+
+        let h2t_binary = env!("CARGO_BIN_EXE_h2t");
+
+        let proxy_command = format!("{} http://127.0.0.1:{}/_ssh", h2t_binary, setup.http_port);
+
+        let mut ssh_client_process = Command::new("ssh")
+            .arg("-v")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg("-o")
+            .arg("ControlPath=none")
+            .arg("-o")
+            .arg(format!("ProxyCommand={}", proxy_command))
+            .arg("-i")
+            .arg(setup.client_key_path.to_str().unwrap())
+            .arg("-l")
+            .arg("testuser")
+            .arg("127.0.0.1")
+            .arg("-N")
+            .spawn()?;
+
+        // Give it time to connect and authenticate
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // 3. Verify the client is listed in the API
+        let res: Value = client
+            .get(format!(
+                "http://127.0.0.1:{}/api/ssh/clients",
+                setup.http_port
+            ))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let clients = res.as_object().unwrap();
+        assert_eq!(
+            clients.len(),
+            1,
+            "Should have 1 client connected over HTTP/2"
+        );
+        let client_info = clients.values().next().unwrap();
+        assert_eq!(client_info["user"], "testuser");
+
+        // 4. Disconnect the client
+        ssh_client_process.kill()?;
+        ssh_client_process.wait()?;
+
+        // Give the server a moment to recognize the disconnect
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // 5. Verify the client is no longer listed
+        let res: Value = client
+            .get(format!(
+                "http://127.0.0.1:{}/api/ssh/clients",
+                setup.http_port
+            ))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert!(
+            res.as_object().unwrap().is_empty(),
+            "Client list should be empty after disconnect"
+        );
 
         setup.server_handle.abort();
         Ok(())
