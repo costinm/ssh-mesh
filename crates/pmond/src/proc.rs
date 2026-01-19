@@ -3,6 +3,7 @@ use crate::psi::{PressureType, PsiWatcher};
 use libc::close;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::io::RawFd;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -56,6 +57,27 @@ pub struct ProcMon {
 }
 
 impl ProcMon {
+    pub fn get_psi_watches(&self) -> HashMap<u32, (PressureType, String)> {
+        let watches_lock = self.psi_watcher.watches.lock().unwrap();
+        let mut result = HashMap::new();
+
+        for (&pid, watch) in watches_lock.iter() {
+            let pressure_file_name = match watch.pressure_type {
+                PressureType::Memory => "memory.pressure",
+                PressureType::Cpu => "cpu.pressure",
+                PressureType::Io => "io.pressure",
+            };
+            let pressure_file_path = format!("{}/{}", watch.cgroup_path, pressure_file_name);
+            let mut content = String::new();
+            if let Ok(mut f) = fs::File::open(&pressure_file_path) {
+                if f.read_to_string(&mut content).is_ok() {
+                    result.insert(pid, (watch.pressure_type.clone(), content.trim_end().to_string()));
+                }
+            }
+        }
+        result
+    }
+
     /// Create a new monitor and connect to Netlink.
     #[instrument]
     pub fn new() -> Result<Self, nix::Error> {
@@ -64,6 +86,13 @@ impl ProcMon {
         debug!("Connected to netlink socket: {}", nl_sock);
 
         let psi_watcher = PsiWatcher::new();
+        // let mut rx = psi_watcher.event_tx.subscribe();
+
+        // tokio::spawn(async move {
+        //     while let Ok(event) = rx.recv().await {
+        //         info!("PSI Broadcast Event: pid={}, type={:?}, data={}", event.pid, event.pressure_type, event.pressure_data);
+        //     }
+        // });
         psi_watcher.start().unwrap();
         psi_watcher.set_callback(|pid, info| {
             println!("PSI event for pid {}: {}", pid, info);
@@ -121,8 +150,6 @@ impl ProcMon {
         let processes = self.processes.clone();
         let psi_watcher = self.psi_watcher.clone();
         let handle = std::thread::spawn(move || {
-            debug!("Netlink monitoring thread started");
-
             // Wrap the proc_handle_ev call in a panic handler
             let result = std::panic::catch_unwind(|| {
                 proc_handle_ev(nl_sock, callback, running, processes, psi_watcher)
@@ -169,7 +196,6 @@ impl ProcMon {
         let mut h = self.handle.lock().unwrap();
         if let Some(handle) = h.take() {
             std::thread::spawn(move || {
-                debug!("Waiting for thread to complete");
                 let _ = handle.join();
                 debug!("Thread completed");
             });
@@ -433,7 +459,7 @@ fn read_cmdline(pid: u32) -> Option<String> {
     if let Ok(content) = std::fs::read_to_string(&cmdline_path) {
         // cmdline is null-separated, convert to space-separated for display
         if !content.is_empty() {
-            let cmdline = content.replace('\0', " ").trim_end().to_string();
+            let cmdline = content.replace("\0", " ").trim_end().to_string();
             if !cmdline.is_empty() {
                 return Some(cmdline);
             }

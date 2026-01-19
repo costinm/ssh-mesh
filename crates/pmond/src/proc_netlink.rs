@@ -399,6 +399,7 @@ pub fn proc_handle_ev(
 
 #[cfg(test)]
 mod tests {
+    use log::info;
 
     #[test]
     fn test_start_populates_processes() {

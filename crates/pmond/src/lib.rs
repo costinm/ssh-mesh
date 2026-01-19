@@ -7,3 +7,4 @@ pub mod psi;
 
 pub use handlers::handle_ps_request;
 pub use proc::{ProcMon, ProcessInfo};
+pub use psi::{PressureEvent, PsiWatcher};

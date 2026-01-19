@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn start_periodic_broadcast(ws_server: Arc<WSServer>, proc_mon: Arc<ProcMon>) {
     tokio::spawn(async move {
         loop {
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(10)).await;
             let processes = proc_mon.get_all_processes();
             match serde_json::to_string(&processes) {
                 Ok(json) => {

@@ -12,32 +12,40 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::JoinHandle;
-// Import the function to read cgroup paths from proc.rs
+use tokio::sync::broadcast;
 use crate::proc::create_process_info;
 use tracing::{debug, error, info, instrument, trace};
 
 const WAKER_TOKEN: Token = Token(1024);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum PressureType {
     Memory,
     Cpu,
     Io,
 }
 
-struct Watch {
-    cgroup_path: String,
-    pressure_type: PressureType,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PressureEvent {
+    pub pid: u32,
+    pub pressure_type: PressureType,
+    pub pressure_data: String,
+}
+
+pub struct Watch {
+    pub cgroup_path: String,
+    pub pressure_type: PressureType,
 }
 
 pub struct PsiWatcher {
     running: Arc<AtomicBool>,
-    watches: Arc<Mutex<HashMap<u32, Watch>>>, // pid -> Watch
-    new_pids: Arc<Mutex<Vec<u32>>>,           // PIDs to be added
-    terminated_pids: Arc<Mutex<Vec<u32>>>,    // PIDs to be removed
+    pub watches: Arc<Mutex<HashMap<u32, Watch>>>,
+    new_pids: Arc<Mutex<Vec<u32>>>,
+    terminated_pids: Arc<Mutex<Vec<u32>>>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     callback: Arc<Mutex<Option<Box<dyn Fn(u32, &str) + Send + Sync>>>>,
     waker: Arc<Mutex<Option<Waker>>>,
+    pub event_tx: broadcast::Sender<PressureEvent>,
 }
 
 impl PsiWatcher {
@@ -45,6 +53,7 @@ impl PsiWatcher {
     #[instrument]
     pub fn new() -> Self {
         debug!("Creating new PsiWatcher");
+        let (event_tx, _event_rx) = broadcast::channel(100); // Create a broadcast channel
         let watcher = PsiWatcher {
             running: Arc::new(AtomicBool::new(false)),
             watches: Arc::new(Mutex::new(HashMap::new())),
@@ -53,6 +62,7 @@ impl PsiWatcher {
             handle: Arc::new(Mutex::new(None)),
             callback: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
+            event_tx,
         };
         info!("PsiWatcher created successfully");
         watcher
@@ -93,10 +103,11 @@ impl PsiWatcher {
                     new_pids.push(pid);
                     drop(new_pids);
 
-                    debug!("Process {} added to PSI watcher", pid);
                     if let Some(waker) = self.waker.lock().unwrap().as_ref() {
                         if let Err(e) = waker.wake() {
-                            error!("Failed to wake PSI watcher for PID {}: {}", pid, e);
+                            debug!("Failed to wake PSI watcher for PID {}: {}", pid, e);
+                        } else {
+                            debug!("Process {} added to PSI watcher", pid);
                         }
                     }
                 } else {
@@ -104,7 +115,7 @@ impl PsiWatcher {
                 }
             }
             Err(e) => {
-                error!("Failed to create process info for PID {}: {}", pid, e);
+                debug!("Failed to create process info for PID {}: {}", pid, e);
             }
         }
     }
@@ -129,7 +140,7 @@ impl PsiWatcher {
         debug!("Starting PSI monitoring thread");
         if self.running.load(Ordering::SeqCst) {
             debug!("PSI monitoring already running");
-            return Ok(());
+            return Ok(())
         }
 
         self.running.store(true, Ordering::SeqCst);
@@ -141,6 +152,7 @@ impl PsiWatcher {
         let terminated_pids = self.terminated_pids.clone();
         let callback = self.callback.clone();
         let waker = self.waker.clone();
+        let event_tx = self.event_tx.clone();
 
         let handle = std::thread::spawn(move || {
             debug!("PSI monitoring thread started");
@@ -155,8 +167,7 @@ impl PsiWatcher {
 
             {
                 let watches_snapshot = watches.lock().unwrap();
-                debug!(
-                    "Setting up watches for {} processes",
+                info!("Setting up watches for {} processes",
                     watches_snapshot.len()
                 );
                 for (&pid, watch) in watches_snapshot.iter() {
@@ -301,8 +312,8 @@ impl PsiWatcher {
                                 trace!("PSI event for PID: {}", pid);
                                 if files.contains_key(&pid) {
                                     let mut content = String::new();
-                                    let watch = watches.lock().unwrap();
-                                    let watch = watch.get(&pid).unwrap();
+                                    let watch_guard = watches.lock().unwrap();
+                                    let watch = watch_guard.get(&pid).unwrap();
                                     let pressure_file_name = match watch.pressure_type {
                                         PressureType::Memory => "memory.pressure",
                                         PressureType::Cpu => "cpu.pressure",
@@ -317,16 +328,24 @@ impl PsiWatcher {
                                                 pid,
                                                 content.len()
                                             );
+                                            let event = PressureEvent {
+                                                pid,
+                                                pressure_type: watch.pressure_type.clone(),
+                                                pressure_data: content.trim_end().to_string(),
+                                            };
+                                            if let Err(e) = event_tx.send(event) {
+                                                error!("Failed to broadcast PSI event: {}", e);
+                                            }
                                             let cb = callback.lock().unwrap();
                                             if let Some(ref callback_fn) = *cb {
-                                                debug!(
+                                                info!(
                                                     "PSI event for process {}: \n{}",
                                                     pid,
                                                     content.trim_end()
                                                 );
                                                 callback_fn(pid, &content.trim_end());
                                             } else {
-                                                debug!(
+                                                info!(
                                                     "PSI event for process {}: \n{}",
                                                     pid,
                                                     content.trim_end()
