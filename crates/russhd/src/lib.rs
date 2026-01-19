@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::StreamExt;
 use tracing::{debug, error as tracing_error, instrument, trace};
 
-use pmond::ProcMon;
+// use pmond::ProcMon;
 use ws::WSServer;
 
 // File paths for SSH authentication
@@ -100,7 +100,7 @@ pub struct ConnectedClientInfo {
 #[derive(Clone)]
 pub struct AppState {
     pub ssh_server: Arc<SshServer>,
-    pub proc_mon: Arc<ProcMon>,
+    //pub proc_mon: Arc<ProcMon>,
     pub ws_server: Arc<WSServer>,
 }
 

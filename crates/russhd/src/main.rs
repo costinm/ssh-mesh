@@ -1,6 +1,6 @@
 use anyhow::Error;
 use log::{error, info};
-use pmond::ProcMon;
+//use pmond::ProcMon;
 use russhd::{get_port_from_env, handlers, run_ssh_server, AppState, SshServer};
 use std::env;
 use std::path::PathBuf;
@@ -33,8 +33,8 @@ async fn main() -> Result<(), Error> {
     let ssh_server = Arc::new(SshServer::new(0, None, base_dir));
 
     // Create ProcMon instance
-    let proc_mon = Arc::new(ProcMon::new()?);
-    proc_mon.listen(true)?;
+    //let proc_mon = Arc::new(ProcMon::new()?);
+    //proc_mon.listen(true)?;
     /////XXXX proc_mon.start(true, true)?;
 
     // Create WebSocket server instance
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Error> {
     // Create AppState
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
-        proc_mon: proc_mon.clone(),
+        //proc_mon: proc_mon.clone(),
         ws_server: ws_server.clone(),
     };
 

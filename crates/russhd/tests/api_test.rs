@@ -69,7 +69,6 @@ async fn setup_test_environment() -> Result<TestSetup> {
         let ssh_server = std::sync::Arc::new(russhd::SshServer::new(0, None, server_base_dir));
         let app_state = russhd::AppState {
             ssh_server: ssh_server.clone(),
-            proc_mon: std::sync::Arc::new(pmond::ProcMon::new().unwrap()),
             ws_server: std::sync::Arc::new(ws::WSServer::new()),
         };
 
@@ -263,6 +262,9 @@ async fn test_client_api_over_http2() -> Result<()> {
         // 4. Disconnect the client
         ssh_client_process.kill()?;
         ssh_client_process.wait()?;
+
+        // TODO: this appears to panic in some cases - ssh doesn't handle it 
+        // properly, and the client is not removed.
 
         // Give the server a moment to recognize the disconnect
         tokio::time::sleep(Duration::from_secs(5)).await;

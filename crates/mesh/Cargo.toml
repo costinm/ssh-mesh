@@ -66,10 +66,6 @@ crate-type = ["staticlib", "rlib"]
 name = "ssh-mesh"
 path = "src/main.rs"
 
-[[bin]]
-name = "h2t"
-path = "src/bin/h2t.rs"
-
 #[target.'cfg(target_env = "musl")']
 #rustflags = ["-C", "target-feature=+crt-static"]
 
