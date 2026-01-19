@@ -5,7 +5,7 @@ use nix::unistd::{dup2, setsid};
 use openpty::openpty;
 use russh::keys::{PrivateKey, PublicKey, PublicKeyBase64};
 use russh::server::Server;
-use russh::{server, ChannelId, MethodKind};
+use russh::{server, ChannelId, MethodKind, MethodSet};
 use ssh_key::LineEnding;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
@@ -18,26 +18,55 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::SystemTime,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::process::Command;
+use serde::Serialize;
 use tokio::sync::{mpsc, Mutex};
-// use tokio::fs::File; // unused import removed
 use bytes::Buf;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{body::Incoming, Request, Response};
 use tracing::{debug, error as tracing_error, instrument, trace};
 
+use pmond::ProcMon;
+use ws::WSServer;
+
 // File paths for SSH authentication
 const AUTHORIZED_KEYS_PATH: &str = ".ssh/authorized_keys";
 const AUTHORIZED_CAS_PATH: &str = ".ssh/authorized_cas";
 const DEBUG_PTY: bool = false;
 
-// TODO: move the env vars to main
-// TODO: move key generation to separate module, main should write the files.
-// TODO: load_authorized key public method, take file path, another method with bytes.
+pub mod handlers {
+    use axum::{
+        extract::State,
+        http::StatusCode,
+        response::{Html, IntoResponse},
+        routing::get,
+        Json, Router,
+    };
+
+    use crate::AppState;
+
+    pub fn app(app_state: AppState) -> Router {
+        Router::new()
+            .route("/", get(serve_index))
+            .route("/api/ssh/clients", get(get_ssh_clients))
+            .with_state(app_state)
+    }
+
+    async fn serve_index() -> impl IntoResponse {
+        let html_content = tokio::fs::read_to_string("web/ssh.html").await.unwrap();
+        Html(html_content)
+    }
+
+    async fn get_ssh_clients(State(app_state): State<AppState>) -> impl IntoResponse {
+        let clients = app_state.ssh_server.connected_clients.lock().await;
+        (StatusCode::OK, Json(clients.clone()))
+    }
+}
 
 // Configuration for the SSH server
 #[derive(Clone)]
@@ -52,17 +81,26 @@ pub struct SshServer {
     /// Active SSH handlers indexed by their ID
     active_handlers: Arc<Mutex<HashMap<usize, Arc<Mutex<SshHandler>>>>>,
     /// Track connected clients with their remote forward listeners
-    connected_clients: Arc<Mutex<HashMap<usize, ConnectedClientInfo>>>,
+    pub connected_clients: Arc<Mutex<HashMap<usize, ConnectedClientInfo>>>,
 }
 
 /// Information about a connected client
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ConnectedClientInfo {
     pub id: usize,
     pub user: String,
     pub remote_forward_listeners: Vec<(String, u32)>,
-    pub connected_at: std::time::SystemTime,
+    pub connected_at: SystemTime,
 }
+
+#[derive(Clone)]
+pub struct AppState {
+    pub ssh_server: Arc<SshServer>,
+    pub proc_mon: Arc<ProcMon>,
+    pub ws_server: Arc<WSServer>,
+}
+
+// TODO: move the env vars to main
 
 impl SshServer {
     /// Create a new SshServer instance with an optional private key
@@ -140,10 +178,7 @@ impl SshServer {
                 // Note: PEM format support could be added here if needed
                 // For now, we'll rely on the existing OpenSSH and binary format support
                 // If parsing fails, we'll generate a new key below
-                debug!(
-                    "Failed to parse existing file in any known format {:?} {:?}",
-                    key_path, key_data
-                );
+                debug!("Failed to parse existing file in any known format {:?} {:?}", key_path, key_data);
             }
         }
         debug!("existing file not found, generating new");
@@ -212,10 +247,7 @@ async fn validate_public_key(
         }
     };
 
-    trace!(
-        "Comparing against {} authorized keys",
-        authorized_keys.len()
-    );
+    trace!("Comparing against {} authorized keys", authorized_keys.len());
     // Compare against all authorized keys using fingerprints
     let incoming_fingerprint = incoming_key.fingerprint(ssh_key::HashAlg::Sha256);
 
@@ -223,10 +255,7 @@ async fn validate_public_key(
         let authorized_fingerprint = authorized_key.fingerprint(ssh_key::HashAlg::Sha256);
 
         if incoming_fingerprint == authorized_fingerprint {
-            info!(
-                "Public key authentication successful (match at index {})",
-                i
-            );
+            info!("Public key authentication successful (match at index {})", i);
             return Ok(server::Auth::Accept);
         }
     }
@@ -294,10 +323,8 @@ async fn validate_certificate(
         let user_matches = valid_principals.iter().any(|p| p == user);
 
         if !user_matches {
-            info!(
-                "Certificate principals {:?} do not include user '{}'",
-                valid_principals, user
-            );
+            info!("Certificate principals {:?} do not include user 
+išt{}", valid_principals, user);
             return Ok(server::Auth::Reject {
                 proceed_with_methods: None,
                 partial_success: false,
@@ -385,6 +412,8 @@ impl server::Handler for SshHandler {
         let authorized_keys = self.server.authorized_keys.clone();
         let ca_keys = self.server.ca_keys.clone();
         let user_str = user.to_string();
+        let connected_clients = self.server.connected_clients.clone();
+        let handler_id = self.id;
 
         self.user = user_str.clone();
         // Serialize russh key to OpenSSH format for ssh-key crate
@@ -396,13 +425,28 @@ impl server::Handler for SshHandler {
         async move {
             trace!("Validating public key for user: {}", user);
             // Detect if this is a certificate or regular key
-            if key_openssh.contains("-cert-v01@openssh.com") {
+            let auth_result = if key_openssh.contains("-cert-v01@openssh.com") {
                 debug!("Validating certificate for user: {}", user);
-                validate_certificate(&key_openssh, &user, &ca_keys).await
+                let result = validate_certificate(&key_openssh, &user_str, &ca_keys).await;
+                result
             } else {
                 debug!("Validating public key for user: {}", user);
-                validate_public_key(&key_openssh, &authorized_keys).await
+                let result = validate_public_key(&key_openssh, &authorized_keys).await;
+                result
+            };
+
+            if let Ok(server::Auth::Accept) = auth_result {
+                let mut clients = connected_clients.lock().await;
+                let client_info = ConnectedClientInfo {
+                    id: handler_id,
+                    user: user_str.clone(), // Clone user_str here
+                    remote_forward_listeners: Vec::new(),
+                    connected_at: SystemTime::now(),
+                };
+                clients.insert(handler_id, client_info);
             }
+
+            auth_result
         }
     }
 
@@ -435,11 +479,7 @@ impl server::Handler for SshHandler {
             sessions_lock.insert(channel_id, channel_session);
             drop(sessions_lock);
 
-            trace!(
-                "Created new session for channel {:?} in handler {}",
-                channel_id,
-                handler_id
-            );
+            trace!("Created new session for channel {:?} in handler {}", channel_id, handler_id);
             Ok(true)
         }
     }
@@ -454,10 +494,7 @@ impl server::Handler for SshHandler {
         originator_port: u32,
         session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        info!(
-            "Direct TCP/IP connection request: {}:{} from {}:{}",
-            host_to_connect, port_to_connect, originator_ip_address, originator_port
-        );
+        info!("Direct TCP/IP connection request: {}:{} from {}:{}", host_to_connect, port_to_connect, originator_ip_address, originator_port);
         debug!("SSH handler ID: {}", self.id);
 
         let channel_id = channel.id();
@@ -470,13 +507,7 @@ impl server::Handler for SshHandler {
         let session_handle = session.handle();
 
         async move {
-            trace!(
-                "Processing direct TCP/IP connection for: {}:{} from {}:{}",
-                host,
-                port,
-                originator_ip,
-                originator_port
-            );
+            trace!("Processing direct TCP/IP connection for: {}:{} from {}:{}", host, port, originator_ip, originator_port);
 
             // Create a new session entry for this channel
             let channel_session = ChannelSession {
@@ -492,11 +523,7 @@ impl server::Handler for SshHandler {
             sessions_lock.insert(channel_id, channel_session);
             drop(sessions_lock);
 
-            trace!(
-                "Created new direct TCP/IP session for channel {:?} in handler {}",
-                channel_id,
-                handler_id
-            );
+            trace!("Created new direct TCP/IP session for channel {:?} in handler {}", channel_id, handler_id);
 
             // Establish a TCP connection to the target host:port
             let target_addr = format!("{}:{}", host, port);
@@ -535,18 +562,12 @@ impl server::Handler for SshHandler {
                                         .data(channel_id, (&buffer[..n]).into())
                                         .await
                                     {
-                                        error!(
-                                            "Failed to send data to SSH channel {:?}: {:?}",
-                                            channel_id, e
-                                        );
+                                        error!("Failed to send data to SSH channel {:?}: {:?}", channel_id, e);
                                         break;
                                     }
                                 }
                                 Err(e) => {
-                                    error!(
-                                        "Failed to read from TCP connection for channel {:?}: {}",
-                                        channel_id, e
-                                    );
+                                    error!("Failed to read from TCP connection for channel {:?}: {}", channel_id, e);
                                     break;
                                 }
                             }
@@ -567,17 +588,11 @@ impl server::Handler for SshHandler {
                         while let Some(data) = rx.recv().await {
                             info!("SSHd received data from target server");
                             if let Err(e) = tcp_writer.write_all(&data).await {
-                                error!(
-                                    "Failed to write to TCP connection for channel {:?}: {}",
-                                    channel_id, e
-                                );
+                                error!("Failed to write to TCP connection for channel {:?}: {}", channel_id, e);
                                 break;
                             }
                             if let Err(e) = tcp_writer.flush().await {
-                                error!(
-                                    "Failed to write to TCP connection for channel {:?}: {}",
-                                    channel_id, e
-                                );
+                                error!("Failed to write to TCP connection for channel {:?}: {}", channel_id, e);
                                 break;
                             }
                         }
@@ -633,10 +648,7 @@ impl server::Handler for SshHandler {
                 .output()
                 .map_err(anyhow::Error::new)?;
 
-            debug!(
-                "Command execution completed with status: {:?}",
-                output.status
-            );
+            debug!("Command execution completed with status: {:?}", output.status);
 
             // Send the command output back to the client
             if !output.stdout.is_empty() {
@@ -672,11 +684,7 @@ impl server::Handler for SshHandler {
         session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let _data_str = String::from_utf8_lossy(data).to_string();
-        trace!(
-            "Received data on channel {:?}: {} bytes",
-            channel,
-            data.len()
-        );
+        trace!("Received data on channel {:?}: {} bytes", channel, data.len());
         debug!("SSH handler ID: {}", self.id);
 
         // Check if this is a direct TCP/IP channel and forward data to the TCP connection
@@ -690,21 +698,13 @@ impl server::Handler for SshHandler {
             let writers = tcp_writers.lock().await;
             if let Some(tx) = writers.get(&channel_id) {
                 // Forward data to the TCP connection or PTY
-                trace!(
-                    "Forwarding {} bytes from SSH channel {:?}",
-                    data_vec.len(),
-                    channel_id
-                );
+                trace!("Forwarding {} bytes from SSH channel {:?}", data_vec.len(), channel_id);
                 if let Err(e) = tx.send(Bytes::from(data_vec.clone())) {
                     error!("Failed to send data for channel {:?}: {}", channel_id, e);
                 }
             } else {
                 // Not a direct TCP/IP channel, echo the data back for other types of channels
-                trace!(
-                    "Echoing data back ({} bytes) for non-TCP channel {:?}",
-                    data_vec.len(),
-                    channel_id
-                );
+                trace!("Echoing data back ({} bytes) for non-TCP channel {:?}", data_vec.len(), channel_id);
                 let _ = session_handle.data(channel_id, data_vec.into()).await;
             }
             Ok(())
@@ -783,18 +783,15 @@ impl server::Handler for SshHandler {
                         dup2(slave_fd, 1).map_err(|e| std::io::Error::other(e))?;
                         dup2(slave_fd, 2).map_err(|e| std::io::Error::other(e))?;
                         Ok(())
-                    })
-                };
+                    });
+                }
                 let child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
                 // Save the child process and its stdin for later cleanup.
                 channel_session.process = Some(child);
                 // Return the PTY for I/O handling.
                 Some(pty.1)
             } else {
-                trace!(
-                    "No session found for channel {:?} when processing shell request",
-                    channel_id
-                );
+                trace!("No session found for channel {:?} when processing shell request", channel_id);
                 None
             };
             drop(sessions_lock);
@@ -817,18 +814,12 @@ impl server::Handler for SshHandler {
                 use std::os::unix::io::FromRawFd;
                 let master_fd_read = unsafe { nix::libc::dup(master_fd) };
                 if master_fd_read < 0 {
-                    return Err(anyhow::Error::msg(
-                        "Failed to duplicate master FD for reading",
-                    ));
+                    return Err(anyhow::Error::msg("Failed to duplicate master FD for reading"));
                 }
                 let master_fd_write = unsafe { nix::libc::dup(master_fd) };
                 if master_fd_write < 0 {
-                    unsafe {
-                        nix::libc::close(master_fd_read);
-                    }
-                    return Err(anyhow::Error::msg(
-                        "Failed to duplicate master FD for writing",
-                    ));
+                    unsafe { nix::libc::close(master_fd_read); }
+                    return Err(anyhow::Error::msg("Failed to duplicate master FD for writing"));
                 }
 
                 // Now create File objects from the duplicated FDs
@@ -837,7 +828,6 @@ impl server::Handler for SshHandler {
 
                 let mut master_read = tokio::fs::File::from_std(master_read_file);
                 let mut master_write = tokio::fs::File::from_std(master_write_file);
-                trace!("Created independent read/write handles for PTY master");
                 drop(slave);
 
                 // Get a handle to the SSH channel for sending data back.
@@ -850,7 +840,7 @@ impl server::Handler for SshHandler {
                     loop {
                         match master_read.read(&mut buf).await {
                             Ok(0) => {
-                                // EOF – the child exited.
+                                // EOF - connection closed
                                 trace!("PTY closed (EOF) for channel {:?}", ch_id);
                                 let _ = session_handle.close(ch_id).await;
                                 break;
@@ -892,29 +882,16 @@ impl server::Handler for SshHandler {
                 }
                 // Spawn a task that consumes data from the channel (via the writer) and writes to the PTY master.
                 tokio::spawn(async move {
-                    info!(
-                        "PTY WRITER: Starting SSH to PTY writer task for channel {:?}",
-                        ch_id
-                    );
+                    info!("PTY WRITER: Starting SSH to PTY writer task for channel {:?}", ch_id);
                     while let Some(data) = rx.recv().await {
-                        info!(
-                            "PTY WRITER: Received from SSH, writing {} bytes to PTY: {:?}",
-                            data.len(),
-                            data
-                        );
+                        info!("PTY WRITER: Received from SSH, writing {} bytes to PTY: {:?}", data.len(), data);
                         if let Err(e) = master_write.write_all(&data).await {
-                            error!(
-                                "PTY WRITER: Error writing to PTY for channel {:?}: {}",
-                                ch_id, e
-                            );
+                            error!("PTY WRITER: Error writing to PTY for channel {:?}: {}", ch_id, e);
                             break;
                         }
                         info!("PTY WRITER: Write successful, flushing...");
                         if let Err(e) = master_write.flush().await {
-                            error!(
-                                "PTY WRITER: Error flushing PTY for channel {:?}: {}",
-                                ch_id, e
-                            );
+                            error!("PTY WRITER: Error flushing PTY for channel {:?}: {}", ch_id, e);
                             break;
                         }
                         info!("PTY WRITER: Flush successful for {} bytes", data.len());
@@ -939,16 +916,7 @@ impl server::Handler for SshHandler {
         modes: &[(russh::Pty, u32)],
         _session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        info!(
-            "PTY request for channel {:?}: term={}, {}x{} ({}x{} px), modes: {} entries",
-            channel,
-            term,
-            col_width,
-            row_height,
-            pix_width,
-            pix_height,
-            modes.len()
-        );
+        info!("PTY request for channel {:?}: term={}, {}x{} ({}x{} px), modes: {} entries", channel, term, col_width, row_height, pix_width, pix_height, modes.len());
 
         let sessions = self.sessions.clone();
         let channel_id = channel;
@@ -981,15 +949,10 @@ impl server::Handler for SshHandler {
                         ws_xpixel: pix_width as u16,
                         ws_ypixel: pix_height as u16,
                     };
-                    unsafe {
-                        nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &mut winsize);
-                    }
+                    unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &mut winsize); }
                 }
             } else {
-                trace!(
-                    "No session found for channel {:?} when processing PTY request",
-                    channel_id
-                );
+                trace!("No session found for channel {:?} when processing PTY request", channel_id);
             }
             drop(sessions_lock);
 
@@ -1008,10 +971,7 @@ impl server::Handler for SshHandler {
         variable_value: &str,
         _session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        info!(
-            "Env request for channel {:?}: {}={}",
-            channel, variable_name, variable_value
-        );
+        info!("Env request for channel {:?}: {}={}", channel, variable_name, variable_value);
 
         let sessions = self.sessions.clone();
         let channel_id = channel;
@@ -1038,10 +998,7 @@ impl server::Handler for SshHandler {
         pix_height: u32,
         _session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        info!(
-            "Window change request for channel {:?}: {}x{} ({}x{} px)",
-            channel, col_width, row_height, pix_width, pix_height
-        );
+        info!("Window change request for channel {:?}: {}x{} ({}x{} px)", channel, col_width, row_height, pix_width, pix_height);
 
         let sessions = self.sessions.clone();
         let channel_id = channel;
@@ -1064,12 +1021,14 @@ impl server::Handler for SshHandler {
                         ws_xpixel: pix_width as u16,
                         ws_ypixel: pix_height as u16,
                     };
-                    unsafe {
-                        nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &mut winsize);
-                    }
+                    unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &mut winsize); }
                 }
             }
             drop(sessions_lock);
+
+            // We're accepting PTY requests but actual terminal emulation
+            // would need to be implemented based on these parameters
+            trace!("Processing PTY request with terminal info");
             Ok(())
         }
     }
@@ -1227,10 +1186,7 @@ impl server::Handler for SshHandler {
         port: u32,
         _session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        info!(
-            "Request to cancel TCP/IP forwarding for {}:{}",
-            address, port
-        );
+        info!("Request to cancel TCP/IP forwarding for {}:{}", address, port);
         let remote_forward_listeners = self.remote_forward_listeners.clone();
         let address = address.to_string();
 
@@ -1242,11 +1198,7 @@ impl server::Handler for SshHandler {
                 info!("Cancelled TCP/IP forwarding for {}:{}", address, port);
                 Ok(true)
             } else {
-                log::warn!(
-                    "No active forwarding found for {}:{} to cancel",
-                    address,
-                    port
-                );
+                log::warn!("No active forwarding found for {}:{} to cancel", address, port);
                 Ok(false)
             }
         }
@@ -1273,6 +1225,7 @@ impl server::Handler for SshHandler {
 
         let sessions = self.sessions.clone();
         let tcp_writers = self.tcp_writers.clone();
+        let connected_clients = self.server.connected_clients.clone();
         let handler_id = self.id;
         let channel_id = channel;
 
@@ -1280,11 +1233,7 @@ impl server::Handler for SshHandler {
             // Remove the session from our sessions map and clean up PTY process if any
             let mut sessions_lock = sessions.lock().await;
             if let Some(mut removed_session) = sessions_lock.remove(&channel_id) {
-                trace!(
-                    "Removed session for channel {:?} from handler {}",
-                    channel_id,
-                    handler_id
-                );
+                trace!("Removed session for channel {:?} from handler {}", channel_id, handler_id);
                 // If a PTY process was spawned, kill it.
                 if let Some(mut child) = removed_session.process.take() {
                     // Attempt graceful termination, then force kill if needed.
@@ -1293,11 +1242,7 @@ impl server::Handler for SshHandler {
                 drop(sessions_lock);
                 trace!("Cleaned up session data for channel {:?}", channel_id);
             } else {
-                trace!(
-                    "No session found for channel {:?} in handler {}",
-                    channel_id,
-                    handler_id
-                );
+                trace!("No session found for channel {:?} in handler {}", channel_id, handler_id);
             }
 
             // Remove the writer (PTY or TCP) for this channel if it exists
@@ -1307,6 +1252,11 @@ impl server::Handler for SshHandler {
             } else {
                 trace!("No writer found for channel {:?}", channel_id);
             }
+
+            // Remove the client from the connected_clients map
+            let mut clients = connected_clients.lock().await;
+            clients.remove(&handler_id);
+            eprintln!("DEBUG: Client {} removed. Connected clients remaining: {:?}", handler_id, clients.keys().collect::<Vec<_>>());
 
             Ok(())
         }
@@ -1343,16 +1293,54 @@ impl server::Server for SshServer {
 pub async fn run_ssh_server(
     port: u16,
     config: server::Config,
-    server: SshServer,
+    mut server: SshServer,
 ) -> Result<(), anyhow::Error> {
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting SSH server on {}", addr);
     debug!("SSH server configuration: {:?}", config);
 
-    let mut server = server;
-    server.run_on_address(Arc::new(config), &addr).await?;
-    Ok(())
+    let config = Arc::new(config);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let config = config.clone();
+        let mut server_clone = server.clone();
+
+        tokio::spawn(async move {
+            let handler = server_clone.new_client(Some(peer_addr));
+            let handler_id = handler.id;
+            
+            debug!("Starting session for handler {}", handler_id);
+
+            match russh::server::run_stream(config, stream, handler).await {
+                Ok(session) => {
+                    // Drive the session to completion
+                    if let Err(e) = session.await {
+                        error!("SSH session error for handler {}: {:?}", handler_id, e);
+                    }
+                }
+                Err(e) => {
+                    error!("SSH handshake failed for handler {}: {}", handler_id, e);
+                }
+            }
+
+            // Explicit cleanup after session ends (for any reason: disconnect, kill, error)
+            debug!("Session ended for handler {}, performing cleanup", handler_id);
+            let mut clients = server_clone.connected_clients.lock().await;
+            if clients.remove(&handler_id).is_some() {
+                debug!("Removed client {} from connected_clients", handler_id);
+            } else {
+                debug!("Client {} was not in connected_clients (already removed or never authenticated)", handler_id);
+            }
+            debug!("Connected clients remaining: {:?}", clients.keys().collect::<Vec<_>>());
+        });
+    }
 }
+
+// TODO: hook this method into the app
+// TODO: add pmon, ws methods into the app
+// TODO: add monitoring from ws create.
 
 // SSH handler for /_ssh* paths - handles SSH over HTTP/2
 #[instrument(skip(req), fields(method = %req.method(), uri = %req.uri()))]
@@ -1425,9 +1413,7 @@ pub async fn handle_ssh_request(
             // In a real implementation, you'd want to stream the response
             let response = Response::builder()
                 .status(200)
-                .body(Full::new(Bytes::from(
-                    "SSH session established over HTTP/2",
-                )))
+                .body(Full::new(Bytes::from("SSH session established over HTTP/2")))
                 .unwrap();
 
             Ok(response)
@@ -1436,10 +1422,7 @@ pub async fn handle_ssh_request(
             tracing_error!("Failed to start SSH session: {:?}", e);
             let response = Response::builder()
                 .status(500)
-                .body(Full::new(Bytes::from(format!(
-                    "SSH session failed: {:?}",
-                    e
-                ))))
+                .body(Full::new(Bytes::from(format!("SSH session failed: {:?}", e))))
                 .unwrap();
             Ok(response)
         }
@@ -1549,7 +1532,7 @@ pub fn save_ca_keypair(
     let public_key_path = ssh_dir.join("id_ca.pub");
 
     // Save private key in OpenSSH format
-    let private_key_pem = private_key.to_openssh(ssh_key::LineEnding::LF)?;
+    let private_key_pem = private_key.to_openssh(LineEnding::LF)?;
     fs::write(&private_key_path, private_key_pem.as_bytes())?;
 
     // Set proper permissions on private key (0600)
@@ -1565,11 +1548,7 @@ pub fn save_ca_keypair(
     let public_key_str = public_key.to_openssh()?;
     fs::write(&public_key_path, public_key_str.as_bytes())?;
 
-    info!(
-        "CA keypair saved to {} and {}",
-        private_key_path.display(),
-        public_key_path.display()
-    );
+    info!("CA keypair saved to {} and {}", private_key_path.display(), public_key_path.display());
     Ok(())
 }
 
@@ -1581,10 +1560,7 @@ pub fn load_ca_private_key(base_dir: &Path) -> Result<ssh_key::PrivateKey, anyho
     let private_key_path = base_dir.join(".ssh").join("id_ca");
 
     if !private_key_path.exists() {
-        return Err(anyhow::Error::msg(format!(
-            "CA private key not found at {}. Run generate_ca_keypair() first.",
-            private_key_path.display()
-        )));
+        return Err(anyhow::Error::msg(format!("CA private key not found at {}. Run generate_ca_keypair() first.", private_key_path.display())));
     }
 
     let private_key_data = fs::read_to_string(&private_key_path)?;
@@ -1709,9 +1685,7 @@ mod tests {
         // The keys should be identical
         assert_eq!(
             first_key.to_bytes().expect("Failed to serialize first key"),
-            second_key
-                .to_bytes()
-                .expect("Failed to serialize second key"),
+            second_key.to_bytes().expect("Failed to serialize second key"),
             "Keys should be identical after reload"
         );
     }
@@ -1741,8 +1715,7 @@ fn load_authorized_keys(base_dir: &Path) -> Result<Vec<ssh_key::PublicKey>, anyh
         return Ok(Vec::new());
     }
 
-    let content =
-        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     parse_authorized_keys_content(&content)
 }
@@ -1764,11 +1737,7 @@ fn parse_authorized_keys_content(content: &str) -> Result<Vec<ssh_key::PublicKey
             Ok(key) => keys.push(key),
             Err(e) => {
                 // Log warning but continue (don't fail on malformed lines)
-                log::warn!(
-                    "Failed to parse authorized_keys line {}: {}",
-                    line_num + 1,
-                    e
-                );
+                log::warn!("Failed to parse authorized_keys line {}: {}", line_num + 1, e);
             }
         }
     }
@@ -1791,8 +1760,7 @@ fn load_authorized_cas(base_dir: &Path) -> Result<Vec<ssh_key::PublicKey>, anyho
         return Ok(Vec::new());
     }
 
-    let content =
-        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     parse_authorized_cas_content(&content)
 }
@@ -1812,10 +1780,7 @@ fn parse_authorized_cas_content(content: &str) -> Result<Vec<ssh_key::PublicKey>
         // OpenSSH format with @cert-authority marker:
         // @cert-authority [principals="..."] keytype base64-key [comment]
         if !line.starts_with("@cert-authority") && !line.starts_with("cert-authority") {
-            log::warn!(
-                "authorized_cas line {} missing cert-authority marker, skipping",
-                line_num + 1
-            );
+            log::warn!("authorized_cas line {} missing cert-authority marker, skipping", line_num + 1);
             continue;
         }
 
@@ -1843,11 +1808,7 @@ fn parse_authorized_cas_content(content: &str) -> Result<Vec<ssh_key::PublicKey>
         match ssh_key::PublicKey::from_openssh(&key_line) {
             Ok(key) => ca_keys.push(key),
             Err(e) => {
-                log::warn!(
-                    "Failed to parse authorized_cas line {}: {}",
-                    line_num + 1,
-                    e
-                );
+                log::warn!("Failed to parse authorized_cas line {}: {}", line_num + 1, e);
             }
         }
     }

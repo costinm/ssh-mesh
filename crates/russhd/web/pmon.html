@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PMOND - Process Monitor</title>
+    <style>
+        :root {
+            --primary: #4361ee;
+            --secondary: #3f37c9;
+            --success: #4cc9f0;
+            --danger: #f72585;
+            --warning: #f8961e;
+            --info: #4895ef;
+            --light: #f8f9fa;
+            --dark: #212529;
+            --gray: #6c757d;
+            --gray-light: #e9ecef;
+            --border: #dee2e6;
+            --card-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            --transition: all 0.3s ease;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+         body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f7fb;
+            color: #333;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            overflow-x: hidden;
+        }
+        
+        .container {
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        
+        .dashboard {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 25px;
+            margin-bottom: 25px;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        
+        .process-card, .log-card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: var(--card-shadow);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        
+        .card-body {
+            padding: 0;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        
+        .process-table-container {
+            flex: 1;
+            overflow-y: auto;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        
+        #process-table {
+            width: 100%;
+            table-layout: fixed;
+            min-width: 100%;
+            box-sizing: border-box;
+        }
+        
+        #process-table col {
+            width: 16.666%;
+        }
+        
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 25px;
+            box-shadow: var(--card-shadow);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .header-content h1 {
+            font-size: 2.2rem;
+            margin-bottom: 8px;
+        }
+        
+        .header-content p {
+            opacity: 0.9;
+            font-size: 1.1rem;
+        }
+        
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            background: rgba(255, 255, 255, 0.15);
+            padding: 12px 20px;
+            border-radius: 50px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        
+        .connected {
+            background-color: #28a745;
+        }
+        
+        .disconnected {
+            background-color: #dc3545;
+        }
+        
+        .process-count {
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 25px;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: var(--transition);
+            box-shadow: var(--card-shadow);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button.secondary {
+            background: linear-gradient(135deg, var(--info), #3a86ff);
+        }
+        
+        button.warning {
+            background: linear-gradient(135deg, var(--warning), #f3722c);
+        }
+        
+        button:disabled {
+            background: var(--gray-light);
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        
+        .card-header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 18px 25px;
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+        
+        .card-body {
+            padding: 0;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+        }
+        
+         .process-table-container {
+            flex: 1;
+            overflow-y: auto;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        
+         #process-table {
+            width: 100%;
+            table-layout: fixed;
+            min-width: 100%;
+        }
+        
+        #process-table th,
+        #process-table td {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+/* Ensure columns are distributed properly */
+         #process-table col:nth-child(1) { width: 6%; }
+         #process-table col:nth-child(2) { width: 6%; }
+         #process-table col:nth-child(3) { width: 12%; }
+         #process-table col:nth-child(4) { width: 12%; }
+         #process-table col:nth-child(5) { width: 64%; }
+        
+        /* For responsive design */
+        @media (max-width: 768px) {
+            #process-table col:nth-child(1) { width: 15%; }
+            #process-table col:nth-child(2) { width: 15%; }
+            #process-table col:nth-child(3) { width: 20%; }
+            #process-table col:nth-child(4) { width: 25%; }
+            #process-table col:nth-child(5) { width: 15%; }
+        }
+        
+        th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            text-align: left;
+            padding: 15px 20px;
+            border-bottom: 2px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            min-width: 0;
+        }
+        
+        td {
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+            min-width: 0;
+        }
+        
+        tr:hover {
+            background-color: rgba(67, 97, 238, 0.05);
+        }
+        
+        tr:nth-child(even) {
+            background-color: rgba(0, 0, 0, 0.02);
+        }
+        
+        .process-row {
+            border-bottom: 2px solid var(--border);
+        }
+        
+        .process-main {
+            font-weight: 500;
+        }
+        
+        .process-memory {
+            font-size: 0.85rem;
+            color: var(--gray);
+            padding-top: 0;
+        }
+        
+        .memory-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+            gap: 5px;
+            width: 100%;
+            overflow: hidden;
+        }
+        
+        .memory-item {
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .memory-label {
+            font-weight: 600;
+            margin-right: 5px;
+        }
+        
+        .memory-value {
+            font-family: 'Courier New', monospace;
+        }
+        
+.pid-cell {
+             font-weight: 600;
+             color: var(--primary);
+             width: 8ch;
+             max-width: 8ch;
+             white-space: nowrap;
+             overflow: hidden;
+             text-overflow: ellipsis;
+         }
+        
+        .comm-cell {
+            font-weight: 500;
+        }
+        
+        .cmdline-cell {
+            font-size: 0.85rem;
+            color: var(--gray);
+            max-width: 300px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .log-content {
+            padding: 20px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            background-color: #2c3e50;
+            color: #ecf0f1;
+        }
+        
+        .log-entry {
+            margin-bottom: 8px;
+            padding: 8px;
+            border-radius: 4px;
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+        
+        .log-timestamp {
+            color: #95a5a6;
+            font-weight: 600;
+        }
+        
+        .log-error {
+            color: #e74c3c;
+        }
+        
+        .log-info {
+            color: #3498db;
+        }
+        
+        .log-success {
+            color: #2ecc71;
+        }
+        
+        .log-warning {
+            color: #f39c12;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--gray);
+        }
+        
+        .empty-state i {
+            font-size: 3rem;
+            margin-bottom: 15px;
+            display: block;
+        }
+        
+        .search-box {
+            padding: 12px 20px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 1rem;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        
+        .search-box:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.2);
+        }
+        
+        .stats-bar {
+            display: flex;
+            gap: 20px;
+            padding: 15px 25px;
+            background-color: #f8f9fa;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .stat-item {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--gray);
+            margin-bottom: 4px;
+        }
+        
+        .stat-value {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+        
+        footer {
+            text-align: center;
+            padding: 20px;
+            color: var(--gray);
+            font-size: 0.9rem;
+            margin-top: 20px;
+        }
+        
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+        
+        /* Responsive design */
+        @media (max-width: 768px) {
+            .container {
+                padding: 15px;
+            }
+            
+            header {
+                flex-direction: column;
+                text-align: center;
+                gap: 15px;
+            }
+            
+            .status-bar {
+                width: 100%;
+                justify-content: center;
+            }
+            
+            .controls {
+                flex-direction: column;
+            }
+            
+            button {
+                width: 100%;
+                justify-content: center;
+            }
+            
+            th, td {
+                padding: 10px 12px;
+            }
+            
+            .cmdline-cell, .cgroup-cell {
+                max-width: 150px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-content">
+                <h1>PMOND - Process Monitor</h1>
+                <p>Real-time system process monitoring with WebSocket updates</p>
+            </div>
+            <div class="status-bar">
+                <div class="status-item">
+                    <div id="connection-status-indicator" class="status-indicator disconnected"></div>
+                    <span id="connection-status-text">Disconnected</span>
+                </div>
+                <div class="status-item">
+                    <span class="process-count">Processes: <span id="process-count">0</span></span>
+                </div>
+            </div>
+        </header>
+        
+        <div class="controls">
+            <button id="connect-btn">
+                <i>🔗</i> Connect WebSocket
+            </button>
+            <button id="refresh-btn" class="secondary">
+                <i>🔄</i> Refresh Processes
+            </button>
+            <button id="clear-log-btn" class="warning">
+                <i>🧹</i> Clear Log
+            </button>
+         </div>
+         <div class="dashboard">
+             <div class="process-card">
+                 <div class="card-header">
+                     <i>📋</i> Process List
+                 </div>
+<div class="stats-bar">
+                      <div class="stat-item">
+                          <span class="stat-label">Total Processes</span>
+                          <span class="stat-value" id="total-processes">0</span>
+                      </div>
+                      <div class="stat-item">
+                          <span class="stat-label">Anon</span>
+                          <span class="stat-value" id="total-anon">0</span>
+                      </div>
+                      <div class="stat-item">
+                          <span class="stat-label">File</span>
+                          <span class="stat-value" id="total-file">0</span>
+                      </div>
+                      <div class="stat-item">
+                          <span class="stat-label">WebSocket Status</span>
+                          <span class="stat-value" id="ws-status">Disconnected</span>
+                      </div>
+                  </div>
+                 <div class="card-body">
+                     <input type="text" id="search-box" class="search-box" placeholder="Search processes...">
+                     <div class="process-table-container">
+                         <table id="process-table">
+                             <colgroup>
+                                 <col>
+                                 <col>
+                                 <col>
+                                 <col>
+                                 <col>
+                             </colgroup>
+                             <thead>
+                                 <tr>
+                                     <th  class="pid-cell">PID</th>
+                                     <th  class="pid-cell">PPID</th>
+                                     <th>Command</th>
+                                     <th>Memory</th>
+                                     <th>Command Line</th>
+                                 </tr>
+                             </thead>
+                             <tbody id="process-table-body">
+                                 <tr>
+                                     <td colspan="6" class="empty-state">
+                                         <i>📊</i>
+                                         <p>No process data available</p>
+                                         <p>Connect to WebSocket or refresh to load processes</p>
+                                     </td>
+                                 </tr>
+                             </tbody>
+                         </table>
+                     </div>
+                 </div>
+             </div>
+         </div>
+        
+        <footer>
+            <p>PMOND Process Monitor | Real-time system monitoring</p>
+        </footer>
+    </div>
+
+    <script>
+        // Format memory size in bytes to a human-readable format
+        function formatMemory(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+        
+         // DOM elements
+         const processTableBody = document.getElementById('process-table-body');
+         const processCountElement = document.getElementById('process-count');
+         const totalProcessesElement = document.getElementById('total-processes');
+         const connectionStatusIndicator = document.getElementById('connection-status-indicator');
+         const connectionStatusText = document.getElementById('connection-status-text');
+         const wsStatusElement = document.getElementById('ws-status');
+         const connectButton = document.getElementById('connect-btn');
+         const refreshButton = document.getElementById('refresh-btn');
+         const clearLogButton = document.getElementById('clear-log-btn');
+         const searchBox = document.getElementById('search-box');
+         
+         // WebSocket connection
+         let ws = null;
+         let allProcesses = {};
+         
+         // Add log entry
+         function addLogEntry(message, type = 'info') {
+             const timestamp = new Date().toISOString();
+             // Redirect logs to console instead of UI
+             console.log(`[${timestamp}] ${type.toUpperCase()}: ${message}`);
+         }
+        
+        // Update connection status
+        function updateConnectionStatus(connected) {
+            if (connected) {
+                connectionStatusIndicator.className = 'status-indicator connected';
+                connectionStatusText.textContent = 'Connected';
+                wsStatusElement.textContent = 'Connected';
+                wsStatusElement.style.color = '#28a745';
+                connectButton.innerHTML = '<i>🔌</i> Disconnect';
+                connectButton.disabled = false;
+            } else {
+                connectionStatusIndicator.className = 'status-indicator disconnected';
+                connectionStatusText.textContent = 'Disconnected';
+                wsStatusElement.textContent = 'Disconnected';
+                wsStatusElement.style.color = '#dc3545';
+                connectButton.innerHTML = '<i>🔗</i> Connect WebSocket';
+                connectButton.disabled = false;
+            }
+        }
+        
+        // Connect to WebSocket
+        function connectWebSocket() {
+            if (ws) {
+                ws.close();
+                return;
+            }
+            
+            try {
+                // Connect to the WebSocket endpoint
+                ws = new WebSocket(`ws://${window.location.host}/ws`);
+                
+                ws.onopen = function(event) {
+                    addLogEntry('WebSocket connection established', 'success');
+                    updateConnectionStatus(true);
+                };
+                
+                ws.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        updateProcessList(data);
+                        addLogEntry(`Received process data with ${Object.keys(data).length} processes`, 'info');
+                    } catch (e) {
+                        addLogEntry(`Received message: ${event.data}`, 'info');
+                    }
+                };
+                
+                ws.onclose = function(event) {
+                    addLogEntry('WebSocket connection closed', 'info');
+                    updateConnectionStatus(false);
+                    ws = null;
+                };
+                
+                ws.onerror = function(error) {
+                    addLogEntry(`WebSocket error: ${error.message}`, 'error');
+                    updateConnectionStatus(false);
+                    ws = null;
+                };
+                
+                connectButton.disabled = true;
+            } catch (e) {
+                addLogEntry(`Failed to connect: ${e.message}`, 'error');
+                updateConnectionStatus(false);
+                connectButton.disabled = false;
+            }
+        }
+        
+// Update process list
+          function updateProcessList(processes) {
+              // Store all processes for filtering
+              allProcesses = processes;
+              
+              // Filter processes based on search term
+              const searchTerm = searchBox.value.toLowerCase();
+              let filteredProcesses = {};
+              
+              if (searchTerm) {
+                  for (const pid in processes) {
+                      const process = processes[pid];
+                      if (process.comm.toLowerCase().includes(searchTerm) || 
+                          (process.cmdline && process.cmdline.toLowerCase().includes(searchTerm)) ||
+                          pid.includes(searchTerm) ||
+                          process.ppid.toString().includes(searchTerm)) {
+                          filteredProcesses[pid] = process;
+                      }
+                  }
+              } else {
+                  filteredProcesses = processes;
+              }
+              
+               // Sort processes by file memory amount (descending)
+               let sortedProcesses = Object.entries(filteredProcesses)
+                   .sort(([pid1, proc1], [pid2, proc2]) => {
+                       const file1 = proc1.mem_info ? proc1.mem_info.file : 0;
+                       const file2 = proc2.mem_info ? proc2.mem_info.file : 0;
+                       const a1 = proc1.mem_info ? proc1.mem_info.anon : 0;
+                       const a2 = proc2.mem_info ? proc2.mem_info.anon : 0;
+                       return file2 + a2 - file1 - a1;
+                   });
+               
+               // Convert to array for proper ordering
+               const sortedProcessArray = sortedProcesses.map(([pid, process]) => ({pid, process}));
+              
+               // Update process count
+               const processCount = sortedProcessArray.length;
+               processCountElement.textContent = processCount;
+               totalProcessesElement.textContent = Object.keys(processes).length;
+              
+              // Calculate sums of anon and file memory
+              let totalAnon = 0;
+              let totalFile = 0;
+              for (const pid in processes) {
+                  const process = processes[pid];
+                  if (process.mem_info) {
+                      totalAnon += process.mem_info.anon || 0;
+                      totalFile += process.mem_info.file || 0;
+                  }
+              }
+              
+              // Update total anon and file values
+              document.getElementById('total-anon').textContent = formatMemory(totalAnon);
+              document.getElementById('total-file').textContent = formatMemory(totalFile);
+              
+              // Clear existing table rows
+              processTableBody.innerHTML = '';
+              
+              // Check if there are processes to display
+              if (processCount === 0) {
+                  processTableBody.innerHTML = `
+                      <tr>
+                          <td colspan="6" class="empty-state">
+                              <i>🔍</i>
+                              <p>No processes match your search</p>
+                              <p>Try a different search term</p>
+                          </td>
+                      </tr>
+                  `;
+                  return;
+              }
+              
+               // Add processes to table
+               for (const {pid, process} of sortedProcessArray) {
+                  const process = filteredProcesses[pid];
+                  const row = document.createElement('tr');
+                  
+                  // Create a row for each process with two lines
+                  const mainRow = document.createElement('tr');
+                  mainRow.className = 'process-main';
+                  
+                  // First line with main process info
+                  mainRow.innerHTML = `
+                      <td class="pid-cell">${process.pid}</td>
+                      <td class="pid-cell">${process.ppid}</td>
+                      <td class="comm-cell">${process.comm}</td>
+                      <td class="mem-cell">
+                          ${process.mem_info ? formatMemory(process.mem_info.anon) : 'N/A'} + ${process.mem_info ? formatMemory(process.mem_info.file) : 'N/A'}
+                        
+                      </td>
+                      <td class="cmdline-cell">${process.cmdline || ''}</td>
+                      
+                  `;
+                  
+                  // Second line with detailed memory info
+                  const memoryRow = document.createElement('tr');
+                  memoryRow.className = 'process-memory';
+                  memoryRow.innerHTML = `
+                      <td colspan="5">
+                          <div class="memory-details">
+                              <div class="memory-item">
+                                  <span class="memory-label">Kernel:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.kernel) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">
+                                  <span class="memory-label">Stack:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.kernel_stack) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">
+                                  <span class="memory-label">Tables:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.pagetables) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">
+                                  <span class="memory-label">Shmem:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shmem) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">
+                                  <span class="memory-label">Mapped:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file_mapped) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">
+                                  <span class="memory-label">Dirty:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file_dirty) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">
+                                  <span class="memory-label">Writeback:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file_writeback) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">
+                                  <span class="memory-label">Swap:</span>
+                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.swapcached) : 'N/A'}</span>
+                              </div>
+                              <div class="memory-item">CG: ${process.cgroup_path || ''}</div>
+                          </div>
+                      </td>
+                  `;
+                  
+                  processTableBody.appendChild(mainRow);
+                  processTableBody.appendChild(memoryRow);
+              }
+          }
+        
+        // Refresh processes via REST API
+        function refreshProcesses() {
+            fetch('/_ps')
+                .then(response => response.json())
+                .then(data => {
+                    updateProcessList(data);
+                    addLogEntry(`Refreshed process list with ${Object.keys(data).length} processes`, 'success');
+                })
+                .catch(error => {
+                    addLogEntry(`Failed to refresh processes: ${error.message}`, 'error');
+                });
+        }
+        
+         // Clear log
+         function clearLog() {
+             // Clear console logs
+             console.clear();
+             addLogEntry('Log cleared', 'info');
+         }
+        
+        // Search handler
+        function handleSearch() {
+            updateProcessList(allProcesses);
+        }
+        
+        // Event listeners
+        connectButton.addEventListener('click', connectWebSocket);
+        refreshButton.addEventListener('click', refreshProcesses);
+        clearLogButton.addEventListener('click', clearLog);
+        searchBox.addEventListener('input', handleSearch);
+        
+         // Initial refresh
+         refreshProcesses();
+         
+         // Auto-connect to WebSocket on page load
+         connectWebSocket();
+         
+         // Add some sample log entries for demonstration
+         setTimeout(() => {
+             addLogEntry('PMOND web interface loaded successfully', 'success');
+             addLogEntry('Ready to monitor system processes', 'info');
+         }, 1000);
+    </script>
+</body>
+</html>

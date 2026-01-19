@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Russhd - SSH Clients</title>
+</head>
+<body>
+    <h1>Active SSH Clients</h1>
+    <table border="1">
+        <thead>
+            <tr>
+                <th>Client ID</th>
+                <th>Forwards</th>
+            </tr>
+        </thead>
+        <tbody id="clients-table-body">
+        </tbody>
+    </table>
+
+    <script>
+        async function fetchSshClients() {
+            const response = await fetch('/api/ssh/clients');
+            const clients = await response.json();
+            const tableBody = document.getElementById('clients-table-body');
+            tableBody.innerHTML = '';
+            for (const clientId in clients) {
+                const client = clients[clientId];
+                const row = document.createElement('tr');
+                const forwards = client.forwards.map(f => `${f[0]}:${f[1]}`).join('<br>');
+                row.innerHTML = `<td>${client.id}</td><td>${forwards}</td>`;
+                tableBody.appendChild(row);
+            }
+        }
+
+        setInterval(fetchSshClients, 5000);
+        fetchSshClients();
+    </script>
+</body>
+</html>
