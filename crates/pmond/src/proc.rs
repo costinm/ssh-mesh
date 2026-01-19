@@ -71,7 +71,10 @@ impl ProcMon {
             let mut content = String::new();
             if let Ok(mut f) = fs::File::open(&pressure_file_path) {
                 if f.read_to_string(&mut content).is_ok() {
-                    result.insert(pid, (watch.pressure_type.clone(), content.trim_end().to_string()));
+                    result.insert(
+                        pid,
+                        (watch.pressure_type.clone(), content.trim_end().to_string()),
+                    );
                 }
             }
         }

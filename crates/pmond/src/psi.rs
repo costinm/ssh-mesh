@@ -1,6 +1,7 @@
 // This file deals with watching memory pressure (PSI) for a set of
 // processes.
 
+use crate::proc::create_process_info;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::collections::HashMap;
@@ -13,7 +14,6 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use tokio::sync::broadcast;
-use crate::proc::create_process_info;
 use tracing::{debug, error, info, instrument, trace};
 
 const WAKER_TOKEN: Token = Token(1024);
@@ -140,7 +140,7 @@ impl PsiWatcher {
         debug!("Starting PSI monitoring thread");
         if self.running.load(Ordering::SeqCst) {
             debug!("PSI monitoring already running");
-            return Ok(())
+            return Ok(());
         }
 
         self.running.store(true, Ordering::SeqCst);
@@ -167,7 +167,8 @@ impl PsiWatcher {
 
             {
                 let watches_snapshot = watches.lock().unwrap();
-                info!("Setting up watches for {} processes",
+                info!(
+                    "Setting up watches for {} processes",
                     watches_snapshot.len()
                 );
                 for (&pid, watch) in watches_snapshot.iter() {

@@ -55,6 +55,7 @@ async fn setup_test_environment() -> Result<TestSetup> {
     // Bind HTTP listener here to ensure we have the port
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let http_port = http_listener.local_addr()?.port();
+    println!("HTTP server bound to port {}", http_port);
 
     // Find a free SSH port that is different from HTTP port
     let mut ssh_port = find_free_port()?;
@@ -62,6 +63,7 @@ async fn setup_test_environment() -> Result<TestSetup> {
         tokio::time::sleep(Duration::from_millis(10)).await;
         ssh_port = find_free_port()?;
     }
+    println!("SSH server will try to bind to port {}", ssh_port);
 
     let server_base_dir = base_dir.clone();
 
@@ -83,9 +85,10 @@ async fn setup_test_environment() -> Result<TestSetup> {
         });
 
         let app = russhd::handlers::app(app_state);
-        axum::serve(http_listener, app.into_make_service())
-            .await
-            .unwrap();
+        match axum::serve(http_listener, app.into_make_service()).await {
+            Ok(_) => println!("Axum server finished"),
+            Err(e) => eprintln!("Axum server failed: {}", e),
+        }
     });
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -262,9 +265,6 @@ async fn test_client_api_over_http2() -> Result<()> {
         // 4. Disconnect the client
         ssh_client_process.kill()?;
         ssh_client_process.wait()?;
-
-        // TODO: this appears to panic in some cases - ssh doesn't handle it 
-        // properly, and the client is not removed.
 
         // Give the server a moment to recognize the disconnect
         tokio::time::sleep(Duration::from_secs(5)).await;

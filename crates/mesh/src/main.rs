@@ -53,24 +53,24 @@ enum Command {
         #[arg(short, long, default_value_t = false)]
         benchmark: bool,
     },
-    /// Run the PMON process monitor
-    Pmon {
-        /// Monitoring interval in seconds
-        #[arg(short, long, default_value_t = 5)]
-        interval: u64,
+    // /// Run the PMON process monitor
+    // Pmon {
+    //     /// Monitoring interval in seconds
+    //     #[arg(short, long, default_value_t = 5)]
+    //     interval: u64,
 
-        /// Timeout in seconds (0 for no timeout)
-        #[arg(short, long, default_value_t = 0)]
-        timeout: u64,
+    //     /// Timeout in seconds (0 for no timeout)
+    //     #[arg(short, long, default_value_t = 0)]
+    //     timeout: u64,
 
-        /// Processes to monitor
-        #[arg(short, long, value_delimiter = ',')]
-        processes: Vec<String>,
+    //     /// Processes to monitor
+    //     #[arg(short, long, value_delimiter = ',')]
+    //     processes: Vec<String>,
 
-        /// Verbose output
-        #[arg(short, long, default_value_t = false)]
-        verbose: bool,
-    },
+    //     /// Verbose output
+    //     #[arg(short, long, default_value_t = false)]
+    //     verbose: bool,
+    // },
     /// List existing processes
     Ps,
     /// List existing processes and watch PSI
@@ -239,46 +239,6 @@ async fn main() {
                 eprintln!("UDS client failed: {}", e);
                 process::exit(1);
             }
-        }
-        #[cfg(feature = "pmon")]
-        Command::Pmon {
-            interval,
-            timeout,
-            processes,
-            verbose,
-        } => {
-            // Run PMON process monitor
-            // Set up Ctrl-C handler
-            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let running_clone = running.clone();
-
-            ctrlc::set_handler(move || {
-                println!("Received Ctrl-C, shutting down...");
-                running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
-                process::exit(0);
-            })
-            .expect("Error setting Ctrl-C handler");
-
-            // Run PMON process monitor
-            if let Err(e) = pmon::pmon_main(interval, timeout, processes, verbose).await {
-                eprintln!("PMON failed: {}", e);
-                process::exit(1);
-            }
-
-            // Block the main thread until exit
-            loop {
-                // Sleep to avoid busy waiting
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                // Check if we should exit (though Ctrl-C handler will exit directly)
-                if !running.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-            }
-        }
-        #[cfg(not(feature = "pmon"))]
-        Command::Pmon { .. } => {
-            eprintln!("PMON feature is not enabled. Please compile with --features pmon");
-            process::exit(1);
         }
         #[cfg(feature = "pmon")]
         Command::Ps => {

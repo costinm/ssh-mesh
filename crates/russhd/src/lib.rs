@@ -1524,6 +1524,9 @@ pub async fn handle_ssh_request(
         read_buf: bytes::BytesMut::new(),
     };
 
+    let handler_id = handler.id;
+    let connected_clients = ssh_server.connected_clients.clone();
+
     // Run SSH over the HTTP/2 stream
     match russh::server::run_stream(config, stream, handler).await {
         Ok(session) => {
@@ -1535,6 +1538,12 @@ pub async fn handle_ssh_request(
                     tracing_error!("SSH session error: {:?}", e);
                 }
                 info!("SSH session completed");
+
+                // Explicit cleanup after session ends
+                let mut clients = connected_clients.lock().await;
+                if clients.remove(&handler_id).is_some() {
+                    debug!("Removed client {} from connected_clients", handler_id);
+                }
             });
 
             // Create response body from writer_rx

@@ -1,4 +1,4 @@
-use crate::{ProcMon};
+use crate::ProcMon;
 use axum::{
     extract::State,
     response::{Html, Json},
@@ -83,11 +83,9 @@ pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
         )
         .route(
             "/api/clients/:id/message",
-            post(
-                move |State(app_state): State<AppState>, path, json| {
-                    ws::handle_send_message(State(app_state.ws_server), path, json)
-                },
-            ),
+            post(move |State(app_state): State<AppState>, path, json| {
+                ws::handle_send_message(State(app_state.ws_server), path, json)
+            }),
         )
         .route(
             "/api/broadcast",
