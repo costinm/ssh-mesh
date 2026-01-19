@@ -154,9 +154,9 @@ impl ProcMon {
         let psi_watcher = self.psi_watcher.clone();
         let handle = std::thread::spawn(move || {
             // Wrap the proc_handle_ev call in a panic handler
-            let result = std::panic::catch_unwind(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 proc_handle_ev(nl_sock, callback, running, processes, psi_watcher)
-            });
+            }));
 
             match result {
                 Ok(Ok(_)) => {

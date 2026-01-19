@@ -16,8 +16,8 @@ async fn main() -> Result<(), Error> {
         .init();
 
     // Get SSH port from environment variable or use default
-    let ssh_port = get_port_from_env("SSH_PORT", 2223);
-    let http_port = get_port_from_env("HTTP_PORT", 8081);
+    let ssh_port = get_port_from_env("SSH_PORT", 15022);
+    let http_port = get_port_from_env("HTTP_PORT", 15028);
 
     // Get base directory from environment or use home directory as default
     let base_dir = env::var("HOME")

@@ -65,10 +65,7 @@ async fn main() -> Result<(), Error> {
         .route("/ws", get(ws::handle_websocket_upgrade))
         .route("/api/clients", get(ws::handle_list_clients))
         .route("/api/clients/:id", delete(ws::handle_remove_client))
-        .route(
-            "/api/clients/:id/message",
-            post(ws::handle_send_message),
-        )
+        .route("/api/clients/:id/message", post(ws::handle_send_message))
         .route("/api/broadcast", post(ws::handle_broadcast))
         .with_state(server)
         .layer(
@@ -84,4 +81,3 @@ async fn main() -> Result<(), Error> {
 
     Ok(())
 }
-

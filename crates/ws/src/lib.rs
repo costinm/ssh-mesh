@@ -25,11 +25,7 @@ impl WSServer {
         Self::default()
     }
 
-    pub async fn add_client(
-        &self,
-        id: String,
-        sender: mpsc::UnboundedSender<Frame<'static>>,
-    ) {
+    pub async fn add_client(&self, id: String, sender: mpsc::UnboundedSender<Frame<'static>>) {
         debug!("Adding client: {}", id);
         self.clients.lock().await.insert(id.clone(), sender);
         let new_count = self.clients.lock().await.len();
@@ -234,10 +230,7 @@ pub async fn handle_send_message(
 ) -> Result<Json<MessageResponse>, StatusCode> {
     debug!("Target client ID: {}", client_id);
 
-    match server
-        .send_to_client(&client_id, &payload.message)
-        .await
-    {
+    match server.send_to_client(&client_id, &payload.message).await {
         Ok(_) => {
             debug!("Message sent successfully to {}", client_id);
             Ok(Json(MessageResponse { success: true }))
@@ -253,11 +246,7 @@ use hyper::Uri;
 
 pub async fn static_file_handler(uri: Uri) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() {
-        "chat.html"
-    } else {
-        path
-    };
+    let path = if path.is_empty() { "chat.html" } else { path };
 
     let web_path = format!("web/{}", path);
 
