@@ -5,7 +5,7 @@ use nix::unistd::{dup2, setsid};
 use openpty::openpty;
 use russh::keys::{PrivateKey, PublicKey, PublicKeyBase64};
 use russh::server::Server;
-use russh::{server, ChannelId, MethodKind, MethodSet};
+use russh::{server, ChannelId, MethodKind};
 use ssh_key::LineEnding;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
@@ -26,10 +26,15 @@ use tokio::process::Command;
 use serde::Serialize;
 use tokio::sync::{mpsc, Mutex};
 use bytes::Buf;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Bytes;
-use hyper::{body::Incoming, Request, Response};
+use hyper::{Request, Response};
 use tracing::{debug, error as tracing_error, instrument, trace};
+use axum::{
+    extract::State,
+    response::IntoResponse,
+    body::Body,
+};
 
 use pmond::ProcMon;
 use ws::WSServer;
@@ -44,7 +49,7 @@ pub mod handlers {
         extract::State,
         http::StatusCode,
         response::{Html, IntoResponse},
-        routing::get,
+        routing::{get, any},
         Json, Router,
     };
 
@@ -54,6 +59,8 @@ pub mod handlers {
         Router::new()
             .route("/", get(serve_index))
             .route("/api/ssh/clients", get(get_ssh_clients))
+            .route("/_ssh", any(crate::handle_ssh_request))
+            .route("/_ssh/*rest", any(crate::handle_ssh_request))
             .with_state(app_state)
     }
 
@@ -1293,7 +1300,7 @@ impl server::Server for SshServer {
 pub async fn run_ssh_server(
     port: u16,
     config: server::Config,
-    mut server: SshServer,
+    server: SshServer,
 ) -> Result<(), anyhow::Error> {
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting SSH server on {}", addr);
@@ -1343,19 +1350,17 @@ pub async fn run_ssh_server(
 // TODO: add monitoring from ws create.
 
 // SSH handler for /_ssh* paths - handles SSH over HTTP/2
-#[instrument(skip(req), fields(method = %req.method(), uri = %req.uri()))]
+#[instrument(skip(req, state), fields(method = %req.method(), uri = %req.uri()))]
 pub async fn handle_ssh_request(
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> impl IntoResponse {
     info!("Received SSH request: {} {}", req.method(), req.uri());
 
-    // Get base directory from environment or use home directory as default
-    let base_dir = env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-
-    // Create SSH server with handler
-    let mut ssh_server = SshServer::new(1, None, base_dir);
+    // Use shared SSH server
+    // We clone the server to get a mutable instance (interior mutability handles state)
+    // SshServer is designed to be cloned
+    let mut ssh_server = state.ssh_server.as_ref().clone();
     let config = Arc::new(ssh_server.get_config());
     let handler = ssh_server.new_client(None);
 
@@ -1413,18 +1418,18 @@ pub async fn handle_ssh_request(
             // In a real implementation, you'd want to stream the response
             let response = Response::builder()
                 .status(200)
-                .body(Full::new(Bytes::from("SSH session established over HTTP/2")))
+                .body(Body::from("SSH session established over HTTP/2"))
                 .unwrap();
 
-            Ok(response)
+            response
         }
         Err(e) => {
             tracing_error!("Failed to start SSH session: {:?}", e);
             let response = Response::builder()
                 .status(500)
-                .body(Full::new(Bytes::from(format!("SSH session failed: {:?}", e))))
+                .body(Body::from(format!("SSH session failed: {:?}", e)))
                 .unwrap();
-            Ok(response)
+            response
         }
     }
 }
