@@ -1,10 +1,11 @@
 use axum::serve;
 use clap::Parser;
 use tracing::{error, info};
-use pmond::ProcMon;
+use pmond::{ProcMon, proc_netlink};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
+use tokio::sync::mpsc;
 use ws::WSServer;
 
 #[derive(Parser, Debug)]
@@ -62,20 +63,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn start_monitoring(proc_mon: Arc<ProcMon>) -> tokio::task::JoinHandle<()> {
+    let (tx, mut rx) = mpsc::channel(100);
+    let running = proc_mon.running.clone();
+    
+    // Start netlink listener
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = proc_netlink::run_netlink_listener(tx, running) {
+            error!("Netlink listener error: {}", e);
+        }
+    });
+
+    // Start event consumer
+    let pm = proc_mon.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            match event {
+                proc_netlink::NetlinkEvent::Fork { parent_tgid, child_pid, child_tgid, .. } => {
+                    pm.handle_fork(parent_tgid, child_pid, child_tgid);
+                }
+                proc_netlink::NetlinkEvent::Exit { process_tgid, .. } => {
+                    pm.handle_exit(process_tgid);
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
 fn show_processes() -> Result<(), Box<dyn std::error::Error>> {
     info!("Showing processes");
 
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-
-    // Enable listening for events
-    proc_mon.listen(true)?;
-
-    // Wrap the monitor in an Arc for shared ownership
     let proc_mon = Arc::new(proc_mon);
 
-    // Start monitoring in a background thread
+    // Start monitoring
     proc_mon.start(true, true)?;
+    start_monitoring(proc_mon.clone());
 
     // Get processes and display them sorted by RSS
     let processes = proc_mon.get_all_processes();
@@ -99,15 +124,11 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
 
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-
-    // Enable listening for events
-    proc_mon.listen(true)?;
-
-    // Wrap the monitor in an Arc for shared ownership
     let proc_mon = Arc::new(proc_mon);
 
-    // Start monitoring in a background thread
+    // Start monitoring
     proc_mon.start(true, true)?;
+    start_monitoring(proc_mon.clone());
 
     info!(
         "Watching process {} with refresh interval {}s",
@@ -142,20 +163,11 @@ async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-
-    // Enable listening for events
-    //proc_mon.listen(true)?;
-
-    // Wrap the monitor in an Arc for shared ownership
     let proc_mon = Arc::new(proc_mon);
 
-    // Start monitoring in a background thread
-    // let pm_clone = proc_mon.clone();
-    // tokio::task::spawn_blocking(move || {
-    //     if let Err(e) = pm_clone.start(true, true) {
-    //         error!("Failed to start ProcMon: {}", e);
-    //     }
-    // });
+    // MCP server might start monitoring internally or we start it here
+    proc_mon.start(true, true)?;
+    start_monitoring(proc_mon.clone());
 
     pmond::mcp::run_stdio_server(proc_mon).await
 }
@@ -165,15 +177,11 @@ async fn run_server(refresh: u64) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-
-    // Enable listening for events
-    proc_mon.listen(true)?;
-
-    // Wrap the monitor in an Arc for shared ownership
     let proc_mon = Arc::new(proc_mon);
 
-    // Start monitoring in a background thread
+    // Start monitoring
     proc_mon.start(true, true)?;
+    start_monitoring(proc_mon.clone());
 
     info!("PMON process monitor started successfully");
 

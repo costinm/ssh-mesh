@@ -2,7 +2,7 @@
 // of
 // processes.
 
-use crate::proc::create_process_info;
+use crate::{create_process_info, PressureType};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::collections::HashMap;
@@ -18,13 +18,6 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, instrument, trace};
 
 const WAKER_TOKEN: Token = Token(1024);
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub enum PressureType {
-    Memory,
-    Cpu,
-    Io,
-}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PressureEvent {
@@ -54,7 +47,7 @@ impl PsiWatcher {
     #[instrument]
     pub fn new() -> Self {
         debug!("Creating new PsiWatcher");
-        let (event_tx, _event_rx) = broadcast::channel(100); // Create a broadcast channel
+        let (event_tx, _event_rx) = broadcast::channel(100); 
         let watcher = PsiWatcher {
             running: Arc::new(AtomicBool::new(false)),
             watches: Arc::new(Mutex::new(HashMap::new())),
@@ -85,7 +78,6 @@ impl PsiWatcher {
             "Adding process {} to PSI watcher for {:?}",
             pid, pressure_type
         );
-        // Get the cgroup path for this process
         match create_process_info(pid) {
             Ok(process_info) => {
                 if let Some(cgroup_path) = process_info.cgroup_path {
@@ -188,7 +180,6 @@ impl PsiWatcher {
                     {
                         Ok(f) => f,
                         Err(_e) => {
-                            //eprintln!("Failed to open {}: {}", pressure_file_path, e);
                             continue;
                         }
                     };
@@ -278,7 +269,6 @@ impl PsiWatcher {
                                         {
                                             Ok(f) => f,
                                             Err(_e) => {
-                                                //eprintln!("Failed to open {}: {}", pressure_file_path, e);
                                                 continue;
                                             }
                                         };
@@ -341,14 +331,16 @@ impl PsiWatcher {
                                             let cb = callback.lock().unwrap();
                                             if let Some(ref callback_fn) = *cb {
                                                 info!(
-                                                    "PSI event for process {}: \n{}",
+                                                    "PSI event for process {}: 
+{}",
                                                     pid,
                                                     content.trim_end()
                                                 );
                                                 callback_fn(pid, &content.trim_end());
                                             } else {
                                                 info!(
-                                                    "PSI event for process {}: \n{}",
+                                                    "PSI event for process {}: 
+{}",
                                                     pid,
                                                     content.trim_end()
                                                 );
@@ -396,9 +388,7 @@ impl PsiWatcher {
 
 impl Drop for PsiWatcher {
     fn drop(&mut self) {
-        debug!("Dropping PsiWatcher");
         let _ = self.stop();
-        info!("PsiWatcher dropped");
     }
 }
 
@@ -420,20 +410,16 @@ mod tests {
 
             // Add current process to watch
             let current_pid = std::process::id();
-            watcher.add_pid(current_pid, PressureType::Memory);
-            // If this fails, it will print an error message internally
+            watcher.add_pid(current_pid, crate::PressureType::Memory);
 
             // Start the watcher
             if let Err(e) = watcher.start() {
                 info!("Failed to start PSI watcher: {}", e);
-                // This might fail in test environments, which is acceptable
                 return;
             }
 
-            // Wait for a short time to see if any events occur
             thread::sleep(Duration::from_secs(2));
 
-            // Stop the watcher
             let _ = watcher.stop();
 
             info!("PSI watcher test completed");
@@ -465,7 +451,7 @@ mod tests {
                 .unwrap();
 
             let pid = child.id();
-            watcher.add_pid(pid, PressureType::Memory);
+            watcher.add_pid(pid, crate::PressureType::Memory);
 
             // Check that the pid is in watches
             {

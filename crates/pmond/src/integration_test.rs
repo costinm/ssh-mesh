@@ -5,28 +5,55 @@
 //! - Handle HTTP requests for process information
 //! - Detect new processes when they are started
 
-use pmond::{ProcMon, ProcessInfo};
-use tracing::info;
+use pmond::{ProcMon, ProcessInfo, proc_netlink};
+use tracing::{info, error};
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::mpsc;
+
+fn start_monitoring(proc_mon: Arc<ProcMon>) {
+    let (tx, mut rx) = mpsc::channel(100);
+    let running = proc_mon.running.clone();
+    
+    // Start netlink listener
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = proc_netlink::run_netlink_listener(tx, running) {
+            error!("Netlink listener error: {}", e);
+        }
+    });
+
+    // Start event consumer
+    let pm = proc_mon.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            match event {
+                proc_netlink::NetlinkEvent::Fork { parent_tgid, child_pid, child_tgid, .. } => {
+                    pm.handle_fork(parent_tgid, child_pid, child_tgid);
+                }
+                proc_netlink::NetlinkEvent::Exit { process_tgid, .. } => {
+                    pm.handle_exit(process_tgid);
+                }
+                _ => {}
+            }
+        }
+    });
+}
 
 /// Test that we can create a ProcMon instance and get existing processes
-#[test]
-fn test_proc_mon_creation_and_existing_processes() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn test_proc_mon_creation_and_existing_processes() -> Result<(), Box<dyn std::error::Error>> {
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-    
-    // Enable listening for events
-    proc_mon.listen(true)?;
+    let proc_mon = Arc::new(proc_mon);
     
     // Start monitoring
     proc_mon.start(true, false)?; // Don't watch PSI for this test
+    start_monitoring(proc_mon.clone());
     
     // Give it a moment to read existing processes
-    thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Get all processes
     let processes = proc_mon.get_all_processes();
@@ -43,24 +70,20 @@ fn test_proc_mon_creation_and_existing_processes() -> Result<(), Box<dyn std::er
 }
 
 /// Test that the HTTP handler returns process information as JSON
-#[test]
-fn test_http_handler_returns_processes() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn test_http_handler_returns_processes() -> Result<(), Box<dyn std::error::Error>> {
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-    
-    // Enable listening for events
-    proc_mon.listen(true)?;
+    let proc_mon = Arc::new(proc_mon);
     
     // Start monitoring
     proc_mon.start(true, false)?; // Don't watch PSI for this test
+    start_monitoring(proc_mon.clone());
     
     // Give it a moment to read existing processes
-    thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
-    // Wrap in Arc for sharing
-    let proc_mon = Arc::new(proc_mon);
-    
-    // Get all processes through the handler-like function
+    // Get all processes
     let processes = proc_mon.get_all_processes();
     
     // Verify we got some processes
@@ -81,13 +104,11 @@ fn test_http_handler_returns_processes() -> Result<(), Box<dyn std::error::Error
 }
 
 /// Test that we can detect new processes
-#[test]
-fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-    
-    // Enable listening for events
-    proc_mon.listen(true)?;
+    let proc_mon = Arc::new(proc_mon);
     
     // Vector to store detected processes
     let detected_processes = Arc::new(Mutex::new(Vec::new()));
@@ -102,9 +123,10 @@ fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
     
     // Start monitoring
     proc_mon.start(true, false)?; // Don't watch PSI for this test
+    start_monitoring(proc_mon.clone());
     
     // Give it a moment to read existing processes
-    thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Start a short-lived process
     let mut child = Command::new("sleep")
@@ -117,20 +139,19 @@ fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
     info!("Started test process with PID: {}", child_pid);
     
     // Wait a bit for the process to be detected
-    thread::sleep(Duration::from_millis(500));
+    tokio::time::sleep(Duration::from_millis(500)).await;
     
     // Wait for the process to complete
     let _ = child.wait();
     
     // Wait a bit more for the exit event to be processed
-    thread::sleep(Duration::from_millis(500));
+    tokio::time::sleep(Duration::from_millis(500)).await;
     
     // Check if our process was detected
     let detected = detected_processes.lock().unwrap();
     let process_found = detected.iter().any(|p| p.pid == child_pid);
     
     // Note: Process detection through netlink might not always work in test environments
-    // so we won't assert this strictly, but we'll print the result
     if process_found {
         info!("Successfully detected test process with PID: {}", child_pid);
     } else {
@@ -144,19 +165,18 @@ fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Test that we can get a specific process by PID
-#[test]
-fn test_get_process_by_pid() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn test_get_process_by_pid() -> Result<(), Box<dyn std::error::Error>> {
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
-    
-    // Enable listening for events
-    proc_mon.listen(true)?;
+    let proc_mon = Arc::new(proc_mon);
     
     // Start monitoring
     proc_mon.start(true, false)?; // Don't watch PSI for this test
+    start_monitoring(proc_mon.clone());
     
     // Give it a moment to read existing processes
-    thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Get current process ID
     let current_pid = std::process::id();

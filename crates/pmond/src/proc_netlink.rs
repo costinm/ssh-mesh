@@ -1,21 +1,14 @@
-use log::{debug, info};
+use log::{debug, error, info};
 use nix::sys::socket::{bind, recv, send, NetlinkAddr};
 use nix::unistd::getpid;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
-
-use crate::proc::{read_process_info_from_proc, ProcessInfo};
-use crate::psi::{PressureType, PsiWatcher};
-
-pub struct ProcWatch {
-    
-}
+use tokio::sync::mpsc;
 
 // linux/connector.h
 const CN_IDX_PROC: u32 = 0x1;
@@ -40,6 +33,26 @@ pub enum ProcEventWhat {
     ProcEventGid = 0x40,
     ProcEventExit = 0x80000000,
     ProcEventComm = 0x200,
+}
+
+#[derive(Debug, Clone)]
+pub enum NetlinkEvent {
+    Fork {
+        parent_pid: u32,
+        parent_tgid: u32,
+        child_pid: u32,
+        child_tgid: u32,
+    },
+    Exec {
+        process_pid: u32,
+        process_tgid: u32,
+    },
+    Exit {
+        process_pid: u32,
+        process_tgid: u32,
+        exit_code: u32,
+        exit_signal: u32,
+    },
 }
 
 #[repr(C)]
@@ -207,57 +220,6 @@ const NLCN_MSG_EVENT_INIT: NlcnMsgEvent = NlcnMsgEvent {
     },
 };
 
-/// Periodically check processes every 10 seconds to verify they still exist
-/// and get current memory usage
-fn periodic_process_checker(
-    running: Arc<AtomicBool>,
-    processes: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
-    psi_watcher: Arc<PsiWatcher>,
-    _callback: Arc<Mutex<Option<Box<dyn Fn(ProcessInfo) + Send + Sync>>>>,
-) {
-    while running.load(Ordering::SeqCst) {
-        // Sleep for 10 seconds
-        std::thread::sleep(std::time::Duration::from_secs(10));
-
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // Clone the process list to minimize lock time
-        let pids: Vec<u32> = {
-            let proc_map = processes.lock().unwrap();
-            proc_map.keys().cloned().collect()
-        };
-
-        // Check each process
-        for pid in pids {
-            // Check if process still exists by trying to read its info
-            match read_process_info_from_proc(pid) {
-                Ok(process_info) => {
-                    // Process still exists, update its information
-                    {
-                        let mut proc_map = processes.lock().unwrap();
-                        proc_map.insert(pid, process_info.clone());
-                    }
-
-                    // Invoke callback if exists
-                    // if let Some(cb) = callback.lock().unwrap().as_ref() {
-                    //     cb(process_info);
-                    // }
-                }
-                Err(_) => {
-                    // Process no longer exists, remove it
-                    {
-                        let mut proc_map = processes.lock().unwrap();
-                        proc_map.remove(&pid);
-                    }
-                    psi_watcher.remove_pid(pid);
-                }
-            }
-        }
-    }
-}
-
 pub fn proc_nl_connect() -> Result<RawFd, nix::Error> {
     let nl_sock =
         unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, libc::NETLINK_CONNECTOR) };
@@ -291,146 +253,77 @@ pub fn proc_set_ev_listen(nl_sock: RawFd, enable: bool) -> Result<(), nix::Error
     Ok(())
 }
 
-pub fn proc_handle_ev(
-    nl_sock: RawFd,
-    callback: Arc<Mutex<Option<Box<dyn Fn(ProcessInfo) + Send + Sync>>>>,
+pub fn run_netlink_listener(
+    tx: mpsc::Sender<NetlinkEvent>,
     running: Arc<AtomicBool>,
-    processes: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
-    psi_watcher: Arc<PsiWatcher>,
 ) -> Result<(), nix::Error> {
-    // Clone variables for the periodic checker thread
-    let running_clone = running.clone();
-    let processes_clone = processes.clone();
-    let psi_watcher_clone = psi_watcher.clone();
-    let callback_clone = callback.clone();
+    info!("Starting netlink listener");
+    let nl_sock = proc_nl_connect()?;
+    proc_set_ev_listen(nl_sock, true)?;
 
-    // Start a periodic checker thread that runs every 10 seconds
-    std::thread::spawn(move || {
-        periodic_process_checker(
-            running_clone,
-            processes_clone,
-            psi_watcher_clone,
-            callback_clone,
-        );
-    });
     let mut nlcn_msg = NLCN_MSG_EVENT_INIT;
     let nlcn_msg_ptr: *mut c_void = &mut nlcn_msg as *mut _ as *mut c_void;
+
     while running.load(Ordering::SeqCst) {
         let buf = unsafe {
             std::slice::from_raw_parts_mut(nlcn_msg_ptr as *mut u8, size_of::<NlcnMsgEvent>())
         };
+        // This recv is blocking
         let rc = recv(nl_sock, buf, nix::sys::socket::MsgFlags::empty());
         if rc.is_err() {
             let err = rc.err().unwrap();
             if err == nix::Error::EINTR {
                 continue;
             }
-            // Return error when recv fails
+            error!("Netlink recv error: {}", err);
+            unsafe { libc::close(nl_sock) };
             return Err(err);
         }
+
         // Process the event
-        match nlcn_msg.proc_ev.what {
-            ProcEventWhat::ProcEventNone => {}
+        let event = match nlcn_msg.proc_ev.what {
             ProcEventWhat::ProcEventFork => {
                 let data = unsafe { nlcn_msg.proc_ev.event_data.fork };
-                // Use tokio to execute the read and update operations
-                let processes_clone = processes.clone();
-                let psi_watcher_clone = psi_watcher.clone();
-                let callback_clone = callback.clone();
-
-                // Update process information by reading from /proc
-                if let Ok(process_info) = read_process_info_from_proc(data.child_tgid) {
-                    if data.parent_tgid == data.child_tgid {
-                        debug!(
-                            "thread: parent pid={} -> child pid={} {} {}",
-                            data.parent_tgid, data.child_pid, data.child_tgid, process_info.comm
-                        );
-                    } else {
-                        debug!(
-                            "fork: parent pid={} {} -> child pid={} {} tname/cmd ({}) {:?}",
-                            data.parent_tgid,
-                            data.parent_pid,
-                            data.child_pid,
-                            data.child_tgid,
-                            process_info.comm,
-                            process_info.cmdline
-                        );
-
-                        // Process still exists, update its information
-                        {
-                            let mut proc_map = processes_clone.lock().unwrap();
-                            proc_map.insert(process_info.pid, process_info.clone());
-                        }
-
-                        psi_watcher_clone.add_pid(process_info.pid, PressureType::Memory);
-                        psi_watcher_clone.add_pid(process_info.pid, PressureType::Cpu);
-                        psi_watcher_clone.add_pid(process_info.pid, PressureType::Io);
-
-                        if let Some(cb) = callback_clone.lock().unwrap().as_ref() {
-                            cb(process_info);
-                        }
-                    }
-                }
+                Some(NetlinkEvent::Fork {
+                    parent_pid: data.parent_pid,
+                    parent_tgid: data.parent_tgid,
+                    child_pid: data.child_pid,
+                    child_tgid: data.child_tgid,
+                })
             }
-            // Ignore Exec event as requested
             ProcEventWhat::ProcEventExec => {
-                // Ignored as per requirements
-            }
-            // Ignore Uid event as requested
-            ProcEventWhat::ProcEventUid => {
-                // Ignored as per requirements
-            }
-            // Ignore Gid event as requested
-            ProcEventWhat::ProcEventGid => {
-                // Ignored as per requirements
+                let data = unsafe { nlcn_msg.proc_ev.event_data.exec };
+                Some(NetlinkEvent::Exec {
+                    process_pid: data.process_pid,
+                    process_tgid: data.process_tgid,
+                })
             }
             ProcEventWhat::ProcEventExit => {
                 let data = unsafe { nlcn_msg.proc_ev.event_data.exit };
-                info!("exit: pid={}", data.process_tgid);
-                processes.lock().unwrap().remove(&data.process_tgid);
-                psi_watcher.remove_pid(data.process_tgid);
+                Some(NetlinkEvent::Exit {
+                    process_pid: data.process_pid,
+                    process_tgid: data.process_tgid,
+                    exit_code: data.exit_code,
+                    exit_signal: data.exit_signal,
+                })
             }
-            // Ignore Comm event as requested
-            ProcEventWhat::ProcEventComm => {
-                // Ignored as per requirements
+            _ => None,
+        };
+
+        if let Some(e) = event {
+            // blocking_send is appropriate here because we are likely running in a dedicated thread
+            // (or using spawn_blocking) and we don't want to async await inside this tight blocking loop
+            // without converting the socket to async.
+            if let Err(err) = tx.blocking_send(e) {
+                error!("Failed to send netlink event: {}", err);
+                break;
             }
         }
-        //println!("Processes: {}", processes.lock().unwrap().len());
     }
-    // Only return Ok when the loop exits due to running being set to false
+
+    info!("Stopping netlink listener");
+    proc_set_ev_listen(nl_sock, false).ok();
+    unsafe { libc::close(nl_sock) };
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use log::info;
-
-    #[test]
-    fn test_start_populates_processes() {
-        use crate::proc::ProcMon;
-
-        let proc_mon = match ProcMon::new() {
-            Ok(pm) => pm,
-            Err(e) => {
-                if let nix::Error::EADDRINUSE = e {
-                    info!("Skipping test due to EADDRINUSE - another instance may be running");
-                    return;
-                }
-                panic!("Failed to create ProcMon: {}", e);
-            }
-        };
-
-        if let Err(e) = proc_mon.start(true, false) {
-            panic!("Failed to start ProcMon: {}", e);
-        }
-
-        let processes = proc_mon.processes.lock().unwrap();
-        assert!(
-            processes.len() >= 5,
-            "Expected at least 5 processes, found {}",
-            processes.len()
-        );
-
-        let _ = proc_mon.stop();
-    }
-}
