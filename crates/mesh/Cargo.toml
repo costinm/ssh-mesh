@@ -1,13 +1,7 @@
 [package]
-name = "ssh-mesh"
+name = "ssh-mesh-crate"
 version = "0.0.1"
 edition = "2021"
-default-run = "ssh-mesh"
-
-[features]
-default = ["ssh"]
-ssh = ["dep:russhd"]
-pmon = ["dep:pmond"]
 
 [dependencies]
 jni = "0.21.1"
@@ -56,15 +50,6 @@ echo_service = { path = "../echo_service" }
 
 [dev-dependencies]
 tempfile = "3.3"
-
-[lib]
-# cdylib ?
-name = "sshmesh"
-crate-type = ["staticlib", "rlib"]
-
-[[bin]]
-name = "ssh-mesh"
-path = "src/main.rs"
 
 #[target.'cfg(target_env = "musl")']
 #rustflags = ["-C", "target-feature=+crt-static"]
