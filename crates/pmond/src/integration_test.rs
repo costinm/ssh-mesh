@@ -6,6 +6,7 @@
 //! - Detect new processes when they are started
 
 use pmond::{ProcMon, ProcessInfo};
+use tracing::info;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
@@ -33,7 +34,7 @@ fn test_proc_mon_creation_and_existing_processes() -> Result<(), Box<dyn std::er
     // We should have at least some processes
     assert!(!processes.is_empty(), "Should have found some processes");
     
-    println!("Found {} processes", processes.len());
+    info!("Found {} processes", processes.len());
     
     // Stop monitoring
     proc_mon.stop()?;
@@ -71,7 +72,7 @@ fn test_http_handler_returns_processes() -> Result<(), Box<dyn std::error::Error
         assert!(!process_info.comm.is_empty(), "Process should have a command name");
     }
     
-    println!("Verified {} processes have required fields", processes.len());
+    info!("Verified {} processes have required fields", processes.len());
     
     // Stop monitoring
     proc_mon.stop()?;
@@ -94,7 +95,7 @@ fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
     
     // Set a callback to handle new processes
     proc_mon.set_callback(move |p: ProcessInfo| {
-        println!("New process detected: pid={}, comm={}", p.pid, p.comm);
+        info!("New process detected: pid={}, comm={}", p.pid, p.comm);
         let mut detected = detected_processes_clone.lock().unwrap();
         detected.push(p);
     });
@@ -113,7 +114,7 @@ fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()?;
     
     let child_pid = child.id();
-    println!("Started test process with PID: {}", child_pid);
+    info!("Started test process with PID: {}", child_pid);
     
     // Wait a bit for the process to be detected
     thread::sleep(Duration::from_millis(500));
@@ -131,9 +132,9 @@ fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
     // Note: Process detection through netlink might not always work in test environments
     // so we won't assert this strictly, but we'll print the result
     if process_found {
-        println!("Successfully detected test process with PID: {}", child_pid);
+        info!("Successfully detected test process with PID: {}", child_pid);
     } else {
-        println!("Test process with PID {} may not have been detected (this can happen in some environments)", child_pid);
+        info!("Test process with PID {} may not have been detected (this can happen in some environments)", child_pid);
     }
     
     // Stop monitoring
@@ -164,13 +165,13 @@ fn test_get_process_by_pid() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(process_info) = proc_mon.get_process(current_pid) {
         assert_eq!(process_info.pid, current_pid, "PID should match");
         assert!(!process_info.comm.is_empty(), "Process should have a command name");
-        println!("Found current process: {} (PID: {})", process_info.comm, process_info.pid);
+        info!("Found current process: {} (PID: {})", process_info.comm, process_info.pid);
     } else {
         // If we can't get the current process, try to get the init process (PID 1)
         if let Some(process_info) = proc_mon.get_process(1) {
             assert_eq!(process_info.pid, 1, "PID should be 1");
             assert!(!process_info.comm.is_empty(), "Process should have a command name");
-            println!("Found init process: {} (PID: {})", process_info.comm, process_info.pid);
+            info!("Found init process: {} (PID: {})", process_info.comm, process_info.pid);
         } else {
             panic!("Could not find current process or init process");
         }

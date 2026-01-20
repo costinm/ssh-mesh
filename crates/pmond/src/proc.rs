@@ -49,9 +49,12 @@ pub struct ProcMemInfo {
 /// Monitors process events via Netlink.
 pub struct ProcMon {
     pub nl_sock: RawFd,
+
     pub running: Arc<AtomicBool>,
     pub handle: Mutex<Option<JoinHandle<()>>>,
+
     pub callback: Arc<Mutex<Option<Box<dyn Fn(ProcessInfo) + Send + Sync>>>>,
+
     pub processes: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
     pub psi_watcher: Arc<PsiWatcher>,
 }
@@ -96,9 +99,10 @@ impl ProcMon {
         //         info!("PSI Broadcast Event: pid={}, type={:?}, data={}", event.pid, event.pressure_type, event.pressure_data);
         //     }
         // });
-        psi_watcher.start().unwrap();
+        
+        // psi_watcher.start().unwrap();
         psi_watcher.set_callback(|pid, info| {
-            println!("PSI event for pid {}: {}", pid, info);
+            info!("PSI event for pid {}: {}", pid, info);
         });
 
         info!("ProcMon created successfully");

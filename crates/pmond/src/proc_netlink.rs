@@ -13,6 +13,10 @@ use std::sync::{
 use crate::proc::{read_process_info_from_proc, ProcessInfo};
 use crate::psi::{PressureType, PsiWatcher};
 
+pub struct ProcWatch {
+    
+}
+
 // linux/connector.h
 const CN_IDX_PROC: u32 = 0x1;
 const CN_VAL_PROC: u32 = 0x1;

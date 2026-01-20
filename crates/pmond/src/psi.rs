@@ -1,4 +1,5 @@
-// This file deals with watching memory pressure (PSI) for a set of
+// This file deals with watching memory pressure (PSI) for a set
+// of
 // processes.
 
 use crate::proc::create_process_info;
@@ -140,7 +141,7 @@ impl PsiWatcher {
         debug!("Starting PSI monitoring thread");
         if self.running.load(Ordering::SeqCst) {
             debug!("PSI monitoring already running");
-            return Ok(());
+            return Ok(())
         }
 
         self.running.store(true, Ordering::SeqCst);
@@ -414,7 +415,7 @@ mod tests {
 
             // Set a callback
             watcher.set_callback(|pid, info| {
-                println!("PSI callback triggered for PID {}: {}", pid, info);
+                info!("PSI callback triggered for PID {}: {}", pid, info);
             });
 
             // Add current process to watch
@@ -424,7 +425,7 @@ mod tests {
 
             // Start the watcher
             if let Err(e) = watcher.start() {
-                println!("Failed to start PSI watcher: {}", e);
+                info!("Failed to start PSI watcher: {}", e);
                 // This might fail in test environments, which is acceptable
                 return;
             }
@@ -435,7 +436,7 @@ mod tests {
             // Stop the watcher
             let _ = watcher.stop();
 
-            println!("PSI watcher test completed");
+            info!("PSI watcher test completed");
         });
 
         let start = std::time::Instant::now();

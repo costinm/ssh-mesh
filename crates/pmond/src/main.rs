@@ -1,13 +1,11 @@
 use axum::serve;
 use clap::Parser;
-use log::{error, info};
+use tracing::{error, info};
 use pmond::ProcMon;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 use ws::WSServer;
-
-mod handlers;
 
 #[derive(Parser, Debug)]
 #[clap(name = "pmond", version = "0.1.0", author = "Author")]
@@ -24,6 +22,10 @@ struct Args {
     #[clap(long = "watch", value_name = "PID")]
     watch: Option<u32>,
 
+    /// Run in MCP (Model Context Protocol) mode via stdin
+    #[clap(long = "mcp")]
+    mcp: bool,
+
     /// Refresh interval in seconds for server mode (default: 10)
     #[clap(long = "refresh", default_value = "10", value_name = "SECONDS")]
     refresh: u64,
@@ -32,7 +34,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for logging
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
 
     let args = Args::parse();
 
@@ -43,6 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(pid) = args.watch {
         watch_process(pid, args.refresh).await?;
+        return Ok(());
+    }
+
+    if args.mcp {
+        run_mcp_server().await?;
         return Ok(());
     }
 
@@ -73,7 +83,7 @@ fn show_processes() -> Result<(), Box<dyn std::error::Error>> {
     processes_list.sort_by_key(|(_, p)| p.mem_info.as_ref().map(|m| m.anon).unwrap_or(0));
 
     for (_, process) in processes_list.iter().rev() {
-        println!(
+        info!(
             "PID: {} | RSS: {} | Name: {}",
             process.pid,
             process.mem_info.as_ref().map(|m| m.anon).unwrap_or(0),
@@ -99,11 +109,11 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
     // Start monitoring in a background thread
     proc_mon.start(true, true)?;
 
-    println!(
+    info!(
         "Watching process {} with refresh interval {}s",
         pid, refresh
     );
-    println!("Press Ctrl+C to stop");
+    info!("Press Ctrl+C to stop");
 
     // Watch for updates for the specific process
     let refresh_duration = Duration::from_secs(refresh);
@@ -114,7 +124,7 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
         let processes = proc_mon.get_all_processes();
         if let Some(process) = processes.get(&pid) {
             if let Some(mem_info) = &process.mem_info {
-                println!(
+                info!(
                     "Anon: {} | File: {} | Kernel: {} | Shmem: {} | Swapcached: {}",
                     mem_info.anon,
                     mem_info.file,
@@ -125,6 +135,29 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
             }
         }
     }
+}
+
+async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting PMON MCP server");
+
+    // Create a new ProcMon instance
+    let proc_mon = ProcMon::new()?;
+
+    // Enable listening for events
+    //proc_mon.listen(true)?;
+
+    // Wrap the monitor in an Arc for shared ownership
+    let proc_mon = Arc::new(proc_mon);
+
+    // Start monitoring in a background thread
+    // let pm_clone = proc_mon.clone();
+    // tokio::task::spawn_blocking(move || {
+    //     if let Err(e) = pm_clone.start(true, true) {
+    //         error!("Failed to start ProcMon: {}", e);
+    //     }
+    // });
+
+    pmond::mcp::run_stdio_server(proc_mon).await
 }
 
 async fn run_server(refresh: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -156,7 +189,7 @@ async fn run_server(refresh: u64) -> Result<(), Box<dyn std::error::Error>> {
     info!("Listening on http://{}", addr);
 
     // Create the Axum app
-    let app = handlers::app(proc_mon, ws_server);
+    let app = pmond::handlers::app(proc_mon, ws_server);
 
     // Run the server
     serve(listener, app.into_make_service()).await?;
