@@ -55,7 +55,7 @@ pub async fn get_psi_watches(
 
 pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
     let app_state = AppState {
-        proc_mon,
+        proc_mon: proc_mon.clone(),
         ws_server,
     };
 
@@ -94,5 +94,6 @@ pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
             }),
         )
         .nest_service("/web", ServeDir::new("web"))
+        .nest_service("/mcp", crate::mcp::mcp_service(proc_mon))
         .with_state(app_state)
 }

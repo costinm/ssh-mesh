@@ -1,20 +1,25 @@
-use crate::ProcMon;
+use crate::{ProcMemInfo, ProcMon};
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 use rmcp::{
     handler::server::ServerHandler,
     model::{
-        CallToolResult, ErrorData, InitializeRequestParam, InitializeResult,
-        ListResourcesResult, ListToolsResult, PaginatedRequestParam, ReadResourceResult,
-        ReadResourceRequestParam, Resource, Tool, ServerCapabilities, Implementation,
-        ResourceContents, RawResource, RawContent, Annotated, ErrorCode,
-        ToolsCapability, ResourcesCapability, RawTextContent, ProtocolVersion,
+        Annotated, CallToolResult, ErrorCode, ErrorData, Implementation, InitializeRequestParam,
+        InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParam,
+        ProtocolVersion, RawContent, RawResource, RawTextContent, ReadResourceRequestParam,
+        ReadResourceResult, Resource, ResourceContents, ResourcesCapability, ServerCapabilities,
+        Tool, ToolsCapability,
     },
-    service::RequestContext, ServiceExt, RoleServer,
+    service::RequestContext,
+    RoleServer, ServiceExt,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct PmonMcpHandler {
     proc_mon: Arc<ProcMon>,
 }
@@ -25,16 +30,31 @@ impl PmonMcpHandler {
     }
 }
 
+pub fn mcp_service(proc_mon: Arc<ProcMon>) -> StreamableHttpService<PmonMcpHandler> {
+    let config = StreamableHttpServerConfig::default();
+    let session_manager = Arc::new(LocalSessionManager::default());
+
+    StreamableHttpService::new(
+        move || Ok(PmonMcpHandler::new(proc_mon.clone())),
+        session_manager,
+        config,
+    )
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct GetProcessArgs {
-    pid: u32,
+    process: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SimplifiedProcess {
     pid: u32,
+    ppid: u32,
     name: String,
+    cgroup_path: Option<String>,
+    cmdline: Option<String>,
     rss: u64,
+    mem_info: Option<ProcMemInfo>,
     user: Option<u32>,
 }
 
@@ -99,7 +119,11 @@ impl ServerHandler for PmonMcpHandler {
             },
             Tool {
                 name: "get_process".to_string().into(),
-                description: Some("Get details of a specific process by PID".to_string().into()),
+                description: Some(
+                    "Get details of a specific process by PID"
+                        .to_string()
+                        .into(),
+                ),
                 input_schema: to_schema(serde_json::to_value(schema_for!(GetProcessArgs)).unwrap()),
                 annotations: None,
                 icons: None,
@@ -129,8 +153,12 @@ impl ServerHandler for PmonMcpHandler {
                     .values()
                     .map(|p| SimplifiedProcess {
                         pid: p.pid,
+                        ppid: p.ppid,
                         name: p.comm.clone(),
+                        cgroup_path: p.cgroup_path.clone(),
+                        cmdline: p.cmdline.clone(),
                         rss: p.mem_info.as_ref().map(|m| m.anon).unwrap_or(0),
+                        mem_info: p.mem_info.clone(),
                         user: p.uid,
                     })
                     .collect();
@@ -150,14 +178,20 @@ impl ServerHandler for PmonMcpHandler {
             }
             "get_process" => {
                 let args_val = serde_json::Value::Object(params.arguments.unwrap_or_default());
-                let args: GetProcessArgs = serde_json::from_value(args_val)
-                    .map_err(|e| ErrorData {
+                let args: GetProcessArgs =
+                    serde_json::from_value(args_val).map_err(|e| ErrorData {
                         code: ErrorCode(-32602),
                         message: format!("Invalid arguments: {}", e).into(),
                         data: None,
                     })?;
 
-                match self.proc_mon.get_process(args.pid) {
+                let pid = args.process.parse::<u32>().map_err(|_| ErrorData {
+                    code: ErrorCode(-32602),
+                    message: format!("Invalid PID: {}", args.process).into(),
+                    data: None,
+                })?;
+
+                match self.proc_mon.get_process(pid) {
                     Some(process) => Ok(CallToolResult {
                         content: vec![Annotated {
                             raw: RawContent::Text(RawTextContent {
@@ -172,7 +206,7 @@ impl ServerHandler for PmonMcpHandler {
                     }),
                     None => Err(ErrorData {
                         code: ErrorCode(-32001),
-                        message: format!("Process {} not found", args.pid).into(),
+                        message: format!("Process {} not found", pid).into(),
                         data: None,
                     }),
                 }
@@ -242,11 +276,4 @@ pub async fn run_stdio_server(proc_mon: Arc<ProcMon>) -> Result<(), Box<dyn std:
     let service = handler.serve(transport).await?;
     service.waiting().await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // Tests are temporarily disabled as they require significant adaptation to the new rmcp structure
-    // and mocking of RequestContext which is non-trivial without extra test utilities.
 }
