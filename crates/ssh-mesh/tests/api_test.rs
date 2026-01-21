@@ -68,8 +68,8 @@ async fn setup_test_environment() -> Result<TestSetup> {
     let server_base_dir = base_dir.clone();
 
     let server_handle = tokio::spawn(async move {
-        let ssh_server = std::sync::Arc::new(russhd::SshServer::new(0, None, server_base_dir));
-        let app_state = russhd::AppState {
+        let ssh_server = std::sync::Arc::new(ssh_mesh::SshServer::new(0, None, server_base_dir));
+        let app_state = ssh_mesh::AppState {
             ssh_server: ssh_server.clone(),
             ws_server: std::sync::Arc::new(ws::WSServer::new()),
         };
@@ -78,13 +78,13 @@ async fn setup_test_environment() -> Result<TestSetup> {
         tokio::spawn(async move {
             let config = ssh_server_clone.get_config();
             if let Err(e) =
-                russhd::run_ssh_server(ssh_port, config, (*ssh_server_clone).clone()).await
+                ssh_mesh::run_ssh_server(ssh_port, config, (*ssh_server_clone).clone()).await
             {
                 eprintln!("SSH server failed: {}", e);
             }
         });
 
-        let app = russhd::handlers::app(app_state);
+        let app = ssh_mesh::handlers::app(app_state);
         match axum::serve(http_listener, app.into_make_service()).await {
             Ok(_) => println!("Axum server finished"),
             Err(e) => eprintln!("Axum server failed: {}", e),

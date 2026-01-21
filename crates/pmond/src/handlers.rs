@@ -1,16 +1,21 @@
 use crate::ProcMon;
 use axum::{
     extract::State,
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json},
     routing::{delete, get, post},
     Router,
 };
 use hyper::StatusCode;
 use log::debug;
+use rust_embed::RustEmbed;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
-use tower_http::services::ServeDir;
 use ws::WSServer;
+
+#[derive(RustEmbed)]
+#[folder = "web/"]
+pub struct Assets;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +58,41 @@ pub async fn get_psi_watches(
     (StatusCode::OK, Json(json!(watches)))
 }
 
+pub async fn handle_web_request(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    let path = path.trim_start_matches('/');
+    let local_path = Path::new("web").join(path);
+
+    if local_path.exists() && local_path.is_file() {
+        match std::fs::read(&local_path) {
+            Ok(content) => {
+                let mime = mime_guess::from_path(&local_path).first_or_octet_stream();
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, mime.to_string())],
+                    content,
+                )
+                    .into_response();
+            }
+            Err(_) => {}
+        }
+    }
+
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, mime.to_string())],
+                content.data.to_owned(),
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+    }
+}
+
 pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
     let app_state = AppState {
         proc_mon: proc_mon.clone(),
@@ -93,7 +133,7 @@ pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
                 ws::handle_broadcast(State(app_state.ws_server), json)
             }),
         )
-        .nest_service("/web", ServeDir::new("web"))
+        .route("/web/*path", get(handle_web_request))
         .nest_service("/mcp", crate::mcp::mcp_service(proc_mon))
         .with_state(app_state)
 }

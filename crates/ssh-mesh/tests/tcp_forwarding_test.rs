@@ -86,9 +86,9 @@ async fn setup_test_environment() -> Result<TestSetup> {
     let ssh_port = find_free_port()?;
     let server_base_dir = base_dir.clone();
     let server_handle = tokio::spawn(async move {
-        let ssh_server = russhd::SshServer::new(0, None, server_base_dir);
+        let ssh_server = ssh_mesh::SshServer::new(0, None, server_base_dir);
         let config = ssh_server.get_config();
-        russhd::run_ssh_server(ssh_port, config, ssh_server)
+        ssh_mesh::run_ssh_server(ssh_port, config, ssh_server)
             .await
             .unwrap();
     });

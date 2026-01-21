@@ -1,4 +1,4 @@
-use log::{debug, error, info};
+use log::{error, info};
 use nix::sys::socket::{bind, recv, send, NetlinkAddr};
 use nix::unistd::getpid;
 use std::ffi::c_void;

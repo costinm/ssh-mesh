@@ -11,7 +11,6 @@ pub use handlers::handle_ps_request;
 pub use proc::{ProcMon};
 pub use psi::{PressureEvent, PsiWatcher};
 
-use std::fs;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PressureType {
