@@ -8,9 +8,8 @@ pub mod proc_netlink;
 pub mod psi;
 
 pub use handlers::handle_ps_request;
-pub use proc::{ProcMon};
+pub use proc::ProcMon;
 pub use psi::{PressureEvent, PsiWatcher};
-
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PressureType {
@@ -31,7 +30,7 @@ pub struct ProcessInfo {
 }
 
 /// memory.stats
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct ProcMemInfo {
     pub anon: u64,
     pub file: u64,
@@ -43,6 +42,42 @@ pub struct ProcMemInfo {
     pub file_dirty: u64,
     pub file_writeback: u64,
     pub swapcached: u64,
+
+    // Faults and VM activity
+    pub pgfault: u64,
+    pub pgmajfault: u64,
+    pub pgrefill: u64,
+    pub pgactivate: u64,
+    pub pgdeactivate: u64,
+    pub pswpin: u64,
+    pub pswpout: u64,
+    pub pgsteal: u64,
+    pub pgscan: u64,
+
+    // Demotion stats
+    pub pgdemote_kswapd: u64,
+    pub pgdemote_direct: u64,
+    pub pgdemote_khugepaged: u64,
+    pub pgdemote_proactive: u64,
+
+    // Active/Inactive
+    pub active_anon: u64,
+    pub active_file: u64,
+    pub inactive_anon: u64,
+    pub inactive_file: u64,
+
+    // Workingset stats
+    pub workingset_refault_anon: u64,
+    pub workingset_refault_file: u64,
+    pub workingset_activate_anon: u64,
+    pub workingset_activate_file: u64,
+    pub workingset_restore_anon: u64,
+    pub workingset_restore_file: u64,
+    pub workingset_nodereclaim: u64,
+
+    // Cgroup memory limits and usage
+    pub memory_current: Option<u64>,
+    pub memory_high: Option<String>,
 }
 
 /// Read process information from /proc/[pid]/stat (static version for global access)
@@ -87,7 +122,7 @@ pub fn read_cgroup_path(pid: u32) -> Option<String> {
     if let Ok(content) = std::fs::read_to_string(&cgroup_path) {
         for line in content.lines() {
             if line.starts_with("0::") {
-                let cgroup = &line[3..]; 
+                let cgroup = &line[3..];
                 if !cgroup.is_empty() && cgroup != "/" {
                     return Some(format!("/sys/fs/cgroup{}", cgroup));
                 }
@@ -102,18 +137,7 @@ pub fn read_memory_info(pid: u32) -> Option<ProcMemInfo> {
     let status_path = format!("/proc/{}/status", pid);
     let content = std::fs::read_to_string(&status_path).ok()?;
 
-    let mut mem_info = ProcMemInfo {
-        anon: 0,
-        file: 0,
-        kernel: 0,
-        kernel_stack: 0,
-        pagetables: 0,
-        shmem: 0,
-        file_mapped: 0,
-        file_dirty: 0,
-        file_writeback: 0,
-        swapcached: 0,
-    };
+    let mut mem_info = ProcMemInfo::default();
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -176,18 +200,17 @@ pub fn parse_memory_stats(cgroup_path: &str) -> Result<ProcMemInfo, Box<dyn std:
     let memory_stat_path = format!("{}/memory.stat", cgroup_path);
     let content = std::fs::read_to_string(&memory_stat_path)?;
 
-    let mut mem_info = ProcMemInfo {
-        anon: 0,
-        file: 0,
-        kernel: 0,
-        kernel_stack: 0,
-        pagetables: 0,
-        shmem: 0,
-        file_mapped: 0,
-        file_dirty: 0,
-        file_writeback: 0,
-        swapcached: 0,
-    };
+    let mut mem_info = ProcMemInfo::default();
+
+    // Try reading memory.current
+    if let Ok(curr) = std::fs::read_to_string(format!("{}/memory.current", cgroup_path)) {
+        mem_info.memory_current = curr.trim().parse().ok();
+    }
+
+    // Try reading memory.high
+    if let Ok(high) = std::fs::read_to_string(format!("{}/memory.high", cgroup_path)) {
+        mem_info.memory_high = Some(high.trim().to_string());
+    }
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -207,6 +230,34 @@ pub fn parse_memory_stats(cgroup_path: &str) -> Result<ProcMemInfo, Box<dyn std:
             "file_dirty" => mem_info.file_dirty = value,
             "file_writeback" => mem_info.file_writeback = value,
             "swapcached" => mem_info.swapcached = value,
+
+            "pgfault" => mem_info.pgfault = value,
+            "pgmajfault" => mem_info.pgmajfault = value,
+            "pgrefill" => mem_info.pgrefill = value,
+            "pgactivate" => mem_info.pgactivate = value,
+            "pgdeactivate" => mem_info.pgdeactivate = value,
+            "pswpin" => mem_info.pswpin = value,
+            "pswpout" => mem_info.pswpout = value,
+            "pgsteal" => mem_info.pgsteal = value,
+            "pgscan" => mem_info.pgscan = value,
+
+            "pgdemote_kswapd" => mem_info.pgdemote_kswapd = value,
+            "pgdemote_direct" => mem_info.pgdemote_direct = value,
+            "pgdemote_khugepaged" => mem_info.pgdemote_khugepaged = value,
+            "pgdemote_proactive" => mem_info.pgdemote_proactive = value,
+
+            "active_anon" => mem_info.active_anon = value,
+            "active_file" => mem_info.active_file = value,
+            "inactive_anon" => mem_info.inactive_anon = value,
+            "inactive_file" => mem_info.inactive_file = value,
+
+            "workingset_refault_anon" => mem_info.workingset_refault_anon = value,
+            "workingset_refault_file" => mem_info.workingset_refault_file = value,
+            "workingset_activate_anon" => mem_info.workingset_activate_anon = value,
+            "workingset_activate_file" => mem_info.workingset_activate_file = value,
+            "workingset_restore_anon" => mem_info.workingset_restore_anon = value,
+            "workingset_restore_file" => mem_info.workingset_restore_file = value,
+            "workingset_nodereclaim" => mem_info.workingset_nodereclaim = value,
             _ => (),
         }
     }

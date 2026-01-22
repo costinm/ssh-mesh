@@ -46,6 +46,11 @@ struct GetProcessArgs {
     process: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct GetCgroupArgs {
+    path: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct SimplifiedProcess {
     pid: u32,
@@ -125,6 +130,33 @@ impl ServerHandler for PmonMcpHandler {
                         .into(),
                 ),
                 input_schema: to_schema(serde_json::to_value(schema_for!(GetProcessArgs)).unwrap()),
+                annotations: None,
+                icons: None,
+                meta: None,
+                title: None,
+                output_schema: None,
+            },
+            Tool {
+                name: "list_cgroups".to_string().into(),
+                description: Some("List all cgroups used by processes".to_string().into()),
+                input_schema: to_schema(json!({
+                    "type": "object",
+                    "properties": {},
+                })),
+                annotations: None,
+                icons: None,
+                meta: None,
+                title: None,
+                output_schema: None,
+            },
+            Tool {
+                name: "get_cgroup".to_string().into(),
+                description: Some(
+                    "Get memory info for a specific cgroup path"
+                        .to_string()
+                        .into(),
+                ),
+                input_schema: to_schema(serde_json::to_value(schema_for!(GetCgroupArgs)).unwrap()),
                 annotations: None,
                 icons: None,
                 meta: None,
@@ -211,6 +243,50 @@ impl ServerHandler for PmonMcpHandler {
                     }),
                 }
             }
+            "list_cgroups" => {
+                let cgroups = self.proc_mon.get_all_cgroups();
+                Ok(CallToolResult {
+                    content: vec![Annotated {
+                        raw: RawContent::Text(RawTextContent {
+                            text: serde_json::to_string_pretty(&cgroups).unwrap().into(),
+                            meta: None,
+                        }),
+                        annotations: None,
+                    }],
+                    is_error: None,
+                    meta: None,
+                    structured_content: None,
+                })
+            }
+            "get_cgroup" => {
+                let args_val = serde_json::Value::Object(params.arguments.unwrap_or_default());
+                let args: GetCgroupArgs =
+                    serde_json::from_value(args_val).map_err(|e| ErrorData {
+                        code: ErrorCode(-32602),
+                        message: format!("Invalid arguments: {}", e).into(),
+                        data: None,
+                    })?;
+
+                match self.proc_mon.read_cgroup(&args.path) {
+                    Some(cgroup) => Ok(CallToolResult {
+                        content: vec![Annotated {
+                            raw: RawContent::Text(RawTextContent {
+                                text: serde_json::to_string_pretty(&cgroup).unwrap().into(),
+                                meta: None,
+                            }),
+                            annotations: None,
+                        }],
+                        is_error: None,
+                        meta: None,
+                        structured_content: None,
+                    }),
+                    None => Err(ErrorData {
+                        code: ErrorCode(-32002),
+                        message: format!("Cgroup {} not found or failed to read", args.path).into(),
+                        data: None,
+                    }),
+                }
+            }
             _ => Err(ErrorData {
                 code: ErrorCode(-32601),
                 message: format!("Tool not found: {}", params.name).into(),
@@ -224,19 +300,38 @@ impl ServerHandler for PmonMcpHandler {
         _params: Option<PaginatedRequestParam>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let resources = vec![Resource {
-            annotations: None,
-            raw: RawResource {
-                uri: "process://list".to_string().into(),
-                name: "Process List".to_string().into(),
-                description: Some("List of all processes".to_string().into()),
-                mime_type: Some("application/json".to_string().into()),
-                size: None,
-                meta: None,
-                icons: None,
-                title: None,
+        let resources = vec![
+            Resource {
+                annotations: None,
+                raw: RawResource {
+                    uri: "process://list".to_string().into(),
+                    name: "Process List".to_string().into(),
+                    description: Some("List of all processes".to_string().into()),
+                    mime_type: Some("application/json".to_string().into()),
+                    size: None,
+                    meta: None,
+                    icons: None,
+                    title: None,
+                },
             },
-        }];
+            Resource {
+                annotations: None,
+                raw: RawResource {
+                    uri: "cgroup://list".to_string().into(),
+                    name: "CGroup List".to_string().into(),
+                    description: Some(
+                        "List of all cgroups and their memory info"
+                            .to_string()
+                            .into(),
+                    ),
+                    mime_type: Some("application/json".to_string().into()),
+                    size: None,
+                    meta: None,
+                    icons: None,
+                    title: None,
+                },
+            },
+        ];
 
         Ok(ListResourcesResult {
             resources,
@@ -257,6 +352,16 @@ impl ServerHandler for PmonMcpHandler {
                     uri: params.uri,
                     mime_type: Some("application/json".to_string().into()),
                     text: serde_json::to_string(&processes).unwrap().into(),
+                    meta: None,
+                }],
+            })
+        } else if params.uri == "cgroup://list" {
+            let cgroups = self.proc_mon.get_all_cgroups();
+            Ok(ReadResourceResult {
+                contents: vec![ResourceContents::TextResourceContents {
+                    uri: params.uri,
+                    mime_type: Some("application/json".to_string().into()),
+                    text: serde_json::to_string(&cgroups).unwrap().into(),
                     meta: None,
                 }],
             })

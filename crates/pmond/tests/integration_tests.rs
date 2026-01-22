@@ -6,7 +6,7 @@
 //! - Detect new processes when they are started
 //! - Handle WebSocket connections properly
 
-use pmond::{ProcMon, ProcessInfo, proc_netlink};
+use pmond::{proc_netlink, ProcMon, ProcessInfo};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 fn start_monitoring(proc_mon: Arc<ProcMon>) {
     let (tx, mut rx) = mpsc::channel(100);
     let running = proc_mon.running.clone();
-    
+
     // Start netlink listener
     tokio::task::spawn_blocking(move || {
         let _ = proc_netlink::run_netlink_listener(tx, running);
@@ -26,7 +26,12 @@ fn start_monitoring(proc_mon: Arc<ProcMon>) {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
-                proc_netlink::NetlinkEvent::Fork { parent_tgid, child_pid, child_tgid, .. } => {
+                proc_netlink::NetlinkEvent::Fork {
+                    parent_tgid,
+                    child_pid,
+                    child_tgid,
+                    ..
+                } => {
                     pm.handle_fork(parent_tgid, child_pid, child_tgid);
                 }
                 proc_netlink::NetlinkEvent::Exit { process_tgid, .. } => {
@@ -209,6 +214,39 @@ async fn test_get_process_by_pid() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             panic!("Could not find current process or init process");
         }
+    }
+
+    // Stop monitoring
+    proc_mon.stop()?;
+
+    Ok(())
+}
+
+/// Test that we can get all cgroups and their memory info
+#[tokio::test]
+async fn test_cgroups_retrieval() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a new ProcMon instance
+    let proc_mon = ProcMon::new()?;
+    let proc_mon = Arc::new(proc_mon);
+
+    // Start monitoring
+    proc_mon.start(true, false)?; // Don't watch PSI for this test
+
+    // Give it a moment to read existing processes
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Get all cgroups
+    let cgroups = proc_mon.get_all_cgroups();
+
+    // We should have at least some cgroups if running on a real Linux system with cgroups v2
+    println!("Found {} cgroups", cgroups.len());
+
+    // If not empty, verify some data
+    for (path, _info) in cgroups.iter() {
+        assert!(
+            path.starts_with("/sys/fs/cgroup"),
+            "Cgroup path should start with /sys/fs/cgroup"
+        );
     }
 
     // Stop monitoring

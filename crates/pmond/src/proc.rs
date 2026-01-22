@@ -1,5 +1,5 @@
 use crate::psi::PsiWatcher;
-use crate::{read_process_info_from_proc, ProcessInfo, PressureType};
+use crate::{read_process_info_from_proc, PressureType, ProcMemInfo, ProcessInfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -51,7 +51,7 @@ impl ProcMon {
         debug!("Creating new ProcMon instance");
 
         let psi_watcher = PsiWatcher::new();
-        
+
         psi_watcher.set_callback(|pid, info| {
             info!("PSI event for pid {}: {}", pid, info);
         });
@@ -66,7 +66,9 @@ impl ProcMon {
         })
     }
 
-    /// Handle a fork event.
+    /// Handle a fork event - this is called when a Proc Netlink watcher is started
+    /// and generates an event for a process start. The process will be updated and
+    /// watched for PSI.
     pub fn handle_fork(&self, parent_tgid: u32, child_pid: u32, child_tgid: u32) {
         if let Ok(process_info) = read_process_info_from_proc(child_tgid) {
             if parent_tgid == child_tgid {
@@ -77,11 +79,7 @@ impl ProcMon {
             } else {
                 debug!(
                     "fork: parent pid={} -> child pid={} {} tname/cmd ({}) {:?}",
-                    parent_tgid,
-                    child_pid,
-                    child_tgid,
-                    process_info.comm,
-                    process_info.cmdline
+                    parent_tgid, child_pid, child_tgid, process_info.comm, process_info.cmdline
                 );
 
                 {
@@ -89,8 +87,10 @@ impl ProcMon {
                     proc_map.insert(process_info.pid, process_info.clone());
                 }
 
-                self.psi_watcher.add_pid(process_info.pid, PressureType::Memory);
-                self.psi_watcher.add_pid(process_info.pid, PressureType::Cpu);
+                self.psi_watcher
+                    .add_pid(process_info.pid, PressureType::Memory);
+                self.psi_watcher
+                    .add_pid(process_info.pid, PressureType::Cpu);
                 self.psi_watcher.add_pid(process_info.pid, PressureType::Io);
 
                 if let Some(cb) = self.callback.lock().unwrap().as_ref() {
@@ -117,9 +117,16 @@ impl ProcMon {
     }
 
     /// Start the monitoring and periodic checker. Will also read
-    /// the existing processes.
+    /// the existing processes and optionally maintain PSI watches.
+    ///
+    /// This method is not required - can just call get_process and get_all_processes
+    /// directly without background update and PSI watching.
     #[instrument(skip(self), fields(read_sync = _read_sync, watch_psi = watch_psi))]
-    pub fn start(&self, _read_sync: bool, watch_psi: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(
+        &self,
+        _read_sync: bool,
+        watch_psi: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Starting monitoring");
         if self.running.load(Ordering::SeqCst) {
             debug!("Monitoring already running");
@@ -131,7 +138,7 @@ impl ProcMon {
         let running_checker = self.running.clone();
         let processes_checker = self.processes.clone();
         let psi_watcher_checker = self.psi_watcher.clone();
-        
+
         // Spawn Periodic Checker (blocking due to file IO)
         let checker_handle = tokio::task::spawn_blocking(move || {
             periodic_process_checker(running_checker, processes_checker, psi_watcher_checker);
@@ -141,7 +148,11 @@ impl ProcMon {
         handles.push(checker_handle);
 
         debug!("Reading existing processes");
-        self.read_existing_processes(watch_psi);
+        let initial_processes = self.read_existing_processes(watch_psi);
+        {
+            let mut processes = self.processes.lock().unwrap();
+            *processes = initial_processes;
+        }
 
         Ok(())
     }
@@ -153,7 +164,7 @@ impl ProcMon {
         self.running.store(false, Ordering::SeqCst);
         debug!("Stopping PSI watcher");
         self.psi_watcher.stop().unwrap();
-        
+
         info!("Monitoring stopped");
         Ok(())
     }
@@ -167,55 +178,45 @@ impl ProcMon {
         Ok(())
     }
 
-    /// Retrieve a cached process by PID.
+    /// Retrieve current process by PID.
     #[instrument(skip(self), fields(pid = pid))]
     pub fn get_process(&self, pid: u32) -> Option<ProcessInfo> {
         trace!("Getting process by PID: {}", pid);
-        let procs = self.processes.lock().unwrap();
-        let result = procs.get(&pid).cloned();
-        debug!(
-            "Process {}found for PID: {}",
-            if result.is_some() { "" } else { "not " },
-            pid
-        );
-        result
+
+        match read_process_info_from_proc(pid) {
+            Ok(process_info) => {
+                let mut procs = self.processes.lock().unwrap();
+                procs.insert(pid, process_info.clone());
+                Some(process_info)
+            }
+            Err(_) => {
+                let mut procs = self.processes.lock().unwrap();
+                if procs.remove(&pid).is_some() {
+                    debug!("Process {} no longer exists, removed from cache", pid);
+                    self.psi_watcher.remove_pid(pid);
+                }
+                None
+            }
+        }
     }
 
     /// Get all processes
     #[instrument(skip(self))]
     pub fn get_all_processes(&self) -> HashMap<u32, ProcessInfo> {
         trace!("Getting all processes");
-        let procs = self.processes.lock().unwrap();
-        let _count = procs.len();
+        self.read_existing_processes(false)
+    }
+
+    /// Read existing processes from /proc and optionally add them to the PSI watcher.
+    #[instrument(skip(self), fields(watch_psi = watch_psi))]
+    pub fn read_existing_processes(&self, watch_psi: bool) -> HashMap<u32, ProcessInfo> {
+        debug!("Reading existing processes from /proc");
+        let mut result = HashMap::new();
 
         // Check if we're running as root
         let current_uid = get_current_uid();
         let is_root = current_uid == 0;
 
-        // Filter processes if not running as root
-        let result = if !is_root {
-            let filtered: HashMap<u32, ProcessInfo> = procs
-                .clone()
-                .into_iter()
-                .filter(|(_, process_info)| {
-                    // Show processes owned by the current user
-                    process_info.uid == Some(current_uid)
-                })
-                .collect();
-            filtered
-        } else {
-            procs.clone()
-        };
-
-        debug!("Returning {} processes", result.len());
-        result
-    }
-
-    /// Read existing processes from /proc and populate the processes map
-    #[instrument(skip(self), fields(watch_psi = watch_psi))]
-    pub fn read_existing_processes(&self, watch_psi: bool) {
-        debug!("Reading existing processes from /proc");
-        let mut count = 0;
         if let Ok(entries) = fs::read_dir("/proc") {
             for entry in entries {
                 if let Ok(entry) = entry {
@@ -225,10 +226,13 @@ impl ProcMon {
                         .and_then(|s| s.parse::<u32>().ok())
                     {
                         if let Ok(process_info) = read_process_info_from_proc(pid) {
-                            count += 1;
+                            // Filter processes if not running as root
+                            if !is_root && process_info.uid != Some(current_uid) {
+                                continue;
+                            }
+
                             trace!("Found process: {} (PID: {})", process_info.comm, pid);
-                            let mut processes = self.processes.lock().unwrap();
-                            processes.insert(pid, process_info.clone());
+                            result.insert(pid, process_info.clone());
 
                             // If watching PSI and process has a cgroup, start monitoring
                             if watch_psi {
@@ -242,7 +246,31 @@ impl ProcMon {
                 }
             }
         }
-        info!("Read {} existing processes", count);
+        info!("Read {} existing processes", result.len());
+        result
+    }
+
+    /// Read cgroup information by path.
+    pub fn read_cgroup(&self, cgroup_path: &str) -> Option<ProcMemInfo> {
+        crate::parse_memory_stats(cgroup_path).ok()
+    }
+
+    /// Get all cgroups used by known processes.
+    pub fn get_all_cgroups(&self) -> HashMap<String, ProcMemInfo> {
+        let processes = self.read_existing_processes(false);
+        let mut cgroups = HashMap::new();
+
+        for info in processes.values() {
+            if let Some(ref cgroup_path) = info.cgroup_path {
+                if !cgroups.contains_key(cgroup_path) {
+                    if let Some(mem_info) = self.read_cgroup(cgroup_path) {
+                        cgroups.insert(cgroup_path.clone(), mem_info);
+                    }
+                }
+            }
+        }
+
+        cgroups
     }
 }
 
@@ -261,31 +289,47 @@ fn periodic_process_checker(
             break;
         }
 
-        // Clone the process list to minimize lock time
-        let pids: Vec<u32> = {
+        // Get the current set of PIDs we know about
+        let old_pids: Vec<u32> = {
             let proc_map = processes.lock().unwrap();
             proc_map.keys().cloned().collect()
         };
 
-        // Check each process
-        for pid in pids {
-            // Check if process still exists by trying to read its info
-            match read_process_info_from_proc(pid) {
-                Ok(process_info) => {
-                    // Process still exists, update its information
+        // Check each process and discover new ones
+        let mut current_processes = HashMap::new();
+
+        // Check if we're running as root
+        let current_uid = get_current_uid();
+        let is_root = current_uid == 0;
+
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    if let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|s| s.parse::<u32>().ok())
                     {
-                        let mut proc_map = processes.lock().unwrap();
-                        proc_map.insert(pid, process_info.clone());
+                        if let Ok(process_info) = read_process_info_from_proc(pid) {
+                            // Filter processes if not running as root
+                            if !is_root && process_info.uid != Some(current_uid) {
+                                continue;
+                            }
+                            current_processes.insert(pid, process_info);
+                        }
                     }
                 }
-                Err(_) => {
-                    // Process no longer exists, remove it
-                    {
-                        let mut proc_map = processes.lock().unwrap();
-                        proc_map.remove(&pid);
-                    }
-                    psi_watcher.remove_pid(pid);
-                }
+            }
+        }
+
+        // Update the shared state
+        let mut proc_map = processes.lock().unwrap();
+        *proc_map = current_processes.clone();
+
+        // Clean up PSI watcher for disappeared processes
+        for pid in old_pids {
+            if !current_processes.contains_key(&pid) {
+                psi_watcher.remove_pid(pid);
             }
         }
     }

@@ -1,7 +1,5 @@
-// This file deals with watching memory pressure (PSI) for a set
-// of
-// processes.
-
+/// Watching pressure (PSI) for a set of processes. The list is updated periodically
+/// or by using netlink or manually.
 use crate::{create_process_info, PressureType};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -30,7 +28,6 @@ pub struct Watch {
     pub cgroup_path: String,
     pub pressure_type: PressureType,
 }
-
 pub struct PsiWatcher {
     running: Arc<AtomicBool>,
     pub watches: Arc<Mutex<HashMap<u32, Watch>>>,
@@ -40,6 +37,8 @@ pub struct PsiWatcher {
     callback: Arc<Mutex<Option<Box<dyn Fn(u32, &str) + Send + Sync>>>>,
     waker: Arc<Mutex<Option<Waker>>>,
     pub event_tx: broadcast::Sender<PressureEvent>,
+    pub interval_us: u64,
+    pub threshold_us: u64,
 }
 
 impl PsiWatcher {
@@ -47,7 +46,7 @@ impl PsiWatcher {
     #[instrument]
     pub fn new() -> Self {
         debug!("Creating new PsiWatcher");
-        let (event_tx, _event_rx) = broadcast::channel(100); 
+        let (event_tx, _event_rx) = broadcast::channel(100);
         let watcher = PsiWatcher {
             running: Arc::new(AtomicBool::new(false)),
             watches: Arc::new(Mutex::new(HashMap::new())),
@@ -57,9 +56,18 @@ impl PsiWatcher {
             callback: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
             event_tx,
+            interval_us: 10000,
+            threshold_us: 10000000,
         };
         info!("PsiWatcher created successfully");
         watcher
+    }
+
+    /// Update configuration
+    pub fn with_config(mut self, interval_us: u64, threshold_us: u64) -> Self {
+        self.interval_us = interval_us;
+        self.threshold_us = threshold_us;
+        self
     }
 
     /// Set a callback to be invoked when a PSI event is triggered
@@ -133,7 +141,7 @@ impl PsiWatcher {
         debug!("Starting PSI monitoring thread");
         if self.running.load(Ordering::SeqCst) {
             debug!("PSI monitoring already running");
-            return Ok(())
+            return Ok(());
         }
 
         self.running.store(true, Ordering::SeqCst);
@@ -146,6 +154,8 @@ impl PsiWatcher {
         let callback = self.callback.clone();
         let waker = self.waker.clone();
         let event_tx = self.event_tx.clone();
+        let interval_us = self.interval_us;
+        let threshold_us = self.threshold_us;
 
         let handle = std::thread::spawn(move || {
             debug!("PSI monitoring thread started");
@@ -184,7 +194,7 @@ impl PsiWatcher {
                         }
                     };
 
-                    let trig = "some 150000 1000000";
+                    let trig = format!("some {} {}", interval_us, threshold_us);
                     if let Err(e) = file.write_all(trig.as_bytes()) {
                         error!("Failed to write to {}: {}", pressure_file_path, e);
                         continue;
@@ -273,8 +283,7 @@ impl PsiWatcher {
                                             }
                                         };
 
-                                        // 10 sec interval
-                                        let trig = "some 10000 10000000";
+                                        let trig = format!("some {} {}", interval_us, threshold_us);
                                         if let Err(e) = file.write_all(trig.as_bytes()) {
                                             error!(
                                                 "Failed to write to {}: {}",
