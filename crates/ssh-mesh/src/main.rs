@@ -1,19 +1,61 @@
-use anyhow::Error;
-use log::{error, info};
-//use pmond::ProcMon;
-use ssh_mesh::{get_port_from_env, handlers, run_ssh_server, AppState, SshServer};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use ws::WSServer;
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+
+
+
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry};
+
+/// Initialize telemetry with JSON tracing and Perfetto tracing.
+///
+/// Configuration is controlled via the `RUST_LOG` environment variable.
+/// Examples:
+/// - `RUST_LOG=info` -> Log info and above
+/// - `RUST_LOG=debug` -> Log debug and above
+/// - `RUST_LOG=ssh_mesh=debug,info` -> Log debug for ssh_mesh crate, info for others
+fn init_telemetry() {
+    let json_layer = tracing_subscriber::fmt::layer()
+        .json();
+
+    let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
+        tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
+            std::fs::File::create(file).expect("failed to create trace file")
+        ))
+    });
+
+    Registry::default()
+        .with(EnvFilter::from_default_env())
+        .with(json_layer)
+        .with(perfetto_layer)
         .init();
+}
+
+
+fn get_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip().to_string())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    init_telemetry();
+
+    let main_span = tracing::info_span!("main");
+    let _main_guard = main_span.enter();
+
+    // Import required items that were replaced by the block
+    use log::{error, info};
+    use ssh_mesh::{get_port_from_env, handlers, run_ssh_server, AppState, SshServer};
+
+    let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
+    info!("Starting ssh-mesh on host: {}", host_ip);
 
     // Get SSH port from environment variable or use default
     let ssh_port = get_port_from_env("SSH_PORT", 15022);

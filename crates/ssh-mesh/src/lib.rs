@@ -1,3 +1,6 @@
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 use anyhow::Context as AnyhowContext;
 use axum::{body::Body, extract::State, response::IntoResponse};
 use bytes::Buf;
@@ -22,6 +25,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::Arc,
     task::{Context, Poll},
     time::SystemTime,
@@ -77,15 +81,15 @@ pub mod handlers {
 #[allow(unused)]
 pub struct SshServer {
     keys: PrivateKey,
-    clients: Arc<Mutex<Vec<usize>>>,
-    id_counter: Arc<Mutex<usize>>,
+    clients: Arc<tokio::sync::Mutex<Vec<usize>>>,
+    id_counter: Arc<std::sync::Mutex<usize>>,
     pub authorized_keys: Arc<Vec<ssh_key::PublicKey>>,
     pub ca_keys: Arc<Vec<ssh_key::PublicKey>>,
     pub base_dir: PathBuf,
     /// Active SSH handlers indexed by their ID
-    active_handlers: Arc<Mutex<HashMap<usize, Arc<Mutex<SshHandler>>>>>,
+    active_handlers: Arc<std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<SshHandler>>>>>,
     /// Track connected clients with their remote forward listeners
-    pub connected_clients: Arc<Mutex<HashMap<usize, ConnectedClientInfo>>>,
+    pub connected_clients: Arc<tokio::sync::Mutex<HashMap<usize, ConnectedClientInfo>>>,
 }
 
 /// Information about a connected client
@@ -146,13 +150,13 @@ impl SshServer {
 
         SshServer {
             keys,
-            clients: Arc::new(Mutex::new(Vec::new())),
-            id_counter: Arc::new(Mutex::new(id)),
+            clients: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            id_counter: Arc::new(std::sync::Mutex::new(id)),
             authorized_keys,
             ca_keys,
             base_dir,
-            active_handlers: Arc::new(Mutex::new(HashMap::new())),
-            connected_clients: Arc::new(Mutex::new(HashMap::new())),
+            active_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            connected_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -241,7 +245,7 @@ async fn validate_public_key(
     key_openssh: &str,
     authorized_keys: &Arc<Vec<ssh_key::PublicKey>>,
 ) -> Result<server::Auth, anyhow::Error> {
-    trace!("Parsing incoming public key");
+    info!("Validating public key: {}", key_openssh);
     // Parse the incoming key from OpenSSH format
     let incoming_key = match ssh_key::PublicKey::from_openssh(key_openssh) {
         Ok(key) => key,
@@ -439,7 +443,7 @@ impl server::Handler for SshHandler {
         let key_openssh = format!("{} {}", key_type_name, key_base64);
 
         async move {
-            trace!("Validating public key for user: {}", user);
+            info!("Validating public key for user: {}", user);
             // Detect if this is a certificate or regular key
             let auth_result = if key_openssh.contains("-cert-v01@openssh.com") {
                 debug!("Validating certificate for user: {}", user);
@@ -687,10 +691,11 @@ impl server::Handler for SshHandler {
         async move {
             trace!("Executing command in shell: {}", command_str);
             // Execute the command and capture output
-            let output = std::process::Command::new("sh")
+            let output = Command::new("sh")
                 .arg("-c")
                 .arg(&command_str)
                 .output()
+                .await
                 .map_err(anyhow::Error::new)?;
 
             debug!(
@@ -1322,7 +1327,15 @@ impl server::Handler for SshHandler {
         _session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         info!("Channel EOF: stream: {:?} client: {}", channel, self.id);
-        async move { Ok(()) }
+        let tcp_writers = self.tcp_writers.clone();
+        let channel_id = channel;
+        async move {
+            let mut writers = tcp_writers.lock().await;
+            if writers.remove(&channel_id).is_some() {
+                debug!("Removed writer for channel {:?} after EOF", channel_id);
+            }
+            Ok(())
+        }
     }
 
     #[instrument(skip(self, _session), fields(channel_id = ?channel))]
@@ -1384,6 +1397,140 @@ impl server::Handler for SshHandler {
             Ok(())
         }
     }
+
+    #[instrument(skip(self, session), fields(channel_id = ?channel, name = %name))]
+    fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut server::Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        info!("Subsystem request: {}", name);
+        let channel_id = channel;
+        let subsystem_name = name.to_string();
+        let tcp_writers = self.tcp_writers.clone();
+        let session_handle = session.handle();
+
+        async move {
+            if subsystem_name == "sftp" {
+                let sftp_server_path = "/usr/lib/openssh/sftp-server";
+                if !std::path::Path::new(sftp_server_path).exists() {
+                    error!("SFTP server binary not found at {}", sftp_server_path);
+                    let _ = session_handle.channel_failure(channel_id).await;
+                    return Ok(());
+                }
+
+                info!("Spawning SFTP server: {} in {:?}", sftp_server_path, self.server.base_dir);
+                let mut cmd = Command::new(sftp_server_path);
+                cmd.current_dir(&self.server.base_dir)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
+                let mut stdin = child.stdin.take().unwrap();
+                let mut stdout = child.stdout.take().unwrap();
+                let mut stderr = child.stderr.take().unwrap();
+
+                // Forward SFTP stdout -> SSH data
+                let session_handle_clone = session_handle.clone();
+                tokio::spawn(async move {
+                    debug!("SFTP stdout -> SSH reader task started");
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stdout.read(&mut buf).await {
+                            Ok(0) => {
+                                debug!("SFTP stdout reached EOF");
+                                break;
+                            }
+                            Ok(n) => {
+                                trace!("Read {} bytes from SFTP stdout, sending to SSH", n);
+                                if session_handle_clone.data(channel_id, (&buf[..n]).into()).await.is_err() {
+                                    error!("Failed to send SFTP data to SSH channel");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error reading SFTP stdout: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    debug!("SFTP stdout -> SSH reader task ended");
+                    let _ = session_handle_clone.close(channel_id).await;
+                });
+
+                // Forward SFTP stderr -> SSH extended data
+                let session_handle_clone2 = session_handle.clone();
+                tokio::spawn(async move {
+                    debug!("SFTP stderr -> SSH reader task started");
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stderr.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if session_handle_clone2.extended_data(channel_id, 1, (&buf[..n]).into()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    debug!("SFTP stderr -> SSH reader task ended");
+                });
+
+                // Forward SSH data -> SFTP stdin
+                let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+                {
+                    let mut writers = tcp_writers.lock().await;
+                    writers.insert(channel_id, tx);
+                }
+
+                tokio::spawn(async move {
+                    debug!("SSH -> SFTP stdin writer task started");
+                    while let Some(data) = rx.recv().await {
+                        trace!("Writing {} bytes to SFTP stdin", data.len());
+                        if let Err(e) = stdin.write_all(&data).await {
+                            error!("Error writing to SFTP stdin: {}", e);
+                            break;
+                        }
+                        if let Err(e) = stdin.flush().await {
+                            error!("Error flushing SFTP stdin: {}", e);
+                            break;
+                        }
+                    }
+                    debug!("SSH -> SFTP stdin writer task ended");
+                });
+
+                // Monitor child process exit
+                let session_handle_clone3 = session_handle.clone();
+                tokio::spawn(async move {
+                    debug!("SFTP process monitor task started");
+                    match child.wait().await {
+                        Ok(status) => {
+                            info!("SFTP server exited with status: {:?}", status);
+                            let exit_code = status.code().unwrap_or(0) as u32;
+                            let _ = session_handle_clone3
+                                .exit_status_request(channel_id, exit_code)
+                                .await;
+                        }
+                        Err(e) => {
+                            error!("Error waiting for SFTP server: {}", e);
+                        }
+                    }
+                    debug!("SFTP process monitor task ended");
+                });
+
+                info!("SFTP subsystem request accepted and handlers spawned");
+                let _ = session_handle.channel_success(channel_id).await;
+                Ok(())
+            } else {
+                error!("Unsupported subsystem: {}", subsystem_name);
+                let _ = session_handle.channel_failure(channel_id).await;
+                Ok(())
+            }
+        }
+    }
 }
 
 impl server::Server for SshServer {
@@ -1391,20 +1538,20 @@ impl server::Server for SshServer {
 
     #[instrument(skip(self))]
     fn new_client(&mut self, _peer_addr: Option<SocketAddr>) -> Self::Handler {
-        let mut id = self.id_counter.try_lock().unwrap();
+        let mut id = self.id_counter.lock().unwrap();
         *id += 1;
         let handler = SshHandler {
             id: *id,
             server: self.clone(),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            tcp_writers: Arc::new(Mutex::new(HashMap::new())),
-            remote_forward_listeners: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            tcp_writers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            remote_forward_listeners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             user: String::new(),
         };
 
         // Store the handler in active_handlers
-        let handler_arc = Arc::new(Mutex::new(handler.clone()));
-        let mut active_handlers = self.active_handlers.try_lock().unwrap();
+        let handler_arc = Arc::new(tokio::sync::Mutex::new(handler.clone()));
+        let mut active_handlers = self.active_handlers.lock().unwrap();
         active_handlers.insert(*id, handler_arc);
 
         handler
@@ -1420,13 +1567,14 @@ pub async fn run_ssh_server(
 ) -> Result<(), anyhow::Error> {
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting SSH server on {}", addr);
-    debug!("SSH server configuration: {:?}", config);
 
     let config = Arc::new(config);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     loop {
+        debug!("Waiting for new connection...");
         let (stream, peer_addr) = listener.accept().await?;
+        info!("Accepted connection from {:?}", peer_addr);
         let config = config.clone();
         let mut server_clone = server.clone();
 
@@ -1438,10 +1586,12 @@ pub async fn run_ssh_server(
 
             match russh::server::run_stream(config, stream, handler).await {
                 Ok(session) => {
+                    info!("SSH session stream started for handler {}", handler_id);
                     // Drive the session to completion
                     if let Err(e) = session.await {
                         error!("SSH session error for handler {}: {:?}", handler_id, e);
                     }
+                    info!("SSH session future finished for handler {}", handler_id);
                 }
                 Err(e) => {
                     error!("SSH handshake failed for handler {}: {}", handler_id, e);
@@ -1449,20 +1599,10 @@ pub async fn run_ssh_server(
             }
 
             // Explicit cleanup after session ends (for any reason: disconnect, kill, error)
-            debug!(
-                "Session ended for handler {}, performing cleanup",
-                handler_id
-            );
             let mut clients = server_clone.connected_clients.lock().await;
             if clients.remove(&handler_id).is_some() {
                 debug!("Removed client {} from connected_clients", handler_id);
-            } else {
-                debug!("Client {} was not in connected_clients (already removed or never authenticated)", handler_id);
             }
-            debug!(
-                "Connected clients remaining: {:?}",
-                clients.keys().collect::<Vec<_>>()
-            );
         });
     }
 }

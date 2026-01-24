@@ -1,12 +1,24 @@
-use axum::serve;
 use clap::Parser;
-use tracing::{error, info};
-use pmond::{ProcMon, proc_netlink};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::time::{sleep, Duration};
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
+use tracing::{error, info};
 use ws::WSServer;
+use axum::serve;
+
+
+
+
+use pmond::{ProcMon, proc_netlink};
+
+fn get_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip().to_string())
+}
+
 
 #[derive(Parser, Debug)]
 #[clap(name = "pmond", version = "0.1.0", author = "Author")]
@@ -32,13 +44,43 @@ struct Args {
     refresh: u64,
 }
 
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry};
+
+/// Initialize telemetry with JSON tracing and Perfetto tracing.
+///
+/// Configuration is controlled via the `RUST_LOG` environment variable.
+/// Examples:
+/// - `RUST_LOG=info` -> Log info and above
+/// - `RUST_LOG=debug` -> Log debug and above
+/// - `RUST_LOG=pmond=debug,info` -> Log debug for pmond crate, info for others
+fn init_telemetry() {
+    let json_layer = tracing_subscriber::fmt::layer()
+        .json();
+
+    let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
+        tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
+            std::fs::File::create(file).expect("failed to create trace file")
+        ))
+    });
+
+    Registry::default()
+        .with(EnvFilter::from_default_env())
+        .with(json_layer)
+        .with(perfetto_layer)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for logging
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    init_telemetry();
+ 
+    let main_span = tracing::info_span!("pmond");
+    let _main_guard = main_span.enter();
+
+    let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
+    info!("Starting pmond on host: {}", host_ip);
 
     let args = Args::parse();
 
@@ -224,3 +266,6 @@ fn start_periodic_broadcast(ws_server: Arc<WSServer>, proc_mon: Arc<ProcMon>, re
         }
     });
 }
+
+#[cfg(test)]
+mod telemetry_test;

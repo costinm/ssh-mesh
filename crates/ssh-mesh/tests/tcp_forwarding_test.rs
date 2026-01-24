@@ -1,25 +1,14 @@
 use anyhow::Result;
 use log::info;
-use once_cell::sync::Lazy;
-use ssh_key::{Algorithm, LineEnding, PrivateKey};
+use ssh_mesh::test_utils::{find_free_port, setup_test_environment};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::thread;
 use std::time::Duration;
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-
-static INIT_LOGGING: Lazy<()> = Lazy::new(|| {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
-        .with_level(true)
-        .init();
-});
 
 // Simple echo server for testing
 fn start_echo_server(port: u16) {
@@ -51,58 +40,6 @@ fn start_echo_server(port: u16) {
     });
 }
 
-fn find_free_port() -> Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
-}
-
-struct TestSetup {
-    temp_dir: TempDir,
-    client_key_path: PathBuf,
-    ssh_port: u16,
-    server_handle: tokio::task::JoinHandle<()>,
-}
-
-async fn setup_test_environment() -> Result<TestSetup> {
-    Lazy::force(&INIT_LOGGING);
-
-    let temp_dir = tempfile::Builder::new().prefix("russhd-test").tempdir()?;
-    let base_dir = temp_dir.path().to_path_buf();
-    std::fs::create_dir_all(base_dir.join(".ssh"))?;
-
-    let client_keypair = PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519)?;
-    let client_key_path = temp_dir.path().join(".ssh/id_ed25519");
-    std::fs::write(
-        &client_key_path,
-        client_keypair.to_openssh(LineEnding::LF)?.as_bytes(),
-    )?;
-    std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600))?;
-
-    let public_key_openssh = client_keypair.public_key().to_openssh()?;
-    std::fs::write(
-        base_dir.join(".ssh/authorized_keys"),
-        public_key_openssh.as_bytes(),
-    )?;
-
-    let ssh_port = find_free_port()?;
-    let server_base_dir = base_dir.clone();
-    let server_handle = tokio::spawn(async move {
-        let ssh_server = ssh_mesh::SshServer::new(0, None, server_base_dir);
-        let config = ssh_server.get_config();
-        ssh_mesh::run_ssh_server(ssh_port, config, ssh_server)
-            .await
-            .unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    Ok(TestSetup {
-        temp_dir,
-        client_key_path,
-        ssh_port,
-        server_handle,
-    })
-}
-
 async fn run_test_with_timeout<F, Fut>(test_fn: F) -> Result<()>
 where
     F: FnOnce() -> Fut,
@@ -114,7 +51,7 @@ where
 #[tokio::test]
 async fn test_local_tcp_forwarding() -> Result<()> {
     run_test_with_timeout(|| async {
-        let setup = setup_test_environment().await?;
+        let setup = setup_test_environment(None, false).await?;
 
         let echo_port = find_free_port()?;
         start_echo_server(echo_port);
@@ -162,7 +99,7 @@ async fn test_local_tcp_forwarding() -> Result<()> {
 #[tokio::test]
 async fn test_remote_tcp_forwarding() -> Result<()> {
     run_test_with_timeout(|| async {
-        let setup = setup_test_environment().await?;
+        let setup = setup_test_environment(None, false).await?;
 
         // This echo server is on the "client" side.
         let echo_port = find_free_port()?;

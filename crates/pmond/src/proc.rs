@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use tracing::{debug, info, instrument, trace};
+use tracing::{debug, error, info, instrument, trace};
 use users::get_current_uid;
 
 /// Monitors process state.
@@ -208,7 +208,7 @@ impl ProcMon {
     }
 
     /// Read existing processes from /proc and optionally add them to the PSI watcher.
-    #[instrument(skip(self), fields(watch_psi = watch_psi))]
+    //   #[instrument(skip(self), fields(watch_psi = watch_psi))]
     pub fn read_existing_processes(&self, watch_psi: bool) -> HashMap<u32, ProcessInfo> {
         debug!("Reading existing processes from /proc");
         let mut result = HashMap::new();
@@ -271,6 +271,73 @@ impl ProcMon {
         }
 
         cgroups
+    }
+
+    /// Adjust memory.high for a cgroup.
+    /// percentage: 0.0 to 100.0, or negative for 'max'
+    /// interval_secs: if > 0, reset to 'max' after this interval.
+    pub fn adjust_cgroup_memory_high(
+        &self,
+        cgroup_path: String,
+        percentage: f64,
+        interval_secs: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let current_path = format!("{}/memory.current", cgroup_path);
+        let high_path = format!("{}/memory.high", cgroup_path);
+
+        let current_str = fs::read_to_string(&current_path)?;
+        let current: u64 = current_str.trim().parse()?;
+
+        let target_str = if percentage < 0.0 {
+            "max".to_string()
+        } else {
+            let target = (current as f64 * percentage / 100.0) as u64;
+            target.to_string()
+        };
+
+        info!("Attempting to write {} to {}", target_str, high_path);
+        fs::write(&high_path, &target_str)?;
+        info!(
+            "Successfully set {} memory.high to {} (requested {}% of current {})",
+            cgroup_path, target_str, percentage, current
+        );
+
+        if interval_secs > 0 && percentage >= 0.0 {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                info!("Interval expired. Resetting {} to max", high_path);
+                if let Err(e) = tokio::fs::write(&high_path, "max").await {
+                    error!(
+                        "Failed to reset memory.high to max for {}: {}",
+                        high_path, e
+                    );
+                } else {
+                    info!(
+                        "Successfully reset {} to max after {}s",
+                        high_path, interval_secs
+                    );
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Get all processes in a specific cgroup.
+    pub fn get_processes_in_cgroup(&self, cgroup_path: &str) -> Vec<crate::ProcessInfo> {
+        let procs_path = format!("{}/cgroup.procs", cgroup_path);
+        let mut result = Vec::new();
+
+        if let Ok(content) = fs::read_to_string(&procs_path) {
+            for line in content.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    if let Ok(info) = crate::read_process_info_from_proc(pid) {
+                        result.push(info);
+                    }
+                }
+            }
+        }
+        result
     }
 }
 

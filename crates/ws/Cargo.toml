@@ -4,37 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "sync", "io-util", "rt", "macros", "fs", "rt-multi-thread", "tracing", "signal"] }
-fastwebsockets = { version = "0.10.0", features = ["upgrade"] }
-hyper = { version = "1.8.1", default-features = false, features = ["http1", "http2", "server", "client"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "http1", "http2"] }
-http-body-util = "0.1.3"
+axum = { version = "0.7", features = ["macros"] }
 bytes = "1"
+fastwebsockets = { version = "0.8", features = ["upgrade"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio-util = { version = "0.7", features = ["io", "compat"] }
-futures-util = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-log = "0.4"
-anyhow = "1.0"
-chrono = "0.4"
-env_logger = "0.10"
-axum = "0.7"
-axum-extra = { version = "0.9", features = ["typed-routing"] }
-tower = { version = "0.5", features = ["util"] }
-tower-service = "0.3"
-tracing-opentelemetry = "0.24.0"
-opentelemetry = { version = "0.23.0" }
-opentelemetry_sdk = { version = "0.23.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.16.0", features = ["http-json"] }
-tower-http = { version = "0.5.2", features = ["trace"] }
-mime_guess = "2.0.5"
-
-[dev-dependencies]
-tokio-tungstenite = { version = "0.23.1", features = ["native-tls"] }
-reqwest = { version = "0.12.5", features = ["json"] }
-futures-util = "0.3"
-serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }

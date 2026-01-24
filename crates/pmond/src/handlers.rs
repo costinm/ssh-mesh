@@ -8,6 +8,7 @@ use axum::{
 use hyper::StatusCode;
 use log::debug;
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
@@ -37,6 +38,45 @@ pub async fn handle_cgroups_request(
     debug!("Received CGroups request");
     let cgroups = app_state.proc_mon.get_all_cgroups();
     (StatusCode::OK, Json(json!(cgroups)))
+}
+
+#[derive(Deserialize, Debug)]
+pub struct CgroupHighPayload {
+    pub path: String,
+    pub percentage: f64,
+    pub interval: u64,
+}
+
+pub async fn handle_cgroup_high_request(
+    State(app_state): State<AppState>,
+    Json(payload): Json<CgroupHighPayload>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    debug!("Received CGroup High request for {}", payload.path);
+    match app_state.proc_mon.adjust_cgroup_memory_high(
+        payload.path,
+        payload.percentage,
+        payload.interval,
+    ) {
+        Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct CgroupProcsPayload {
+    pub path: String,
+}
+
+pub async fn handle_cgroup_procs_request(
+    State(app_state): State<AppState>,
+    Json(payload): Json<CgroupProcsPayload>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    debug!("Received CGroup Procs request for {}", payload.path);
+    let processes = app_state.proc_mon.get_processes_in_cgroup(&payload.path);
+    (StatusCode::OK, Json(json!(processes)))
 }
 
 pub async fn handle_root_request() -> Html<&'static str> {
@@ -113,6 +153,8 @@ pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
         .route("/", get(handle_root_request))
         .route("/_ps", get(handle_ps_request))
         .route("/_cgroups", get(handle_cgroups_request))
+        .route("/_cgroup_high", post(handle_cgroup_high_request))
+        .route("/_cgroup_procs", post(handle_cgroup_procs_request))
         .route("/_psi", get(get_psi_watches))
         .route(
             "/ws",
