@@ -1,21 +1,26 @@
-FROM golang:1.25.1-alpine AS build
+# Build stage using Rust with MUSL for static linking
+FROM rust:slim-bookworm AS build
+
+RUN apt-get update && apt-get install -y \
+    musl-tools \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /src
+COPY . .
 
-# Copy go.mod and go.sum to cache dependencies
-COPY go.mod go.sum ./
+# Build both pmond and ssh-mesh targets for MUSL
+RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p ssh-mesh
+RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p pmond
 
-# Download all dependencies. Caching is leveraged to speed up builds.
-RUN go mod download
-
-# Copy the source code into the container
-COPY . ./
-
-# Build the Go application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o sshm ./cmd/sshm
-
+# Final stage
 FROM nicolaka/netshoot
 
-# ~400k - compared to 4.3M (2.9 stripped)
-COPY --from=build /src/sshm /ko-app/sshm
-ENTRYPOINT ["/ko-app/sshm"]
+# Copy the statically linked binaries from the build stage
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh /usr/local/bin/ssh-mesh
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond /usr/local/bin/pmond
+
+# Use ssh-mesh as the default entrypoint
+ENTRYPOINT ["/usr/local/bin/ssh-mesh"]
