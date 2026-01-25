@@ -1,6 +1,6 @@
 use crate::psi::PsiWatcher;
 use crate::{read_process_info_from_proc, PressureType, ProcMemInfo, ProcessInfo};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::sync::{
@@ -9,6 +9,12 @@ use std::sync::{
 };
 use tracing::{debug, error, info, instrument, trace};
 use users::get_current_uid;
+
+/// Configuration for process monitoring.
+#[derive(Debug, Clone, Default)]
+pub struct ProcCfg {
+    pub refresh_interval: Option<std::time::Duration>,
+}
 
 /// Monitors process state.
 pub struct ProcMon {
@@ -19,6 +25,9 @@ pub struct ProcMon {
 
     pub processes: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
     pub psi_watcher: Arc<PsiWatcher>,
+    pub config: Arc<Mutex<ProcCfg>>,
+    pub snap1: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
+    pub snap2: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
 }
 
 impl ProcMon {
@@ -63,7 +72,16 @@ impl ProcMon {
             callback: Arc::new(Mutex::new(None)),
             processes: Arc::new(Mutex::new(HashMap::new())),
             psi_watcher: Arc::new(psi_watcher),
+            config: Arc::new(Mutex::new(ProcCfg::default())),
+            snap1: Arc::new(Mutex::new(HashMap::new())),
+            snap2: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Update the configuration.
+    pub fn set_config(&self, config: ProcCfg) {
+        let mut cfg = self.config.lock().unwrap();
+        *cfg = config;
     }
 
     /// Handle a fork event - this is called when a Proc Netlink watcher is started
@@ -135,23 +153,38 @@ impl ProcMon {
         self.running.store(true, Ordering::SeqCst);
         info!("Monitoring started");
 
-        let running_checker = self.running.clone();
-        let processes_checker = self.processes.clone();
-        let psi_watcher_checker = self.psi_watcher.clone();
+        let running_snapshot = self.running.clone();
+        let processes_snapshot = self.processes.clone();
+        let snap1_snapshot = self.snap1.clone();
+        let snap2_snapshot = self.snap2.clone();
+        let config_snapshot = self.config.clone();
+        let psi_watcher_snapshot = self.psi_watcher.clone();
 
-        // Spawn Periodic Checker (blocking due to file IO)
-        let checker_handle = tokio::task::spawn_blocking(move || {
-            periodic_process_checker(running_checker, processes_checker, psi_watcher_checker);
+        let snapshot_handle = tokio::task::spawn_blocking(move || {
+            periodic_snapshot_checker(
+                running_snapshot,
+                processes_snapshot,
+                snap1_snapshot,
+                snap2_snapshot,
+                config_snapshot,
+                psi_watcher_snapshot,
+            );
         });
 
         let mut handles = self.handles.lock().unwrap();
-        handles.push(checker_handle);
+        handles.push(snapshot_handle);
 
         debug!("Reading existing processes");
         let initial_processes = self.read_existing_processes(watch_psi);
         {
             let mut processes = self.processes.lock().unwrap();
-            *processes = initial_processes;
+            *processes = initial_processes.clone();
+
+            let mut s1 = self.snap1.lock().unwrap();
+            *s1 = initial_processes.clone();
+
+            let mut s2 = self.snap2.lock().unwrap();
+            *s2 = initial_processes;
         }
 
         Ok(())
@@ -200,11 +233,11 @@ impl ProcMon {
         }
     }
 
-    /// Get all processes
+    /// Get all processes (from the latest snapshot with deltas)
     #[instrument(skip(self))]
     pub fn get_all_processes(&self) -> HashMap<u32, ProcessInfo> {
-        trace!("Getting all processes");
-        self.read_existing_processes(false)
+        trace!("Getting all processes from snap1");
+        self.snap1.lock().unwrap().clone()
     }
 
     /// Read existing processes from /proc and optionally add them to the PSI watcher.
@@ -495,63 +528,126 @@ impl ProcMon {
     }
 }
 
-/// Periodically check processes every 10 seconds to verify they still exist
-/// and get current memory usage
-fn periodic_process_checker(
+/// Periodically take snapshots and calculate deltas
+fn periodic_snapshot_checker(
     running: Arc<AtomicBool>,
     processes: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
+    snap1: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
+    snap2: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
+    config: Arc<Mutex<ProcCfg>>,
     psi_watcher: Arc<PsiWatcher>,
 ) {
     while running.load(Ordering::SeqCst) {
-        // Sleep for 10 seconds
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        // Get refresh interval from config, default to 20 seconds
+        let interval = {
+            let cfg = config.lock().unwrap();
+            cfg.refresh_interval
+                .unwrap_or(std::time::Duration::from_secs(20))
+        };
+
+        // Sleep for the configured interval
+        std::thread::sleep(interval);
 
         if !running.load(Ordering::SeqCst) {
             break;
         }
 
-        // Get the current set of PIDs we know about
-        let old_pids: Vec<u32> = {
-            let proc_map = processes.lock().unwrap();
-            proc_map.keys().cloned().collect()
+        // 1. Take fresh snapshot
+        let fresh_proc_mon = ProcMon {
+            running: running.clone(),
+            handles: Arc::new(Mutex::new(Vec::new())),
+            callback: Arc::new(Mutex::new(None)),
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            psi_watcher: psi_watcher.clone(),
+            config: config.clone(),
+            snap1: Arc::new(Mutex::new(HashMap::new())),
+            snap2: Arc::new(Mutex::new(HashMap::new())),
         };
+        let new_processes = fresh_proc_mon.read_existing_processes(false);
 
-        // Check each process and discover new ones
-        let mut current_processes = HashMap::new();
+        // 2. Compute diff and update PSI watcher
+        let (added, removed) = {
+            let s1 = snap1.lock().unwrap();
+            let old_pids: HashSet<u32> = s1.keys().cloned().collect();
+            let new_pids: HashSet<u32> = new_processes.keys().cloned().collect();
+            calculate_process_diff(&old_pids, &new_pids)
+        };
+        update_psi_watcher_for_pids(&psi_watcher, added, removed);
 
-        // Check if we're running as root
-        let current_uid = get_current_uid();
-        let is_root = current_uid == 0;
+        // 3. Update snapshots: snap2 = snap1, snap1 = new_processes
+        let mut s1 = snap1.lock().unwrap();
+        let mut s2 = snap2.lock().unwrap();
 
-        if let Ok(entries) = fs::read_dir("/proc") {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    if let Some(pid) = entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|s| s.parse::<u32>().ok())
-                    {
-                        if let Ok(process_info) = read_process_info_from_proc(pid) {
-                            // Filter processes if not running as root
-                            if !is_root && process_info.uid != Some(current_uid) {
-                                continue;
-                            }
-                            current_processes.insert(pid, process_info);
-                        }
-                    }
+        *s2 = s1.clone();
+        *s1 = new_processes.clone();
+
+        // 4. Update master processes map
+        {
+            let mut p = processes.lock().unwrap();
+            *p = new_processes;
+        }
+
+        // 5. Calculate deltas in snap1 based on snap2
+        for (pid, proc1) in s1.iter_mut() {
+            if let Some(proc2) = s2.get(pid) {
+                if let (Some(m1), Some(m2)) = (&mut proc1.mem_info, &proc2.mem_info) {
+                    m1.d_anon = m1.anon as i64 - m2.anon as i64;
+                    m1.d_file = m1.file as i64 - m2.file as i64;
+                    m1.d_kernel_stack = m1.kernel_stack as i64 - m2.kernel_stack as i64;
+                    m1.d_pagetables = m1.pagetables as i64 - m2.pagetables as i64;
+                    m1.d_shmem = m1.shmem as i64 - m2.shmem as i64;
+                    m1.d_pgfault = m1.pgfault as i64 - m2.pgfault as i64;
+                    m1.d_pgmajfault = m1.pgmajfault as i64 - m2.pgmajfault as i64;
                 }
             }
         }
+    }
+}
 
-        // Update the shared state
-        let mut proc_map = processes.lock().unwrap();
-        *proc_map = current_processes.clone();
+fn calculate_process_diff(
+    old_pids: &HashSet<u32>,
+    new_pids: &HashSet<u32>,
+) -> (Vec<u32>, Vec<u32>) {
+    let added = new_pids.difference(old_pids).cloned().collect();
+    let removed = old_pids.difference(new_pids).cloned().collect();
+    (added, removed)
+}
 
-        // Clean up PSI watcher for disappeared processes
-        for pid in old_pids {
-            if !current_processes.contains_key(&pid) {
-                psi_watcher.remove_pid(pid);
-            }
-        }
+fn update_psi_watcher_for_pids(
+    psi_watcher: &PsiWatcher,
+    added_pids: Vec<u32>,
+    removed_pids: Vec<u32>,
+) {
+    for pid in removed_pids {
+        psi_watcher.remove_pid(pid);
+    }
+    for pid in added_pids {
+        psi_watcher.add_pid(pid, PressureType::Memory);
+        psi_watcher.add_pid(pid, PressureType::Cpu);
+        psi_watcher.add_pid(pid, PressureType::Io);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_procmon_start_and_get_processes() {
+        let proc_mon = ProcMon::new().expect("Failed to create ProcMon");
+        proc_mon.set_config(ProcCfg {
+            refresh_interval: Some(std::time::Duration::from_millis(100)),
+        });
+        proc_mon
+            .start(true, false)
+            .expect("Failed to start ProcMon");
+
+        let processes = proc_mon.get_all_processes();
+        assert!(
+            !processes.is_empty(),
+            "Processes list should not be empty after start()"
+        );
+
+        proc_mon.stop().expect("Failed to stop ProcMon");
     }
 }

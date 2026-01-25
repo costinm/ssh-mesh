@@ -31,6 +31,22 @@ pub struct ProcessInfo {
 /// where it is derived from.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ProcMemInfo {
+    // --- Delta Fields  ---
+    /// Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon).
+    pub d_anon: i64,
+    /// File-backed memory. Process: Derived (rss - anon) or status (RssFile). Cgroup: memory.stat (file).
+    pub d_file: i64,
+    /// Kernel stack memory. Process: status (VmStk). Cgroup: memory.stat (kernel_stack).
+    pub d_kernel_stack: i64,
+    /// Page table entries. Process: status (VmPTE). Cgroup: memory.stat (pagetables).
+    pub d_pagetables: i64,
+    /// Shared memory. Process: status (RssShmem) or statm (shared). Cgroup: memory.stat (shmem).
+    pub d_shmem: i64,
+    /// Page faults. Process: stat (minflt + majflt). Cgroup: memory.stat (pgfault).
+    pub d_pgfault: i64,
+    /// Major page faults. Process: stat (majflt). Cgroup: memory.stat (pgmajfault).
+    pub d_pgmajfault: i64,
+
     // --- Common Fields (Both Process and Cgroup) ---
     /// Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon).
     pub anon: u64,

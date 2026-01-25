@@ -806,19 +806,34 @@
                     return `<div class="memory-item" style="${style}"><span class="memory-label">${label}:</span><span class="memory-value">${displayVal}</span></div>`;
                 };
 
+                const formatDelta = (value) => {
+                    if (!value || value === 0) return '';
+                    const formatted = typeof value === 'number' ? formatMemory(Math.abs(value)) : value;
+                    const sign = value > 0 ? '+' : '-';
+                    const color = value > 0 ? '#ff4d4d' : '#2ecc71';
+                    return `<span style="color: ${color}; font-size: 0.85em; margin-left: 5px; font-weight: 600;">(${sign}${formatted})</span>`;
+                };
+
+                const formatDeltaSimple = (value) => {
+                    if (!value || value === 0) return '';
+                    const sign = value > 0 ? '+' : '';
+                    const color = value > 0 ? '#ff4d4d' : '#2ecc71';
+                    return `<span style="color: ${color}; font-size: 0.85em; margin-left: 5px; font-weight: 600;">(${sign}${value})</span>`;
+                };
+
                 const m = process.mem_info || {};
                 memoryRow.innerHTML = `
                        <td colspan="4">
                            <div class="memory-details" style="grid-template-columns: repeat(4, 1fr); padding: 15px; background: #fdfdfd; border: 1px solid #eee; border-radius: 8px; margin: 5px 20px 15px 20px;">
                                <div class="memory-item"><span class="memory-label">PSS:</span><span class="memory-value" style="color: var(--primary); font-weight: bold;">${formatMemory(m.pss || 0)}</span></div>
                                <div class="memory-item"><span class="memory-label">RSS:</span><span class="memory-value">${formatMemory(m.rss || 0)}</span></div>
-                               <div class="memory-item"><span class="memory-label">Anon:</span><span class="memory-value">${formatMemory(m.anon || 0)}</span></div>
-                               <div class="memory-item"><span class="memory-label">File:</span><span class="memory-value">${formatMemory(m.file || 0)}</span></div>
+                               <div class="memory-item"><span class="memory-label">Anon:</span><span class="memory-value">${formatMemory(m.anon || 0)}${formatDelta(m.d_anon)}</span></div>
+                               <div class="memory-item"><span class="memory-label">File:</span><span class="memory-value">${formatMemory(m.file || 0)}${formatDelta(m.d_file)}</span></div>
                                
                                <div class="memory-item"><span class="memory-label">Referenced:</span><span class="memory-value" style="color: var(--success); font-weight: 600;">${formatMemory(m.referenced || 0)}</span></div>
-                               ${renderItem("Shared", m.shmem)}
-                               ${renderItem("PTE Tables", m.pagetables)}
-                               ${renderItem("Kernel Stk", m.kernel_stack)}
+                               <div class="memory-item"><span class="memory-label">Shared:</span><span class="memory-value">${formatMemory(m.shmem || 0)}${formatDelta(m.d_shmem)}</span></div>
+                               <div class="memory-item"><span class="memory-label">PTE Tables:</span><span class="memory-value">${formatMemory(m.pagetables || 0)}${formatDelta(m.d_pagetables)}</span></div>
+                               <div class="memory-item"><span class="memory-label">Kernel Stk:</span><span class="memory-value">${formatMemory(m.kernel_stack || 0)}${formatDelta(m.d_kernel_stack)}</span></div>
                                
                                ${renderItem("Priv Dirty", m.private_dirty)}
                                ${renderItem("Priv Clean", m.private_clean)}
@@ -827,7 +842,7 @@
                                
                                ${renderItem("Swap", m.swap, "color: var(--danger);")}
                                ${renderItem("HugeTLB", m.hugetlb)}
-                               <div class="memory-item"><span class="memory-label">Faults:</span><span class="memory-value">${(m.pgfault || 0) - (m.pgmajfault || 0)} / ${m.pgmajfault || 0}</span></div>
+                               <div class="memory-item"><span class="memory-label">Faults:</span><span class="memory-value">${(m.pgfault || 0) - (m.pgmajfault || 0)} / ${m.pgmajfault || 0}${formatDeltaSimple(m.d_pgfault)} ${m.d_pgmajfault ? "[maj: " + formatDeltaSimple(m.d_pgmajfault) + "]" : ""}</span></div>
                                
                                <!-- Extra CGroup fields -->
                                ${renderItem("Active Anon", m.active_anon)}

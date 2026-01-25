@@ -515,7 +515,6 @@
 
         function updateStats() {
             const paths = Object.keys(cgroupsData).filter(path => {
-                if (path === '/sys/fs/cgroup') return false;
                 if (path.endsWith('.slice')) return false;
                 return true;
             });
@@ -537,6 +536,9 @@
             const filteredPaths = Object.keys(cgroupsData)
                 .filter(path => path.toLowerCase().includes(searchTerm))
                 .sort((a, b) => {
+                    // Always put root at top if it exists and matches search
+                    if (a === '/sys/fs/cgroup') return -1;
+                    if (b === '/sys/fs/cgroup') return 1;
                     const memA = (cgroupsData[a].anon || 0) + (cgroupsData[a].file || 0);
                     const memB = (cgroupsData[b].anon || 0) + (cgroupsData[b].file || 0);
                     return memB - memA;
@@ -553,13 +555,19 @@
                 const data = cgroupsData[path];
 
                 // Main row
+                const isRoot = path === '/sys/fs/cgroup';
+                const displayName = isRoot ? '/' : (path.split('/').pop() || '/');
+                const subPath = path.replace('/sys/fs/cgroup', '') || '/';
                 const mainRow = document.createElement('tr');
                 const totalMem = (data.anon || 0) + (data.file || 0);
                 // Escape backslashes and single quotes for JS injection
                 const safePath = path.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
                 mainRow.innerHTML = `
-                    <td class="cgroup-path td-path" title="Click to view processes" onclick="toggleCgroupProcs('${safePath}', this)">${path}</td>
+                    <td class="td-path" title="Click to view processes" onclick="toggleCgroupProcs('${safePath}', this)">
+                        <div class="cgroup-path">${displayName}</div>
+                        <div style="font-size: 0.75rem; color: var(--gray); margin-top: 2px;">${subPath}</div>
+                    </td>
                     <td class="mem-value">${formatMemory(data.anon || 0)}</td>
                     <td class="mem-value">${formatMemory(data.file || 0)}</td>
                     <td class="mem-value">
