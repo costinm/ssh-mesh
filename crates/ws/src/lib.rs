@@ -131,13 +131,31 @@ pub async fn handle_websocket(
 
 pub async fn handle_websocket_upgrade(
     State(server): State<Arc<WSServer>>,
-    mut req: Request,
+    req: Request,
 ) -> Response {
+    handle_upgrade_with_handler(req, move |ws| async move {
+        let client_id = format!(
+            "client_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        info!("WebSocket connection established for {}", client_id);
+        handle_websocket(ws, server, client_id).await;
+    })
+    .await
+}
+
+pub async fn handle_upgrade_with_handler<F, Fut>(mut req: Request, handler: F) -> Response
+where
+    F: FnOnce(WebSocket<TokioIo<hyper::upgrade::Upgraded>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     debug!(
         "WebSocket upgrade requested, is_upgrade: {}",
         upgrade::is_upgrade_request(&req)
     );
-    debug!("Headers: {:?}", req.headers());
 
     if upgrade::is_upgrade_request(&req) {
         let (response, fut) = match upgrade::upgrade(&mut req) {
@@ -151,41 +169,126 @@ pub async fn handle_websocket_upgrade(
             }
         };
 
-        let client_id = format!(
-            "client_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
-        info!("WebSocket upgrade successful, client ID: {}", client_id);
-
         tokio::task::spawn(async move {
             let ws = match fut.await {
-                Ok(ws) => {
-                    info!("WebSocket connection established for {}", client_id);
-                    ws
-                }
+                Ok(ws) => ws,
                 Err(e) => {
-                    error!("Error upgrading to WebSocket for {}: {}", client_id, e);
+                    error!("Error upgrading to WebSocket: {}", e);
                     return;
                 }
             };
-
-            handle_websocket(ws, server, client_id).await;
+            handler(ws).await;
         });
 
         let (parts, _body) = response.into_parts();
         Response::from_parts(parts, Body::from(Bytes::new()))
     } else {
         warn!("Request is not a WebSocket upgrade");
-        debug!("Request method: {}", req.method());
-        debug!("Request URI: {}", req.uri());
-
         Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from("Expected WebSocket upgrade"))
             .unwrap()
+    }
+}
+
+/// A wrapper around `WebSocket` that implements `AsyncRead` and `AsyncWrite`.
+/// This allows using a WebSocket as a byte stream.
+pub struct WebSocketStream {
+    ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
+    read_buffer: bytes::BytesMut,
+}
+
+impl WebSocketStream {
+    pub fn new(ws: WebSocket<TokioIo<hyper::upgrade::Upgraded>>) -> Self {
+        Self {
+            ws,
+            read_buffer: bytes::BytesMut::new(),
+        }
+    }
+}
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+impl AsyncRead for WebSocketStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.read_buffer.is_empty() {
+            let to_read = std::cmp::min(buf.remaining(), self.read_buffer.len());
+            buf.put_slice(&self.read_buffer[..to_read]);
+            self.read_buffer.advance(to_read);
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.ws.poll_read_frame(cx) {
+            Poll::Ready(Ok(frame)) => {
+                if frame.opcode == OpCode::Binary || frame.opcode == OpCode::Text {
+                    let data = &frame.payload;
+                    let to_read = std::cmp::min(buf.remaining(), data.len());
+                    buf.put_slice(&data[..to_read]);
+                    if to_read < data.len() {
+                        self.read_buffer.extend_from_slice(&data[to_read..]);
+                    }
+                    Poll::Ready(Ok(()))
+                } else if frame.opcode == OpCode::Close {
+                    Poll::Ready(Ok(()))
+                } else {
+                    // Ignore other frames for now or handle them
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("WebSocket error: {}", e),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for WebSocketStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let frame = Frame::binary(Payload::Owned(buf.to_vec()));
+        match self.ws.poll_write_frame(cx, frame) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("WebSocket error: {}", e),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.ws.poll_flush(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("WebSocket error: {}", e),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let frame = Frame::close(1000, b"shutting down");
+        match self.ws.poll_write_frame(cx, frame) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("WebSocket error: {}", e),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
