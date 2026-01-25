@@ -2,7 +2,7 @@ use crate::{ProcMemInfo, ProcMon};
 use axum::{
     extract::{Path as AxumPath, State},
     response::{Html, IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use hyper::StatusCode;
@@ -12,9 +12,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
-use ws::WSServer;
-
 // MCP Imports
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -46,7 +43,6 @@ pub struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     pub proc_mon: Arc<ProcMon>,
-    pub ws_server: Arc<WSServer>,
 }
 
 pub async fn handle_ps_request(
@@ -163,11 +159,9 @@ pub async fn handle_root_request() -> Html<&'static str> {
             <h1>PMOND - Process Monitor</h1>
             <p><a href='/web/pmon.html'>Process Monitor</a></p>
             <p><a href='/web/cgmon.html'>CGroup Monitor</a></p>
-            <p><a href='/web/chat.html'>Chat</a></p>
             <p><a href='/_ps'>Process API</a></p>
             <p><a href='/_cgroups'>CGroups API</a></p>
             <p><a href='/_psi'>PSI Watches API</a></p>
-            <p><a href='/ws'>WebSocket</a></p>
         </body>
         </html>
     "#,
@@ -217,10 +211,9 @@ pub async fn handle_web_request(
     }
 }
 
-pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
+pub fn app(proc_mon: Arc<ProcMon>) -> Router {
     let app_state = AppState {
         proc_mon: proc_mon.clone(),
-        ws_server,
     };
 
     Router::new()
@@ -232,39 +225,8 @@ pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
         .route("/_move_process", post(handle_move_process_request))
         .route("/_clear_refs", post(handle_clear_refs_request))
         .route("/_psi", get(get_psi_watches))
-        .route(
-            "/ws",
-            get(move |State(app_state): State<AppState>, req| {
-                ws::handle_websocket_upgrade(State(app_state.ws_server), req)
-            }),
-        )
-        .route(
-            "/api/clients",
-            get(move |State(app_state): State<AppState>| {
-                ws::handle_list_clients(State(app_state.ws_server))
-            }),
-        )
-        .route(
-            "/api/clients/:id",
-            delete(move |State(app_state): State<AppState>, path| {
-                ws::handle_remove_client(State(app_state.ws_server), path)
-            }),
-        )
-        .route(
-            "/api/clients/:id/message",
-            post(move |State(app_state): State<AppState>, path, json| {
-                ws::handle_send_message(State(app_state.ws_server), path, json)
-            }),
-        )
-        .route(
-            "/api/broadcast",
-            post(move |State(app_state): State<AppState>, json| {
-                ws::handle_broadcast(State(app_state.ws_server), json)
-            }),
-        )
         .route("/web/*path", get(handle_web_request))
         .nest_service("/mcp", mcp_service(proc_mon))
-        .layer(CorsLayer::permissive())
         .with_state(app_state)
 }
 
@@ -745,16 +707,65 @@ pub async fn run_stdio_server(proc_mon: Arc<ProcMon>) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-pub async fn run_uds_server(
+pub async fn run_uds_http_server(
     proc_mon: Arc<ProcMon>,
     path: &str,
     authorized_uid: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    info!("MCP UDS server listening on {}", path);
+    info!("HTTP UDS server listening on {}", path);
 
-    // Set permissions to 0666 so other users can connect (we will verify UID anyway)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o666);
+        std::fs::set_permissions(path, perms)?;
+    }
+
+    let current_uid = unsafe { libc::getuid() };
+    let app = app(proc_mon);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let peer_cred = stream.peer_cred()?;
+        let peer_uid = peer_cred.uid();
+
+        let is_authorized = peer_uid == 0
+            || peer_uid == current_uid
+            || (authorized_uid.is_some() && authorized_uid == Some(peer_uid));
+
+        if !is_authorized {
+            error!("Unauthorized UDS HTTP connection from UID {}", peer_uid);
+            continue;
+        }
+
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            use hyper_util::rt::TokioIo;
+            use hyper_util::service::TowerToHyperService;
+            let io = TokioIo::new(stream);
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, TowerToHyperService::new(app_clone))
+                .with_upgrades()
+                .await
+            {
+                error!("Error serving UDS HTTP connection: {:?}", err);
+            }
+        });
+    }
+}
+
+pub async fn run_uds_mcp_server(
+    proc_mon: Arc<ProcMon>,
+    path: &str,
+    authorized_uid: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    info!("MCP Stream UDS server listening on {}", path);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -768,8 +779,6 @@ pub async fn run_uds_server(
     loop {
         let (stream, _) = listener.accept().await?;
         let proc_mon_clone = proc_mon.clone();
-
-        // Verify credentials
         let peer_cred = stream.peer_cred()?;
         let peer_uid = peer_cred.uid();
 
@@ -778,22 +787,17 @@ pub async fn run_uds_server(
             || (authorized_uid.is_some() && authorized_uid == Some(peer_uid));
 
         if !is_authorized {
-            error!("Unauthorized UDS connection from UID {}", peer_uid);
+            error!("Unauthorized UDS MCP connection from UID {}", peer_uid);
             continue;
         }
 
         tokio::spawn(async move {
             let handler = PmonMcpHandler::new(proc_mon_clone);
             let (read, write) = tokio::io::split(stream);
-            match handler.serve((read, write)).await {
-                Ok(service) => {
-                    if let Err(e) = service.waiting().await {
-                        error!("MCP UDS session error: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to start MCP UDS service: {}", e);
-                }
+            if let Err(e) = handler.serve((read, write)).await {
+                error!("Failed to start MCP UDS service: {}", e);
+            } else {
+                info!("MCP session started for UID {}", peer_uid);
             }
         });
     }
