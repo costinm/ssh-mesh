@@ -1,7 +1,11 @@
 name: docker
 
 on:
-  push: {}
+  push:
+    branches:
+      - main
+      - master
+  pull_request: {}
 
 permissions:
   contents: write
@@ -14,20 +18,24 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to the Container registry
-        uses: docker/login-action@f054a8b539a109f9f41c372932f1ae047eff08c9
+        uses: docker/login-action@v3
         with:
           registry: https://ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Does not use the checked out files - but the git directly
-      - name: push recovery
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          push: true
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ghcr.io/costinm/sshm:latest
-
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
