@@ -255,11 +255,12 @@ impl ProcMon {
         crate::parse_memory_stats(cgroup_path).ok()
     }
 
-    /// Get all cgroups used by known processes.
+    /// Get all cgroups used by known processes or present in /sys/fs/cgroup.
     pub fn get_all_cgroups(&self) -> HashMap<String, ProcMemInfo> {
-        let processes = self.read_existing_processes(false);
         let mut cgroups = HashMap::new();
 
+        // 1. Discovery via processes
+        let processes = self.read_existing_processes(false);
         for info in processes.values() {
             if let Some(ref cgroup_path) = info.cgroup_path {
                 if !cgroups.contains_key(cgroup_path) {
@@ -270,7 +271,32 @@ impl ProcMon {
             }
         }
 
+        // 2. Discovery via filesystem (scan /sys/fs/cgroup)
+        self.scan_cgroups("/sys/fs/cgroup", &mut cgroups);
+
         cgroups
+    }
+
+    fn scan_cgroups(&self, dir: &str, cgroups: &mut HashMap<String, ProcMemInfo>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type() {
+                    if file_type.is_dir() {
+                        let path = entry.path().to_string_lossy().into_owned();
+                        if !cgroups.contains_key(&path) {
+                            let procs_file = format!("{}/cgroup.procs", path);
+                            if std::path::Path::new(&procs_file).exists() {
+                                if let Ok(mem_info) = crate::parse_memory_stats(&path) {
+                                    cgroups.insert(path.clone(), mem_info);
+                                }
+                            }
+                        }
+                        // Recurse into sub-cgroups
+                        self.scan_cgroups(&path, cgroups);
+                    }
+                }
+            }
+        }
     }
 
     /// Adjust memory.high for a cgroup.
@@ -338,6 +364,134 @@ impl ProcMon {
             }
         }
         result
+    }
+
+    /// Move a process to a new cgroup, under mesh.slice or custom systemd path.
+    ///
+    /// Moving processes will NOT move the memory stats and limits - they stay with the original
+    /// group. This is useful for tracking new allocations after init and other special uses.
+    /// SSH and long-running processes should be started with cgexec or similar wrappers - or moved
+    /// immediately after startup if a wrapper (or using a library) is not possible.
+    ///
+    /// Will:
+    ///  - find the process and it's current cgroup path.
+    ///  - create a subdirectory on the cgroup path with the new cgroup_name if it doesn't exist.
+    ///    This is under mesh.slice if systemd is not detected.
+    ///  - move the process to the new cgroup.
+    pub fn move_process_to_cgroup(
+        &self,
+        pid: u32,
+        cgroup_name: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let process_info = self.get_process(pid).ok_or("Process not found")?;
+
+        // 1. Determine the base path for systemd delegation
+        let uid = process_info.uid.unwrap_or(1000);
+        let systemd_path = format!(
+            "/sys/fs/cgroup/user.slice/user-{}.slice/user@{}.service",
+            uid, uid
+        );
+
+        let base_path = if std::path::Path::new(&systemd_path).exists() {
+            systemd_path
+        } else {
+            // Fallback: /sys/fs/cgroup/mesh.slice/user-{uid}.slice
+            // We create this top-level to avoid systemd leaf node conflicts
+            let mesh_top = "/sys/fs/cgroup/mesh.slice";
+            let user_slice = format!("{}/user-{}.slice", mesh_top, uid);
+
+            self.setup_cgroup_dir("/sys/fs/cgroup", "mesh.slice")?;
+            self.setup_cgroup_dir(mesh_top, &format!("user-{}.slice", uid))?;
+
+            user_slice
+        };
+
+        // 2. Enable controllers in the final base path before creating the scope
+        self.enable_controllers(&base_path)?;
+
+        // 3. Determine final cgroup name (must end in .scope for systemd delegation)
+        let name = cgroup_name.unwrap_or_else(|| format!("{}-{}", process_info.comm, pid));
+        let name = if name.contains('.') {
+            name
+        } else {
+            format!("{}.scope", name)
+        };
+
+        let target_cgroup_path = format!("{}/{}", base_path, name);
+
+        if !std::path::Path::new(&target_cgroup_path).exists() {
+            fs::create_dir_all(&target_cgroup_path)?;
+            info!("Created target cgroup: {}", target_cgroup_path);
+        }
+
+        // 4. Move the process
+        let procs_path = format!("{}/cgroup.procs", target_cgroup_path);
+        fs::write(&procs_path, pid.to_string())?;
+        info!("Moved process {} to cgroup {}", pid, target_cgroup_path);
+
+        // Refresh process info in cache after move
+        let _ = self.get_process(pid);
+
+        Ok(())
+    }
+
+    /// Ensure a cgroup directory exists and has controllers enabled in its parent.
+    fn setup_cgroup_dir(&self, parent: &str, name: &str) -> std::io::Result<()> {
+        let path = format!("{}/{}", parent, name);
+        if !std::path::Path::new(&path).exists() {
+            fs::create_dir_all(&path)?;
+            info!("Created cgroup directory: {}", path);
+        }
+        // Try to enable controllers in the parent for this child to use
+        let _ = self.enable_controllers(parent);
+        Ok(())
+    }
+
+    fn enable_controllers(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let controllers_path = format!("{}/cgroup.controllers", path);
+        let subtree_control_path = format!("{}/cgroup.subtree_control", path);
+
+        if let Ok(available) = fs::read_to_string(&controllers_path) {
+            let mut to_enable = Vec::new();
+            if available.contains("memory") {
+                to_enable.push("+memory");
+            }
+            if available.contains("cpu") {
+                to_enable.push("+cpu");
+            }
+            if available.contains("io") {
+                to_enable.push("+io");
+            }
+            if !to_enable.is_empty() {
+                let cmd = to_enable.join(" ");
+                // Be careful: if there are processes in this node, writing to subtree_control will fail
+                // with EBUSY in cgroupv2. We attempt it and log.
+                if let Err(e) = fs::write(&subtree_control_path, &cmd) {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        error!(
+                            "Permission denied writing to {}. Run as root.",
+                            subtree_control_path
+                        );
+                    } else {
+                        debug!(
+                            "Could not enable controllers in {}: {} (might have processes)",
+                            subtree_control_path, e
+                        );
+                    }
+                } else {
+                    info!("Enabled controllers {} in {}", cmd, subtree_control_path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear process memory references (PSS, etc)
+    pub fn clear_refs(&self, pid: u32, value: &str) -> std::io::Result<()> {
+        crate::clear_process_refs(pid, value)?;
+        // After clearing, we might want to refresh the stats immediately
+        let _ = self.get_process(pid);
+        Ok(())
     }
 }
 

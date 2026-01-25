@@ -569,12 +569,12 @@
                         <span class="stat-value" id="total-processes">0</span>
                     </div>
                     <div class="stat-item">
-                        <span class="stat-label">Anon</span>
-                        <span class="stat-value" id="total-anon">0</span>
+                        <span class="stat-label">Total PSS</span>
+                        <span class="stat-value" id="total-pss">0</span>
                     </div>
                     <div class="stat-item">
-                        <span class="stat-label">File</span>
-                        <span class="stat-value" id="total-file">0</span>
+                        <span class="stat-label">Total RSS</span>
+                        <span class="stat-value" id="total-rss">0</span>
                     </div>
                     <div class="stat-item">
                         <span class="stat-label">WebSocket Status</span>
@@ -586,24 +586,22 @@
                     <div class="process-table-container">
                         <table id="process-table">
                             <colgroup>
-                                <col>
-                                <col>
-                                <col>
-                                <col>
+                                <col style="width: 250px;">
+                                <col style="width: 80px;">
+                                <col style="width: 80px;">
                                 <col>
                             </colgroup>
                             <thead>
                                 <tr>
+                                    <th>Memory (Anon / File / RSS)</th>
                                     <th class="pid-cell">PID</th>
                                     <th class="pid-cell">PPID</th>
                                     <th>Command</th>
-                                    <th>Memory</th>
-                                    <th>Command Line</th>
                                 </tr>
                             </thead>
                             <tbody id="process-table-body">
                                 <tr>
-                                    <td colspan="6" class="empty-state">
+                                    <td colspan="4" class="empty-state">
                                         <i>📊</i>
                                         <p>No process data available</p>
                                         <p>Connect to WebSocket or refresh to load processes</p>
@@ -650,7 +648,6 @@
         // Add log entry
         function addLogEntry(message, type = 'info') {
             const timestamp = new Date().toISOString();
-            // Redirect logs to console instead of UI
             console.log(`[${timestamp}] ${type.toUpperCase()}: ${message}`);
         }
 
@@ -681,7 +678,6 @@
             }
 
             try {
-                // Connect to the WebSocket endpoint
                 ws = new WebSocket(`ws://${window.location.host}/ws`);
 
                 ws.onopen = function (event) {
@@ -719,12 +715,66 @@
             }
         }
 
+        // Move process to a new cgroup subdirectory
+        function moveToCgroup(pid) {
+            // No longer prompting for name, using default command-pid
+            fetch('/_move_process', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    pid: parseInt(pid),
+                    cgroup_name: null // Backend will use default
+                }),
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        addLogEntry(`Successfully moved process ${pid} to mesh.slice`, 'success');
+                        refreshProcesses();
+                    } else {
+                        addLogEntry(`Failed to move process ${pid}: ${data.error}`, 'error');
+                        alert('Error: ' + data.error);
+                    }
+                })
+                .catch(error => {
+                    addLogEntry(`Request failed for process ${pid}: ${error.message}`, 'error');
+                    alert('Request failed: ' + error.message);
+                });
+        }
+
+        // Clear process memory references (PSS, etc)
+        function clearRefs(pid, value = '5') {
+            fetch('/_clear_refs', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    pid: parseInt(pid),
+                    value: value
+                }),
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        addLogEntry(`Successfully cleared refs for process ${pid}`, 'success');
+                        refreshProcesses();
+                    } else {
+                        addLogEntry(`Failed to clear refs for process ${pid}: ${data.error}`, 'error');
+                        alert('Error: ' + data.error);
+                    }
+                })
+                .catch(error => {
+                    addLogEntry(`Request failed for process ${pid}: ${error.message}`, 'error');
+                    alert('Request failed: ' + error.message);
+                });
+        }
+
         // Update process list
         function updateProcessList(processes) {
-            // Store all processes for filtering
             allProcesses = processes;
-
-            // Filter processes based on search term
             const searchTerm = searchBox.value.toLowerCase();
             let filteredProcesses = {};
 
@@ -733,6 +783,7 @@
                     const process = processes[pid];
                     if (process.comm.toLowerCase().includes(searchTerm) ||
                         (process.cmdline && process.cmdline.toLowerCase().includes(searchTerm)) ||
+                        (process.cgroup_path && process.cgroup_path.toLowerCase().includes(searchTerm)) ||
                         pid.includes(searchTerm) ||
                         process.ppid.toString().includes(searchTerm)) {
                         filteredProcesses[pid] = process;
@@ -742,120 +793,102 @@
                 filteredProcesses = processes;
             }
 
-            // Sort processes by file memory amount (descending)
             let sortedProcesses = Object.entries(filteredProcesses)
                 .sort(([pid1, proc1], [pid2, proc2]) => {
-                    const file1 = proc1.mem_info ? proc1.mem_info.file : 0;
-                    const file2 = proc2.mem_info ? proc2.mem_info.file : 0;
-                    const a1 = proc1.mem_info ? proc1.mem_info.anon : 0;
-                    const a2 = proc2.mem_info ? proc2.mem_info.anon : 0;
-                    return file2 + a2 - file1 - a1;
+                    const pss1 = proc1.mem_info ? proc1.mem_info.pss : 0;
+                    const pss2 = proc2.mem_info ? proc2.mem_info.pss : 0;
+                    return pss2 - pss1;
                 });
 
-            // Convert to array for proper ordering
             const sortedProcessArray = sortedProcesses.map(([pid, process]) => ({ pid, process }));
-
-            // Update process count
-            const processCount = sortedProcessArray.length;
-            processCountElement.textContent = processCount;
+            processCountElement.textContent = sortedProcessArray.length;
             totalProcessesElement.textContent = Object.keys(processes).length;
 
-            // Calculate sums of anon and file memory
-            let totalAnon = 0;
-            let totalFile = 0;
+            let totalPss = 0;
+            let totalRss = 0;
             for (const pid in processes) {
                 const process = processes[pid];
                 if (process.mem_info) {
-                    totalAnon += process.mem_info.anon || 0;
-                    totalFile += process.mem_info.file || 0;
+                    totalPss += process.mem_info.pss || 0;
+                    totalRss += process.mem_info.rss || 0;
                 }
             }
 
-            // Update total anon and file values
-            document.getElementById('total-anon').textContent = formatMemory(totalAnon);
-            document.getElementById('total-file').textContent = formatMemory(totalFile);
+            document.getElementById('total-pss').textContent = formatMemory(totalPss);
+            document.getElementById('total-rss').textContent = formatMemory(totalRss);
 
-            // Clear existing table rows
             processTableBody.innerHTML = '';
 
-            // Check if there are processes to display
-            if (processCount === 0) {
+            if (sortedProcessArray.length === 0) {
                 processTableBody.innerHTML = `
                       <tr>
                           <td colspan="6" class="empty-state">
                               <i>🔍</i>
                               <p>No processes match your search</p>
-                              <p>Try a different search term</p>
                           </td>
                       </tr>
                   `;
                 return;
             }
 
-            // Add processes to table
             for (const { pid, process } of sortedProcessArray) {
-                const process = filteredProcesses[pid];
-                const row = document.createElement('tr');
-
-                // Create a row for each process with two lines
                 const mainRow = document.createElement('tr');
                 mainRow.className = 'process-main';
-
-                // First line with main process info
                 mainRow.innerHTML = `
-                      <td class="pid-cell">${process.pid}</td>
-                      <td class="pid-cell">${process.ppid}</td>
-                      <td class="comm-cell">${process.comm}</td>
-                      <td class="mem-cell">
-                          ${process.mem_info ? formatMemory(process.mem_info.anon) : 'N/A'} + ${process.mem_info ? formatMemory(process.mem_info.file) : 'N/A'}
-                        
-                      </td>
-                      <td class="cmdline-cell">${process.cmdline || ''}</td>
-                      
-                  `;
+                       <td class="mem-cell">
+                           <span style="color: var(--primary); font-weight: bold;">${process.mem_info ? formatMemory(process.mem_info.anon) : 'N/A'}</span>
+                           <span style="font-size: 0.85em; color: var(--gray);"> / ${process.mem_info ? formatMemory(process.mem_info.file) : 'N/A'}</span>
+                           <span style="font-size: 0.85em; color: #666;"> / ${process.mem_info ? formatMemory(process.mem_info.rss) : 'N/A'}</span>
+                       </td>
+                       <td class="pid-cell">${process.pid}</td>
+                       <td class="pid-cell">${process.ppid}</td>
+                       <td class="comm-cell">${process.comm}</td>
+                   `;
 
-                // Second line with detailed memory info
                 const memoryRow = document.createElement('tr');
                 memoryRow.className = 'process-memory';
                 memoryRow.innerHTML = `
-                      <td colspan="5">
-                          <div class="memory-details">
-                              <div class="memory-item">
-                                  <span class="memory-label">Kernel:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.kernel) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">
-                                  <span class="memory-label">Stack:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.kernel_stack) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">
-                                  <span class="memory-label">Tables:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.pagetables) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">
-                                  <span class="memory-label">Shmem:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shmem) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">
-                                  <span class="memory-label">Mapped:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file_mapped) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">
-                                  <span class="memory-label">Dirty:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file_dirty) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">
-                                  <span class="memory-label">Writeback:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file_writeback) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">
-                                  <span class="memory-label">Swap:</span>
-                                  <span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.swapcached) : 'N/A'}</span>
-                              </div>
-                              <div class="memory-item">CG: ${process.cgroup_path || ''}</div>
-                          </div>
-                      </td>
-                  `;
+                       <td colspan="4">
+                           <div class="memory-details" style="grid-template-columns: repeat(4, 1fr); padding: 15px; background: #fdfdfd; border: 1px solid #eee; border-radius: 8px; margin: 5px 20px 15px 20px;">
+                               <div class="memory-item"><span class="memory-label">PSS:</span><span class="memory-value" style="color: var(--primary); font-weight: bold;">${process.mem_info ? formatMemory(process.mem_info.pss) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">RSS:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.rss) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Anon:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.anon) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">File:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file) : 'N/A'}</span></div>
+                               
+                               <div class="memory-item"><span class="memory-label">Referenced:</span><span class="memory-value" style="color: var(--success); font-weight: 600;">${process.mem_info ? formatMemory(process.mem_info.referenced) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Shared:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shmem) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">PTE Tables:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.pagetables) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Kernel Stk:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.kernel_stack) : 'N/A'}</span></div>
+                               
+                               <div class="memory-item"><span class="memory-label">Priv Dirty:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.private_dirty) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Priv Clean:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.private_clean) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Shr Dirty:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shared_dirty) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Shr Clean:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shared_clean) : 'N/A'}</span></div>
+                               
+                               <div class="memory-item"><span class="memory-label">Swap:</span><span class="memory-value" style="color: var(--danger);">${process.mem_info ? formatMemory(process.mem_info.swap) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">HugeTLB:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.hugetlb) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Faults:</span><span class="memory-value">${process.mem_info ? (process.mem_info.pgfault - process.mem_info.pgmajfault) : '0'} / ${process.mem_info ? process.mem_info.pgmajfault : '0'}</span></div>
+                               <div class="memory-item" style="font-size: 0.75em; color: var(--gray); display: flex; align-items: center;">(Minor / Major)</div>
+                               <div class="memory-item" style="grid-column: 1 / -1; margin-top: 8px; padding-top: 8px; border-top: 1px dashed #eee;">
+                                   <span class="memory-label" style="display: block; margin-bottom: 4px;">Command Line:</span>
+                                   <div class="memory-value" style="word-break: break-all; white-space: normal; font-size: 0.9em; background: #f8f9fa; padding: 6px; border-radius: 4px;">${process.cmdline || 'N/A'}</div>
+                               </div>
+                               
+                               <div class="memory-item" style="grid-column: 1 / -1; display: flex; align-items: center; border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px;">
+                                   <span class="memory-label">Cgroup:</span>
+                                   <span class="memory-value" style="flex: 1; margin-right: 10px; font-size: 0.85em; color: var(--gray);">${process.cgroup_path || '/'}</span>
+                                   <div style="display: flex; gap: 5px;">
+                                       <button onclick="clearRefs(${process.pid})" class="warning" style="padding: 4px 8px; font-size: 11px; height: auto;">
+                                           Clear PSS
+                                        </button>
+                                       <button onclick="moveToCgroup(${process.pid})" class="secondary" style="padding: 4px 8px; font-size: 11px; height: auto;">
+                                           Move
+                                       </button>
+                                   </div>
+                               </div>
+                           </div>
+                       </td>
+                    `;
 
                 processTableBody.appendChild(mainRow);
                 processTableBody.appendChild(memoryRow);
@@ -877,7 +910,6 @@
 
         // Clear log
         function clearLog() {
-            // Clear console logs
             console.clear();
             addLogEntry('Log cleared', 'info');
         }
@@ -894,12 +926,14 @@
         searchBox.addEventListener('input', handleSearch);
 
         // Initial refresh
+        const urlParams = new URLSearchParams(window.location.search);
+        const searchParam = urlParams.get('search');
+        if (searchParam) {
+            searchBox.value = searchParam;
+        }
         refreshProcesses();
-
-        // Auto-connect to WebSocket on page load
         connectWebSocket();
 
-        // Add some sample log entries for demonstration
         setTimeout(() => {
             addLogEntry('PMOND web interface loaded successfully', 'success');
             addLogEntry('Ready to monitor system processes', 'info');

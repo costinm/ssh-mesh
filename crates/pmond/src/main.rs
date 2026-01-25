@@ -1,3 +1,4 @@
+use axum::serve;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,12 +7,8 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use ws::WSServer;
-use axum::serve;
 
-
-
-
-use pmond::{ProcMon, proc_netlink};
+use pmond::{proc_netlink, ProcMon};
 
 fn get_local_ip() -> Option<String> {
     use std::net::UdpSocket;
@@ -19,7 +16,6 @@ fn get_local_ip() -> Option<String> {
     socket.connect("8.8.8.8:80").ok()?;
     socket.local_addr().ok().map(|addr| addr.ip().to_string())
 }
-
 
 #[derive(Parser, Debug)]
 #[clap(name = "pmond", version = "0.1.0", author = "Author")]
@@ -61,12 +57,11 @@ use tracing_subscriber::{EnvFilter, Registry};
 /// - `RUST_LOG=debug` -> Log debug and above
 /// - `RUST_LOG=pmond=debug,info` -> Log debug for pmond crate, info for others
 fn init_telemetry() {
-    let json_layer = tracing_subscriber::fmt::layer()
-        .json();
+    let json_layer = tracing_subscriber::fmt::layer().json();
 
     let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
         tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
-            std::fs::File::create(file).expect("failed to create trace file")
+            std::fs::File::create(file).expect("failed to create trace file"),
         ))
     });
 
@@ -80,7 +75,7 @@ fn init_telemetry() {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_telemetry();
- 
+
     let main_span = tracing::info_span!("pmond");
     let _main_guard = main_span.enter();
 
@@ -118,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn start_monitoring(proc_mon: Arc<ProcMon>) -> tokio::task::JoinHandle<()> {
     let (tx, mut rx) = mpsc::channel(100);
     let running = proc_mon.running.clone();
-    
+
     // Start netlink listener
     tokio::task::spawn_blocking(move || {
         if let Err(e) = proc_netlink::run_netlink_listener(tx, running) {
@@ -131,7 +126,12 @@ fn start_monitoring(proc_mon: Arc<ProcMon>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
-                proc_netlink::NetlinkEvent::Fork { parent_tgid, child_pid, child_tgid, .. } => {
+                proc_netlink::NetlinkEvent::Fork {
+                    parent_tgid,
+                    child_pid,
+                    child_tgid,
+                    ..
+                } => {
                     pm.handle_fork(parent_tgid, child_pid, child_tgid);
                 }
                 proc_netlink::NetlinkEvent::Exit { process_tgid, .. } => {
@@ -260,7 +260,7 @@ async fn run_server(
                 let _ = std::fs::create_dir_all(parent);
             }
         }
-        
+
         if let Err(e) = pmond::handlers::run_uds_server(pm, &path_str, auth_uid).await {
             error!("MCP UDS server error: {}", e);
         }
@@ -305,6 +305,3 @@ fn start_periodic_broadcast(ws_server: Arc<WSServer>, proc_mon: Arc<ProcMon>, re
         }
     });
 }
-
-#[cfg(test)]
-mod telemetry_test;

@@ -514,12 +514,16 @@
         }
 
         function updateStats() {
-            const paths = Object.keys(cgroupsData);
+            const paths = Object.keys(cgroupsData).filter(path => {
+                if (path === '/sys/fs/cgroup') return false;
+                if (path.endsWith('.slice')) return false;
+                return true;
+            });
             totalCgroupsEl.textContent = paths.length;
 
             let totalAnon = 0;
             let totalFile = 0;
-            for (const path in cgroupsData) {
+            for (const path of paths) {
                 totalAnon += cgroupsData[path].anon || 0;
                 totalFile += cgroupsData[path].file || 0;
             }
@@ -781,6 +785,11 @@
         }, 1000);
 
         // Initial fetch
+        const urlParams = new URLSearchParams(window.location.search);
+        const searchParam = urlParams.get('search');
+        if (searchParam) {
+            searchBox.value = searchParam;
+        }
         fetchData();
     </script>
 </body>

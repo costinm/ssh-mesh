@@ -326,4 +326,3 @@ pub fn run_netlink_listener(
     unsafe { libc::close(nl_sock) };
     Ok(())
 }
-

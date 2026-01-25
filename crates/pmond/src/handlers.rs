@@ -1,6 +1,6 @@
 use crate::{ProcMemInfo, ProcMon};
 use axum::{
-    extract::{State, Path as AxumPath},
+    extract::{Path as AxumPath, State},
     response::{Html, IntoResponse, Json},
     routing::{delete, get, post},
     Router,
@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
-use ws::WSServer;
 use tower_http::cors::CorsLayer;
+use ws::WSServer;
 
 // MCP Imports
 use rmcp::transport::streamable_http_server::{
@@ -35,10 +35,9 @@ use schemars::{schema_for, JsonSchema};
 use tokio::net::UnixListener;
 use tracing::{error, info};
 
-// TODO: find a way to reduce duplication and auto-generate 
+// TODO: find a way to reduce duplication and auto-generate
 // the MCP and REST boilerplate. Each public method should
 // be exposed with a rust macro.
-
 
 #[derive(RustEmbed)]
 #[folder = "web/"]
@@ -103,6 +102,55 @@ pub async fn handle_cgroup_procs_request(
     debug!("Received CGroup Procs request for {}", payload.path);
     let processes = app_state.proc_mon.get_processes_in_cgroup(&payload.path);
     (StatusCode::OK, Json(json!(processes)))
+}
+
+#[derive(Deserialize, Debug)]
+pub struct MoveProcessPayload {
+    pub pid: u32,
+    pub cgroup_name: Option<String>,
+}
+
+pub async fn handle_move_process_request(
+    State(app_state): State<AppState>,
+    Json(payload): Json<MoveProcessPayload>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    debug!(
+        "Received Move Process request for pid {} to cgroup {:?}",
+        payload.pid, payload.cgroup_name
+    );
+    match app_state
+        .proc_mon
+        .move_process_to_cgroup(payload.pid, payload.cgroup_name)
+    {
+        Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ClearRefsPayload {
+    pub pid: u32,
+    pub value: String, // "1", "2", "3", "4", "5"
+}
+
+pub async fn handle_clear_refs_request(
+    State(app_state): State<AppState>,
+    Json(payload): Json<ClearRefsPayload>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    debug!(
+        "Received Clear Refs request for pid {} with value {}",
+        payload.pid, payload.value
+    );
+    match app_state.proc_mon.clear_refs(payload.pid, &payload.value) {
+        Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
 }
 
 pub async fn handle_root_request() -> Html<&'static str> {
@@ -181,6 +229,8 @@ pub fn app(proc_mon: Arc<ProcMon>, ws_server: Arc<WSServer>) -> Router {
         .route("/_cgroups", get(handle_cgroups_request))
         .route("/_cgroup_high", post(handle_cgroup_high_request))
         .route("/_cgroup_procs", post(handle_cgroup_procs_request))
+        .route("/_move_process", post(handle_move_process_request))
+        .route("/_clear_refs", post(handle_clear_refs_request))
         .route("/_psi", get(get_psi_watches))
         .route(
             "/ws",
@@ -252,6 +302,18 @@ struct GetCgroupArgs {
     path: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct MoveProcessArgs {
+    pid: u32,
+    cgroup_name: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ClearRefsArgs {
+    pid: u32,
+    value: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SimplifiedProcess {
     pid: u32,
@@ -259,6 +321,7 @@ pub struct SimplifiedProcess {
     name: String,
     cgroup_path: Option<String>,
     cmdline: Option<String>,
+    pss: u64,
     rss: u64,
     mem_info: Option<ProcMemInfo>,
     user: Option<u32>,
@@ -364,6 +427,38 @@ impl ServerHandler for PmonMcpHandler {
                 title: None,
                 output_schema: None,
             },
+            Tool {
+                name: "move_process".to_string().into(),
+                description: Some(
+                    "Move a process to a new cgroup subdirectory"
+                        .to_string()
+                        .into(),
+                ),
+                input_schema: to_schema(
+                    serde_json::to_value(schema_for!(MoveProcessArgs)).unwrap(),
+                ),
+                annotations: None,
+                icons: None,
+                meta: None,
+                title: None,
+                output_schema: None,
+            },
+            Tool {
+                name: "clear_refs".to_string().into(),
+                description: Some(
+                    "Clear process memory references (PSS, etc) via /proc/[pid]/clear_refs. Values: 1 (PSS/soft-dirty), 2 (whole process), 3 (anon), 4 (file), 5 (PSS only)"
+                        .to_string()
+                        .into(),
+                ),
+                input_schema: to_schema(
+                    serde_json::to_value(schema_for!(ClearRefsArgs)).unwrap(),
+                ),
+                annotations: None,
+                icons: None,
+                meta: None,
+                title: None,
+                output_schema: None,
+            },
         ];
 
         Ok(ListToolsResult {
@@ -390,7 +485,8 @@ impl ServerHandler for PmonMcpHandler {
                         name: p.comm.clone(),
                         cgroup_path: p.cgroup_path.clone(),
                         cmdline: p.cmdline.clone(),
-                        rss: p.mem_info.as_ref().map(|m| m.anon).unwrap_or(0),
+                        pss: p.mem_info.as_ref().map(|m| m.pss).unwrap_or(0),
+                        rss: p.mem_info.as_ref().map(|m| m.rss).unwrap_or(0),
                         mem_info: p.mem_info.clone(),
                         user: p.uid,
                     })
@@ -484,6 +580,71 @@ impl ServerHandler for PmonMcpHandler {
                     None => Err(ErrorData {
                         code: ErrorCode(-32002),
                         message: format!("Cgroup {} not found or failed to read", args.path).into(),
+                        data: None,
+                    }),
+                }
+            }
+            "move_process" => {
+                let args_val = serde_json::Value::Object(params.arguments.unwrap_or_default());
+                let args: MoveProcessArgs =
+                    serde_json::from_value(args_val).map_err(|e| ErrorData {
+                        code: ErrorCode(-32602),
+                        message: format!("Invalid arguments: {}", e).into(),
+                        data: None,
+                    })?;
+
+                match self
+                    .proc_mon
+                    .move_process_to_cgroup(args.pid, args.cgroup_name)
+                {
+                    Ok(_) => Ok(CallToolResult {
+                        content: vec![Annotated {
+                            raw: RawContent::Text(RawTextContent {
+                                text: "Successfully moved process".to_string().into(),
+                                meta: None,
+                            }),
+                            annotations: None,
+                        }],
+                        is_error: None,
+                        meta: None,
+                        structured_content: None,
+                    }),
+                    Err(e) => Err(ErrorData {
+                        code: ErrorCode(-32003),
+                        message: format!("Failed to move process: {}", e).into(),
+                        data: None,
+                    }),
+                }
+            }
+            "clear_refs" => {
+                let args_val = serde_json::Value::Object(params.arguments.unwrap_or_default());
+                let args: ClearRefsArgs =
+                    serde_json::from_value(args_val).map_err(|e| ErrorData {
+                        code: ErrorCode(-32602),
+                        message: format!("Invalid arguments: {}", e).into(),
+                        data: None,
+                    })?;
+
+                match self.proc_mon.clear_refs(args.pid, &args.value) {
+                    Ok(_) => Ok(CallToolResult {
+                        content: vec![Annotated {
+                            raw: RawContent::Text(RawTextContent {
+                                text: format!(
+                                    "Successfully cleared refs for process {} with value {}",
+                                    args.pid, args.value
+                                )
+                                .into(),
+                                meta: None,
+                            }),
+                            annotations: None,
+                        }],
+                        is_error: None,
+                        meta: None,
+                        structured_content: None,
+                    }),
+                    Err(e) => Err(ErrorData {
+                        code: ErrorCode(-32004),
+                        message: format!("Failed to clear refs: {}", e).into(),
                         data: None,
                     }),
                 }
