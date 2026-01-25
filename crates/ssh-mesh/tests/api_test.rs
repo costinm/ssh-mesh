@@ -18,6 +18,7 @@ async fn test_client_api() -> Result<()> {
     run_test_with_timeout(|| async {
         let setup = setup_test_environment(None, true).await?;
         let http_port = setup.http_port.unwrap();
+        
         let client = reqwest::Client::new();
 
         // 1. Initially, no clients should be connected

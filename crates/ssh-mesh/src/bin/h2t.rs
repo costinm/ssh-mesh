@@ -56,10 +56,14 @@ async fn handle_stdio(url: &str) -> Result<(), Box<dyn std::error::Error + Send 
     let body = StreamBody::new(stream);
 
     // Build request
-    let req_builder = Request::builder()
+    let mut req_builder = Request::builder()
         .method(Method::POST)
         .uri(&uri)
         .header("x-host", "localhost:15022"); // TODO: Make configurable
+
+    if let Ok(token) = env::var("TUN_TOKEN") {
+        req_builder = req_builder.header("authorization", format!("Bearer {}", token));
+    }
 
     let request = req_builder.body(body)?;
 
