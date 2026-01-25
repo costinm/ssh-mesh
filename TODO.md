@@ -36,6 +36,11 @@ Standalone binaries for testing and specialized cases with lower complexity:
 
 [ ] document all env vars, including rust ones
 
+# JNI 
+
+[ ] Add JNI interface - exposing the MCP-like protocol
+[ ] Add JNI for common methods to start the servers, stream data. Focus on using rust-allocated/managed Arc objects - and/or DirectBuffers.
+
 # Other
 
 [ ] create control socket (UDS), maybe using SSH format and interop with ssh control socket
