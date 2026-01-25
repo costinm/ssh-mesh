@@ -36,9 +36,7 @@ pub async fn setup_test_environment(
     let (temp_dir, base_dir) = if let Some(path) = custom_temp_dir {
         (None, path)
     } else {
-        let td = tempfile::Builder::new()
-            .prefix("ssh-mesh-test")
-            .tempdir()?;
+        let td = tempfile::Builder::new().prefix("ssh-mesh-test").tempdir()?;
         let path = td.path().to_path_buf();
         (Some(td), path)
     };
@@ -78,7 +76,7 @@ pub async fn setup_test_environment(
     let server_base_dir = base_dir.clone();
     let server_handle = tokio::spawn(async move {
         let ssh_server = std::sync::Arc::new(crate::SshServer::new(0, None, server_base_dir));
-        
+
         if start_http {
             let app_state = crate::AppState {
                 ssh_server: ssh_server.clone(),
@@ -104,9 +102,7 @@ pub async fn setup_test_environment(
             }
         } else {
             let config = ssh_server.get_config();
-            if let Err(e) =
-                crate::run_ssh_server(ssh_port, config, (*ssh_server).clone()).await
-            {
+            if let Err(e) = crate::run_ssh_server(ssh_port, config, (*ssh_server).clone()).await {
                 eprintln!("SSH server failed: {}", e);
             }
         }

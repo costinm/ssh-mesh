@@ -42,7 +42,11 @@ async fn handle_stdio(url_str: &str) -> Result<(), Box<dyn std::error::Error + S
             match stdin.read(&mut buffer).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    if write.send(Message::Binary(buffer[..n].to_vec())).await.is_err() {
+                    if write
+                        .send(Message::Binary(buffer[..n].to_vec()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }

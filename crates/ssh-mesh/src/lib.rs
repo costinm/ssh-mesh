@@ -1420,7 +1420,10 @@ impl server::Handler for SshHandler {
                     return Ok(());
                 }
 
-                info!("Spawning SFTP server: {} in {:?}", sftp_server_path, self.server.base_dir);
+                info!(
+                    "Spawning SFTP server: {} in {:?}",
+                    sftp_server_path, self.server.base_dir
+                );
                 let mut cmd = Command::new(sftp_server_path);
                 cmd.current_dir(&self.server.base_dir)
                     .stdin(Stdio::piped())
@@ -1445,7 +1448,11 @@ impl server::Handler for SshHandler {
                             }
                             Ok(n) => {
                                 trace!("Read {} bytes from SFTP stdout, sending to SSH", n);
-                                if session_handle_clone.data(channel_id, (&buf[..n]).into()).await.is_err() {
+                                if session_handle_clone
+                                    .data(channel_id, (&buf[..n]).into())
+                                    .await
+                                    .is_err()
+                                {
                                     error!("Failed to send SFTP data to SSH channel");
                                     break;
                                 }
@@ -1469,7 +1476,11 @@ impl server::Handler for SshHandler {
                         match stderr.read(&mut buf).await {
                             Ok(0) => break,
                             Ok(n) => {
-                                if session_handle_clone2.extended_data(channel_id, 1, (&buf[..n]).into()).await.is_err() {
+                                if session_handle_clone2
+                                    .extended_data(channel_id, 1, (&buf[..n]).into())
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }

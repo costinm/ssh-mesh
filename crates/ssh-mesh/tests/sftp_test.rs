@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ssh_mesh::test_utils::setup_test_environment;
-use tokio::process::Command;
 use std::time::Duration;
+use tokio::process::Command;
 use tokio::time::timeout;
 
 #[tokio::test]
@@ -36,10 +36,14 @@ async fn test_sftp_basic_ops() -> Result<()> {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
-        
+
         let wait_result = timeout(Duration::from_secs(30), child.wait()).await;
         let status = wait_result.expect("SFTP command timed out")?;
-        assert!(status.success(), "SFTP command failed with status: {:?}", status);
+        assert!(
+            status.success(),
+            "SFTP command failed with status: {:?}",
+            status
+        );
 
         // Verify the file was downloaded
         let downloaded_file = std::path::Path::new("hello_got.txt");
@@ -50,5 +54,6 @@ async fn test_sftp_basic_ops() -> Result<()> {
 
         setup.server_handle.abort();
         Ok(())
-    }).await?
+    })
+    .await?
 }

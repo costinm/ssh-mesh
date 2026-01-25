@@ -4,9 +4,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use ws::WSServer;
 
-
-
-
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
@@ -19,12 +16,11 @@ use tracing_subscriber::{EnvFilter, Registry};
 /// - `RUST_LOG=debug` -> Log debug and above
 /// - `RUST_LOG=ssh_mesh=debug,info` -> Log debug for ssh_mesh crate, info for others
 fn init_telemetry() {
-    let json_layer = tracing_subscriber::fmt::layer()
-        .json();
+    let json_layer = tracing_subscriber::fmt::layer().json();
 
     let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
         tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
-            std::fs::File::create(file).expect("failed to create trace file")
+            std::fs::File::create(file).expect("failed to create trace file"),
         ))
     });
 
@@ -34,7 +30,6 @@ fn init_telemetry() {
         .with(perfetto_layer)
         .init();
 }
-
 
 fn get_local_ip() -> Option<String> {
     use std::net::UdpSocket;

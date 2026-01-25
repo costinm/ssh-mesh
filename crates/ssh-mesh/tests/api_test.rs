@@ -1,8 +1,8 @@
 use anyhow::Result;
 use serde_json::Value;
+use ssh_mesh::test_utils::setup_test_environment;
 use std::process::Command;
 use std::time::Duration;
-use ssh_mesh::test_utils::setup_test_environment;
 use tokio::time::timeout;
 
 async fn run_test_with_timeout<F, Fut>(test_fn: F) -> Result<()>
@@ -18,15 +18,12 @@ async fn test_client_api() -> Result<()> {
     run_test_with_timeout(|| async {
         let setup = setup_test_environment(None, true).await?;
         let http_port = setup.http_port.unwrap();
-        
+
         let client = reqwest::Client::new();
 
         // 1. Initially, no clients should be connected
         let res: Value = client
-            .get(format!(
-                "http://127.0.0.1:{}/api/ssh/clients",
-                http_port
-            ))
+            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -59,10 +56,7 @@ async fn test_client_api() -> Result<()> {
 
         // 3. Verify the client is listed in the API
         let res: Value = client
-            .get(format!(
-                "http://127.0.0.1:{}/api/ssh/clients",
-                http_port
-            ))
+            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -82,10 +76,7 @@ async fn test_client_api() -> Result<()> {
 
         // 5. Verify the client is no longer listed
         let res: Value = client
-            .get(format!(
-                "http://127.0.0.1:{}/api/ssh/clients",
-                http_port
-            ))
+            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -107,10 +98,7 @@ async fn test_client_api_over_http2() -> Result<()> {
 
         // 1. Initially, no clients should be connected
         let res: Value = client
-            .get(format!(
-                "http://127.0.0.1:{}/api/ssh/clients",
-                http_port
-            ))
+            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -150,10 +138,7 @@ async fn test_client_api_over_http2() -> Result<()> {
 
         // 3. Verify the client is listed in the API
         let res: Value = client
-            .get(format!(
-                "http://127.0.0.1:{}/api/ssh/clients",
-                http_port
-            ))
+            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -177,10 +162,7 @@ async fn test_client_api_over_http2() -> Result<()> {
 
         // 5. Verify the client is no longer listed
         let res: Value = client
-            .get(format!(
-                "http://127.0.0.1:{}/api/ssh/clients",
-                http_port
-            ))
+            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
