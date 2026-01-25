@@ -1,14 +1,12 @@
 use axum::serve;
 use clap::Parser;
+use pmond::{proc_netlink, ProcMon};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
-use ws::WSServer;
-
-use pmond::{proc_netlink, ProcMon};
 
 fn get_local_ip() -> Option<String> {
     use std::net::UdpSocket;
@@ -225,7 +223,7 @@ async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_server(
-    refresh: u64,
+    _refresh: u64,
     mcp_uds: Option<String>,
     auth_uid: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -241,7 +239,7 @@ async fn run_server(
 
     info!("PMON process monitor started successfully");
 
-    // Start UDS MCP server
+    // Start UDS servers
     let path_str = if let Some(path) = mcp_uds {
         path
     } else {
@@ -250,27 +248,28 @@ async fn run_server(
         format!("/run/user/{}/pmond.sock", uid)
     };
 
-    let pm = proc_mon.clone();
-    tokio::spawn(async move {
-        // Ensure parent directory exists if using default path or custom path
-        let path = PathBuf::from(&path_str);
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                // Try to create it, but don't fail if we can't (might just work if existing)
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
+    // Ensure parent directory exists
+    let path = PathBuf::from(&path_str);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
-        if let Err(e) = pmond::handlers::run_uds_server(pm, &path_str, auth_uid).await {
-            error!("MCP UDS server error: {}", e);
+    let http_path = format!("{}.http", path_str);
+    let mcp_path = format!("{}.mcp", path_str);
+
+    let pm_http = proc_mon.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pmond::handlers::run_uds_http_server(pm_http, &http_path, auth_uid).await {
+            error!("UDS HTTP server error: {}", e);
         }
     });
 
-    // Create a new WebSocket server
-    let ws_server = Arc::new(WSServer::new());
-
-    // Start the periodic broadcast task
-    start_periodic_broadcast(ws_server.clone(), proc_mon.clone(), refresh);
+    let pm_mcp = proc_mon.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pmond::handlers::run_uds_mcp_server(pm_mcp, &mcp_path, auth_uid).await {
+            error!("UDS MCP server error: {}", e);
+        }
+    });
 
     // Set up HTTP server
     let addr = "127.0.0.1:8081";
@@ -278,30 +277,10 @@ async fn run_server(
     info!("Listening on http://{}", addr);
 
     // Create the Axum app
-    let app = pmond::handlers::app(proc_mon, ws_server);
+    let app = pmond::handlers::app(proc_mon);
 
     // Run the server
     serve(listener, app.into_make_service()).await?;
 
     Ok(())
-}
-
-/// Periodically broadcasts the process list to all connected clients.
-fn start_periodic_broadcast(ws_server: Arc<WSServer>, proc_mon: Arc<ProcMon>, refresh: u64) {
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(refresh)).await;
-            let processes = proc_mon.get_all_processes();
-            match serde_json::to_string(&processes) {
-                Ok(json) => {
-                    if let Err(e) = ws_server.broadcast_message(&json).await {
-                        error!("Failed to broadcast process list: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to serialize process list: {}", e);
-                }
-            }
-        }
-    });
 }

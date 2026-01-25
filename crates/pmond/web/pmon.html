@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PMOND - Process Monitor</title>
+    <title>Memory Monitor</title>
     <style>
         :root {
             --primary: #4361ee;
@@ -130,6 +130,17 @@
             padding: 12px 20px;
             border-radius: 50px;
             backdrop-filter: blur(10px);
+            cursor: pointer;
+            transition: var(--transition);
+            user-select: none;
+        }
+
+        .status-bar:hover {
+            background: rgba(255, 255, 255, 0.25);
+        }
+
+        .status-bar.paused {
+            background: rgba(247, 37, 133, 0.3);
         }
 
         .status-item {
@@ -530,13 +541,14 @@
     <div class="container">
         <header>
             <div class="header-content">
-                <h1>PMOND - Process Monitor</h1>
-                <p>Real-time system process monitoring with WebSocket updates</p>
+                <h1>Memory Monitor</h1>
             </div>
-            <div class="status-bar">
+            <div class="status-bar paused" id="status-bar" title="Click to toggle auto-refresh">
                 <div class="status-item">
-                    <div id="connection-status-indicator" class="status-indicator disconnected"></div>
-                    <span id="connection-status-text">Disconnected</span>
+                    <span class="stat-label" style="color: white; margin-bottom: 0; margin-right: 8px;">Refreshing
+                        in:</span>
+                    <span id="refresh-timer" style="font-weight: 600;">5s</span>
+                    <span id="paused-label" style="display: inline; font-weight: 600; margin-left: 8px;">(PAUSED)</span>
                 </div>
                 <div class="status-item">
                     <span class="process-count">Processes: <span id="process-count">0</span></span>
@@ -545,11 +557,8 @@
         </header>
 
         <div class="controls">
-            <button id="connect-btn">
-                <i>🔗</i> Connect WebSocket
-            </button>
-            <button id="refresh-btn" class="secondary">
-                <i>🔄</i> Refresh Processes
+            <button id="refresh-btn">
+                <i>🔄</i> Refresh Now
             </button>
             <button id="clear-log-btn" class="warning">
                 <i>🧹</i> Clear Log
@@ -577,8 +586,8 @@
                         <span class="stat-value" id="total-rss">0</span>
                     </div>
                     <div class="stat-item">
-                        <span class="stat-label">WebSocket Status</span>
-                        <span class="stat-value" id="ws-status">Disconnected</span>
+                        <span class="stat-label">Refresh Interval</span>
+                        <span class="stat-value">5s</span>
                     </div>
                 </div>
                 <div class="card-body">
@@ -604,7 +613,7 @@
                                     <td colspan="4" class="empty-state">
                                         <i>📊</i>
                                         <p>No process data available</p>
-                                        <p>Connect to WebSocket or refresh to load processes</p>
+                                        <p>Refresh to load processes</p>
                                     </td>
                                 </tr>
                             </tbody>
@@ -633,86 +642,29 @@
         const processTableBody = document.getElementById('process-table-body');
         const processCountElement = document.getElementById('process-count');
         const totalProcessesElement = document.getElementById('total-processes');
-        const connectionStatusIndicator = document.getElementById('connection-status-indicator');
-        const connectionStatusText = document.getElementById('connection-status-text');
-        const wsStatusElement = document.getElementById('ws-status');
-        const connectButton = document.getElementById('connect-btn');
+        const statusBar = document.getElementById('status-bar');
+        const pausedLabel = document.getElementById('paused-label');
+        const refreshTimerEl = document.getElementById('refresh-timer');
         const refreshButton = document.getElementById('refresh-btn');
         const clearLogButton = document.getElementById('clear-log-btn');
         const searchBox = document.getElementById('search-box');
 
-        // WebSocket connection
-        let ws = null;
+        // State
         let allProcesses = {};
+        let refreshInterval = 5;
+        let timeLeft = refreshInterval;
+        let isPaused = true;
+
+        statusBar.addEventListener('click', () => {
+            isPaused = !isPaused;
+            statusBar.classList.toggle('paused', isPaused);
+            pausedLabel.style.display = isPaused ? 'inline' : 'none';
+        });
 
         // Add log entry
         function addLogEntry(message, type = 'info') {
             const timestamp = new Date().toISOString();
             console.log(`[${timestamp}] ${type.toUpperCase()}: ${message}`);
-        }
-
-        // Update connection status
-        function updateConnectionStatus(connected) {
-            if (connected) {
-                connectionStatusIndicator.className = 'status-indicator connected';
-                connectionStatusText.textContent = 'Connected';
-                wsStatusElement.textContent = 'Connected';
-                wsStatusElement.style.color = '#28a745';
-                connectButton.innerHTML = '<i>🔌</i> Disconnect';
-                connectButton.disabled = false;
-            } else {
-                connectionStatusIndicator.className = 'status-indicator disconnected';
-                connectionStatusText.textContent = 'Disconnected';
-                wsStatusElement.textContent = 'Disconnected';
-                wsStatusElement.style.color = '#dc3545';
-                connectButton.innerHTML = '<i>🔗</i> Connect WebSocket';
-                connectButton.disabled = false;
-            }
-        }
-
-        // Connect to WebSocket
-        function connectWebSocket() {
-            if (ws) {
-                ws.close();
-                return;
-            }
-
-            try {
-                ws = new WebSocket(`ws://${window.location.host}/ws`);
-
-                ws.onopen = function (event) {
-                    addLogEntry('WebSocket connection established', 'success');
-                    updateConnectionStatus(true);
-                };
-
-                ws.onmessage = function (event) {
-                    try {
-                        const data = JSON.parse(event.data);
-                        updateProcessList(data);
-                        addLogEntry(`Received process data with ${Object.keys(data).length} processes`, 'info');
-                    } catch (e) {
-                        addLogEntry(`Received message: ${event.data}`, 'info');
-                    }
-                };
-
-                ws.onclose = function (event) {
-                    addLogEntry('WebSocket connection closed', 'info');
-                    updateConnectionStatus(false);
-                    ws = null;
-                };
-
-                ws.onerror = function (error) {
-                    addLogEntry(`WebSocket error: ${error.message}`, 'error');
-                    updateConnectionStatus(false);
-                    ws = null;
-                };
-
-                connectButton.disabled = true;
-            } catch (e) {
-                addLogEntry(`Failed to connect: ${e.message}`, 'error');
-                updateConnectionStatus(false);
-                connectButton.disabled = false;
-            }
         }
 
         // Move process to a new cgroup subdirectory
@@ -847,28 +799,52 @@
 
                 const memoryRow = document.createElement('tr');
                 memoryRow.className = 'process-memory';
+
+                const renderItem = (label, val, style = "") => {
+                    if (!val || val === "0" || val === 0 || val === "N/A") return "";
+                    let displayVal = typeof val === 'number' ? formatMemory(val) : val;
+                    return `<div class="memory-item" style="${style}"><span class="memory-label">${label}:</span><span class="memory-value">${displayVal}</span></div>`;
+                };
+
+                const m = process.mem_info || {};
                 memoryRow.innerHTML = `
                        <td colspan="4">
                            <div class="memory-details" style="grid-template-columns: repeat(4, 1fr); padding: 15px; background: #fdfdfd; border: 1px solid #eee; border-radius: 8px; margin: 5px 20px 15px 20px;">
-                               <div class="memory-item"><span class="memory-label">PSS:</span><span class="memory-value" style="color: var(--primary); font-weight: bold;">${process.mem_info ? formatMemory(process.mem_info.pss) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">RSS:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.rss) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">Anon:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.anon) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">File:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.file) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">PSS:</span><span class="memory-value" style="color: var(--primary); font-weight: bold;">${formatMemory(m.pss || 0)}</span></div>
+                               <div class="memory-item"><span class="memory-label">RSS:</span><span class="memory-value">${formatMemory(m.rss || 0)}</span></div>
+                               <div class="memory-item"><span class="memory-label">Anon:</span><span class="memory-value">${formatMemory(m.anon || 0)}</span></div>
+                               <div class="memory-item"><span class="memory-label">File:</span><span class="memory-value">${formatMemory(m.file || 0)}</span></div>
                                
-                               <div class="memory-item"><span class="memory-label">Referenced:</span><span class="memory-value" style="color: var(--success); font-weight: 600;">${process.mem_info ? formatMemory(process.mem_info.referenced) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">Shared:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shmem) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">PTE Tables:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.pagetables) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">Kernel Stk:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.kernel_stack) : 'N/A'}</span></div>
+                               <div class="memory-item"><span class="memory-label">Referenced:</span><span class="memory-value" style="color: var(--success); font-weight: 600;">${formatMemory(m.referenced || 0)}</span></div>
+                               ${renderItem("Shared", m.shmem)}
+                               ${renderItem("PTE Tables", m.pagetables)}
+                               ${renderItem("Kernel Stk", m.kernel_stack)}
                                
-                               <div class="memory-item"><span class="memory-label">Priv Dirty:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.private_dirty) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">Priv Clean:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.private_clean) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">Shr Dirty:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shared_dirty) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">Shr Clean:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.shared_clean) : 'N/A'}</span></div>
+                               ${renderItem("Priv Dirty", m.private_dirty)}
+                               ${renderItem("Priv Clean", m.private_clean)}
+                               ${renderItem("Shr Dirty", m.shared_dirty)}
+                               ${renderItem("Shr Clean", m.shared_clean)}
                                
-                               <div class="memory-item"><span class="memory-label">Swap:</span><span class="memory-value" style="color: var(--danger);">${process.mem_info ? formatMemory(process.mem_info.swap) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">HugeTLB:</span><span class="memory-value">${process.mem_info ? formatMemory(process.mem_info.hugetlb) : 'N/A'}</span></div>
-                               <div class="memory-item"><span class="memory-label">Faults:</span><span class="memory-value">${process.mem_info ? (process.mem_info.pgfault - process.mem_info.pgmajfault) : '0'} / ${process.mem_info ? process.mem_info.pgmajfault : '0'}</span></div>
-                               <div class="memory-item" style="font-size: 0.75em; color: var(--gray); display: flex; align-items: center;">(Minor / Major)</div>
+                               ${renderItem("Swap", m.swap, "color: var(--danger);")}
+                               ${renderItem("HugeTLB", m.hugetlb)}
+                               <div class="memory-item"><span class="memory-label">Faults:</span><span class="memory-value">${(m.pgfault || 0) - (m.pgmajfault || 0)} / ${m.pgmajfault || 0}</span></div>
+                               
+                               <!-- Extra CGroup fields -->
+                               ${renderItem("Active Anon", m.active_anon)}
+                               ${renderItem("Inactive Anon", m.inactive_anon)}
+                               ${renderItem("Active File", m.active_file)}
+                               ${renderItem("Inactive File", m.inactive_file)}
+                               
+                               ${renderItem("Kernel", m.kernel)}
+                               ${renderItem("File Mapped", m.file_mapped)}
+                               ${renderItem("File Dirty", m.file_dirty)}
+                               ${renderItem("File WB", m.file_writeback)}
+                               
+                               ${renderItem("Refault Anon", m.workingset_refault_anon)}
+                               ${renderItem("Refault File", m.workingset_refault_file)}
+                               ${renderItem("Current", m.memory_current)}
+                               ${renderItem("Limit", m.memory_high)}
+
                                <div class="memory-item" style="grid-column: 1 / -1; margin-top: 8px; padding-top: 8px; border-top: 1px dashed #eee;">
                                    <span class="memory-label" style="display: block; margin-bottom: 4px;">Command Line:</span>
                                    <div class="memory-value" style="word-break: break-all; white-space: normal; font-size: 0.9em; background: #f8f9fa; padding: 6px; border-radius: 4px;">${process.cmdline || 'N/A'}</div>
@@ -902,6 +878,7 @@
                 .then(data => {
                     updateProcessList(data);
                     addLogEntry(`Refreshed process list with ${Object.keys(data).length} processes`, 'success');
+                    timeLeft = refreshInterval;
                 })
                 .catch(error => {
                     addLogEntry(`Failed to refresh processes: ${error.message}`, 'error');
@@ -920,10 +897,27 @@
         }
 
         // Event listeners
-        connectButton.addEventListener('click', connectWebSocket);
         refreshButton.addEventListener('click', refreshProcesses);
         clearLogButton.addEventListener('click', clearLog);
         searchBox.addEventListener('input', handleSearch);
+
+        // Add keyboard shortcut for refresh
+        document.addEventListener('keydown', (event) => {
+            if ((event.key === 'r' || event.key === 'R') &&
+                event.target.tagName !== 'INPUT' &&
+                event.target.tagName !== 'TEXTAREA') {
+                refreshProcesses();
+            }
+        });
+
+        setInterval(() => {
+            if (isPaused) return;
+            timeLeft--;
+            if (timeLeft <= 0) {
+                refreshProcesses();
+            }
+            refreshTimerEl.textContent = timeLeft + 's';
+        }, 1000);
 
         // Initial refresh
         const urlParams = new URLSearchParams(window.location.search);
@@ -932,7 +926,6 @@
             searchBox.value = searchParam;
         }
         refreshProcesses();
-        connectWebSocket();
 
         setTimeout(() => {
             addLogEntry('PMOND web interface loaded successfully', 'success');

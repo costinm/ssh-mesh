@@ -122,10 +122,151 @@ pub struct ProcMemInfo {
     pub workingset_restore_file: u64,
     /// Workingset node reclaim. Cgroup: memory.stat (workingset_nodereclaim).
     pub workingset_nodereclaim: u64,
-    /// Current cgroup memory usage. Cgroup: memory.current.
+    /// Current cgroup memory current usage. Cgroup: memory.current.
     pub memory_current: Option<u64>,
     /// Cgroup memory high limit. Cgroup: memory.high.
     pub memory_high: Option<String>,
+}
+
+impl ProcMemInfo {
+    /// Merge fields from another ProcMemInfo if they are zero or None in this one.
+    pub fn merge(&mut self, other: &ProcMemInfo) {
+        if self.pss == 0 {
+            self.pss = other.pss;
+        }
+        if self.anon == 0 {
+            self.anon = other.anon;
+        }
+        if self.file == 0 {
+            self.file = other.file;
+        }
+        if self.kernel_stack == 0 {
+            self.kernel_stack = other.kernel_stack;
+        }
+        if self.pagetables == 0 {
+            self.pagetables = other.pagetables;
+        }
+        if self.shmem == 0 {
+            self.shmem = other.shmem;
+        }
+        if self.pgfault == 0 {
+            self.pgfault = other.pgfault;
+        }
+        if self.pgmajfault == 0 {
+            self.pgmajfault = other.pgmajfault;
+        }
+        if self.rss == 0 {
+            self.rss = other.rss;
+        }
+        if self.private_clean == 0 {
+            self.private_clean = other.private_clean;
+        }
+        if self.private_dirty == 0 {
+            self.private_dirty = other.private_dirty;
+        }
+        if self.shared_clean == 0 {
+            self.shared_clean = other.shared_clean;
+        }
+        if self.shared_dirty == 0 {
+            self.shared_dirty = other.shared_dirty;
+        }
+        if self.referenced == 0 {
+            self.referenced = other.referenced;
+        }
+        if self.swap == 0 {
+            self.swap = other.swap;
+        }
+        if self.hugetlb == 0 {
+            self.hugetlb = other.hugetlb;
+        }
+        if self.kernel == 0 {
+            self.kernel = other.kernel;
+        }
+        if self.file_mapped == 0 {
+            self.file_mapped = other.file_mapped;
+        }
+        if self.file_dirty == 0 {
+            self.file_dirty = other.file_dirty;
+        }
+        if self.file_writeback == 0 {
+            self.file_writeback = other.file_writeback;
+        }
+        if self.swapcached == 0 {
+            self.swapcached = other.swapcached;
+        }
+        if self.pgrefill == 0 {
+            self.pgrefill = other.pgrefill;
+        }
+        if self.pgactivate == 0 {
+            self.pgactivate = other.pgactivate;
+        }
+        if self.pgdeactivate == 0 {
+            self.pgdeactivate = other.pgdeactivate;
+        }
+        if self.pswpin == 0 {
+            self.pswpin = other.pswpin;
+        }
+        if self.pswpout == 0 {
+            self.pswpout = other.pswpout;
+        }
+        if self.pgsteal == 0 {
+            self.pgsteal = other.pgsteal;
+        }
+        if self.pgscan == 0 {
+            self.pgscan = other.pgscan;
+        }
+        if self.pgdemote_kswapd == 0 {
+            self.pgdemote_kswapd = other.pgdemote_kswapd;
+        }
+        if self.pgdemote_direct == 0 {
+            self.pgdemote_direct = other.pgdemote_direct;
+        }
+        if self.pgdemote_khugepaged == 0 {
+            self.pgdemote_khugepaged = other.pgdemote_khugepaged;
+        }
+        if self.pgdemote_proactive == 0 {
+            self.pgdemote_proactive = other.pgdemote_proactive;
+        }
+        if self.active_anon == 0 {
+            self.active_anon = other.active_anon;
+        }
+        if self.active_file == 0 {
+            self.active_file = other.active_file;
+        }
+        if self.inactive_anon == 0 {
+            self.inactive_anon = other.inactive_anon;
+        }
+        if self.inactive_file == 0 {
+            self.inactive_file = other.inactive_file;
+        }
+        if self.workingset_refault_anon == 0 {
+            self.workingset_refault_anon = other.workingset_refault_anon;
+        }
+        if self.workingset_refault_file == 0 {
+            self.workingset_refault_file = other.workingset_refault_file;
+        }
+        if self.workingset_activate_anon == 0 {
+            self.workingset_activate_anon = other.workingset_activate_anon;
+        }
+        if self.workingset_activate_file == 0 {
+            self.workingset_activate_file = other.workingset_activate_file;
+        }
+        if self.workingset_restore_anon == 0 {
+            self.workingset_restore_anon = other.workingset_restore_anon;
+        }
+        if self.workingset_restore_file == 0 {
+            self.workingset_restore_file = other.workingset_restore_file;
+        }
+        if self.workingset_nodereclaim == 0 {
+            self.workingset_nodereclaim = other.workingset_nodereclaim;
+        }
+        if self.memory_current.is_none() {
+            self.memory_current = other.memory_current;
+        }
+        if self.memory_high.is_none() {
+            self.memory_high = other.memory_high.clone();
+        }
+    }
 }
 
 /// Read process information from /proc/[pid]/stat (static version for global access)
@@ -335,6 +476,15 @@ pub fn read_memory_info(pid: u32) -> Option<ProcMemInfo> {
     }
 
     if found_any {
+        // Check if process has a dedicated cgroup (-PID.scope)
+        if let Some(cg_path) = read_cgroup_path(pid) {
+            let expected_suffix = format!("-{}.scope", pid);
+            if cg_path.ends_with(&expected_suffix) {
+                if let Ok(cg_info) = parse_memory_stats(&cg_path) {
+                    mem_info.merge(&cg_info);
+                }
+            }
+        }
         Some(mem_info)
     } else {
         None
