@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -42,6 +43,10 @@ struct Args {
     /// Refresh interval in seconds for server mode (default: 10)
     #[clap(long = "refresh", default_value = "10", value_name = "SECONDS")]
     refresh: u64,
+
+    /// Run MCP via UDS at the specified path
+    #[clap(long = "mcp-uds", value_name = "PATH")]
+    mcp_uds: Option<String>,
 }
 
 use tracing_subscriber::layer::SubscriberExt;
@@ -99,8 +104,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Authorized UID for MCP UDS
+    let auth_uid = std::env::var("MCP_AUTHORIZED_UID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+
     // Default server mode
-    run_server(args.refresh).await?;
+    run_server(args.refresh, args.mcp_uds, auth_uid).await?;
 
     Ok(())
 }
@@ -211,10 +221,14 @@ async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     proc_mon.start(true, true)?;
     start_monitoring(proc_mon.clone());
 
-    pmond::mcp::run_stdio_server(proc_mon).await
+    pmond::handlers::run_stdio_server(proc_mon).await
 }
 
-async fn run_server(refresh: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(
+    refresh: u64,
+    mcp_uds: Option<String>,
+    auth_uid: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting PMON process monitor");
 
     // Create a new ProcMon instance
@@ -226,6 +240,31 @@ async fn run_server(refresh: u64) -> Result<(), Box<dyn std::error::Error>> {
     start_monitoring(proc_mon.clone());
 
     info!("PMON process monitor started successfully");
+
+    // Start UDS MCP server
+    let path_str = if let Some(path) = mcp_uds {
+        path
+    } else {
+        // Default to /run/user/<uid>/pmond.sock
+        let uid = unsafe { libc::getuid() };
+        format!("/run/user/{}/pmond.sock", uid)
+    };
+
+    let pm = proc_mon.clone();
+    tokio::spawn(async move {
+        // Ensure parent directory exists if using default path or custom path
+        let path = PathBuf::from(&path_str);
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                // Try to create it, but don't fail if we can't (might just work if existing)
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        
+        if let Err(e) = pmond::handlers::run_uds_server(pm, &path_str, auth_uid).await {
+            error!("MCP UDS server error: {}", e);
+        }
+    });
 
     // Create a new WebSocket server
     let ws_server = Arc::new(WSServer::new());

@@ -124,7 +124,7 @@ impl PsiWatcher {
     /// Remove a process from the watch list
     #[instrument(skip(self), fields(pid = pid))]
     pub fn remove_pid(&self, pid: u32) {
-        debug!("Removing process {} from PSI watcher", pid);
+        trace!("Removing process {} from PSI watcher", pid);
         let mut terminated_pids = self.terminated_pids.lock().unwrap();
         terminated_pids.push(pid);
         if let Some(waker) = self.waker.lock().unwrap().as_ref() {
@@ -132,7 +132,7 @@ impl PsiWatcher {
                 error!("Failed to wake PSI watcher for PID {}: {}", pid, e);
             }
         }
-        info!("Process {} removed from PSI watcher", pid);
+        trace!("Process {} removed from PSI watcher", pid);
     }
 
     /// Start the PSI monitoring thread
