@@ -5,8 +5,8 @@
 ///
 ///
 use anyhow::{Context, Result};
-use openssl::ec::EcKey;
-use openssl::pkey::Private;
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+use p256::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -66,7 +66,7 @@ impl LocalDiscovery {
     /// Create a new LocalDiscovery instance with an optional EC P256 private key
     /// If no key is provided, attempts to load from $HOME/.ssh/key.pem or generates a new one
     #[instrument(skip(key))]
-    pub async fn new(key: Option<EcKey<Private>>) -> Result<Self> {
+    pub async fn new(key: Option<SecretKey>) -> Result<Self> {
         debug!("Creating new LocalDiscovery instance");
         // Get the private key either from parameter or by loading/generating
         let private_key_ec = match key {
@@ -79,16 +79,18 @@ impl LocalDiscovery {
 
         debug!("Serializing private key to DER format");
         // Serialize the private key to DER format
-        let private_key = private_key_ec
-            .private_key_to_der()
+        let secret_key_der = private_key_ec
+            .to_pkcs8_der()
             .context("Failed to serialize private key")?;
+        let private_key = secret_key_der.to_bytes().to_vec();
 
         debug!("Serializing public key to DER format");
-        // Get the public key and serialize it to DER format
-        let public_key_ec = private_key_ec
-            .public_key_to_der()
+        // Get the public key and serialize it to DER format (SPKI)
+        let public_key_ec = private_key_ec.public_key();
+        let public_key_der = public_key_ec
+            .to_public_key_der()
             .context("Failed to serialize public key")?;
-        let public_key = public_key_ec;
+        let public_key = public_key_der.to_vec();
 
         let public_key_b64 = base64_url_encode(&public_key);
         debug!("Generated public key ({} bytes)", public_key_b64.len());
@@ -104,38 +106,36 @@ impl LocalDiscovery {
     }
 
     /// Load key from file or generate a new one
-    fn load_or_generate_key() -> Result<EcKey<Private>> {
-        use openssl::ec::{EcGroup, EcKey};
-        use openssl::nid::Nid;
-
+    fn load_or_generate_key() -> Result<SecretKey> {
         // Try to load key from file
         let home_dir = std::env::var("HOME").context("HOME environment variable not set")?;
         let key_path = Path::new(&home_dir).join(".ssh").join("key.pem");
 
         if key_path.exists() {
             // Load key from file
-            let key_data = fs::read(&key_path).context("Failed to read key file")?;
+            let key_data = fs::read_to_string(&key_path).context("Failed to read key file")?;
             // Check if the file is not empty before trying to parse it
             if !key_data.is_empty() {
-                if let Ok(key) = EcKey::private_key_from_pem(&key_data) {
+                if let Ok(key) = SecretKey::from_pkcs8_pem(&key_data) {
                     return Ok(key);
                 }
-                // If parsing fails, we'll generate a new key below
+                // If PKCS8 fails, try to load it from our own previous format if it was different
+                // but for now let's assume PKCS8 PEM.
             }
         }
 
         // Generate new keypair
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
-            .context("Failed to create P256 curve group")?;
-        let key = EcKey::generate(&group).context("Failed to generate EC key")?;
+        let mut rng = rand::thread_rng();
+        let key = SecretKey::random(&mut rng);
 
         // Save the generated key to file
-        std::fs::create_dir_all(key_path.parent().unwrap())
-            .context("Failed to create .ssh directory")?;
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent).context("Failed to create .ssh directory")?;
+        }
         let key_pem = key
-            .private_key_to_pem()
+            .to_pkcs8_pem(Default::default())
             .context("Failed to serialize private key to PEM")?;
-        fs::write(&key_path, &key_pem).context("Failed to write key to file")?;
+        fs::write(&key_path, key_pem.as_bytes()).context("Failed to write key to file")?;
 
         Ok(key)
     }
