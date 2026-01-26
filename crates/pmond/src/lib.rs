@@ -51,6 +51,7 @@ pub struct ProcMemInfo {
     /// Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon).
     pub anon: u64,
     /// File-backed memory. Process: Derived (rss - anon) or status (RssFile). Cgroup: memory.stat (file).
+    /// statm[3] is file + shmem
     pub file: u64,
     /// Kernel stack memory. Process: status (VmStk). Cgroup: memory.stat (kernel_stack).
     pub kernel_stack: u64,
@@ -64,9 +65,11 @@ pub struct ProcMemInfo {
     pub pgmajfault: u64,
 
     // --- Process Only Fields ---
+    // VmExec - exec size - statm[4]
+
     /// Proportional Set Size. Process: smaps_rollup (Pss). Cgroup: N/A.
     pub pss: u64,
-    /// Total Resident Set Size. Process: smaps_rollup (Rss), status (VmRSS), or statm. Cgroup: N/A (see memory_current).
+    /// Total Resident Set Size. Process: smaps_rollup (Rss), status (VmRSS), or statm[2]. Cgroup: N/A (see memory_current).
     pub rss: u64,
     /// Private clean pages. Process: smaps_rollup (Private_Clean). Cgroup: N/A.
     pub private_clean: u64,
@@ -612,14 +615,24 @@ pub fn parse_memory_stats(cgroup_path: &str) -> Result<ProcMemInfo, Box<dyn std:
 
 /// Reset process references (PSS, soft-dirty, etc) via /proc/[pid]/clear_refs
 /// Values:
-/// 1: reset PSS, soft-dirty, etc
-/// 2: reset whole process
-/// 3: reset anon
-/// 4: reset file
-/// 5: reset PSS only
+/// 1: reset referenced
+/// 2: reset anonymous memory pages only
+/// 3: reset file backed
+/// 4: reset dirty (find how many pages are written to)
+/// 5: reset 'peak memory'
+/// 6: reset huge pages
+/// 7: all of the above.
 pub fn clear_process_refs(pid: u32, value: &str) -> std::io::Result<()> {
     let path = format!("/proc/{}/clear_refs", pid);
-    std::fs::write(path, value)
+    if value.eq("7") {
+        std::fs::write(path.clone(), "1")?;
+        std::fs::write(path.clone(), "2")?;
+        std::fs::write(path.clone(), "3")?;
+        std::fs::write(path.clone(), "4")?;
+        std::fs::write(path, "5")
+    } else {
+        std::fs::write(path, value)
+    }
 }
 
 #[cfg(test)]

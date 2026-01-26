@@ -1,0 +1,13 @@
+target
+.git
+.idea
+.vscode
+*.txt
+*.md
+tmp
+testdata
+old
+manifests
+docs
+notes
+etc
