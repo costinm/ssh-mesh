@@ -2,11 +2,9 @@
 pub mod test_utils;
 
 use anyhow::Context as AnyhowContext;
-use axum::{body::Body, extract::State, response::IntoResponse};
-use bytes::Buf;
-use http_body_util::BodyExt;
+// use axum::Json;
 use hyper::body::Bytes;
-use hyper::{Request, Response};
+// use hyper::{Request, Response};
 use log::{error, info};
 use nix::libc::{ioctl, TIOCSCTTY};
 use nix::unistd::{dup2, setsid};
@@ -30,12 +28,12 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
-use tokio_stream::StreamExt;
-use tracing::{debug, error as tracing_error, instrument, trace};
+// use tokio_stream::StreamExt;
+use tracing::{debug, instrument, trace};
 
 // use pmond::ProcMon;
 use ws::WSServer;
@@ -1932,4 +1930,38 @@ fn parse_authorized_cas_content(content: &str) -> Result<Vec<ssh_key::PublicKey>
     }
 
     Ok(ca_keys)
+}
+
+/// Executes a command as a specific user.
+/// Defaults to UID 1000 if EXEC_USER is not set.
+pub fn run_exec_command(args: Vec<String>) -> Result<(), anyhow::Error> {
+    let exec_user = env::var("EXEC_USER").unwrap_or_else(|_| "1000".to_string());
+    let uid_val: u32 = exec_user.parse().context("Invalid EXEC_USER")?;
+
+    info!("Executing command as user {}: {:?}", uid_val, args);
+
+    #[cfg(unix)]
+    {
+        use nix::unistd::{setuid, Uid};
+        // Drop privileges to the target user
+        setuid(Uid::from_raw(uid_val)).context("Failed to setuid - make sure you're running as root if you want to change users")?;
+    }
+
+    let mut child = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .spawn()
+        .context("Failed to spawn command")?;
+
+    let status = child.wait().context("Failed to wait for command")?;
+
+    if !status.success() {
+        error!("Command exited with status: {:?}", status);
+        if let Some(code) = status.code() {
+            std::process::exit(code);
+        } else {
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
 }

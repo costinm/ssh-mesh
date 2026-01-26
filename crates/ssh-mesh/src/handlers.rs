@@ -1,10 +1,10 @@
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::State,
     http::StatusCode,
     response::{Html, IntoResponse, Json},
     routing::{any, delete, get, post},
-    Json as AxumJson, Router,
+    Router,
 };
 use bytes::{Buf, Bytes};
 use http_body_util::BodyExt;
@@ -17,8 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
+use russh::server::Server;
 
-use crate::{AppState, SshServer};
+use crate::AppState;
 
 pub fn app(app_state: AppState) -> Router {
     Router::new()

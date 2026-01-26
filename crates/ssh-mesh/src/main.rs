@@ -42,6 +42,14 @@ fn get_local_ip() -> Option<String> {
 async fn main() -> Result<(), anyhow::Error> {
     init_telemetry();
 
+    // Check for command line arguments (excluding $0)
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        // If args exist, execute them as a command and exit
+        ssh_mesh::run_exec_command(args[1..].to_vec())?;
+        return Ok(());
+    }
+
     let main_span = tracing::info_span!("main");
     let _main_guard = main_span.enter();
 
