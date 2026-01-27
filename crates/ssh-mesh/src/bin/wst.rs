@@ -13,7 +13,10 @@ use url::Url;
 /// For testing:
 ///  `ssh -o ProxyCommand="wst ws://localhost:15028/_ssh %h"  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@host`
 
-async fn handle_stdio(url_str: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_stdio(
+    url_str: &str,
+    token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = if url_str.contains("://") {
         Url::parse(url_str)?
     } else {
@@ -24,7 +27,7 @@ async fn handle_stdio(url_str: &str) -> Result<(), Box<dyn std::error::Error + S
         .uri(url.as_str())
         .header("Host", url.host_str().unwrap_or("localhost"));
 
-    if let Ok(token) = env::var("TUN_TOKEN") {
+    if let Some(token) = token {
         request = request.header("Authorization", format!("Bearer {}", token));
     }
 
@@ -110,7 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         process::exit(1);
     }
 
-    handle_stdio(&args[1]).await?;
+    let token = env::var("TUN_TOKEN").ok();
+    handle_stdio(&args[1], token).await?;
 
     Ok(())
 }

@@ -29,7 +29,10 @@ use tokio::sync::mpsc;
 /// Stripped binary size should be 17 -> ~1.5M
 /// Tracing is 10M -> 1.5M
 
-async fn handle_stdio(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_stdio(
+    url: &str,
+    token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create HTTP client
     let mut https_connector = HttpConnector::new();
     https_connector.enforce_http(false);
@@ -61,7 +64,7 @@ async fn handle_stdio(url: &str) -> Result<(), Box<dyn std::error::Error + Send 
         .uri(&uri)
         .header("x-host", "localhost:15022"); // TODO: Make configurable
 
-    if let Ok(token) = env::var("TUN_TOKEN") {
+    if let Some(token) = token {
         req_builder = req_builder.header("authorization", format!("Bearer {}", token));
     }
 
@@ -133,7 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         process::exit(1);
     }
 
-    handle_stdio(&args[1]).await?;
+    let token = env::var("TUN_TOKEN").ok();
+    handle_stdio(&args[1], token).await?;
 
     Ok(())
 }

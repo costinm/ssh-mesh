@@ -1591,7 +1591,6 @@ pub async fn run_ssh_server(
 // TODO: add pmon, ws methods into the app
 // TODO: add monitoring from ws create.
 
-
 // ============================================================================
 // SSH CA Management Functions
 // ============================================================================
@@ -1729,23 +1728,6 @@ mod tests {
     use tempfile;
 
     #[test]
-    fn test_get_port_from_env() {
-        // Test with default value
-        let default_port = 1234;
-        let random_var = "NONEXISTENT_VAR";
-        assert_eq!(get_port_from_env(random_var, default_port), default_port);
-
-        // Test with environment variable set
-        let test_port = 5678;
-        let test_var = "TEST_PORT";
-        std::env::set_var(test_var, test_port.to_string());
-        assert_eq!(get_port_from_env(test_var, default_port), test_port);
-
-        // Cleanup
-        std::env::remove_var(test_var);
-    }
-
-    #[test]
     fn test_ssh_server_creation() {
         let base_dir = env::var("HOME")
             .map(PathBuf::from)
@@ -1792,15 +1774,6 @@ mod tests {
             "Keys should be identical after reload"
         );
     }
-}
-
-/// Function to get port from environment variable or use default
-/// Helper for main.
-pub fn get_port_from_env(var_name: &str, default: u16) -> u16 {
-    std::env::var(var_name)
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(default)
 }
 
 /// Load authorized public keys from baseDir/.ssh/authorized_keys
@@ -1932,11 +1905,16 @@ fn parse_authorized_cas_content(content: &str) -> Result<Vec<ssh_key::PublicKey>
     Ok(ca_keys)
 }
 
+/// Configuration for executing a command.
+pub struct ExecConfig {
+    pub args: Vec<String>,
+    pub uid: u32,
+}
+
 /// Executes a command as a specific user.
-/// Defaults to UID 1000 if EXEC_USER is not set.
-pub fn run_exec_command(args: Vec<String>) -> Result<(), anyhow::Error> {
-    let exec_user = env::var("EXEC_USER").unwrap_or_else(|_| "1000".to_string());
-    let uid_val: u32 = exec_user.parse().context("Invalid EXEC_USER")?;
+pub fn run_exec_command(config: ExecConfig) -> Result<(), anyhow::Error> {
+    let uid_val = config.uid;
+    let args = config.args;
 
     info!("Executing command as user {}: {:?}", uid_val, args);
 
@@ -1944,7 +1922,9 @@ pub fn run_exec_command(args: Vec<String>) -> Result<(), anyhow::Error> {
     {
         use nix::unistd::{setuid, Uid};
         // Drop privileges to the target user
-        setuid(Uid::from_raw(uid_val)).context("Failed to setuid - make sure you're running as root if you want to change users")?;
+        setuid(Uid::from_raw(uid_val)).context(
+            "Failed to setuid - make sure you're running as root if you want to change users",
+        )?;
     }
 
     let mut child = std::process::Command::new(&args[0])

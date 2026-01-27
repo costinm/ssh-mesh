@@ -550,9 +550,6 @@
                     <span id="refresh-timer" style="font-weight: 600;">5s</span>
                     <span id="paused-label" style="display: inline; font-weight: 600; margin-left: 8px;">(PAUSED)</span>
                 </div>
-                <div class="status-item">
-                    <span class="process-count">Processes: <span id="process-count">0</span></span>
-                </div>
             </div>
         </header>
 
@@ -586,8 +583,12 @@
                         <span class="stat-value" id="total-rss">0</span>
                     </div>
                     <div class="stat-item">
-                        <span class="stat-label">Refresh Interval</span>
-                        <span class="stat-value">5s</span>
+                        <span class="stat-label">Total Anon</span>
+                        <span class="stat-value" id="total-anon">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Total File</span>
+                        <span class="stat-value" id="total-file">0</span>
                     </div>
                 </div>
                 <div class="card-body">
@@ -640,7 +641,6 @@
 
         // DOM elements
         const processTableBody = document.getElementById('process-table-body');
-        const processCountElement = document.getElementById('process-count');
         const totalProcessesElement = document.getElementById('total-processes');
         const statusBar = document.getElementById('status-bar');
         const pausedLabel = document.getElementById('paused-label');
@@ -697,7 +697,7 @@
         }
 
         // Clear process memory references (PSS, etc)
-        function clearRefs(pid, value = '5') {
+        function clearRefs(pid, value = '7') {
             fetch('/_clear_refs', {
                 method: 'POST',
                 headers: {
@@ -753,21 +753,26 @@
                 });
 
             const sortedProcessArray = sortedProcesses.map(([pid, process]) => ({ pid, process }));
-            processCountElement.textContent = sortedProcessArray.length;
             totalProcessesElement.textContent = Object.keys(processes).length;
 
             let totalPss = 0;
             let totalRss = 0;
+            let totalAnon = 0;
+            let totalFile = 0;
             for (const pid in processes) {
                 const process = processes[pid];
                 if (process.mem_info) {
                     totalPss += process.mem_info.pss || 0;
                     totalRss += process.mem_info.rss || 0;
+                    totalAnon += process.mem_info.anon || 0;
+                    totalFile += process.mem_info.file || 0;
                 }
             }
 
             document.getElementById('total-pss').textContent = formatMemory(totalPss);
             document.getElementById('total-rss').textContent = formatMemory(totalRss);
+            document.getElementById('total-anon').textContent = formatMemory(totalAnon);
+            document.getElementById('total-file').textContent = formatMemory(totalFile);
 
             processTableBody.innerHTML = '';
 
