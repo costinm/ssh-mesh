@@ -28,7 +28,6 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -44,6 +43,7 @@ const AUTHORIZED_CAS_PATH: &str = ".ssh/authorized_cas";
 const DEBUG_PTY: bool = false;
 
 pub mod handlers;
+pub mod utils;
 
 // Configuration for the SSH server
 #[derive(Clone)]
@@ -75,6 +75,7 @@ pub struct AppState {
     pub ssh_server: Arc<SshServer>,
     //pub proc_mon: Arc<ProcMon>,
     pub ws_server: Arc<WSServer>,
+    pub target_http_address: Option<String>,
 }
 
 // TODO: move the env vars to main
@@ -538,7 +539,7 @@ impl server::Handler for SshHandler {
                     trace!("Successfully connected to target {}:{}", host, port);
 
                     // Set up bidirectional data forwarding between SSH channel and TCP connection
-                    let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
+                    let (tcp_reader, tcp_writer) = tcp_stream.into_split();
                     let channel_id = channel_id;
 
                     // Store the TCP writer for SSH to TCP forwarding
@@ -549,72 +550,25 @@ impl server::Handler for SshHandler {
                         writers.insert(channel_id, tx);
                     }
 
-                    // Spawn task to forward data from TCP to SSH channel
+                    // Spawn task to forward data from TCP -> SSH channel
                     let session_handle_clone = session_handle.clone();
                     let tcp_writers_clone = tcp_writers.clone();
                     tokio::spawn(async move {
-                        let mut buffer = [0; 8192];
-                        loop {
-                            match tcp_reader.read(&mut buffer).await {
-                                Ok(0) => {
-                                    // EOF - connection closed
-                                    trace!("TCP connection closed for channel {:?}", channel_id);
-                                    break;
-                                }
-                                Ok(n) => {
-                                    info!("TCP forwarding got {}", n);
-                                    // Forward data to SSH channel
-                                    if let Err(e) = session_handle_clone
-                                        .data(channel_id, (&buffer[..n]).into())
-                                        .await
-                                    {
-                                        error!(
-                                            "Failed to send data to SSH channel {:?}: {:?}",
-                                            channel_id, e
-                                        );
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to read from TCP connection for channel {:?}: {}",
-                                        channel_id, e
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        // Close the channel when TCP connection closes
-                        let _ = session_handle_clone.close(channel_id).await;
-
-                        // Clean up the TCP writer
+                        crate::utils::pipe_read_to_ssh(
+                            tcp_reader,
+                            session_handle_clone,
+                            channel_id,
+                            "TCP to SSH",
+                        )
+                        .await;
                         let mut writers = tcp_writers_clone.lock().await;
                         writers.remove(&channel_id);
                     });
 
-                    // Spawn task to forward data from SSH channel to TCP connection
+                    // Spawn task to forward data from SSH channel -> TCP connection
                     let tcp_writers_clone2 = tcp_writers.clone();
                     tokio::spawn(async move {
-                        let mut rx = rx;
-                        let mut tcp_writer = tcp_writer;
-                        while let Some(data) = rx.recv().await {
-                            info!("SSHd received data from target server");
-                            if let Err(e) = tcp_writer.write_all(&data).await {
-                                error!(
-                                    "Failed to write to TCP connection for channel {:?}: {}",
-                                    channel_id, e
-                                );
-                                break;
-                            }
-                            if let Err(e) = tcp_writer.flush().await {
-                                error!(
-                                    "Failed to write to TCP connection for channel {:?}: {}",
-                                    channel_id, e
-                                );
-                                break;
-                            }
-                        }
-                        // Clean up the TCP writer
+                        crate::utils::pipe_rx_to_write(rx, tcp_writer, "SSH to TCP").await;
                         let mut writers = tcp_writers_clone2.lock().await;
                         writers.remove(&channel_id);
                     });
@@ -869,8 +823,8 @@ impl server::Handler for SshHandler {
                 let master_read_file = unsafe { std::fs::File::from_raw_fd(master_fd_read) };
                 let master_write_file = unsafe { std::fs::File::from_raw_fd(master_fd_write) };
 
-                let mut master_read = tokio::fs::File::from_std(master_read_file);
-                let mut master_write = tokio::fs::File::from_std(master_write_file);
+                let master_read = tokio::fs::File::from_std(master_read_file);
+                let master_write = tokio::fs::File::from_std(master_write_file);
                 drop(slave);
 
                 // Get a handle to the SSH channel for sending data back.
@@ -878,81 +832,27 @@ impl server::Handler for SshHandler {
                 let ch_id = channel_id;
                 // Spawn task that reads from PTY and writes to the SSH client.
                 tokio::spawn(async move {
-                    trace!("Starting PTY to SSH reader task for channel {:?}", ch_id);
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match master_read.read(&mut buf).await {
-                            Ok(0) => {
-                                // EOF - connection closed
-                                trace!("PTY closed (EOF) for channel {:?}", ch_id);
-                                let _ = session_handle.close(ch_id).await;
-                                break;
-                            }
-                            Ok(n) => {
-                                trace!("Read {} bytes from PTY", n);
-                                if session_handle
-                                    .data(ch_id, (&buf[..n]).into())
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(e)
-                                if e.kind() == std::io::ErrorKind::Other
-                                    || e.raw_os_error() == Some(5) =>
-                            {
-                                // EIO (error 5) happens when the PTY slave closes (shell exits)
-                                // This is expected and not an error condition
-                                trace!("PTY closed for channel {:?}", ch_id);
-                                let _ = session_handle.close(ch_id).await;
-                                break;
-                            }
-                            Err(e) => {
-                                error!("Error reading PTY for channel {:?}: {}", ch_id, e);
-                                break;
-                            }
-                        }
-                    }
-                    trace!("PTY reader task ended for channel {:?}", ch_id);
+                    crate::utils::pipe_read_to_ssh(
+                        master_read,
+                        session_handle,
+                        ch_id,
+                        "PTY to SSH",
+                    )
+                    .await;
                 });
 
                 // Now forward data from SSH client -> PTY. Store writer in the tcp_writers map so that data() can use it.
-                let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
                 {
                     let mut writers = tcp_writers.lock().await;
                     writers.insert(ch_id, tx);
                 }
                 // Spawn a task that consumes data from the channel (via the writer) and writes to the PTY master.
+                let tcp_writers_clone = tcp_writers.clone();
                 tokio::spawn(async move {
-                    info!(
-                        "PTY WRITER: Starting SSH to PTY writer task for channel {:?}",
-                        ch_id
-                    );
-                    while let Some(data) = rx.recv().await {
-                        info!(
-                            "PTY WRITER: Received from SSH, writing {} bytes to PTY: {:?}",
-                            data.len(),
-                            data
-                        );
-                        if let Err(e) = master_write.write_all(&data).await {
-                            error!(
-                                "PTY WRITER: Error writing to PTY for channel {:?}: {}",
-                                ch_id, e
-                            );
-                            break;
-                        }
-                        info!("PTY WRITER: Write successful, flushing...");
-                        if let Err(e) = master_write.flush().await {
-                            error!(
-                                "PTY WRITER: Error flushing PTY for channel {:?}: {}",
-                                ch_id, e
-                            );
-                            break;
-                        }
-                        info!("PTY WRITER: Flush successful for {} bytes", data.len());
-                    }
-                    info!("PTY WRITER: SSH to PTY task ended for channel {:?}", ch_id);
+                    crate::utils::pipe_rx_to_write(rx, master_write, "SSH to PTY").await;
+                    let mut writers = tcp_writers_clone.lock().await;
+                    writers.remove(&ch_id);
                 });
             }
 
@@ -1174,66 +1074,38 @@ impl server::Handler for SshHandler {
                                         info!("Opened forwarded-tcpip channel {:?}", channel_id);
 
                                         // Set up bidirectional data forwarding
-                                        let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
+                                        let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
                                         // Store the TCP writer for SSH to TCP forwarding
-                                        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+                                        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
                                         {
                                             let mut writers = tcp_writers_clone.lock().await;
                                             writers.insert(channel_id, tx);
                                         }
 
-                                        // Spawn task to forward data from TCP to SSH channel
+                                        // Spawn task to forward data from TCP -> SSH channel
                                         let session_handle_clone2 = session_handle_clone.clone();
                                         let tcp_writers_clone2 = tcp_writers_clone.clone();
                                         tokio::spawn(async move {
-                                            let mut buffer = [0; 8192];
-                                            loop {
-                                                match tcp_reader.read(&mut buffer).await {
-                                                    Ok(0) => {
-                                                        trace!("TCP connection closed for channel {:?}", channel_id);
-                                                        break;
-                                                    }
-                                                    Ok(n) => {
-                                                        if let Err(e) = session_handle_clone2.data(channel_id, (&buffer[..n]).into()).await {
-                                                            error!("Failed to send data to SSH channel {:?}: {:?}", channel_id, e);
-                                                            break;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        error!("Failed to read from TCP connection for channel {:?}: {}", channel_id, e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            let _ = session_handle_clone2.close(channel_id).await;
+                                            crate::utils::pipe_read_to_ssh(tcp_reader, session_handle_clone2, channel_id, "TCP forwarder to SSH").await;
                                             let mut writers = tcp_writers_clone2.lock().await;
                                             writers.remove(&channel_id);
                                         });
 
-                                        // Spawn task to forward data from SSH channel to TCP connection
+                                        // Spawn task to forward data from SSH channel -> TCP connection
                                         let tcp_writers_clone3 = tcp_writers_clone.clone();
                                         tokio::spawn(async move {
-                                            let mut tcp_writer = tcp_writer;
-                                            while let Some(data) = rx.recv().await {
-                                                if let Err(e) = tcp_writer.write_all(&data).await {
-                                                    error!("Failed to write to TCP connection for channel {:?}: {}", channel_id, e);
-                                                    break;
-                                                }
-                                            }
+                                            crate::utils::pipe_rx_to_write(rx, tcp_writer, "SSH to TCP forwarder").await;
                                             let mut writers = tcp_writers_clone3.lock().await;
                                             writers.remove(&channel_id);
                                         });
                                     });
                                 }
-                                Err(e) => {
-                                    error!("Error accepting connection: {}", e);
-                                    break;
-                                }
+                                Err(e) => error!("Failed to accept connection: {}", e),
                             }
                         }
                         _ = shutdown_rx.recv() => {
-                            info!("Stopping listener for {}:{}", bind_addr, actual_port);
+                            info!("Shutting down remote forward listener on {}:{}", bind_addr, bind_port);
                             break;
                         }
                     }
@@ -1400,95 +1272,57 @@ impl server::Handler for SshHandler {
                     .stderr(Stdio::piped());
 
                 let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
-                let mut stdin = child.stdin.take().unwrap();
-                let mut stdout = child.stdout.take().unwrap();
-                let mut stderr = child.stderr.take().unwrap();
+                let stdin = child.stdin.take().unwrap();
+                let stdout = child.stdout.take().unwrap();
+                let stderr = child.stderr.take().unwrap();
 
                 // Forward SFTP stdout -> SSH data
                 let session_handle_clone = session_handle.clone();
                 tokio::spawn(async move {
-                    debug!("SFTP stdout -> SSH reader task started");
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match stdout.read(&mut buf).await {
-                            Ok(0) => {
-                                debug!("SFTP stdout reached EOF");
-                                break;
-                            }
-                            Ok(n) => {
-                                trace!("Read {} bytes from SFTP stdout, sending to SSH", n);
-                                if session_handle_clone
-                                    .data(channel_id, (&buf[..n]).into())
-                                    .await
-                                    .is_err()
-                                {
-                                    error!("Failed to send SFTP data to SSH channel");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error reading SFTP stdout: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    debug!("SFTP stdout -> SSH reader task ended");
-                    let _ = session_handle_clone.close(channel_id).await;
+                    crate::utils::pipe_read_to_ssh(
+                        stdout,
+                        session_handle_clone,
+                        channel_id,
+                        "SFTP stdout to SSH",
+                    )
+                    .await;
                 });
 
                 // Forward SFTP stderr -> SSH extended data
                 let session_handle_clone2 = session_handle.clone();
                 tokio::spawn(async move {
-                    debug!("SFTP stderr -> SSH reader task started");
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match stderr.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if session_handle_clone2
-                                    .extended_data(channel_id, 1, (&buf[..n]).into())
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    debug!("SFTP stderr -> SSH reader task ended");
+                    crate::utils::pipe_read_to_ssh_extended(
+                        stderr,
+                        session_handle_clone2,
+                        channel_id,
+                        1,
+                        "SFTP stderr to SSH",
+                    )
+                    .await;
                 });
 
                 // Forward SSH data -> SFTP stdin
-                let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
                 {
                     let mut writers = tcp_writers.lock().await;
                     writers.insert(channel_id, tx);
                 }
 
+                let tcp_writers_clone = tcp_writers.clone();
                 tokio::spawn(async move {
-                    debug!("SSH -> SFTP stdin writer task started");
-                    while let Some(data) = rx.recv().await {
-                        trace!("Writing {} bytes to SFTP stdin", data.len());
-                        if let Err(e) = stdin.write_all(&data).await {
-                            error!("Error writing to SFTP stdin: {}", e);
-                            break;
-                        }
-                        if let Err(e) = stdin.flush().await {
-                            error!("Error flushing SFTP stdin: {}", e);
-                            break;
-                        }
-                    }
-                    debug!("SSH -> SFTP stdin writer task ended");
+                    crate::utils::pipe_rx_to_write(rx, stdin, "SSH to SFTP stdin").await;
+                    let mut writers = tcp_writers_clone.lock().await;
+                    writers.remove(&channel_id);
                 });
 
                 // Monitor child process exit
                 let session_handle_clone3 = session_handle.clone();
+                let tcp_writers_clone2 = tcp_writers.clone();
                 tokio::spawn(async move {
                     debug!("SFTP process monitor task started");
                     match child.wait().await {
                         Ok(status) => {
-                            info!("SFTP server exited with status: {:?}", status);
+                            debug!("SFTP server exited with status: {}", status);
                             let exit_code = status.code().unwrap_or(0) as u32;
                             let _ = session_handle_clone3
                                 .exit_status_request(channel_id, exit_code)
@@ -1498,9 +1332,13 @@ impl server::Handler for SshHandler {
                             error!("Error waiting for SFTP server: {}", e);
                         }
                     }
+                    let _ = session_handle_clone3.close(channel_id).await;
+
+                    // Ensure cleanup
+                    let mut writers = tcp_writers_clone2.lock().await;
+                    writers.remove(&channel_id);
                     debug!("SFTP process monitor task ended");
                 });
-
                 info!("SFTP subsystem request accepted and handlers spawned");
                 let _ = session_handle.channel_success(channel_id).await;
                 Ok(())

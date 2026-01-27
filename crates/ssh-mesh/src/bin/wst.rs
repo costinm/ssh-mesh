@@ -6,13 +6,6 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 
 /// wst is a minimal TCP tunnel over WebSockets, forwarding stdin/stdout.
-///
-/// On client - use with 'ProxyCommand':
-///   `ssh -o ProxyCommand="wst %h"  user@host`
-///
-/// For testing:
-///  `ssh -o ProxyCommand="wst ws://localhost:15028/_ssh %h"  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@host`
-
 async fn handle_stdio(
     url_str: &str,
     token: Option<String>,
@@ -23,17 +16,23 @@ async fn handle_stdio(
         Url::parse(&format!("ws://{}", url_str))?
     };
 
-    let mut request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
-        .uri(url.as_str())
-        .header("Host", url.host_str().unwrap_or("localhost"));
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url.as_str().into_client_request()?;
 
     if let Some(token) = token {
-        request = request.header("Authorization", format!("Bearer {}", token));
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
     }
 
-    let request = request.body(())?;
+    let (ws_stream, _): (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        _,
+    ) = connect_async(request).await?;
 
-    let (ws_stream, _) = connect_async(request).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let mut stdin = tokio::io::stdin();
@@ -53,10 +52,7 @@ async fn handle_stdio(
                         break;
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error reading from stdin: {}", e);
-                    break;
-                }
+                Err(_) => break,
             }
         }
         let _ = write.close().await;
@@ -82,10 +78,6 @@ async fn handle_stdio(
                     }
                 }
                 Ok(Message::Close(_)) => break,
-                Err(e) => {
-                    eprintln!("Error reading from websocket: {}", e);
-                    break;
-                }
                 _ => {}
             }
         }
@@ -101,12 +93,6 @@ async fn handle_stdio(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <URL>", args[0]);

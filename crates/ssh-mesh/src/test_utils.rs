@@ -81,6 +81,7 @@ pub async fn setup_test_environment(
             let app_state = crate::AppState {
                 ssh_server: ssh_server.clone(),
                 ws_server: std::sync::Arc::new(ws::WSServer::new()),
+                target_http_address: std::env::var("HTTP_PORT").ok(),
             };
 
             let ssh_server_clone = ssh_server.clone();

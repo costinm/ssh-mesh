@@ -62,7 +62,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Get SSH port from environment variable or use default
     let ssh_port = get_port_from_env("SSH_PORT", 15022);
-    let http_port = get_port_from_env("HTTP_PORT", 15028);
+    let http_port = get_port_from_env("LISTEN_HTTP_PORT", 15028);
 
     // Get base directory from environment or use home directory as default
     let base_dir = env::var("HOME")
@@ -84,6 +84,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
         ws_server: ws_server.clone(),
+        target_http_address: std::env::var("HTTP_PORT").ok(),
     };
 
     // Start SSH server in a separate task
@@ -102,6 +103,10 @@ async fn main() -> Result<(), anyhow::Error> {
     let http_addr = format!("0.0.0.0:{}", http_port);
     let listener = TcpListener::bind(&http_addr).await?;
     info!("Listening on http://{}", http_addr);
+
+    if let Some(target) = &app_state.target_http_address {
+        info!("Proxying unknown routes to {}", target);
+    }
 
     // Check for command line arguments (excluding $0)
     let args: Vec<String> = env::args().collect();
