@@ -384,14 +384,14 @@ pub async fn validate_certificate(
     if cert.validate_at(2000000000, fingerprints.iter()).is_ok() {
         info!("Certificate validated successfully");
         let mut opts = Vec::new();
-        for (k, v) in cert.critical_options() {
+        for (k, v) in cert.critical_options().iter() {
             if v.is_empty() {
                 opts.push(k.clone());
             } else {
                 opts.push(format!("{}={}", k, v));
             }
         }
-        for (k, v) in cert.extensions() {
+        for (k, v) in cert.extensions().iter() {
             if v.is_empty() {
                 opts.push(k.clone());
             } else {
@@ -762,5 +762,40 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(res.status, server::Auth::Reject { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_certificate() {
+        let ca_key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        let user_key =
+            ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut OsRng,
+            user_key.public_key().key_data().clone(),
+            0,
+            2000000000 + 100000,
+        )
+        .unwrap();
+
+        builder
+            .cert_type(ssh_key::certificate::CertType::User)
+            .unwrap();
+        builder.valid_principal("user").unwrap();
+        builder.key_id("test-cert").unwrap();
+        builder.critical_option("force-command", "ls").unwrap();
+
+        let cert = builder.sign(&ca_key).unwrap();
+        let cert_openssh = cert.to_openssh().unwrap();
+
+        let ca_keys = Arc::new(vec![ca_key.public_key().clone()]);
+
+        let res = validate_certificate(&cert_openssh, "user", &ca_keys)
+            .await
+            .unwrap();
+
+        assert!(matches!(res.status, server::Auth::Accept));
+        assert_eq!(res.comment, "test-cert");
+        assert!(res.options.as_ref().unwrap().contains("force-command=ls"));
     }
 }
