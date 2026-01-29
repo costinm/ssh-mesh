@@ -143,51 +143,75 @@ async fn test_ws_exec_cat() -> Result<()> {
 
 #[tokio::test]
 async fn test_ws_ssh_proxy() -> Result<()> {
-    let setup = setup_test_environment(None, true).await?;
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let testdata_dir = manifest_dir.join("tests/testdata");
+    let alice_dir = testdata_dir.join("alice");
+    let bob_dir = testdata_dir.join("bob");
+
+    // Start server with bob's configuration
+    let setup = setup_test_environment(Some(bob_dir), true).await?;
     let http_port = setup.http_port.expect("HTTP port should be set");
 
     let wst_binary = env!("CARGO_BIN_EXE_wst");
     let proxy_command = format!("{} ws://127.0.0.1:{}/_ws/_ssh", wst_binary, http_port);
 
-    let mut ssh_client_process = std::process::Command::new("ssh")
+    // Use alice's keys and configs to connect
+    let mut ssh_client_process = tokio::process::Command::new("ssh")
         .arg("-v")
         .arg("-o")
-        .arg("StrictHostKeyChecking=no")
+        .arg("StrictHostKeyChecking=yes")
         .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
+        .arg("CheckHostIP=no")
+        .arg("-o")
+        .arg(format!(
+            "UserKnownHostsFile={}",
+            alice_dir.join("known_hosts").to_str().unwrap()
+        ))
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
         .arg("-o")
         .arg("ControlMaster=no")
         .arg("-o")
         .arg("ControlPath=none")
         .arg("-o")
         .arg(format!("ProxyCommand={}", proxy_command))
+        .arg("-o")
+        .arg("HostName=127.0.0.1")
         .arg("-i")
-        .arg(setup.client_key_path.to_str().unwrap())
+        .arg(alice_dir.join("id_ecdsa").to_str().unwrap())
         .arg("-p")
         .arg("22")
         .arg("-l")
-        .arg("testuser")
-        .arg("127.0.0.1")
+        .arg("alice@test.m")
+        .arg("bob.test.m")
         .arg("echo 'SUCCESS'")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
         .spawn()?;
 
     let mut output = String::new();
-    ssh_client_process
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut output)?;
+    let mut stdout = ssh_client_process.stdout.take().unwrap();
 
-    if !output.contains("SUCCESS") {
-        let mut err_output = String::new();
-        ssh_client_process
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err_output)?;
-        panic!("SSH failed. Output: {}, Stderr: {}", output, err_output);
+    let read_res = tokio::time::timeout(Duration::from_secs(25), async {
+        stdout.read_to_string(&mut output).await
+    })
+    .await;
+
+    println!("SSH STDOUT: {}", output);
+
+    match read_res {
+        Ok(Ok(_)) => {
+            if !output.contains("SUCCESS") {
+                panic!("SSH failed. Output: {}", output);
+            }
+        }
+        Ok(Err(e)) => panic!("Failed to read SSH stdout: {}", e),
+        Err(_) => {
+            let _ = ssh_client_process.kill().await;
+            panic!("SSH command timed out. Output: {}", output);
+        }
     }
 
     setup.server_handle.abort();

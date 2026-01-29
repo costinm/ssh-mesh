@@ -1,8 +1,7 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
-use ssh_key::{Algorithm, LineEnding, PrivateKey};
+use russh::keys::PublicKeyBase64;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -41,26 +40,22 @@ pub async fn setup_test_environment(
         (Some(td), path)
     };
 
-    std::fs::create_dir_all(base_dir.join(".ssh"))?;
+    let client_key_path = base_dir.join("id_ecdsa");
 
-    let client_keypair = PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519)?;
-    let client_key_path = base_dir.join(".ssh/id_ed25519");
-    std::fs::write(
-        &client_key_path,
-        client_keypair.to_openssh(LineEnding::LF)?.as_bytes(),
-    )?;
-    std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600))?;
+    // Unified key management via auth module
+    let key = crate::auth::load_or_generate_key(&base_dir);
 
-    let public_key_openssh = client_keypair.public_key().to_openssh()?;
-    std::fs::write(
-        base_dir.join(".ssh/authorized_keys"),
-        public_key_openssh.as_bytes(),
-    )?;
+    if temp_dir.is_some() {
+        // For temporary test setups, we need to populate authorized_keys
+        // so the test client (using the newly generated key) can connect to the server.
+        let public_key_line = format!("ecdsa-sha2-nistp256 {} test-key\n", key.public_key_base64());
+        std::fs::write(base_dir.join("authorized_keys"), public_key_line.as_bytes())?;
+    }
 
     let mut http_port = None;
     let mut http_listener = None;
     if start_http {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
         http_port = Some(listener.local_addr()?.port());
         http_listener = Some(listener);
     }
@@ -75,6 +70,10 @@ pub async fn setup_test_environment(
 
     let server_base_dir = base_dir.clone();
     let server_handle = tokio::spawn(async move {
+        println!(
+            "Starting SshServer for tests at base_dir: {:?}",
+            server_base_dir
+        );
         let ssh_server = std::sync::Arc::new(crate::SshServer::new(0, None, server_base_dir));
 
         if start_http {
@@ -87,6 +86,7 @@ pub async fn setup_test_environment(
             let ssh_server_clone = ssh_server.clone();
             tokio::spawn(async move {
                 let config = ssh_server_clone.get_config();
+                println!("Starting real SSH server on port {}", ssh_port);
                 if let Err(e) =
                     crate::run_ssh_server(ssh_port, config, (*ssh_server_clone).clone()).await
                 {
@@ -96,6 +96,8 @@ pub async fn setup_test_environment(
 
             let app = crate::handlers::app(app_state);
             if let Some(listener) = http_listener {
+                let addr = listener.local_addr().unwrap();
+                println!("Starting Axum server on {}", addr);
                 match axum::serve(listener, app.into_make_service()).await {
                     Ok(_) => println!("Axum server finished"),
                     Err(e) => eprintln!("Axum server failed: {}", e),

@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use std::env;
 use std::process;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
@@ -26,12 +27,36 @@ async fn handle_stdio(
         );
     }
 
+    eprintln!("Connecting to {}", request.uri());
+
+    // Check TCP first
+    let host = request.uri().host().unwrap_or("127.0.0.1");
+    let port = request.uri().port_u16().unwrap_or(80);
+    match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(_) => eprintln!("TCP connection successful"),
+        Err(e) => {
+            eprintln!("TCP connection failed: {}", e);
+            return Err(e.into());
+        }
+    }
+
     let (ws_stream, _): (
         tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
         _,
-    ) = connect_async(request).await?;
+    ) = match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => {
+            eprintln!("Failed to connect: {}", e);
+            return Err(e.into());
+        }
+        Err(_) => {
+            eprintln!("Connection timeout during WebSocket handshake");
+            return Err("Timeout".into());
+        }
+    };
+    eprintln!("Connected to WebSocket");
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -93,7 +118,9 @@ async fn handle_stdio(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("WST STARTING");
     let args: Vec<String> = env::args().collect();
+    eprintln!("WST ARGS: {:?}", args);
     if args.len() < 2 {
         eprintln!("Usage: {} <URL>", args[0]);
         process::exit(1);

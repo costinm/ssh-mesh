@@ -61,6 +61,7 @@ pub async fn bridge_ws_to_mpsc<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    println!("bridge_ws_to_mpsc: Starting bridge for {}", label);
     loop {
         tokio::select! {
             res = ws.read_frame() => {
@@ -68,15 +69,20 @@ pub async fn bridge_ws_to_mpsc<S>(
                     Ok(frame) => {
                         match frame.opcode {
                             OpCode::Binary | OpCode::Text => {
+                                println!("bridge_ws_to_mpsc: Received frame from WS: {} bytes", frame.payload.len());
                                 if tx_to_mpsc.send(Ok(Bytes::from(frame.payload.to_vec()))).is_err() {
                                     break;
                                 }
                             }
-                            OpCode::Close => break,
+                            OpCode::Close => {
+                                println!("bridge_ws_to_mpsc: Received close frame from WS");
+                                break;
+                            },
                             _ => {}
                         }
                     }
                     Err(e) => {
+                        println!("bridge_ws_to_mpsc: WS read error: {}", e);
                         error!("WS bridge {}: read error: {}", label, e);
                         break;
                     }
@@ -85,12 +91,14 @@ pub async fn bridge_ws_to_mpsc<S>(
             res = rx_from_mpsc.recv() => {
                 match res {
                     Some(data) => {
+                        println!("bridge_ws_to_mpsc: Sending data to WS: {} bytes", data.len());
                         let frame = Frame::binary(Payload::Owned(data.to_vec()));
                         if ws.write_frame(frame).await.is_err() {
                             break;
                         }
                     }
                     None => {
+                        println!("bridge_ws_to_mpsc: MPSC channel closed");
                         let _ = ws.write_frame(Frame::close(1000, b"EOF")).await;
                         break;
                     }
@@ -98,6 +106,7 @@ pub async fn bridge_ws_to_mpsc<S>(
             }
         }
     }
+    println!("bridge_ws_to_mpsc: Bridge closed for {}", label);
     debug!("WebSocket MPSC bridge {} closed", label);
 }
 

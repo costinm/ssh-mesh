@@ -405,7 +405,9 @@ pub async fn handle_exec(
 // WebSocket SSH handler
 #[instrument(skip(req, state), fields(method = %req.method(), uri = %req.uri()))]
 pub async fn handle_ws_ssh(State(state): State<AppState>, req: Request<Body>) -> Response {
+    println!("handle_ws_ssh: Received connection request");
     ws::handle_upgrade_with_handler(req, move |ws| async move {
+        println!("handle_ws_ssh: WebSocket upgraded");
         let mut ssh_server = state.ssh_server.as_ref().clone();
         let config = Arc::new(ssh_server.get_config());
         let handler = ssh_server.new_client(None);

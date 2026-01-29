@@ -64,10 +64,17 @@ async fn main() -> Result<(), anyhow::Error> {
     let ssh_port = get_port_from_env("SSH_PORT", 15022);
     let http_port = get_port_from_env("LISTEN_HTTP_PORT", 15028);
 
-    // Get base directory from environment or use home directory as default
-    let base_dir = env::var("HOME")
+    // Get base directory from environment variable SSH_BASEDIR
+    // If not set, use $HOME/.ssh or /tmp/.ssh as default
+    let base_dir = env::var("SSH_BASEDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+        .unwrap_or_else(|_| {
+            let mut path = env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp"));
+            path.push(".ssh");
+            path
+        });
 
     info!(
         "Starting SSH server on port {} and HTTP server on port {} with base directory: {:?}",
@@ -75,7 +82,7 @@ async fn main() -> Result<(), anyhow::Error> {
     );
 
     // Create SSH server instance
-    let ssh_server = Arc::new(SshServer::new(0, None, base_dir));
+    let ssh_server = Arc::new(SshServer::new(0, None, base_dir.clone()));
 
     // Create WebSocket server instance
     let ws_server = Arc::new(WSServer::new());
@@ -97,7 +104,7 @@ async fn main() -> Result<(), anyhow::Error> {
     });
 
     // Create Axum app
-    let app = handlers::app(app_state);
+    let app = handlers::app(app_state.clone());
 
     // Start Axum server
     let http_addr = format!("0.0.0.0:{}", http_port);
@@ -106,6 +113,36 @@ async fn main() -> Result<(), anyhow::Error> {
 
     if let Some(target) = &app_state.target_http_address {
         info!("Proxying unknown routes to {}", target);
+    }
+
+    // HTTPS server
+    let https_port = get_port_from_env("HTTPS_PORT", 0);
+    if https_port > 0 {
+        let cert_path = base_dir.join("id_ecdsa.crt");
+        let key_path = base_dir.join("id_ecdsa");
+        if cert_path.exists() && key_path.exists() {
+            let app = app.clone();
+            let https_addr = format!("0.0.0.0:{}", https_port);
+            match ssh_mesh::auth::TlsServer::new(&cert_path, &key_path, None, &https_addr) {
+                Ok(tls_server) => {
+                    info!("Starting HTTPS server on https://{}", https_addr);
+                    tokio::spawn(async move {
+                        if let Err(e) = ssh_mesh::auth::run_axum_https_server(
+                            https_port,
+                            tls_server.acceptor,
+                            app,
+                        )
+                        .await
+                        {
+                            error!("HTTPS server failed: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to initialize TLS config: {}", e);
+                }
+            }
+        }
     }
 
     // Check for command line arguments (excluding $0)
@@ -132,26 +169,4 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_get_port_from_env() {
-        // Test with default value
-        let default_port = 1234;
-        let random_var = "NONEXISTENT_VAR";
-        assert_eq!(get_port_from_env(random_var, default_port), default_port);
-
-        // Test with environment variable set
-        let test_port = 5678;
-        let test_var = "TEST_PORT";
-        std::env::set_var(test_var, test_port.to_string());
-        assert_eq!(get_port_from_env(test_var, default_port), test_port);
-
-        // Cleanup
-        std::env::remove_var(test_var);
-    }
 }

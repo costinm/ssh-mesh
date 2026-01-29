@@ -1,0 +1,2 @@
+alice.test.m,127.0.0.1 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBICtPKa3mXZss+k6LqtiNOQ3TbJFqLvjsvZGubtILlkV2Kz3HjO9+fghwCT/bb1R2SrvqHWWEj+QH6G4+ogPns=
+@cert-authority *.test.m ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLR/dnbZ58eupn+zQhXVWUn+ELMDylfbEAabtNbEkDSVjV/a7nbwpPFu0ct+ZFsC9SacWO14DBsiQDpTMlYPpUg=

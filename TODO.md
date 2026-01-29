@@ -1,3 +1,6 @@
+# Rust 
+
+[ ] Add ntest and cargo-nextest (test deps)
 
 # Pmond
 
