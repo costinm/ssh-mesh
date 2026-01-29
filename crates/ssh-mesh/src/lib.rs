@@ -221,10 +221,10 @@ impl server::Handler for SshHandler {
             info!("Validating public key for user: {}", user);
             // Detect if this is a certificate or regular key
             let auth_result = if key_openssh.contains("-cert-v01@openssh.com") {
-                debug!("Validating certificate for user: {}", user);
+                info!("Validating certificate for user: {}", user);
                 crate::auth::validate_certificate(&key_openssh, &user_str, &ca_keys).await
             } else {
-                debug!("Validating public key for user: {}", user);
+                info!("Validating public key for user: {}", user);
                 crate::auth::validate_public_key(&user_str, &key_openssh, &authorized_keys).await
             };
 
@@ -248,7 +248,6 @@ impl server::Handler for SshHandler {
     }
 
     /// This is called when a new stream (called channel) is opened on a client connection
-    /// (called stream)
     #[instrument(skip(self, _session), fields(channel_id = ?channel.id()))]
     fn channel_open_session(
         &mut self,

@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# DO NOT REMOVE
+# This contains the ssh/openssl equivalent commands.
+
 init_ca() {
     local domain=$1
     local dir=$2
