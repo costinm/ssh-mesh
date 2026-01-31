@@ -516,6 +516,7 @@
         function updateStats() {
             const paths = Object.keys(cgroupsData).filter(path => {
                 if (path.endsWith('.slice')) return false;
+                if (path === '/sys/fs/cgroup') return false;
                 return true;
             });
             totalCgroupsEl.textContent = paths.length;

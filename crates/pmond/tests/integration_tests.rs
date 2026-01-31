@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 fn start_monitoring(proc_mon: Arc<ProcMon>) {
-    let (tx, mut rx) = mpsc::channel(100);
+    let (tx, mut rx) = mpsc::channel::<pmond::MonitoringEvent>(100);
     let running = proc_mon.running.clone();
 
     // Start netlink listener
@@ -25,19 +25,22 @@ fn start_monitoring(proc_mon: Arc<ProcMon>) {
     let pm = proc_mon.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            match event {
-                proc_netlink::NetlinkEvent::Fork {
-                    parent_tgid,
-                    child_pid,
-                    child_tgid,
-                    ..
-                } => {
-                    pm.handle_fork(parent_tgid, child_pid, child_tgid);
+            if let pmond::MonitoringEvent::Netlink(nl_event) = event {
+                match nl_event {
+                    proc_netlink::NetlinkEvent::Fork {
+                        parent_tgid,
+                        child_pid,
+                        child_tgid,
+                        ..
+                    } => {
+                        pm.psi_watcher
+                            .handle_fork(parent_tgid, child_pid, child_tgid);
+                    }
+                    proc_netlink::NetlinkEvent::Exit { process_tgid, .. } => {
+                        pm.psi_watcher.handle_exit(process_tgid);
+                    }
+                    _ => {}
                 }
-                proc_netlink::NetlinkEvent::Exit { process_tgid, .. } => {
-                    pm.handle_exit(process_tgid);
-                }
-                _ => {}
             }
         }
     });
@@ -51,7 +54,7 @@ async fn test_proc_mon_creation_and_existing_processes() -> Result<(), Box<dyn s
     let proc_mon = Arc::new(proc_mon);
 
     // Start monitoring
-    proc_mon.start(true, false)?; // Don't watch PSI for this test
+    proc_mon.start(true, false, None)?; // Don't watch PSI for this test
     start_monitoring(proc_mon.clone());
 
     // Give it a moment to read existing processes
@@ -79,7 +82,7 @@ async fn test_http_handler_returns_processes() -> Result<(), Box<dyn std::error:
     let proc_mon = Arc::new(proc_mon);
 
     // Start monitoring
-    proc_mon.start(true, false)?; // Don't watch PSI for this test
+    proc_mon.start(true, false, None)?; // Don't watch PSI for this test
     start_monitoring(proc_mon.clone());
 
     // Give it a moment to read existing processes
@@ -130,7 +133,7 @@ async fn test_process_detection() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start monitoring
-    proc_mon.start(true, false)?; // Don't watch PSI for this test
+    proc_mon.start(true, false, None)?; // Don't watch PSI for this test
     start_monitoring(proc_mon.clone());
 
     // Give it a moment to read existing processes
@@ -179,7 +182,7 @@ async fn test_get_process_by_pid() -> Result<(), Box<dyn std::error::Error>> {
     let proc_mon = Arc::new(proc_mon);
 
     // Start monitoring
-    proc_mon.start(true, false)?; // Don't watch PSI for this test
+    proc_mon.start(true, false, None)?; // Don't watch PSI for this test
     start_monitoring(proc_mon.clone());
 
     // Give it a moment to read existing processes
@@ -230,7 +233,7 @@ async fn test_cgroups_retrieval() -> Result<(), Box<dyn std::error::Error>> {
     let proc_mon = Arc::new(proc_mon);
 
     // Start monitoring
-    proc_mon.start(true, false)?; // Don't watch PSI for this test
+    proc_mon.start(true, false, None)?; // Don't watch PSI for this test
 
     // Give it a moment to read existing processes
     tokio::time::sleep(Duration::from_millis(100)).await;

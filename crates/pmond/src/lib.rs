@@ -7,11 +7,17 @@ pub mod psi;
 
 pub use proc::ProcMon;
 
+/// Read process name from /proc/[pid]/comm
+pub fn read_comm(pid: u32) -> String {
+    let comm_path = format!("/proc/{}/comm", pid);
+    std::fs::read_to_string(comm_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PressureType {
     Memory,
-    Cpu,
-    Io,
 }
 
 pub use read_process_info as read_process_info_from_proc;
@@ -25,6 +31,12 @@ pub struct ProcessInfo {
     pub cmdline: Option<String>,
     pub mem_info: Option<ProcMemInfo>,
     pub uid: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MonitoringEvent {
+    Netlink(crate::proc_netlink::NetlinkEvent),
+    Pressure(crate::psi::PressureEvent),
 }
 
 /// Memory info for a process or cgroup. Each field should have a comment indicating
@@ -66,7 +78,6 @@ pub struct ProcMemInfo {
 
     // --- Process Only Fields ---
     // VmExec - exec size - statm[4]
-
     /// Proportional Set Size. Process: smaps_rollup (Pss). Cgroup: N/A.
     pub pss: u64,
     /// Total Resident Set Size. Process: smaps_rollup (Rss), status (VmRSS), or statm[2]. Cgroup: N/A (see memory_current).
@@ -520,6 +531,15 @@ pub fn read_cmdline(pid: u32) -> Option<String> {
                 return Some(cmdline);
             }
         }
+    }
+    None
+}
+
+/// Read exe (symbolic link target) for a process
+pub fn read_exe(pid: u32) -> Option<String> {
+    let exe_path = format!("/proc/{}/exe", pid);
+    if let Ok(target) = std::fs::read_link(exe_path) {
+        return Some(target.to_string_lossy().to_string());
     }
     None
 }

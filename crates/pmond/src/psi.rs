@@ -5,7 +5,7 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -13,9 +13,15 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, instrument, trace};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, instrument, trace, warn};
 
 const WAKER_TOKEN: Token = Token(1024);
+
+/// Default PSI polling interval in microseconds
+const DEFAULT_INTERVAL_US: u64 = 10000;
+/// Default PSI threshold in microseconds (10 seconds)
+const DEFAULT_THRESHOLD_US: u64 = 10000000;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PressureEvent {
@@ -24,21 +30,27 @@ pub struct PressureEvent {
     pub pressure_data: String,
 }
 
-pub struct Watch {
-    pub cgroup_path: String,
-    pub pressure_type: PressureType,
-}
 pub struct PsiWatcher {
-    running: Arc<AtomicBool>,
-    pub watches: Arc<Mutex<HashMap<u32, Watch>>>,
-    new_pids: Arc<Mutex<Vec<u32>>>,
+    pub running: Arc<AtomicBool>,
+    // PID -> Cgroup Path
+    pub watches: Arc<Mutex<HashMap<u32, String>>>,
+    pub processes: Arc<Mutex<HashMap<u32, crate::ProcessInfo>>>,
+    // Notification for the monitoring thread
+    new_pid_events: Arc<Mutex<Vec<(u32, String)>>>,
     terminated_pids: Arc<Mutex<Vec<u32>>>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     callback: Arc<Mutex<Option<Box<dyn Fn(u32, &str) + Send + Sync>>>>,
+    pub proc_callback: Arc<Mutex<Option<Box<dyn Fn(crate::ProcessInfo) + Send + Sync>>>>,
     waker: Arc<Mutex<Option<Waker>>>,
     pub event_tx: broadcast::Sender<PressureEvent>,
     pub interval_us: u64,
     pub threshold_us: u64,
+}
+
+impl Default for PsiWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PsiWatcher {
@@ -46,18 +58,21 @@ impl PsiWatcher {
     #[instrument]
     pub fn new() -> Self {
         debug!("Creating new PsiWatcher");
-        let (event_tx, _event_rx) = broadcast::channel(100);
+        // Broadcast requires creating one receiver even if we don't use it
+        let (event_tx, _) = broadcast::channel(100);
         let watcher = PsiWatcher {
             running: Arc::new(AtomicBool::new(false)),
             watches: Arc::new(Mutex::new(HashMap::new())),
-            new_pids: Arc::new(Mutex::new(Vec::new())),
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            new_pid_events: Arc::new(Mutex::new(Vec::new())),
             terminated_pids: Arc::new(Mutex::new(Vec::new())),
             handle: Arc::new(Mutex::new(None)),
             callback: Arc::new(Mutex::new(None)),
+            proc_callback: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
             event_tx,
-            interval_us: 10000,
-            threshold_us: 10000000,
+            interval_us: DEFAULT_INTERVAL_US,
+            threshold_us: DEFAULT_THRESHOLD_US,
         };
         info!("PsiWatcher created successfully");
         watcher
@@ -79,36 +94,29 @@ impl PsiWatcher {
         *callback = Some(Box::new(cb));
     }
 
-    /// Add a process to watch by PID
+    /// Add a process to watch by PID (currently only Memory pressure is supported)
     #[instrument(skip(self), fields(pid = pid))]
-    pub fn add_pid(&self, pid: u32, pressure_type: PressureType) {
-        debug!(
-            "Adding process {} to PSI watcher for {:?}",
-            pid, pressure_type
-        );
+    pub fn add_pid(&self, pid: u32) {
+        debug!("Adding process {} to PSI watcher", pid);
         match create_process_info(pid) {
             Ok(process_info) => {
                 if let Some(cgroup_path) = process_info.cgroup_path {
                     trace!("Found cgroup path for PID {}: {}", pid, cgroup_path);
-                    let mut watches = self.watches.lock().unwrap();
-                    watches.insert(
-                        pid,
-                        Watch {
-                            cgroup_path,
-                            pressure_type,
-                        },
-                    );
-                    drop(watches);
+                    {
+                        let mut watches = self.watches.lock().unwrap();
+                        watches.insert(pid, cgroup_path.clone());
+                    }
 
-                    let mut new_pids = self.new_pids.lock().unwrap();
-                    new_pids.push(pid);
-                    drop(new_pids);
+                    {
+                        let mut events = self.new_pid_events.lock().unwrap();
+                        events.push((pid, cgroup_path));
+                    }
 
                     if let Some(waker) = self.waker.lock().unwrap().as_ref() {
                         if let Err(e) = waker.wake() {
                             debug!("Failed to wake PSI watcher for PID {}: {}", pid, e);
                         } else {
-                            debug!("Process {} added to PSI watcher", pid);
+                            debug!("Wake signal sent for new PID {}", pid);
                         }
                     }
                 } else {
@@ -117,6 +125,89 @@ impl PsiWatcher {
             }
             Err(e) => {
                 debug!("Failed to create process info for PID {}: {}", pid, e);
+            }
+        }
+    }
+
+    /// Handle a fork event
+    pub fn handle_fork(&self, parent_tgid: u32, child_pid: u32, child_tgid: u32) {
+        if let Ok(process_info) = crate::read_process_info_from_proc(child_tgid) {
+            if parent_tgid == child_tgid {
+                trace!(
+                    "thread: parent pid={} -> child pid={} {} {}",
+                    parent_tgid,
+                    child_pid,
+                    child_tgid,
+                    process_info.comm
+                );
+            } else {
+                trace!(
+                    "fork: parent pid={} -> child pid={} {} tname/cmd ({}) {:?}",
+                    parent_tgid,
+                    child_pid,
+                    child_tgid,
+                    process_info.comm,
+                    process_info.cmdline
+                );
+
+                {
+                    let mut proc_map = self.processes.lock().unwrap();
+                    proc_map.insert(process_info.pid, process_info.clone());
+                }
+
+                self.add_pid(process_info.pid);
+
+                if let Some(cb) = self.proc_callback.lock().unwrap().as_ref() {
+                    cb(process_info);
+                }
+            }
+        }
+    }
+
+    /// Handle an exec event
+    pub fn handle_exec(&self, _process_pid: u32, process_tgid: u32) {
+        if let Ok(process_info) = crate::read_process_info_from_proc(process_tgid) {
+            {
+                let mut proc_map = self.processes.lock().unwrap();
+                proc_map.insert(process_info.pid, process_info.clone());
+            }
+        }
+    }
+
+    /// Handle an exit event
+    pub fn handle_exit(&self, process_tgid: u32) {
+        self.processes.lock().unwrap().remove(&process_tgid);
+        self.remove_pid(process_tgid);
+    }
+
+    /// Handle a UID change event
+    pub fn handle_uid(&self, _process_pid: u32, process_tgid: u32, ruid: u32, euid: u32) {
+        let mut proc_map = self.processes.lock().unwrap();
+        if let Some(info) = proc_map.get_mut(&process_tgid) {
+            info.uid = Some(ruid);
+            trace!(
+                "uid change: pid={} ruid={} euid={}",
+                process_tgid,
+                ruid,
+                euid
+            );
+            let info_clone = info.clone();
+            drop(proc_map);
+            if let Some(cb) = self.proc_callback.lock().unwrap().as_ref() {
+                cb(info_clone);
+            }
+        }
+    }
+
+    /// Handle a COMM change event (process name change)
+    pub fn handle_comm(&self, _process_pid: u32, process_tgid: u32, comm: String) {
+        let mut proc_map = self.processes.lock().unwrap();
+        if let Some(info) = proc_map.get_mut(&process_tgid) {
+            info.comm = comm;
+            let info_clone = info.clone();
+            drop(proc_map);
+            if let Some(cb) = self.proc_callback.lock().unwrap().as_ref() {
+                cb(info_clone);
             }
         }
     }
@@ -132,12 +223,15 @@ impl PsiWatcher {
                 error!("Failed to wake PSI watcher for PID {}: {}", pid, e);
             }
         }
-        trace!("Process {} removed from PSI watcher", pid);
+        trace!("Process {} removal signal queued", pid);
     }
 
     /// Start the PSI monitoring thread
     #[instrument(skip(self))]
-    pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(
+        &self,
+        monitoring_tx: Option<mpsc::Sender<crate::MonitoringEvent>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Starting PSI monitoring thread");
         if self.running.load(Ordering::SeqCst) {
             debug!("PSI monitoring already running");
@@ -149,77 +243,123 @@ impl PsiWatcher {
 
         let running = self.running.clone();
         let watches = self.watches.clone();
-        let new_pids = self.new_pids.clone();
+        let new_pid_events = self.new_pid_events.clone();
         let terminated_pids = self.terminated_pids.clone();
         let callback = self.callback.clone();
         let waker = self.waker.clone();
         let event_tx = self.event_tx.clone();
+        let internal_monitoring_tx = monitoring_tx.clone();
         let interval_us = self.interval_us;
         let threshold_us = self.threshold_us;
 
         let handle = std::thread::spawn(move || {
             debug!("PSI monitoring thread started");
-            let mut poll = Poll::new().unwrap();
+
+            let mut poll = match Poll::new() {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Failed to create mio Poll: {}", e);
+                    return;
+                }
+            };
             let mut events = Events::with_capacity(1024);
-            let mut token_map = HashMap::new();
-            let mut files = HashMap::new();
+
+            // Internal state
+            let mut cgroup_to_pids: HashMap<String, std::collections::HashSet<u32>> =
+                HashMap::new();
+            let mut token_to_cgroup: HashMap<Token, String> = HashMap::new();
+            let mut cgroup_to_token: HashMap<String, Token> = HashMap::new(); // Reverse map for O(1) cleanup
+            let mut cgroup_to_file: HashMap<String, File> = HashMap::new();
             let mut next_token = Token(0);
 
-            let new_waker = Waker::new(poll.registry(), WAKER_TOKEN).unwrap();
+            let new_waker = match Waker::new(poll.registry(), WAKER_TOKEN) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to create Waker: {}", e);
+                    return;
+                }
+            };
             *waker.lock().unwrap() = Some(new_waker);
 
-            {
-                let watches_snapshot = watches.lock().unwrap();
-                info!(
-                    "Setting up watches for {} processes",
-                    watches_snapshot.len()
-                );
-                for (&pid, watch) in watches_snapshot.iter() {
-                    trace!("Setting up watch for PID: {}", pid);
-                    let pressure_file_name = match watch.pressure_type {
-                        PressureType::Memory => "memory.pressure",
-                        PressureType::Cpu => "cpu.pressure",
-                        PressureType::Io => "io.pressure",
-                    };
-                    let pressure_file_path =
-                        format!("{}/{}", watch.cgroup_path, pressure_file_name);
-                    let mut file = match OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&pressure_file_path)
-                    {
-                        Ok(f) => f,
-                        Err(_e) => {
-                            continue;
-                        }
-                    };
-
-                    let trig = format!("some {} {}", interval_us, threshold_us);
-                    if let Err(e) = file.write_all(trig.as_bytes()) {
-                        error!("Failed to write to {}: {}", pressure_file_path, e);
-                        continue;
+            /// Helper to open and register a cgroup for PSI monitoring
+            fn setup_cgroup_watch(
+                cgroup_path: &str,
+                interval_us: u64,
+                threshold_us: u64,
+                poll: &Poll,
+                next_token: &mut Token,
+                token_to_cgroup: &mut HashMap<Token, String>,
+                cgroup_to_token: &mut HashMap<String, Token>,
+                cgroup_to_file: &mut HashMap<String, File>,
+            ) -> bool {
+                let pressure_file_path = format!("{}/memory.pressure", cgroup_path);
+                let mut file = match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&pressure_file_path)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to open {}: {}", pressure_file_path, e);
+                        return false;
                     }
+                };
 
-                    let fd = file.as_raw_fd();
-                    let token = Token(next_token.0);
-                    next_token.0 += 1;
+                let trig = format!("some {} {}", interval_us, threshold_us);
+                if let Err(e) = file.write_all(trig.as_bytes()) {
+                    error!("Failed to write trigger to {}: {}", pressure_file_path, e);
+                    return false;
+                }
 
+                let fd = file.as_raw_fd();
+                let token = Token(next_token.0);
+                next_token.0 += 1;
+
+                if let Err(e) =
                     poll.registry()
                         .register(&mut SourceFd(&fd), token, Interest::PRIORITY)
-                        .unwrap();
-                    token_map.insert(token, pid);
-                    files.insert(pid, file);
+                {
+                    error!("Failed to register {} with mio: {}", pressure_file_path, e);
+                    return false;
                 }
+
+                token_to_cgroup.insert(token, cgroup_path.to_string());
+                cgroup_to_token.insert(cgroup_path.to_string(), token);
+                cgroup_to_file.insert(cgroup_path.to_string(), file);
+                debug!("Started watching cgroup: {}", cgroup_path);
+                true
+            }
+
+            // Initial setup - populate internal state from existing watches
+            {
+                let watches_snapshot = watches.lock().unwrap();
+                for (&pid, cgroup_path) in watches_snapshot.iter() {
+                    cgroup_to_pids
+                        .entry(cgroup_path.clone())
+                        .or_insert_with(std::collections::HashSet::new)
+                        .insert(pid);
+                }
+            }
+
+            // Open files and register watches for existing cgroups
+            for cgroup_path in cgroup_to_pids.keys().cloned().collect::<Vec<_>>() {
+                setup_cgroup_watch(
+                    &cgroup_path,
+                    interval_us,
+                    threshold_us,
+                    &poll,
+                    &mut next_token,
+                    &mut token_to_cgroup,
+                    &mut cgroup_to_token,
+                    &mut cgroup_to_file,
+                );
             }
 
             while running.load(Ordering::SeqCst) {
                 trace!("Polling for PSI events");
                 match poll.poll(&mut events, None) {
                     Ok(_) => (),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                        debug!("Poll interrupted, continuing");
-                        continue;
-                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
                         error!("Poll failed: {}", e);
                         break;
@@ -229,130 +369,104 @@ impl PsiWatcher {
                 for event in events.iter() {
                     match event.token() {
                         WAKER_TOKEN => {
-                            trace!("Received wake event");
                             if !running.load(Ordering::SeqCst) {
                                 debug!("PSI monitoring stopping");
                                 return;
                             }
 
-                            let mut terminated_pids_lock = terminated_pids.lock().unwrap();
-                            if !terminated_pids_lock.is_empty() {
-                                debug!("Processing {} terminated PIDs", terminated_pids_lock.len());
-                                for &pid in terminated_pids_lock.iter() {
-                                    trace!("Removing watch for terminated PID: {}", pid);
-                                    watches.lock().unwrap().remove(&pid);
-                                    let token_to_remove = token_map.iter().find_map(|(k, &v)| {
-                                        if v == pid {
-                                            Some(k.clone())
-                                        } else {
-                                            None
+                            // Handle terminations - drain vec first to minimize lock time
+                            let pids_to_remove: Vec<u32> = {
+                                let mut lock = terminated_pids.lock().unwrap();
+                                lock.drain(..).collect()
+                            };
+
+                            for pid in pids_to_remove {
+                                let mut cgroup_to_cleanup = None;
+
+                                // Find which cgroup this PID belonged to and remove it
+                                if let Some(cgroup_path) = watches.lock().unwrap().remove(&pid) {
+                                    if let Some(pids) = cgroup_to_pids.get_mut(&cgroup_path) {
+                                        pids.remove(&pid);
+                                        if pids.is_empty() {
+                                            cgroup_to_cleanup = Some(cgroup_path);
                                         }
-                                    });
-                                    if let Some(token) = token_to_remove {
-                                        token_map.remove(&token);
                                     }
-                                    files.remove(&pid);
                                 }
-                            }
-                            terminated_pids_lock.clear();
-                            drop(terminated_pids_lock);
 
-                            let mut new_pids_lock = new_pids.lock().unwrap();
-                            if !new_pids_lock.is_empty() {
-                                debug!("Processing {} new PIDs", new_pids_lock.len());
-                                let watches_lock = watches.lock().unwrap();
-
-                                for &pid in new_pids_lock.iter() {
-                                    trace!("Setting up watch for new PID: {}", pid);
-                                    if let Some(watch) = watches_lock.get(&pid) {
-                                        let pressure_file_name = match watch.pressure_type {
-                                            PressureType::Memory => "memory.pressure",
-                                            PressureType::Cpu => "cpu.pressure",
-                                            PressureType::Io => "io.pressure",
-                                        };
-                                        let pressure_file_path =
-                                            format!("{}/{}", watch.cgroup_path, pressure_file_name);
-                                        let mut file = match OpenOptions::new()
-                                            .read(true)
-                                            .write(true)
-                                            .open(&pressure_file_path)
-                                        {
-                                            Ok(f) => f,
-                                            Err(_e) => {
-                                                continue;
-                                            }
-                                        };
-
-                                        let trig = format!("some {} {}", interval_us, threshold_us);
-                                        if let Err(e) = file.write_all(trig.as_bytes()) {
-                                            error!(
-                                                "Failed to write to {}: {}",
-                                                pressure_file_path, e
-                                            );
-                                            continue;
-                                        }
-
+                                if let Some(path) = cgroup_to_cleanup {
+                                    debug!("Cleaning up watch for empty cgroup: {}", path);
+                                    cgroup_to_pids.remove(&path);
+                                    if let Some(file) = cgroup_to_file.remove(&path) {
                                         let fd = file.as_raw_fd();
-                                        let token = Token(next_token.0);
-                                        next_token.0 += 1;
-
-                                        poll.registry()
-                                            .register(&mut SourceFd(&fd), token, Interest::PRIORITY)
-                                            .unwrap();
-                                        token_map.insert(token, pid);
-                                        files.insert(pid, file);
+                                        // Use reverse map for O(1) lookup
+                                        if let Some(t) = cgroup_to_token.remove(&path) {
+                                            let _ = poll.registry().deregister(&mut SourceFd(&fd));
+                                            token_to_cgroup.remove(&t);
+                                        }
                                     }
                                 }
                             }
-                            new_pids_lock.clear();
-                            drop(new_pids_lock);
+
+                            // Handle new PIDs - drain vec first to minimize lock time
+                            let new_pids: Vec<(u32, String)> = {
+                                let mut lock = new_pid_events.lock().unwrap();
+                                lock.drain(..).collect()
+                            };
+
+                            for (pid, cgroup_path) in new_pids {
+                                if !cgroup_to_file.contains_key(&cgroup_path) {
+                                    setup_cgroup_watch(
+                                        &cgroup_path,
+                                        interval_us,
+                                        threshold_us,
+                                        &poll,
+                                        &mut next_token,
+                                        &mut token_to_cgroup,
+                                        &mut cgroup_to_token,
+                                        &mut cgroup_to_file,
+                                    );
+                                }
+                                cgroup_to_pids.entry(cgroup_path).or_default().insert(pid);
+                            }
                         }
                         token => {
-                            trace!("Received PSI event for token: {:?}", token);
-                            if let Some(&pid) = token_map.get(&token) {
-                                trace!("PSI event for PID: {}", pid);
-                                if files.contains_key(&pid) {
-                                    let mut content = String::new();
-                                    let watch_guard = watches.lock().unwrap();
-                                    let watch = watch_guard.get(&pid).unwrap();
-                                    let pressure_file_name = match watch.pressure_type {
-                                        PressureType::Memory => "memory.pressure",
-                                        PressureType::Cpu => "cpu.pressure",
-                                        PressureType::Io => "io.pressure",
-                                    };
-                                    let pressure_file_path =
-                                        format!("{}/{}", watch.cgroup_path, pressure_file_name);
-                                    if let Ok(mut f) = File::open(&pressure_file_path) {
-                                        if f.read_to_string(&mut content).is_ok() {
-                                            trace!(
-                                                "Read PSI content for PID {}: {} bytes",
-                                                pid,
-                                                content.len()
-                                            );
-                                            let event = PressureEvent {
-                                                pid,
-                                                pressure_type: watch.pressure_type.clone(),
-                                                pressure_data: content.trim_end().to_string(),
-                                            };
-                                            if let Err(e) = event_tx.send(event) {
-                                                error!("Failed to broadcast PSI event: {}", e);
-                                            }
-                                            let cb = callback.lock().unwrap();
-                                            if let Some(ref callback_fn) = *cb {
-                                                info!(
-                                                    "PSI event for process {}: 
-{}",
+                            if let Some(cgroup_path) = token_to_cgroup.get(&token) {
+                                trace!("PSI event for cgroup: {}", cgroup_path);
+                                let mut content = String::new();
+                                // We need to read from the file to clear the event
+                                if let Some(file) = cgroup_to_file.get_mut(cgroup_path) {
+                                    // Seek to start to read again
+                                    if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
+                                        warn!(
+                                            "Failed to seek in pressure file for {}: {}",
+                                            cgroup_path, e
+                                        );
+                                    }
+                                    if file.read_to_string(&mut content).is_ok() {
+                                        let trimmed = content.trim_end().to_string();
+
+                                        // Broadcast for ALL associated PIDs
+                                        if let Some(pids) = cgroup_to_pids.get(cgroup_path) {
+                                            for &pid in pids.iter() {
+                                                let event = PressureEvent {
                                                     pid,
-                                                    content.trim_end()
-                                                );
-                                                callback_fn(pid, &content.trim_end());
-                                            } else {
-                                                info!(
-                                                    "PSI event for process {}: 
-{}",
-                                                    pid,
-                                                    content.trim_end()
-                                                );
+                                                    pressure_type: PressureType::Memory,
+                                                    pressure_data: trimmed.clone(),
+                                                };
+
+                                                let _ = event_tx.send(event.clone());
+
+                                                if let Some(ref tx) = internal_monitoring_tx {
+                                                    let _ = tx.blocking_send(
+                                                        crate::MonitoringEvent::Pressure(event),
+                                                    );
+                                                }
+
+                                                if let Some(ref callback_fn) =
+                                                    *callback.lock().unwrap()
+                                                {
+                                                    callback_fn(pid, &trimmed);
+                                                }
                                             }
                                         }
                                     }
@@ -414,16 +528,16 @@ mod tests {
 
             // Set a callback
             watcher.set_callback(|pid, info| {
-                info!("PSI callback triggered for PID {}: {}", pid, info);
+                println!("PSI callback triggered for PID {}: {}", pid, info);
             });
 
             // Add current process to watch
             let current_pid = std::process::id();
-            watcher.add_pid(current_pid, crate::PressureType::Memory);
+            watcher.add_pid(current_pid);
 
             // Start the watcher
-            if let Err(e) = watcher.start() {
-                info!("Failed to start PSI watcher: {}", e);
+            if let Err(e) = watcher.start(None) {
+                println!("Failed to start PSI watcher: {}", e);
                 return;
             }
 
@@ -431,7 +545,7 @@ mod tests {
 
             let _ = watcher.stop();
 
-            info!("PSI watcher test completed");
+            println!("PSI watcher test completed");
         });
 
         let start = std::time::Instant::now();
@@ -452,7 +566,7 @@ mod tests {
     fn test_psi_watcher_dynamic_add_remove() {
         let handle = thread::spawn(|| {
             let watcher = PsiWatcher::new();
-            watcher.start().unwrap();
+            watcher.start(None).unwrap();
 
             let mut child = std::process::Command::new("sleep")
                 .arg("1")
@@ -460,7 +574,7 @@ mod tests {
                 .unwrap();
 
             let pid = child.id();
-            watcher.add_pid(pid, crate::PressureType::Memory);
+            watcher.add_pid(pid);
 
             // Check that the pid is in watches
             {

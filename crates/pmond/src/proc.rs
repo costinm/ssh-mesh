@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, trace};
 use users::get_current_uid;
 
@@ -21,8 +22,6 @@ pub struct ProcMon {
     pub running: Arc<AtomicBool>,
     pub handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 
-    pub callback: Arc<Mutex<Option<Box<dyn Fn(ProcessInfo) + Send + Sync>>>>,
-
     pub processes: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
     pub psi_watcher: Arc<PsiWatcher>,
     pub config: Arc<Mutex<ProcCfg>>,
@@ -35,20 +34,12 @@ impl ProcMon {
         let watches_lock = self.psi_watcher.watches.lock().unwrap();
         let mut result = HashMap::new();
 
-        for (&pid, watch) in watches_lock.iter() {
-            let pressure_file_name = match watch.pressure_type {
-                PressureType::Memory => "memory.pressure",
-                PressureType::Cpu => "cpu.pressure",
-                PressureType::Io => "io.pressure",
-            };
-            let pressure_file_path = format!("{}/{}", watch.cgroup_path, pressure_file_name);
+        for (&pid, cgroup_path) in watches_lock.iter() {
+            let pressure_file_path = format!("{}/memory.pressure", cgroup_path);
             let mut content = String::new();
             if let Ok(mut f) = fs::File::open(&pressure_file_path) {
                 if f.read_to_string(&mut content).is_ok() {
-                    result.insert(
-                        pid,
-                        (watch.pressure_type.clone(), content.trim_end().to_string()),
-                    );
+                    result.insert(pid, (PressureType::Memory, content.trim_end().to_string()));
                 }
             }
         }
@@ -59,19 +50,18 @@ impl ProcMon {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         debug!("Creating new ProcMon instance");
 
-        let psi_watcher = PsiWatcher::new();
+        let psi_watcher = Arc::new(PsiWatcher::new());
 
         psi_watcher.set_callback(|pid, info| {
-            info!("PSI event for pid {}: {}", pid, info);
+            debug!("PSI event for pid {}: {}", pid, info);
         });
 
         info!("ProcMon created successfully");
         Ok(ProcMon {
             running: Arc::new(AtomicBool::new(false)),
             handles: Arc::new(Mutex::new(Vec::new())),
-            callback: Arc::new(Mutex::new(None)),
-            processes: Arc::new(Mutex::new(HashMap::new())),
-            psi_watcher: Arc::new(psi_watcher),
+            processes: psi_watcher.processes.clone(),
+            psi_watcher,
             config: Arc::new(Mutex::new(ProcCfg::default())),
             snap1: Arc::new(Mutex::new(HashMap::new())),
             snap2: Arc::new(Mutex::new(HashMap::new())),
@@ -84,54 +74,13 @@ impl ProcMon {
         *cfg = config;
     }
 
-    /// Handle a fork event - this is called when a Proc Netlink watcher is started
-    /// and generates an event for a process start. The process will be updated and
-    /// watched for PSI.
-    pub fn handle_fork(&self, parent_tgid: u32, child_pid: u32, child_tgid: u32) {
-        if let Ok(process_info) = read_process_info_from_proc(child_tgid) {
-            if parent_tgid == child_tgid {
-                debug!(
-                    "thread: parent pid={} -> child pid={} {} {}",
-                    parent_tgid, child_pid, child_tgid, process_info.comm
-                );
-            } else {
-                debug!(
-                    "fork: parent pid={} -> child pid={} {} tname/cmd ({}) {:?}",
-                    parent_tgid, child_pid, child_tgid, process_info.comm, process_info.cmdline
-                );
-
-                {
-                    let mut proc_map = self.processes.lock().unwrap();
-                    proc_map.insert(process_info.pid, process_info.clone());
-                }
-
-                self.psi_watcher
-                    .add_pid(process_info.pid, PressureType::Memory);
-                self.psi_watcher
-                    .add_pid(process_info.pid, PressureType::Cpu);
-                self.psi_watcher.add_pid(process_info.pid, PressureType::Io);
-
-                if let Some(cb) = self.callback.lock().unwrap().as_ref() {
-                    cb(process_info);
-                }
-            }
-        }
-    }
-
-    /// Handle an exit event.
-    pub fn handle_exit(&self, process_tgid: u32) {
-        info!("exit: pid={}", process_tgid);
-        self.processes.lock().unwrap().remove(&process_tgid);
-        self.psi_watcher.remove_pid(process_tgid);
-    }
-
     /// Set a callback to be invoked when a new process is observed.
     pub fn set_callback<F>(&self, cb: F)
     where
         F: Fn(ProcessInfo) + Send + Sync + 'static,
     {
-        let mut opt = self.callback.lock().unwrap();
-        *opt = Some(Box::new(cb));
+        let mut opt2 = self.psi_watcher.proc_callback.lock().unwrap();
+        *opt2 = Some(Box::new(cb));
     }
 
     /// Start the monitoring and periodic checker. Will also read
@@ -144,6 +93,7 @@ impl ProcMon {
         &self,
         _read_sync: bool,
         watch_psi: bool,
+        event_tx: Option<mpsc::Sender<crate::MonitoringEvent>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Starting monitoring");
         if self.running.load(Ordering::SeqCst) {
@@ -185,6 +135,11 @@ impl ProcMon {
 
             let mut s2 = self.snap2.lock().unwrap();
             *s2 = initial_processes;
+        }
+
+        if watch_psi {
+            debug!("Starting PSI watcher");
+            self.psi_watcher.start(event_tx)?;
         }
 
         Ok(())
@@ -270,9 +225,7 @@ impl ProcMon {
                             // If watching PSI and process has a cgroup, start monitoring
                             if watch_psi {
                                 trace!("Adding PID {} to PSI watcher", pid);
-                                self.psi_watcher.add_pid(pid, PressureType::Memory);
-                                self.psi_watcher.add_pid(pid, PressureType::Cpu);
-                                self.psi_watcher.add_pid(pid, PressureType::Io);
+                                self.psi_watcher.add_pid(pid);
                             }
                         }
                     }
@@ -556,7 +509,6 @@ fn periodic_snapshot_checker(
         let fresh_proc_mon = ProcMon {
             running: running.clone(),
             handles: Arc::new(Mutex::new(Vec::new())),
-            callback: Arc::new(Mutex::new(None)),
             processes: Arc::new(Mutex::new(HashMap::new())),
             psi_watcher: psi_watcher.clone(),
             config: config.clone(),
@@ -622,9 +574,7 @@ fn update_psi_watcher_for_pids(
         psi_watcher.remove_pid(pid);
     }
     for pid in added_pids {
-        psi_watcher.add_pid(pid, PressureType::Memory);
-        psi_watcher.add_pid(pid, PressureType::Cpu);
-        psi_watcher.add_pid(pid, PressureType::Io);
+        psi_watcher.add_pid(pid);
     }
 }
 
@@ -639,7 +589,7 @@ mod tests {
             refresh_interval: Some(std::time::Duration::from_millis(100)),
         });
         proc_mon
-            .start(true, false)
+            .start(true, false, None)
             .expect("Failed to start ProcMon");
 
         let processes = proc_mon.get_all_processes();

@@ -1,12 +1,14 @@
 use axum::serve;
 use clap::Parser;
-use pmond::{proc_netlink, ProcMon};
+use pmond::{proc_netlink, psi::PsiWatcher, ProcMon};
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 fn get_local_ip() -> Option<String> {
     use std::net::UdpSocket;
@@ -41,6 +43,14 @@ struct Args {
     /// Run MCP via UDS at the specified path
     #[clap(long = "mcp-uds", value_name = "PATH")]
     mcp_uds: Option<String>,
+
+    /// Start monitoring processes via netlink
+    #[clap(long = "monitor")]
+    monitor: bool,
+
+    /// Show debug information
+    #[clap(long = "debug")]
+    debug: bool,
 }
 
 use tracing_subscriber::layer::SubscriberExt;
@@ -55,7 +65,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 /// - `RUST_LOG=debug` -> Log debug and above
 /// - `RUST_LOG=pmond=debug,info` -> Log debug for pmond crate, info for others
 fn init_telemetry() {
-    let json_layer = tracing_subscriber::fmt::layer().json();
+    let out_layer = tracing_subscriber::fmt::layer().compact();
 
     let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
         tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
@@ -65,7 +75,7 @@ fn init_telemetry() {
 
     Registry::default()
         .with(EnvFilter::from_default_env())
-        .with(json_layer)
+        .with(out_layer)
         .with(perfetto_layer)
         .init();
 }
@@ -97,6 +107,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if args.monitor {
+        run_monitor(args.debug, args.mcp_uds).await?;
+        return Ok(());
+    }
+
     // Authorized UID for MCP UDS
     let auth_uid = std::env::var("MCP_AUTHORIZED_UID")
         .ok()
@@ -108,9 +123,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn start_monitoring(proc_mon: Arc<ProcMon>) -> tokio::task::JoinHandle<()> {
-    let (tx, mut rx) = mpsc::channel(100);
-    let running = proc_mon.running.clone();
+async fn run_monitor(
+    debug: bool,
+    mcp_uds: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting PMON monitor mode");
+
+    let proc_mon = ProcMon::new()?;
+    let proc_mon = Arc::new(proc_mon);
+
+    let (tx, rx) = mpsc::channel(100);
+
+    // Start monitoring (periodic snapshot and PSI)
+    proc_mon.start(true, true, Some(tx.clone()))?;
+
+    let (event_tx, _) = broadcast::channel::<serde_json::Value>(1024);
+
+    // Start monitoring consumer loop
+    start_monitoring(
+        proc_mon.psi_watcher.clone(),
+        tx,
+        rx,
+        Some(event_tx.clone()),
+        debug,
+    );
+
+    // Determine path for pwatch.sock
+    let path_str = if let Some(path) = mcp_uds {
+        if path.ends_with(".mcp") || path.ends_with(".sock") || path.ends_with(".http") {
+            let base = path.rsplit_once('.').map(|x| x.0).unwrap_or(&path);
+            format!("{}.pwatch", base)
+        } else {
+            format!("{}/pwatch.sock", path)
+        }
+    } else {
+        let uid = unsafe { libc::getuid() };
+        format!("/run/user/{}/pwatch.sock", uid)
+    };
+
+    // Ensure parent directory exists
+    let path = std::path::Path::new(&path_str);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(path);
+
+    let listener = UnixListener::bind(path)?;
+    info!("Mirroring events to UDS: {}", path_str);
+
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                let mut rx = event_tx.subscribe();
+                tokio::spawn(async move {
+                    while let Ok(msg) = rx.recv().await {
+                        let json = serde_json::to_vec(&msg).unwrap();
+                        if let Err(_) = stream.write_all(&json).await {
+                            break;
+                        }
+                        if let Err(_) = stream.write_all(b"\n").await {
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Accept error: {}", e);
+            }
+        }
+    }
+}
+
+fn start_monitoring(
+    psi_watcher: Arc<PsiWatcher>,
+    tx: mpsc::Sender<pmond::MonitoringEvent>,
+    mut rx: mpsc::Receiver<pmond::MonitoringEvent>,
+    event_tx: Option<broadcast::Sender<serde_json::Value>>,
+    debug: bool,
+) -> tokio::task::JoinHandle<()> {
+    let running = psi_watcher.running.clone();
 
     // Start netlink listener
     tokio::task::spawn_blocking(move || {
@@ -120,22 +211,173 @@ fn start_monitoring(proc_mon: Arc<ProcMon>) -> tokio::task::JoinHandle<()> {
     });
 
     // Start event consumer
-    let pm = proc_mon.clone();
+    let pw = psi_watcher.clone();
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                proc_netlink::NetlinkEvent::Fork {
-                    parent_tgid,
-                    child_pid,
-                    child_tgid,
-                    ..
-                } => {
-                    pm.handle_fork(parent_tgid, child_pid, child_tgid);
+        while let Some(monitoring_event) = rx.recv().await {
+            let mut should_broadcast = true;
+            let event_json = match monitoring_event {
+                pmond::MonitoringEvent::Netlink(event) => match event {
+                    proc_netlink::NetlinkEvent::Fork {
+                        parent_pid,
+                        parent_tgid,
+                        child_pid,
+                        child_tgid,
+                    } => {
+                        let p_pid = if parent_tgid != 0 {
+                            parent_tgid
+                        } else {
+                            parent_pid
+                        };
+                        let c_pid = if child_tgid != 0 {
+                            child_tgid
+                        } else {
+                            child_pid
+                        };
+
+                        pw.handle_fork(p_pid, child_pid, c_pid);
+                        should_broadcast = false;
+                        debug!(
+                            "fork: parent pid={} -> child pid={} tgid={}",
+                            p_pid, child_pid, c_pid
+                        );
+                        json!({
+                            "type": "fork",
+                            "parent_pid": p_pid,
+                            "comm": pmond::read_comm(p_pid),
+                            "child_pid": child_pid,
+                            "child_tgid": c_pid,
+                        })
+                    }
+                    proc_netlink::NetlinkEvent::Exec {
+                        process_pid,
+                        process_tgid,
+                    } => {
+                        let pid = if process_tgid != 0 {
+                            process_tgid
+                        } else {
+                            process_pid
+                        };
+                        pw.handle_exec(process_pid, pid);
+
+                        let mut comm = pmond::read_comm(pid);
+                        let mut cmdline = pmond::read_cmdline(pid);
+                        let mut exe = pmond::read_exe(pid);
+                        let mut cgroup = pmond::read_cgroup_path(pid);
+
+                        // Fallback to process_pid if tgid fields were null
+                        if (cmdline.is_none() || exe.is_none())
+                            && process_pid != pid
+                            && process_pid != 0
+                        {
+                            if cmdline.is_none() {
+                                cmdline = pmond::read_cmdline(process_pid);
+                            }
+                            if exe.is_none() {
+                                exe = pmond::read_exe(process_pid);
+                            }
+                            if cgroup.is_none() {
+                                cgroup = pmond::read_cgroup_path(process_pid);
+                            }
+                            if comm == "(unknown)" {
+                                comm = pmond::read_comm(process_pid);
+                            }
+                        }
+
+                        json!({
+                            "type": "exec",
+                            "pid": process_pid,
+                            "tgid": process_tgid,
+                            "comm": comm,
+                            "cmdline": cmdline,
+                            "exe": exe,
+                            "cgroup": cgroup,
+                        })
+                    }
+                    proc_netlink::NetlinkEvent::Exit {
+                        process_tgid,
+                        process_pid,
+                        exit_code,
+                        exit_signal,
+                        ..
+                    } => {
+                        let pid = if process_tgid != 0 {
+                            process_tgid
+                        } else {
+                            process_pid
+                        };
+                        pw.handle_exit(pid);
+                        json!({
+                            "type": "exit",
+                            "pid": process_pid,
+                            "tgid": process_tgid,
+                            "exit_code": exit_code,
+                            "exit_signal": exit_signal
+                        })
+                    }
+                    proc_netlink::NetlinkEvent::Uid {
+                        process_pid,
+                        process_tgid,
+                        ruid,
+                        euid,
+                    } => {
+                        let pid = if process_tgid != 0 {
+                            process_tgid
+                        } else {
+                            process_pid
+                        };
+                        pw.handle_uid(process_pid, pid, ruid, euid);
+                        should_broadcast = false;
+                        debug!(
+                            "uid change: pid={} tgid={} ruid={} euid={}",
+                            process_pid, pid, ruid, euid
+                        );
+                        json!({
+                            "type": "uid",
+                            "pid": process_pid,
+                            "tgid": process_tgid,
+                            "ruid": ruid,
+                            "euid": euid,
+                            "comm": pmond::read_comm(pid)
+                        })
+                    }
+                    proc_netlink::NetlinkEvent::Comm {
+                        process_pid,
+                        process_tgid,
+                        comm,
+                    } => {
+                        let pid = if process_tgid != 0 {
+                            process_tgid
+                        } else {
+                            process_pid
+                        };
+                        pw.handle_comm(process_pid, pid, comm.clone());
+                        json!({
+                            "type": "comm",
+                            "pid": process_pid,
+                            "tgid": process_tgid,
+                            "comm": comm
+                        })
+                    }
+                },
+                pmond::MonitoringEvent::Pressure(event) => {
+                    json!({
+                        "type": "pressure",
+                        "pid": event.pid,
+                        "pressure_type": format!("{:?}", event.pressure_type).to_lowercase(),
+                        "data": event.pressure_data,
+                        "comm": pmond::read_comm(event.pid)
+                    })
                 }
-                proc_netlink::NetlinkEvent::Exit { process_tgid, .. } => {
-                    pm.handle_exit(process_tgid);
+            };
+
+            if should_broadcast {
+                if debug {
+                    println!("{}", serde_json::to_string(&event_json).unwrap());
                 }
-                _ => {}
+
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(event_json);
+                }
             }
         }
     })
@@ -149,8 +391,7 @@ fn show_processes() -> Result<(), Box<dyn std::error::Error>> {
     let proc_mon = Arc::new(proc_mon);
 
     // Start monitoring
-    proc_mon.start(true, true)?;
-    start_monitoring(proc_mon.clone());
+    proc_mon.start(true, true, None)?;
 
     // Get processes and display them sorted by RSS
     let processes = proc_mon.get_all_processes();
@@ -177,8 +418,7 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
     let proc_mon = Arc::new(proc_mon);
 
     // Start monitoring
-    proc_mon.start(true, true)?;
-    start_monitoring(proc_mon.clone());
+    proc_mon.start(true, true, None)?;
 
     info!(
         "Watching process {} with refresh interval {}s",
@@ -216,8 +456,7 @@ async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     let proc_mon = Arc::new(proc_mon);
 
     // MCP server might start monitoring internally or we start it here
-    proc_mon.start(true, true)?;
-    start_monitoring(proc_mon.clone());
+    proc_mon.start(true, true, None)?;
 
     pmond::handlers::run_stdio_server(proc_mon).await
 }
@@ -233,9 +472,11 @@ async fn run_server(
     let proc_mon = ProcMon::new()?;
     let proc_mon = Arc::new(proc_mon);
 
+    let (tx, rx) = mpsc::channel(100);
+
     // Start monitoring
-    proc_mon.start(true, true)?;
-    start_monitoring(proc_mon.clone());
+    proc_mon.start(true, true, Some(tx.clone()))?;
+    start_monitoring(proc_mon.psi_watcher.clone(), tx, rx, None, false);
 
     info!("PMON process monitor started successfully");
 
