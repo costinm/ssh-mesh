@@ -6,10 +6,12 @@
 //! - [`ProcMon`]: Process monitor for tracking process lifecycle
 //! - Helper functions for reading process details from procfs
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
 pub mod handlers;
+pub mod methods;
 pub mod proc;
 pub mod proc_netlink;
 pub mod psi;
@@ -29,14 +31,9 @@ pub fn read_comm(pid: u32) -> String {
         .unwrap_or_else(|_| "(unknown)".to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum PressureType {
-    Memory,
-}
-
 pub use read_process_info as read_process_info_from_proc;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub ppid: u32,
@@ -47,6 +44,65 @@ pub struct ProcessInfo {
     pub uid: Option<u32>,
 }
 
+// ============================================================================
+// API Argument Types (used by HTTP, MCP, and handlers)
+// ============================================================================
+
+/// Arguments for list_processes - no parameters needed
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct ListProcessesArgs {}
+
+/// Arguments for get_process
+#[derive(Deserialize, JsonSchema)]
+pub struct GetProcessArgs {
+    /// Process ID or name to look up
+    pub process: String,
+}
+
+/// Arguments for list_cgroups - no parameters needed
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct ListCgroupsArgs {}
+
+/// Arguments for get_cgroup
+#[derive(Deserialize, JsonSchema)]
+pub struct GetCgroupArgs {
+    /// Full cgroup path
+    pub path: String,
+}
+
+/// Arguments for move_process
+#[derive(Deserialize, JsonSchema)]
+pub struct MoveProcessArgs {
+    /// Process ID to move
+    pub pid: u32,
+    /// Target cgroup name (None for default)
+    pub cgroup_name: Option<String>,
+}
+
+/// Arguments for clear_refs
+#[derive(Deserialize, JsonSchema)]
+pub struct ClearRefsArgs {
+    /// Process ID
+    pub pid: u32,
+    /// Value to write: "1"-"5" or "7" for all
+    pub value: String,
+}
+
+/// Arguments for cgroup_high
+#[derive(Deserialize, JsonSchema)]
+pub struct CgroupHighArgs {
+    /// Full cgroup path
+    pub path: String,
+    /// Percentage of current memory to set as high (0-100)
+    pub percentage: f64,
+    /// Seconds before resetting to max (0 = no reset)
+    pub interval: u64,
+}
+
+/// Arguments for psi_watches - no parameters needed
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct PsiWatchesArgs {}
+
 #[derive(Debug, Clone)]
 pub enum MonitoringEvent {
     Netlink(crate::proc_netlink::NetlinkEvent),
@@ -55,7 +111,7 @@ pub enum MonitoringEvent {
 
 /// Memory info for a process or cgroup. Each field should have a comment indicating
 /// where it is derived from.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
 pub struct ProcMemInfo {
     // --- Delta Fields  ---
     /// Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon).

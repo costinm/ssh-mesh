@@ -1,6 +1,5 @@
 /// Watching pressure (PSI) for a set of cgroups. The list is updated periodically
 /// or by using cgroup-level APIs directly.
-use crate::PressureType;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
@@ -118,6 +117,11 @@ impl PressureInfo {
         self.last_event_time = Some(Instant::now());
         self.event_count += 1;
     }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PressureType {
+    Memory,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -469,6 +469,11 @@ impl ProcMon {
         let _ = self.get_process(pid);
         Ok(())
     }
+
+    /// Get all PSI watches and their current status.
+    pub fn get_psi_watches(&self) -> std::collections::HashMap<String, crate::psi::PressureInfo> {
+        self.psi_watcher.watches.lock().clone()
+    }
 }
 
 // ============================================================================
