@@ -1,10 +1,10 @@
-/// Watching pressure (PSI) for a set of processes. The list is updated periodically
-/// or by using netlink or manually.
-use crate::{create_process_info, PressureType};
+/// Watching pressure (PSI) for a set of cgroups. The list is updated periodically
+/// or by using cgroup-level APIs directly.
+use crate::PressureType;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
@@ -13,6 +13,7 @@ use std::sync::{
     Arc,
 };
 use std::thread::JoinHandle;
+use std::time::{Instant, SystemTime};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -24,26 +25,120 @@ const DEFAULT_INTERVAL_US: u64 = 10000;
 /// Default PSI threshold in microseconds (10 seconds)
 const DEFAULT_THRESHOLD_US: u64 = 10000000;
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PressureEvent {
-    pub pid: u32,
-    pub pressure_type: PressureType,
-    pub pressure_data: String,
+/// Parsed PSI pressure data from /proc/pressure or cgroup memory.pressure files.
+/// Format: "some avg10=X.XX avg60=X.XX avg300=X.XX total=N"
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PressureData {
+    /// Average percentage of time stalled in the last 10 seconds
+    pub avg10: f64,
+    /// Average percentage of time stalled in the last 60 seconds
+    pub avg60: f64,
+    /// Average percentage of time stalled in the last 300 seconds
+    pub avg300: f64,
+    /// Total stall time in microseconds
+    pub total: u64,
+    /// Raw string if parsing failed
+    pub raw: Option<String>,
 }
 
+impl PressureData {
+    /// Parse PSI data from a string like "some avg10=0.00 avg60=0.00 avg300=0.00 total=0"
+    pub fn parse(s: &str) -> Self {
+        let mut data = PressureData::default();
+
+        // Look for the "some" line (we're monitoring "some" pressure, not "full")
+        for line in s.lines() {
+            if line.starts_with("some") || !line.starts_with("full") {
+                for part in line.split_whitespace() {
+                    if let Some((key, val)) = part.split_once('=') {
+                        match key {
+                            "avg10" => data.avg10 = val.parse().unwrap_or(0.0),
+                            "avg60" => data.avg60 = val.parse().unwrap_or(0.0),
+                            "avg300" => data.avg300 = val.parse().unwrap_or(0.0),
+                            "total" => data.total = val.parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // Store raw if no meaningful data was parsed
+        if data.total == 0 && data.avg10 == 0.0 && data.avg60 == 0.0 && data.avg300 == 0.0 {
+            data.raw = Some(s.to_string());
+        }
+
+        data
+    }
+}
+
+/// Tracks pressure information for a cgroup, including historical events.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PressureInfo {
+    /// The cgroup path being watched
+    pub cgroup_path: String,
+    /// When this cgroup was first added to the watch list
+    pub watch_started: SystemTime,
+    /// The most recent pressure event data
+    pub last_event: Option<PressureData>,
+    /// Timestamp of the most recent event (monotonic)
+    #[serde(skip)]
+    pub last_event_time: Option<Instant>,
+    /// The previous pressure event data (before last_event)
+    pub previous_event: Option<PressureData>,
+    /// Timestamp of the previous event (monotonic)
+    #[serde(skip)]
+    pub previous_event_time: Option<Instant>,
+    /// Total number of pressure events received
+    pub event_count: u64,
+}
+
+impl PressureInfo {
+    /// Create a new PressureInfo for a cgroup
+    pub fn new(cgroup_path: String) -> Self {
+        Self {
+            cgroup_path,
+            watch_started: SystemTime::now(),
+            last_event: None,
+            last_event_time: None,
+            previous_event: None,
+            previous_event_time: None,
+            event_count: 0,
+        }
+    }
+
+    /// Record a new pressure event
+    pub fn record_event(&mut self, data: PressureData) {
+        // Shift last to previous
+        self.previous_event = self.last_event.take();
+        self.previous_event_time = self.last_event_time.take();
+        // Set new last
+        self.last_event = Some(data);
+        self.last_event_time = Some(Instant::now());
+        self.event_count += 1;
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PressureEvent {
+    pub cgroup_path: String,
+    pub pressure_type: PressureType,
+    pub pressure_data: PressureData,
+}
+
+/// PsiWatcher is watching for memory pressure for a set of cgroups.
 pub struct PsiWatcher {
     pub running: Arc<AtomicBool>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     waker: Arc<Mutex<Option<Waker>>>,
 
-    // PID -> Cgroup Path
-    pub watches: Arc<Mutex<HashMap<u32, String>>>,
+    // Cgroups being watched -> their pressure info
+    pub watches: Arc<Mutex<HashMap<String, PressureInfo>>>,
 
-    pub processes: Arc<Mutex<HashMap<u32, crate::ProcessInfo>>>,
-
-    // Notification for the monitoring thread - to add and remove processes.
-    new_pid_events: Arc<Mutex<Vec<(u32, String)>>>,
-    terminated_pids: Arc<Mutex<Vec<u32>>>,
+    // Notification for the monitoring thread - to add and remove cgroups.
+    new_cgroup_events: Arc<Mutex<Vec<String>>>,
+    removed_cgroups: Arc<Mutex<Vec<String>>>,
 
     pub event_tx: broadcast::Sender<PressureEvent>,
 
@@ -66,9 +161,8 @@ impl PsiWatcher {
         let watcher = PsiWatcher {
             running: Arc::new(AtomicBool::new(false)),
             watches: Arc::new(Mutex::new(HashMap::new())),
-            processes: Arc::new(Mutex::new(HashMap::new())),
-            new_pid_events: Arc::new(Mutex::new(Vec::new())),
-            terminated_pids: Arc::new(Mutex::new(Vec::new())),
+            new_cgroup_events: Arc::new(Mutex::new(Vec::new())),
+            removed_cgroups: Arc::new(Mutex::new(Vec::new())),
             handle: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
             event_tx,
@@ -78,66 +172,98 @@ impl PsiWatcher {
         watcher
     }
 
-    /// Add a memory pressure watch for a PID, if one doesn't exist already for the group.
-    /// Ideally longer lived processes will sit in a separate cgroup and be watched.
-    ///
-    /// We don't want to monitor short lived processes - they may sit in the parent cgroup, are considered
-    /// part of its normal memory use and part of performing a specific operation (for example getting a token).
-    ///
-    /// If a process lives longer than x sec it will be watched.  
-    #[instrument(skip(self), fields(pid = pid))]
-    pub fn add_pid(&self, pid: u32) {
-        match create_process_info(pid) {
-            Ok(process_info) => {
-                if let Some(cgroup_path) = process_info.cgroup_path {
-                    trace!("Found cgroup path for PID {}: {}", pid, cgroup_path);
-                    {
-                        let mut watches = self.watches.lock();
-                        watches.insert(pid, cgroup_path.clone());
-                    }
-
-                    {
-                        let mut events = self.new_pid_events.lock();
-                        events.push((pid, cgroup_path));
-                    }
-
-                    if let Some(waker) = self.waker.lock().as_ref() {
-                        if let Err(e) = waker.wake() {
-                            debug!("Failed to wake PSI watcher for PID {}: {}", pid, e);
-                        } else {
-                            debug!("Wake signal sent for new PID {}", pid);
-                        }
-                    }
-                } else {
-                    debug!("No cgroup path found for PID {}, skipping", pid);
-                }
+    /// Add a cgroup to the watch list.
+    #[instrument(skip(self), fields(cgroup_path = cgroup_path))]
+    pub fn add_cgroup(&self, cgroup_path: &str) {
+        {
+            let mut watches = self.watches.lock();
+            if watches.contains_key(cgroup_path) {
+                trace!("Cgroup {} already watched, skipping", cgroup_path);
+                return;
             }
-            Err(e) => {
-                debug!("Failed to create process info for PID {}: {}", pid, e);
+            watches.insert(
+                cgroup_path.to_string(),
+                PressureInfo::new(cgroup_path.to_string()),
+            );
+        }
+
+        {
+            let mut events = self.new_cgroup_events.lock();
+            events.push(cgroup_path.to_string());
+        }
+
+        if let Some(waker) = self.waker.lock().as_ref() {
+            if let Err(e) = waker.wake() {
+                debug!(
+                    "Failed to wake PSI watcher for cgroup {}: {}",
+                    cgroup_path, e
+                );
+            } else {
+                debug!("Wake signal sent for new cgroup {}", cgroup_path);
             }
         }
     }
 
-    /// Remove a process from the watch list - process is gone.
-    ///
-    /// Normally the watcher should detect close and remove this already.
-    #[instrument(skip(self), fields(pid = pid))]
-    pub fn remove_pid(&self, pid: u32) {
+    /// Remove a cgroup from the watch list.
+    #[instrument(skip(self), fields(cgroup_path = cgroup_path))]
+    pub fn remove_cgroup(&self, cgroup_path: &str) {
         {
             let mut watches = self.watches.lock();
-            if watches.remove(&pid).is_none() {
+            if watches.remove(cgroup_path).is_none() {
                 return;
             }
         }
 
-        let mut terminated_pids = self.terminated_pids.lock();
-        terminated_pids.push(pid);
+        let mut removed = self.removed_cgroups.lock();
+        removed.push(cgroup_path.to_string());
         if let Some(waker) = self.waker.lock().as_ref() {
             if let Err(e) = waker.wake() {
-                error!("Failed to wake PSI watcher for PID {}: {}", pid, e);
+                error!(
+                    "Failed to wake PSI watcher for cgroup {}: {}",
+                    cgroup_path, e
+                );
             }
         }
-        debug!("Process {} removal signal queued", pid);
+        debug!("Cgroup {} removal signal queued", cgroup_path);
+    }
+
+    /// Prune cgroups that are no longer active.
+    ///
+    /// This will remove watches for any cgroup not in the `active_cgroups` set.
+    #[instrument(skip(self, active_cgroups))]
+    pub fn prune_cgroups(&self, active_cgroups: &HashSet<String>) {
+        let cgroups_to_remove: Vec<String> = {
+            let watches = self.watches.lock();
+            watches
+                .keys()
+                .filter(|cgroup| !active_cgroups.contains(*cgroup))
+                .cloned()
+                .collect()
+        };
+
+        for cgroup in cgroups_to_remove {
+            self.remove_cgroup(&cgroup);
+        }
+    }
+
+    /// Ensure that the specified cgroups are being watched.
+    ///
+    /// Adds any cgroup in `target_cgroups` that is not currently watched.
+    #[instrument(skip(self, target_cgroups))]
+    pub fn watch_cgroups(&self, target_cgroups: &HashSet<String>) {
+        // Identify which cgroups are already watched
+        let watched_cgroups: std::collections::HashSet<String> =
+            self.watches.lock().keys().cloned().collect();
+
+        // Identify which cgroups need to be added
+        let missing_cgroups: Vec<_> = target_cgroups
+            .difference(&watched_cgroups)
+            .cloned()
+            .collect();
+
+        for cgroup in missing_cgroups {
+            self.add_cgroup(&cgroup);
+        }
     }
 
     /// Start the PSI monitoring thread
@@ -147,16 +273,15 @@ impl PsiWatcher {
         monitoring_tx: Option<mpsc::Sender<crate::MonitoringEvent>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if self.running.load(Ordering::SeqCst) {
-            debug!("PSI monitoring already running");
             return Ok(());
         }
 
         self.running.store(true, Ordering::SeqCst);
-    
+
         let running = self.running.clone();
         let watches = self.watches.clone();
-        let new_pid_events = self.new_pid_events.clone();
-        let terminated_pids = self.terminated_pids.clone();
+        let new_cgroup_events = self.new_cgroup_events.clone();
+        let removed_cgroups = self.removed_cgroups.clone();
         let waker = self.waker.clone();
         let event_tx = self.event_tx.clone();
         let internal_monitoring_tx = monitoring_tx.clone();
@@ -164,7 +289,6 @@ impl PsiWatcher {
         let threshold_us = self.threshold_us;
 
         let handle = std::thread::spawn(move || {
-
             let mut poll = match Poll::new() {
                 Ok(p) => p,
                 Err(e) => {
@@ -174,13 +298,12 @@ impl PsiWatcher {
             };
             let mut events = Events::with_capacity(2048);
 
-            // Internal state
-            let mut cgroup_to_pids: HashMap<String, std::collections::HashSet<u32>> =
-                HashMap::new();
+            // Internal state - maps for tracking cgroup watches
             let mut token_to_cgroup: HashMap<Token, String> = HashMap::new();
-            let mut cgroup_to_token: HashMap<String, Token> = HashMap::new(); // Reverse map for O(1) cleanup
+            let mut cgroup_to_token: HashMap<String, Token> = HashMap::new();
             let mut cgroup_to_file: HashMap<String, File> = HashMap::new();
             let mut next_token = Token(0);
+            let is_root = unsafe { libc::getuid() } == 0;
 
             let new_waker = match Waker::new(poll.registry(), WAKER_TOKEN) {
                 Ok(w) => w,
@@ -210,14 +333,24 @@ impl PsiWatcher {
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        error!("Failed to open {}: {}", pressure_file_path, e);
+                        let is_root = unsafe { libc::getuid() } == 0;
+                        if is_root {
+                            debug!("Failed to open {}: {}", pressure_file_path, e);
+                        } else {
+                            trace!("Failed to open {}: {}", pressure_file_path, e);
+                        }
                         return false;
                     }
                 };
 
                 let trig = format!("some {} {}", interval_us, threshold_us);
                 if let Err(e) = file.write_all(trig.as_bytes()) {
-                    error!("Failed to write trigger to {}: {}", pressure_file_path, e);
+                    let is_root = unsafe { libc::getuid() } == 0;
+                    if is_root {
+                        debug!("Failed to write trigger to {}: {}", pressure_file_path, e);
+                    } else {
+                        trace!("Failed to write trigger to {}: {}", pressure_file_path, e);
+                    }
                     return false;
                 }
 
@@ -229,7 +362,12 @@ impl PsiWatcher {
                     poll.registry()
                         .register(&mut SourceFd(&fd), token, Interest::PRIORITY)
                 {
-                    error!("Failed to register {} with mio: {}", pressure_file_path, e);
+                    let is_root = unsafe { libc::getuid() } == 0;
+                    if is_root {
+                        debug!("Failed to register {} with mio: {}", pressure_file_path, e);
+                    } else {
+                        trace!("Failed to register {} with mio: {}", pressure_file_path, e);
+                    }
                     return false;
                 }
 
@@ -240,29 +378,77 @@ impl PsiWatcher {
                 true
             }
 
-            // Initial setup - populate internal state from existing watches
+            /// Helper to cleanup a cgroup watch
+            fn cleanup_cgroup_watch(
+                cgroup_path: &str,
+                poll: &Poll,
+                token_to_cgroup: &mut HashMap<Token, String>,
+                cgroup_to_token: &mut HashMap<String, Token>,
+                cgroup_to_file: &mut HashMap<String, File>,
+            ) {
+                if let Some(file) = cgroup_to_file.remove(cgroup_path) {
+                    let fd = file.as_raw_fd();
+                    if let Some(t) = cgroup_to_token.remove(cgroup_path) {
+                        let _ = poll.registry().deregister(&mut SourceFd(&fd));
+                        token_to_cgroup.remove(&t);
+                    }
+                }
+                debug!("Cleaned up watch for cgroup: {}", cgroup_path);
+            }
+
             {
                 let watches_snapshot = watches.lock();
-                for (&pid, cgroup_path) in watches_snapshot.iter() {
-                    cgroup_to_pids
-                        .entry(cgroup_path.clone())
-                        .or_insert_with(std::collections::HashSet::new)
-                        .insert(pid);
+                for cgroup_path in watches_snapshot.keys() {
+                    setup_cgroup_watch(
+                        cgroup_path,
+                        interval_us,
+                        threshold_us,
+                        &poll,
+                        &mut next_token,
+                        &mut token_to_cgroup,
+                        &mut cgroup_to_token,
+                        &mut cgroup_to_file,
+                    );
                 }
             }
 
-            // Open files and register watches for existing cgroups
-            for cgroup_path in cgroup_to_pids.keys().cloned().collect::<Vec<_>>() {
-                setup_cgroup_watch(
-                    &cgroup_path,
-                    interval_us,
-                    threshold_us,
-                    &poll,
-                    &mut next_token,
-                    &mut token_to_cgroup,
-                    &mut cgroup_to_token,
-                    &mut cgroup_to_file,
-                );
+            // Register system-wide memory pressure watch
+            let system_pressure_path = "/proc/pressure/memory";
+            if is_root && std::path::Path::new(system_pressure_path).exists() {
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(system_pressure_path)
+                {
+                    Ok(mut file) => {
+                        let trig = format!("some {} {}", interval_us, threshold_us);
+                        if let Err(e) = file.write_all(trig.as_bytes()) {
+                            error!("Failed to write trigger to {}: {}", system_pressure_path, e);
+                        } else {
+                            let fd = file.as_raw_fd();
+                            let token = Token(next_token.0);
+                            next_token.0 += 1;
+                            if let Err(e) = poll.registry().register(
+                                &mut SourceFd(&fd),
+                                token,
+                                Interest::PRIORITY,
+                            ) {
+                                error!(
+                                    "Failed to register {} with mio: {}",
+                                    system_pressure_path, e
+                                );
+                            } else {
+                                token_to_cgroup.insert(token, system_pressure_path.to_string());
+                                cgroup_to_file.insert(system_pressure_path.to_string(), file);
+                                debug!(
+                                    "Started watching system pressure: {}",
+                                    system_pressure_path
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => debug!("Failed to open system pressure file: {}", e),
+                }
             }
 
             while running.load(Ordering::SeqCst) {
@@ -284,46 +470,29 @@ impl PsiWatcher {
                                 return;
                             }
 
-                            // Handle terminations - drain vec first to minimize lock time
-                            let pids_to_remove: Vec<u32> = {
-                                let mut lock = terminated_pids.lock();
+                            // Handle cgroup removals - drain vec first to minimize lock time
+                            let cgroups_to_remove: Vec<String> = {
+                                let mut lock = removed_cgroups.lock();
                                 lock.drain(..).collect()
                             };
 
-                            for pid in pids_to_remove {
-                                let mut cgroup_to_cleanup = None;
-
-                                // Find which cgroup this PID belonged to and remove it
-                                if let Some(cgroup_path) = watches.lock().remove(&pid) {
-                                    if let Some(pids) = cgroup_to_pids.get_mut(&cgroup_path) {
-                                        pids.remove(&pid);
-                                        if pids.is_empty() {
-                                            cgroup_to_cleanup = Some(cgroup_path);
-                                        }
-                                    }
-                                }
-
-                                if let Some(path) = cgroup_to_cleanup {
-                                    debug!("Cleaning up watch for empty cgroup: {}", path);
-                                    cgroup_to_pids.remove(&path);
-                                    if let Some(file) = cgroup_to_file.remove(&path) {
-                                        let fd = file.as_raw_fd();
-                                        // Use reverse map for O(1) lookup
-                                        if let Some(t) = cgroup_to_token.remove(&path) {
-                                            let _ = poll.registry().deregister(&mut SourceFd(&fd));
-                                            token_to_cgroup.remove(&t);
-                                        }
-                                    }
-                                }
+                            for cgroup_path in cgroups_to_remove {
+                                cleanup_cgroup_watch(
+                                    &cgroup_path,
+                                    &poll,
+                                    &mut token_to_cgroup,
+                                    &mut cgroup_to_token,
+                                    &mut cgroup_to_file,
+                                );
                             }
 
-                            // Handle new PIDs - drain vec first to minimize lock time
-                            let new_pids: Vec<(u32, String)> = {
-                                let mut lock = new_pid_events.lock();
+                            // Handle new cgroups - drain vec first to minimize lock time
+                            let new_cgroups: Vec<String> = {
+                                let mut lock = new_cgroup_events.lock();
                                 lock.drain(..).collect()
                             };
 
-                            for (pid, cgroup_path) in new_pids {
+                            for cgroup_path in new_cgroups {
                                 if !cgroup_to_file.contains_key(&cgroup_path) {
                                     setup_cgroup_watch(
                                         &cgroup_path,
@@ -336,7 +505,6 @@ impl PsiWatcher {
                                         &mut cgroup_to_file,
                                     );
                                 }
-                                cgroup_to_pids.entry(cgroup_path).or_default().insert(pid);
                             }
                         }
                         token => {
@@ -353,25 +521,26 @@ impl PsiWatcher {
                                         );
                                     }
                                     if file.read_to_string(&mut content).is_ok() {
-                                        let trimmed = content.trim_end().to_string();
+                                        let trimmed = content.trim_end();
+                                        let pressure_data = PressureData::parse(trimmed);
 
-                                        // Broadcast for ALL associated PIDs
-                                        if let Some(pids) = cgroup_to_pids.get(cgroup_path) {
-                                            for &pid in pids.iter() {
-                                                let event = PressureEvent {
-                                                    pid,
-                                                    pressure_type: PressureType::Memory,
-                                                    pressure_data: trimmed.clone(),
-                                                };
+                                        // Update the PressureInfo in watches
+                                        if let Some(info) = watches.lock().get_mut(cgroup_path) {
+                                            info.record_event(pressure_data.clone());
+                                        }
 
-                                                let _ = event_tx.send(event.clone());
+                                        let event = PressureEvent {
+                                            cgroup_path: cgroup_path.clone(),
+                                            pressure_type: PressureType::Memory,
+                                            pressure_data,
+                                        };
 
-                                                if let Some(ref tx) = internal_monitoring_tx {
-                                                    let _ = tx.blocking_send(
-                                                        crate::MonitoringEvent::Pressure(event),
-                                                    );
-                                                }
-                                            }
+                                        let _ = event_tx.send(event.clone());
+
+                                        if let Some(ref tx) = internal_monitoring_tx {
+                                            let _ = tx.blocking_send(
+                                                crate::MonitoringEvent::Pressure(event),
+                                            );
                                         }
                                     }
                                 }
@@ -421,7 +590,7 @@ impl Drop for PsiWatcher {
 
 #[cfg(test)]
 mod tests {
-    use crate::psi::*;
+    use super::*;
     use std::thread;
     use std::time::Duration;
 
@@ -430,9 +599,10 @@ mod tests {
         let handle = thread::spawn(|| {
             let watcher = PsiWatcher::new();
 
-            // Add current process to watch
-            let current_pid = std::process::id();
-            watcher.add_pid(current_pid);
+            // Get current process cgroup and add it
+            if let Some(cgroup_path) = crate::read_cgroup_path(std::process::id()) {
+                watcher.add_cgroup(&cgroup_path);
+            }
 
             // Start the watcher
             if let Err(e) = watcher.start(None) {
@@ -467,31 +637,28 @@ mod tests {
             let watcher = PsiWatcher::new();
             watcher.start(None).unwrap();
 
-            let mut child = std::process::Command::new("sleep")
-                .arg("1")
-                .spawn()
-                .unwrap();
+            // Use a test cgroup path (may not exist, but tests the API)
+            let test_cgroup = "/sys/fs/cgroup/user.slice";
 
-            let pid = child.id();
-            watcher.add_pid(pid);
+            if std::path::Path::new(test_cgroup).exists() {
+                watcher.add_cgroup(test_cgroup);
 
-            // Check that the pid is in watches
-            {
-                let watches = watcher.watches.lock();
-                assert!(watches.contains_key(&pid));
-            }
+                // Check that the cgroup is in watches
+                {
+                    let watches = watcher.watches.lock();
+                    assert!(watches.contains_key(test_cgroup));
+                }
 
-            child.wait().unwrap();
+                watcher.remove_cgroup(test_cgroup);
 
-            watcher.remove_pid(pid);
+                // Allow some time for the watcher to process the removal
+                std::thread::sleep(std::time::Duration::from_millis(100));
 
-            // Allow some time for the watcher to process the removal
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // Check that the pid is no longer in watches
-            {
-                let watches = watcher.watches.lock();
-                assert!(!watches.contains_key(&pid));
+                // Check that the cgroup is no longer in watches
+                {
+                    let watches = watcher.watches.lock();
+                    assert!(!watches.contains_key(test_cgroup));
+                }
             }
 
             watcher.stop().unwrap();

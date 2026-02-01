@@ -6,11 +6,9 @@
 //! - Detect new processes when they are started
 //! - Handle WebSocket connections properly
 
-use pmond::{proc_netlink, ProcMon, ProcessInfo};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use pmond::ProcMon;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 /// Test that we can get a specific process by PID
 #[tokio::test]

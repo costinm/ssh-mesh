@@ -1,7 +1,6 @@
 use axum::serve;
 use clap::Parser;
 use pmond::{proc_netlink, psi::PsiWatcher, ProcMon};
-use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -198,8 +197,8 @@ fn start_monitoring(
     psi_watcher: Arc<PsiWatcher>,
     tx: mpsc::Sender<pmond::MonitoringEvent>,
     mut rx: mpsc::Receiver<pmond::MonitoringEvent>,
-    event_tx: Option<broadcast::Sender<serde_json::Value>>,
-    debug: bool,
+    _event_tx: Option<broadcast::Sender<serde_json::Value>>,
+    _debug: bool,
 ) -> tokio::task::JoinHandle<()> {
     let running = psi_watcher.running.clone();
 
@@ -211,11 +210,10 @@ fn start_monitoring(
     });
 
     // Start event consumer
-    let pw = psi_watcher.clone();
+    let _pw = psi_watcher.clone();
     tokio::spawn(async move {
         while let Some(monitoring_event) = rx.recv().await {
-            let mut should_broadcast = true;
-            let event_json = match monitoring_event {
+            match monitoring_event {
                 pmond::MonitoringEvent::Netlink(event) => match event {
                     proc_netlink::NetlinkEvent::Fork {
                         parent_pid,
@@ -234,7 +232,6 @@ fn start_monitoring(
                             child_pid
                         };
 
-                        should_broadcast = false;
                         debug!(
                             "fork: parent pid={} -> child pid={} tgid={} comm={}",
                             p_pid,
@@ -330,27 +327,26 @@ fn start_monitoring(
                         ruid,
                         euid,
                     } => {
-                        let pid = if process_tgid != 0 {
+                        let _pid = if process_tgid != 0 {
                             process_tgid
                         } else {
                             process_pid
                         };
-                        should_broadcast = false;
                         debug!(
                             "uid change: pid={} tgid={} ruid={} euid={} comm={}",
                             process_pid,
                             process_tgid,
                             ruid,
                             euid,
-                            pmond::read_comm(pid)
+                            pmond::read_comm(_pid)
                         );
                     }
                     proc_netlink::NetlinkEvent::Comm {
                         process_pid,
                         process_tgid,
-                        comm,
+                        comm: _comm,
                     } => {
-                        let pid = if process_tgid != 0 {
+                        let _pid = if process_tgid != 0 {
                             process_tgid
                         } else {
                             process_pid
@@ -359,38 +355,44 @@ fn start_monitoring(
                 },
                 pmond::MonitoringEvent::Pressure(event) => {
                     debug!(
-                        "pressure: pid={} comm={} data={}",
-                        event.pid,
-                        pmond::read_comm(event.pid),
-                        event.pressure_data,
-                    )
+                        "pressure: cgroup={} avg10={} avg60={} total={}",
+                        event.cgroup_path,
+                        event.pressure_data.avg10,
+                        event.pressure_data.avg60,
+                        event.pressure_data.total,
+                    );
                 }
-            };
+            }
         }
     })
 }
 
 fn show_processes() -> Result<(), Box<dyn std::error::Error>> {
-    info!("Showing processes");
-
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
     let proc_mon = Arc::new(proc_mon);
 
-    // Start monitoring
-    proc_mon.start(true, true, None)?;
-
     // Get processes and display them sorted by RSS
-    let processes = proc_mon.get_all_processes();
+    let processes = proc_mon.get_all_processes(0);
     let mut processes_list: Vec<(&u32, &pmond::ProcessInfo)> = processes.iter().collect();
-    processes_list.sort_by_key(|(_, p)| p.mem_info.as_ref().map(|m| m.anon).unwrap_or(0));
+    processes_list.sort_by_key(|(_, p)| p.mem_info.as_ref().map(|m| m.rss).unwrap_or(0));
+
+    // Print Header
+    println!(
+        "{:<8} {:>10} {:>10} {:>10} {:<20}",
+        "PID", "RSS(MB)", "ANON(MB)", "FILE(MB)", "NAME"
+    );
+    println!("{:-<8} {:-<10} {:-<10} {:-<10} {:-<20}", "", "", "", "", "");
 
     for (_, process) in processes_list.iter().rev() {
-        info!(
-            "PID: {} | RSS: {} | Name: {}",
-            process.pid,
-            process.mem_info.as_ref().map(|m| m.anon).unwrap_or(0),
-            &process.comm
+        let mem = process.mem_info.as_ref();
+        let rss_mb = mem.map(|m| m.rss).unwrap_or(0) as f64 / 1024.0 / 1024.0;
+        let anon_mb = mem.map(|m| m.anon).unwrap_or(0) as f64 / 1024.0 / 1024.0;
+        let file_mb = mem.map(|m| m.file).unwrap_or(0) as f64 / 1024.0 / 1024.0;
+
+        println!(
+            "{:<8} {:>10.1} {:>10.1} {:>10.1} {:<20}",
+            process.pid, rss_mb, anon_mb, file_mb, &process.comm
         );
     }
 
@@ -398,40 +400,72 @@ fn show_processes() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Watching process with PID: {}", pid);
+    println!("Watching process with PID: {}", pid);
 
     // Create a new ProcMon instance
     let proc_mon = ProcMon::new()?;
     let proc_mon = Arc::new(proc_mon);
 
-    // Start monitoring
-    proc_mon.start(true, true, None)?;
+    // Create a channel for PSI events
+    let (tx, mut rx) = mpsc::channel(100);
 
-    info!(
+    // Start PSI monitoring
+    proc_mon.psi_watcher.start(Some(tx))?;
+
+    println!(
         "Watching process {} with refresh interval {}s",
         pid, refresh
     );
-    info!("Press Ctrl+C to stop");
+    println!("Press Ctrl+C to stop");
+
+    // Spawn a task to print PSI events
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let pmond::MonitoringEvent::Pressure(pe) = event {
+                println!(
+                    "PSI EVENT: cgroup={} avg10={} avg60={} total={}",
+                    pe.cgroup_path,
+                    pe.pressure_data.avg10,
+                    pe.pressure_data.avg60,
+                    pe.pressure_data.total
+                );
+            }
+        }
+    });
+
+    let mut cgroup_added = false;
 
     // Watch for updates for the specific process
     let refresh_duration = Duration::from_secs(refresh);
     loop {
-        sleep(refresh_duration).await;
-
         // Get processes and find the specific one
-        let processes = proc_mon.get_all_processes();
+        let processes = proc_mon.get_all_processes(0);
         if let Some(process) = processes.get(&pid) {
-            if let Some(mem_info) = &process.mem_info {
-                info!(
-                    "Anon: {} | File: {} | Kernel: {} | Shmem: {} | Swapcached: {}",
-                    mem_info.anon,
-                    mem_info.file,
-                    mem_info.kernel,
-                    mem_info.shmem,
-                    mem_info.swapcached
-                );
+            if !cgroup_added {
+                if let Some(ref cg_path) = process.cgroup_path {
+                    println!("Adding cgroup to PSI watch: {}", cg_path);
+                    proc_mon.psi_watcher.add_cgroup(cg_path);
+                    cgroup_added = true;
+                }
             }
+
+            if let Some(mem_info) = &process.mem_info {
+                println!(
+                    "PID: {} | RSS: {:.1}MB | ANON: {:.1}MB | FILE: {:.1}MB | Name: {}",
+                    pid,
+                    mem_info.rss as f64 / 1024.0 / 1024.0,
+                    mem_info.anon as f64 / 1024.0 / 1024.0,
+                    mem_info.file as f64 / 1024.0 / 1024.0,
+                    &process.comm
+                );
+            } else {
+                println!("PID: {} | Name: {} (no memory info)", pid, &process.comm);
+            }
+        } else {
+            println!("Process {} not found", pid);
         }
+
+        sleep(refresh_duration).await;
     }
 }
 
@@ -463,7 +497,6 @@ async fn run_server(
 
     // Start monitoring
     proc_mon.start(true, true, Some(tx.clone()))?;
-    start_monitoring(proc_mon.psi_watcher.clone(), tx, rx, None, false);
 
     info!("PMON process monitor started successfully");
 
@@ -500,8 +533,15 @@ async fn run_server(
     });
 
     // Set up HTTP server
-    let addr = "127.0.0.1:8081";
-    let listener = TcpListener::bind(addr).await?;
+    let uid = unsafe { libc::getuid() };
+    let port = if uid == 0 {
+        8081
+    } else {
+        8082 + (uid as i32 - 1000)
+    };
+
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&addr).await?;
     info!("Listening on http://{}", addr);
 
     // Create the Axum app

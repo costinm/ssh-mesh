@@ -48,7 +48,7 @@ pub struct AppState {
 pub async fn handle_ps_request(
     State(app_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let processes = app_state.proc_mon.get_all_processes();
+    let processes = app_state.proc_mon.get_all_processes(1);
     (StatusCode::OK, Json(json!(processes)))
 }
 
@@ -70,17 +70,20 @@ pub async fn handle_cgroup_high_request(
     State(app_state): State<AppState>,
     Json(payload): Json<CgroupHighPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    debug!("Received CGroup High request for {}", payload.path);
+    info!("Received CGroup High request for {}", payload.path);
     match app_state.proc_mon.adjust_cgroup_memory_high(
         payload.path,
         payload.percentage,
         payload.interval,
     ) {
         Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ),
+        Err(e) => {
+            error!("Error processing cgroup high request: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
     }
 }
 
@@ -425,7 +428,7 @@ impl ServerHandler for PmonMcpHandler {
     ) -> Result<CallToolResult, ErrorData> {
         match params.name.as_ref() {
             "list_processes" => {
-                let processes = self.proc_mon.get_all_processes();
+                let processes = self.proc_mon.get_all_processes(1);
                 // Convert to a simplified list for display
                 let process_list: Vec<SimplifiedProcess> = processes
                     .values()
@@ -658,7 +661,7 @@ impl ServerHandler for PmonMcpHandler {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         if params.uri == "process://list" {
-            let processes = self.proc_mon.get_all_processes();
+            let processes = self.proc_mon.get_all_processes(1);
             Ok(ReadResourceResult {
                 contents: vec![ResourceContents::TextResourceContents {
                     uri: params.uri,

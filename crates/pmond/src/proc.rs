@@ -1,9 +1,8 @@
 use crate::psi::PsiWatcher;
-use crate::{read_process_info_from_proc, PressureType, ProcMemInfo, ProcessInfo};
+use crate::{read_process_info_from_proc, ProcMemInfo, ProcessInfo};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -73,8 +72,8 @@ pub struct ProcMon {
     // snap2 is the previous snapshot - between refresh and 2xrefresh.
     pub snap2: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
 
-    // snapU is a user generate snapshot, at an arbitrary point in time.
-    pub snapU: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
+    // snap_user is a user generate snapshot, at an arbitrary point in time.
+    pub snap_user: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
 }
 
 impl ProcMon {
@@ -90,7 +89,7 @@ impl ProcMon {
             config: Arc::new(Mutex::new(ProcCfg::default())),
             snap1: Arc::new(Mutex::new(HashMap::new())),
             snap2: Arc::new(Mutex::new(HashMap::new())),
-            snapU: Arc::new(Mutex::new(HashMap::new())),
+            snap_user: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -112,7 +111,6 @@ impl ProcMon {
         watch_psi: bool,
         event_tx: Option<mpsc::Sender<crate::MonitoringEvent>>,
     ) -> Result<(), PmondError> {
-
         if self.running.load(Ordering::SeqCst) {
             return Err(PmondError::AlreadyRunning);
         }
@@ -181,18 +179,32 @@ impl ProcMon {
 
         match read_process_info_from_proc(pid) {
             Ok(process_info) => Some(process_info),
-            Err(_) => {
-                self.psi_watcher.remove_pid(pid);
-                None
-            }
+            Err(_) => None,
         }
     }
 
-    /// Get all processes (from the latest snapshot with deltas)
+    /// Get all processes.
+    /// mode 0: current life processes (real-time from /proc). If running, calculate deltas from snap1.
+    /// mode 1: return snap1 (latest background snapshot).
+    /// mode 2: return snap2 (previous background snapshot).
     #[instrument(skip(self))]
-    pub fn get_all_processes(&self) -> HashMap<u32, ProcessInfo> {
-        trace!("Getting all processes from snap1");
-        self.snap1.lock().clone()
+    pub fn get_all_processes(&self, mode: i32) -> HashMap<u32, ProcessInfo> {
+        match mode {
+            0 => {
+                let mut current = read_existing_processes_impl();
+                if self.running.load(Ordering::SeqCst) {
+                    let s1 = self.snap1.lock();
+                    calculate_memory_deltas(&mut current, &s1);
+                }
+                current
+            }
+            1 => self.snap1.lock().clone(),
+            2 => self.snap2.lock().clone(),
+            _ => {
+                trace!("Invalid mode {}, defaulting to snap1", mode);
+                self.snap1.lock().clone()
+            }
+        }
     }
 
     /// Read cgroup information by path.
@@ -256,9 +268,19 @@ impl ProcMon {
         let current_path = format!("{}/memory.current", cgroup_path);
         let high_path = format!("{}/memory.high", cgroup_path);
 
-        let current_str = fs::read_to_string(&current_path)?;
+        let current_str = fs::read_to_string(&current_path).map_err(|e| {
+            let msg = format!("Failed to read {}: {}", current_path, e);
+            error!("{}", msg);
+            PmondError::CgroupError(msg)
+        })?;
+
         let current: u64 = current_str.trim().parse().map_err(|e| {
-            PmondError::ParseError(format!("Failed to parse memory.current: {}", e))
+            let msg = format!(
+                "Failed to parse memory.current from {}: {}",
+                current_path, e
+            );
+            error!("{}", msg);
+            PmondError::ParseError(msg)
         })?;
 
         let target_str = if percentage < 0.0 {
@@ -269,7 +291,12 @@ impl ProcMon {
         };
 
         info!("Attempting to write {} to {}", target_str, high_path);
-        fs::write(&high_path, &target_str)?;
+        fs::write(&high_path, &target_str).map_err(|e| {
+            let msg = format!("Failed to write to {}: {}", high_path, e);
+            error!("{}", msg);
+            PmondError::CgroupError(msg)
+        })?;
+
         info!(
             "Successfully set {} memory.high to {} (requested {}% of current {})",
             cgroup_path, target_str, percentage, current
@@ -464,7 +491,7 @@ fn read_existing_processes_impl() -> HashMap<u32, ProcessInfo> {
                 .to_str()
                 .and_then(|s| s.parse::<u32>().ok())
             {
-                if let Ok(process_info) = read_process_info_from_proc(pid) {
+                if let Ok(process_info) = crate::read_process_info_from_proc(pid) {
                     // Filter processes if not running as root
                     if !is_root && process_info.uid != Some(current_uid) {
                         continue;
@@ -493,6 +520,7 @@ fn spawn_snapshot_checker(
 }
 
 /// Main loop for periodic snapshot checking.
+/// Main loop for periodic snapshot checking.
 fn run_snapshot_loop(
     running: Arc<AtomicBool>,
     snap1: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
@@ -509,13 +537,60 @@ fn run_snapshot_loop(
         }
 
         // Take fresh snapshot
-        let new_processes = read_existing_processes_impl();
+        let mut new_processes = read_existing_processes_impl();
 
-        // Compute diff and update PSI watcher
-        update_psi_from_diff(&snap1, &new_processes, &psi_watcher);
+        // --------------------------------------------------------------------
+        // PSI Watcher Logic
+        // --------------------------------------------------------------------
 
-        // Rotate snapshots and calculate deltas
-        rotate_and_compute_deltas(&snap1, &snap2, new_processes);
+        // 1. Extract the set of cgroups referenced from each process in the new list
+        let active_cgroups: HashSet<String> = new_processes
+            .values()
+            .filter_map(|p| p.cgroup_path.clone())
+            .collect();
+
+        // 2. Pass it to the psi_watcher - it should iterate over the cgroups it is watching
+        // and remove any that is not present in the new list.
+        psi_watcher.prune_cgroups(&active_cgroups);
+
+        // 3. Go over snap2 - and find the set of cgroups referenced that is still present
+        // in the set discovered at the first step.
+        let stable_cgroups: HashSet<String> = {
+            let s2 = snap2.lock();
+            s2.values()
+                .filter_map(|p| p.cgroup_path.clone())
+                .filter(|path| active_cgroups.contains(path))
+                .collect()
+        };
+
+        // 4. Pass it to psi watcher, and have it add any cgroup that is not already watched.
+        // This will ensure psi is watching 'old' cgroups for processes that are still running.
+        psi_watcher.watch_cgroups(&stable_cgroups);
+
+        // --------------------------------------------------------------------
+        // Delta Calculation and Snapshot Rotation
+        // The intent is to know what changed in last 2 intervals.
+        // --------------------------------------------------------------------
+        {
+            let mut s1 = snap1.lock();
+            let mut s2 = snap2.lock();
+
+            // 5. Compute the deltas between snap2 and snap1, saving the delta in snap1
+            // snap1 contains processes from T-1. snap2 contains processes from T-2.
+            // We update snap1 to hold the diffs (T-1) - (T-2).
+            calculate_memory_deltas(&mut s1, &s2);
+
+            // 6. Compute the delta between snap1 and new_processes, saving the delta in new_processes
+            // new_processes contains processes from T. snap1 contains processes from T-1.
+            // We update new_processes to hold the diffs (T) - (T-1).
+            calculate_memory_deltas(&mut new_processes, &s1);
+
+            // 7. Finally set snap2 with snap1 and snap1 with new_processes
+            // snap2 becomes the previous snap1 (T-1)
+            *s2 = s1.clone();
+            // snap1 becomes the new processes (T)
+            *s1 = new_processes;
+        }
     }
 }
 
@@ -527,44 +602,8 @@ fn get_refresh_interval(config: &Mutex<ProcCfg>) -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(20))
 }
 
-/// Compute process diff and update PSI watcher accordingly.
-fn update_psi_from_diff(
-    snap1: &Mutex<HashMap<u32, ProcessInfo>>,
-    new_processes: &HashMap<u32, ProcessInfo>,
-    psi_watcher: &PsiWatcher,
-) {
-    let old_pids: HashSet<u32> = snap1.lock().keys().cloned().collect();
-    let new_pids: HashSet<u32> = new_processes.keys().cloned().collect();
-
-    let added: Vec<u32> = new_pids.difference(&old_pids).cloned().collect();
-    let removed: Vec<u32> = old_pids.difference(&new_pids).cloned().collect();
-
-    for pid in removed {
-        psi_watcher.remove_pid(pid);
-    }
-    for pid in added {
-        psi_watcher.add_pid(pid);
-    }
-}
-
-/// Rotate snapshots (snap2 = snap1, snap1 = new) and calculate memory deltas.
-fn rotate_and_compute_deltas(
-    snap1: &Mutex<HashMap<u32, ProcessInfo>>,
-    snap2: &Mutex<HashMap<u32, ProcessInfo>>,
-    new_processes: HashMap<u32, ProcessInfo>,
-) {
-    let mut s1 = snap1.lock();
-    let mut s2 = snap2.lock();
-
-    // Rotate: snap2 = snap1, snap1 = new_processes
-    *s2 = std::mem::take(&mut *s1);
-    *s1 = new_processes.clone();
-
-    // Calculate deltas in snap1 based on snap2
-    calculate_memory_deltas(&mut s1, &s2);
-}
-
 /// Calculate memory deltas between current and previous snapshots.
+/// The `current` map is modified in-place to store the deltas.
 fn calculate_memory_deltas(
     current: &mut HashMap<u32, ProcessInfo>,
     previous: &HashMap<u32, ProcessInfo>,
@@ -598,7 +637,7 @@ mod tests {
             .start(true, false, None)
             .expect("Failed to start ProcMon");
 
-        let processes = proc_mon.get_all_processes();
+        let processes = proc_mon.get_all_processes(1);
         assert!(
             !processes.is_empty(),
             "Processes list should not be empty after start()"
