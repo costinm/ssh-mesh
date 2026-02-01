@@ -1,4 +1,13 @@
+//! Process monitoring utilities for reading process and memory information from `/proc` and cgroups.
+//!
+//! This module provides:
+//! - [`ProcessInfo`]: Information about a running process
+//! - [`ProcMemInfo`]: Memory statistics from `/proc/[pid]` or cgroups
+//! - [`ProcMon`]: Process monitor for tracking process lifecycle
+//! - Helper functions for reading process details from procfs
+
 use serde::{Deserialize, Serialize};
+use tracing::trace;
 
 pub mod handlers;
 pub mod proc;
@@ -6,6 +15,11 @@ pub mod proc_netlink;
 pub mod psi;
 
 pub use proc::ProcMon;
+
+/// Base path for procfs
+const PROC_BASE: &str = "/proc";
+/// Base path for cgroup2 filesystem
+const CGROUP_BASE: &str = "/sys/fs/cgroup";
 
 /// Read process name from /proc/[pid]/comm
 pub fn read_comm(pid: u32) -> String {
@@ -158,144 +172,75 @@ pub struct ProcMemInfo {
     pub memory_high: Option<String>,
 }
 
+/// Macro to reduce boilerplate in `ProcMemInfo::merge()`
+macro_rules! merge_field {
+    ($self:ident, $other:ident, $field:ident) => {
+        if $self.$field == 0 {
+            $self.$field = $other.$field;
+        }
+    };
+    ($self:ident, $other:ident, $field:ident, option) => {
+        if $self.$field.is_none() {
+            $self.$field = $other.$field.clone();
+        }
+    };
+}
+
 impl ProcMemInfo {
     /// Merge fields from another ProcMemInfo if they are zero or None in this one.
     pub fn merge(&mut self, other: &ProcMemInfo) {
-        if self.pss == 0 {
-            self.pss = other.pss;
-        }
-        if self.anon == 0 {
-            self.anon = other.anon;
-        }
-        if self.file == 0 {
-            self.file = other.file;
-        }
-        if self.kernel_stack == 0 {
-            self.kernel_stack = other.kernel_stack;
-        }
-        if self.pagetables == 0 {
-            self.pagetables = other.pagetables;
-        }
-        if self.shmem == 0 {
-            self.shmem = other.shmem;
-        }
-        if self.pgfault == 0 {
-            self.pgfault = other.pgfault;
-        }
-        if self.pgmajfault == 0 {
-            self.pgmajfault = other.pgmajfault;
-        }
-        if self.rss == 0 {
-            self.rss = other.rss;
-        }
-        if self.private_clean == 0 {
-            self.private_clean = other.private_clean;
-        }
-        if self.private_dirty == 0 {
-            self.private_dirty = other.private_dirty;
-        }
-        if self.shared_clean == 0 {
-            self.shared_clean = other.shared_clean;
-        }
-        if self.shared_dirty == 0 {
-            self.shared_dirty = other.shared_dirty;
-        }
-        if self.referenced == 0 {
-            self.referenced = other.referenced;
-        }
-        if self.swap == 0 {
-            self.swap = other.swap;
-        }
-        if self.hugetlb == 0 {
-            self.hugetlb = other.hugetlb;
-        }
-        if self.kernel == 0 {
-            self.kernel = other.kernel;
-        }
-        if self.file_mapped == 0 {
-            self.file_mapped = other.file_mapped;
-        }
-        if self.file_dirty == 0 {
-            self.file_dirty = other.file_dirty;
-        }
-        if self.file_writeback == 0 {
-            self.file_writeback = other.file_writeback;
-        }
-        if self.swapcached == 0 {
-            self.swapcached = other.swapcached;
-        }
-        if self.pgrefill == 0 {
-            self.pgrefill = other.pgrefill;
-        }
-        if self.pgactivate == 0 {
-            self.pgactivate = other.pgactivate;
-        }
-        if self.pgdeactivate == 0 {
-            self.pgdeactivate = other.pgdeactivate;
-        }
-        if self.pswpin == 0 {
-            self.pswpin = other.pswpin;
-        }
-        if self.pswpout == 0 {
-            self.pswpout = other.pswpout;
-        }
-        if self.pgsteal == 0 {
-            self.pgsteal = other.pgsteal;
-        }
-        if self.pgscan == 0 {
-            self.pgscan = other.pgscan;
-        }
-        if self.pgdemote_kswapd == 0 {
-            self.pgdemote_kswapd = other.pgdemote_kswapd;
-        }
-        if self.pgdemote_direct == 0 {
-            self.pgdemote_direct = other.pgdemote_direct;
-        }
-        if self.pgdemote_khugepaged == 0 {
-            self.pgdemote_khugepaged = other.pgdemote_khugepaged;
-        }
-        if self.pgdemote_proactive == 0 {
-            self.pgdemote_proactive = other.pgdemote_proactive;
-        }
-        if self.active_anon == 0 {
-            self.active_anon = other.active_anon;
-        }
-        if self.active_file == 0 {
-            self.active_file = other.active_file;
-        }
-        if self.inactive_anon == 0 {
-            self.inactive_anon = other.inactive_anon;
-        }
-        if self.inactive_file == 0 {
-            self.inactive_file = other.inactive_file;
-        }
-        if self.workingset_refault_anon == 0 {
-            self.workingset_refault_anon = other.workingset_refault_anon;
-        }
-        if self.workingset_refault_file == 0 {
-            self.workingset_refault_file = other.workingset_refault_file;
-        }
-        if self.workingset_activate_anon == 0 {
-            self.workingset_activate_anon = other.workingset_activate_anon;
-        }
-        if self.workingset_activate_file == 0 {
-            self.workingset_activate_file = other.workingset_activate_file;
-        }
-        if self.workingset_restore_anon == 0 {
-            self.workingset_restore_anon = other.workingset_restore_anon;
-        }
-        if self.workingset_restore_file == 0 {
-            self.workingset_restore_file = other.workingset_restore_file;
-        }
-        if self.workingset_nodereclaim == 0 {
-            self.workingset_nodereclaim = other.workingset_nodereclaim;
-        }
-        if self.memory_current.is_none() {
-            self.memory_current = other.memory_current;
-        }
-        if self.memory_high.is_none() {
-            self.memory_high = other.memory_high.clone();
-        }
+        // Common fields
+        merge_field!(self, other, anon);
+        merge_field!(self, other, file);
+        merge_field!(self, other, kernel_stack);
+        merge_field!(self, other, pagetables);
+        merge_field!(self, other, shmem);
+        merge_field!(self, other, pgfault);
+        merge_field!(self, other, pgmajfault);
+
+        // Process-only fields
+        merge_field!(self, other, pss);
+        merge_field!(self, other, rss);
+        merge_field!(self, other, private_clean);
+        merge_field!(self, other, private_dirty);
+        merge_field!(self, other, shared_clean);
+        merge_field!(self, other, shared_dirty);
+        merge_field!(self, other, referenced);
+        merge_field!(self, other, swap);
+        merge_field!(self, other, hugetlb);
+
+        // Cgroup-only fields
+        merge_field!(self, other, kernel);
+        merge_field!(self, other, file_mapped);
+        merge_field!(self, other, file_dirty);
+        merge_field!(self, other, file_writeback);
+        merge_field!(self, other, swapcached);
+        merge_field!(self, other, pgrefill);
+        merge_field!(self, other, pgactivate);
+        merge_field!(self, other, pgdeactivate);
+        merge_field!(self, other, pswpin);
+        merge_field!(self, other, pswpout);
+        merge_field!(self, other, pgsteal);
+        merge_field!(self, other, pgscan);
+        merge_field!(self, other, pgdemote_kswapd);
+        merge_field!(self, other, pgdemote_direct);
+        merge_field!(self, other, pgdemote_khugepaged);
+        merge_field!(self, other, pgdemote_proactive);
+        merge_field!(self, other, active_anon);
+        merge_field!(self, other, active_file);
+        merge_field!(self, other, inactive_anon);
+        merge_field!(self, other, inactive_file);
+        merge_field!(self, other, workingset_refault_anon);
+        merge_field!(self, other, workingset_refault_file);
+        merge_field!(self, other, workingset_activate_anon);
+        merge_field!(self, other, workingset_activate_file);
+        merge_field!(self, other, workingset_restore_anon);
+        merge_field!(self, other, workingset_restore_file);
+        merge_field!(self, other, workingset_nodereclaim);
+
+        // Option fields
+        merge_field!(self, other, memory_current, option);
+        merge_field!(self, other, memory_high, option);
     }
 }
 
@@ -305,7 +250,7 @@ pub fn read_process_info(pid: u32) -> Result<ProcessInfo, Box<dyn std::error::Er
 }
 
 pub fn read_process_info_impl(pid: u32) -> Result<ProcessInfo, Box<dyn std::error::Error>> {
-    let stat_path = format!("/proc/{}/stat", pid);
+    let stat_path = format!("{}/{}/stat", PROC_BASE, pid);
     let stat_content = std::fs::read_to_string(stat_path)?;
 
     // Parse the stat file: format is "pid (comm) state ppid ..."
@@ -338,20 +283,26 @@ pub fn read_process_info_impl(pid: u32) -> Result<ProcessInfo, Box<dyn std::erro
 
 /// Read cgroup path for a process
 pub fn read_cgroup_path(pid: u32) -> Option<String> {
-    let cgroup_path = format!("/proc/{}/cgroup", pid);
-    if let Ok(content) = std::fs::read_to_string(&cgroup_path) {
-        for line in content.lines() {
-            if line.starts_with("0::") {
-                let cgroup = &line[3..];
-                if cgroup == "/" {
-                    return Some("/sys/fs/cgroup".to_string());
-                } else if !cgroup.is_empty() {
-                    return Some(format!("/sys/fs/cgroup{}", cgroup));
+    let cgroup_file = format!("{}/{}/cgroup", PROC_BASE, pid);
+    match std::fs::read_to_string(&cgroup_file) {
+        Ok(content) => {
+            for line in content.lines() {
+                if line.starts_with("0::") {
+                    let cgroup = &line[3..];
+                    if cgroup == "/" {
+                        return Some(CGROUP_BASE.to_string());
+                    } else if !cgroup.is_empty() {
+                        return Some(format!("{}{}", CGROUP_BASE, cgroup));
+                    }
                 }
             }
+            None
+        }
+        Err(e) => {
+            trace!("Failed to read {}: {}", cgroup_file, e);
+            None
         }
     }
-    None
 }
 
 /// Read memory information for a process from /proc/[pid]/smaps_rollup, /proc/[pid]/status, /proc/[pid]/stat and /proc/[pid]/statm as fallback
@@ -359,158 +310,26 @@ pub fn read_memory_info(pid: u32) -> Option<ProcMemInfo> {
     let mut mem_info = ProcMemInfo::default();
     let mut found_any = false;
 
-    // 0. Try /proc/[pid]/stat for faults
-    let stat_path = format!("/proc/{}/stat", pid);
-    if let Ok(content) = std::fs::read_to_string(&stat_path) {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 12 {
-            // Field 10 is minflt, 12 is majflt (0-indexed: 9, 11)
-            let min_faults: u64 = parts[9].parse().unwrap_or(0);
-            let maj_faults: u64 = parts[11].parse().unwrap_or(0);
-            mem_info.pgfault = min_faults + maj_faults;
-            mem_info.pgmajfault = maj_faults;
-            found_any = true;
-        }
-    }
+    // Read fault statistics from /proc/[pid]/stat
+    found_any |= read_fault_stats(pid, &mut mem_info);
 
-    // 1. Try /proc/[pid]/smaps_rollup for accurate PSS and RSS breakdown
-    let rollup_path = format!("/proc/{}/smaps_rollup", pid);
-    if let Ok(content) = std::fs::read_to_string(&rollup_path) {
-        let mut rollup_found = false;
-        for line in content.lines() {
-            if let Some(colon_idx) = line.find(':') {
-                let key = line[..colon_idx].trim();
-                let value_part = line[colon_idx + 1..].trim();
-                let val_kb: u64 = value_part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
+    // Read PSS/RSS from smaps_rollup (most accurate)
+    found_any |= read_smaps_rollup(pid, &mut mem_info);
 
-                match key {
-                    "Rss" => {
-                        mem_info.rss = val_kb * 1024;
-                        rollup_found = true;
-                    }
-                    "Pss" => {
-                        mem_info.pss = val_kb * 1024;
-                        rollup_found = true;
-                    }
-                    "Anonymous" => {
-                        mem_info.anon = val_kb * 1024;
-                        rollup_found = true;
-                    }
-                    "Private_Clean" => mem_info.private_clean = val_kb * 1024,
-                    "Private_Dirty" => mem_info.private_dirty = val_kb * 1024,
-                    "Shared_Clean" => mem_info.shared_clean = val_kb * 1024,
-                    "Shared_Dirty" => mem_info.shared_dirty = val_kb * 1024,
-                    "Swap" => mem_info.swap = val_kb * 1024,
-                    "Referenced" => {
-                        mem_info.referenced = val_kb * 1024;
-                        rollup_found = true;
-                    }
-                    _ => (),
-                }
-            }
-        }
-        if rollup_found {
-            found_any = true;
-            // Derive file-backed RSS if possible
-            if mem_info.rss > mem_info.anon {
-                mem_info.file = mem_info.rss - mem_info.anon;
-            }
-        }
-    }
+    // Read additional fields from status
+    found_any |= read_proc_status_memory(pid, &mut mem_info);
 
-    // 2. Try /proc/[pid]/status for other fields (PTE, Stack, Shmem)
-    let status_path = format!("/proc/{}/status", pid);
-    if let Ok(content) = std::fs::read_to_string(&status_path) {
-        for line in content.lines() {
-            if let Some(colon_idx) = line.find(':') {
-                let key = line[..colon_idx].trim();
-                let value_part = line[colon_idx + 1..].trim();
-                let val_kb: u64 = value_part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-
-                match key {
-                    "RssAnon" if mem_info.anon == 0 => {
-                        mem_info.anon = val_kb * 1024;
-                        found_any = true;
-                    }
-                    "RssFile" if mem_info.file == 0 => {
-                        mem_info.file = val_kb * 1024;
-                        found_any = true;
-                    }
-                    "RssShmem" => {
-                        mem_info.shmem = val_kb * 1024;
-                        found_any = true;
-                    }
-                    "VmPTE" => {
-                        mem_info.pagetables = val_kb * 1024;
-                        found_any = true;
-                    }
-                    "VmStk" => {
-                        mem_info.kernel_stack = val_kb * 1024;
-                        found_any = true;
-                    }
-                    "VmSwap" if mem_info.swap == 0 => {
-                        mem_info.swap = val_kb * 1024;
-                        found_any = true;
-                    }
-                    "VmRSS" if mem_info.rss == 0 => {
-                        mem_info.rss = val_kb * 1024;
-                        found_any = true;
-                    }
-                    "HugetlbPages" => {
-                        mem_info.hugetlb = val_kb * 1024;
-                        found_any = true;
-                    }
-                    _ => (),
-                }
-            }
-        }
-    }
-
-    // 3. Try /proc/[pid]/statm as a fallback for total RSS
+    // Fallback to statm for basic RSS/anon
     if !found_any || (mem_info.anon == 0 && mem_info.rss == 0) {
-        let statm_path = format!("/proc/{}/statm", pid);
-        if let Ok(content) = std::fs::read_to_string(&statm_path) {
-            let parts: Vec<&str> = content.split_whitespace().collect();
-            if parts.len() >= 3 {
-                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-                if page_size > 0 {
-                    let resident_pages: u64 = parts[1].parse().unwrap_or(0);
-                    let shared_pages: u64 = parts[2].parse().unwrap_or(0);
-
-                    if mem_info.rss == 0 {
-                        mem_info.rss = resident_pages * page_size;
-                        found_any = true;
-                    }
-                    if mem_info.anon == 0 {
-                        let total_rss = resident_pages * page_size;
-                        let shared = shared_pages * page_size;
-                        mem_info.shmem = shared;
-                        mem_info.anon = if total_rss > shared {
-                            total_rss - shared
-                        } else {
-                            total_rss
-                        };
-                        found_any = true;
-                    }
-                }
-            }
-        }
+        found_any |= read_statm_fallback(pid, &mut mem_info);
     }
 
     if found_any {
-        // Check if process has a dedicated cgroup (-PID.scope)
+        // Merge cgroup stats if process has a dedicated cgroup (-PID.scope)
         if let Some(cg_path) = read_cgroup_path(pid) {
             let expected_suffix = format!("-{}.scope", pid);
             if cg_path.ends_with(&expected_suffix) {
-                if let Ok(cg_info) = parse_memory_stats(&cg_path) {
+                if let Ok(cg_info) = read_cgroup_info(&cg_path) {
                     mem_info.merge(&cg_info);
                 }
             }
@@ -521,45 +340,247 @@ pub fn read_memory_info(pid: u32) -> Option<ProcMemInfo> {
     }
 }
 
-/// Read cmdline for a process
-pub fn read_cmdline(pid: u32) -> Option<String> {
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(content) = std::fs::read_to_string(&cmdline_path) {
-        if !content.is_empty() {
-            let cmdline = content.replace("\0", " ").trim_end().to_string();
-            if !cmdline.is_empty() {
-                return Some(cmdline);
+/// Read page fault statistics from /proc/[pid]/stat
+fn read_fault_stats(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
+    let stat_path = format!("{}/{}/stat", PROC_BASE, pid);
+    match std::fs::read_to_string(&stat_path) {
+        Ok(content) => {
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            if parts.len() >= 12 {
+                // Field 10 is minflt, 12 is majflt (0-indexed: 9, 11)
+                let min_faults: u64 = parts[9].parse().unwrap_or(0);
+                let maj_faults: u64 = parts[11].parse().unwrap_or(0);
+                mem_info.pgfault = min_faults + maj_faults;
+                mem_info.pgmajfault = maj_faults;
+                true
+            } else {
+                false
             }
         }
+        Err(e) => {
+            trace!("Failed to read {}: {}", stat_path, e);
+            false
+        }
     }
-    None
+}
+
+/// Read PSS and RSS breakdown from /proc/[pid]/smaps_rollup
+fn read_smaps_rollup(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
+    let rollup_path = format!("{}/{}/smaps_rollup", PROC_BASE, pid);
+    match std::fs::read_to_string(&rollup_path) {
+        Ok(content) => {
+            let mut rollup_found = false;
+            for line in content.lines() {
+                if let Some(colon_idx) = line.find(':') {
+                    let key = line[..colon_idx].trim();
+                    let value_part = line[colon_idx + 1..].trim();
+                    let val_kb: u64 = value_part
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+
+                    match key {
+                        "Rss" => {
+                            mem_info.rss = val_kb * 1024;
+                            rollup_found = true;
+                        }
+                        "Pss" => {
+                            mem_info.pss = val_kb * 1024;
+                            rollup_found = true;
+                        }
+                        "Anonymous" => {
+                            mem_info.anon = val_kb * 1024;
+                            rollup_found = true;
+                        }
+                        "Private_Clean" => mem_info.private_clean = val_kb * 1024,
+                        "Private_Dirty" => mem_info.private_dirty = val_kb * 1024,
+                        "Shared_Clean" => mem_info.shared_clean = val_kb * 1024,
+                        "Shared_Dirty" => mem_info.shared_dirty = val_kb * 1024,
+                        "Swap" => mem_info.swap = val_kb * 1024,
+                        "Referenced" => {
+                            mem_info.referenced = val_kb * 1024;
+                            rollup_found = true;
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            if rollup_found && mem_info.rss > mem_info.anon {
+                mem_info.file = mem_info.rss - mem_info.anon;
+            }
+            rollup_found
+        }
+        Err(e) => {
+            trace!("Failed to read {}: {}", rollup_path, e);
+            false
+        }
+    }
+}
+
+/// Read memory fields from /proc/[pid]/status (VmPTE, VmStk, RssShmem, etc.)
+fn read_proc_status_memory(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
+    let status_path = format!("{}/{}/status", PROC_BASE, pid);
+    match std::fs::read_to_string(&status_path) {
+        Ok(content) => {
+            let mut found = false;
+            for line in content.lines() {
+                if let Some(colon_idx) = line.find(':') {
+                    let key = line[..colon_idx].trim();
+                    let value_part = line[colon_idx + 1..].trim();
+                    let val_kb: u64 = value_part
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+
+                    match key {
+                        "RssAnon" if mem_info.anon == 0 => {
+                            mem_info.anon = val_kb * 1024;
+                            found = true;
+                        }
+                        "RssFile" if mem_info.file == 0 => {
+                            mem_info.file = val_kb * 1024;
+                            found = true;
+                        }
+                        "RssShmem" => {
+                            mem_info.shmem = val_kb * 1024;
+                            found = true;
+                        }
+                        "VmPTE" => {
+                            mem_info.pagetables = val_kb * 1024;
+                            found = true;
+                        }
+                        "VmStk" => {
+                            mem_info.kernel_stack = val_kb * 1024;
+                            found = true;
+                        }
+                        "VmSwap" if mem_info.swap == 0 => {
+                            mem_info.swap = val_kb * 1024;
+                            found = true;
+                        }
+                        "VmRSS" if mem_info.rss == 0 => {
+                            mem_info.rss = val_kb * 1024;
+                            found = true;
+                        }
+                        "HugetlbPages" => {
+                            mem_info.hugetlb = val_kb * 1024;
+                            found = true;
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            found
+        }
+        Err(e) => {
+            trace!("Failed to read {}: {}", status_path, e);
+            false
+        }
+    }
+}
+
+/// Read basic RSS from /proc/[pid]/statm
+/// This should be faster - but has limitted information.
+///
+/// Useful:
+/// - RSS (2) - total, anon + file + others
+/// - SHARED == FILE + Shmem (3)
+/// - TEXT/code (4) - VmExe + VmLib
+/// - DATA+stack (6)
+fn read_statm_fallback(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
+    let statm_path = format!("{}/{}/statm", PROC_BASE, pid);
+    match std::fs::read_to_string(&statm_path) {
+        Ok(content) => {
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+                if page_size > 0 {
+                    let resident_pages: u64 = parts[1].parse().unwrap_or(0);
+                    let shared_pages: u64 = parts[2].parse().unwrap_or(0);
+                    let mut found = false;
+
+                    if mem_info.rss == 0 {
+                        mem_info.rss = resident_pages * page_size;
+                        found = true;
+                    }
+                    if mem_info.anon == 0 {
+                        let total_rss = resident_pages * page_size;
+                        let shared = shared_pages * page_size;
+                        mem_info.shmem = shared;
+                        mem_info.anon = if total_rss > shared {
+                            total_rss - shared
+                        } else {
+                            total_rss
+                        };
+                        found = true;
+                    }
+                    return found;
+                }
+            }
+            false
+        }
+        Err(e) => {
+            trace!("Failed to read {}: {}", statm_path, e);
+            false
+        }
+    }
+}
+
+/// Read cmdline for a process
+pub fn read_cmdline(pid: u32) -> Option<String> {
+    let cmdline_path = format!("{}/{}/cmdline", PROC_BASE, pid);
+    match std::fs::read_to_string(&cmdline_path) {
+        Ok(content) if !content.is_empty() => {
+            let cmdline = content.replace("\0", " ").trim_end().to_string();
+            if !cmdline.is_empty() {
+                Some(cmdline)
+            } else {
+                None
+            }
+        }
+        Ok(_) => None,
+        Err(e) => {
+            trace!("Failed to read {}: {}", cmdline_path, e);
+            None
+        }
+    }
 }
 
 /// Read exe (symbolic link target) for a process
 pub fn read_exe(pid: u32) -> Option<String> {
-    let exe_path = format!("/proc/{}/exe", pid);
-    if let Ok(target) = std::fs::read_link(exe_path) {
-        return Some(target.to_string_lossy().to_string());
+    let exe_path = format!("{}/{}/exe", PROC_BASE, pid);
+    match std::fs::read_link(&exe_path) {
+        Ok(target) => Some(target.to_string_lossy().to_string()),
+        Err(e) => {
+            trace!("Failed to read {}: {}", exe_path, e);
+            None
+        }
     }
-    None
 }
 
 /// Read UID for a process from /proc/[pid]/status
 pub fn read_process_uid(pid: u32) -> Option<u32> {
-    let status_path = format!("/proc/{}/status", pid);
-    if let Ok(content) = std::fs::read_to_string(&status_path) {
-        for line in content.lines() {
-            if line.starts_with("Uid:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(uid) = parts[1].parse::<u32>() {
-                        return Some(uid);
+    let status_path = format!("{}/{}/status", PROC_BASE, pid);
+    match std::fs::read_to_string(&status_path) {
+        Ok(content) => {
+            for line in content.lines() {
+                if line.starts_with("Uid:") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let Ok(uid) = parts[1].parse::<u32>() {
+                            return Some(uid);
+                        }
                     }
                 }
             }
+            None
+        }
+        Err(e) => {
+            trace!("Failed to read {}: {}", status_path, e);
+            None
         }
     }
-    None
 }
 
 /// Create ProcessInfo for a given PID, including cgroup information
@@ -568,7 +589,9 @@ pub fn create_process_info(pid: u32) -> Result<ProcessInfo, Box<dyn std::error::
 }
 
 /// Parse memory statistics from a cgroup path
-pub fn parse_memory_stats(cgroup_path: &str) -> Result<ProcMemInfo, Box<dyn std::error::Error>> {
+pub fn read_cgroup_info(cgroup_path: &str) -> Result<ProcMemInfo, Box<dyn std::error::Error>> {
+    // TODO: take ProcMemInfo as a param
+    // TODO: bool to indicate only cgroup-unique fields should be processed.
     let mut mem_info = ProcMemInfo::default();
 
     if !std::path::Path::new(cgroup_path).is_dir() {

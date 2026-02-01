@@ -234,19 +234,14 @@ fn start_monitoring(
                             child_pid
                         };
 
-                        pw.handle_fork(p_pid, child_pid, c_pid);
                         should_broadcast = false;
                         debug!(
-                            "fork: parent pid={} -> child pid={} tgid={}",
-                            p_pid, child_pid, c_pid
+                            "fork: parent pid={} -> child pid={} tgid={} comm={}",
+                            p_pid,
+                            child_pid,
+                            c_pid,
+                            pmond::read_comm(p_pid)
                         );
-                        json!({
-                            "type": "fork",
-                            "parent_pid": p_pid,
-                            "comm": pmond::read_comm(p_pid),
-                            "child_pid": child_pid,
-                            "child_tgid": c_pid,
-                        })
                     }
                     proc_netlink::NetlinkEvent::Exec {
                         process_pid,
@@ -257,7 +252,6 @@ fn start_monitoring(
                         } else {
                             process_pid
                         };
-                        pw.handle_exec(process_pid, pid);
 
                         let mut comm = pmond::read_comm(pid);
                         let mut cmdline = pmond::read_cmdline(pid);
@@ -283,15 +277,10 @@ fn start_monitoring(
                             }
                         }
 
-                        json!({
-                            "type": "exec",
-                            "pid": process_pid,
-                            "tgid": process_tgid,
-                            "comm": comm,
-                            "cmdline": cmdline,
-                            "exe": exe,
-                            "cgroup": cgroup,
-                        })
+                        info!(
+                            "exec: pid={} tgid={} comm={:?} cmdline={:?} exe={:?} cgroup={:?}",
+                            process_pid, process_tgid, comm, cmdline, exe, cgroup
+                        );
                     }
                     proc_netlink::NetlinkEvent::Exit {
                         process_tgid,
@@ -305,14 +294,35 @@ fn start_monitoring(
                         } else {
                             process_pid
                         };
-                        pw.handle_exit(pid);
-                        json!({
-                            "type": "exit",
-                            "pid": process_pid,
-                            "tgid": process_tgid,
-                            "exit_code": exit_code,
-                            "exit_signal": exit_signal
-                        })
+
+                        let mut comm = pmond::read_comm(pid);
+                        let mut cmdline = pmond::read_cmdline(pid);
+                        let mut exe = pmond::read_exe(pid);
+                        let mut cgroup = pmond::read_cgroup_path(pid);
+
+                        // Fallback to process_pid if tgid fields were null
+                        if (cmdline.is_none() || exe.is_none())
+                            && process_pid != pid
+                            && process_pid != 0
+                        {
+                            if cmdline.is_none() {
+                                cmdline = pmond::read_cmdline(process_pid);
+                            }
+                            if exe.is_none() {
+                                exe = pmond::read_exe(process_pid);
+                            }
+                            if cgroup.is_none() {
+                                cgroup = pmond::read_cgroup_path(process_pid);
+                            }
+                            if comm == "(unknown)" {
+                                comm = pmond::read_comm(process_pid);
+                            }
+                        }
+
+                        info!(
+                            "exit: pid={} tgid={} code={} signal={} comm={:?} cmdline={:?} exe={:?} cgroup={:?}",
+                            process_pid, process_tgid, exit_code, exit_signal, comm, cmdline, exe, cgroup
+                        );
                     }
                     proc_netlink::NetlinkEvent::Uid {
                         process_pid,
@@ -325,20 +335,15 @@ fn start_monitoring(
                         } else {
                             process_pid
                         };
-                        pw.handle_uid(process_pid, pid, ruid, euid);
                         should_broadcast = false;
                         debug!(
-                            "uid change: pid={} tgid={} ruid={} euid={}",
-                            process_pid, pid, ruid, euid
+                            "uid change: pid={} tgid={} ruid={} euid={} comm={}",
+                            process_pid,
+                            process_tgid,
+                            ruid,
+                            euid,
+                            pmond::read_comm(pid)
                         );
-                        json!({
-                            "type": "uid",
-                            "pid": process_pid,
-                            "tgid": process_tgid,
-                            "ruid": ruid,
-                            "euid": euid,
-                            "comm": pmond::read_comm(pid)
-                        })
                     }
                     proc_netlink::NetlinkEvent::Comm {
                         process_pid,
@@ -350,35 +355,17 @@ fn start_monitoring(
                         } else {
                             process_pid
                         };
-                        pw.handle_comm(process_pid, pid, comm.clone());
-                        json!({
-                            "type": "comm",
-                            "pid": process_pid,
-                            "tgid": process_tgid,
-                            "comm": comm
-                        })
                     }
                 },
                 pmond::MonitoringEvent::Pressure(event) => {
-                    json!({
-                        "type": "pressure",
-                        "pid": event.pid,
-                        "pressure_type": format!("{:?}", event.pressure_type).to_lowercase(),
-                        "data": event.pressure_data,
-                        "comm": pmond::read_comm(event.pid)
-                    })
+                    debug!(
+                        "pressure: pid={} comm={} data={}",
+                        event.pid,
+                        pmond::read_comm(event.pid),
+                        event.pressure_data,
+                    )
                 }
             };
-
-            if should_broadcast {
-                if debug {
-                    println!("{}", serde_json::to_string(&event_json).unwrap());
-                }
-
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(event_json);
-                }
-            }
         }
     })
 }

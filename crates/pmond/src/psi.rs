@@ -3,13 +3,14 @@
 use crate::{create_process_info, PressureType};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::thread::JoinHandle;
 use tokio::sync::broadcast;
@@ -32,17 +33,20 @@ pub struct PressureEvent {
 
 pub struct PsiWatcher {
     pub running: Arc<AtomicBool>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    waker: Arc<Mutex<Option<Waker>>>,
+
     // PID -> Cgroup Path
     pub watches: Arc<Mutex<HashMap<u32, String>>>,
+
     pub processes: Arc<Mutex<HashMap<u32, crate::ProcessInfo>>>,
-    // Notification for the monitoring thread
+
+    // Notification for the monitoring thread - to add and remove processes.
     new_pid_events: Arc<Mutex<Vec<(u32, String)>>>,
     terminated_pids: Arc<Mutex<Vec<u32>>>,
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    callback: Arc<Mutex<Option<Box<dyn Fn(u32, &str) + Send + Sync>>>>,
-    pub proc_callback: Arc<Mutex<Option<Box<dyn Fn(crate::ProcessInfo) + Send + Sync>>>>,
-    waker: Arc<Mutex<Option<Waker>>>,
+
     pub event_tx: broadcast::Sender<PressureEvent>,
+
     pub interval_us: u64,
     pub threshold_us: u64,
 }
@@ -57,7 +61,6 @@ impl PsiWatcher {
     /// Create a new PsiWatcher
     #[instrument]
     pub fn new() -> Self {
-        debug!("Creating new PsiWatcher");
         // Broadcast requires creating one receiver even if we don't use it
         let (event_tx, _) = broadcast::channel(100);
         let watcher = PsiWatcher {
@@ -67,52 +70,38 @@ impl PsiWatcher {
             new_pid_events: Arc::new(Mutex::new(Vec::new())),
             terminated_pids: Arc::new(Mutex::new(Vec::new())),
             handle: Arc::new(Mutex::new(None)),
-            callback: Arc::new(Mutex::new(None)),
-            proc_callback: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
             event_tx,
             interval_us: DEFAULT_INTERVAL_US,
             threshold_us: DEFAULT_THRESHOLD_US,
         };
-        info!("PsiWatcher created successfully");
         watcher
     }
 
-    /// Update configuration
-    pub fn with_config(mut self, interval_us: u64, threshold_us: u64) -> Self {
-        self.interval_us = interval_us;
-        self.threshold_us = threshold_us;
-        self
-    }
-
-    /// Set a callback to be invoked when a PSI event is triggered
-    pub fn set_callback<F>(&self, cb: F)
-    where
-        F: Fn(u32, &str) + Send + Sync + 'static,
-    {
-        let mut callback = self.callback.lock().unwrap();
-        *callback = Some(Box::new(cb));
-    }
-
-    /// Add a process to watch by PID (currently only Memory pressure is supported)
+    /// Add a memory pressure watch for a PID, if one doesn't exist already for the group.
+    /// Ideally longer lived processes will sit in a separate cgroup and be watched.
+    ///
+    /// We don't want to monitor short lived processes - they may sit in the parent cgroup, are considered
+    /// part of its normal memory use and part of performing a specific operation (for example getting a token).
+    ///
+    /// If a process lives longer than x sec it will be watched.  
     #[instrument(skip(self), fields(pid = pid))]
     pub fn add_pid(&self, pid: u32) {
-        debug!("Adding process {} to PSI watcher", pid);
         match create_process_info(pid) {
             Ok(process_info) => {
                 if let Some(cgroup_path) = process_info.cgroup_path {
                     trace!("Found cgroup path for PID {}: {}", pid, cgroup_path);
                     {
-                        let mut watches = self.watches.lock().unwrap();
+                        let mut watches = self.watches.lock();
                         watches.insert(pid, cgroup_path.clone());
                     }
 
                     {
-                        let mut events = self.new_pid_events.lock().unwrap();
+                        let mut events = self.new_pid_events.lock();
                         events.push((pid, cgroup_path));
                     }
 
-                    if let Some(waker) = self.waker.lock().unwrap().as_ref() {
+                    if let Some(waker) = self.waker.lock().as_ref() {
                         if let Err(e) = waker.wake() {
                             debug!("Failed to wake PSI watcher for PID {}: {}", pid, e);
                         } else {
@@ -129,101 +118,26 @@ impl PsiWatcher {
         }
     }
 
-    /// Handle a fork event
-    pub fn handle_fork(&self, parent_tgid: u32, child_pid: u32, child_tgid: u32) {
-        if let Ok(process_info) = crate::read_process_info_from_proc(child_tgid) {
-            if parent_tgid == child_tgid {
-                trace!(
-                    "thread: parent pid={} -> child pid={} {} {}",
-                    parent_tgid,
-                    child_pid,
-                    child_tgid,
-                    process_info.comm
-                );
-            } else {
-                trace!(
-                    "fork: parent pid={} -> child pid={} {} tname/cmd ({}) {:?}",
-                    parent_tgid,
-                    child_pid,
-                    child_tgid,
-                    process_info.comm,
-                    process_info.cmdline
-                );
-
-                {
-                    let mut proc_map = self.processes.lock().unwrap();
-                    proc_map.insert(process_info.pid, process_info.clone());
-                }
-
-                self.add_pid(process_info.pid);
-
-                if let Some(cb) = self.proc_callback.lock().unwrap().as_ref() {
-                    cb(process_info);
-                }
-            }
-        }
-    }
-
-    /// Handle an exec event
-    pub fn handle_exec(&self, _process_pid: u32, process_tgid: u32) {
-        if let Ok(process_info) = crate::read_process_info_from_proc(process_tgid) {
-            {
-                let mut proc_map = self.processes.lock().unwrap();
-                proc_map.insert(process_info.pid, process_info.clone());
-            }
-        }
-    }
-
-    /// Handle an exit event
-    pub fn handle_exit(&self, process_tgid: u32) {
-        self.processes.lock().unwrap().remove(&process_tgid);
-        self.remove_pid(process_tgid);
-    }
-
-    /// Handle a UID change event
-    pub fn handle_uid(&self, _process_pid: u32, process_tgid: u32, ruid: u32, euid: u32) {
-        let mut proc_map = self.processes.lock().unwrap();
-        if let Some(info) = proc_map.get_mut(&process_tgid) {
-            info.uid = Some(ruid);
-            trace!(
-                "uid change: pid={} ruid={} euid={}",
-                process_tgid,
-                ruid,
-                euid
-            );
-            let info_clone = info.clone();
-            drop(proc_map);
-            if let Some(cb) = self.proc_callback.lock().unwrap().as_ref() {
-                cb(info_clone);
-            }
-        }
-    }
-
-    /// Handle a COMM change event (process name change)
-    pub fn handle_comm(&self, _process_pid: u32, process_tgid: u32, comm: String) {
-        let mut proc_map = self.processes.lock().unwrap();
-        if let Some(info) = proc_map.get_mut(&process_tgid) {
-            info.comm = comm;
-            let info_clone = info.clone();
-            drop(proc_map);
-            if let Some(cb) = self.proc_callback.lock().unwrap().as_ref() {
-                cb(info_clone);
-            }
-        }
-    }
-
-    /// Remove a process from the watch list
+    /// Remove a process from the watch list - process is gone.
+    ///
+    /// Normally the watcher should detect close and remove this already.
     #[instrument(skip(self), fields(pid = pid))]
     pub fn remove_pid(&self, pid: u32) {
-        trace!("Removing process {} from PSI watcher", pid);
-        let mut terminated_pids = self.terminated_pids.lock().unwrap();
+        {
+            let mut watches = self.watches.lock();
+            if watches.remove(&pid).is_none() {
+                return;
+            }
+        }
+
+        let mut terminated_pids = self.terminated_pids.lock();
         terminated_pids.push(pid);
-        if let Some(waker) = self.waker.lock().unwrap().as_ref() {
+        if let Some(waker) = self.waker.lock().as_ref() {
             if let Err(e) = waker.wake() {
                 error!("Failed to wake PSI watcher for PID {}: {}", pid, e);
             }
         }
-        trace!("Process {} removal signal queued", pid);
+        debug!("Process {} removal signal queued", pid);
     }
 
     /// Start the PSI monitoring thread
@@ -232,20 +146,17 @@ impl PsiWatcher {
         &self,
         monitoring_tx: Option<mpsc::Sender<crate::MonitoringEvent>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("Starting PSI monitoring thread");
         if self.running.load(Ordering::SeqCst) {
             debug!("PSI monitoring already running");
             return Ok(());
         }
 
         self.running.store(true, Ordering::SeqCst);
-        info!("PSI monitoring started");
-
+    
         let running = self.running.clone();
         let watches = self.watches.clone();
         let new_pid_events = self.new_pid_events.clone();
         let terminated_pids = self.terminated_pids.clone();
-        let callback = self.callback.clone();
         let waker = self.waker.clone();
         let event_tx = self.event_tx.clone();
         let internal_monitoring_tx = monitoring_tx.clone();
@@ -253,7 +164,6 @@ impl PsiWatcher {
         let threshold_us = self.threshold_us;
 
         let handle = std::thread::spawn(move || {
-            debug!("PSI monitoring thread started");
 
             let mut poll = match Poll::new() {
                 Ok(p) => p,
@@ -262,7 +172,7 @@ impl PsiWatcher {
                     return;
                 }
             };
-            let mut events = Events::with_capacity(1024);
+            let mut events = Events::with_capacity(2048);
 
             // Internal state
             let mut cgroup_to_pids: HashMap<String, std::collections::HashSet<u32>> =
@@ -279,7 +189,7 @@ impl PsiWatcher {
                     return;
                 }
             };
-            *waker.lock().unwrap() = Some(new_waker);
+            *waker.lock() = Some(new_waker);
 
             /// Helper to open and register a cgroup for PSI monitoring
             fn setup_cgroup_watch(
@@ -332,7 +242,7 @@ impl PsiWatcher {
 
             // Initial setup - populate internal state from existing watches
             {
-                let watches_snapshot = watches.lock().unwrap();
+                let watches_snapshot = watches.lock();
                 for (&pid, cgroup_path) in watches_snapshot.iter() {
                     cgroup_to_pids
                         .entry(cgroup_path.clone())
@@ -376,7 +286,7 @@ impl PsiWatcher {
 
                             // Handle terminations - drain vec first to minimize lock time
                             let pids_to_remove: Vec<u32> = {
-                                let mut lock = terminated_pids.lock().unwrap();
+                                let mut lock = terminated_pids.lock();
                                 lock.drain(..).collect()
                             };
 
@@ -384,7 +294,7 @@ impl PsiWatcher {
                                 let mut cgroup_to_cleanup = None;
 
                                 // Find which cgroup this PID belonged to and remove it
-                                if let Some(cgroup_path) = watches.lock().unwrap().remove(&pid) {
+                                if let Some(cgroup_path) = watches.lock().remove(&pid) {
                                     if let Some(pids) = cgroup_to_pids.get_mut(&cgroup_path) {
                                         pids.remove(&pid);
                                         if pids.is_empty() {
@@ -409,7 +319,7 @@ impl PsiWatcher {
 
                             // Handle new PIDs - drain vec first to minimize lock time
                             let new_pids: Vec<(u32, String)> = {
-                                let mut lock = new_pid_events.lock().unwrap();
+                                let mut lock = new_pid_events.lock();
                                 lock.drain(..).collect()
                             };
 
@@ -461,12 +371,6 @@ impl PsiWatcher {
                                                         crate::MonitoringEvent::Pressure(event),
                                                     );
                                                 }
-
-                                                if let Some(ref callback_fn) =
-                                                    *callback.lock().unwrap()
-                                                {
-                                                    callback_fn(pid, &trimmed);
-                                                }
                                             }
                                         }
                                     }
@@ -479,7 +383,7 @@ impl PsiWatcher {
             debug!("PSI monitoring thread exiting");
         });
 
-        let mut h = self.handle.lock().unwrap();
+        let mut h = self.handle.lock();
         *h = Some(handle);
 
         Ok(())
@@ -491,13 +395,13 @@ impl PsiWatcher {
         debug!("Stopping PSI monitoring");
         self.running.store(false, Ordering::SeqCst);
 
-        if let Some(waker) = self.waker.lock().unwrap().as_ref() {
+        if let Some(waker) = self.waker.lock().as_ref() {
             debug!("Waking PSI monitoring thread");
             waker.wake()?;
         }
 
         debug!("Joining PSI monitoring thread");
-        let mut h = self.handle.lock().unwrap();
+        let mut h = self.handle.lock();
         if let Some(handle) = h.take() {
             debug!("Waiting for thread to complete");
             let _ = handle.join();
@@ -525,11 +429,6 @@ mod tests {
     fn test_psi_watcher() {
         let handle = thread::spawn(|| {
             let watcher = PsiWatcher::new();
-
-            // Set a callback
-            watcher.set_callback(|pid, info| {
-                println!("PSI callback triggered for PID {}: {}", pid, info);
-            });
 
             // Add current process to watch
             let current_pid = std::process::id();
@@ -578,7 +477,7 @@ mod tests {
 
             // Check that the pid is in watches
             {
-                let watches = watcher.watches.lock().unwrap();
+                let watches = watcher.watches.lock();
                 assert!(watches.contains_key(&pid));
             }
 
@@ -591,7 +490,7 @@ mod tests {
 
             // Check that the pid is no longer in watches
             {
-                let watches = watcher.watches.lock().unwrap();
+                let watches = watcher.watches.lock();
                 assert!(!watches.contains_key(&pid));
             }
 

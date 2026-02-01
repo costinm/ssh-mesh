@@ -48,7 +48,6 @@ pub struct AppState {
 pub async fn handle_ps_request(
     State(app_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    debug!("Received PS request");
     let processes = app_state.proc_mon.get_all_processes();
     (StatusCode::OK, Json(json!(processes)))
 }
@@ -56,7 +55,6 @@ pub async fn handle_ps_request(
 pub async fn handle_cgroups_request(
     State(app_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    debug!("Received CGroups request");
     let cgroups = app_state.proc_mon.get_all_cgroups();
     (StatusCode::OK, Json(json!(cgroups)))
 }
@@ -168,14 +166,6 @@ pub async fn handle_root_request() -> Html<&'static str> {
     )
 }
 
-pub async fn get_psi_watches(
-    State(app_state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    debug!("Received PSI watches request");
-    let watches = app_state.proc_mon.get_psi_watches();
-    (StatusCode::OK, Json(json!(watches)))
-}
-
 pub async fn handle_web_request(
     AxumPath(path): AxumPath<String>,
 ) -> impl axum::response::IntoResponse {
@@ -224,7 +214,6 @@ pub fn app(proc_mon: Arc<ProcMon>) -> Router {
         .route("/_cgroup_procs", post(handle_cgroup_procs_request))
         .route("/_move_process", post(handle_move_process_request))
         .route("/_clear_refs", post(handle_clear_refs_request))
-        .route("/_psi", get(get_psi_watches))
         .route("/web/*path", get(handle_web_request))
         .nest_service("/mcp", mcp_service(proc_mon))
         .with_state(app_state)
@@ -333,7 +322,6 @@ impl ServerHandler for PmonMcpHandler {
         _params: Option<PaginatedRequestParam>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        tracing::info!("list_tools called");
         let tools = vec![
             Tool {
                 name: "list_processes".to_string().into(),
