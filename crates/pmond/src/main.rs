@@ -1,10 +1,8 @@
-use axum::serve;
 use clap::Parser;
 use pmond::{proc_netlink, psi::PsiWatcher, ProcMon};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info};
@@ -470,85 +468,22 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
 }
 
 async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting PMON MCP server");
-
-    // Create a new ProcMon instance
-    let proc_mon = ProcMon::new()?;
-    let proc_mon = Arc::new(proc_mon);
-
-    // MCP server might start monitoring internally or we start it here
-    proc_mon.start(true, true, None)?;
-
-    pmond::handlers::run_stdio_server(proc_mon).await
+    let config = pmond::ServerConfig::default();
+    let server = pmond::PmonServer::new(config)?;
+    server.run_mcp_server().await
 }
 
 async fn run_server(
-    _refresh: u64,
+    refresh: u64,
     mcp_uds: Option<String>,
     auth_uid: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting PMON process monitor");
-
-    // Create a new ProcMon instance
-    let proc_mon = ProcMon::new()?;
-    let proc_mon = Arc::new(proc_mon);
-
-    let (tx, rx) = mpsc::channel(100);
-
-    // Start monitoring
-    proc_mon.start(true, true, Some(tx.clone()))?;
-
-    info!("PMON process monitor started successfully");
-
-    // Start UDS servers
-    let path_str = if let Some(path) = mcp_uds {
-        path
-    } else {
-        // Default to /run/user/<uid>/pmond.sock
-        let uid = unsafe { libc::getuid() };
-        format!("/run/user/{}/pmond.sock", uid)
+    let config = pmond::ServerConfig {
+        refresh_interval: refresh,
+        mcp_uds_path: mcp_uds,
+        auth_uid,
     };
 
-    // Ensure parent directory exists
-    let path = PathBuf::from(&path_str);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let http_path = format!("{}.http", path_str);
-    let mcp_path = format!("{}.mcp", path_str);
-
-    let pm_http = proc_mon.clone();
-    tokio::spawn(async move {
-        if let Err(e) = pmond::handlers::run_uds_http_server(pm_http, &http_path, auth_uid).await {
-            error!("UDS HTTP server error: {}", e);
-        }
-    });
-
-    let pm_mcp = proc_mon.clone();
-    tokio::spawn(async move {
-        if let Err(e) = pmond::handlers::run_uds_mcp_server(pm_mcp, &mcp_path, auth_uid).await {
-            error!("UDS MCP server error: {}", e);
-        }
-    });
-
-    // Set up HTTP server
-    let uid = unsafe { libc::getuid() };
-    let port = if uid == 0 {
-        8081
-    } else {
-        8082 + (uid as i32 - 1000)
-    };
-
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Listening on http://{}", addr);
-
-    // Create the Axum app
-    let app = pmond::handlers::app(proc_mon);
-
-    // Run the server
-    serve(listener, app.into_make_service()).await?;
-
-    Ok(())
+    let server = pmond::PmonServer::new(config)?;
+    server.run_server().await
 }

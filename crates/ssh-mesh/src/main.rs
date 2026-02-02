@@ -97,6 +97,42 @@ async fn main() -> Result<(), anyhow::Error> {
         ssh_port, https_port, http_port, base_dir, &app_state.target_http_address, host_ip
     );
 
+    // Start pmond server if enabled via feature flag
+    #[cfg(feature = "pmon")]
+    {
+        let pmon_port = get_port_from_env("PMON_PORT", 0);
+        let pmon_refresh = std::env::var("PMON_REFRESH")
+            .ok()
+            .and_then(|r| r.parse::<u64>().ok())
+            .unwrap_or(10);
+        let pmon_uds = std::env::var("PMON_UDS").ok();
+        let pmon_auth_uid = std::env::var("PMON_AUTH_UID")
+            .ok()
+            .and_then(|u| u.parse::<u32>().ok());
+
+        if pmon_port > 0 {
+            info!("Starting pmond server on port {}", pmon_port);
+            let config = pmond::ServerConfig {
+                refresh_interval: pmon_refresh,
+                mcp_uds_path: pmon_uds,
+                auth_uid: pmon_auth_uid,
+            };
+
+            match pmond::PmonServer::new(config) {
+                Ok(pmon_server) => {
+                    tokio::spawn(async move {
+                        if let Err(e) = pmon_server.run_server().await {
+                            error!("Pmond server failed: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to initialize pmond server: {}", e);
+                }
+            }
+        }
+    }
+
     // Start SSH server in a separate task
     let ssh_server_clone = ssh_server.clone();
     let _ssh_server_task = tokio::spawn(async move {

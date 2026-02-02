@@ -15,7 +15,7 @@ COPY crates .
 # Build both pmond and ssh-mesh targets for MUSL, built individually
 # Less efficient (duplicate builds of common deps), but want to evaluate each
 RUN cd pmond && CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release 
-RUN cd ssh-mesh &&  CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release
+RUN cd ssh-mesh &&  CC_x86_64_unknown_linux_musl=gcc cargo build --features pmon --target x86_64-unknown-linux-musl --release
 #RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p ssh-mesh
 #RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p pmond
 

@@ -15,6 +15,9 @@ pub mod methods;
 pub mod proc;
 pub mod proc_netlink;
 pub mod psi;
+pub mod server;
+
+pub use server::{PmonServer, ServerConfig};
 
 pub use proc::ProcMon;
 
