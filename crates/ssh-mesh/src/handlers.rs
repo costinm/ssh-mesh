@@ -1,15 +1,17 @@
 use axum::{
+    Router,
     body::Body,
-    extract::{Path, State},
+    extract::{Path as AxumPath, State},
     http::{Method, Request, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::{any, delete, get, post},
-    Router,
 };
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use log::{debug, info};
 use russh::server::Server;
+use rust_embed::RustEmbed;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -19,51 +21,56 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
 
+#[derive(RustEmbed)]
+#[folder = "web/"]
+pub struct Assets;
+
 use crate::AppState;
 
 pub fn app(app_state: AppState) -> Router {
     Router::new()
-        .route("/_sshm/admin", get(serve_index))
+        .route("/_m/adm", get(serve_index))
+        .route("/_m/adm/*path", get(handle_web_request))
         // WebSocket equivalents
-        .route("/_ws/_ssh", get(handle_ws_ssh))
-        .route("/_ws/_tcp/:host/:port", get(handle_ws_tcp_proxy))
-        .route("/_ws/_uds", get(handle_ws_uds_proxy))
-        .route("/_ws/_uds/*path", get(handle_ws_uds_proxy))
-        .route("/_ws/_exec/*cmd", get(handle_ws_exec))
-        .route("/_ssh", any(handle_ssh_request))
-        .route("/_ssh/*rest", any(handle_ssh_request))
-        .route("/_tcp/:host/:port", any(handle_tcp_proxy))
-        .route("/_uds", any(handle_uds_proxy))
-        .route("/_uds/*path", any(handle_uds_proxy))
-        .route("/_exec/*cmd", any(handle_exec))
+        .route("/_m/_ws/_ssh", get(handle_ws_ssh))
+        .route("/_m/_ws/_tcp/:host/:port", get(handle_ws_tcp_proxy))
+        .route("/_m/_ws/_uds", get(handle_ws_uds_proxy))
+        .route("/_m/_ws/_uds/*path", get(handle_ws_uds_proxy))
+        .route("/_m/_ws/_exec/*cmd", get(handle_ws_exec))
+        .route("/_m/_ssh", any(handle_ssh_request))
+        .route("/_m/_ssh/*rest", any(handle_ssh_request))
+        .route("/_m/_tcp/:host/:port", any(handle_tcp_proxy))
+        .route("/_m/_uds", any(handle_uds_proxy))
+        .route("/_m/_uds/*path", any(handle_uds_proxy))
+        .route("/_m/_exec/*cmd", any(handle_exec))
         .fallback(handle_proxy_request)
         .route(
-            "/ws",
+            "/_m/ws",
             get(move |State(app_state): State<AppState>, req| {
                 ws::handle_websocket_upgrade(State(app_state.ws_server), req)
             }),
         )
-        .route("/api/ssh/clients", get(get_ssh_clients))
+        .route("/_m/api/ssh/clients", get(get_ssh_clients))
         .route(
-            "/api/clients",
+            "/_m/api/clients",
             get(move |State(app_state): State<AppState>| {
                 ws::handle_list_clients(State(app_state.ws_server))
             }),
         )
         .route(
-            "/api/clients/:id",
+            "/_m/api/clients/:id",
             delete(move |State(app_state): State<AppState>, path| {
                 ws::handle_remove_client(State(app_state.ws_server), path)
             }),
         )
         .route(
-            "/api/clients/:id/message",
+            "/_m/api/clients/:id/message",
             post(move |State(app_state): State<AppState>, path, json| {
                 ws::handle_send_message(State(app_state.ws_server), path, json)
             }),
         )
         .route(
-            "/api/broadcast",
+            "/_m/api/broadcast",
             post(move |State(app_state): State<AppState>, json| {
                 ws::handle_broadcast(State(app_state.ws_server), json)
             }),
@@ -71,9 +78,53 @@ pub fn app(app_state: AppState) -> Router {
         .with_state(app_state)
 }
 
+fn mime_for_path(path: &str) -> String {
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string()
+}
+
+pub async fn handle_web_request(
+    AxumPath(path): AxumPath<String>,
+) -> impl axum::response::IntoResponse {
+    let path = path.trim_start_matches('/');
+    // Check local filesystem first (for dev)
+    let local_path = Path::new("web").join(path);
+
+    if local_path.exists() && local_path.is_file() {
+        match std::fs::read(&local_path) {
+            Ok(content) => {
+                let mime = mime_for_path(&local_path.to_string_lossy());
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, mime)],
+                    content,
+                )
+                    .into_response();
+            }
+            Err(_) => {}
+        }
+    }
+
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_for_path(path);
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, mime)],
+                content.data.to_owned(),
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+    }
+}
+
 async fn serve_index() -> impl IntoResponse {
-    let html_content = tokio::fs::read_to_string("web/ssh.html").await.unwrap();
-    Html(html_content)
+    match Assets::get("ssh.html") {
+        Some(content) => Html(std::str::from_utf8(&content.data).unwrap().to_string()),
+        None => Html("<h1>Error: ssh.html not found</h1>".to_string()),
+    }
 }
 
 async fn get_ssh_clients(State(app_state): State<AppState>) -> impl IntoResponse {
@@ -183,7 +234,7 @@ async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Err
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), host = %host, port = %port))]
 pub async fn handle_tcp_proxy(
     State(_state): State<AppState>,
-    Path((host, port)): Path<(String, u32)>,
+    AxumPath((host, port)): AxumPath<(String, u32)>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     let method = req.method().clone();
@@ -244,7 +295,7 @@ pub async fn handle_tcp_proxy(
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), path = %path))]
 pub async fn handle_uds_proxy(
     State(_state): State<AppState>,
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     let method = req.method().clone();
@@ -307,7 +358,7 @@ pub async fn handle_uds_proxy(
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), cmd = %cmd))]
 pub async fn handle_exec(
     State(_state): State<AppState>,
-    Path(cmd): Path<String>,
+    AxumPath(cmd): AxumPath<String>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     let method = req.method().clone();
@@ -458,7 +509,7 @@ pub async fn handle_ws_ssh(State(state): State<AppState>, req: Request<Body>) ->
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), host = %host, port = %port))]
 pub async fn handle_ws_tcp_proxy(
     State(_state): State<AppState>,
-    Path((host, port)): Path<(String, u32)>,
+    AxumPath((host, port)): AxumPath<(String, u32)>,
     req: Request<Body>,
 ) -> Response {
     ws::handle_upgrade_with_handler(req, move |ws| async move {
@@ -479,7 +530,7 @@ pub async fn handle_ws_tcp_proxy(
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), path = %path))]
 pub async fn handle_ws_uds_proxy(
     State(_state): State<AppState>,
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     req: Request<Body>,
 ) -> Response {
     let full_path = if path.starts_with('/') {
@@ -507,7 +558,7 @@ pub async fn handle_ws_uds_proxy(
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), cmd = %cmd))]
 pub async fn handle_ws_exec(
     State(_state): State<AppState>,
-    Path(cmd): Path<String>,
+    AxumPath(cmd): AxumPath<String>,
     req: Request<Body>,
 ) -> Response {
     ws::handle_upgrade_with_handler(req, move |ws| async move {
@@ -586,8 +637,8 @@ pub async fn handle_proxy_request(
 
     let proxy_req = hyper::Request::from_parts(parts, body);
 
-    use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_util::client::legacy::Client;
+    use hyper_util::client::legacy::connect::HttpConnector;
     let client: Client<HttpConnector, axum::body::Body> =
         Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
 

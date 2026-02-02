@@ -1,4 +1,4 @@
-use axum::{body::Body, http::Request, routing::get, Router};
+use axum::{Router, body::Body, http::Request, routing::get};
 use ssh_mesh::test_utils::{find_free_port, setup_test_environment};
 
 #[tokio::test]
@@ -24,7 +24,8 @@ async fn test_mesh_proxy_fallback() {
 
     // 2. Start ssh-mesh with target_http_address pointing to echo server
     // We need to set HTTP_PORT environment variable for the mesh to pick it up in AppState
-    std::env::set_var("HTTP_PORT", echo_port.to_string());
+    // SAFETY: We ensure HTTP_PORT is only used in single-threaded tests
+    unsafe { std::env::set_var("HTTP_PORT", echo_port.to_string()) };
 
     let setup = setup_test_environment(None, true).await.unwrap();
     let mesh_port = setup.http_port.expect("HTTP port should be set");
@@ -59,5 +60,6 @@ async fn test_mesh_proxy_fallback() {
     assert_eq!(body, "Mesh Echo: /some/random/path");
 
     setup.server_handle.abort();
-    std::env::remove_var("HTTP_PORT");
+    // SAFETY: Cleaning up after test
+    unsafe { std::env::remove_var("HTTP_PORT") };
 }

@@ -580,11 +580,6 @@ fn run_snapshot_loop(
             let mut s1 = snap1.lock();
             let mut s2 = snap2.lock();
 
-            // 5. Compute the deltas between snap2 and snap1, saving the delta in snap1
-            // snap1 contains processes from T-1. snap2 contains processes from T-2.
-            // We update snap1 to hold the diffs (T-1) - (T-2).
-            calculate_memory_deltas(&mut s1, &s2);
-
             // 6. Compute the delta between snap1 and new_processes, saving the delta in new_processes
             // new_processes contains processes from T. snap1 contains processes from T-1.
             // We update new_processes to hold the diffs (T) - (T-1).

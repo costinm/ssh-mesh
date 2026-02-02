@@ -329,6 +329,7 @@ pub async fn pipe_read_to_ssh<R>(
             }
         }
     }
+    let _ = session_handle.eof(channel_id).await;
     let _ = session_handle.close(channel_id).await;
 }
 

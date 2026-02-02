@@ -38,7 +38,7 @@ pub fn load_or_generate_key(base_dir: &Path) -> PrivateKey {
         }
     }
 
-    debug!("Generating new EC-256 key (PKCS#8 format)");
+    info!("Generating new EC-256 key (PKCS#8 format)");
     let ssh_pk = ssh_key::PrivateKey::random(
         &mut rand::rngs::OsRng,
         ssh_key::Algorithm::Ecdsa {

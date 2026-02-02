@@ -6,12 +6,12 @@ use anyhow::Context as AnyhowContext;
 use hyper::body::Bytes;
 // use hyper::{Request, Response};
 use log::{error, info};
-use nix::libc::{ioctl, TIOCSCTTY};
+use nix::libc::{TIOCSCTTY, ioctl};
 use nix::unistd::{dup2, setsid};
 use openpty::openpty;
 use russh::keys::{PrivateKey, PublicKey, PublicKeyBase64};
 use russh::server::Server;
-use russh::{server, ChannelId, MethodKind};
+use russh::{ChannelId, MethodKind, server};
 use serde::Serialize;
 use ssh_key;
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ use std::{
 };
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 // use tokio_stream::StreamExt;
 use tracing::{debug, instrument, trace};
 
@@ -39,7 +39,9 @@ use ws::WSServer;
 
 // File paths for SSH authentication
 pub mod auth;
+pub mod drain;
 pub mod handlers;
+pub mod socks5;
 pub mod utils;
 
 // Configuration for the SSH server
@@ -277,8 +279,7 @@ impl server::Handler for SshHandler {
 
             trace!(
                 "Created new session for channel {:?} in handler {}",
-                channel_id,
-                handler_id
+                channel_id, handler_id
             );
             Ok(true)
         }
@@ -295,10 +296,9 @@ impl server::Handler for SshHandler {
         session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
         info!(
-            "Direct TCP/IP connection request: {}:{} from {}:{}",
-            host_to_connect, port_to_connect, originator_ip_address, originator_port
+            "Direct TCP/IP connection request: {}:{} from {}:{} (handler ID: {})",
+            host_to_connect, port_to_connect, originator_ip_address, originator_port, self.id
         );
-        debug!("SSH handler ID: {}", self.id);
 
         let channel_id = channel.id();
         let sessions = self.sessions.clone();
@@ -312,10 +312,7 @@ impl server::Handler for SshHandler {
         async move {
             trace!(
                 "Processing direct TCP/IP connection for: {}:{} from {}:{}",
-                host,
-                port,
-                originator_ip,
-                originator_port
+                host, port, originator_ip, originator_port
             );
 
             // Create a new session entry for this channel
@@ -334,8 +331,7 @@ impl server::Handler for SshHandler {
 
             trace!(
                 "Created new direct TCP/IP session for channel {:?} in handler {}",
-                channel_id,
-                handler_id
+                channel_id, handler_id
             );
 
             // Establish a TCP connection to the target host:port
@@ -379,10 +375,14 @@ impl server::Handler for SshHandler {
                         writers.remove(&channel_id);
                     });
 
+                    info!("Direct TCP/IP forwarding established for {}:{}", host, port);
                     Ok(true)
                 }
                 Err(e) => {
-                    error!("Failed to connect to target {}:{}: {}", host, port, e);
+                    error!(
+                        "Failed to connect to target {}:{}: {} (handler ID: {})",
+                        host, port, e, handler_id
+                    );
                     Ok(false) // Reject the channel if we can't connect
                 }
             }
@@ -467,11 +467,11 @@ impl server::Handler for SshHandler {
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let _data_str = String::from_utf8_lossy(data).to_string();
         trace!(
-            "Received data on channel {:?}: {} bytes",
+            "Received data on channel {:?}: {} bytes (handler ID: {})",
             channel,
-            data.len()
+            data.len(),
+            self.id
         );
-        debug!("SSH handler ID: {}", self.id);
 
         // Check if this is a direct TCP/IP channel and forward data to the TCP connection
         let tcp_writers = self.tcp_writers.clone();
@@ -1006,8 +1006,7 @@ impl server::Handler for SshHandler {
             if let Some(mut removed_session) = sessions_lock.remove(&channel_id) {
                 trace!(
                     "Removed session for channel {:?} from handler {}",
-                    channel_id,
-                    handler_id
+                    channel_id, handler_id
                 );
                 // If a PTY process was spawned, kill it.
                 if let Some(mut child) = removed_session.process.take() {
@@ -1019,8 +1018,7 @@ impl server::Handler for SshHandler {
             } else {
                 trace!(
                     "No session found for channel {:?} in handler {}",
-                    channel_id,
-                    handler_id
+                    channel_id, handler_id
                 );
             }
 
@@ -1031,15 +1029,6 @@ impl server::Handler for SshHandler {
             } else {
                 trace!("No writer found for channel {:?}", channel_id);
             }
-
-            // Remove the client from the connected_clients map
-            let mut clients = connected_clients.lock().await;
-            clients.remove(&handler_id);
-            eprintln!(
-                "DEBUG: Client {} removed. Connected clients remaining: {:?}",
-                handler_id,
-                clients.keys().collect::<Vec<_>>()
-            );
 
             Ok(())
         }
@@ -1250,7 +1239,7 @@ pub fn run_exec_command(config: ExecConfig) -> Result<(), anyhow::Error> {
 
     #[cfg(unix)]
     {
-        use nix::unistd::{setuid, Uid};
+        use nix::unistd::{Uid, setuid};
         // Drop privileges to the target user
         setuid(Uid::from_raw(uid_val)).context(
             "Failed to setuid - make sure you're running as root if you want to change users",

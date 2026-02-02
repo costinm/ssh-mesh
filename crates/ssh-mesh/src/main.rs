@@ -16,7 +16,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 /// - `RUST_LOG=debug` -> Log debug and above
 /// - `RUST_LOG=ssh_mesh=debug,info` -> Log debug for ssh_mesh crate, info for others
 fn init_telemetry() {
-    let json_layer = tracing_subscriber::fmt::layer().json();
+    let fmt_layer = tracing_subscriber::fmt::layer().compact();
 
     let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
         tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
@@ -26,7 +26,7 @@ fn init_telemetry() {
 
     Registry::default()
         .with(EnvFilter::from_default_env())
-        .with(json_layer)
+        .with(fmt_layer)
         .with(perfetto_layer)
         .init();
 }
@@ -55,14 +55,16 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Import required items
     use log::{error, info};
-    use ssh_mesh::{handlers, run_ssh_server, AppState, ExecConfig, SshServer};
+    use ssh_mesh::{AppState, ExecConfig, SshServer, handlers, run_ssh_server};
 
     let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
-    info!("Starting ssh-mesh on host: {}", host_ip);
 
     // Get SSH port from environment variable or use default
     let ssh_port = get_port_from_env("SSH_PORT", 15022);
-    let http_port = get_port_from_env("LISTEN_HTTP_PORT", 15028);
+    let http_port = get_port_from_env("HTTP_PORT", 0);
+    let https_port = get_port_from_env("HTTPS_PORT", 15028);
+    // Start SOCKS5 server if SOCKS_PORT is set
+    let socks_port = get_port_from_env("SOCKS_PORT", 0);
 
     // Get base directory from environment variable SSH_BASEDIR
     // If not set, use $HOME/.ssh or /tmp/.ssh as default
@@ -76,11 +78,6 @@ async fn main() -> Result<(), anyhow::Error> {
             path
         });
 
-    info!(
-        "Starting SSH server on port {} and HTTP server on port {} with base directory: {:?}",
-        ssh_port, http_port, base_dir
-    );
-
     // Create SSH server instance
     let ssh_server = Arc::new(SshServer::new(0, None, base_dir.clone()));
 
@@ -88,11 +85,17 @@ async fn main() -> Result<(), anyhow::Error> {
     let ws_server = Arc::new(WSServer::new());
 
     // Create AppState
+
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
         ws_server: ws_server.clone(),
-        target_http_address: std::env::var("HTTP_PORT").ok(),
+        target_http_address: std::env::var("APP_HTTP_PORT").ok(),
     };
+
+    info!(
+        "Starting SSH_PORT {} and HTTPS_PORT={} HTTP_PORT={} SSH_BASEDIR={:?} app_port={:?} ip={}",
+        ssh_port, https_port, http_port, base_dir, &app_state.target_http_address, host_ip
+    );
 
     // Start SSH server in a separate task
     let ssh_server_clone = ssh_server.clone();
@@ -103,20 +106,25 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
 
+    if socks_port > 0 {
+        let socks_addr = format!("0.0.0.0:{}", socks_port);
+        tokio::spawn(async move {
+            match ssh_mesh::socks5::Socks5Server::bind(&socks_addr).await {
+                Ok(server) => {
+                    info!("SOCKS5 server listening on {}", socks_addr);
+                    server.run().await;
+                }
+                Err(e) => {
+                    error!("Failed to start SOCKS5 server: {}", e);
+                }
+            }
+        });
+    }
+
     // Create Axum app
     let app = handlers::app(app_state.clone());
 
-    // Start Axum server
-    let http_addr = format!("0.0.0.0:{}", http_port);
-    let listener = TcpListener::bind(&http_addr).await?;
-    info!("Listening on http://{}", http_addr);
-
-    if let Some(target) = &app_state.target_http_address {
-        info!("Proxying unknown routes to {}", target);
-    }
-
     // HTTPS server
-    let https_port = get_port_from_env("HTTPS_PORT", 0);
     if https_port > 0 {
         let cert_path = base_dir.join("id_ecdsa.crt");
         let key_path = base_dir.join("id_ecdsa");
@@ -145,16 +153,21 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    // Check for command line arguments (excluding $0)
-    let args: Vec<String> = env::args().collect();
-    if args.len() > 1 {
+    // Start Axum server
+    if http_port > 0 {
+        let http_addr = format!("0.0.0.0:{}", http_port);
+        let listener = TcpListener::bind(&http_addr).await?;
         // Run HTTP server in background
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app.into_make_service()).await {
                 error!("HTTP server failed: {}", e);
             }
         });
+    }
 
+    // Check for command line arguments (excluding $0)
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
         // Run the command in foreground
         let exec_user = env::var("EXEC_USER").unwrap_or_else(|_| "1000".to_string());
         let uid: u32 = exec_user.parse().expect("Invalid EXEC_USER");
@@ -164,8 +177,12 @@ async fn main() -> Result<(), anyhow::Error> {
             uid,
         })?;
     } else {
-        // Run HTTP server in foreground
-        axum::serve(listener, app.into_make_service()).await?;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {}", err);
+            }
+        }
     }
 
     Ok(())
