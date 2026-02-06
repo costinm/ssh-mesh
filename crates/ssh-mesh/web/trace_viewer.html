@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSH-Mesh Live Log Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        h1 {
+            color: #4ec9b0;
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
+
+        .controls {
+            background: #252526;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .status {
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+
+        .status.connected {
+            background: #4ec9b0;
+            color: #1e1e1e;
+        }
+
+        .status.disconnected {
+            background: #f48771;
+            color: #1e1e1e;
+        }
+
+        button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-family: inherit;
+        }
+
+        button:hover {
+            background: #1177bb;
+        }
+
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+
+        select,
+        input {
+            background: #3c3c3c;
+            color: #d4d4d4;
+            border: 1px solid #555;
+            padding: 6px 10px;
+            border-radius: 3px;
+            font-family: inherit;
+        }
+
+        .filter-buttons {
+            display: flex;
+            gap: 5px;
+        }
+
+        .filter-btn {
+            padding: 5px 10px;
+            font-size: 12px;
+            opacity: 0.6;
+        }
+
+        .filter-btn.active {
+            opacity: 1;
+            font-weight: bold;
+        }
+
+        .filter-btn.trace {
+            background: #888;
+        }
+
+        .filter-btn.debug {
+            background: #4ec9b0;
+        }
+
+        .filter-btn.info {
+            background: #569cd6;
+        }
+
+        .filter-btn.warn {
+            background: #dcdcaa;
+        }
+
+        .filter-btn.error {
+            background: #f48771;
+        }
+
+        #logs {
+            background: #252526;
+            padding: 15px;
+            border-radius: 5px;
+            max-height: calc(100vh - 200px);
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            margin: 3px 0;
+            padding: 6px 10px;
+            border-left: 3px solid;
+            font-size: 13px;
+            animation: fadeIn 0.2s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(-5px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .log-entry.trace {
+            border-color: #888;
+            background: rgba(136, 136, 136, 0.1);
+        }
+
+        .log-entry.debug {
+            border-color: #4ec9b0;
+            background: rgba(78, 201, 176, 0.1);
+        }
+
+        .log-entry.info {
+            border-color: #569cd6;
+            background: rgba(86, 156, 214, 0.1);
+        }
+
+        .log-entry.warn {
+            border-color: #dcdcaa;
+            background: rgba(220, 220, 170, 0.1);
+        }
+
+        .log-entry.error {
+            border-color: #f48771;
+            background: rgba(244, 135, 113, 0.1);
+        }
+
+        .log-entry.hidden {
+            display: none;
+        }
+
+        .log-time {
+            color: #858585;
+            font-size: 11px;
+        }
+
+        .log-level {
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 11px;
+            display: inline-block;
+            width: 50px;
+        }
+
+        .log-level.trace {
+            color: #888;
+        }
+
+        .log-level.debug {
+            color: #4ec9b0;
+        }
+
+        .log-level.info {
+            color: #569cd6;
+        }
+
+        .log-level.warn {
+            color: #dcdcaa;
+        }
+
+        .log-level.error {
+            color: #f48771;
+        }
+
+        .log-target {
+            color: #9cdcfe;
+            font-size: 11px;
+        }
+
+        .log-message {
+            color: #d4d4d4;
+            margin-top: 2px;
+        }
+
+        .log-fields {
+            color: #ce9178;
+            font-size: 11px;
+            margin-top: 2px;
+            margin-left: 20px;
+        }
+
+        .stats {
+            margin-top: 10px;
+            padding: 10px;
+            background: #252526;
+            border-radius: 5px;
+            font-size: 12px;
+            display: flex;
+            gap: 20px;
+        }
+
+        .stat {
+            color: #858585;
+        }
+
+        .stat-value {
+            color: #4ec9b0;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🔍 SSH-Mesh Live Log Viewer</h1>
+
+    <div class="controls">
+        <span id="status" class="status disconnected">DISCONNECTED</span>
+        <button id="connect-btn">Connect</button>
+        <button id="clear-btn">Clear Logs</button>
+        <label>
+            Max entries:
+            <input type="number" id="max-entries" value="500" min="10" max="10000" style="width: 80px;">
+        </label>
+        <label>
+            <input type="checkbox" id="auto-scroll" checked> Auto-scroll
+        </label>
+    </div>
+
+    <div class="controls">
+        <span>Filter by level:</span>
+        <div class="filter-buttons">
+            <button class="filter-btn trace active" data-level="trace"> TRACE</button>
+            <button class="filter-btn debug active" data-level="debug">DEBUG</button>
+            <button class="filter-btn info active" data-level="info">INFO</button>
+            <button class="filter-btn warn active" data-level="warn">WARN</button>
+            <button class="filter-btn error active" data-level="error">ERROR</button>
+        </div>
+    </div>
+
+    <div id="logs"></div>
+
+    <div class="stats">
+        <div class="stat">Total: <span id="total-count" class="stat-value">0</span></div>
+        <div class="stat">Trace: <span id="trace-count" class="stat-value">0</span></div>
+        <div class="stat">Debug: <span id="debug-count" class="stat-value">0</span></div>
+        <div class="stat">Info: <span id="info-count" class="stat-value">0</span></div>
+        <div class="stat">Warn: <span id="warn-count" class="stat-value">0</span></div>
+        <div class="stat">Error: <span id="error-count" class="stat-value">0</span></div>
+    </div>
+
+    <script>
+        let ws = null;
+        let activeFilters = new Set(['trace', 'debug', 'info', 'warn', 'error']);
+        let counts = { total: 0, trace: 0, debug: 0, info: 0, warn: 0, error: 0 };
+
+        const logsDiv = document.getElementById('logs');
+        const statusSpan = document.getElementById('status');
+        const connectBtn = document.getElementById('connect-btn');
+        const clearBtn = document.getElementById('clear-btn');
+        const maxEntriesInput = document.getElementById('max-entries');
+        const autoScrollCheckbox = document.getElementById('auto-scroll');
+
+        // Connection management
+        function connect() {
+            const wsUrl = `ws://${window.location.hostname}:${window.location.port || 8081}/_m/trace/view`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                statusSpan.textContent = 'CONNECTED';
+                statusSpan.className = 'status connected';
+                connectBtn.textContent = 'Disconnect';
+                connectBtn.disabled = false;
+            };
+
+            ws.onmessage = (event) => {
+                const log = JSON.parse(event.data);
+                addLogEntry(log);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onclose = () => {
+                statusSpan.textContent = 'DISCONNECTED';
+                statusSpan.className = 'status disconnected';
+                connectBtn.textContent = 'Connect';
+                ws = null;
+            };
+
+            connectBtn.disabled = true;
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+
+        connectBtn.addEventListener('click', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                disconnect();
+            } else {
+                connect();
+            }
+        });
+
+        // Log entry management
+        function addLogEntry(log) {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${log.level}`;
+
+            if (!activeFilters.has(log.level)) {
+                entry.classList.add('hidden');
+            }
+
+            const timestamp = new Date(log.timestamp).toLocaleTimeString();
+
+            let html = `
+        <div>
+          <span class="log-time">${timestamp}</span>
+          <span class="log-level ${log.level}">${log.level}</span>
+          <span class="log-target">${log.target}</span>
+        </div>
+        <div class="log-message">${escapeHtml(log.message)}</div>
+      `;
+
+            if (log.fields && Object.keys(log.fields).length > 0) {
+                html += `<div class="log-fields">${JSON.stringify(log.fields)}</div>`;
+            }
+
+            entry.innerHTML = html;
+            logsDiv.appendChild(entry);
+
+            // Update counts
+            counts.total++;
+            counts[log.level]++;
+            updateCounts();
+
+            // Manage max entries
+            const maxEntries = parseInt(maxEntriesInput.value) || 500;
+            while (logsDiv.children.length > maxEntries) {
+                logsDiv.removeChild(logsDiv.firstChild);
+            }
+
+            // Auto-scroll
+            if (autoScrollCheckbox.checked) {
+                logsDiv.scrollTop = logsDiv.scrollHeight;
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function updateCounts() {
+            document.getElementById('total-count').textContent = counts.total;
+            document.getElementById('trace-count').textContent = counts.trace;
+            document.getElementById('debug-count').textContent = counts.debug;
+            document.getElementById('info-count').textContent = counts.info;
+            document.getElementById('warn-count').textContent = counts.warn;
+            document.getElementById('error-count').textContent = counts.error;
+        }
+
+        clearBtn.addEventListener('click', () => {
+            logsDiv.innerHTML = '';
+            counts = { total: 0, trace: 0, debug: 0, info: 0, warn: 0, error: 0 };
+            updateCounts();
+        });
+
+        // Filter management
+        document.querySelectorAll('.filter-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const level = btn.dataset.level;
+
+                if (activeFilters.has(level)) {
+                    activeFilters.delete(level);
+                    btn.classList.remove('active');
+                } else {
+                    activeFilters.add(level);
+                    btn.classList.add('active');
+                }
+
+                // Apply filters
+                document.querySelectorAll('.log-entry').forEach(entry => {
+                    const entryLevel = [...entry.classList].find(c =>
+                        ['trace', 'debug', 'info', 'warn', 'error'].includes(c)
+                    );
+
+                    if (activeFilters.has(entryLevel)) {
+                        entry.classList.remove('hidden');
+                    } else {
+                        entry.classList.add('hidden');
+                    }
+                });
+            });
+        });
+
+        // Auto-connect on load
+        connect();
+    </script>
+</body>
+
+</html>
