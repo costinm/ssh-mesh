@@ -6,29 +6,34 @@ use ws::WSServer;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
-/// Initialize telemetry with JSON tracing and Perfetto tracing.
+/// Initialize telemetry with dynamic reload support and in-memory log buffering.
 ///
 /// Configuration is controlled via the `RUST_LOG` environment variable.
 /// Examples:
 /// - `RUST_LOG=info` -> Log info and above
 /// - `RUST_LOG=debug` -> Log debug and above
 /// - `RUST_LOG=ssh_mesh=debug,info` -> Log debug for ssh_mesh crate, info for others
-fn init_telemetry() {
+///
+/// The tracing level can be dynamically changed at runtime using the reload handle.
+/// All log events are also captured in the provided log buffer for viewing via WebSocket.
+fn init_telemetry(log_buffer: ssh_mesh::local_trace::LogBuffer) {
+    let filter = EnvFilter::from_default_env();
+    let (filter, reload_handle) = reload::Layer::new(filter);
     let fmt_layer = tracing_subscriber::fmt::layer().compact();
-
-    let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
-        tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
-            std::fs::File::create(file).expect("failed to create trace file"),
-        ))
-    });
+    let buffer_layer = ssh_mesh::local_trace::LogBufferLayer::new(log_buffer);
 
     Registry::default()
-        .with(EnvFilter::from_default_env())
+        .with(filter)
         .with(fmt_layer)
-        .with(perfetto_layer)
+        .with(buffer_layer)
         .init();
+
+    // Store the reload handle globally
+    let _ = ssh_mesh::TRACING_RELOAD_HANDLE.set(reload_handle);
+
+    tracing::trace!(hello = "world", foo = 2, "Test {}", 1);
 }
 
 fn get_local_ip() -> Option<String> {
@@ -48,7 +53,10 @@ fn get_port_from_env(var_name: &str, default: u16) -> u16 {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    init_telemetry();
+    // Create log buffer early so we can initialize telemetry with it
+    let log_buffer = ssh_mesh::local_trace::create_log_buffer();
+
+    init_telemetry(log_buffer.clone());
 
     let main_span = tracing::info_span!("main");
     let _main_guard = main_span.enter();
@@ -84,54 +92,34 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create WebSocket server instance
     let ws_server = Arc::new(WSServer::new());
 
+    // Initialize ProcMon if enabled
+    #[cfg(feature = "pmon")]
+    let proc_mon = {
+        let pm = Arc::new(pmond::ProcMon::new().expect("Failed to create ProcMon"));
+        // Start monitoring: read_sync=true, watch_psi=true, event_tx=None
+        if let Err(e) = pm.start(true, true, None) {
+            error!("Failed to start ProcMon: {}", e);
+        } else {
+            info!("ProcMon started successfully");
+        }
+        pm
+    };
+
     // Create AppState
 
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
         ws_server: ws_server.clone(),
         target_http_address: std::env::var("APP_HTTP_PORT").ok(),
+        #[cfg(feature = "pmon")]
+        proc_mon: proc_mon.clone(),
+        log_buffer: log_buffer.clone(),
     };
 
     info!(
         "Starting SSH_PORT {} and HTTPS_PORT={} HTTP_PORT={} SSH_BASEDIR={:?} app_port={:?} ip={}",
         ssh_port, https_port, http_port, base_dir, &app_state.target_http_address, host_ip
     );
-
-    // Start pmond server if enabled via feature flag
-    #[cfg(feature = "pmon")]
-    {
-        let pmon_port = get_port_from_env("PMON_PORT", 0);
-        let pmon_refresh = std::env::var("PMON_REFRESH")
-            .ok()
-            .and_then(|r| r.parse::<u64>().ok())
-            .unwrap_or(10);
-        let pmon_uds = std::env::var("PMON_UDS").ok();
-        let pmon_auth_uid = std::env::var("PMON_AUTH_UID")
-            .ok()
-            .and_then(|u| u.parse::<u32>().ok());
-
-        if pmon_port > 0 {
-            info!("Starting pmond server on port {}", pmon_port);
-            let config = pmond::ServerConfig {
-                refresh_interval: pmon_refresh,
-                mcp_uds_path: pmon_uds,
-                auth_uid: pmon_auth_uid,
-            };
-
-            match pmond::PmonServer::new(config) {
-                Ok(pmon_server) => {
-                    tokio::spawn(async move {
-                        if let Err(e) = pmon_server.run_server().await {
-                            error!("Pmond server failed: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to initialize pmond server: {}", e);
-                }
-            }
-        }
-    }
 
     // Start SSH server in a separate task
     let ssh_server_clone = ssh_server.clone();
@@ -160,7 +148,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create Axum app
     let app = handlers::app(app_state.clone());
 
-    // HTTPS server
+    // HTTPS server - WIP, authz and authn not implemented.
     if https_port > 0 {
         let cert_path = base_dir.join("id_ecdsa.crt");
         let key_path = base_dir.join("id_ecdsa");
@@ -189,7 +177,9 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    // Start Axum server
+    // HTTP server - forwards to the app's port, with handlers for
+    // ssh tunneling and an admin interface.
+    // TODO: separate admin interface to different port.
     if http_port > 0 {
         let http_addr = format!("0.0.0.0:{}", http_port);
         let listener = TcpListener::bind(&http_addr).await?;

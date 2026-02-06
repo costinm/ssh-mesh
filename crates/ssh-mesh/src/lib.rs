@@ -33,14 +33,24 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 // use tokio_stream::StreamExt;
 use tracing::{debug, instrument, trace};
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
-// use pmond::ProcMon;
+/// Global handle for dynamically reloading the tracing filter
+pub static TRACING_RELOAD_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, Registry>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "pmon")]
+use pmond::ProcMon;
+use utoipa::ToSchema;
 use ws::WSServer;
 
 // File paths for SSH authentication
 pub mod auth;
 pub mod drain;
 pub mod handlers;
+pub mod local_trace;
+#[cfg(feature = "sftp")]
+pub mod sftp;
 pub mod socks5;
 pub mod utils;
 
@@ -61,22 +71,25 @@ pub struct SshServer {
 }
 
 /// Information about a connected client
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ConnectedClientInfo {
     pub id: usize,
     pub user: String,
     pub comment: String,
     pub options: Option<String>,
     pub remote_forward_listeners: Vec<(String, u32)>,
+    #[schema(value_type = String, format = DateTime)]
     pub connected_at: SystemTime,
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub ssh_server: Arc<SshServer>,
-    //pub proc_mon: Arc<ProcMon>,
+    #[cfg(feature = "pmon")]
+    pub proc_mon: Arc<ProcMon>,
     pub ws_server: Arc<WSServer>,
     pub target_http_address: Option<String>,
+    pub log_buffer: crate::local_trace::LogBuffer,
 }
 
 // TODO: move the env vars to main
@@ -996,7 +1009,7 @@ impl server::Handler for SshHandler {
 
         let sessions = self.sessions.clone();
         let tcp_writers = self.tcp_writers.clone();
-        let connected_clients = self.server.connected_clients.clone();
+        let _connected_clients = self.server.connected_clients.clone();
         let handler_id = self.id;
         let channel_id = channel;
 
@@ -1049,94 +1062,145 @@ impl server::Handler for SshHandler {
 
         async move {
             if subsystem_name == "sftp" {
-                let sftp_server_path = "/usr/lib/openssh/sftp-server";
-                if !std::path::Path::new(sftp_server_path).exists() {
-                    error!("SFTP server binary not found at {}", sftp_server_path);
-                    let _ = session_handle.channel_failure(channel_id).await;
+                #[cfg(feature = "sftp")]
+                {
+                    info!("Starting built-in SFTP server for channel {:?}", channel_id);
+
+                    // Create input channel (SSH -> SFTP)
+                    let (tx_in, rx_in) = mpsc::unbounded_channel::<Bytes>();
+                    {
+                        let mut writers = tcp_writers.lock().await;
+                        writers.insert(channel_id, tx_in);
+                    }
+
+                    // Create output channel (SFTP -> SSH)
+                    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<Bytes>();
+
+                    // Create the stream adapter
+                    let stream = crate::utils::ChannelBytesStream {
+                        reader: rx_in,
+                        writer: tx_out,
+                        read_buf: bytes::BytesMut::new(),
+                    };
+
+                    // Spawn task to forward SFTP output to SSH channel
+                    let session_handle_clone = session_handle.clone();
+                    tokio::spawn(async move {
+                        while let Some(data) = rx_out.recv().await {
+                            if session_handle_clone
+                                .data(channel_id, data.as_ref().into())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        let _ = session_handle_clone.eof(channel_id).await;
+                        let _ = session_handle_clone.close(channel_id).await;
+                    });
+
+                    // Start SFTP server
+                    let base_dir = self.server.base_dir.clone();
+                    tokio::spawn(async move {
+                        let handler = crate::sftp::FileSystemHandler::new(base_dir);
+                        russh_sftp::server::run(stream, handler).await;
+                    });
+
+                    let _ = session_handle.channel_success(channel_id).await;
                     return Ok(());
                 }
 
-                info!(
-                    "Spawning SFTP server: {} in {:?}",
-                    sftp_server_path, self.server.base_dir
-                );
-                let mut cmd = Command::new(sftp_server_path);
-                cmd.current_dir(&self.server.base_dir)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
-                let stdin = child.stdin.take().unwrap();
-                let stdout = child.stdout.take().unwrap();
-                let stderr = child.stderr.take().unwrap();
-
-                // Forward SFTP stdout -> SSH data
-                let session_handle_clone = session_handle.clone();
-                tokio::spawn(async move {
-                    crate::utils::pipe_read_to_ssh(
-                        stdout,
-                        session_handle_clone,
-                        channel_id,
-                        "SFTP stdout to SSH",
-                    )
-                    .await;
-                });
-
-                // Forward SFTP stderr -> SSH extended data
-                let session_handle_clone2 = session_handle.clone();
-                tokio::spawn(async move {
-                    crate::utils::pipe_read_to_ssh_extended(
-                        stderr,
-                        session_handle_clone2,
-                        channel_id,
-                        1,
-                        "SFTP stderr to SSH",
-                    )
-                    .await;
-                });
-
-                // Forward SSH data -> SFTP stdin
-                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                #[cfg(not(feature = "sftp"))]
                 {
-                    let mut writers = tcp_writers.lock().await;
-                    writers.insert(channel_id, tx);
-                }
-
-                let tcp_writers_clone = tcp_writers.clone();
-                tokio::spawn(async move {
-                    crate::utils::pipe_rx_to_write(rx, stdin, "SSH to SFTP stdin").await;
-                    let mut writers = tcp_writers_clone.lock().await;
-                    writers.remove(&channel_id);
-                });
-
-                // Monitor child process exit
-                let session_handle_clone3 = session_handle.clone();
-                let tcp_writers_clone2 = tcp_writers.clone();
-                tokio::spawn(async move {
-                    debug!("SFTP process monitor task started");
-                    match child.wait().await {
-                        Ok(status) => {
-                            debug!("SFTP server exited with status: {}", status);
-                            let exit_code = status.code().unwrap_or(0) as u32;
-                            let _ = session_handle_clone3
-                                .exit_status_request(channel_id, exit_code)
-                                .await;
-                        }
-                        Err(e) => {
-                            error!("Error waiting for SFTP server: {}", e);
-                        }
+                    let sftp_server_path = "/usr/lib/openssh/sftp-server";
+                    if !std::path::Path::new(sftp_server_path).exists() {
+                        error!("SFTP server binary not found at {}", sftp_server_path);
+                        let _ = session_handle.channel_failure(channel_id).await;
+                        return Ok(());
                     }
-                    let _ = session_handle_clone3.close(channel_id).await;
 
-                    // Ensure cleanup
-                    let mut writers = tcp_writers_clone2.lock().await;
-                    writers.remove(&channel_id);
-                    debug!("SFTP process monitor task ended");
-                });
-                info!("SFTP subsystem request accepted and handlers spawned");
-                let _ = session_handle.channel_success(channel_id).await;
-                Ok(())
+                    info!(
+                        "Spawning SFTP server: {} in {:?}",
+                        sftp_server_path, self.server.base_dir
+                    );
+                    let mut cmd = Command::new(sftp_server_path);
+                    cmd.current_dir(&self.server.base_dir)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+
+                    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
+                    let stdin = child.stdin.take().unwrap();
+                    let stdout = child.stdout.take().unwrap();
+                    let stderr = child.stderr.take().unwrap();
+
+                    // Forward SFTP stdout -> SSH data
+                    let session_handle_clone = session_handle.clone();
+                    tokio::spawn(async move {
+                        crate::utils::pipe_read_to_ssh(
+                            stdout,
+                            session_handle_clone,
+                            channel_id,
+                            "SFTP stdout to SSH",
+                        )
+                        .await;
+                    });
+
+                    // Forward SFTP stderr -> SSH extended data
+                    let session_handle_clone2 = session_handle.clone();
+                    tokio::spawn(async move {
+                        crate::utils::pipe_read_to_ssh_extended(
+                            stderr,
+                            session_handle_clone2,
+                            channel_id,
+                            1,
+                            "SFTP stderr to SSH",
+                        )
+                        .await;
+                    });
+
+                    // Forward SSH data -> SFTP stdin
+                    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                    {
+                        let mut writers = tcp_writers.lock().await;
+                        writers.insert(channel_id, tx);
+                    }
+
+                    let tcp_writers_clone = tcp_writers.clone();
+                    tokio::spawn(async move {
+                        crate::utils::pipe_rx_to_write(rx, stdin, "SSH to SFTP stdin").await;
+                        let mut writers = tcp_writers_clone.lock().await;
+                        writers.remove(&channel_id);
+                    });
+
+                    // Monitor child process exit
+                    let session_handle_clone3 = session_handle.clone();
+                    let tcp_writers_clone2 = tcp_writers.clone();
+                    tokio::spawn(async move {
+                        debug!("SFTP process monitor task started");
+                        match child.wait().await {
+                            Ok(status) => {
+                                debug!("SFTP server exited with status: {}", status);
+                                let exit_code = status.code().unwrap_or(0) as u32;
+                                let _ = session_handle_clone3
+                                    .exit_status_request(channel_id, exit_code)
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Error waiting for SFTP server: {}", e);
+                            }
+                        }
+                        let _ = session_handle_clone3.close(channel_id).await;
+
+                        // Ensure cleanup
+                        let mut writers = tcp_writers_clone2.lock().await;
+                        writers.remove(&channel_id);
+                        debug!("SFTP process monitor task ended");
+                    });
+                    info!("SFTP subsystem request accepted and handlers spawned");
+                    let _ = session_handle.channel_success(channel_id).await;
+                    Ok(())
+                }
             } else {
                 error!("Unsupported subsystem: {}", subsystem_name);
                 let _ = session_handle.channel_failure(channel_id).await;

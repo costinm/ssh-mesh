@@ -272,6 +272,66 @@ impl AsyncWrite for UnboundedChannelStream {
     }
 }
 
+/// Adapter to bridge Unbounded MPSC channels (Bytes only) with AsyncRead + AsyncWrite
+pub struct ChannelBytesStream {
+    pub reader: mpsc::UnboundedReceiver<Bytes>,
+    pub writer: mpsc::UnboundedSender<Bytes>,
+    pub read_buf: BytesMut,
+}
+
+impl AsyncRead for ChannelBytesStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.read_buf.is_empty() {
+            let to_copy = buf.remaining().min(self.read_buf.len());
+            buf.put_slice(&self.read_buf[..to_copy]);
+            self.read_buf.advance(to_copy);
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.reader.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                let to_copy = buf.remaining().min(data.len());
+                buf.put_slice(&data[..to_copy]);
+                if to_copy < data.len() {
+                    self.read_buf.extend_from_slice(&data[to_copy..]);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for ChannelBytesStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let data = Bytes::copy_from_slice(buf);
+        if self.writer.send(data).is_err() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Channel closed",
+            )));
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Bridge two bidirectional streams
 pub async fn bridge<S1, S2>(mut s1: S1, mut s2: S2, label: &str)
 where

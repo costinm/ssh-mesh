@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use utoipa::ToSchema;
 
 /// WSServer holds the state of the WebSocket server.
 #[derive(Clone, Default)]
@@ -191,22 +192,29 @@ where
     }
 }
 
-
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct SendMessageRequest {
     pub message: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct ClientsResponse {
     pub clients: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct MessageResponse {
     pub success: bool,
 }
 
+#[utoipa::path(
+    get,
+    path = "/_m/api/clients",
+    tag = "ws",
+    responses(
+        (status = 200, description = "List connected WebSocket clients", body = ClientsResponse)
+    )
+)]
 pub async fn handle_list_clients(State(server): State<Arc<WSServer>>) -> Json<ClientsResponse> {
     debug!("handle_list_clients called");
     let clients = server.list_clients().await;
@@ -217,6 +225,17 @@ pub async fn handle_list_clients(State(server): State<Arc<WSServer>>) -> Json<Cl
     Json(ClientsResponse { clients })
 }
 
+#[utoipa::path(
+    delete,
+    path = "/_m/api/clients/{id}",
+    tag = "ws",
+    params(
+        ("id" = String, Path, description = "Client ID")
+    ),
+    responses(
+        (status = 200, description = "Remove client", body = MessageResponse)
+    )
+)]
 pub async fn handle_remove_client(
     State(server): State<Arc<WSServer>>,
     Path(client_id): Path<String>,
@@ -226,6 +245,18 @@ pub async fn handle_remove_client(
     Json(MessageResponse { success: true })
 }
 
+#[utoipa::path(
+    post,
+    path = "/_m/api/clients/{id}/message",
+    tag = "ws",
+    params(
+        ("id" = String, Path, description = "Client ID")
+    ),
+    request_body = SendMessageRequest,
+    responses(
+        (status = 200, description = "Send message to client", body = MessageResponse)
+    )
+)]
 pub async fn handle_send_message(
     State(server): State<Arc<WSServer>>,
     Path(client_id): Path<String>,
@@ -245,6 +276,15 @@ pub async fn handle_send_message(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/_m/api/broadcast",
+    tag = "ws",
+    request_body = SendMessageRequest,
+    responses(
+        (status = 200, description = "Broadcast message to all clients", body = MessageResponse)
+    )
+)]
 pub async fn handle_broadcast(
     State(server): State<Arc<WSServer>>,
     Json(payload): Json<SendMessageRequest>,

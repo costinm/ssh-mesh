@@ -3,19 +3,21 @@ FROM rust:slim-bookworm AS build
 
 RUN apt-get update && apt-get install -y \
     musl-tools \
-    gcc \
+    clang \
+    gcc-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup target add x86_64-unknown-linux-musl
-
+RUN rustup target add aarch64-unknown-linux-musl
 WORKDIR /src
 #COPY . .
 COPY crates .
 
 # Build both pmond and ssh-mesh targets for MUSL, built individually
 # Less efficient (duplicate builds of common deps), but want to evaluate each
-RUN cd pmond && CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release 
-RUN cd ssh-mesh &&  CC_x86_64_unknown_linux_musl=gcc cargo build --features pmon --target x86_64-unknown-linux-musl --release
+RUN cd pmond && cargo build --target x86_64-unknown-linux-musl --release 
+RUN cd ssh-mesh &&  cargo build --features pmon --target x86_64-unknown-linux-musl --release
+RUN cd ssh-mesh &&  CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc cargo build --features pmon --target aarch64-unknown-linux-musl --release
 #RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p ssh-mesh
 #RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p pmond
 
@@ -27,6 +29,7 @@ RUN cd ssh-mesh &&  CC_x86_64_unknown_linux_musl=gcc cargo build --features pmon
 FROM scratch as bin
 
 COPY --from=build /src/ssh-mesh/target/x86_64-unknown-linux-musl/release/ssh-mesh .
+COPY --from=build /src/ssh-mesh/target/aarch64-unknown-linux-musl/release/ssh-mesh ssh-mesh.aarch64
 COPY --from=build /src/ssh-mesh/target/x86_64-unknown-linux-musl/release/h2t .
 COPY --from=build /src/ssh-mesh/target/x86_64-unknown-linux-musl/release/meshkeys .
 COPY --from=build /src/pmond/target/x86_64-unknown-linux-musl/release/pmond .

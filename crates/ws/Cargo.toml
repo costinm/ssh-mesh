@@ -15,3 +15,4 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+utoipa = { version = "5.4.0", features = ["axum_extras"] }

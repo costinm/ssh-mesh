@@ -81,6 +81,9 @@ pub async fn setup_test_environment(
                 ssh_server: ssh_server.clone(),
                 ws_server: std::sync::Arc::new(ws::WSServer::new()),
                 target_http_address: std::env::var("HTTP_PORT").ok(),
+                #[cfg(feature = "pmon")]
+                proc_mon: std::sync::Arc::new(pmond::ProcMon::new().unwrap()),
+                log_buffer: crate::local_trace::create_log_buffer(),
             };
 
             let ssh_server_clone = ssh_server.clone();

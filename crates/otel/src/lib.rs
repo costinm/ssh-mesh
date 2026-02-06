@@ -110,10 +110,17 @@ pub fn init_telemetry() {
     let logger_layer = logger_provider
         .map(|lp| opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&lp));
 
+    let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
+        tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
+            std::fs::File::create(file).expect("failed to create trace file"),
+        ))
+    });
+
     Registry::default()
         .with(EnvFilter::from_default_env())
         .with(tracer_layer)
         .with(logger_layer)
+        .with(perfetto_layer)
         .with(tracing_subscriber::fmt::layer())
         .init();
 }

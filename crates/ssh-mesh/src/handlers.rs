@@ -1,3 +1,4 @@
+use crate::ConnectedClientInfo;
 use axum::{
     Router,
     body::Body,
@@ -20,6 +21,9 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+use ws::{ClientsResponse, MessageResponse, SendMessageRequest};
 
 #[derive(RustEmbed)]
 #[folder = "web/"]
@@ -27,8 +31,56 @@ pub struct Assets;
 
 use crate::AppState;
 
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        get_ssh_clients,
+        crate::local_trace::get_trace_level,
+        crate::local_trace::set_trace_level,
+        ws::handle_list_clients,
+        ws::handle_remove_client,
+        ws::handle_send_message,
+        ws::handle_broadcast
+    ),
+    components(
+        schemas(
+            ConnectedClientInfo,
+            crate::local_trace::TraceLevelResponse,
+            crate::local_trace::TraceLevelRequest,
+            crate::local_trace::LogEntry,
+            ClientsResponse, MessageResponse, SendMessageRequest
+        )
+    ),
+    tags(
+        (name = "ssh-mesh", description = "SSH Mesh API"),
+        (name = "tracing", description = "Tracing and Logging API")
+    )
+)]
+pub struct ApiDoc;
+
+// Wrapper functions for trace endpoints
+async fn trace_get_level() -> impl IntoResponse {
+    crate::local_trace::get_trace_level().await
+}
+
+async fn trace_set_level(
+    Json(req): Json<crate::local_trace::TraceLevelRequest>,
+) -> impl IntoResponse {
+    crate::local_trace::set_trace_level(Json(req)).await
+}
+
+async fn trace_view_ws(
+    State(app_state): State<AppState>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl IntoResponse {
+    let buffer = app_state.log_buffer.clone();
+    ws.on_upgrade(move |socket| async move {
+        crate::local_trace::handle_trace_socket(socket, buffer).await
+    })
+}
+
 pub fn app(app_state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/_m/adm", get(serve_index))
         .route("/_m/adm/*path", get(handle_web_request))
         // WebSocket equivalents
@@ -75,7 +127,16 @@ pub fn app(app_state: AppState) -> Router {
                 ws::handle_broadcast(State(app_state.ws_server), json)
             }),
         )
-        .with_state(app_state)
+        .merge(SwaggerUi::new("/_m/api/swagger-ui").url("/_m/api/openapi.json", ApiDoc::openapi()))
+        // Trace level API routes
+        .route("/_m/trace/level", get(trace_get_level).put(trace_set_level))
+        // Trace view WebSocket
+        .route("/_m/trace/view", get(trace_view_ws));
+
+    #[cfg(feature = "pmon")]
+    let router = router.nest_service("/", pmond::handlers::app(app_state.proc_mon.clone()));
+
+    router.with_state(app_state)
 }
 
 fn mime_for_path(path: &str) -> String {
@@ -127,6 +188,14 @@ async fn serve_index() -> impl IntoResponse {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/_m/api/ssh/clients",
+    tag = "ssh-mesh",
+    responses(
+        (status = 200, description = "List connected SSH clients", body = Vec<ConnectedClientInfo>)
+    )
+)]
 async fn get_ssh_clients(State(app_state): State<AppState>) -> impl IntoResponse {
     let clients = app_state.ssh_server.connected_clients.lock().await;
     (StatusCode::OK, Json(clients.clone()))
