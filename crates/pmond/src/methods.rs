@@ -90,7 +90,27 @@ fn handle_get_process(proc_mon: &ProcMon, args: Value) -> Result<Value, MethodEr
         .map_err(|_| MethodError::invalid_params(format!("Invalid PID: {}", args.process)))?;
 
     match proc_mon.get_process(pid) {
-        Some(process) => Ok(json!(process)),
+        Some(process) => {
+            // Build enriched response with cgroup info and parent cgroups
+            let cgroup = process
+                .cgroup_path
+                .as_ref()
+                .and_then(|p| crate::read_cgroup_detailed(p));
+
+            let parent_cgroups = process
+                .cgroup_path
+                .as_ref()
+                .map(|p| crate::get_parent_cgroups(p))
+                .unwrap_or_default();
+
+            let detailed_info = crate::ProcessDetailedInfo {
+                process,
+                cgroup,
+                parent_cgroups,
+            };
+
+            Ok(json!(detailed_info))
+        }
         None => Err(MethodError::not_found(format!("Process {} not found", pid))),
     }
 }

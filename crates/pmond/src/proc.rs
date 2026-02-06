@@ -287,7 +287,12 @@ impl ProcMon {
             "max".to_string()
         } else {
             let target = (current as f64 * percentage / 100.0) as u64;
-            target.to_string()
+            let s = target.to_string();
+            info!(
+                "Calculated target memory: {} bytes ({}% of {})",
+                s, percentage, current
+            );
+            s
         };
 
         info!("Attempting to write {} to {}", target_str, high_path);
@@ -621,6 +626,9 @@ fn calculate_memory_deltas(
             }
         }
     }
+    // TODO: generate perfetto trace, if enabled.
+
+    // TODO: save historic data in a bound ring.
 }
 
 #[cfg(test)]

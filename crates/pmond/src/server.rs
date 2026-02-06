@@ -42,16 +42,41 @@ impl PmonServer {
         Ok(Self { config, proc_mon })
     }
 
-    /// Run the default HTTP/MCP server mode
+    /// Run the default HTTP server - for debug. In prod - use UDS or
+    /// embed the library.
     pub async fn run_server(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Starting PMON process monitor");
-
         let (tx, _rx) = tokio::sync::mpsc::channel(100);
 
         // Start monitoring
         self.proc_mon.start(true, true, Some(tx.clone()))?;
 
-        info!("PMON process monitor started successfully");
+        // Set up HTTP server
+        let uid = unsafe { libc::getuid() };
+        let port = if uid == 0 {
+            8081
+        } else {
+            8082 + (uid as i32 - 1000)
+        };
+
+        let addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&addr).await?;
+        info!("Listening on http://{}", addr);
+
+        // Create the Axum app with hardcoded /_m/pmon prefix
+        let app = crate::handlers::app(self.proc_mon.clone());
+
+        // Run the server
+        serve(listener, app.into_make_service()).await?;
+
+        Ok(())
+    }
+
+    /// Run the default HTTP/MCP server on UDS socket
+    pub async fn run_uds_server(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+        // Start monitoring
+        self.proc_mon.start(true, true, Some(tx.clone()))?;
 
         // Start UDS servers
         let path_str = if let Some(path) = &self.config.mcp_uds_path {
@@ -88,24 +113,6 @@ impl PmonServer {
                 error!("UDS MCP server error: {}", e);
             }
         });
-
-        // Set up HTTP server
-        let uid = unsafe { libc::getuid() };
-        let port = if uid == 0 {
-            8081
-        } else {
-            8082 + (uid as i32 - 1000)
-        };
-
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = TcpListener::bind(&addr).await?;
-        info!("Listening on http://{}", addr);
-
-        // Create the Axum app
-        let app = crate::handlers::app(self.proc_mon.clone());
-
-        // Run the server
-        serve(listener, app.into_make_service()).await?;
 
         Ok(())
     }

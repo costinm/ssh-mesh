@@ -534,6 +534,182 @@
                 max-width: 150px;
             }
         }
+
+        /* CGroup Panel Modal */
+        .cgroup-panel-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            backdrop-filter: blur(4px);
+        }
+
+        .cgroup-panel {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 900px;
+            width: 90%;
+            max-height: 85vh;
+            overflow-y: auto;
+            z-index: 1001;
+        }
+
+        .cgroup-panel-header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 20px 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .cgroup-panel-header h2 {
+            margin: 0;
+            font-size: 1.3rem;
+        }
+
+        .cgroup-panel-close {
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            font-size: 1.5rem;
+            cursor: pointer;
+            padding: 5px 12px;
+            border-radius: 6px;
+            transition: var(--transition);
+        }
+
+        .cgroup-panel-close:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: none;
+            box-shadow: none;
+        }
+
+        .cgroup-panel-body {
+            padding: 25px;
+        }
+
+        .cgroup-inline-container {
+            margin-top: 15px;
+            padding: 15px;
+            background: #f8faff;
+            border: 1px solid #e0e6ed;
+            border-radius: 8px;
+            animation: slideDown 0.3s ease-out;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .cgroup-section {
+            margin-bottom: 25px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid var(--border);
+        }
+
+        .cgroup-section-title {
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 15px;
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .pressure-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+        }
+
+        .pressure-card {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+
+        .pressure-card h4 {
+            margin: 0 0 10px 0;
+            font-size: 0.9rem;
+            color: var(--gray);
+            text-transform: uppercase;
+        }
+
+        .pressure-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--primary);
+        }
+
+        .pressure-details {
+            font-size: 0.8rem;
+            color: var(--gray);
+            margin-top: 8px;
+        }
+
+        .cgroup-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 15px;
+        }
+
+        .parent-cgroup {
+            padding: 12px 15px;
+            background: white;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .parent-cgroup:hover {
+            background: var(--gray-light);
+            border-color: var(--primary);
+        }
+
+        .parent-cgroup-path {
+            font-family: 'Courier New', monospace;
+            color: var(--primary);
+            font-weight: 500;
+            font-size: 0.9rem;
+        }
+
+        .cgroup-path-clickable {
+            cursor: pointer;
+            text-decoration: underline dotted;
+            color: var(--primary);
+        }
+
+        .cgroup-path-clickable:hover {
+            color: var(--secondary);
+        }
     </style>
 </head>
 
@@ -560,7 +736,7 @@
             <button id="clear-log-btn" class="warning">
                 <i>🧹</i> Clear Log
             </button>
-            <button onclick="location.href='/web/cgmon.html'" class="secondary" style="background: var(--info)">
+            <button onclick="location.href='cgmon.html'" class="secondary" style="background: var(--info)">
                 <i>📂</i> CGroups
             </button>
         </div>
@@ -629,6 +805,8 @@
         </footer>
     </div>
 
+    </div>
+
     <script>
         // Format memory size in bytes to a human-readable format
         function formatMemory(bytes) {
@@ -670,7 +848,7 @@
         // Move process to a new cgroup subdirectory
         function moveToCgroup(pid) {
             // No longer prompting for name, using default command-pid
-            fetch('/_move_process', {
+            fetch('../_move_process', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -698,7 +876,7 @@
 
         // Clear process memory references (PSS, etc)
         function clearRefs(pid, value = '7') {
-            fetch('/_clear_refs', {
+            fetch('../_clear_refs', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -722,6 +900,161 @@
                     addLogEntry(`Request failed for process ${pid}: ${error.message}`, 'error');
                     alert('Request failed: ' + error.message);
                 });
+        }
+
+        async function showCgroupInfo(pid) {
+            const container = document.getElementById(`cgroup-info-${pid}`);
+            if (!container) return;
+
+            // Toggle logic
+            if (container.style.display !== 'none' && container.dataset.loaded === 'true') {
+                container.style.display = 'none';
+                container.dataset.loaded = 'false';
+                container.innerHTML = '';
+                return;
+            }
+
+            container.style.display = 'block';
+            container.innerHTML = '<div style="text-align: center; padding: 10px; color: var(--gray);">Loading cgroup information...</div>';
+            container.dataset.loaded = 'false';
+
+            try {
+                const response = await fetch(`../_process/${pid}`);
+                if (!response.ok) throw new Error('Failed to fetch process info');
+                const data = await response.json();
+
+                renderCgroupInline(container, data);
+                container.dataset.loaded = 'true';
+            } catch (err) {
+                container.innerHTML = `<div style="text-align: center; padding: 10px; color: var(--danger);">Error: ${err.message}</div>`;
+            }
+        }
+
+        function formatPressure(pressure) {
+            if (!pressure) return { avg10: '0.00', avg60: '0.00', avg300: '0.00', total: '0' };
+            return {
+                avg10: pressure.avg10?.toFixed(2) || '0.00',
+                avg60: pressure.avg60?.toFixed(2) || '0.00',
+                avg300: pressure.avg300?.toFixed(2) || '0.00',
+                total: (pressure.total || 0).toLocaleString()
+            };
+        }
+
+        function renderPressureCard(label, emoji, pressure) {
+            const p = formatPressure(pressure);
+            return `
+                <div class="pressure-card">
+                    <h4>${emoji} ${label}</h4>
+                    <div class="pressure-value">${p.avg10}%</div>
+                    <div class="pressure-details">
+                        60s: ${p.avg60}% | 300s: ${p.avg300}%<br>
+                        Total: ${p.total}µs
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderCgroupActions(cgroupPath) {
+            const safePath = cgroupPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            return `
+                <div class="cgroup-actions">
+                    <button class="action-btn" onclick="setCgroupHigh('${safePath}', 90, 5)" style="background: var(--success); color: white; border: none;">90% High (5s)</button>
+                    <button class="action-btn" onclick="setCgroupHigh('${safePath}', 50, 5)" style="background: var(--warning); color: white; border: none;">50% High (5s)</button>
+                    <button class="action-btn" onclick="customCgroupHigh('${safePath}')" style="background: var(--info); color: white; border: none;">Custom...</button>
+                    <button class="action-btn" onclick="setCgroupHigh('${safePath}', -1, 0)" style="background: var(--danger); color: white; border: none;">Reset to Max</button>
+                </div>
+            `;
+        }
+
+        async function setCgroupHigh(path, percentage, interval) {
+            try {
+                const response = await fetch('../_cgroup_high', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path, percentage, interval })
+                });
+                if (response.ok) {
+                    addLogEntry(`Set memory.high for ${path}`, 'success');
+                    alert('Memory high limit updated!');
+                } else {
+                    const err = await response.json();
+                    alert(`Error: ${err.error}`);
+                }
+            } catch (err) {
+                alert(`Failed: ${err}`);
+            }
+        }
+
+        function customCgroupHigh(path) {
+            const percentage = prompt("Enter percentage (e.g. 90):", "90");
+            if (percentage === null) return;
+            const interval = prompt("Seconds before reset (0 = indefinite):", "5");
+            if (interval === null) return;
+            setCgroupHigh(path, parseFloat(percentage), parseInt(interval));
+        }
+
+        function renderCgroupSection(cgroup, isParent = false) {
+            if (!cgroup) return '';
+
+            const displayPath = cgroup.path.replace('/sys/fs/cgroup', '') || '/';
+            const mem = cgroup.mem_info || {};
+
+            return `
+                <div class="cgroup-section ${isParent ? 'parent-cgroup' : ''}">
+                    <div class="cgroup-section-title">
+                        ${isParent ? '↳' : '📂'} ${displayPath}
+                    </div>
+                    
+                    <div style="margin-bottom: 15px;">
+                        <strong>Memory:</strong> 
+                        Current: <span style="color: var(--primary); font-weight: 600;">${mem.memory_current ? formatMemory(mem.memory_current) : 'N/A'}</span> | 
+                        Anon: ${formatMemory(mem.anon || 0)} | 
+                        File: ${formatMemory(mem.file || 0)} | 
+                        High: ${mem.memory_high || 'max'}
+                    </div>
+                    
+                    <div class="pressure-grid">
+                        ${renderPressureCard('Memory', '💾', cgroup.memory_pressure)}
+                        ${renderPressureCard('IO', '💿', cgroup.io_pressure)}
+                        ${renderPressureCard('CPU', '⚡', cgroup.cpu_pressure)}
+                    </div>
+                    
+                    ${cgroup.pids && cgroup.pids.length > 0 ? `
+                        <div style="margin-top: 15px; font-size: 0.85rem; color: var(--gray);">
+                            <strong>PIDs in cgroup:</strong> ${cgroup.pids.slice(0, 20).join(', ')}${cgroup.pids.length > 20 ? ` ... (+${cgroup.pids.length - 20} more)` : ''}
+                        </div>
+                    ` : ''}
+                    
+                    ${!isParent ? renderCgroupActions(cgroup.path) : ''}
+                </div>
+            `;
+        }
+
+        function renderCgroupInline(container, data) {
+            const process = data.process;
+
+            let html = `
+                <div class="cgroup-inline-container">
+                    <div style="font-size: 0.9rem; font-weight: 600; color: var(--dark); margin-bottom: 12px; border-bottom: 1px solid #eee; padding-bottom: 8px;">
+                        Detailed CGroup Information
+                    </div>
+            `;
+
+            if (data.cgroup) {
+                html += renderCgroupSection(data.cgroup);
+            } else {
+                html += '<div style="padding: 10px; text-align: center; color: var(--gray);">No direct cgroup information available</div>';
+            }
+
+            if (data.parent_cgroups && data.parent_cgroups.length > 0) {
+                html += '<div style="margin: 15px 0 10px 0; font-weight: 600; font-size: 0.9rem; color: var(--gray);">Parent Hierarchy</div>';
+                for (const parent of data.parent_cgroups) {
+                    html += renderCgroupSection(parent, true);
+                }
+            }
+
+            html += '</div>';
+            container.innerHTML = html;
         }
 
         // Update process list
@@ -872,7 +1205,7 @@
                                
                                <div class="memory-item" style="grid-column: 1 / -1; display: flex; align-items: center; border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px;">
                                    <span class="memory-label">Cgroup:</span>
-                                   <span class="memory-value" style="flex: 1; margin-right: 10px; font-size: 0.85em; color: var(--gray);">${process.cgroup_path || '/'}</span>
+                                   <span class="memory-value cgroup-path-clickable" style="flex: 1; margin-right: 10px; font-size: 0.85em;" onclick="showCgroupInfo(${process.pid})">${process.cgroup_path || '/'}</span>
                                    <div style="display: flex; gap: 5px;">
                                        <button onclick="clearRefs(${process.pid})" class="warning" style="padding: 4px 8px; font-size: 11px; height: auto;">
                                            Clear PSS
@@ -882,8 +1215,11 @@
                                        </button>
                                    </div>
                                </div>
-                           </div>
-                       </td>
+
+                                <!-- Inline details target -->
+                                <div id="cgroup-info-${process.pid}" style="display: none; grid-column: 1 / -1;" data-loaded="false"></div>
+                            </div>
+                        </td>
                     `;
 
                 processTableBody.appendChild(mainRow);
@@ -893,7 +1229,7 @@
 
         // Refresh processes via REST API
         function refreshProcesses() {
-            fetch('/_ps')
+            fetch('../_ps')
                 .then(response => response.json())
                 .then(data => {
                     updateProcessList(data);

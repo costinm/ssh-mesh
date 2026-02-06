@@ -404,7 +404,7 @@
 
         <div class="controls">
             <button id="refresh-btn"><i>🔄</i> Refresh Now</button>
-            <button onclick="location.href='/web/pmon.html'" style="background: var(--gray)"><i>⬅️</i> Back to
+            <button onclick="location.href='pmon.html'" style="background: var(--gray)"><i>⬅️</i> Back to
                 Processes</button>
         </div>
 
@@ -502,7 +502,7 @@
 
         async function fetchData() {
             try {
-                const response = await fetch('/_cgroups');
+                const response = await fetch('../_cgroups');
                 if (!response.ok) throw new Error('Failed to fetch cgroups');
                 cgroupsData = await response.json();
                 renderTable();
@@ -661,7 +661,7 @@
 
         async function setCgroupHigh(path, percentage, interval) {
             try {
-                const response = await fetch('/_cgroup_high', {
+                const response = await fetch('../_cgroup_high', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ path, percentage, interval })
@@ -703,7 +703,7 @@
             listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--gray)">Loading processes...</div>';
 
             try {
-                const response = await fetch('/_cgroup_procs', {
+                const response = await fetch('../_cgroup_procs', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ path })

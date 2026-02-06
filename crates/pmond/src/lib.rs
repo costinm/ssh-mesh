@@ -10,6 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
+use utoipa::ToSchema;
+
 pub mod handlers;
 pub mod methods;
 pub mod proc;
@@ -36,7 +38,7 @@ pub fn read_comm(pid: u32) -> String {
 
 pub use read_process_info as read_process_info_from_proc;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema, ToSchema)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub ppid: u32,
@@ -52,29 +54,29 @@ pub struct ProcessInfo {
 // ============================================================================
 
 /// Arguments for list_processes - no parameters needed
-#[derive(Deserialize, JsonSchema, Default)]
+#[derive(Deserialize, JsonSchema, Default, ToSchema)]
 pub struct ListProcessesArgs {}
 
 /// Arguments for get_process
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, ToSchema)]
 pub struct GetProcessArgs {
     /// Process ID or name to look up
     pub process: String,
 }
 
 /// Arguments for list_cgroups - no parameters needed
-#[derive(Deserialize, JsonSchema, Default)]
+#[derive(Deserialize, JsonSchema, Default, ToSchema)]
 pub struct ListCgroupsArgs {}
 
 /// Arguments for get_cgroup
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, ToSchema)]
 pub struct GetCgroupArgs {
     /// Full cgroup path
     pub path: String,
 }
 
 /// Arguments for move_process
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, ToSchema)]
 pub struct MoveProcessArgs {
     /// Process ID to move
     pub pid: u32,
@@ -83,7 +85,7 @@ pub struct MoveProcessArgs {
 }
 
 /// Arguments for clear_refs
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, ToSchema)]
 pub struct ClearRefsArgs {
     /// Process ID
     pub pid: u32,
@@ -92,7 +94,7 @@ pub struct ClearRefsArgs {
 }
 
 /// Arguments for cgroup_high
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, ToSchema)]
 pub struct CgroupHighArgs {
     /// Full cgroup path
     pub path: String,
@@ -103,7 +105,7 @@ pub struct CgroupHighArgs {
 }
 
 /// Arguments for psi_watches - no parameters needed
-#[derive(Deserialize, JsonSchema, Default)]
+#[derive(Deserialize, JsonSchema, Default, ToSchema)]
 pub struct PsiWatchesArgs {}
 
 #[derive(Debug, Clone)]
@@ -112,9 +114,13 @@ pub enum MonitoringEvent {
     Pressure(crate::psi::PressureEvent),
 }
 
-/// Memory info for a process or cgroup. Each field should have a comment indicating
-/// where it is derived from.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
+/// Memory info for a process or set of processes. Each field should have a
+/// comment indicating where it is derived from.
+///
+/// This is also used for cgroups - ideally one cgroup per process (like docker/Android),
+/// not ideal mapping in systemd sessions since it's a set of processes.
+///
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema, ToSchema)]
 pub struct ProcMemInfo {
     // --- Delta Fields  ---
     /// Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon).
@@ -133,6 +139,8 @@ pub struct ProcMemInfo {
     pub d_pgmajfault: i64,
 
     // --- Common Fields (Both Process and Cgroup) ---
+    // For single process - the fields are from /proc - cgroup holding single process
+    // should be the same.
     /// Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon).
     pub anon: u64,
     /// File-backed memory. Process: Derived (rss - anon) or status (RssFile). Cgroup: memory.stat (file).
@@ -171,6 +179,10 @@ pub struct ProcMemInfo {
     pub hugetlb: u64,
 
     // --- Cgroup Only Fields ---
+    /// Current cgroup memory current usage. Cgroup: memory.current.
+    pub memory_current: Option<u64>,
+    /// Cgroup memory high limit. Cgroup: memory.high.
+    pub memory_high: Option<String>,
     /// Kernel memory. Process: N/A. Cgroup: memory.stat (kernel).
     pub kernel: u64,
     /// Mapped file memory. Process: N/A (partial in smaps). Cgroup: memory.stat (file_mapped).
@@ -225,10 +237,6 @@ pub struct ProcMemInfo {
     pub workingset_restore_file: u64,
     /// Workingset node reclaim. Cgroup: memory.stat (workingset_nodereclaim).
     pub workingset_nodereclaim: u64,
-    /// Current cgroup memory current usage. Cgroup: memory.current.
-    pub memory_current: Option<u64>,
-    /// Cgroup memory high limit. Cgroup: memory.high.
-    pub memory_high: Option<String>,
 }
 
 /// Macro to reduce boilerplate in `ProcMemInfo::merge()`
@@ -301,6 +309,127 @@ impl ProcMemInfo {
         merge_field!(self, other, memory_current, option);
         merge_field!(self, other, memory_high, option);
     }
+}
+
+// ============================================================================
+// CGroup Information Types
+// ============================================================================
+
+/// Information about a cgroup including pressure metrics and process list.
+/// This struct is separate from ProcMemInfo to provide a complete view of a cgroup.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema, ToSchema)]
+pub struct CGroupInfo {
+    /// Full cgroup path
+    pub path: String,
+    /// Memory statistics from memory.stat
+    pub mem_info: ProcMemInfo,
+    /// Memory pressure data (from memory.pressure)
+    pub memory_pressure: Option<psi::PressureData>,
+    /// IO pressure data (from io.pressure)
+    pub io_pressure: Option<psi::PressureData>,
+    /// CPU pressure data (from cpu.pressure)
+    pub cpu_pressure: Option<psi::PressureData>,
+    /// List of PIDs in this cgroup (from cgroup.procs)
+    pub pids: Vec<u32>,
+}
+
+/// Detailed process information including cgroup hierarchy.
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, ToSchema)]
+pub struct ProcessDetailedInfo {
+    /// Core process information
+    pub process: ProcessInfo,
+    /// Direct cgroup info (if available)
+    pub cgroup: Option<CGroupInfo>,
+    /// Parent cgroups from the process's cgroup up to root
+    pub parent_cgroups: Vec<CGroupInfo>,
+}
+
+/// Read pressure metrics (memory, io, cpu) for a cgroup.
+/// Returns (memory_pressure, io_pressure, cpu_pressure).
+pub fn read_cgroup_pressure(
+    cgroup_path: &str,
+) -> (
+    Option<psi::PressureData>,
+    Option<psi::PressureData>,
+    Option<psi::PressureData>,
+) {
+    let memory_pressure = std::fs::read_to_string(format!("{}/memory.pressure", cgroup_path))
+        .ok()
+        .map(|s| psi::PressureData::parse(&s));
+
+    let io_pressure = std::fs::read_to_string(format!("{}/io.pressure", cgroup_path))
+        .ok()
+        .map(|s| psi::PressureData::parse(&s));
+
+    let cpu_pressure = std::fs::read_to_string(format!("{}/cpu.pressure", cgroup_path))
+        .ok()
+        .map(|s| psi::PressureData::parse(&s));
+
+    (memory_pressure, io_pressure, cpu_pressure)
+}
+
+/// Read the list of PIDs in a cgroup from cgroup.procs.
+pub fn read_cgroup_pids(cgroup_path: &str) -> Vec<u32> {
+    let procs_path = format!("{}/cgroup.procs", cgroup_path);
+    match std::fs::read_to_string(&procs_path) {
+        Ok(content) => content
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect(),
+        Err(e) => {
+            trace!("Failed to read {}: {}", procs_path, e);
+            Vec::new()
+        }
+    }
+}
+
+/// Read detailed cgroup information including memory stats, pressure metrics, and PIDs.
+pub fn read_cgroup_detailed(cgroup_path: &str) -> Option<CGroupInfo> {
+    if !std::path::Path::new(cgroup_path).is_dir() {
+        return None;
+    }
+
+    let mem_info = read_cgroup_info(cgroup_path).unwrap_or_default();
+    let (memory_pressure, io_pressure, cpu_pressure) = read_cgroup_pressure(cgroup_path);
+    let pids = read_cgroup_pids(cgroup_path);
+
+    Some(CGroupInfo {
+        path: cgroup_path.to_string(),
+        mem_info,
+        memory_pressure,
+        io_pressure,
+        cpu_pressure,
+        pids,
+    })
+}
+
+/// Get all parent cgroups from the given cgroup path up to (but not including) the root.
+/// Returns them in order from immediate parent to root.
+pub fn get_parent_cgroups(cgroup_path: &str) -> Vec<CGroupInfo> {
+    let mut parents = Vec::new();
+    let mut current = std::path::Path::new(cgroup_path);
+
+    // Walk up the hierarchy until we reach the cgroup root
+    while let Some(parent) = current.parent() {
+        let parent_str = parent.to_string_lossy();
+
+        // Stop if we've gone above /sys/fs/cgroup
+        if !parent_str.starts_with(CGROUP_BASE) || parent_str == CGROUP_BASE {
+            break;
+        }
+
+        // Only include if it has cgroup.procs (is a cgroup directory)
+        let procs_file = format!("{}/cgroup.procs", parent_str);
+        if std::path::Path::new(&procs_file).exists() {
+            if let Some(info) = read_cgroup_detailed(&parent_str) {
+                parents.push(info);
+            }
+        }
+
+        current = parent;
+    }
+
+    parents
 }
 
 /// Read process information from /proc/[pid]/stat (static version for global access)

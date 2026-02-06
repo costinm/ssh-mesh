@@ -14,6 +14,11 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 // MCP Imports
+use crate::psi::{PressureData, PressureEvent, PressureInfo, PressureType};
+use crate::{
+    CgroupHighArgs, ClearRefsArgs, GetCgroupArgs, GetProcessArgs, ListCgroupsArgs,
+    ListProcessesArgs, MoveProcessArgs, CGroupInfo, ProcMemInfo, ProcessDetailedInfo, ProcessInfo, PsiWatchesArgs,
+};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -31,6 +36,8 @@ use rmcp::{
 };
 use tokio::net::UnixListener;
 use tracing::{error, info};
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(RustEmbed)]
 #[folder = "web/"]
@@ -51,16 +58,62 @@ fn method_response(
 ) -> (StatusCode, Json<Value>) {
     match result {
         Ok(v) => (StatusCode::OK, Json(v)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.message})),
-        ),
+        Err(e) => {
+            let status = match e.code {
+                -32602 => StatusCode::BAD_REQUEST,     // Invalid params
+                -32601 => StatusCode::NOT_FOUND,       // Method not found
+                -32001 => StatusCode::NOT_FOUND,       // Resource not found
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            info!("Method error: {} (code: {}, status: {})", e.message, e.code, status);
+            (
+                status,
+                Json(json!({"error": e.message, "code": e.code})),
+            )
+        }
     }
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        handle_ps_request,
+        handle_get_process_request,
+        handle_cgroups_request,
+        handle_psi_request,
+        handle_cgroup_high_request,
+        handle_cgroup_procs_request,
+        handle_move_process_request,
+        handle_clear_refs_request
+    ),
+    components(
+        schemas(
+            ProcessInfo, ProcessDetailedInfo, CGroupInfo, ProcMemInfo, CgroupProcsPayload,
+            ListProcessesArgs, GetProcessArgs, ListCgroupsArgs, GetCgroupArgs,
+            MoveProcessArgs, ClearRefsArgs, CgroupHighArgs, PsiWatchesArgs,
+            PressureInfo, PressureData, PressureEvent, PressureType
+        )
+    ),
+    tags(
+        (name = "pmond", description = "Process Memory Monitor API")
+    )
+)]
+pub struct ApiDoc;
+
+#[utoipa::path(
+    get,
+    path = "/_m/pmon/_ps",
+    tag = "pmond",
+    responses(
+        (status = 200, 
+        description = "List processes and return detailed memory info", 
+        body = Vec<ProcessInfo>)
+    )
+)]
 pub async fn handle_ps_request(
     State(app_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    info!("Received list_processes request");
     method_response(call_method(
         &app_state.proc_mon,
         "list_processes",
@@ -68,31 +121,89 @@ pub async fn handle_ps_request(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/_m/pmon/_process/{pid}",
+    tag = "pmond",
+    params(
+        ("pid" = String, Path, description = "Process ID")
+    ),
+    responses(
+        (status = 200, description = "Get detailed process info with cgroup hierarchy", body = ProcessDetailedInfo),
+        (status = 404, description = "Process not found")
+    )
+)]
+pub async fn handle_get_process_request(
+    State(app_state): State<AppState>,
+    AxumPath(pid): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    debug!("Received get_process request for PID: {}", pid);
+    method_response(call_method(
+        &app_state.proc_mon,
+        "get_process",
+        json!({"process": pid}),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/_m/pmon/_cgroups",
+    tag = "pmond",
+    responses(
+        (status = 200, description = "List all cgroups", body = HashMap<String, ProcMemInfo>)
+    )
+)]
 pub async fn handle_cgroups_request(
     State(app_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     method_response(call_method(&app_state.proc_mon, "list_cgroups", json!({})))
 }
 
+#[utoipa::path(
+    get,
+    path = "/_m/pmon/_psi",
+    tag = "pmond",
+    responses(
+        (status = 200, description = "Get PSI watches", body = HashMap<String, PressureInfo>)
+    )
+)]
 pub async fn handle_psi_request(
     State(app_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     method_response(call_method(&app_state.proc_mon, "psi_watches", json!({})))
 }
 
+#[utoipa::path(
+    post,
+    path = "/_m/pmon/_cgroup_high",
+    tag = "pmond",
+    request_body = CgroupHighArgs,
+    responses(
+        (status = 200, description = "Adjust memory.high")
+    )
+)]
 pub async fn handle_cgroup_high_request(
     State(app_state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    info!("Received CGroup High request: {:?}", payload);
+    info!("Received CGroup High request: {}", payload);
     method_response(call_method(&app_state.proc_mon, "cgroup_high", payload))
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, ToSchema)]
 pub struct CgroupProcsPayload {
     pub path: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/_m/pmon/_cgroup_procs",
+    tag = "pmond",
+    request_body = CgroupProcsPayload,
+    responses(
+        (status = 200, description = "Get processes in cgroup", body = Vec<ProcessInfo>)
+    )
+)]
 pub async fn handle_cgroup_procs_request(
     State(app_state): State<AppState>,
     Json(payload): Json<CgroupProcsPayload>,
@@ -103,6 +214,15 @@ pub async fn handle_cgroup_procs_request(
     (StatusCode::OK, Json(json!(processes)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/_m/pmon/_move_process",
+    tag = "pmond",
+    request_body = MoveProcessArgs,
+    responses(
+        (status = 200, description = "Move process to cgroup")
+    )
+)]
 pub async fn handle_move_process_request(
     State(app_state): State<AppState>,
     Json(payload): Json<Value>,
@@ -111,6 +231,15 @@ pub async fn handle_move_process_request(
     method_response(call_method(&app_state.proc_mon, "move_process", payload))
 }
 
+#[utoipa::path(
+    post,
+    path = "/_m/pmon/_clear_refs",
+    tag = "pmond",
+    request_body = ClearRefsArgs,
+    responses(
+        (status = 200, description = "Clear process refs")
+    )
+)]
 pub async fn handle_clear_refs_request(
     State(app_state): State<AppState>,
     Json(payload): Json<Value>,
@@ -123,23 +252,24 @@ pub async fn handle_clear_refs_request(
 // Static Pages
 // ============================================================================
 
-pub async fn handle_root_request() -> Html<&'static str> {
-    Html(
+pub async fn handle_root_request(_state: State<AppState>) -> Html<String> {
+    Html(format!(
         r#"
         <!DOCTYPE html>
         <html>
         <head><title>PMOND</title></head>
         <body>
             <h1>PMOND - Process Monitor</h1>
-            <p><a href='/web/pmon.html'>Process Monitor</a></p>
-            <p><a href='/web/cgmon.html'>CGroup Monitor</a></p>
-            <p><a href='/_ps'>Process API</a></p>
-            <p><a href='/_cgroups'>CGroups API</a></p>
-            <p><a href='/_psi'>PSI Watches API</a></p>
+            <p><a href='/_m/pmon/web/pmon.html'>Process Monitor</a></p>
+            <p><a href='/_m/pmon/web/cgmon.html'>CGroup Monitor</a></p>
+            <p><a href='/_m/pmon/_ps'>Process API</a></p>
+            <p><a href='/_m/pmon/_cgroups'>CGroups API</a></p>
+        <p><a href='/_m/pmon/_psi'>PSI Watches API</a></p>
+            <p><a href='/_m/pmon/swagger-ui/'>Swagger UI</a></p>
         </body>
         </html>
-    "#,
-    )
+    "#
+    ))
 }
 
 pub async fn handle_web_request(
@@ -187,23 +317,38 @@ pub fn app(proc_mon: Arc<ProcMon>) -> Router {
     };
 
     Router::new()
-        .route("/", get(handle_root_request))
-        .route("/_ps", get(handle_ps_request))
-        .route("/_cgroups", get(handle_cgroups_request))
-        .route("/_psi", get(handle_psi_request))
-        .route("/_cgroup_high", post(handle_cgroup_high_request))
-        .route("/_cgroup_procs", post(handle_cgroup_procs_request))
-        .route("/_move_process", post(handle_move_process_request))
-        .route("/_clear_refs", post(handle_clear_refs_request))
-        .route("/web/*path", get(handle_web_request))
-        .nest_service("/mcp", mcp_service(proc_mon))
+        .route("/_m/pmon/", get(handle_root_request))
+        .route("/_m/pmon/_ps", get(handle_ps_request))
+        .route("/_m/pmon/_process/:pid", get(handle_get_process_request))
+        .route("/_m/pmon/_cgroups", get(handle_cgroups_request))
+        .route("/_m/pmon/_psi", get(handle_psi_request))
+        .route("/_m/pmon/_cgroup_high", post(handle_cgroup_high_request))
+        .route("/_m/pmon/_cgroup_procs", post(handle_cgroup_procs_request))
+        .route("/_m/pmon/_move_process", post(handle_move_process_request))
+        .route("/_m/pmon/_clear_refs", post(handle_clear_refs_request))
+        .route(
+            "/_m/pmon/api-docs/openapi.json",
+            get(|| async { Json(ApiDoc::openapi()) }),
+        )
+        .route("/_m/pmon/web/*path", get(handle_web_request))
+        .nest_service("/_m/pmon/mcp", mcp_service(proc_mon))
         .with_state(app_state)
+        .merge(
+            SwaggerUi::new("/_m/pmon/swagger-ui").config(utoipa_swagger_ui::Config::new([
+                utoipa_swagger_ui::Url::with_primary(
+                    "pmond",
+                    "/_m/pmon/api-docs/openapi.json",
+                    true,
+                ),
+            ])),
+        )
 }
 
 // ============================================================================
 // MCP Implementation (using unified methods)
 // ============================================================================
 
+/// MCP handler for the Process Memory monitor.
 #[derive(Clone)]
 pub struct PmonMcpHandler {
     proc_mon: Arc<ProcMon>,
@@ -215,6 +360,16 @@ impl PmonMcpHandler {
     }
 }
 
+/// Handles the MCP streamable protocol - streaming events and json-rpc 
+/// calls. This is backed by a local session manager - will not work well
+/// with a load balancer without sticky sessions or some other routing to
+/// a specific host, which makes sense since the process is specific to a host.
+///
+/// It is likely better to use a H2 stream using the stdio protocol - and have the
+/// load balancers and some external box handle the strange MCP HTTP/1.1 protocol.
+/// 
+/// Even better to use a local stdio server that tunnels over SSH or H2 to
+/// the server-stdio server.
 pub fn mcp_service(proc_mon: Arc<ProcMon>) -> StreamableHttpService<PmonMcpHandler> {
     let config = StreamableHttpServerConfig::default();
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -225,6 +380,16 @@ pub fn mcp_service(proc_mon: Arc<ProcMon>) -> StreamableHttpService<PmonMcpHandl
         config,
     )
 }
+
+/// Handles the MCP STDIO protocol.
+pub async fn run_stdio_server(proc_mon: Arc<ProcMon>) -> Result<(), Box<dyn std::error::Error>> {
+    let handler = PmonMcpHandler::new(proc_mon);
+    let transport = rmcp::transport::stdio();
+    let service = handler.serve(transport).await?;
+    service.waiting().await?;
+    Ok(())
+}
+
 
 /// Helper to convert Value to input_schema type (Arc<Map<String, Value>>)
 fn to_schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
@@ -241,7 +406,6 @@ impl ServerHandler for PmonMcpHandler {
         _params: InitializeRequestParam,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        tracing::info!("MCP Initialize called");
         Ok(InitializeResult {
             protocol_version: ProtocolVersion::default(),
             server_info: Implementation {
@@ -408,14 +572,9 @@ impl ServerHandler for PmonMcpHandler {
 // Server Functions
 // ============================================================================
 
-pub async fn run_stdio_server(proc_mon: Arc<ProcMon>) -> Result<(), Box<dyn std::error::Error>> {
-    let handler = PmonMcpHandler::new(proc_mon);
-    let transport = rmcp::transport::stdio();
-    let service = handler.serve(transport).await?;
-    service.waiting().await?;
-    Ok(())
-}
-
+/// Run a HTTP server over UDS - to avoid opening a port (security).
+/// 
+/// The SSH server can forard local ports to UDS, safer and simpler.
 pub async fn run_uds_http_server(
     proc_mon: Arc<ProcMon>,
     path: &str,
