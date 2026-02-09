@@ -2138,6 +2138,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "mcp"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "log",
+ "pmond",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2768,7 +2785,6 @@ dependencies = [
  "mio 0.8.11",
  "nix 0.29.0",
  "parking_lot",
- "rmcp",
  "rust-embed",
  "schemars 0.8.22",
  "serde",

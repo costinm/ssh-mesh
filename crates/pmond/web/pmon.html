@@ -102,9 +102,9 @@
         header {
             background: linear-gradient(135deg, var(--primary), var(--secondary));
             color: white;
-            padding: 25px;
-            border-radius: 12px;
-            margin-bottom: 25px;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
             box-shadow: var(--card-shadow);
             display: flex;
             justify-content: space-between;
@@ -113,13 +113,13 @@
         }
 
         .header-content h1 {
-            font-size: 2.2rem;
-            margin-bottom: 8px;
+            font-size: 1.6rem;
+            margin-bottom: 4px;
         }
 
         .header-content p {
             opacity: 0.9;
-            font-size: 1.1rem;
+            font-size: 0.9rem;
         }
 
         .status-bar {
@@ -719,32 +719,28 @@
             <div class="header-content">
                 <h1>Memory Monitor</h1>
             </div>
+            <div style="display: flex; gap: 15px; align-items: center;">
+                <button onclick="location.href='cgmon.html'"
+                    style="padding: 8px 16px; font-size: 0.9rem; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); box-shadow: none;"
+                    title="View CGroups">
+                    📂 CGroups
+                </button>
+            </div>
             <div class="status-bar paused" id="status-bar" title="Click to toggle auto-refresh">
                 <div class="status-item">
                     <span class="stat-label" style="color: white; margin-bottom: 0; margin-right: 8px;">Refreshing
                         in:</span>
                     <span id="refresh-timer" style="font-weight: 600;">5s</span>
                     <span id="paused-label" style="display: inline; font-weight: 600; margin-left: 8px;">(PAUSED)</span>
+                    <button id="refresh-btn" title="Refresh Now"
+                        style="margin-left: 15px; padding: 6px 12px; font-size: 1.2rem; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); box-shadow: none;">🔄</button>
                 </div>
             </div>
         </header>
 
-        <div class="controls">
-            <button id="refresh-btn">
-                <i>🔄</i> Refresh Now
-            </button>
-            <button id="clear-log-btn" class="warning">
-                <i>🧹</i> Clear Log
-            </button>
-            <button onclick="location.href='cgmon.html'" class="secondary" style="background: var(--info)">
-                <i>📂</i> CGroups
-            </button>
-        </div>
+
         <div class="dashboard">
             <div class="process-card">
-                <div class="card-header">
-                    <i>📋</i> Process List
-                </div>
                 <div class="stats-bar">
                     <div class="stat-item">
                         <span class="stat-label">Total Processes</span>
@@ -807,16 +803,8 @@
 
     </div>
 
+    <script src="pmond.js"></script>
     <script>
-        // Format memory size in bytes to a human-readable format
-        function formatMemory(bytes) {
-            if (bytes === 0) return '0 B';
-            const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-        }
-
         // DOM elements
         const processTableBody = document.getElementById('process-table-body');
         const totalProcessesElement = document.getElementById('total-processes');
@@ -824,7 +812,6 @@
         const pausedLabel = document.getElementById('paused-label');
         const refreshTimerEl = document.getElementById('refresh-timer');
         const refreshButton = document.getElementById('refresh-btn');
-        const clearLogButton = document.getElementById('clear-log-btn');
         const searchBox = document.getElementById('search-box');
 
         // State
@@ -1010,7 +997,71 @@
                         Current: <span style="color: var(--primary); font-weight: 600;">${mem.memory_current ? formatMemory(mem.memory_current) : 'N/A'}</span> | 
                         Anon: ${formatMemory(mem.anon || 0)} | 
                         File: ${formatMemory(mem.file || 0)} | 
-                        High: ${mem.memory_high || 'max'}
+                        High: ${formatMemoryOrMax(mem.memory_high)}
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-bottom: 15px;">
+                        <!-- Usage & Core -->
+                        <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.8rem; font-weight: 700; text-transform: uppercase; color: var(--gray); margin-bottom: 10px; border-bottom: 1px solid var(--gray-light); padding-bottom: 4px;">
+                                🏠 Usage & Core
+                            </div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Kernel (total):</span> <span style="font-family: monospace;">${formatMemory(mem.kernel || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Kernel Stack:</span> <span style="font-family: monospace;">${formatMemory(mem.kernel_stack || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Page Tables:</span> <span style="font-family: monospace;">${formatMemory(mem.pagetables || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Shmem:</span> <span style="font-family: monospace;">${formatMemory(mem.shmem || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">File Mapped:</span> <span style="font-family: monospace;">${formatMemory(mem.file_mapped || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">File Dirty:</span> <span style="font-family: monospace;">${formatMemory(mem.file_dirty || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">File Writeback:</span> <span style="font-family: monospace;">${formatMemory(mem.file_writeback || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Swap Cached:</span> <span style="font-family: monospace;">${formatMemory(mem.swapcached || 0)}</span></div>
+                        </div>
+                        
+                        <!-- VM Events -->
+                        <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.8rem; font-weight: 700; text-transform: uppercase; color: var(--gray); margin-bottom: 10px; border-bottom: 1px solid var(--gray-light); padding-bottom: 4px;">
+                                ⚡ VM Events (Counts)
+                            </div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Page Faults:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgfault)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Major Faults:</span> <span style="font-family: monospace; color: var(--danger);">${formatCount(mem.pgmajfault)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Pg Refill:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgrefill)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Pg Activate:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgactivate)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Pg Deactivate:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgdeactivate)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Swap In/Out:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pswpin)} / ${formatCount(mem.pswpout)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Steal / Scan:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgsteal)} / ${formatCount(mem.pgscan)}</span></div>
+                        </div>
+                        
+                        <!-- Active/Inactive -->
+                        <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.8rem; font-weight: 700; text-transform: uppercase; color: var(--gray); margin-bottom: 10px; border-bottom: 1px solid var(--gray-light); padding-bottom: 4px;">
+                                🔄 Active / Inactive
+                            </div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Active Anon:</span> <span style="font-family: monospace;">${formatMemory(mem.active_anon || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Inactive Anon:</span> <span style="font-family: monospace;">${formatMemory(mem.inactive_anon || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Active File:</span> <span style="font-family: monospace;">${formatMemory(mem.active_file || 0)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Inactive File:</span> <span style="font-family: monospace;">${formatMemory(mem.inactive_file || 0)}</span></div>
+                        </div>
+                        
+                        <!-- WorkingSet Stats -->
+                        <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.8rem; font-weight: 700; text-transform: uppercase; color: var(--gray); margin-bottom: 10px; border-bottom: 1px solid var(--gray-light); padding-bottom: 4px;">
+                                🧠 WorkingSet Stats
+                            </div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Refault A/F:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.workingset_refault_anon)} / ${formatCount(mem.workingset_refault_file)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Activate A/F:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.workingset_activate_anon)} / ${formatCount(mem.workingset_activate_file)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Restore A/F:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.workingset_restore_anon)} / ${formatCount(mem.workingset_restore_file)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Nodereclaim:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.workingset_nodereclaim)}</span></div>
+                        </div>
+                        
+                        <!-- Demotions -->
+                        <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.8rem; font-weight: 700; text-transform: uppercase; color: var(--gray); margin-bottom: 10px; border-bottom: 1px solid var(--gray-light); padding-bottom: 4px;">
+                                📉 Demotions
+                            </div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Kswapd:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgdemote_kswapd)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Direct:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgdemote_direct)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Khugepaged:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgdemote_khugepaged)}</span></div>
+                            <div style="font-size: 0.85rem; margin-bottom: 4px;"><span style="color: var(--gray);">Proactive:</span> <span style="font-family: monospace; color: var(--secondary);">${formatCount(mem.pgdemote_proactive)}</span></div>
+                        </div>
                     </div>
                     
                     <div class="pressure-grid">
@@ -1241,11 +1292,6 @@
                 });
         }
 
-        // Clear log
-        function clearLog() {
-            console.clear();
-            addLogEntry('Log cleared', 'info');
-        }
 
         // Search handler
         function handleSearch() {
@@ -1254,7 +1300,6 @@
 
         // Event listeners
         refreshButton.addEventListener('click', refreshProcesses);
-        clearLogButton.addEventListener('click', clearLog);
         searchBox.addEventListener('input', handleSearch);
 
         // Add keyboard shortcut for refresh

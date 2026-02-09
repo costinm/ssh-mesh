@@ -11,9 +11,9 @@ use tracing::{error, info};
 pub struct ServerConfig {
     /// Refresh interval in seconds for monitoring
     pub refresh_interval: u64,
-    /// Optional UDS path for MCP server
-    pub mcp_uds_path: Option<String>,
-    /// Authorized UID for MCP UDS connections
+    /// Optional UDS path for HTTP server
+    pub http_uds_path: Option<String>,
+    /// Authorized UID for UDS connections
     pub auth_uid: Option<u32>,
 }
 
@@ -21,7 +21,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             refresh_interval: 10,
-            mcp_uds_path: None,
+            http_uds_path: None,
             auth_uid: None,
         }
     }
@@ -40,6 +40,11 @@ impl PmonServer {
         let proc_mon = Arc::new(proc_mon);
 
         Ok(Self { config, proc_mon })
+    }
+
+    /// Get a reference to the ProcMon instance
+    pub fn proc_mon(&self) -> Arc<ProcMon> {
+        self.proc_mon.clone()
     }
 
     /// Run the default HTTP server - for debug. In prod - use UDS or
@@ -71,15 +76,15 @@ impl PmonServer {
         Ok(())
     }
 
-    /// Run the default HTTP/MCP server on UDS socket
+    /// Run the HTTP server on UDS socket
     pub async fn run_uds_server(&self) -> Result<(), Box<dyn std::error::Error>> {
         let (tx, _rx) = tokio::sync::mpsc::channel(100);
 
         // Start monitoring
         self.proc_mon.start(true, true, Some(tx.clone()))?;
 
-        // Start UDS servers
-        let path_str = if let Some(path) = &self.config.mcp_uds_path {
+        // Start UDS server
+        let path_str = if let Some(path) = &self.config.http_uds_path {
             path.clone()
         } else {
             // Default to /run/user/<uid>/pmond.sock
@@ -93,37 +98,15 @@ impl PmonServer {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let http_path = format!("{}.http", path_str);
-        let mcp_path = format!("{}.mcp", path_str);
-
         let pm_http = self.proc_mon.clone();
         let auth_uid = self.config.auth_uid;
         tokio::spawn(async move {
-            if let Err(e) =
-                crate::handlers::run_uds_http_server(pm_http, &http_path, auth_uid).await
+            if let Err(e) = crate::handlers::run_uds_http_server(pm_http, &path_str, auth_uid).await
             {
                 error!("UDS HTTP server error: {}", e);
             }
         });
 
-        let pm_mcp = self.proc_mon.clone();
-        let auth_uid = self.config.auth_uid;
-        tokio::spawn(async move {
-            if let Err(e) = crate::handlers::run_uds_mcp_server(pm_mcp, &mcp_path, auth_uid).await {
-                error!("UDS MCP server error: {}", e);
-            }
-        });
-
         Ok(())
-    }
-
-    /// Run MCP server mode via stdio
-    pub async fn run_mcp_server(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Starting PMON MCP server");
-
-        // Start monitoring
-        self.proc_mon.start(true, true, None)?;
-
-        crate::handlers::run_stdio_server(self.proc_mon.clone()).await
     }
 }

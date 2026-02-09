@@ -79,22 +79,79 @@ async fn trace_view_ws(
     })
 }
 
-pub fn app(app_state: AppState) -> Router {
+/// appCore is the core handler for H2C - for example in CloudRun
+/// or K8S with a Gateway/ztunnel.
+///
+/// All access to admin interface will be available by creating
+/// SSH port forwards.
+pub fn app_core(app_state: AppState) -> Router {
     let router = Router::new()
-        .route("/_m/adm", get(serve_index))
-        .route("/_m/adm/*path", get(handle_web_request))
-        // WebSocket equivalents
+        .route("/_m/_ssh", any(handle_ssh_request))
+        .fallback(handle_proxy_request);
+
+    router.with_state(app_state)
+}
+
+/// "Mesh" like function, like Istio but using POST.
+/// Should be exposed over mTLS (H2 proper).
+///
+/// SSH can be exposed as a proxy to port 15022.
+///
+/// WIP: needs authz.
+pub fn app_mesh(app_state: AppState) -> Router {
+    let router = Router::new()
+        .route("/_m/_ssh", any(handle_ssh_request))
+        .route("/_m/_tcp/:host/:port", any(handle_tcp_proxy))
+        // This could be restricted to a prefix.
+        .route("/_m/_uds", any(handle_uds_proxy))
+        .route("/_m/_uds/*path", any(handle_uds_proxy))
+        // This could be replaced with a configured host:port
+        .route("/_m/_exec/*cmd", any(handle_exec))
+        .fallback(handle_proxy_request);
+
+    router.with_state(app_state)
+}
+
+/// Expose SSH and 'mesh' over websocket.
+/// WIP: needs authz, authn.
+/// May be simpler to have a separate WS->TCP proxy, in gateway.
+pub fn app_ws(app_state: AppState) -> Router {
+    let router = Router::new()
         .route("/_m/_ws/_ssh", get(handle_ws_ssh))
         .route("/_m/_ws/_tcp/:host/:port", get(handle_ws_tcp_proxy))
         .route("/_m/_ws/_uds", get(handle_ws_uds_proxy))
         .route("/_m/_ws/_uds/*path", get(handle_ws_uds_proxy))
         .route("/_m/_ws/_exec/*cmd", get(handle_ws_exec))
+        .fallback(handle_proxy_request)
+        .route(
+            "/_m/ws",
+            get(move |State(app_state): State<AppState>, req| {
+                ws::handle_websocket_upgrade(State(app_state.ws_server), req)
+            }),
+        );
+
+    router.with_state(app_state)
+}
+
+/// Admin app. Exposed over SSH for admin/authorized_keys.
+/// For devel can be exposed locally. Should be on different port
+/// from the H2C - and not exposed on H2 directly.
+/// Has all other features - for testing.
+pub fn app(app_state: AppState) -> Router {
+    let router = Router::new()
+        .route("/_m/adm", get(serve_index))
+        .route("/_m/adm/*path", get(handle_web_request))
         .route("/_m/_ssh", any(handle_ssh_request))
-        .route("/_m/_ssh/*rest", any(handle_ssh_request))
+        .route("/_m/_ws/_ssh", get(handle_ws_ssh))
         .route("/_m/_tcp/:host/:port", any(handle_tcp_proxy))
         .route("/_m/_uds", any(handle_uds_proxy))
         .route("/_m/_uds/*path", any(handle_uds_proxy))
         .route("/_m/_exec/*cmd", any(handle_exec))
+        .route("/_m/_ws/_tcp/:host/:port", get(handle_ws_tcp_proxy))
+        .route("/_m/_ws/_uds", get(handle_ws_uds_proxy))
+        .route("/_m/_ws/_uds/*path", get(handle_ws_uds_proxy))
+        .route("/_m/_ws/_exec/*cmd", get(handle_ws_exec))
+        .route("/_m/_ssh/*rest", any(handle_ssh_request))
         .fallback(handle_proxy_request)
         .route(
             "/_m/ws",

@@ -4,8 +4,11 @@ FROM rust:slim-bookworm AS build
 RUN apt-get update && apt-get install -y \
     musl-tools \
     clang \
+    curl \
     gcc-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
+
+# Utoipa-swagger-ui build depends on curl to download swagger-ui
 
 RUN rustup target add x86_64-unknown-linux-musl
 RUN rustup target add aarch64-unknown-linux-musl
@@ -22,6 +25,48 @@ RUN cd ssh-mesh &&  CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TA
 #RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p pmond
 
 #RUN ls -lR /src/pmond/target
+
+# -----------------------
+FROM rust:slim-bookworm AS build-android
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install Android NDK
+ENV ANDROID_NDK_VERSION=r27b
+ENV ANDROID_NDK_HOME=/opt/android-ndk
+RUN curl -o ndk.zip https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
+    unzip -q ndk.zip && \
+    rm ndk.zip && \
+    mv android-ndk-${ANDROID_NDK_VERSION} ${ANDROID_NDK_HOME}
+
+# Add Rust Android targets
+RUN rustup target add aarch64-linux-android
+RUN rustup target add x86_64-linux-android
+
+# Set up environment variables for Android NDK toolchains
+ENV PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+ENV CC_aarch64_linux_android=aarch64-linux-android34-clang
+ENV CXX_aarch64_linux_android=aarch64-linux-android34-clang++
+ENV AR_aarch64_linux_android=llvm-ar
+ENV CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android34-clang
+ENV CC_x86_64_linux_android=x86_64-linux-android34-clang
+ENV CXX_x86_64_linux_android=x86_64-linux-android34-clang++
+ENV AR_x86_64_linux_android=llvm-ar
+ENV CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=x86_64-linux-android34-clang
+
+WORKDIR /src
+COPY crates .
+
+# Build for aarch64-linux-android
+RUN cd ssh-mesh && cargo build --features pmon --target aarch64-linux-android --release
+
+# Build for x86_64-linux-android
+RUN cd ssh-mesh && cargo build --features pmon --target x86_64-linux-android --release
+
 
 # -----------------------
 # Use with 

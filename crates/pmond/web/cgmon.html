@@ -45,9 +45,9 @@
         header {
             background: linear-gradient(135deg, var(--primary), var(--secondary));
             color: white;
-            padding: 25px;
-            border-radius: 12px;
-            margin-bottom: 25px;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
             box-shadow: var(--card-shadow);
             display: flex;
             justify-content: space-between;
@@ -56,13 +56,13 @@
         }
 
         .header-content h1 {
-            font-size: 2.2rem;
-            margin-bottom: 8px;
+            font-size: 1.6rem;
+            margin-bottom: 4px;
         }
 
         .header-content p {
             opacity: 0.9;
-            font-size: 1.1rem;
+            font-size: 0.9rem;
         }
 
         .status-bar {
@@ -392,47 +392,42 @@
                 <h1>PMOND - CGroup Monitor</h1>
                 <p>Advanced system cgroup resource & VM statistics</p>
             </div>
+            <div style="display: flex; gap: 30px; align-items: center; flex-wrap: wrap;">
+                <div class="stat-item" style="color: white;">
+                    <span class="stat-label" style="color: rgba(255,255,255,0.8);">CGroups</span>
+                    <span class="stat-value" id="total-cgroups" style="color: white;">0</span>
+                </div>
+                <div class="stat-item" style="color: white;">
+                    <span class="stat-label" style="color: rgba(255,255,255,0.8);">Anon</span>
+                    <span class="stat-value" id="total-anon" style="color: white;">0 B</span>
+                </div>
+                <div class="stat-item" style="color: white;">
+                    <span class="stat-label" style="color: rgba(255,255,255,0.8);">File</span>
+                    <span class="stat-value" id="total-file" style="color: white;">0 B</span>
+                </div>
+            </div>
             <div class="status-bar paused" id="status-bar" title="Click to toggle auto-refresh">
                 <div class="status-item">
                     <span class="stat-label" style="color: white; margin-bottom: 0; margin-right: 8px;">Refreshing
                         in:</span>
                     <span id="refresh-timer" style="font-weight: 600;">5s</span>
                     <span id="paused-label" style="display: inline; font-weight: 600; margin-left: 8px;">(PAUSED)</span>
+                    <button id="refresh-btn" title="Refresh Now"
+                        style="margin-left: 15px; padding: 6px 12px; font-size: 1.2rem; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); box-shadow: none;">🔄</button>
                 </div>
             </div>
         </header>
 
-        <div class="controls">
-            <button id="refresh-btn"><i>🔄</i> Refresh Now</button>
-            <button onclick="location.href='pmon.html'" style="background: var(--gray)"><i>⬅️</i> Back to
-                Processes</button>
-        </div>
-
         <div class="dashboard">
             <div class="card">
-                <div class="card-header"><i>📊</i> Detailed CGroups Performance</div>
-                <div class="stats-bar">
-                    <div class="stat-item">
-                        <span class="stat-label">Total CGroups</span>
-                        <span class="stat-value" id="total-cgroups">0</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-label">Total Anon Memory</span>
-                        <span class="stat-value" id="total-anon">0 B</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-label">Total File Memory</span>
-                        <span class="stat-value" id="total-file">0 B</span>
-                    </div>
-                </div>
                 <div class="card-body">
                     <input type="text" id="search-box" class="search-box" placeholder="Filter by cgroup path...">
                     <table id="cgroup-table">
                         <colgroup>
-                            <col style="width: 35%;">
+                            <col style="width: 25%;">
                             <col style="width: 15%;">
                             <col style="width: 15%;">
-                            <col style="width: 20%;">
+                            <col style="width: 30%;">
                             <col style="width: 15%;">
                         </colgroup>
                         <thead>
@@ -457,31 +452,12 @@
         </footer>
     </div>
 
+    <script src="pmond.js"></script>
     <script>
-        function formatMemory(bytes) {
-            if (bytes === 0) return '0 B';
-            const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-        }
-
-        function formatCount(num) {
-            return (num || 0).toLocaleString();
-        }
-
-        function formatMemoryOrMax(val) {
-            if (val === 'max' || !val) return 'max';
-            const num = parseInt(val);
-            if (isNaN(num)) return val;
-            // If it's a huge number (e.g. 2^63-1), it's essentially max
-            if (num > 1e15) return 'max';
-            return formatMemory(num);
-        }
-
+        // DOM elements
         const tableBody = document.getElementById('cgroup-table-body');
         const searchBox = document.getElementById('search-box');
-        const progressBar = document.getElementById('status-bar');
+        const statusBar = document.getElementById('status-bar');
         const pausedLabel = document.getElementById('paused-label');
         const totalCgroupsEl = document.getElementById('total-cgroups');
         const totalAnonEl = document.getElementById('total-anon');
@@ -489,16 +465,9 @@
         const refreshTimerEl = document.getElementById('refresh-timer');
         const refreshBtn = document.getElementById('refresh-btn');
 
+        // State
         let cgroupsData = {};
-        let refreshInterval = 5;
-        let timeLeft = refreshInterval;
-        let isPaused = true;
-
-        progressBar.addEventListener('click', () => {
-            isPaused = !isPaused;
-            progressBar.classList.toggle('paused', isPaused);
-            pausedLabel.style.display = isPaused ? 'inline' : 'none';
-        });
+        const refreshInterval = 5;
 
         async function fetchData() {
             try {
@@ -507,7 +476,6 @@
                 cgroupsData = await response.json();
                 renderTable();
                 updateStats();
-                timeLeft = refreshInterval;
             } catch (err) {
                 console.error(err);
             }
@@ -599,11 +567,14 @@
                             <!-- USAGE & BASIS -->
                             <div class="detail-section">
                                 <div class="section-title"><i>🏠</i> Usage & Core</div>
+                                <div class="memory-item"><span class="memory-label">Kernel (total):</span><span class="mem-value">${formatMemory(data.kernel || 0)}</span></div>
+                                <div class="memory-item"><span class="memory-label">Kernel Stack:</span><span class="mem-value">${formatMemory(data.kernel_stack || 0)}</span></div>
+                                <div class="memory-item"><span class="memory-label">Page Tables:</span><span class="mem-value">${formatMemory(data.pagetables || 0)}</span></div>
                                 <div class="memory-item"><span class="memory-label">Shmem:</span><span class="mem-value">${formatMemory(data.shmem || 0)}</span></div>
                                 <div class="memory-item"><span class="memory-label">File Mapped:</span><span class="mem-value">${formatMemory(data.file_mapped || 0)}</span></div>
                                 <div class="memory-item"><span class="memory-label">File Dirty:</span><span class="mem-value">${formatMemory(data.file_dirty || 0)}</span></div>
-                                <div class="memory-item"><span class="memory-label">Kernel Stack:</span><span class="mem-value">${formatMemory(data.kernel_stack || 0)}</span></div>
-                                <div class="memory-item"><span class="memory-label">Page Tables:</span><span class="mem-value">${formatMemory(data.pagetables || 0)}</span></div>
+                                <div class="memory-item"><span class="memory-label">File Writeback:</span><span class="mem-value">${formatMemory(data.file_writeback || 0)}</span></div>
+                                <div class="memory-item"><span class="memory-label">Swap Cached:</span><span class="mem-value">${formatMemory(data.swapcached || 0)}</span></div>
                             </div>
                             
                             <!-- VM EVENTS (COUNTS) -->
@@ -753,45 +724,18 @@
             }
         }
 
-        function toggleDropdown(event, btn) {
-            event.stopPropagation();
-            const content = btn.nextElementSibling;
-            const isOpen = content.style.display === 'block';
-
-            // Close all other dropdowns
-            document.querySelectorAll('.dropdown-content').forEach(d => d.style.display = 'none');
-
-            content.style.display = isOpen ? 'none' : 'block';
-        }
-
-        // Close dropdowns when clicking outside
-        window.onclick = function (event) {
-            if (!event.target.matches('.action-btn')) {
-                document.querySelectorAll('.dropdown-content').forEach(d => d.style.display = 'none');
-            }
-        }
-
+        // Event listeners
         searchBox.addEventListener('input', renderTable);
         refreshBtn.addEventListener('click', fetchData);
-
-        // Add keyboard shortcut for refresh
-        document.addEventListener('keydown', (event) => {
-            // Trigger on 'R' or 'r' if not typing in an input field
-            if ((event.key === 'r' || event.key === 'R') &&
-                event.target.tagName !== 'INPUT' &&
-                event.target.tagName !== 'TEXTAREA') {
-                fetchData();
-            }
+        setupRefreshShortcut(fetchData);
+        setupDropdownClose();
+        setupRefreshTimer({
+            statusBar,
+            pausedLabel,
+            refreshTimerEl,
+            refreshInterval,
+            onRefresh: fetchData
         });
-
-        setInterval(() => {
-            if (isPaused) return;
-            timeLeft--;
-            if (timeLeft <= 0) {
-                fetchData();
-            }
-            refreshTimerEl.textContent = timeLeft + 's';
-        }, 1000);
 
         // Initial fetch
         const urlParams = new URLSearchParams(window.location.search);

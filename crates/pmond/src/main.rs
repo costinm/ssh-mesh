@@ -29,17 +29,13 @@ struct Args {
     #[clap(long = "watch", value_name = "PID")]
     watch: Option<u32>,
 
-    /// Run in MCP (Model Context Protocol) mode via stdin
-    #[clap(long = "mcp")]
-    mcp: bool,
-
     /// Refresh interval in seconds for server mode (default: 10)
     #[clap(long = "refresh", default_value = "10", value_name = "SECONDS")]
     refresh: u64,
 
-    /// Run MCP via UDS at the specified path
-    #[clap(long = "mcp-uds", value_name = "PATH")]
-    mcp_uds: Option<String>,
+    /// Run HTTP server via UDS at the specified path
+    #[clap(long = "uds", value_name = "PATH")]
+    http_uds: Option<String>,
 
     /// Start monitoring processes via netlink
     #[clap(long = "monitor")]
@@ -99,23 +95,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if args.mcp {
-        run_mcp_server().await?;
-        return Ok(());
-    }
-
     if args.monitor {
-        run_monitor(args.debug, args.mcp_uds).await?;
+        run_monitor(args.debug, args.http_uds).await?;
         return Ok(());
     }
 
-    // Authorized UID for MCP UDS
-    let auth_uid = std::env::var("MCP_AUTHORIZED_UID")
+    // Authorized UID for UDS
+    let auth_uid = std::env::var("PMOND_AUTHORIZED_UID")
         .ok()
         .and_then(|s| s.parse::<u32>().ok());
 
     // Default server mode
-    run_server(args.refresh, args.mcp_uds, auth_uid).await?;
+    run_server(args.refresh, args.http_uds, auth_uid).await?;
 
     Ok(())
 }
@@ -467,20 +458,14 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
     }
 }
 
-async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
-    let config = pmond::ServerConfig::default();
-    let server = pmond::PmonServer::new(config)?;
-    server.run_mcp_server().await
-}
-
 async fn run_server(
     refresh: u64,
-    mcp_uds: Option<String>,
+    http_uds: Option<String>,
     auth_uid: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = pmond::ServerConfig {
         refresh_interval: refresh,
-        mcp_uds_path: mcp_uds,
+        http_uds_path: http_uds,
         auth_uid,
     };
 

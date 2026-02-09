@@ -46,7 +46,6 @@ use ws::WSServer;
 
 // File paths for SSH authentication
 pub mod auth;
-pub mod drain;
 pub mod handlers;
 pub mod local_trace;
 #[cfg(feature = "sftp")]

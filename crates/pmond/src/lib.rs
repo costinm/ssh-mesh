@@ -13,7 +13,6 @@ use tracing::trace;
 use utoipa::ToSchema;
 
 pub mod handlers;
-pub mod methods;
 pub mod proc;
 pub mod proc_netlink;
 pub mod psi;
