@@ -1,0 +1,1339 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ssh-mesh",
+    "description": "",
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/_m/api/broadcast": {
+      "post": {
+        "tags": [
+          "ws"
+        ],
+        "operationId": "handle_broadcast",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Broadcast message to all clients",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/api/clients": {
+      "get": {
+        "tags": [
+          "ws"
+        ],
+        "operationId": "handle_list_clients",
+        "responses": {
+          "200": {
+            "description": "List connected WebSocket clients",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/api/clients/{id}": {
+      "delete": {
+        "tags": [
+          "ws"
+        ],
+        "operationId": "handle_remove_client",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Remove client",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/api/clients/{id}/message": {
+      "post": {
+        "tags": [
+          "ws"
+        ],
+        "operationId": "handle_send_message",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Send message to client",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/api/ssh/clients": {
+      "get": {
+        "tags": [
+          "ssh-mesh"
+        ],
+        "operationId": "get_ssh_clients",
+        "responses": {
+          "200": {
+            "description": "List connected SSH clients",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectedClientInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/pmon/_cgroup_high": {
+      "post": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_cgroup_high_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CgroupHighArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Adjust memory.high"
+          }
+        }
+      }
+    },
+    "/_m/pmon/_cgroup_procs": {
+      "post": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_cgroup_procs_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CgroupProcsPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Get processes in cgroup",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProcessInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/pmon/_cgroups": {
+      "get": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_cgroups_request",
+        "responses": {
+          "200": {
+            "description": "List all cgroups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "$ref": "#/components/schemas/ProcMemInfo"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/pmon/_clear_refs": {
+      "post": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_clear_refs_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClearRefsArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Clear process refs"
+          }
+        }
+      }
+    },
+    "/_m/pmon/_move_process": {
+      "post": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_move_process_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveProcessArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Move process to cgroup"
+          }
+        }
+      }
+    },
+    "/_m/pmon/_process/{pid}": {
+      "get": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_get_process_request",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "description": "Process ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Get detailed process info with cgroup hierarchy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessDetailedInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Process not found"
+          }
+        }
+      }
+    },
+    "/_m/pmon/_ps": {
+      "get": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_ps_request",
+        "responses": {
+          "200": {
+            "description": "List processes and return detailed memory info",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProcessInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/pmon/_psi": {
+      "get": {
+        "tags": [
+          "pmond"
+        ],
+        "operationId": "handle_psi_request",
+        "responses": {
+          "200": {
+            "description": "Get PSI watches",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "$ref": "#/components/schemas/PressureInfo"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/_m/trace/level": {
+      "get": {
+        "tags": [
+          "tracing"
+        ],
+        "summary": "Get the current tracing level",
+        "operationId": "get_trace_level",
+        "responses": {
+          "200": {
+            "description": "Current trace level",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceLevelResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to get trace level"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "tracing"
+        ],
+        "summary": "Set a new tracing level dynamically",
+        "operationId": "set_trace_level",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TraceLevelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Trace level updated successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceLevelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid trace level format"
+          },
+          "500": {
+            "description": "Failed to update trace level"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CGroupInfo": {
+        "type": "object",
+        "description": "Information about a cgroup including pressure metrics and process list.\nThis struct is separate from ProcMemInfo to provide a complete view of a cgroup.",
+        "required": [
+          "path",
+          "mem_info",
+          "pids"
+        ],
+        "properties": {
+          "cpu_pressure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PressureData",
+                "description": "CPU pressure data (from cpu.pressure)"
+              }
+            ]
+          },
+          "io_pressure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PressureData",
+                "description": "IO pressure data (from io.pressure)"
+              }
+            ]
+          },
+          "mem_info": {
+            "$ref": "#/components/schemas/ProcMemInfo",
+            "description": "Memory statistics from memory.stat"
+          },
+          "memory_pressure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PressureData",
+                "description": "Memory pressure data (from memory.pressure)"
+              }
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "Full cgroup path"
+          },
+          "pids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "List of PIDs in this cgroup (from cgroup.procs)"
+          }
+        }
+      },
+      "CgroupHighArgs": {
+        "type": "object",
+        "description": "Arguments for cgroup_high",
+        "required": [
+          "path",
+          "percentage",
+          "interval"
+        ],
+        "properties": {
+          "interval": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds before resetting to max (0 = no reset)",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "description": "Full cgroup path"
+          },
+          "percentage": {
+            "type": "number",
+            "format": "double",
+            "description": "Percentage of current memory to set as high (0-100)"
+          }
+        }
+      },
+      "CgroupProcsPayload": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "ClearRefsArgs": {
+        "type": "object",
+        "description": "Arguments for clear_refs",
+        "required": [
+          "pid",
+          "value"
+        ],
+        "properties": {
+          "pid": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Process ID",
+            "minimum": 0
+          },
+          "value": {
+            "type": "string",
+            "description": "Value to write: \"1\"-\"5\" or \"7\" for all"
+          }
+        }
+      },
+      "ClientsResponse": {
+        "type": "object",
+        "required": [
+          "clients"
+        ],
+        "properties": {
+          "clients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ConnectedClientInfo": {
+        "type": "object",
+        "description": "Information about a connected client",
+        "required": [
+          "id",
+          "user",
+          "comment",
+          "remote_forward_listeners",
+          "connected_at"
+        ],
+        "properties": {
+          "comment": {
+            "type": "string"
+          },
+          "connected_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "options": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remote_forward_listeners": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": false,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              ]
+            }
+          },
+          "user": {
+            "type": "string"
+          }
+        }
+      },
+      "GetCgroupArgs": {
+        "type": "object",
+        "description": "Arguments for get_cgroup",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Full cgroup path"
+          }
+        }
+      },
+      "GetProcessArgs": {
+        "type": "object",
+        "description": "Arguments for get_process",
+        "required": [
+          "process"
+        ],
+        "properties": {
+          "process": {
+            "type": "string",
+            "description": "Process ID or name to look up"
+          }
+        }
+      },
+      "ListCgroupsArgs": {
+        "type": "object",
+        "description": "Arguments for list_cgroups - no parameters needed"
+      },
+      "ListProcessesArgs": {
+        "type": "object",
+        "description": "Arguments for list_processes - no parameters needed"
+      },
+      "LogEntry": {
+        "type": "object",
+        "description": "A single log entry in the buffer",
+        "required": [
+          "timestamp",
+          "level",
+          "target",
+          "message"
+        ],
+        "properties": {
+          "fields": {
+            "description": "Optional fields (key-value pairs)"
+          },
+          "level": {
+            "type": "string",
+            "description": "Log level (trace, debug, info, warn, error)"
+          },
+          "message": {
+            "type": "string",
+            "description": "Log message"
+          },
+          "target": {
+            "type": "string",
+            "description": "Target module/crate"
+          },
+          "timestamp": {
+            "type": "string",
+            "description": "Timestamp in RFC3339 format"
+          }
+        }
+      },
+      "MessageResponse": {
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MoveProcessArgs": {
+        "type": "object",
+        "description": "Arguments for move_process",
+        "required": [
+          "pid"
+        ],
+        "properties": {
+          "cgroup_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Target cgroup name (None for default)"
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Process ID to move",
+            "minimum": 0
+          }
+        }
+      },
+      "PressureData": {
+        "type": "object",
+        "description": "Parsed PSI pressure data from /proc/pressure or cgroup memory.pressure files.\nFormat: \"some avg10=X.XX avg60=X.XX avg300=X.XX total=N\"",
+        "required": [
+          "avg10",
+          "avg60",
+          "avg300",
+          "total"
+        ],
+        "properties": {
+          "avg10": {
+            "type": "number",
+            "format": "double",
+            "description": "Average percentage of time stalled in the last 10 seconds"
+          },
+          "avg300": {
+            "type": "number",
+            "format": "double",
+            "description": "Average percentage of time stalled in the last 300 seconds"
+          },
+          "avg60": {
+            "type": "number",
+            "format": "double",
+            "description": "Average percentage of time stalled in the last 60 seconds"
+          },
+          "raw": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Raw string if parsing failed"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total stall time in microseconds",
+            "minimum": 0
+          }
+        }
+      },
+      "PressureEvent": {
+        "type": "object",
+        "required": [
+          "cgroup_path",
+          "pressure_type",
+          "pressure_data"
+        ],
+        "properties": {
+          "cgroup_path": {
+            "type": "string"
+          },
+          "pressure_data": {
+            "$ref": "#/components/schemas/PressureData"
+          },
+          "pressure_type": {
+            "$ref": "#/components/schemas/PressureType"
+          }
+        }
+      },
+      "PressureInfo": {
+        "type": "object",
+        "description": "Tracks pressure information for a cgroup, including historical events.",
+        "required": [
+          "cgroup_path",
+          "watch_started",
+          "event_count"
+        ],
+        "properties": {
+          "cgroup_path": {
+            "type": "string",
+            "description": "The cgroup path being watched"
+          },
+          "event_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total number of pressure events received",
+            "minimum": 0
+          },
+          "last_event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PressureData",
+                "description": "The most recent pressure event data"
+              }
+            ]
+          },
+          "previous_event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PressureData",
+                "description": "The previous pressure event data (before last_event)"
+              }
+            ]
+          },
+          "watch_started": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this cgroup was first added to the watch list"
+          }
+        }
+      },
+      "PressureType": {
+        "type": "string",
+        "enum": [
+          "Memory"
+        ]
+      },
+      "ProcMemInfo": {
+        "type": "object",
+        "description": "Memory info for a process or set of processes. Each field should have a\ncomment indicating where it is derived from.\n\nThis is also used for cgroups - ideally one cgroup per process (like docker/Android),\nnot ideal mapping in systemd sessions since it's a set of processes.\n",
+        "required": [
+          "d_anon",
+          "d_file",
+          "d_kernel_stack",
+          "d_pagetables",
+          "d_shmem",
+          "d_pgfault",
+          "d_pgmajfault",
+          "anon",
+          "file",
+          "kernel_stack",
+          "pagetables",
+          "shmem",
+          "pgfault",
+          "pgmajfault",
+          "pss",
+          "rss",
+          "private_clean",
+          "private_dirty",
+          "shared_clean",
+          "shared_dirty",
+          "referenced",
+          "swap",
+          "hugetlb",
+          "kernel",
+          "file_mapped",
+          "file_dirty",
+          "file_writeback",
+          "swapcached",
+          "pgrefill",
+          "pgactivate",
+          "pgdeactivate",
+          "pswpin",
+          "pswpout",
+          "pgsteal",
+          "pgscan",
+          "pgdemote_kswapd",
+          "pgdemote_direct",
+          "pgdemote_khugepaged",
+          "pgdemote_proactive",
+          "active_anon",
+          "active_file",
+          "inactive_anon",
+          "inactive_file",
+          "workingset_refault_anon",
+          "workingset_refault_file",
+          "workingset_activate_anon",
+          "workingset_activate_file",
+          "workingset_restore_anon",
+          "workingset_restore_file",
+          "workingset_nodereclaim"
+        ],
+        "properties": {
+          "active_anon": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Active anonymous memory. Cgroup: memory.stat (active_anon).",
+            "minimum": 0
+          },
+          "active_file": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Active file memory. Cgroup: memory.stat (active_file).",
+            "minimum": 0
+          },
+          "anon": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon).",
+            "minimum": 0
+          },
+          "d_anon": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Anonymous memory. Process: smaps_rollup (Anonymous), status (RssAnon), or statm. Cgroup: memory.stat (anon)."
+          },
+          "d_file": {
+            "type": "integer",
+            "format": "int64",
+            "description": "File-backed memory. Process: Derived (rss - anon) or status (RssFile). Cgroup: memory.stat (file)."
+          },
+          "d_kernel_stack": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Kernel stack memory. Process: status (VmStk). Cgroup: memory.stat (kernel_stack)."
+          },
+          "d_pagetables": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Page table entries. Process: status (VmPTE). Cgroup: memory.stat (pagetables)."
+          },
+          "d_pgfault": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Page faults. Process: stat (minflt + majflt). Cgroup: memory.stat (pgfault)."
+          },
+          "d_pgmajfault": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Major page faults. Process: stat (majflt). Cgroup: memory.stat (pgmajfault)."
+          },
+          "d_shmem": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Shared memory. Process: status (RssShmem) or statm (shared). Cgroup: memory.stat (shmem)."
+          },
+          "file": {
+            "type": "integer",
+            "format": "int64",
+            "description": "File-backed memory. Process: Derived (rss - anon) or status (RssFile). Cgroup: memory.stat (file).\nstatm[3] is file + shmem",
+            "minimum": 0
+          },
+          "file_dirty": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dirty file cache. Process: N/A. Cgroup: memory.stat (file_dirty).",
+            "minimum": 0
+          },
+          "file_mapped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Mapped file memory. Process: N/A (partial in smaps). Cgroup: memory.stat (file_mapped).",
+            "minimum": 0
+          },
+          "file_writeback": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Writeback file cache. Process: N/A. Cgroup: memory.stat (file_writeback).",
+            "minimum": 0
+          },
+          "hugetlb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "HugeTLB memory. Process: status (HugetlbPages). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "inactive_anon": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Inactive anonymous memory. Cgroup: memory.stat (inactive_anon).",
+            "minimum": 0
+          },
+          "inactive_file": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Inactive file memory. Cgroup: memory.stat (inactive_file).",
+            "minimum": 0
+          },
+          "kernel": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Kernel memory. Process: N/A. Cgroup: memory.stat (kernel).",
+            "minimum": 0
+          },
+          "kernel_stack": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Kernel stack memory. Process: status (VmStk). Cgroup: memory.stat (kernel_stack).",
+            "minimum": 0
+          },
+          "memory_current": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Current cgroup memory current usage. Cgroup: memory.current.",
+            "minimum": 0
+          },
+          "memory_high": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cgroup memory high limit. Cgroup: memory.high."
+          },
+          "pagetables": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Page table entries. Process: status (VmPTE). Cgroup: memory.stat (pagetables).",
+            "minimum": 0
+          },
+          "pgactivate": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages activated. Cgroup: memory.stat (pgactivate).",
+            "minimum": 0
+          },
+          "pgdeactivate": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages deactivated. Cgroup: memory.stat (pgdeactivate).",
+            "minimum": 0
+          },
+          "pgdemote_direct": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages demoted directly. Cgroup: memory.stat (pgdemote_direct).",
+            "minimum": 0
+          },
+          "pgdemote_khugepaged": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages demoted by khugepaged. Cgroup: memory.stat (pgdemote_khugepaged).",
+            "minimum": 0
+          },
+          "pgdemote_kswapd": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages demoted by kswapd. Cgroup: memory.stat (pgdemote_kswapd).",
+            "minimum": 0
+          },
+          "pgdemote_proactive": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages demoted proactively. Cgroup: memory.stat (pgdemote_proactive).",
+            "minimum": 0
+          },
+          "pgfault": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Page faults. Process: stat (minflt + majflt). Cgroup: memory.stat (pgfault).",
+            "minimum": 0
+          },
+          "pgmajfault": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Major page faults. Process: stat (majflt). Cgroup: memory.stat (pgmajfault).",
+            "minimum": 0
+          },
+          "pgrefill": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Page refills. Cgroup: memory.stat (pgrefill).",
+            "minimum": 0
+          },
+          "pgscan": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages scanned. Cgroup: memory.stat (pgscan).",
+            "minimum": 0
+          },
+          "pgsteal": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages stolen. Cgroup: memory.stat (pgsteal).",
+            "minimum": 0
+          },
+          "private_clean": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Private clean pages. Process: smaps_rollup (Private_Clean). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "private_dirty": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Private dirty pages. Process: smaps_rollup (Private_Dirty). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "pss": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Proportional Set Size. Process: smaps_rollup (Pss). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "pswpin": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages swapped in. Cgroup: memory.stat (pswpin).",
+            "minimum": 0
+          },
+          "pswpout": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pages swapped out. Cgroup: memory.stat (pswpout).",
+            "minimum": 0
+          },
+          "referenced": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Referenced memory. Process: smaps_rollup (Referenced). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "rss": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total Resident Set Size. Process: smaps_rollup (Rss), status (VmRSS), or statm[2]. Cgroup: N/A (see memory_current).",
+            "minimum": 0
+          },
+          "shared_clean": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Shared clean pages. Process: smaps_rollup (Shared_Clean). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "shared_dirty": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Shared dirty pages. Process: smaps_rollup (Shared_Dirty). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "shmem": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Shared memory. Process: status (RssShmem) or statm (shared). Cgroup: memory.stat (shmem).",
+            "minimum": 0
+          },
+          "swap": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total swap usage. Process: smaps_rollup (Swap) or status (VmSwap). Cgroup: N/A.",
+            "minimum": 0
+          },
+          "swapcached": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Memory that is swap-cached. Process: N/A. Cgroup: memory.stat (swapcached).",
+            "minimum": 0
+          },
+          "workingset_activate_anon": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Workingset activations for anon. Cgroup: memory.stat (workingset_activate_anon).",
+            "minimum": 0
+          },
+          "workingset_activate_file": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Workingset activations for file. Cgroup: memory.stat (workingset_activate_file).",
+            "minimum": 0
+          },
+          "workingset_nodereclaim": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Workingset node reclaim. Cgroup: memory.stat (workingset_nodereclaim).",
+            "minimum": 0
+          },
+          "workingset_refault_anon": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Workingset refaults for anon. Cgroup: memory.stat (workingset_refault_anon).",
+            "minimum": 0
+          },
+          "workingset_refault_file": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Workingset refaults for file. Cgroup: memory.stat (workingset_refault_file).",
+            "minimum": 0
+          },
+          "workingset_restore_anon": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Workingset restores for anon. Cgroup: memory.stat (workingset_restore_anon).",
+            "minimum": 0
+          },
+          "workingset_restore_file": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Workingset restores for file. Cgroup: memory.stat (workingset_restore_file).",
+            "minimum": 0
+          }
+        }
+      },
+      "ProcessDetailedInfo": {
+        "type": "object",
+        "description": "Detailed process information including cgroup hierarchy.",
+        "required": [
+          "process",
+          "parent_cgroups"
+        ],
+        "properties": {
+          "cgroup": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CGroupInfo",
+                "description": "Direct cgroup info (if available)"
+              }
+            ]
+          },
+          "parent_cgroups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CGroupInfo"
+            },
+            "description": "Parent cgroups from the process's cgroup up to root"
+          },
+          "process": {
+            "$ref": "#/components/schemas/ProcessInfo",
+            "description": "Core process information"
+          }
+        }
+      },
+      "ProcessInfo": {
+        "type": "object",
+        "required": [
+          "pid",
+          "ppid",
+          "comm"
+        ],
+        "properties": {
+          "cgroup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cmdline": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "comm": {
+            "type": "string"
+          },
+          "mem_info": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProcMemInfo"
+              }
+            ]
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "ppid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "uid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "PsiWatchesArgs": {
+        "type": "object",
+        "description": "Arguments for psi_watches - no parameters needed"
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "TraceLevelRequest": {
+        "type": "object",
+        "description": "Request body for setting trace level",
+        "required": [
+          "level"
+        ],
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "The new trace level filter directive (e.g., \"info\", \"debug\", \"trace\", \"ssh_mesh=debug,info\")"
+          }
+        }
+      },
+      "TraceLevelResponse": {
+        "type": "object",
+        "description": "Response for getting/setting trace level",
+        "required": [
+          "level"
+        ],
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "The current trace level filter directive"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional message indicating the result of the operation"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "ssh-mesh",
+      "description": "SSH Mesh API"
+    },
+    {
+      "name": "tracing",
+      "description": "Tracing and Logging API"
+    },
+    {
+      "name": "pmond",
+      "description": "Process Memory Monitor API"
+    }
+  ]
+}
