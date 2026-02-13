@@ -1,3 +1,5 @@
+Original code from https://github.com/u-root/cpu/tree/main/p9cpu
+
 rust-9p
 =====
 Tokio-based asynchronous filesystems library using 9P2000.L protocol, an extended variant of 9P from Plan 9.

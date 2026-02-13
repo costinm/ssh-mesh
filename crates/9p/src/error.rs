@@ -12,7 +12,7 @@ use std::{fmt, io};
 
 fn errno_from_io_error(e: &io::Error) -> nix::errno::Errno {
     e.raw_os_error()
-        .map(nix::errno::from_i32)
+        .map(nix::errno::Errno::from_raw)
         .unwrap_or_else(|| match e.kind() {
             NotFound => ENOENT,
             PermissionDenied => EPERM,

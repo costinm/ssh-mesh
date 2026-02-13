@@ -13,7 +13,7 @@ use {
     },
     async_trait::async_trait,
     bytes::buf::{Buf, BufMut},
-    futures::sink::SinkExt,
+    futures_util::sink::SinkExt,
     std::{collections::HashMap, sync::Arc},
     tokio::{
         io::{AsyncRead, AsyncWrite},
