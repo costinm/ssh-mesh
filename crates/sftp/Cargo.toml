@@ -1,0 +1,21 @@
+[package]
+name = "sftp-server"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sftp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sftp-server"
+path = "src/main.rs"
+
+[dependencies]
+russh-sftp = "2"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
