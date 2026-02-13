@@ -1,48 +1,62 @@
-//! 9P filesystem server over stdin/stdout.
+//! 9P filesystem server.
 //!
-//! Serves the unpfs (Unix Passthrough Filesystem) using the 9P2000.L protocol
-//! over stdin/stdout, suitable for use as an SSH subsystem or ForceCommand.
+//! Serves the unpfs (Unix Passthrough Filesystem) using the 9P2000.L protocol.
+//! Can serve over stdin/stdout (default) or listen on a Unix Domain Socket.
 //!
 //! Usage:
-//!   unpfs [root_directory]
+//!   unpfs [root_directory] [--listen <path>]
 //!
-//! If no root directory is specified, defaults to "/".
+//! If no root directory is specified, defaults to current directory (".").
 
 use clap::Parser;
-use rs9p::unpfs::Unpfs;
+use fsd::unpfs::Unpfs;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "unpfs", about = "9P2000.L filesystem server over stdin/stdout")]
+#[command(name = "unpfs", about = "9P2000.L filesystem server")]
 struct Args {
     /// Root directory to serve
-    #[arg(default_value = "/")]
+    #[arg(default_value = ".")]
     root: PathBuf,
+
+    /// Unix Domain Socket path to listen on
+    #[arg(short, long)]
+    listen: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
 
-    let root = args.root.canonicalize().unwrap_or_else(|_| args.root.clone());
-
-    tracing::info!("unpfs: serving {:?} over stdin/stdout", root);
+    let root = args
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| args.root.clone());
 
     let fs = Unpfs {
-        realroot: root,
+        realroot: root.clone(),
     };
 
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    if let Some(path) = args.listen {
+        tracing::info!("unpfs: serving {:?} on UDS {:?}", root, path);
 
-    rs9p::srv::dispatch(fs, stdin, stdout).await?;
+        // Remove existing socket file if it exists
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+
+        fsd::srv::srv_async_unix(fs, path.to_str().ok_or("Invalid UDS path")?).await?;
+    } else {
+        tracing::info!("unpfs: serving {:?} over stdin/stdout", root);
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
+        fsd::srv::dispatch(fs, stdin, stdout).await?;
+    }
 
     Ok(())
 }

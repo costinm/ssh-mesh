@@ -1,5 +1,5 @@
 [package]
-name = "rust-9p"
+name = "fsd"
 version = "0.0.1"
 edition = "2021"
 authors = ["Ryo Munakata (pfpacket) <afpacket@gmail.com>"]
@@ -12,7 +12,7 @@ categories = ["filesystem", "network-programming"]
 license-file = "LICENSE"
 
 [lib]
-name = "rs9p"
+name = "fsd"
 crate-type = ["rlib"]
 
 [[bin]]
