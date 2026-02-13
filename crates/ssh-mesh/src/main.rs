@@ -86,8 +86,10 @@ async fn main() -> Result<(), anyhow::Error> {
             path
         });
 
+    let sftp_server_path = env::var("SFTP_SERVER_PATH").ok();
+
     // Create SSH server instance
-    let ssh_server = Arc::new(SshServer::new(0, None, base_dir.clone()));
+    let ssh_server = Arc::new(SshServer::new(0, None, base_dir.clone(), sftp_server_path));
 
     // Create WebSocket server instance
     let ws_server = Arc::new(WSServer::new());

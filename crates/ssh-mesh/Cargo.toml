@@ -16,11 +16,19 @@ path = "src/bin/h2t.rs"
 name = "meshkeys"
 path = "src/bin/meshkeys.rs"
 
+[[bin]]
+name = "gen-openapi"
+path = "src/bin/gen-openapi.rs"
+
+[[bin]]
+name = "swagger"
+path = "src/bin/swagger.rs"
+
 [features]
 default = ["test-utils", "sftp", "pmon"]
 test-utils = ["tempfile", "once_cell"]
 pmon = ["dep:pmond"]
-sftp = ["dep:russh-sftp"]
+sftp = ["dep:sftp-server", "dep:russh-sftp"]
 
 [dependencies]
 anyhow = "1.0"
@@ -66,6 +74,7 @@ rustls-pemfile = "2.2"
 rust-embed = "8.11.0"
 mime_guess = "2.0.5"
 russh-sftp = { version = "2", optional = true }
+sftp-server = { path = "../sftp", optional = true }
 pmond = { path = "../pmond", optional = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "^8.0", features = ["axum"] }

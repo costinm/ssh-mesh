@@ -48,8 +48,6 @@ use ws::WSServer;
 pub mod auth;
 pub mod handlers;
 pub mod local_trace;
-#[cfg(feature = "sftp")]
-pub mod sftp;
 pub mod socks5;
 pub mod utils;
 
@@ -67,6 +65,7 @@ pub struct SshServer {
     active_handlers: Arc<std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<SshHandler>>>>>,
     /// Track connected clients with their remote forward listeners
     pub connected_clients: Arc<tokio::sync::Mutex<HashMap<usize, ConnectedClientInfo>>>,
+    pub sftp_server_path: Option<String>,
 }
 
 /// Information about a connected client
@@ -101,7 +100,12 @@ impl SshServer {
     /// * `id` - Server ID
     /// * `key` - Optional private key
     /// * `base_dir` - Base directory containing the .ssh subdirectory
-    pub fn new(id: usize, key: Option<PrivateKey>, base_dir: PathBuf) -> Self {
+    pub fn new(
+        id: usize,
+        key: Option<PrivateKey>,
+        base_dir: PathBuf,
+        sftp_server_path: Option<String>,
+    ) -> Self {
         let keys = match key {
             Some(key) => key,
             None => crate::auth::load_or_generate_key(&base_dir),
@@ -140,6 +144,7 @@ impl SshServer {
             base_dir,
             active_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             connected_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sftp_server_path,
         }
     }
 
@@ -1062,26 +1067,22 @@ impl server::Handler for SshHandler {
         async move {
             if subsystem_name == "sftp" {
                 #[cfg(feature = "sftp")]
-                {
+                if self.server.sftp_server_path.is_none() {
                     info!("Starting built-in SFTP server for channel {:?}", channel_id);
-
                     // Create input channel (SSH -> SFTP)
                     let (tx_in, rx_in) = mpsc::unbounded_channel::<Bytes>();
                     {
                         let mut writers = tcp_writers.lock().await;
                         writers.insert(channel_id, tx_in);
                     }
-
                     // Create output channel (SFTP -> SSH)
                     let (tx_out, mut rx_out) = mpsc::unbounded_channel::<Bytes>();
-
                     // Create the stream adapter
                     let stream = crate::utils::ChannelBytesStream {
                         reader: rx_in,
                         writer: tx_out,
                         read_buf: bytes::BytesMut::new(),
                     };
-
                     // Spawn task to forward SFTP output to SSH channel
                     let session_handle_clone = session_handle.clone();
                     tokio::spawn(async move {
@@ -1097,21 +1098,24 @@ impl server::Handler for SshHandler {
                         let _ = session_handle_clone.eof(channel_id).await;
                         let _ = session_handle_clone.close(channel_id).await;
                     });
-
                     // Start SFTP server
                     let base_dir = self.server.base_dir.clone();
                     tokio::spawn(async move {
-                        let handler = crate::sftp::FileSystemHandler::new(base_dir);
+                        let handler = sftp_server::FileSystemHandler::new(base_dir);
                         russh_sftp::server::run(stream, handler).await;
                     });
-
                     let _ = session_handle.channel_success(channel_id).await;
                     return Ok(());
                 }
 
-                #[cfg(not(feature = "sftp"))]
                 {
-                    let sftp_server_path = "/usr/lib/openssh/sftp-server";
+                    let default_path = "/usr/lib/openssh/sftp-server".to_string();
+                    let sftp_server_path = self
+                        .server
+                        .sftp_server_path
+                        .as_ref()
+                        .unwrap_or(&default_path);
+
                     if !std::path::Path::new(sftp_server_path).exists() {
                         error!("SFTP server binary not found at {}", sftp_server_path);
                         let _ = session_handle.channel_failure(channel_id).await;
@@ -1342,7 +1346,7 @@ mod tests {
 
         let key = PrivateKey::random(&mut rand::rngs::OsRng, russh::keys::Algorithm::Ed25519)
             .expect("Failed to generate test key");
-        let server = SshServer::new(42, Some(key), base_dir);
+        let server = SshServer::new(42, Some(key), base_dir, None);
         let config = server.get_config();
 
         // Verify some configuration settings

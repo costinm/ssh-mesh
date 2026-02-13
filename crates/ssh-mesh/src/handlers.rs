@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+
 use ws::{ClientsResponse, MessageResponse, SendMessageRequest};
 
 #[derive(RustEmbed)]
@@ -57,6 +57,18 @@ use crate::AppState;
     )
 )]
 pub struct ApiDoc;
+
+async fn serve_openapi_json() -> impl IntoResponse {
+    match tokio::fs::read_to_string("web/openapi.json").await {
+        Ok(content) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            content,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "OpenAPI schema not found").into_response(),
+    }
+}
 
 // Wrapper functions for trace endpoints
 async fn trace_get_level() -> impl IntoResponse {
@@ -184,7 +196,8 @@ pub fn app(app_state: AppState) -> Router {
                 ws::handle_broadcast(State(app_state.ws_server), json)
             }),
         )
-        .merge(SwaggerUi::new("/_m/api/swagger-ui").url("/_m/api/openapi.json", ApiDoc::openapi()))
+        // Serve pre-generated OpenAPI schema
+        .route("/_m/api/openapi.json", get(serve_openapi_json))
         // Trace level API routes
         .route("/_m/trace/level", get(trace_get_level).put(trace_set_level))
         // Trace view WebSocket

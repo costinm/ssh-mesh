@@ -74,7 +74,7 @@ pub async fn setup_test_environment(
             "Starting SshServer for tests at base_dir: {:?}",
             server_base_dir
         );
-        let ssh_server = std::sync::Arc::new(crate::SshServer::new(0, None, server_base_dir));
+        let ssh_server = std::sync::Arc::new(crate::SshServer::new(0, None, server_base_dir, None));
 
         if start_http {
             let app_state = crate::AppState {
