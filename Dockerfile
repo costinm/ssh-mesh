@@ -13,18 +13,21 @@ RUN apt-get update && apt-get install -y \
 RUN rustup target add x86_64-unknown-linux-musl
 RUN rustup target add aarch64-unknown-linux-musl
 WORKDIR /src
-#COPY . .
-COPY crates .
+
+# Copy workspace configuration and sources
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 
 # Build both pmond and ssh-mesh targets for MUSL, built individually
 # Less efficient (duplicate builds of common deps), but want to evaluate each
-RUN cd pmond && cargo build --target x86_64-unknown-linux-musl --release 
-RUN cd ssh-mesh &&  cargo build --features pmon --target x86_64-unknown-linux-musl --release
-RUN cd ssh-mesh &&  CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc cargo build --features pmon --target aarch64-unknown-linux-musl --release
-#RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p ssh-mesh
-#RUN CC_x86_64_unknown_linux_musl=gcc cargo build --target x86_64-unknown-linux-musl --release -p pmond
+RUN cargo build --target x86_64-unknown-linux-musl --release -p pmond
+RUN cargo build --features pmon --target x86_64-unknown-linux-musl --release -p ssh-mesh
+RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
+    cargo build --features pmon --target aarch64-unknown-linux-musl --release -p ssh-mesh
 
-#RUN ls -lR /src/pmond/target
+# Build rvirtiofsd statically
+RUN RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --target x86_64-unknown-linux-musl --release -p rvirtiofsd
 
 # -----------------------
 FROM rust:slim-bookworm AS build-android
@@ -59,13 +62,14 @@ ENV AR_x86_64_linux_android=llvm-ar
 ENV CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=x86_64-linux-android34-clang
 
 WORKDIR /src
-COPY crates .
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 
 # Build for aarch64-linux-android
-RUN cd ssh-mesh && cargo build --features pmon --target aarch64-linux-android --release
+RUN cargo build --features pmon --target aarch64-linux-android --release -p ssh-mesh
 
 # Build for x86_64-linux-android
-RUN cd ssh-mesh && cargo build --features pmon --target x86_64-linux-android --release
+RUN cargo build --features pmon --target x86_64-linux-android --release -p ssh-mesh
 
 
 # -----------------------
@@ -73,19 +77,21 @@ RUN cd ssh-mesh && cargo build --features pmon --target x86_64-linux-android --r
 # docker build --progress=plain --output . --target bin .
 FROM scratch as bin
 
-COPY --from=build /src/ssh-mesh/target/x86_64-unknown-linux-musl/release/ssh-mesh .
-COPY --from=build /src/ssh-mesh/target/aarch64-unknown-linux-musl/release/ssh-mesh ssh-mesh.aarch64
-COPY --from=build /src/ssh-mesh/target/x86_64-unknown-linux-musl/release/h2t .
-COPY --from=build /src/ssh-mesh/target/x86_64-unknown-linux-musl/release/meshkeys .
-COPY --from=build /src/pmond/target/x86_64-unknown-linux-musl/release/pmond .
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh .
+COPY --from=build /src/target/aarch64-unknown-linux-musl/release/ssh-mesh ssh-mesh.aarch64
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/h2t .
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/meshkeys .
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond .
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/rvirtiofsd .
 
 # ------------------------
 # Final stage for creating a test docker image with various utils.
 FROM nicolaka/netshoot
 
 # Copy the statically linked binaries from the build stage
-COPY --from=build /src/ssh-mesh/target/x86_64-unknown-linux-musl/release/ssh-mesh /usr/local/bin/ssh-mesh
-COPY --from=build /src/pmond/target/x86_64-unknown-linux-musl/release/pmond /usr/local/bin/pmond
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh /usr/local/bin/ssh-mesh
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond /usr/local/bin/pmond
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/rvirtiofsd /usr/local/bin/rvirtiofsd
 
 # Use ssh-mesh as the default entrypoint
 ENTRYPOINT ["/usr/local/bin/ssh-mesh"]
