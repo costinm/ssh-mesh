@@ -172,6 +172,10 @@ pub fn app(app_state: AppState) -> Router {
             }),
         )
         .route("/_m/api/ssh/clients", get(get_ssh_clients))
+        .nest_service(
+            "/_m/api/sshc",
+            crate::sshc::sshc_routes(app_state.ssh_client_manager.clone()),
+        )
         .route(
             "/_m/api/clients",
             get(move |State(app_state): State<AppState>| {

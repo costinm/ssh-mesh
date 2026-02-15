@@ -44,13 +44,14 @@ pub struct SshAuthResult {
     pub status: server::Auth,
     pub comment: String,
     pub options: Option<String>,
+    pub user: String,
 }
 
 impl SshAuthResult {
     pub fn into_auth_result(self) -> AuthResult {
         AuthResult {
             accepted: matches!(self.status, server::Auth::Accept),
-            identity: self.comment,
+            identity: self.user,
             options: self.options,
         }
     }

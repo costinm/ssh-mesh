@@ -58,9 +58,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     init_telemetry(log_buffer.clone());
 
-    let main_span = tracing::info_span!("main");
-    let _main_guard = main_span.enter();
-
     // Import required items
     use log::{error, info};
     use ssh_mesh::{AppState, ExecConfig, SshServer, handlers, run_ssh_server};
@@ -116,6 +113,22 @@ async fn main() -> Result<(), anyhow::Error> {
         #[cfg(feature = "pmon")]
         proc_mon: proc_mon.clone(),
         log_buffer: log_buffer.clone(),
+        ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new(
+            ssh_server.private_key().clone(),
+            {
+                // Default: base_dir/config (i.e. ~/.ssh/config).
+                // Override with SSH_CONFIG env var.
+                let config_path = env::var("SSH_CONFIG")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| base_dir.join("config"));
+                if config_path.exists() {
+                    Some(config_path)
+                } else {
+                    None
+                }
+            },
+            env::var("MUX_DIR").ok().map(PathBuf::from),
+        )),
     };
 
     info!(
@@ -205,13 +218,28 @@ async fn main() -> Result<(), anyhow::Error> {
             uid,
         })?;
     } else {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {}
-            Err(err) => {
-                eprintln!("Unable to listen for shutdown signal: {}", err);
+        // Daemon mode — wait for shutdown signal.
+        // Handle both SIGINT (ctrl-c) and SIGTERM for graceful shutdown.
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received SIGINT (ctrl-c), shutting down");
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down");
+                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await?;
+            info!("Received ctrl-c, shutting down");
         }
     }
 
-    Ok(())
+    info!("Exiting");
+    std::process::exit(0);
 }

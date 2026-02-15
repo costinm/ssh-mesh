@@ -84,6 +84,11 @@ pub async fn setup_test_environment(
                 #[cfg(feature = "pmon")]
                 proc_mon: std::sync::Arc::new(pmond::ProcMon::new().unwrap()),
                 log_buffer: crate::local_trace::create_log_buffer(),
+                ssh_client_manager: std::sync::Arc::new(crate::sshc::SshClientManager::new(
+                    ssh_server.private_key().clone(),
+                    None,
+                    None,
+                )),
             };
 
             let ssh_server_clone = ssh_server.clone();

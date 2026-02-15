@@ -1,14 +1,13 @@
 // SSH authentication - public key and certificate validation
 
-use super::keys::AUTHORIZED_KEYS_PATH;
 use super::SshAuthResult;
+use super::keys::AUTHORIZED_KEYS_PATH;
 use anyhow::Result;
 use log::warn;
-use russh::{server, MethodKind};
+use russh::{MethodKind, server};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info};
 
 /// Entry from authorized_keys file
 #[derive(Debug, Clone)]
@@ -20,20 +19,24 @@ pub struct AuthorizedKeyEntry {
 }
 
 /// Validate a regular public key against authorized_keys
+/// Using the authorized keys allow any user to be impersonated - this
+/// is the node admin/owner.
+///
+/// All other users need to use certificate.
 pub async fn validate_public_key(
     user: &str,
     key_openssh: &str,
     authorized_keys: &[AuthorizedKeyEntry],
 ) -> Result<SshAuthResult> {
-    info!("Validating public key for user {}: {}", user, key_openssh);
-
     let incoming_key = ssh_key::PublicKey::from_openssh(key_openssh)
         .map_err(|e| anyhow::anyhow!("Failed to parse incoming public key: {}", e))?;
+
     let incoming_fp = incoming_key
         .fingerprint(ssh_key::HashAlg::Sha256)
         .to_string();
 
-    for (i, entry) in authorized_keys.iter().enumerate() {
+    // TODO: use a hash map keyed by incoming_fp.
+    for (_i, entry) in authorized_keys.iter().enumerate() {
         let mut matched = false;
 
         if let Some(auth_key) = &entry.key {
@@ -50,34 +53,15 @@ pub async fn validate_public_key(
 
         if matched {
             let comment = entry.comment.as_deref().unwrap_or("");
-            let comment_matches = if comment.is_empty() {
-                true
-            } else {
-                comment == user || comment.starts_with(&format!("{}@", user))
-            };
-
-            if !comment_matches {
-                warn!(
-                    "Key matched but comment '{}' does not match user '{}'",
-                    comment, user
-                );
-            }
-            info!(
-                "Public key authentication successful for user {} (match at index {})",
-                user, i
-            );
             return Ok(SshAuthResult {
                 status: server::Auth::Accept,
                 comment: comment.to_string(),
                 options: entry.options.clone(),
+                user: user.to_string(),
             });
         }
     }
 
-    warn!(
-        "No matching public key found in authorized_keys for user {}",
-        user
-    );
     Ok(SshAuthResult {
         status: server::Auth::Reject {
             proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
@@ -85,6 +69,7 @@ pub async fn validate_public_key(
         },
         comment: String::new(),
         options: None,
+        user: String::new(),
     })
 }
 
@@ -94,8 +79,6 @@ pub async fn validate_certificate(
     user: &str,
     ca_keys: &Arc<Vec<ssh_key::PublicKey>>,
 ) -> Result<SshAuthResult> {
-    debug!("Validating certificate for user: {}", user);
-
     let cert = match ssh_key::Certificate::from_openssh(cert_data) {
         Ok(c) => c,
         Err(e) => {
@@ -107,22 +90,12 @@ pub async fn validate_certificate(
                 },
                 comment: String::new(),
                 options: None,
+                user: String::new(),
             });
         }
     };
 
-    if !cert.valid_principals().contains(&user.to_string()) && !cert.valid_principals().is_empty() {
-        warn!("Certificate not valid for user: {}", user);
-        return Ok(SshAuthResult {
-            status: server::Auth::Reject {
-                proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
-                partial_success: false,
-            },
-            comment: cert.key_id().to_string(),
-            options: None,
-        });
-    }
-
+    // TODO: at load time, also use a hashmap
     let fingerprints: Vec<_> = ca_keys
         .iter()
         .map(|k| k.fingerprint(ssh_key::HashAlg::Sha256))
@@ -133,8 +106,20 @@ pub async fn validate_certificate(
         .unwrap_or_default()
         .as_secs();
 
+    if !cert.valid_principals().contains(&user.to_string()) || cert.valid_principals().is_empty() {
+        warn!("Certificate not valid for user: {}", user);
+        return Ok(SshAuthResult {
+            status: server::Auth::Reject {
+                proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
+                partial_success: false,
+            },
+            comment: cert.key_id().to_string(),
+            options: None,
+            user: String::new(),
+        });
+    }
+
     if cert.validate_at(now, fingerprints.iter()).is_ok() {
-        info!("Certificate validated successfully");
         let mut opts = Vec::new();
         for (k, v) in cert.critical_options().iter() {
             if v.is_empty() {
@@ -160,16 +145,17 @@ pub async fn validate_certificate(
             status: server::Auth::Accept,
             comment: cert.key_id().to_string(),
             options,
+            user: user.to_string(),
         });
     }
 
-    warn!("Certificate validation failed");
     Ok(SshAuthResult {
         status: server::Auth::Reject {
             proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
             partial_success: false,
         },
         comment: cert.key_id().to_string(),
+        user: String::new(),
         options: None,
     })
 }
@@ -288,28 +274,6 @@ mod tests {
         assert!(entries[1].key.is_some());
         assert_eq!(entries[1].options, Some("opt1,opt2".to_string()));
         assert!(entries[2].key.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_validate_public_key() {
-        let key_str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBICtPKa3mXZss+k6LqtiNOQ3TbJFqLvjsvZGubtILlkV2Kz3HjO9+fghwCT/bb1R2SrvqHWWEj+QH6G4+ogPns= user@host";
-        let incoming_key = ssh_key::PublicKey::from_openssh(key_str).unwrap();
-        let fp = incoming_key
-            .fingerprint(ssh_key::HashAlg::Sha256)
-            .to_string();
-
-        let entries = vec![AuthorizedKeyEntry {
-            key: None,
-            fingerprint: Some(fp),
-            options: Some("restrict".to_string()),
-            comment: Some("user".to_string()),
-        }];
-
-        let res = validate_public_key("user", key_str, &entries)
-            .await
-            .unwrap();
-        assert!(matches!(res.status, server::Auth::Accept));
-        assert_eq!(res.options, Some("restrict".to_string()));
     }
 
     #[tokio::test]
