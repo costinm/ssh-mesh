@@ -24,6 +24,10 @@ path = "src/bin/gen-openapi.rs"
 name = "swagger"
 path = "src/bin/swagger.rs"
 
+[[bin]]
+name = "sshmc"
+path = "src/bin/sshmc.rs"
+
 [features]
 default = ["test-utils", "sftp", "pmon"]
 test-utils = ["tempfile", "once_cell"]
@@ -39,9 +43,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # Full 
 tokio = { version = "1", features = ["net", "sync", "io-util", "rt", "macros", "rt-multi-thread", "process", "fs", "signal"] }
 openpty = "0.2"
-nix = { version = "0.29", default-features = false, features = ["process", "fs", "user"] }
+nix = { version = "0.29", default-features = false, features = ["process", "fs", "user", "socket", "uio"] }
 russh = { version = "0.57.0", default-features = false, features = ["ring", "flate2", "rsa", "async-trait", "yasna"] }
 russh-keys = { version = "0.49.2" }
+ssh-config = { path = "../ssh-config" }
 ssh-key = { version = "0.6.7", features = ["alloc", "ecdsa", "p256", "rsa", "rand_core", "std", "serde"] }
 hyper = { version = "1.8", default-features = false, features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-auto", "http1", "http2", "client", "client-legacy", "service"] }
@@ -78,6 +83,7 @@ sftp-server = { path = "../sftp", optional = true }
 pmond = { path = "../pmond", optional = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "^8.0", features = ["axum"] }
+env_logger = "0.11"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] }
