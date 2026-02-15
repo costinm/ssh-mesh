@@ -1,0 +1,24 @@
+[package]
+authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
+description = "Utilities to parse .ssh/config files, forked from russh-config with public internals."
+edition = "2024"
+license = "Apache-2.0"
+name = "ssh-config"
+version = "0.57.0"
+rust-version = "1.85"
+
+[[bin]]
+name = "ssh-config"
+path = "src/main.rs"
+
+[dependencies]
+glob = "0.3"
+globset = "0.4"
+home = "0.5"
+futures = "0.3"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "net", "macros", "process"] }
+whoami = "1.2"
