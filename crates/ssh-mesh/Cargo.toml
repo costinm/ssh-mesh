@@ -21,10 +21,6 @@ name = "gen-openapi"
 path = "src/bin/gen-openapi.rs"
 
 [[bin]]
-name = "swagger"
-path = "src/bin/swagger.rs"
-
-[[bin]]
 name = "sshmc"
 path = "src/bin/sshmc.rs"
 
@@ -82,7 +78,6 @@ russh-sftp = { version = "2", optional = true }
 sftp-server = { path = "../sftp", optional = true }
 pmond = { path = "../pmond", optional = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "^8.0", features = ["axum"] }
 env_logger = "0.11"
 
 [dev-dependencies]

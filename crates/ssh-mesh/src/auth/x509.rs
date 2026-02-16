@@ -78,14 +78,3 @@ fn extract_extensions(cert: &X509Certificate) -> Option<String> {
         Some(opts.join(","))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_common_name() {
-        // This would need a real certificate for proper testing
-        // For now, just verify the function compiles
-    }
-}

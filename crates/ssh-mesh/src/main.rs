@@ -110,11 +110,10 @@ async fn main() -> Result<(), anyhow::Error> {
         ssh_server: ssh_server.clone(),
         ws_server: ws_server.clone(),
         target_http_address: std::env::var("APP_HTTP_PORT").ok(),
-        #[cfg(feature = "pmon")]
-        proc_mon: proc_mon.clone(),
         log_buffer: log_buffer.clone(),
         ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new(
             ssh_server.private_key().clone(),
+            (*ssh_server.ca_keys).clone(),
             {
                 // Default: base_dir/config (i.e. ~/.ssh/config).
                 // Override with SSH_CONFIG env var.
@@ -161,7 +160,9 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Create Axum app
-    let app = handlers::app(app_state.clone());
+    let mut app = handlers::app(app_state.clone());
+
+    app = app.nest_service("/", pmond::handlers::app(proc_mon.clone()));
 
     // HTTPS server - WIP, authz and authn not implemented.
     if https_port > 0 {

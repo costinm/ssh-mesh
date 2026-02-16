@@ -23,7 +23,7 @@ async fn test_client_api() -> Result<()> {
 
         // 1. Initially, no clients should be connected
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
+            .get(format!("http://127.0.0.1:{}/_m/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -56,7 +56,7 @@ async fn test_client_api() -> Result<()> {
 
         // 3. Verify the client is listed in the API
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
+            .get(format!("http://127.0.0.1:{}/_m/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -76,7 +76,7 @@ async fn test_client_api() -> Result<()> {
 
         // 5. Verify the client is no longer listed
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
+            .get(format!("http://127.0.0.1:{}/_m/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -98,7 +98,7 @@ async fn test_client_api_over_http2() -> Result<()> {
 
         // 1. Initially, no clients should be connected
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
+            .get(format!("http://127.0.0.1:{}/_m/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -111,7 +111,7 @@ async fn test_client_api_over_http2() -> Result<()> {
 
         let h2t_binary = env!("CARGO_BIN_EXE_h2t");
 
-        let proxy_command = format!("{} http://127.0.0.1:{}/_ssh", h2t_binary, http_port);
+        let proxy_command = format!("{} http://127.0.0.1:{}/_m/_ssh", h2t_binary, http_port);
 
         let mut ssh_client_process = Command::new("ssh")
             .arg("-v")
@@ -131,14 +131,30 @@ async fn test_client_api_over_http2() -> Result<()> {
             .arg("testuser")
             .arg("127.0.0.1")
             .arg("-N")
+            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()?;
+
+        // Spawn a thread to print ssh stderr
+        let mut stderr = ssh_client_process.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buffer = [0; 1024];
+            loop {
+                let n = stderr.read(&mut buffer).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                print!("{}", String::from_utf8_lossy(&buffer[..n]));
+            }
+        });
 
         // Give it time to connect and authenticate
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         // 3. Verify the client is listed in the API
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
+            .get(format!("http://127.0.0.1:{}/_m/api/ssh/clients", http_port))
             .send()
             .await?
             .json()
@@ -162,7 +178,7 @@ async fn test_client_api_over_http2() -> Result<()> {
 
         // 5. Verify the client is no longer listed
         let res: Value = client
-            .get(format!("http://127.0.0.1:{}/api/ssh/clients", http_port))
+            .get(format!("http://127.0.0.1:{}/_m/api/ssh/clients", http_port))
             .send()
             .await?
             .json()

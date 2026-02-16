@@ -27,8 +27,6 @@ use tracing_subscriber::{EnvFilter, Registry, reload};
 pub static TRACING_RELOAD_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, Registry>> =
     std::sync::OnceLock::new();
 
-#[cfg(feature = "pmon")]
-use pmond::ProcMon;
 use utoipa::ToSchema;
 use ws::WSServer;
 
@@ -78,8 +76,6 @@ pub struct ConnectedClientInfo {
 #[derive(Clone)]
 pub struct AppState {
     pub ssh_server: Arc<SshServer>,
-    #[cfg(feature = "pmon")]
-    pub proc_mon: Arc<ProcMon>,
     pub ws_server: Arc<WSServer>,
     pub target_http_address: Option<String>,
     pub log_buffer: crate::local_trace::LogBuffer,
@@ -302,7 +298,7 @@ mod tests {
 
         // Should use auth::load_or_generate_key
         let first_key = crate::auth::load_or_generate_key(&base_dir);
-        assert!(base_dir.join("meshkey.pem").exists());
+        assert!(base_dir.join("id_ecdsa").exists());
 
         let second_key = crate::auth::load_or_generate_key(&base_dir);
         assert_eq!(

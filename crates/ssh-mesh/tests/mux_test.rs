@@ -17,6 +17,7 @@ async fn test_mux_functionality() -> Result<()> {
     let client_key = ssh_mesh::auth::load_or_generate_key(&setup.base_dir);
     let manager = Arc::new(SshClientManager::new(
         client_key,
+        Vec::new(),
         None,
         Some(mux_dir.clone()),
     ));
@@ -68,8 +69,13 @@ async fn test_mux_functionality() -> Result<()> {
     let cmd = format!("touch {}", test_file.display());
     println!("Executing command via mux: {}", cmd);
 
+    use std::os::unix::io::AsRawFd;
+    let stdin = std::io::stdin().as_raw_fd();
+    let stdout = std::io::stdout().as_raw_fd();
+    let stderr = std::io::stderr().as_raw_fd();
+
     let (session_id, exit_code) = client
-        .new_session(&cmd, false)
+        .new_session(&cmd, false, stdin, stdout, stderr)
         .await
         .expect("New session failed");
     println!(

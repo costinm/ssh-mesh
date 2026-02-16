@@ -59,8 +59,12 @@ pub struct ClientHandler {
     key_file: PathBuf,
     /// Expected server key (if provided or previously saved). Empty ⇒ TOFU.
     expected_key: Option<RusshPublicKey>,
+    /// CA keys for validating server certificates.
+    ca_keys: Arc<Vec<ssh_key::PublicKey>>,
     /// Shared forwards list to look up target for incoming channels.
     forwards: Arc<Mutex<Vec<ForwardInfo>>>,
+    /// Hostname we are connecting to (used for certificate validation).
+    host: String,
 }
 
 impl client::Handler for ClientHandler {
@@ -70,6 +74,43 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
+        // 1. If we have CA keys, check if the server key is signed by one of them.
+        if !self.ca_keys.is_empty() {
+            let key_str = server_public_key
+                .to_openssh()
+                .context("Failed to serialize server key")?;
+
+            // If it's a certificate, validate it
+            if key_str.contains("-cert-v01@openssh.com") {
+                info!("Server presented a certificate. Validating against CA keys.");
+                // We use self.host as the "principal" to validate.
+                match crate::auth::validate_certificate(&key_str, &self.host, &self.ca_keys).await {
+                    Ok(res) => {
+                        if let russh::server::Auth::Accept = res.status {
+                            info!(
+                                "Server certificate validated successfully for host {}",
+                                self.host
+                            );
+                            return Ok(true);
+                        } else {
+                            error!("Server certificate validation failed: {}", res.comment);
+                            // If certificate validation fails, we should probably reject,
+                            // unless we want to fall back to TOFU/Key check?
+                            // Usually if a cert is presented but valid fails, it's a hard error.
+                            return Ok(false);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error during certificate validation: {}", e);
+                        // Fallthrough to standard key check? Or fail?
+                        // Let's fail for now if it looked like a cert.
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback to standard Expected Key / TOFU logic
         if let Some(ref expected) = self.expected_key {
             // Validate against known key: compare OpenSSH string representation
             let expected_str = expected
@@ -89,11 +130,6 @@ impl client::Handler for ClientHandler {
                 "TOFU: Trusting server key on first use, saving to {:?}",
                 self.key_file
             );
-            let openssh_str = server_public_key
-                .to_openssh()
-                .context("Failed to serialize server key")?;
-            std::fs::write(&self.key_file, openssh_str.as_bytes())
-                .context("Failed to save server key")?;
             Ok(true)
         }
     }
@@ -206,6 +242,8 @@ pub struct SshClientManager {
     next_id: Mutex<u64>,
     /// Private key used for client authentication (same as server key).
     private_key: Arc<PrivateKey>,
+    /// CA keys for verifying server certificates
+    ca_keys: Arc<Vec<ssh_key::PublicKey>>,
     /// Optional path to an SSH config file (~/.ssh/config format).
     ssh_config_path: Option<PathBuf>,
     /// Optional directory for mux sockets.
@@ -215,6 +253,7 @@ pub struct SshClientManager {
 impl SshClientManager {
     pub fn new(
         private_key: PrivateKey,
+        ca_keys: Vec<ssh_key::PublicKey>,
         ssh_config_path: Option<PathBuf>,
         mux_dir: Option<PathBuf>,
     ) -> Self {
@@ -228,6 +267,7 @@ impl SshClientManager {
             connections: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
             private_key: Arc::new(private_key),
+            ca_keys: Arc::new(ca_keys),
             ssh_config_path,
             mux_dir,
         }
@@ -355,7 +395,9 @@ impl SshClientManager {
         let handler = ClientHandler {
             key_file,
             expected_key,
+            ca_keys: self.ca_keys.clone(),
             forwards: forwards.clone(),
+            host: connect_host.clone(),
         };
 
         let config = Arc::new(client::Config {

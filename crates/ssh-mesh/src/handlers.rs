@@ -207,9 +207,6 @@ pub fn app(app_state: AppState) -> Router {
         // Trace view WebSocket
         .route("/_m/trace/view", get(trace_view_ws));
 
-    #[cfg(feature = "pmon")]
-    let router = router.nest_service("/", pmond::handlers::app(app_state.proc_mon.clone()));
-
     router.with_state(app_state)
 }
 

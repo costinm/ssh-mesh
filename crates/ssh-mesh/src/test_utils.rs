@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 static INIT_LOGGING: Lazy<()> = Lazy::new(|| {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+        //.with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
         .with_level(true)
         .try_init();
 });
@@ -27,18 +27,15 @@ pub struct TestSetup {
 }
 
 pub async fn setup_test_environment(
-    custom_temp_dir: Option<PathBuf>,
-    start_http: bool,
+    _custom_temp_dir: Option<PathBuf>,
+    _start_http: bool,
 ) -> Result<TestSetup> {
     Lazy::force(&INIT_LOGGING);
+    let start_http = true;
 
-    let (temp_dir, base_dir) = if let Some(path) = custom_temp_dir {
-        (None, path)
-    } else {
-        let td = tempfile::Builder::new().prefix("ssh-mesh-test").tempdir()?;
-        let path = td.path().to_path_buf();
-        (Some(td), path)
-    };
+    let td = tempfile::Builder::new().prefix("ssh-mesh-test").tempdir()?;
+    let path = td.path().to_path_buf();
+    let (temp_dir, base_dir) = (Some(td), path);
 
     let client_key_path = base_dir.join("id_ecdsa");
 
@@ -81,11 +78,10 @@ pub async fn setup_test_environment(
                 ssh_server: ssh_server.clone(),
                 ws_server: std::sync::Arc::new(ws::WSServer::new()),
                 target_http_address: std::env::var("HTTP_PORT").ok(),
-                #[cfg(feature = "pmon")]
-                proc_mon: std::sync::Arc::new(pmond::ProcMon::new().unwrap()),
                 log_buffer: crate::local_trace::create_log_buffer(),
                 ssh_client_manager: std::sync::Arc::new(crate::sshc::SshClientManager::new(
                     ssh_server.private_key().clone(),
+                    Vec::new(),
                     None,
                     None,
                 )),
@@ -119,7 +115,7 @@ pub async fn setup_test_environment(
         }
     });
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // tokio::time::sleep(Duration::from_secs(2)).await;
 
     Ok(TestSetup {
         temp_dir,

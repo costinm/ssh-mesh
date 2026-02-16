@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 /// the test server (load_or_generate_key uses the same base_dir).
 fn manager_from_setup(setup: &ssh_mesh::test_utils::TestSetup) -> Arc<SshClientManager> {
     let key = ssh_mesh::auth::load_or_generate_key(&setup.base_dir);
-    Arc::new(SshClientManager::new(key, None, None))
+    Arc::new(SshClientManager::new(key, Vec::new(), None, None))
 }
 
 #[tokio::test]

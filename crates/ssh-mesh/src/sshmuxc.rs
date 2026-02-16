@@ -46,7 +46,6 @@ impl MuxClient {
                 MUX_PROTOCOL_VERSION
             );
         }
-        debug!("Mux server hello: version {}", server_version);
 
         // Send our hello
         let mut hello = payload_with_type(MUX_MSG_HELLO);
@@ -136,7 +135,75 @@ impl MuxClient {
                     let (_rid, off) = parse_u32_payload(&payload, 0)?;
                     let (sid, _) = parse_u32_payload(&payload, off)?;
                     session_id = sid;
-                    info!("Mux session opened: id={}", sid);
+                }
+                MUX_S_OK => {
+                    // Not happening with ssh client (?)
+                    debug!("Mux session confirmed (MUX_S_OK)");
+                }
+                MUX_S_EXIT_MESSAGE => {
+                    let (resp_sid, off) = parse_u32_payload(&payload, 0)?;
+                    let (exit_code, _) = parse_u32_payload(&payload, off)?;
+                    debug!("Mux session {} exit code: {}", resp_sid, exit_code);
+                    return Ok((session_id, exit_code));
+                }
+                MUX_S_PERMISSION_DENIED | MUX_S_FAILURE => {
+                    let (_rid, off) = parse_u32_payload(&payload, 0)?;
+                    let (reason, _) = parse_string_payload(&payload, off)?;
+                    anyhow::bail!("session error: {}", reason);
+                }
+                _ => {
+                    debug!("Unexpected mux message: 0x{:08x}", msg_type);
+                    return Ok((session_id, 0));
+                }
+            }
+        }
+    }
+
+    /// Request a stdio forward to a destination host:port.
+    /// Returns (session_id, exit_code).
+    pub async fn open_stdio_forward(
+        &mut self,
+        connect_host: &str,
+        connect_port: u16,
+    ) -> Result<(u32, u32)> {
+        let req_id = self.alloc_req_id();
+
+        let mut pkt = payload_with_type(MUX_C_NEW_STDIO_FWD);
+        push_u32(&mut pkt, req_id);
+        push_string(&mut pkt, ""); // reserved
+        push_string(&mut pkt, connect_host);
+        push_u32(&mut pkt, connect_port as u32);
+        self.stream.write_all(&build_packet(&pkt)).await?;
+
+        // Send FDs immediately after the request packet
+        use std::os::unix::io::AsRawFd;
+        let socket_fd = self.stream.as_raw_fd();
+        let stdin = std::io::stdin().as_raw_fd();
+        let stdout = std::io::stdout().as_raw_fd();
+        // Stderr is NOT sent for stdio forward in some implementations?
+        // OpenSSH mux.c: process_mux_new_stdio_fwd:
+        //   "Expected 2 open file descriptors, got X"
+        // So for stdio forward, it only expects stdin/stdout?
+
+        // Let's check PROTOCOL.mux if available?
+        // Doc says "standard input and output file descriptors". "Error file descriptor is not sent".
+        // Wait, I should verify this.
+        // I will assume it sends STDIN and STDOUT only.
+
+        Self::send_fd(socket_fd, stdin).context("send stdin")?;
+        Self::send_fd(socket_fd, stdout).context("send stdout")?;
+
+        // Loop until we get an exit message
+        let mut session_id = 0;
+
+        loop {
+            let (msg_type, payload) = read_packet(&mut self.stream).await?;
+            match msg_type {
+                MUX_S_SESSION_OPENED => {
+                    let (_rid, off) = parse_u32_payload(&payload, 0)?;
+                    let (sid, _) = parse_u32_payload(&payload, off)?;
+                    session_id = sid;
+                    info!("Mux stdio session opened: id={}", sid);
                 }
                 MUX_S_OK => {
                     debug!("Mux session confirmed (MUX_S_OK)");

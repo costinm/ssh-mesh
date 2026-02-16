@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// the test server (load_or_generate_key uses the same base_dir).
 fn manager_from_setup(setup: &ssh_mesh::test_utils::TestSetup) -> Arc<SshClientManager> {
     let key = ssh_mesh::auth::load_or_generate_key(&setup.base_dir);
-    Arc::new(SshClientManager::new(key, None, None))
+    Arc::new(SshClientManager::new(key, Vec::new(), None, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ async fn test_sshc_disconnect_not_found() -> Result<()> {
     let key =
         russh::keys::PrivateKey::random(&mut rand::rngs::OsRng, russh::keys::Algorithm::Ed25519)
             .unwrap();
-    let manager = Arc::new(SshClientManager::new(key, None, None));
+    let manager = Arc::new(SshClientManager::new(key, Vec::new(), None, None));
     let result = manager.disconnect(999).await;
     assert!(result.is_err(), "Disconnecting invalid ID should fail");
     Ok(())

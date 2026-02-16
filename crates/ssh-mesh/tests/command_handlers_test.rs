@@ -2,8 +2,8 @@ use anyhow::Result;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::{Method, Request, StatusCode};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use ssh_mesh::test_utils::setup_test_environment;
 use std::time::Duration;
@@ -63,7 +63,7 @@ async fn test_uds_proxy() -> Result<()> {
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = StreamBody::new(stream);
 
-    let uri = format!("http://127.0.0.1:{}/_uds{}", http_port, socket_path_str);
+    let uri = format!("http://127.0.0.1:{}/_m/_uds{}", http_port, socket_path_str);
     let request = Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -102,7 +102,7 @@ async fn test_exec_cat() -> Result<()> {
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = StreamBody::new(stream);
 
-    let uri = format!("http://127.0.0.1:{}/_exec/cat", http_port);
+    let uri = format!("http://127.0.0.1:{}/_m/_exec/cat", http_port);
     let request = Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -142,7 +142,7 @@ async fn test_exec_env() -> Result<()> {
     let body = StreamBody::new(stream);
 
     // We use a command that prints an environment variable
-    let uri = format!("http://127.0.0.1:{}/_exec/echo%20%24TEST_VAR", http_port);
+    let uri = format!("http://127.0.0.1:{}/_m/_exec/echo%20%24TEST_VAR", http_port);
     let request = Request::builder()
         .method(Method::POST)
         .uri(uri)
