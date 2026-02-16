@@ -19,6 +19,3 @@ panic = "abort"
 strip = "symbols"
 overflow-checks = false
 debug = false
-
-[patch.crates-io]
-capng = { path = "crates/capng-stub" }
