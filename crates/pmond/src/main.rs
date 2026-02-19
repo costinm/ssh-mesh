@@ -1,18 +1,18 @@
 use clap::Parser;
+
 use pmond::{proc_netlink, psi::PsiWatcher, ProcMon};
+
 use std::sync::Arc;
+
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info};
 
-fn get_local_ip() -> Option<String> {
-    use std::net::UdpSocket;
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    socket.local_addr().ok().map(|addr| addr.ip().to_string())
-}
+use tracing::{debug, error, info};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry};
 
 #[derive(Parser, Debug)]
 #[clap(name = "pmond", version = "0.1.0", author = "Author")]
@@ -46,42 +46,18 @@ struct Args {
     debug: bool,
 }
 
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
-
-/// Initialize telemetry with JSON tracing and Perfetto tracing.
-///
-/// Configuration is controlled via the `RUST_LOG` environment variable.
-/// Examples:
-/// - `RUST_LOG=info` -> Log info and above
-/// - `RUST_LOG=debug` -> Log debug and above
-/// - `RUST_LOG=pmond=debug,info` -> Log debug for pmond crate, info for others
 fn init_telemetry() {
     let out_layer = tracing_subscriber::fmt::layer().compact();
-
-    let perfetto_layer = std::env::var("PERFETTO_TRACE").ok().map(|file| {
-        tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(
-            std::fs::File::create(file).expect("failed to create trace file"),
-        ))
-    });
 
     Registry::default()
         .with(EnvFilter::from_default_env())
         .with(out_layer)
-        .with(perfetto_layer)
         .init();
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_telemetry();
-
-    let main_span = tracing::info_span!("pmond");
-    let _main_guard = main_span.enter();
-
-    let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
-    info!("Starting pmond on host: {}", host_ip);
 
     let args = Args::parse();
 
@@ -113,10 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_monitor(
     debug: bool,
-    mcp_uds: Option<String>,
+    mon_uds: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting PMON monitor mode");
-
     let proc_mon = ProcMon::new()?;
     let proc_mon = Arc::new(proc_mon);
 
@@ -137,16 +111,11 @@ async fn run_monitor(
     );
 
     // Determine path for pwatch.sock
-    let path_str = if let Some(path) = mcp_uds {
-        if path.ends_with(".mcp") || path.ends_with(".sock") || path.ends_with(".http") {
-            let base = path.rsplit_once('.').map(|x| x.0).unwrap_or(&path);
-            format!("{}.pwatch", base)
-        } else {
-            format!("{}/pwatch.sock", path)
-        }
+    let path_str = if let Some(path) = mon_uds {
+        format!("{}/pwatch.sock", path)
     } else {
         let uid = unsafe { libc::getuid() };
-        format!("/run/user/{}/pwatch.sock", uid)
+        format!("/tmp/user/{}/pwatch.sock", uid)
     };
 
     // Ensure parent directory exists
@@ -157,7 +126,6 @@ async fn run_monitor(
     let _ = std::fs::remove_file(path);
 
     let listener = UnixListener::bind(path)?;
-    info!("Mirroring events to UDS: {}", path_str);
 
     loop {
         match listener.accept().await {

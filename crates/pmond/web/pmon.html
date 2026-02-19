@@ -726,6 +726,18 @@
                     📂 CGroups
                 </button>
             </div>
+            <div style="margin: 0 15px;">
+                <select id="sort-select"
+                    style="background: rgba(255,255,255,0.2); color: white; border: 1px solid rgba(255,255,255,0.3); padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 600;">
+                    <option value="pss" style="color: #333" selected>Sort: PSS</option>
+                    <option value="anon" style="color: #333">Sort: Anon</option>
+                    <option value="rss" style="color: #333">Sort: RSS</option>
+                    <option value="file" style="color: #333">Sort: File</option>
+                    <option value="kernel" style="color: #333">Sort: Kernel</option>
+                    <option value="swap" style="color: #333">Sort: Swap</option>
+                    <option value="pagetables" style="color: #333">Sort: Page Tables</option>
+                </select>
+            </div>
             <div class="status-bar paused" id="status-bar" title="Click to toggle auto-refresh">
                 <div class="status-item">
                     <span class="stat-label" style="color: white; margin-bottom: 0; margin-right: 8px;">Refreshing
@@ -813,6 +825,7 @@
         const refreshTimerEl = document.getElementById('refresh-timer');
         const refreshButton = document.getElementById('refresh-btn');
         const searchBox = document.getElementById('search-box');
+        const sortSelect = document.getElementById('sort-select');
 
         // State
         let allProcesses = {};
@@ -1129,11 +1142,25 @@
                 filteredProcesses = processes;
             }
 
+            const sortKey = sortSelect.value;
             let sortedProcesses = Object.entries(filteredProcesses)
                 .sort(([pid1, proc1], [pid2, proc2]) => {
-                    const pss1 = proc1.mem_info ? proc1.mem_info.pss : 0;
-                    const pss2 = proc2.mem_info ? proc2.mem_info.pss : 0;
-                    return pss2 - pss1;
+                    const getVal = (proc) => {
+                        const m = proc.mem_info || {};
+                        switch (sortKey) {
+                            case 'pss': return m.pss || 0;
+                            case 'anon': return m.anon || 0;
+                            case 'rss': return m.rss || 0;
+                            case 'file': return m.file || 0;
+                            case 'kernel': return m.kernel || 0;
+                            case 'swap': return m.swap || 0;
+                            case 'pagetables': return m.pagetables || 0;
+                            default: return m.pss || 0;
+                        }
+                    };
+                    const val1 = getVal(proc1);
+                    const val2 = getVal(proc2);
+                    return val2 - val1;
                 });
 
             const sortedProcessArray = sortedProcesses.map(([pid, process]) => ({ pid, process }));
@@ -1300,7 +1327,9 @@
 
         // Event listeners
         refreshButton.addEventListener('click', refreshProcesses);
+        refreshButton.addEventListener('click', refreshProcesses);
         searchBox.addEventListener('input', handleSearch);
+        sortSelect.addEventListener('change', () => { updateProcessList(allProcesses); });
 
         // Add keyboard shortcut for refresh
         document.addEventListener('keydown', (event) => {

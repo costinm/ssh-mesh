@@ -406,6 +406,19 @@
                     <span class="stat-value" id="total-file" style="color: white;">0 B</span>
                 </div>
             </div>
+            <div style="margin: 0 15px;">
+                <select id="sort-select"
+                    style="background: rgba(255,255,255,0.2); color: white; border: 1px solid rgba(255,255,255,0.3); padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 600;">
+                    <option value="anon" style="color: #333">Sort: Anon</option>
+                    <option value="rss" style="color: #333" selected>Sort: RSS</option>
+                    <option value="file" style="color: #333">Sort: File</option>
+                    <option value="kernel" style="color: #333">Sort: Kernel Total</option>
+                    <option value="total" style="color: #333">Sort: Total Usage</option>
+                    <option value="kernel_stack" style="color: #333">Sort: Kernel Stack</option>
+                    <option value="swap" style="color: #333">Sort: Swap</option>
+                    <option value="pagetables" style="color: #333">Sort: Page Tables</option>
+                </select>
+            </div>
             <div class="status-bar paused" id="status-bar" title="Click to toggle auto-refresh">
                 <div class="status-item">
                     <span class="stat-label" style="color: white; margin-bottom: 0; margin-right: 8px;">Refreshing
@@ -464,6 +477,7 @@
         const totalFileEl = document.getElementById('total-file');
         const refreshTimerEl = document.getElementById('refresh-timer');
         const refreshBtn = document.getElementById('refresh-btn');
+        const sortSelect = document.getElementById('sort-select');
 
         // State
         let cgroupsData = {};
@@ -502,15 +516,34 @@
 
         function renderTable() {
             const searchTerm = searchBox.value.toLowerCase();
+            const sortKey = sortSelect.value;
+
             const filteredPaths = Object.keys(cgroupsData)
                 .filter(path => path.toLowerCase().includes(searchTerm))
                 .sort((a, b) => {
                     // Always put root at top if it exists and matches search
                     if (a === '/sys/fs/cgroup') return -1;
                     if (b === '/sys/fs/cgroup') return 1;
-                    const memA = (cgroupsData[a].anon || 0) + (cgroupsData[a].file || 0);
-                    const memB = (cgroupsData[b].anon || 0) + (cgroupsData[b].file || 0);
-                    return memB - memA;
+
+                    const getVal = (path) => {
+                        const d = cgroupsData[path];
+                        if (!d) return 0;
+                        switch (sortKey) {
+                            case 'anon': return d.anon || 0;
+                            case 'rss': return (d.anon || 0) + (d.file || 0);
+                            case 'file': return d.file || 0;
+                            case 'kernel': return d.kernel || 0;
+                            case 'total': return d.memory_current || 0; // Assuming total means current memory usage
+                            case 'kernel_stack': return d.kernel_stack || 0;
+                            case 'swap': return d.swap || 0; // Assuming swap field exists
+                            case 'pagetables': return d.pagetables || 0;
+                            default: return (d.anon || 0) + (d.file || 0);
+                        }
+                    };
+
+                    const valA = getVal(a);
+                    const valB = getVal(b);
+                    return valB - valA;
                 });
 
             tableBody.innerHTML = '';
@@ -727,6 +760,7 @@
         // Event listeners
         searchBox.addEventListener('input', renderTable);
         refreshBtn.addEventListener('click', fetchData);
+        sortSelect.addEventListener('change', () => { renderTable(); });
         setupRefreshShortcut(fetchData);
         setupDropdownClose();
         setupRefreshTimer({
