@@ -50,9 +50,7 @@ pub async fn validate_public_key(
                 matched = true;
             }
         } else if let Some(auth_fp) = &entry.fingerprint {
-            if auth_fp == &incoming_fp
-                || (auth_fp.starts_with("SHA256:") && auth_fp == &incoming_fp)
-            {
+            if auth_fp == &incoming_fp {
                 matched = true;
             }
         }

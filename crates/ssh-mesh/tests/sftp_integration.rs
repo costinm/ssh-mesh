@@ -3,6 +3,7 @@ use russh::client;
 use russh::keys::PrivateKeyWithHashAlg;
 use ssh_mesh::test_utils::setup_test_environment;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct ClientHandler;
@@ -24,6 +25,9 @@ async fn test_sftp_integration() -> Result<()> {
     // 1. Setup server
     let setup = setup_test_environment(None, false).await?;
     let ssh_port = setup.ssh_port;
+
+    // Wait for server to be ready
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 2. Load client key
     let key_path = setup.client_key_path;

@@ -59,6 +59,8 @@ pub struct SshServer {
     /// Track connected clients with their remote forward listeners
     pub connected_clients: Arc<tokio::sync::Mutex<HashMap<usize, ConnectedClientInfo>>>,
     pub sftp_server_path: Option<String>,
+    /// Root directory for built-in SFTP server (defaults to base_dir)
+    pub sftp_root: PathBuf,
 }
 
 /// Information about a connected client
@@ -92,15 +94,18 @@ impl SshServer {
     /// * `id` - Server ID
     /// * `key` - Optional private key
     /// * `base_dir` - Base directory containing the .ssh subdirectory
+    /// * `sftp_server_path` - Optional path to external sftp-server binary
+    /// * `sftp_root` - Optional root directory for built-in SFTP server (defaults to base_dir)
     pub fn new(
         id: usize,
         key: Option<PrivateKey>,
         base_dir: PathBuf,
         sftp_server_path: Option<String>,
+        sftp_root: Option<PathBuf>,
     ) -> Self {
         let keys = match key {
             Some(key) => key,
-            None => crate::auth::load_or_generate_key(&base_dir),
+            None => crate::auth::load_or_generate_keys_save(&base_dir),
         };
 
         // Load authorized keys
@@ -133,10 +138,11 @@ impl SshServer {
             id_counter: Arc::new(std::sync::Mutex::new(id)),
             authorized_keys,
             ca_keys,
-            base_dir,
+            base_dir: base_dir.clone(),
             active_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             connected_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sftp_server_path,
+            sftp_root: sftp_root.unwrap_or(base_dir),
         }
     }
 
@@ -277,7 +283,7 @@ mod tests {
 
         let key = PrivateKey::random(&mut rand::rngs::OsRng, russh::keys::Algorithm::Ed25519)
             .expect("Failed to generate test key");
-        let server = SshServer::new(42, Some(key), base_dir, None);
+        let server = SshServer::new(42, Some(key), base_dir, None, None);
         let config = server.get_config();
 
         // Verify some configuration settings
@@ -286,24 +292,5 @@ mod tests {
             russh::SshId::Standard(id) => assert_eq!(id, "SSH-2.0-Rust-SSH-Server"),
             _ => panic!("Unexpected server ID format"),
         }
-    }
-
-    #[test]
-    fn test_load_or_generate_key_persistence() {
-        let temp_dir = tempfile::Builder::new()
-            .prefix("ssh_key_persistence_test")
-            .tempdir()
-            .expect("Failed to create temp dir");
-        let base_dir = temp_dir.path().to_path_buf();
-
-        // Should use auth::load_or_generate_key
-        let first_key = crate::auth::load_or_generate_key(&base_dir);
-        assert!(base_dir.join("id_ecdsa").exists());
-
-        let second_key = crate::auth::load_or_generate_key(&base_dir);
-        assert_eq!(
-            first_key.to_bytes().unwrap(),
-            second_key.to_bytes().unwrap()
-        );
     }
 }

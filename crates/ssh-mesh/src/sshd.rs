@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use hyper::body::Bytes;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
@@ -30,7 +30,9 @@ use crate::{ConnectedClientInfo, SshServer};
 pub struct SshHandler {
     pub(crate) id: usize,
     pub(crate) server: SshServer,
+
     // streams multiplexed on the client TCP connection
+    // TODO: rename to streams, including (exec/shell) session and forwards.
     sessions: Arc<Mutex<HashMap<ChannelId, ChannelSession>>>,
 
     /// Channel writers, handling incoming data from client for opened
@@ -56,7 +58,7 @@ struct PtyInfo {
     pix_height: u32,
 }
 
-/// Exec/Shell channel with optional  llPTY
+/// Exec/Shell stream, with optional PTY support,
 struct ChannelSession {
     pty: Option<PtyInfo>,
     shell: bool,
@@ -334,6 +336,113 @@ impl SshHandler {
             Ok(())
         }
     }
+
+    /// Helper to connect to a Unix Domain Socket (UDS).
+    /// Handles abstract namespace if path starts with '_'.
+    async fn connect_uds(
+        &mut self,
+        channel: russh::Channel<russh::server::Msg>,
+        socket_path: &str,
+        session_handle: russh::server::Handle,
+    ) -> Result<bool, anyhow::Error> {
+        let channel_id = channel.id();
+        let sessions = self.sessions.clone();
+        let channel_writers = self.channel_writers.clone();
+        let handler_id = self.id;
+        let socket_path_str = socket_path.to_string();
+
+        trace!(
+            "Processing UDS connection for: {} (handler ID: {})",
+            socket_path_str, handler_id
+        );
+
+        // Handle abstract namespace: replace leading '_' with '\0'
+        let path_bytes = if socket_path_str.starts_with('_') {
+            let mut bytes = Vec::with_capacity(socket_path_str.len());
+            bytes.push(0);
+            bytes.extend_from_slice(socket_path_str[1..].as_bytes());
+            bytes
+        } else {
+            socket_path_str.clone().into_bytes()
+        };
+
+        // Create a new session entry for this channel
+        let channel_session = ChannelSession {
+            pty: None,
+            shell: false,
+            env: HashMap::new(),
+            process: None,
+            pty_master: None,
+        };
+
+        // Store the session in our sessions map
+        {
+            let mut sessions_lock = sessions.lock().await;
+            sessions_lock.insert(channel_id, channel_session);
+        }
+
+        trace!(
+            "Created new UDS session for channel {:?} in handler {}",
+            channel_id, handler_id
+        );
+
+        // Establish connection to the UDS
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        let os_str = OsStr::from_bytes(&path_bytes);
+        let path = Path::new(os_str);
+
+        match UnixStream::connect(path).await {
+            Ok(stream) => {
+                trace!("Successfully connected to UDS {}", socket_path_str);
+
+                // Set up bidirectional data forwarding
+                let (uds_reader, uds_writer) = stream.into_split();
+
+                // Store the writer for SSH to UDS forwarding
+                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                {
+                    let mut writers = channel_writers.lock().await;
+                    writers.insert(channel_id, tx);
+                }
+
+                // Spawn task to forward data from UDS -> SSH channel
+                let session_handle_clone = session_handle.clone();
+                let channel_writers_clone = channel_writers.clone();
+                tokio::spawn(async move {
+                    crate::utils::pipe_read_to_ssh(
+                        uds_reader,
+                        session_handle_clone,
+                        channel_id,
+                        "UDS to SSH",
+                    )
+                    .await;
+                    let mut writers = channel_writers_clone.lock().await;
+                    writers.remove(&channel_id);
+                });
+
+                // Spawn task to forward data from SSH channel -> UDS
+                let channel_writers_clone2 = channel_writers.clone();
+                tokio::spawn(async move {
+                    crate::utils::pipe_rx_to_write(rx, uds_writer, "SSH to UDS").await;
+                    let mut writers = channel_writers_clone2.lock().await;
+                    writers.remove(&channel_id);
+                });
+
+                info!("UDS forwarding established for {}", socket_path_str);
+                Ok(true)
+            }
+            Err(e) => {
+                error!(
+                    "Failed to connect to UDS {}: {} (handler ID: {})",
+                    socket_path_str, e, handler_id
+                );
+                Ok(false) // Reject the channel if we can't connect
+            }
+        }
+    }
 }
 
 /// Handler deals with one SSH connection, after crypto and
@@ -426,7 +535,8 @@ impl server::Handler for SshHandler {
 
     /// This is called when a new stream (called channel) is opened on a client connection
     ///
-    /// This is usually a shell.
+    /// This is usually a shell - message followed by env, pty - and ending
+    /// with the actual shell or exec command, than data and close.
     #[instrument(skip(self, _session), fields(channel_id = ?channel.id()))]
     fn channel_open_session(
         &mut self,
@@ -461,6 +571,8 @@ impl server::Handler for SshHandler {
     }
 
     /// Connection forward from client.
+    ///
+    /// If port is -2 (any large value will do, e.g. 0xFFFFFFFE), treat host as a UDS path.
     #[instrument(skip(self, session), fields(channel_id = ?channel.id(), host_to_connect = %host_to_connect, port_to_connect = %port_to_connect, originator_ip = %originator_ip_address, originator_port = %originator_port))]
     fn channel_open_direct_tcpip(
         &mut self,
@@ -488,7 +600,15 @@ impl server::Handler for SshHandler {
 
         let session_handle = session.handle();
 
+        let mut me = self.clone();
+        let channel = channel;
+
         async move {
+            // UDS support: check for port -2 (0xFFFFFFFE)
+            if port == 0xFFFFFFFE {
+                return me.connect_uds(channel, &host, session_handle).await;
+            }
+
             trace!(
                 "Processing direct TCP/IP connection for: {}:{} from {}:{}",
                 host, port, originator_ip, originator_port
@@ -524,7 +644,7 @@ impl server::Handler for SshHandler {
                     let channel_id = channel_id;
 
                     // Store the TCP writer for SSH to TCP forwarding
-                    let tcp_writers = self.channel_writers.clone();
+                    let tcp_writers = me.channel_writers.clone();
                     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
                     {
                         let mut writers = tcp_writers.lock().await;
@@ -566,6 +686,24 @@ impl server::Handler for SshHandler {
                 }
             }
         }
+    }
+
+    fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: russh::Channel<russh::server::Msg>,
+        socket_path: &str,
+        session: &mut server::Session,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        info!(
+            "Direct streamlocal connection request: {} (handler ID: {})",
+            socket_path, self.id
+        );
+        let mut me = self.clone();
+        let channel = channel;
+        let socket_path = socket_path.to_string();
+        let handle = session.handle();
+
+        async move { me.connect_uds(channel, &socket_path, handle).await }
     }
 
     /// This is the message used by server to accept new streams on behalf of
@@ -784,7 +922,7 @@ impl server::Handler for SshHandler {
         channel: ChannelId,
         _session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        info!("Channel EOF: stream: {:?} client: {}", channel, self.id);
+        debug!("Channel EOF: stream: {:?} client: {}", channel, self.id);
         let tcp_writers = self.channel_writers.clone();
         let channel_id = channel;
         async move {
@@ -802,8 +940,7 @@ impl server::Handler for SshHandler {
         channel: ChannelId,
         _session: &mut server::Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        info!("Channel closed: stream {:?} client {}", channel, self.id);
-        debug!("SSH handler ID: client {}", self.id);
+        debug!("Channel closed: stream {:?} client {}", channel, self.id);
 
         let sessions = self.sessions.clone();
         let tcp_writers = self.channel_writers.clone();
@@ -825,9 +962,8 @@ impl server::Handler for SshHandler {
                     let _ = child.kill().await;
                 }
                 drop(sessions_lock);
-                trace!("Cleaned up session data for channel {:?}", channel_id);
             } else {
-                trace!(
+                info!(
                     "No session found for channel {:?} in handler {}",
                     channel_id, handler_id
                 );
@@ -1090,9 +1226,9 @@ impl server::Handler for SshHandler {
                         let _ = session_handle_clone.close(channel_id).await;
                     });
                     // Start SFTP server
+                    let sftp_root = self.server.sftp_root.clone();
                     tokio::spawn(async move {
-                        let handler =
-                            sftp_server::FileSystemHandler::new(std::path::PathBuf::from("/"));
+                        let handler = sftp_server::FileSystemHandler::new(sftp_root);
                         russh_sftp::server::run(stream, handler).await;
                     });
                     let _ = session_handle.channel_success(channel_id).await;

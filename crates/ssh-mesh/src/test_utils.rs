@@ -20,12 +20,16 @@ pub fn find_free_port() -> Result<u16> {
 pub struct TestSetup {
     pub temp_dir: Option<TempDir>,
     pub base_dir: PathBuf,
+
+    // temp file where keys are saved.
     pub client_key_path: PathBuf,
     pub ssh_port: u16,
     pub http_port: Option<u16>,
     pub server_handle: tokio::task::JoinHandle<()>,
 }
 
+// Setup a SSH mesh server on a temp dir. Keys are generated ahead
+// of time.
 pub async fn setup_test_environment(
     _custom_temp_dir: Option<PathBuf>,
     _start_http: bool,
@@ -39,8 +43,7 @@ pub async fn setup_test_environment(
 
     let client_key_path = base_dir.join("id_ecdsa");
 
-    // Unified key management via auth module
-    let key = crate::auth::load_or_generate_key(&base_dir);
+    let key = crate::auth::load_or_generate_keys_save(&base_dir);
 
     if temp_dir.is_some() {
         // For temporary test setups, we need to populate authorized_keys
@@ -71,7 +74,8 @@ pub async fn setup_test_environment(
             "Starting SshServer for tests at base_dir: {:?}",
             server_base_dir
         );
-        let ssh_server = std::sync::Arc::new(crate::SshServer::new(0, None, server_base_dir, None));
+        let ssh_server =
+            std::sync::Arc::new(crate::SshServer::new(0, None, server_base_dir, None, None));
 
         if start_http {
             let app_state = crate::AppState {

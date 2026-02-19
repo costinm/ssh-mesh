@@ -45,6 +45,9 @@ async fn test_tcp_proxy_with_method(method: Method) -> Result<()> {
     let setup = setup_test_environment(None, true).await?;
     let http_port = setup.http_port.expect("HTTP port should be set");
 
+    // Wait for servers to be ready
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
     let echo_port = find_free_port()?;
     start_echo_server(echo_port);
     tokio::time::sleep(Duration::from_millis(200)).await;

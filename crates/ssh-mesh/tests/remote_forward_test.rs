@@ -2,6 +2,7 @@ use anyhow::Result;
 use ssh_mesh::sshc::SshClientManager;
 use ssh_mesh::test_utils::setup_test_environment;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -18,6 +19,9 @@ async fn test_remote_forwarding() -> Result<()> {
     let setup = setup_test_environment(None, false).await?;
     let ssh_port = setup.ssh_port;
     let manager = manager_from_setup(&setup);
+
+    // Wait for server to be ready
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 2. Connect client to server
     let id = manager

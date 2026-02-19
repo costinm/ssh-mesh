@@ -15,7 +15,8 @@ pub const AUTHORIZED_KEYS_PATH: &str = "authorized_keys";
 pub const AUTHORIZED_CAS_PATH: &str = "authorized_cas";
 
 /// Load SSH key from file or generate a new one
-pub fn load_or_generate_key(base_dir: &Path) -> PrivateKey {
+/// Returns the key and valid PEM string if it was newly generated (and thus needs saving).
+pub fn load_keys(base_dir: &Path) -> (PrivateKey, Option<String>) {
     let key_path = base_dir.join("id_ecdsa");
 
     if key_path.exists() {
@@ -25,12 +26,12 @@ pub fn load_or_generate_key(base_dir: &Path) -> PrivateKey {
             if let Ok(content) = String::from_utf8(key_data.clone()) {
                 if let Ok(key) = russh::keys::decode_secret_key(&content, None) {
                     debug!("Loading key from existing file");
-                    return key;
+                    return (key, None);
                 }
             }
             if let Ok(key) = PrivateKey::from_bytes(&key_data) {
                 debug!("Loading key from existing file (binary format)");
-                return key;
+                return (key, None);
             }
         }
     }
@@ -45,23 +46,34 @@ pub fn load_or_generate_key(base_dir: &Path) -> PrivateKey {
     .expect("Failed to generate SSH key");
 
     let pkcs8_pem = ssh_to_pkcs8_pem(&ssh_pk).expect("Failed to convert to PKCS#8");
+    let key = russh::keys::decode_secret_key(&pkcs8_pem, None).expect("Failed to reload key");
+    (key, Some(pkcs8_pem))
+}
 
-    if let Some(parent) = key_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = fs::write(&key_path, pkcs8_pem.as_bytes());
+pub fn load_or_generate_key(base_dir: &Path) -> PrivateKey {
+    load_keys(base_dir).0
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(&key_path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = fs::set_permissions(&key_path, perms);
+pub fn load_or_generate_keys_save(base_dir: &Path) -> PrivateKey {
+    let (key, pem) = load_keys(base_dir);
+    if let Some(pem_str) = pem {
+        let key_path = base_dir.join("id_ecdsa");
+        if let Some(parent) = key_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&key_path, pem_str.as_bytes());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&key_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(&key_path, perms);
+            }
         }
     }
-
-    russh::keys::decode_secret_key(&pkcs8_pem, None).expect("Failed to reload key")
+    key
 }
 
 pub fn ssh_to_pkcs8_pem(ssh_key: &ssh_key::PrivateKey) -> Result<String> {
