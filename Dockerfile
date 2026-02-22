@@ -1,5 +1,5 @@
 # Build stage using Rust with MUSL for static linking
-FROM rust:slim-bookworm AS build
+FROM rust:slim-bookworm AS base
 
 RUN apt-get update && apt-get install -y \
     musl-tools \
@@ -14,6 +14,9 @@ RUN rustup target add x86_64-unknown-linux-musl
 RUN rustup target add aarch64-unknown-linux-musl
 WORKDIR /src
 
+# -----------------------
+FROM base AS build
+
 # Copy workspace configuration and sources
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -22,12 +25,15 @@ COPY crates ./crates
 # Less efficient (duplicate builds of common deps), but want to evaluate each
 RUN cargo build --target x86_64-unknown-linux-musl --release -p pmond
 RUN cargo build --features pmon --target x86_64-unknown-linux-musl --release -p ssh-mesh
+
 RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
     cargo build --features pmon --target aarch64-unknown-linux-musl --release -p ssh-mesh
+RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
+    cargo build --target aarch64-unknown-linux-musl --release -p pmond
 
 # Build rvirtiofsd statically
-RUN RUSTFLAGS="-C target-feature=+crt-static" \
-    cargo build --target x86_64-unknown-linux-musl --release -p rvirtiofsd
+#RUN RUSTFLAGS="-C target-feature=+crt-static" \
+#    cargo build --target x86_64-unknown-linux-musl --release -p rvirtiofsd
 
 # -----------------------
 FROM rust:slim-bookworm AS build-android
@@ -74,15 +80,16 @@ RUN cargo build --features pmon --target x86_64-linux-android --release -p ssh-m
 
 # -----------------------
 # Use with 
-# docker build --progress=plain --output . --target bin .
+# docker build --progress=plain --output /z/build/.cache/OUT --target bin .
 FROM scratch as bin
 
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh .
-COPY --from=build /src/target/aarch64-unknown-linux-musl/release/ssh-mesh ssh-mesh.aarch64
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/h2t .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/meshkeys .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond .
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/rvirtiofsd .
+
+COPY --from=build /src/target/aarch64-unknown-linux-musl/release/pmond aarch64/
+COPY --from=build /src/target/aarch64-unknown-linux-musl/release/ssh-mesh aarch64/
 
 # ------------------------
 # Final stage for creating a test docker image with various utils.
@@ -91,7 +98,7 @@ FROM nicolaka/netshoot
 # Copy the statically linked binaries from the build stage
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh /usr/local/bin/ssh-mesh
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond /usr/local/bin/pmond
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/rvirtiofsd /usr/local/bin/rvirtiofsd
+#COPY --from=build /src/target/x86_64-unknown-linux-musl/release/rvirtiofsd /usr/local/bin/rvirtiofsd
 
 # Use ssh-mesh as the default entrypoint
 ENTRYPOINT ["/usr/local/bin/ssh-mesh"]
