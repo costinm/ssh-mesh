@@ -13,8 +13,9 @@ tracing-opentelemetry = "0.28.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 log = "0.4"
 base64 = "0.22.1"
-tracing-perfetto = "0.1.5"
+perfetto-sdk = "0.2"
+
 
