@@ -130,10 +130,15 @@ pub async fn handle_websocket(
     server.remove_client(&client_id).await;
 }
 
-pub async fn handle_websocket_upgrade(
-    State(server): State<Arc<WSServer>>,
-    req: Request,
-) -> Response {
+#[derive(Clone)]
+pub struct WsAppState {
+    pub ws_server: Arc<WSServer>,
+    pub stream_handlers: Vec<(String, Arc<dyn mesh::StreamHandler>)>,
+    pub push_handler: Option<Arc<dyn mesh::PushHandler>>,
+}
+
+pub async fn handle_websocket_upgrade(State(state): State<WsAppState>, req: Request) -> Response {
+    let server = state.ws_server;
     handle_upgrade_with_handler(req, move |ws| async move {
         let client_id = format!(
             "client_{}",
@@ -192,6 +197,27 @@ where
     }
 }
 
+use utoipa::OpenApi;
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        handle_list_clients,
+        handle_remove_client,
+        handle_send_message,
+        handle_broadcast
+    ),
+    components(
+        schemas(
+            ClientsResponse, MessageResponse, SendMessageRequest
+        )
+    ),
+    tags(
+        (name = "ws", description = "WebSocket API")
+    )
+)]
+pub struct WsApiDoc;
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct SendMessageRequest {
     pub message: String,
@@ -206,7 +232,6 @@ pub struct ClientsResponse {
 pub struct MessageResponse {
     pub success: bool,
 }
-
 #[utoipa::path(
     get,
     path = "/_m/api/clients",
@@ -215,7 +240,8 @@ pub struct MessageResponse {
         (status = 200, description = "List connected WebSocket clients", body = ClientsResponse)
     )
 )]
-pub async fn handle_list_clients(State(server): State<Arc<WSServer>>) -> Json<ClientsResponse> {
+pub async fn handle_list_clients(State(state): State<WsAppState>) -> Json<ClientsResponse> {
+    let server = state.ws_server;
     debug!("handle_list_clients called");
     let clients = server.list_clients().await;
     debug!("Clients count: {}", clients.len());
@@ -237,9 +263,10 @@ pub async fn handle_list_clients(State(server): State<Arc<WSServer>>) -> Json<Cl
     )
 )]
 pub async fn handle_remove_client(
-    State(server): State<Arc<WSServer>>,
+    State(state): State<WsAppState>,
     Path(client_id): Path<String>,
 ) -> Json<MessageResponse> {
+    let server = state.ws_server;
     debug!("Removing client: {}", client_id);
     server.remove_client(&client_id).await;
     Json(MessageResponse { success: true })
@@ -258,10 +285,11 @@ pub async fn handle_remove_client(
     )
 )]
 pub async fn handle_send_message(
-    State(server): State<Arc<WSServer>>,
+    State(state): State<WsAppState>,
     Path(client_id): Path<String>,
     Json(payload): Json<SendMessageRequest>,
 ) -> Result<Json<MessageResponse>, StatusCode> {
+    let server = state.ws_server;
     debug!("Target client ID: {}", client_id);
 
     match server.send_to_client(&client_id, &payload.message).await {
@@ -286,9 +314,10 @@ pub async fn handle_send_message(
     )
 )]
 pub async fn handle_broadcast(
-    State(server): State<Arc<WSServer>>,
+    State(state): State<WsAppState>,
     Json(payload): Json<SendMessageRequest>,
 ) -> Result<Json<MessageResponse>, StatusCode> {
+    let server = state.ws_server;
     debug!("handle_broadcast called");
 
     match server.broadcast_message(&payload.message).await {
@@ -301,4 +330,258 @@ pub async fn handle_broadcast(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// Bridge a WebSocket with an AsyncRead + AsyncWrite target
+pub async fn bridge_ws<S, T>(mut ws: WebSocket<S>, mut target: T, label: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            res = ws.read_frame() => {
+                match res {
+                    Ok(frame) => {
+                        match frame.opcode {
+                            OpCode::Binary | OpCode::Text => {
+                                use tokio::io::AsyncWriteExt;
+                                if target.write_all(&frame.payload).await.is_err() {
+                                    break;
+                                }
+                            }
+                            OpCode::Close => break,
+                            _ => {}
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            res = tokio::io::AsyncReadExt::read(&mut target, &mut buf) => {
+                match res {
+                    Ok(0) => {
+                        // EOF from target
+                        let _ = ws.write_frame(Frame::close(1000, b"EOF")).await;
+                        break;
+                    }
+                    Ok(n) => {
+                        let frame = Frame::binary(Payload::Owned(buf[..n].to_vec()));
+                        if ws.write_frame(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    debug!("WebSocket bridge {} closed", label);
+}
+
+/// Bridge a WebSocket with MPSC channels
+pub async fn bridge_ws_to_mpsc<S>(
+    mut ws: WebSocket<S>,
+    tx_to_mpsc: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    mut rx_from_mpsc: mpsc::UnboundedReceiver<Bytes>,
+    label: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    debug!("bridge_ws_to_mpsc: Starting bridge for {}", label);
+    loop {
+        tokio::select! {
+            res = ws.read_frame() => {
+                match res {
+                    Ok(frame) => {
+                        match frame.opcode {
+                            OpCode::Binary | OpCode::Text => {
+                                if tx_to_mpsc.send(Ok(Bytes::from(frame.payload.to_vec()))).is_err() {
+                                    break;
+                                }
+                            }
+                            OpCode::Close => {
+                                break;
+                            },
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        error!("WS bridge {}: read error: {}", label, e);
+                        break;
+                    }
+                }
+            }
+            res = rx_from_mpsc.recv() => {
+                match res {
+                    Some(data) => {
+                        let frame = Frame::binary(Payload::Owned(data.to_vec()));
+                        if ws.write_frame(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        let _ = ws.write_frame(Frame::close(1000, b"EOF")).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    debug!("WebSocket MPSC bridge {} closed", label);
+}
+
+/// Pipe frames from WebSocket to an MPSC sender
+pub async fn pipe_ws_to_tx<S>(mut ws: WebSocket<S>, tx: mpsc::Sender<Result<Bytes, std::io::Error>>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    while let Ok(frame) = ws.read_frame().await {
+        match frame.opcode {
+            OpCode::Binary | OpCode::Text => {
+                if tx
+                    .send(Ok(Bytes::from(frame.payload.to_vec())))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            OpCode::Close => break,
+            _ => {}
+        }
+    }
+}
+
+/// Pipe data from an MPSC receiver to a WebSocket as binary frames
+pub async fn pipe_rx_to_ws<S>(mut ws: WebSocket<S>, mut rx: mpsc::Receiver<Bytes>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(data) = rx.recv().await {
+        let frame = Frame::binary(Payload::Owned(data.to_vec()));
+        if ws.write_frame(frame).await.is_err() {
+            break;
+        }
+    }
+    let _ = ws.write_frame(Frame::close(1000, b"EOF")).await;
+}
+
+#[async_trait::async_trait]
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + core::marker::Unpin + Send + 'static>
+    mesh::PushSender for GenericWs<S>
+{
+    async fn send_text(
+        &mut self,
+        text: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_text(text).await
+    }
+    async fn recv(&mut self) -> Option<mesh::PushClientMsg> {
+        self.recv().await
+    }
+}
+
+pub struct GenericWs<S> {
+    inner: fastwebsockets::WebSocket<S>,
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + core::marker::Unpin> GenericWs<S> {
+    pub fn new(inner: fastwebsockets::WebSocket<S>) -> Self {
+        Self { inner }
+    }
+
+    pub async fn send_text(
+        &mut self,
+        text: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .write_frame(fastwebsockets::Frame::text(fastwebsockets::Payload::Owned(
+                text.into_bytes(),
+            )))
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    pub async fn recv(&mut self) -> Option<mesh::PushClientMsg> {
+        match self.inner.read_frame().await {
+            Ok(frame) => match frame.opcode {
+                fastwebsockets::OpCode::Close => Some(mesh::PushClientMsg::Close),
+                fastwebsockets::OpCode::Ping | fastwebsockets::OpCode::Pong => {
+                    Some(mesh::PushClientMsg::Ping)
+                }
+                _ => Some(mesh::PushClientMsg::Other),
+            },
+            Err(_) => None,
+        }
+    }
+}
+
+pub fn app_ws(ws_state: WsAppState) -> axum::Router {
+    let mut router = axum::Router::new()
+        .route("/_m/ws", axum::routing::get(handle_websocket_upgrade))
+        .route("/_m/api/clients", axum::routing::get(handle_list_clients))
+        .route(
+            "/_m/api/clients/:id",
+            axum::routing::delete(handle_remove_client),
+        )
+        .route(
+            "/_m/api/clients/:id/message",
+            axum::routing::post(handle_send_message),
+        )
+        .route("/_m/api/broadcast", axum::routing::post(handle_broadcast));
+
+    if let Some(push_handler) = ws_state.push_handler.clone() {
+        router = router.route(
+            "/_m/trace/view",
+            axum::routing::get(move |req: Request| {
+                let ph = push_handler.clone();
+                async move {
+                    handle_upgrade_with_handler(req, move |ws| async move {
+                        ph.handle_push(Box::new(GenericWs::new(ws))).await;
+                    })
+                    .await
+                }
+            }),
+        );
+    }
+
+    for (route, handler) in ws_state.stream_handlers.clone() {
+        let h = handler.clone();
+        router = router.route(
+            &route,
+            axum::routing::get(move |req: axum::extract::Request| async move {
+                handle_ws_proxy(req, h).await
+            }),
+        );
+    }
+
+    router.with_state(ws_state)
+}
+
+async fn handle_ws_proxy(
+    req: axum::extract::Request,
+    handler: std::sync::Arc<dyn mesh::StreamHandler>,
+) -> axum::response::Response {
+    let mut headers = HashMap::new();
+    for (k, v) in req.headers() {
+        if let Ok(value) = v.to_str() {
+            headers.insert(k.as_str().to_string(), value.to_string());
+        }
+    }
+
+    let dest = req.uri().path().to_string();
+
+    handle_upgrade_with_handler(req, move |ws| async move {
+        let (stream1, stream2) = tokio::io::duplex(8192);
+
+        let ws_label = format!("ws-{}", dest);
+
+        tokio::spawn(async move {
+            bridge_ws(ws, stream1, &ws_label).await;
+        });
+
+        handler.handle(&dest, &headers, stream2).await;
+    })
+    .await
 }

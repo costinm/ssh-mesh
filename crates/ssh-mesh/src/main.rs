@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+#[cfg(feature = "ws")]
 use ws::WSServer;
 
 use tracing_subscriber::layer::SubscriberExt;
@@ -87,9 +88,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let sftp_root = env::var("SFTP_ROOT").ok().map(PathBuf::from);
 
     // Create SSH server instance
-    let ssh_server = Arc::new(SshServer::new(0, None, base_dir.clone(), sftp_server_path, sftp_root));
+    let ssh_server = Arc::new(SshServer::new(
+        0,
+        None,
+        base_dir.clone(),
+        sftp_server_path,
+        sftp_root,
+    ));
 
     // Create WebSocket server instance
+    #[cfg(feature = "ws")]
     let ws_server = Arc::new(WSServer::new());
 
     // Initialize ProcMon if enabled
@@ -109,7 +117,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
-        ws_server: ws_server.clone(),
         target_http_address: std::env::var("APP_HTTP_PORT").ok(),
         log_buffer: log_buffer.clone(),
         ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new(
@@ -162,6 +169,40 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Create Axum app
     let mut app = handlers::app(app_state.clone());
+
+    #[cfg(feature = "ws")]
+    {
+        let ws_handlers: Vec<(String, Arc<dyn mesh::StreamHandler>)> = vec![
+            (
+                "/_m/_ws/_ssh".to_string(),
+                Arc::new(handlers::SshWsHandler {
+                    ssh_server: app_state.ssh_server.clone(),
+                }),
+            ),
+            (
+                "/_m/_ws/_tcp/*path".to_string(),
+                Arc::new(handlers::TcpProxyWsHandler),
+            ),
+            (
+                "/_m/_ws/_uds/*path".to_string(),
+                Arc::new(handlers::UdsProxyWsHandler),
+            ),
+            (
+                "/_m/_ws/_exec/*cmd".to_string(),
+                Arc::new(handlers::ExecWsHandler),
+            ),
+        ];
+
+        let ws_state = ws::WsAppState {
+            ws_server: ws_server.clone(),
+            stream_handlers: ws_handlers,
+            push_handler: Some(Arc::new(ssh_mesh::local_trace::TracePushHandler {
+                log_buffer: app_state.log_buffer.clone(),
+            })),
+        };
+
+        app = app.merge(ws::app_ws(ws_state));
+    }
 
     app = app.nest_service("/", pmond::handlers::app(proc_mon.clone()));
 

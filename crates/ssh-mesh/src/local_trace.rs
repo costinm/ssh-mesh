@@ -3,14 +3,11 @@
 //! This module provides:
 //! - Dynamic trace level configuration via REST API
 //! - In-memory circular buffer for recent log entries
-//! - Real-time log streaming via WebSocket
+//! - Real-time log streaming
 
 use axum::{
-    Router,
-    extract::{State, ws::WebSocket, ws::WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -25,7 +22,7 @@ use tracing_subscriber::layer::{Context, Layer};
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 
 /// A single log entry in the buffer
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Timestamp in RFC3339 format
     pub timestamp: String,
@@ -41,14 +38,14 @@ pub struct LogEntry {
 }
 
 /// Request body for setting trace level
-#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraceLevelRequest {
     /// The new trace level filter directive (e.g., "info", "debug", "trace", "ssh_mesh=debug,info")
     pub level: String,
 }
 
 /// Response for getting/setting trace level
-#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraceLevelResponse {
     /// The current trace level filter directive
     pub level: String,
@@ -212,16 +209,6 @@ impl tracing::field::Visit for LogVisitor {
     }
 }
 
-/// Get the current tracing level
-#[utoipa::path(
-    get,
-    path = "/_m/trace/level",
-    tag = "tracing",
-    responses(
-        (status = 200, description = "Current trace level", body = TraceLevelResponse),
-        (status = 500, description = "Failed to get trace level")
-    )
-)]
 pub async fn get_trace_level() -> impl IntoResponse {
     // Note: EnvFilter doesn't provide an easy way to get the current filter as a string,
     // so we return a placeholder. The actual filter is managed by tracing-subscriber.
@@ -236,18 +223,6 @@ pub async fn get_trace_level() -> impl IntoResponse {
     )
 }
 
-/// Set a new tracing level dynamically
-#[utoipa::path(
-    put,
-    path = "/_m/trace/level",
-    tag = "tracing",
-    request_body = TraceLevelRequest,
-    responses(
-        (status = 200, description = "Trace level updated successfully", body = TraceLevelResponse),
-        (status = 400, description = "Invalid trace level format"),
-        (status = 500, description = "Failed to update trace level")
-    )
-)]
 pub async fn set_trace_level(Json(req): Json<TraceLevelRequest>) -> impl IntoResponse {
     use tracing_subscriber::EnvFilter;
 
@@ -306,19 +281,20 @@ pub async fn set_trace_level(Json(req): Json<TraceLevelRequest>) -> impl IntoRes
     }
 }
 
-/// WebSocket handler for streaming logs
-async fn handle_trace_view_ws(
-    ws: WebSocketUpgrade,
-    State(buffer): State<LogBuffer>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_trace_socket(socket, buffer))
+pub struct TracePushHandler {
+    pub log_buffer: LogBuffer,
 }
 
-/// Handle WebSocket connection for trace viewing
-pub async fn handle_trace_socket(mut socket: WebSocket, buffer: LogBuffer) {
-    use axum::extract::ws::Message;
+#[async_trait::async_trait]
+impl mesh::PushHandler for TracePushHandler {
+    async fn handle_push(&self, mut sender: Box<dyn mesh::PushSender>) {
+        stream_messages(sender.as_mut(), self.log_buffer.clone()).await;
+    }
+}
 
-    tracing::info!("New trace view WebSocket connection");
+/// Stream messages to a connected client
+pub async fn stream_messages(sender: &mut dyn mesh::PushSender, buffer: LogBuffer) {
+    tracing::info!("New stream connection");
 
     // Send all existing log entries
     let existing_logs = buffer.get_all();
@@ -326,7 +302,7 @@ pub async fn handle_trace_socket(mut socket: WebSocket, buffer: LogBuffer) {
 
     for entry in existing_logs {
         if let Ok(json) = serde_json::to_string(&entry) {
-            if socket.send(Message::Text(json)).await.is_err() {
+            if sender.send_text(json).await.is_err() {
                 tracing::warn!("Failed to send existing log entry");
                 return;
             }
@@ -342,27 +318,22 @@ pub async fn handle_trace_socket(mut socket: WebSocket, buffer: LogBuffer) {
             // Receive new log entries from broadcast channel
             Ok(entry) = rx.recv() => {
                 if let Ok(json) = serde_json::to_string(&entry) {
-                    if socket.send(Message::Text(json)).await.is_err() {
-                        tracing::info!("Trace view WebSocket client disconnected");
+                    if sender.send_text(json).await.is_err() {
+                        tracing::info!("Stream client disconnected");
                         break;
                     }
                 }
             }
-            // Handle incoming WebSocket messages (typically pings/close)
-            msg = socket.recv() => {
+            // Handle incoming client messages
+            msg = sender.recv() => {
                 match msg {
-                    Some(Ok(Message::Close(_))) | None => {
-                        tracing::info!("Trace view WebSocket client closed connection");
+                    Some(mesh::PushClientMsg::Close) | None => {
+                        tracing::info!("Stream client closed connection");
                         break;
                     }
-                    Some(Ok(Message::Ping(_))) => {
-                        // Axum handles pongs automatically
+                    Some(mesh::PushClientMsg::Ping) | Some(mesh::PushClientMsg::Other) => {
+                        // Handled by transport layer
                     }
-                    Some(Err(e)) => {
-                        tracing::warn!("WebSocket error: {:?}", e);
-                        break;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -608,15 +579,6 @@ async fn handle_uds_connection(
     Ok(())
 }
 
-/// Create the router with all trace-related routes
-pub fn routes(buffer: LogBuffer) -> Router {
-    Router::new()
-        .route("/_m/trace/level", get(get_trace_level))
-        .route("/_m/trace/level", put(set_trace_level))
-        .route("/_m/trace/view", get(handle_trace_view_ws))
-        .with_state(buffer)
-}
-
 /// Create a log buffer with default size
 pub fn create_log_buffer() -> LogBuffer {
     LogBuffer::new(DEFAULT_BUFFER_SIZE)
@@ -625,4 +587,13 @@ pub fn create_log_buffer() -> LogBuffer {
 /// Create a log buffer with custom size
 pub fn create_log_buffer_with_size(size: usize) -> LogBuffer {
     LogBuffer::new(size)
+}
+
+// Wrapper functions for trace endpoints
+pub async fn trace_get_level() -> impl IntoResponse {
+    get_trace_level().await
+}
+
+pub async fn trace_set_level(Json(req): Json<TraceLevelRequest>) -> impl IntoResponse {
+    set_trace_level(Json(req)).await
 }

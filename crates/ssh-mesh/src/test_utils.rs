@@ -80,7 +80,6 @@ pub async fn setup_test_environment(
         if start_http {
             let app_state = crate::AppState {
                 ssh_server: ssh_server.clone(),
-                ws_server: std::sync::Arc::new(ws::WSServer::new()),
                 target_http_address: std::env::var("HTTP_PORT").ok(),
                 log_buffer: crate::local_trace::create_log_buffer(),
                 ssh_client_manager: std::sync::Arc::new(crate::sshc::SshClientManager::new(

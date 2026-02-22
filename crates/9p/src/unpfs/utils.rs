@@ -12,11 +12,7 @@ macro_rules! INVALID_FID {
 }
 
 pub fn create_buffer(size: usize) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(size);
-    unsafe {
-        buffer.set_len(size);
-    }
-    buffer
+    vec![0; size]
 }
 
 pub async fn get_qid<T: AsRef<Path> + ?Sized>(path: &T) -> crate::Result<Qid> {

@@ -1,10 +1,8 @@
 use crate::ProcMon;
-use axum::serve;
+use mesh::{MeshApp, MeshConfig};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::error;
 
 /// Configuration for the Pmon server
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +45,16 @@ impl PmonServer {
         self.proc_mon.clone()
     }
 
+    fn create_mesh_app(&self) -> MeshApp {
+        let mesh_config = MeshConfig {
+            http_port: None, // Will use default logic in MeshApp
+            http_uds_path: self.config.http_uds_path.clone(),
+            auth_uid: self.config.auth_uid,
+        };
+
+        MeshApp::new(mesh_config).with_router(crate::handlers::app(self.proc_mon.clone()))
+    }
+
     /// Run the default HTTP server - for debug. In prod - use UDS or
     /// embed the library.
     pub async fn run_server(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -55,23 +63,9 @@ impl PmonServer {
         // Start monitoring
         self.proc_mon.start(true, true, Some(tx.clone()))?;
 
-        // Set up HTTP server
-        let uid = unsafe { libc::getuid() };
-        let port = if uid == 0 {
-            8081
-        } else {
-            8082 + (uid as i32 - 1000)
-        };
-
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = TcpListener::bind(&addr).await?;
-        info!("Listening on http://{}", addr);
-
-        // Create the Axum app with hardcoded /_m/pmon prefix
-        let app = crate::handlers::app(self.proc_mon.clone());
-
-        // Run the server
-        serve(listener, app.into_make_service()).await?;
+        // Set up HTTP server via MeshApp
+        let app = self.create_mesh_app();
+        app.run_tcp_server().await?;
 
         Ok(())
     }
@@ -83,26 +77,10 @@ impl PmonServer {
         // Start monitoring
         self.proc_mon.start(true, true, Some(tx.clone()))?;
 
-        // Start UDS server
-        let path_str = if let Some(path) = &self.config.http_uds_path {
-            path.clone()
-        } else {
-            // Default to /run/user/<uid>/pmond.sock
-            let uid = unsafe { libc::getuid() };
-            format!("/run/user/{}/pmond.sock", uid)
-        };
+        let app = self.create_mesh_app();
 
-        // Ensure parent directory exists
-        let path = PathBuf::from(&path_str);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let pm_http = self.proc_mon.clone();
-        let auth_uid = self.config.auth_uid;
         tokio::spawn(async move {
-            if let Err(e) = crate::handlers::run_uds_http_server(pm_http, &path_str, auth_uid).await
-            {
+            if let Err(e) = app.run_uds_server().await {
                 error!("UDS HTTP server error: {}", e);
             }
         });

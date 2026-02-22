@@ -5,7 +5,7 @@ use axum::{
     extract::{Path as AxumPath, State},
     http::{Method, Request, StatusCode},
     response::{Html, IntoResponse, Json, Response},
-    routing::{any, delete, get, post},
+    routing::{any, get},
 };
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -23,8 +23,6 @@ use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
 use utoipa::OpenApi;
 
-use ws::{ClientsResponse, MessageResponse, SendMessageRequest};
-
 #[derive(RustEmbed)]
 #[folder = "web/"]
 pub struct Assets;
@@ -34,61 +32,30 @@ use crate::AppState;
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        get_ssh_clients,
-        crate::local_trace::get_trace_level,
-        crate::local_trace::set_trace_level,
-        ws::handle_list_clients,
-        ws::handle_remove_client,
-        ws::handle_send_message,
-        ws::handle_broadcast
+        get_ssh_clients
     ),
     components(
         schemas(
-            ConnectedClientInfo,
-            crate::local_trace::TraceLevelResponse,
-            crate::local_trace::TraceLevelRequest,
-            crate::local_trace::LogEntry,
-            ClientsResponse, MessageResponse, SendMessageRequest
+            ConnectedClientInfo
         )
     ),
     tags(
-        (name = "ssh-mesh", description = "SSH Mesh API"),
-        (name = "tracing", description = "Tracing and Logging API")
+        (name = "ssh-mesh", description = "SSH Mesh API")
     )
 )]
 pub struct ApiDoc;
 
-async fn serve_openapi_json() -> impl IntoResponse {
-    match tokio::fs::read_to_string("web/openapi.json").await {
+async fn serve_json(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
+    let file_path = format!("web/{}", path);
+    match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             content,
         )
             .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "OpenAPI schema not found").into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, format!("{} not found", path)).into_response(),
     }
-}
-
-// Wrapper functions for trace endpoints
-async fn trace_get_level() -> impl IntoResponse {
-    crate::local_trace::get_trace_level().await
-}
-
-async fn trace_set_level(
-    Json(req): Json<crate::local_trace::TraceLevelRequest>,
-) -> impl IntoResponse {
-    crate::local_trace::set_trace_level(Json(req)).await
-}
-
-async fn trace_view_ws(
-    State(app_state): State<AppState>,
-    ws: axum::extract::WebSocketUpgrade,
-) -> impl IntoResponse {
-    let buffer = app_state.log_buffer.clone();
-    ws.on_upgrade(move |socket| async move {
-        crate::local_trace::handle_trace_socket(socket, buffer).await
-    })
 }
 
 /// appCore is the core handler for H2C - for example in CloudRun
@@ -124,27 +91,6 @@ pub fn app_mesh(app_state: AppState) -> Router {
     router.with_state(app_state)
 }
 
-/// Expose SSH and 'mesh' over websocket.
-/// WIP: needs authz, authn.
-/// May be simpler to have a separate WS->TCP proxy, in gateway.
-pub fn app_ws(app_state: AppState) -> Router {
-    let router = Router::new()
-        .route("/_m/_ws/_ssh", get(handle_ws_ssh))
-        .route("/_m/_ws/_tcp/:host/:port", get(handle_ws_tcp_proxy))
-        .route("/_m/_ws/_uds", get(handle_ws_uds_proxy))
-        .route("/_m/_ws/_uds/*path", get(handle_ws_uds_proxy))
-        .route("/_m/_ws/_exec/*cmd", get(handle_ws_exec))
-        .fallback(handle_proxy_request)
-        .route(
-            "/_m/ws",
-            get(move |State(app_state): State<AppState>, req| {
-                ws::handle_websocket_upgrade(State(app_state.ws_server), req)
-            }),
-        );
-
-    router.with_state(app_state)
-}
-
 /// Admin app. Exposed over SSH for admin/authorized_keys.
 /// For devel can be exposed locally. Should be on different port
 /// from the H2C - and not exposed on H2 directly.
@@ -154,58 +100,23 @@ pub fn app(app_state: AppState) -> Router {
         .route("/_m/adm", get(serve_index))
         .route("/_m/adm/*path", get(handle_web_request))
         .route("/_m/_ssh", any(handle_ssh_request))
-        .route("/_m/_ws/_ssh", get(handle_ws_ssh))
         .route("/_m/_tcp/:host/:port", any(handle_tcp_proxy))
         .route("/_m/_uds", any(handle_uds_proxy))
         .route("/_m/_uds/*path", any(handle_uds_proxy))
         .route("/_m/_exec/*cmd", any(handle_exec))
-        .route("/_m/_ws/_tcp/:host/:port", get(handle_ws_tcp_proxy))
-        .route("/_m/_ws/_uds", get(handle_ws_uds_proxy))
-        .route("/_m/_ws/_uds/*path", get(handle_ws_uds_proxy))
-        .route("/_m/_ws/_exec/*cmd", get(handle_ws_exec))
         .route("/_m/_ssh/*rest", any(handle_ssh_request))
         .fallback(handle_proxy_request)
-        .route(
-            "/_m/ws",
-            get(move |State(app_state): State<AppState>, req| {
-                ws::handle_websocket_upgrade(State(app_state.ws_server), req)
-            }),
-        )
         .route("/_m/api/ssh/clients", get(get_ssh_clients))
         .nest_service(
             "/_m/api/sshc",
             crate::sshc::sshc_routes(app_state.ssh_client_manager.clone()),
         )
-        .route(
-            "/_m/api/clients",
-            get(move |State(app_state): State<AppState>| {
-                ws::handle_list_clients(State(app_state.ws_server))
-            }),
-        )
-        .route(
-            "/_m/api/clients/:id",
-            delete(move |State(app_state): State<AppState>, path| {
-                ws::handle_remove_client(State(app_state.ws_server), path)
-            }),
-        )
-        .route(
-            "/_m/api/clients/:id/message",
-            post(move |State(app_state): State<AppState>, path, json| {
-                ws::handle_send_message(State(app_state.ws_server), path, json)
-            }),
-        )
-        .route(
-            "/_m/api/broadcast",
-            post(move |State(app_state): State<AppState>, json| {
-                ws::handle_broadcast(State(app_state.ws_server), json)
-            }),
-        )
         // Serve pre-generated OpenAPI schema
-        .route("/_m/api/openapi.json", get(serve_openapi_json))
-        // Trace level API routes
-        .route("/_m/trace/level", get(trace_get_level).put(trace_set_level))
-        // Trace view WebSocket
-        .route("/_m/trace/view", get(trace_view_ws));
+        .route("/_m/api/*path", get(serve_json))
+        .route(
+            "/_m/trace/level",
+            get(crate::local_trace::trace_get_level).put(crate::local_trace::trace_set_level),
+        );
 
     router.with_state(app_state)
 }
@@ -593,38 +504,30 @@ pub async fn handle_exec(
         .into_response()
 }
 
-// WebSocket SSH handler
-#[instrument(skip(req, state), fields(method = %req.method(), uri = %req.uri()))]
-pub async fn handle_ws_ssh(State(state): State<AppState>, req: Request<Body>) -> Response {
-    println!("handle_ws_ssh: Received connection request");
-    ws::handle_upgrade_with_handler(req, move |ws| async move {
-        println!("handle_ws_ssh: WebSocket upgraded");
-        let mut ssh_server = state.ssh_server.as_ref().clone();
+pub struct SshWsHandler {
+    pub ssh_server: Arc<crate::SshServer>,
+}
+
+impl mesh::Routable for SshWsHandler {
+    fn route(&self) -> &str {
+        "/_m/_ws/_ssh"
+    }
+}
+
+#[async_trait::async_trait]
+impl mesh::StreamHandler for SshWsHandler {
+    async fn handle(
+        &self,
+        _dest: &str,
+        _headers: &std::collections::HashMap<String, String>,
+        stream: tokio::io::DuplexStream,
+    ) {
+        let mut ssh_server = self.ssh_server.as_ref().clone();
         let config = Arc::new(ssh_server.get_config());
         let handler = ssh_server.new_client(None);
-
-        let (ws_to_ssh_tx, ws_to_ssh_rx) =
-            mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
-        let (ssh_to_ws_tx, ssh_to_ws_rx) = mpsc::unbounded_channel::<Bytes>();
-
-        let stream = crate::utils::UnboundedChannelStream {
-            reader: ws_to_ssh_rx,
-            writer: ssh_to_ws_tx,
-            read_buf: bytes::BytesMut::new(),
-        };
-
         let handler_id = handler.id;
-        let connected_clients = ssh_server.connected_clients.clone();
+        let connected_clients = self.ssh_server.connected_clients.clone();
 
-        // Spawn WS bridge
-        tokio::spawn(crate::utils::bridge_ws_to_mpsc(
-            ws,
-            ws_to_ssh_tx,
-            ssh_to_ws_rx,
-            "WS SSH",
-        ));
-
-        // Run SSH over the stream
         match russh::server::run_stream(config, stream, handler).await {
             Ok(session) => {
                 info!("WS SSH session started successfully");
@@ -633,7 +536,6 @@ pub async fn handle_ws_ssh(State(state): State<AppState>, req: Request<Body>) ->
                 }
                 info!("WS SSH session completed");
 
-                // Cleanup
                 let mut clients = connected_clients.lock().await;
                 clients.remove(&handler_id);
             }
@@ -641,67 +543,96 @@ pub async fn handle_ws_ssh(State(state): State<AppState>, req: Request<Body>) ->
                 tracing_error!("Failed to start WS SSH session: {:?}", e);
             }
         }
-    })
-    .await
+    }
 }
 
-// WebSocket TCP proxy handler
-#[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), host = %host, port = %port))]
-pub async fn handle_ws_tcp_proxy(
-    State(_state): State<AppState>,
-    AxumPath((host, port)): AxumPath<(String, u32)>,
-    req: Request<Body>,
-) -> Response {
-    ws::handle_upgrade_with_handler(req, move |ws| async move {
+pub struct TcpProxyWsHandler;
+
+impl mesh::Routable for TcpProxyWsHandler {
+    fn route(&self) -> &str {
+        "/_m/_ws/_tcp/*path"
+    }
+}
+
+#[async_trait::async_trait]
+impl mesh::StreamHandler for TcpProxyWsHandler {
+    async fn handle(
+        &self,
+        dest: &str,
+        _headers: &std::collections::HashMap<String, String>,
+        stream: tokio::io::DuplexStream,
+    ) {
+        let parts: Vec<&str> = dest.splitn(5, '/').collect();
+        let host_port = parts.get(4).unwrap_or(&"");
+        let (host, port) = match host_port.split_once('/') {
+            Some((h, p)) => (h, p),
+            None => {
+                tracing_error!("Invalid TCP proxy dest format: {}", dest);
+                return;
+            }
+        };
         match TcpStream::connect(format!("{}:{}", host, port)).await {
             Ok(tcp_stream) => {
-                crate::utils::bridge_ws(ws, tcp_stream, &format!("WS TCP to {}:{}", host, port))
+                crate::utils::bridge(tcp_stream, stream, &format!("WS TCP to {}:{}", host, port))
                     .await;
             }
             Err(e) => {
                 tracing_error!("WS TCP connect error to {}:{}: {}", host, port, e);
             }
         }
-    })
-    .await
+    }
 }
 
-// WebSocket UDS proxy handler
-#[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), path = %path))]
-pub async fn handle_ws_uds_proxy(
-    State(_state): State<AppState>,
-    AxumPath(path): AxumPath<String>,
-    req: Request<Body>,
-) -> Response {
-    let full_path = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{}", path)
-    };
-    let path_clone = full_path.clone();
+pub struct UdsProxyWsHandler;
 
-    ws::handle_upgrade_with_handler(req, move |ws| async move {
+impl mesh::Routable for UdsProxyWsHandler {
+    fn route(&self) -> &str {
+        "/_m/_ws/_uds/*path"
+    }
+}
+
+#[async_trait::async_trait]
+impl mesh::StreamHandler for UdsProxyWsHandler {
+    async fn handle(
+        &self,
+        dest: &str,
+        _headers: &std::collections::HashMap<String, String>,
+        stream: tokio::io::DuplexStream,
+    ) {
+        let parts: Vec<&str> = dest.splitn(5, '/').collect();
+        let mut path_clone = String::from("/");
+        path_clone.push_str(parts.get(4).unwrap_or(&""));
+
         match UnixStream::connect(&path_clone).await {
             Ok(unix_stream) => {
-                crate::utils::bridge_ws(ws, unix_stream, &format!("WS UDS to {}", path_clone))
+                crate::utils::bridge(unix_stream, stream, &format!("WS UDS to {}", path_clone))
                     .await;
             }
             Err(e) => {
                 tracing_error!("WS UDS connect error to {}: {}", path_clone, e);
             }
         }
-    })
-    .await
+    }
 }
 
-// WebSocket Exec handler
-#[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), cmd = %cmd))]
-pub async fn handle_ws_exec(
-    State(_state): State<AppState>,
-    AxumPath(cmd): AxumPath<String>,
-    req: Request<Body>,
-) -> Response {
-    ws::handle_upgrade_with_handler(req, move |ws| async move {
+pub struct ExecWsHandler;
+
+impl mesh::Routable for ExecWsHandler {
+    fn route(&self) -> &str {
+        "/_m/_ws/_exec/*cmd"
+    }
+}
+
+#[async_trait::async_trait]
+impl mesh::StreamHandler for ExecWsHandler {
+    async fn handle(
+        &self,
+        dest: &str,
+        _headers: &std::collections::HashMap<String, String>,
+        stream: tokio::io::DuplexStream,
+    ) {
+        let parts: Vec<&str> = dest.splitn(5, '/').collect();
+        let cmd = parts.get(4).unwrap_or(&"").to_string();
         info!("WS Executing command: {}", cmd);
         let mut child = match Command::new("sh")
             .arg("-c")
@@ -726,7 +657,7 @@ pub async fn handle_ws_exec(
         tokio::spawn(async move {
             let mut buffer = [0; 8192];
             loop {
-                match stderr.read(&mut buffer).await {
+                match tokio::io::AsyncReadExt::read(&mut stderr, &mut buffer).await {
                     Ok(0) => break,
                     Ok(n) => {
                         let err_msg = String::from_utf8_lossy(&buffer[..n]);
@@ -738,11 +669,10 @@ pub async fn handle_ws_exec(
         });
 
         let child_io = tokio::io::join(stdout, stdin);
-        crate::utils::bridge_ws(ws, child_io, &format!("WS Exec for {}", cmd)).await;
+        crate::utils::bridge(child_io, stream, &format!("WS Exec for {}", cmd)).await;
         let _ = child.wait().await;
         info!("WS Exec session completed for: {}", cmd);
-    })
-    .await
+    }
 }
 
 pub async fn handle_proxy_request(

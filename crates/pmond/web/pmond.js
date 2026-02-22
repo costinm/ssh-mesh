@@ -5,10 +5,12 @@
 // Format bytes to human-readable memory size
 function formatMemory(bytes) {
     if (bytes === 0) return '0 B';
+    const isNegative = bytes < 0;
+    const absBytes = Math.abs(bytes);
     const k = 1024;
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    const i = Math.floor(Math.log(absBytes) / Math.log(k));
+    return (isNegative ? '-' : '') + parseFloat((absBytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 // Format number with locale-specific thousand separators

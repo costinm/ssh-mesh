@@ -42,6 +42,8 @@ pub struct AppState {
     paths(
         handle_ps_request,
         handle_get_process_request,
+        handle_get_process_only_request,
+        handle_get_cgroup_detailed_request,
         handle_cgroups_request,
         handle_psi_request,
         handle_cgroup_high_request,
@@ -134,6 +136,61 @@ pub async fn handle_get_process_request(
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("Process {} not found", pid)})),
+        ),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/_m/pmon/_ps/{pid}",
+    tag = "pmond",
+    params(
+        ("pid" = u32, Path, description = "Process ID")
+    ),
+    responses(
+        (status = 200, description = "Get process info only", body = ProcessInfo),
+        (status = 404, description = "Process not found")
+    )
+)]
+pub async fn handle_get_process_only_request(
+    State(app_state): State<AppState>,
+    AxumPath(pid): AxumPath<u32>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match app_state.proc_mon.get_process(pid) {
+        Some(process) => (StatusCode::OK, Json(json!(process))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Process {} not found", pid)})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GetCgroupQuery {
+    pub path: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/_m/pmon/_cg",
+    tag = "pmond",
+    params(
+        ("path" = String, Query, description = "Full cgroup path")
+    ),
+    responses(
+        (status = 200, description = "Get detailed cgroup info", body = CGroupInfo),
+        (status = 404, description = "Cgroup not found")
+    )
+)]
+pub async fn handle_get_cgroup_detailed_request(
+    State(_app_state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<GetCgroupQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match crate::read_cgroup_detailed(&query.path) {
+        Some(cgroup) => (StatusCode::OK, Json(json!(cgroup))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Cgroup {} not found", query.path)})),
         ),
     }
 }
@@ -355,7 +412,9 @@ pub fn app(proc_mon: Arc<ProcMon>) -> Router {
     Router::new()
         .route("/_m/pmon/", get(handle_root_request))
         .route("/_m/pmon/_ps", get(handle_ps_request))
+        .route("/_m/pmon/_ps/:pid", get(handle_get_process_only_request))
         .route("/_m/pmon/_process/:pid", get(handle_get_process_request))
+        .route("/_m/pmon/_cg", get(handle_get_cgroup_detailed_request))
         .route("/_m/pmon/_cgroups", get(handle_cgroups_request))
         .route("/_m/pmon/_psi", get(handle_psi_request))
         .route("/_m/pmon/_cgroup_high", post(handle_cgroup_high_request))

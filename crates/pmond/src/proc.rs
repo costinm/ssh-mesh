@@ -191,10 +191,10 @@ impl ProcMon {
     pub fn get_all_processes(&self, mode: i32) -> HashMap<u32, ProcessInfo> {
         match mode {
             0 => {
-                let mut current = read_existing_processes_impl();
+                let current = read_existing_processes_impl();
                 if self.running.load(Ordering::SeqCst) {
-                    let s1 = self.snap1.lock();
-                    calculate_memory_deltas(&mut current, &s1);
+                    let _s1 = self.snap1.lock();
+                    // calculate_memory_deltas removed
                 }
                 current
             }
@@ -547,7 +547,7 @@ fn run_snapshot_loop(
         }
 
         // Take fresh snapshot
-        let mut new_processes = read_existing_processes_impl();
+        let new_processes = read_existing_processes_impl();
 
         // --------------------------------------------------------------------
         // PSI Watcher Logic
@@ -588,7 +588,7 @@ fn run_snapshot_loop(
             // 6. Compute the delta between snap1 and new_processes, saving the delta in new_processes
             // new_processes contains processes from T. snap1 contains processes from T-1.
             // We update new_processes to hold the diffs (T) - (T-1).
-            calculate_memory_deltas(&mut new_processes, &s1);
+            // calculate_memory_deltas removed
 
             // 7. Finally set snap2 with snap1 and snap1 with new_processes
             // snap2 becomes the previous snap1 (T-1)
@@ -605,30 +605,6 @@ fn get_refresh_interval(config: &Mutex<ProcCfg>) -> std::time::Duration {
         .lock()
         .refresh_interval
         .unwrap_or(std::time::Duration::from_secs(20))
-}
-
-/// Calculate memory deltas between current and previous snapshots.
-/// The `current` map is modified in-place to store the deltas.
-fn calculate_memory_deltas(
-    current: &mut HashMap<u32, ProcessInfo>,
-    previous: &HashMap<u32, ProcessInfo>,
-) {
-    for (pid, proc1) in current.iter_mut() {
-        if let Some(proc2) = previous.get(pid) {
-            if let (Some(m1), Some(m2)) = (&mut proc1.mem_info, &proc2.mem_info) {
-                m1.d_anon = m1.anon as i64 - m2.anon as i64;
-                m1.d_file = m1.file as i64 - m2.file as i64;
-                m1.d_kernel_stack = m1.kernel_stack as i64 - m2.kernel_stack as i64;
-                m1.d_pagetables = m1.pagetables as i64 - m2.pagetables as i64;
-                m1.d_shmem = m1.shmem as i64 - m2.shmem as i64;
-                m1.d_pgfault = m1.pgfault as i64 - m2.pgfault as i64;
-                m1.d_pgmajfault = m1.pgmajfault as i64 - m2.pgmajfault as i64;
-            }
-        }
-    }
-    // TODO: generate perfetto trace, if enabled.
-
-    // TODO: save historic data in a bound ring.
 }
 
 #[cfg(test)]

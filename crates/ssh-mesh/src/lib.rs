@@ -28,7 +28,6 @@ pub static TRACING_RELOAD_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, 
     std::sync::OnceLock::new();
 
 use utoipa::ToSchema;
-use ws::WSServer;
 
 // File paths for SSH authentication
 pub mod auth;
@@ -78,7 +77,6 @@ pub struct ConnectedClientInfo {
 #[derive(Clone)]
 pub struct AppState {
     pub ssh_server: Arc<SshServer>,
-    pub ws_server: Arc<WSServer>,
     pub target_http_address: Option<String>,
     pub log_buffer: crate::local_trace::LogBuffer,
     pub ssh_client_manager: Arc<sshc::SshClientManager>,
