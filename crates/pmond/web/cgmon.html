@@ -580,6 +580,8 @@
                         <div class="dropdown">
                             <button class="action-btn" onclick="toggleDropdown(event, this)">Actions ▾</button>
                             <div class="dropdown-content">
+                                <a onclick="freezeCgroup('${safePath}', true)" style="color: #1565c0">❄️ Freeze All</a>
+                                <a onclick="freezeCgroup('${safePath}', false)" style="color: #2e7d32">🔥 Unfreeze All</a>
                                 <a onclick="setCgroupHigh('${safePath}', 90, 5)">90% High (5s delay)</a>
                                 <a onclick="setCgroupHigh('${safePath}', 50, 5)">50% High (5s delay)</a>
                                 <a onclick="setCgroupHigh('${safePath}', 90, 0)">90% High (Indefinite)</a>
@@ -689,6 +691,26 @@
             if (interval === null) return;
 
             setCgroupHigh(path, parseFloat(percentage), parseInt(interval));
+        }
+
+        async function freezeCgroup(path, freeze) {
+            const action = freeze ? 'Freeze' : 'Unfreeze';
+            try {
+                const response = await fetch('../_freeze_cgroup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path, freeze })
+                });
+                if (response.ok) {
+                    console.log(`Successfully ${action.toLowerCase()}d cgroup ${path}`);
+                    alert(`${action}d cgroup successfully!`);
+                } else {
+                    const err = await response.json();
+                    alert(`Error: ${err.error}`);
+                }
+            } catch (err) {
+                alert(`Failed to ${action.toLowerCase()} cgroup: ${err}`);
+            }
         }
 
         async function toggleCgroupProcs(path, el) {

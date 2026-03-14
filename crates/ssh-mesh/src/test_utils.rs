@@ -19,17 +19,29 @@ pub fn find_free_port() -> Result<u16> {
 
 pub struct TestSetup {
     pub temp_dir: Option<TempDir>,
-    pub base_dir: PathBuf,
-
     // temp file where keys are saved.
     pub client_key_path: PathBuf,
+
+    pub mesh_node: std::sync::Arc<crate::MeshNode>,
+
+    // Convenience fields for backward compat with tests
+    pub base_dir: PathBuf,
     pub ssh_port: u16,
     pub http_port: Option<u16>,
-    pub server_handle: tokio::task::JoinHandle<()>,
+}
+
+impl TestSetup {
+    pub fn abort_server(&self) {
+        let handle = self.mesh_node.server_handle.lock().unwrap();
+        if let Some(ref h) = *handle {
+            h.abort();
+        }
+    }
 }
 
 // Setup a SSH mesh server on a temp dir. Keys are generated ahead
-// of time.
+// of time. Returns a TestSetup with a MeshNode that has ssh_port,
+// http_port, and server_handle populated.
 pub async fn setup_test_environment(
     _custom_temp_dir: Option<PathBuf>,
     _start_http: bool,
@@ -68,34 +80,39 @@ pub async fn setup_test_environment(
         }
     }
 
-    let server_base_dir = base_dir.clone();
+    let cfg = crate::MeshNodeConfig {
+        base_dir: Some(base_dir.clone()),
+        ssh_port: Some(ssh_port),
+        http_port,
+        ..Default::default()
+    };
+    let mesh_node = std::sync::Arc::new(crate::MeshNode::new(Some(base_dir.clone()), Some(cfg)));
+
+    let mesh_node_clone = mesh_node.clone();
     let server_handle = tokio::spawn(async move {
         println!(
-            "Starting SshServer for tests at base_dir: {:?}",
-            server_base_dir
+            "Starting MeshNode for tests at base_dir: {:?}",
+            mesh_node_clone.base_dir()
         );
-        let ssh_server =
-            std::sync::Arc::new(crate::SshServer::new(0, None, server_base_dir, None, None));
 
         if start_http {
             let app_state = crate::AppState {
-                ssh_server: ssh_server.clone(),
+                ssh_server: mesh_node_clone.clone(),
                 target_http_address: std::env::var("HTTP_PORT").ok(),
-                log_buffer: crate::local_trace::create_log_buffer(),
                 ssh_client_manager: std::sync::Arc::new(crate::sshc::SshClientManager::new(
-                    ssh_server.private_key().clone(),
+                    mesh_node_clone.private_key().clone(),
                     Vec::new(),
                     None,
                     None,
                 )),
             };
 
-            let ssh_server_clone = ssh_server.clone();
+            let mesh_node_for_ssh = mesh_node_clone.clone();
             tokio::spawn(async move {
-                let config = ssh_server_clone.get_config();
+                let config = mesh_node_for_ssh.get_config();
                 println!("Starting real SSH server on port {}", ssh_port);
                 if let Err(e) =
-                    crate::run_ssh_server(ssh_port, config, (*ssh_server_clone).clone()).await
+                    crate::run_ssh_server(ssh_port, config, (*mesh_node_for_ssh).clone()).await
                 {
                     eprintln!("SSH server failed: {}", e);
                 }
@@ -111,14 +128,20 @@ pub async fn setup_test_environment(
                 }
             }
         } else {
-            let config = ssh_server.get_config();
-            if let Err(e) = crate::run_ssh_server(ssh_port, config, (*ssh_server).clone()).await {
+            let config = mesh_node_clone.get_config();
+            if let Err(e) =
+                crate::run_ssh_server(ssh_port, config, (*mesh_node_clone).clone()).await
+            {
                 eprintln!("SSH server failed: {}", e);
             }
         }
     });
 
-    // tokio::time::sleep(Duration::from_secs(2)).await;
+    // Store server_handle in the mesh_node
+    {
+        let mut handle_lock = mesh_node.server_handle.lock().unwrap();
+        *handle_lock = Some(server_handle);
+    }
 
     Ok(TestSetup {
         temp_dir,
@@ -126,6 +149,6 @@ pub async fn setup_test_environment(
         client_key_path,
         ssh_port,
         http_port,
-        server_handle,
+        mesh_node,
     })
 }

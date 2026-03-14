@@ -1,3 +1,4 @@
+pub mod local_trace;
 pub mod uds;
 
 use axum::serve;
@@ -9,7 +10,7 @@ use tracing::{error, info};
 /// Configuration for a mesh application
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshConfig {
-    /// Optional TCP port for HTTP server (if not provided, defaults may apply)
+    /// Optional TCP port for HTTP server
     pub http_port: Option<u16>,
     /// Optional UDS path for HTTP/H2C server
     pub http_uds_path: Option<String>,
@@ -175,4 +176,13 @@ pub trait PushSender: Send + 'static {
 #[async_trait::async_trait]
 pub trait PushHandler: Send + Sync + 'static {
     async fn handle_push(&self, sender: Box<dyn PushSender>);
+}
+
+/// Generic config provider trait. Implementations load config
+/// objects by kind (category/subdirectory) and name (identifier/filename).
+#[async_trait::async_trait]
+pub trait ConfigProvider: Send + Sync {
+    /// Load a config value as a JSON Value by kind and name.
+    /// Returns None if the config does not exist.
+    async fn get(&self, kind: &str, name: &str) -> Option<serde_json::Value>;
 }

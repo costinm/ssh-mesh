@@ -83,7 +83,7 @@ async fn test_client_api() -> Result<()> {
             .await?;
         assert!(res.as_object().unwrap().is_empty());
 
-        setup.server_handle.abort();
+        setup.abort_server();
         Ok(())
     })
     .await
@@ -188,7 +188,7 @@ async fn test_client_api_over_http2() -> Result<()> {
             "Client list should be empty after disconnect"
         );
 
-        setup.server_handle.abort();
+        setup.abort_server();
         Ok(())
     })
     .await

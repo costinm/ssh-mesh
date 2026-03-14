@@ -52,7 +52,7 @@ async fn test_sftp_basic_ops() -> Result<()> {
         assert_eq!(content, "Hello from SFTP test!");
         let _ = std::fs::remove_file(downloaded_file);
 
-        setup.server_handle.abort();
+        setup.abort_server();
         Ok(())
     })
     .await?

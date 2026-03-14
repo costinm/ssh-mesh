@@ -64,7 +64,7 @@ async fn test_ws_tcp_proxy() -> Result<()> {
         panic!("Expected binary message, got {:?}", msg);
     }
 
-    setup.server_handle.abort();
+    setup.abort_server();
     Ok(())
 }
 
@@ -114,7 +114,7 @@ async fn test_ws_uds_proxy() -> Result<()> {
         panic!("Expected binary message, got {:?}", msg);
     }
 
-    setup.server_handle.abort();
+    setup.abort_server();
     Ok(())
 }
 
@@ -137,7 +137,7 @@ async fn test_ws_exec_cat() -> Result<()> {
         panic!("Expected binary message, got {:?}", msg);
     }
 
-    setup.server_handle.abort();
+    setup.abort_server();
     Ok(())
 }
 

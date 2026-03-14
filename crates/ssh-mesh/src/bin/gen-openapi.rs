@@ -1,4 +1,5 @@
 use ssh_mesh::handlers::ApiDoc;
+use ssh_mesh::sshc::SshcApiDoc;
 use std::fs;
 use std::path::Path;
 use utoipa::OpenApi;
@@ -10,6 +11,10 @@ fn main() {
 
     // Generate the OpenAPI schema from the ApiDoc struct
     let mut openapi = ApiDoc::openapi();
+
+    println!("Including sshc schema...");
+    let sshc_openapi = SshcApiDoc::openapi();
+    openapi.merge(sshc_openapi);
 
     println!("Including pmond schema...");
     let pmond_openapi = PmondApiDoc::openapi();

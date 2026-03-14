@@ -103,6 +103,24 @@ pub struct CgroupHighArgs {
     pub interval: u64,
 }
 
+/// Arguments for freezing/unfreezing a process
+#[derive(Deserialize, JsonSchema, ToSchema)]
+pub struct FreezeProcessArgs {
+    /// Process ID
+    pub pid: u32,
+    /// Whether to freeze (true) or unfreeze (false)
+    pub freeze: bool,
+}
+
+/// Arguments for freezing/unfreezing a cgroup
+#[derive(Deserialize, JsonSchema, ToSchema)]
+pub struct FreezeCgroupArgs {
+    /// Full cgroup path
+    pub path: String,
+    /// Whether to freeze (true) or unfreeze (false)
+    pub freeze: bool,
+}
+
 /// Arguments for psi_watches - no parameters needed
 #[derive(Deserialize, JsonSchema, Default, ToSchema)]
 pub struct PsiWatchesArgs {}

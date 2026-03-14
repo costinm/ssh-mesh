@@ -1043,6 +1043,29 @@
                 });
         }
 
+        // Freeze or unfreeze a process (SIGSTOP / SIGCONT)
+        function freezeProcess(pid, freeze) {
+            const action = freeze ? 'Freeze' : 'Unfreeze';
+            fetch('../_freeze_process', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pid: parseInt(pid), freeze: freeze }),
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        addLogEntry(`${action}d process ${pid}`, 'success');
+                    } else {
+                        addLogEntry(`Failed to ${action.toLowerCase()} process ${pid}: ${data.error}`, 'error');
+                        alert('Error: ' + data.error);
+                    }
+                })
+                .catch(error => {
+                    addLogEntry(`Request failed: ${error.message}`, 'error');
+                    alert('Request failed: ' + error.message);
+                });
+        }
+
         function markCurrentState() {
             if (!allProcesses) {
                 addLogEntry('No processes to mark', 'warning');
@@ -1515,12 +1538,18 @@
                                            <span class="cgroup-path-clickable" style="font-family: 'JetBrains Mono', monospace;" onclick="showCgroupInfo(${process.pid}, '${(process.cgroup_path || '/').replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')">
                                                ${process.cgroup_path || '/'}
                                            </span>
-                                           <div style="display: flex; gap: 8px; margin-left: auto;">
-                                               <button onclick="clearRefs(${process.pid})" class="warning" style="padding: 4px 10px; font-size: 11px;">
-                                                   Clear PSS
+                                            <div style="display: flex; gap: 8px; margin-left: auto;">
+                                                <button onclick="freezeProcess(${process.pid}, true)" style="padding: 4px 10px; font-size: 11px; background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9;">
+                                                    ❄️ Freeze
                                                 </button>
-                                               <button onclick="moveToCgroup(${process.pid})" class="secondary" style="padding: 4px 10px; font-size: 11px;">
-                                                   Move
+                                                <button onclick="freezeProcess(${process.pid}, false)" style="padding: 4px 10px; font-size: 11px; background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7;">
+                                                    🔥 Unfreeze
+                                                </button>
+                                                <button onclick="clearRefs(${process.pid})" class="warning" style="padding: 4px 10px; font-size: 11px;">
+                                                    Clear PSS
+                                                 </button>
+                                                <button onclick="moveToCgroup(${process.pid})" class="secondary" style="padding: 4px 10px; font-size: 11px;">
+                                                    Move
                                                </button>
                                            </div>
                                        </div>

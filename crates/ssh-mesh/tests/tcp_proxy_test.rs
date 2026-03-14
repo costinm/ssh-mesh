@@ -102,7 +102,7 @@ async fn test_tcp_proxy_with_method(method: Method) -> Result<()> {
 
     // Cleanup
     drop(tx); // Close the request stream
-    setup.server_handle.abort();
+    setup.abort_server();
     Ok(())
 }
 

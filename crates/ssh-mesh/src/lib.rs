@@ -6,7 +6,7 @@ use log::{error, info};
 use russh::keys::PrivateKey;
 use russh::server;
 use russh::server::Server;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use ssh_key;
 use std::collections::HashMap;
 #[allow(dead_code, unused)]
@@ -21,16 +21,15 @@ use std::{
     time::SystemTime,
 };
 use tracing::{debug, instrument};
-use tracing_subscriber::{EnvFilter, Registry, reload};
 
-/// Global handle for dynamically reloading the tracing filter
-pub static TRACING_RELOAD_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, Registry>> =
-    std::sync::OnceLock::new();
+/// Re-export the global tracing reload handle from mesh crate.
+pub use mesh::local_trace::TRACING_RELOAD_HANDLE;
 
 use utoipa::ToSchema;
 
 // File paths for SSH authentication
 pub mod auth;
+pub mod config_provider;
 pub mod handlers;
 pub mod local_trace;
 pub mod mux;
@@ -42,24 +41,43 @@ pub mod utils;
 
 pub use sshd::SshHandler;
 
-// Configuration for the SSH server
+/// Configurable fields for MeshNode, loadable from JSON or YAML.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct MeshNodeConfig {
+    pub base_dir: Option<PathBuf>,
+    pub ssh_port: Option<u16>,
+    pub http_port: Option<u16>,
+    pub sftp_server_path: Option<String>,
+    pub sftp_root: Option<PathBuf>,
+    /// Optional list of authorized public keys (OpenSSH format lines).
+    /// If present, these are used in addition to keys loaded from the
+    /// `authorized_keys` file in base_dir.
+    pub authorized_keys: Option<Vec<String>>,
+    /// Optional list of CA public keys (OpenSSH format).
+    /// If present, these are used in addition to CAs loaded from
+    /// the `authorized_cas` file in base_dir.
+    pub ca_keys: Option<Vec<String>>,
+}
+
+// MeshNode is the main server struct (formerly SshServer).
 #[derive(Clone)]
 #[allow(unused)]
-pub struct SshServer {
+pub struct MeshNode {
+    pub cfg: MeshNodeConfig,
+
     keys: PrivateKey,
     clients: Arc<tokio::sync::Mutex<Vec<usize>>>,
     id_counter: Arc<std::sync::Mutex<usize>>,
+
     pub authorized_keys: Arc<Vec<crate::auth::AuthorizedKeyEntry>>,
     pub ca_keys: Arc<Vec<ssh_key::PublicKey>>,
-    pub base_dir: PathBuf,
+
     /// Active SSH handlers indexed by their ID
     active_handlers:
         Arc<std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<sshd::SshHandler>>>>>,
     /// Track connected clients with their remote forward listeners
     pub connected_clients: Arc<tokio::sync::Mutex<HashMap<usize, ConnectedClientInfo>>>,
-    pub sftp_server_path: Option<String>,
-    /// Root directory for built-in SFTP server (defaults to base_dir)
-    pub sftp_root: PathBuf,
+    pub server_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Information about a connected client
@@ -76,71 +94,120 @@ pub struct ConnectedClientInfo {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub ssh_server: Arc<SshServer>,
+    pub ssh_server: Arc<MeshNode>,
     pub target_http_address: Option<String>,
-    pub log_buffer: crate::local_trace::LogBuffer,
     pub ssh_client_manager: Arc<sshc::SshClientManager>,
 }
 
 // TODO: move the env vars to main
 
-impl SshServer {
-    /// Create a new SshServer instance with an optional private key
-    /// If no key is provided, attempts to load from baseDir/.ssh/id_ed25519 or generates a new one
+impl MeshNode {
+    /// Load a MeshNodeConfig from JSON or YAML files in the given directory using config-rs.
+    /// Returns default if neither exists.
+    pub fn load_config(base_dir: &Path) -> MeshNodeConfig {
+        let mut builder = config::Config::builder();
+
+        for ext in &["yaml", "json", "toml"] {
+            let path = base_dir.join(format!("mesh.{}", ext));
+            if path.exists() {
+                builder = builder.add_source(config::File::from(path));
+                break;
+            }
+        }
+
+        match builder
+            .build()
+            .and_then(|c| c.try_deserialize::<MeshNodeConfig>())
+        {
+            Ok(cfg) => {
+                info!("Loaded config from {:?}", base_dir);
+                cfg
+            }
+            Err(_) => MeshNodeConfig::default(),
+        }
+    }
+
+    /// Create a new MeshNode instance.
     ///
     /// # Arguments
-    /// * `id` - Server ID
-    /// * `key` - Optional private key
-    /// * `base_dir` - Base directory containing the .ssh subdirectory
-    /// * `sftp_server_path` - Optional path to external sftp-server binary
-    /// * `sftp_root` - Optional root directory for built-in SFTP server (defaults to base_dir)
-    pub fn new(
-        id: usize,
-        key: Option<PrivateKey>,
-        base_dir: PathBuf,
-        sftp_server_path: Option<String>,
-        sftp_root: Option<PathBuf>,
-    ) -> Self {
-        let keys = match key {
-            Some(key) => key,
-            None => crate::auth::load_or_generate_keys_save(&base_dir),
-        };
+    /// * `base_dir` - Optional base directory containing the .ssh subdirectory.
+    ///   Defaults to cfg.base_dir, then current directory.
+    /// * `cfg` - Optional configuration. If not provided, loads from
+    ///   `mesh.yaml` or `mesh.json` in `base_dir`.
+    pub fn new(base_dir: Option<PathBuf>, cfg: Option<MeshNodeConfig>) -> Self {
+        // Resolve base_dir: explicit arg > cfg.base_dir > cwd
+        let effective_base_dir = base_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-        // Load authorized keys
-        let authorized_keys = match crate::auth::load_authorized_keys(&base_dir) {
+        let mut cfg = cfg.unwrap_or_else(|| Self::load_config(&effective_base_dir));
+
+        // Store the resolved base_dir in cfg if not already set
+        if cfg.base_dir.is_none() {
+            cfg.base_dir = Some(effective_base_dir.clone());
+        }
+
+        let base_dir = cfg.base_dir.clone().unwrap_or(effective_base_dir);
+
+        let keys = crate::auth::load_or_generate_keys_save(&base_dir);
+
+        // Load authorized keys from file
+        let mut authorized_keys_vec = match crate::auth::load_authorized_keys(&base_dir) {
             Ok(keys) => {
-                info!("Loaded {} authorized keys", keys.len());
-                Arc::new(keys)
+                info!("Loaded {} authorized keys from file", keys.len());
+                keys
             }
             Err(e) => {
                 error!("Failed to load authorized_keys: {}", e);
-                Arc::new(Vec::new())
+                Vec::new()
             }
         };
 
-        // Load CA keys
-        let ca_keys = match crate::auth::load_authorized_cas(&base_dir) {
+        // Append authorized keys from config if present
+        if let Some(ref config_keys) = cfg.authorized_keys {
+            let joined = config_keys.join("\n");
+            match crate::auth::parse_authorized_keys_content(&joined) {
+                Ok(entries) => {
+                    info!("Added {} authorized keys from config", entries.len());
+                    authorized_keys_vec.extend(entries);
+                }
+                Err(e) => error!("Failed to parse config authorized_keys: {}", e),
+            }
+        }
+
+        // Load CA keys from file
+        let mut ca_keys_vec = match crate::auth::load_authorized_cas(&base_dir) {
             Ok(cas) => {
-                info!("Loaded {} CA keys", cas.len());
-                Arc::new(cas)
+                info!("Loaded {} CA keys from file", cas.len());
+                cas
             }
             Err(e) => {
                 error!("Failed to load authorized_cas: {}", e);
-                Arc::new(Vec::new())
+                Vec::new()
             }
         };
 
-        SshServer {
+        // Append CA keys from config if present
+        if let Some(ref config_cas) = cfg.ca_keys {
+            for line in config_cas {
+                match line.parse::<ssh_key::PublicKey>() {
+                    Ok(key) => ca_keys_vec.push(key),
+                    Err(e) => error!("Failed to parse config CA key: {} - {}", line, e),
+                }
+            }
+            info!("Added {} CA keys from config", config_cas.len());
+        }
+
+        MeshNode {
+            cfg,
             keys,
             clients: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            id_counter: Arc::new(std::sync::Mutex::new(id)),
-            authorized_keys,
-            ca_keys,
-            base_dir: base_dir.clone(),
+            id_counter: Arc::new(std::sync::Mutex::new(0)),
+            authorized_keys: Arc::new(authorized_keys_vec),
+            ca_keys: Arc::new(ca_keys_vec),
             active_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             connected_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            sftp_server_path,
-            sftp_root: sftp_root.unwrap_or(base_dir),
+            server_handle: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -156,9 +223,40 @@ impl SshServer {
     pub fn private_key(&self) -> &PrivateKey {
         &self.keys
     }
+
+    /// Convenience accessor for base_dir from config.
+    pub fn base_dir(&self) -> PathBuf {
+        self.cfg
+            .base_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    }
+
+    /// Convenience accessor for ssh_port from config.
+    pub fn ssh_port(&self) -> u16 {
+        self.cfg.ssh_port.unwrap_or(0)
+    }
+
+    /// Convenience accessor for http_port from config.
+    pub fn http_port(&self) -> Option<u16> {
+        self.cfg.http_port
+    }
+
+    /// Convenience accessor for sftp_server_path from config.
+    pub fn sftp_server_path(&self) -> Option<&str> {
+        self.cfg.sftp_server_path.as_deref()
+    }
+
+    /// Convenience accessor for sftp_root from config, defaulting to base_dir.
+    pub fn sftp_root(&self) -> PathBuf {
+        self.cfg
+            .sftp_root
+            .clone()
+            .unwrap_or_else(|| self.base_dir())
+    }
 }
 
-impl server::Server for SshServer {
+impl server::Server for MeshNode {
     type Handler = SshHandler;
 
     #[instrument(skip(self))]
@@ -181,7 +279,7 @@ impl server::Server for SshServer {
 pub async fn run_ssh_server(
     port: u16,
     config: server::Config,
-    server: SshServer,
+    server: MeshNode,
 ) -> Result<(), anyhow::Error> {
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting SSH server on {}", addr);
@@ -266,22 +364,23 @@ pub fn run_exec_command(config: ExecConfig) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Type alias for backward compatibility.
+pub type SshServer = MeshNode;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile;
 
     #[test]
-    fn test_ssh_server_creation() {
+    fn test_mesh_node_creation() {
         let temp_dir = tempfile::Builder::new()
             .prefix("ssh_server_test")
             .tempdir()
             .expect("Failed to create temp dir");
         let base_dir = temp_dir.path().to_path_buf();
 
-        let key = PrivateKey::random(&mut rand::rngs::OsRng, russh::keys::Algorithm::Ed25519)
-            .expect("Failed to generate test key");
-        let server = SshServer::new(42, Some(key), base_dir, None, None);
+        let server = MeshNode::new(Some(base_dir), None);
         let config = server.get_config();
 
         // Verify some configuration settings
@@ -290,5 +389,53 @@ mod tests {
             russh::SshId::Standard(id) => assert_eq!(id, "SSH-2.0-Rust-SSH-Server"),
             _ => panic!("Unexpected server ID format"),
         }
+    }
+
+    #[test]
+    fn test_mesh_node_config_default() {
+        let cfg = MeshNodeConfig::default();
+        assert!(cfg.sftp_server_path.is_none());
+        assert!(cfg.sftp_root.is_none());
+        assert!(cfg.base_dir.is_none());
+        assert!(cfg.ssh_port.is_none());
+        assert!(cfg.http_port.is_none());
+        assert!(cfg.authorized_keys.is_none());
+        assert!(cfg.ca_keys.is_none());
+    }
+
+    #[test]
+    fn test_mesh_node_config_json() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("mesh_cfg_test")
+            .tempdir()
+            .expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().to_path_buf();
+
+        let json_content = r#"{"sftp_server_path": "/usr/lib/sftp-server"}"#;
+        std::fs::write(base_dir.join("mesh.json"), json_content).unwrap();
+
+        let cfg = MeshNode::load_config(&base_dir);
+        assert_eq!(
+            cfg.sftp_server_path,
+            Some("/usr/lib/sftp-server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mesh_node_config_yaml() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("mesh_cfg_test")
+            .tempdir()
+            .expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().to_path_buf();
+
+        let yaml_content = "sftp_server_path: /usr/lib/sftp-server\n";
+        std::fs::write(base_dir.join("mesh.yaml"), yaml_content).unwrap();
+
+        let cfg = MeshNode::load_config(&base_dir);
+        assert_eq!(
+            cfg.sftp_server_path,
+            Some("/usr/lib/sftp-server".to_string())
+        );
     }
 }

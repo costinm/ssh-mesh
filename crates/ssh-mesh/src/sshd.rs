@@ -20,7 +20,7 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{ConnectedClientInfo, SshServer};
+use crate::{ConnectedClientInfo, MeshNode};
 
 /// SshHandler is responsible for one server multiplexed connection.
 ///
@@ -29,7 +29,7 @@ use crate::{ConnectedClientInfo, SshServer};
 #[derive(Clone)]
 pub struct SshHandler {
     pub(crate) id: usize,
-    pub(crate) server: SshServer,
+    pub(crate) server: MeshNode,
 
     // streams multiplexed on the client TCP connection
     // TODO: rename to streams, including (exec/shell) session and forwards.
@@ -91,7 +91,7 @@ fn build_command(command: &Option<String>) -> Command {
 }
 
 impl SshHandler {
-    pub(crate) fn new(id: usize, server: SshServer) -> Self {
+    pub(crate) fn new(id: usize, server: MeshNode) -> Self {
         SshHandler {
             id,
             server,
@@ -1194,7 +1194,7 @@ impl server::Handler for SshHandler {
         async move {
             if subsystem_name == "sftp" {
                 #[cfg(feature = "sftp")]
-                if self.server.sftp_server_path.is_none() {
+                if self.server.cfg.sftp_server_path.is_none() {
                     info!("Starting built-in SFTP server for channel");
                     // Create input channel (SSH -> SFTP)
                     let (tx_in, rx_in) = mpsc::unbounded_channel::<Bytes>();
@@ -1226,7 +1226,7 @@ impl server::Handler for SshHandler {
                         let _ = session_handle_clone.close(channel_id).await;
                     });
                     // Start SFTP server
-                    let sftp_root = self.server.sftp_root.clone();
+                    let sftp_root = self.server.sftp_root();
                     tokio::spawn(async move {
                         let handler = sftp_server::FileSystemHandler::new(sftp_root);
                         russh_sftp::server::run(stream, handler).await;
@@ -1236,12 +1236,13 @@ impl server::Handler for SshHandler {
                 }
 
                 {
-                    let default_path = "/usr/lib/openssh/sftp-server".to_string();
+                    let default_path = "/usr/lib/openssh/sftp-server";
                     let sftp_server_path = self
                         .server
+                        .cfg
                         .sftp_server_path
-                        .as_ref()
-                        .unwrap_or(&default_path);
+                        .as_deref()
+                        .unwrap_or(default_path);
 
                     if !std::path::Path::new(sftp_server_path).exists() {
                         error!("SFTP server binary not found at {}", sftp_server_path);
@@ -1251,10 +1252,11 @@ impl server::Handler for SshHandler {
 
                     info!(
                         "Spawning SFTP server: {} in {:?}",
-                        sftp_server_path, self.server.base_dir
+                        sftp_server_path,
+                        self.server.base_dir()
                     );
                     let mut cmd = Command::new(sftp_server_path);
-                    cmd.current_dir(&self.server.base_dir)
+                    cmd.current_dir(&self.server.base_dir())
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped());

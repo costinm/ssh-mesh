@@ -116,7 +116,7 @@ impl PerfettoPull {
         }
 
         let mut session_lock = self.session.lock().unwrap();
-        // flush before stop
+        // Flush must happen before stop — flushing after stop is a no-op
         session_lock.0.flush_blocking(Duration::from_millis(500));
         session_lock.0.stop_blocking();
 
@@ -200,7 +200,7 @@ impl PerfettoPull {
     }
 }
 
-fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
+pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0;
     for (i, &b) in data.iter().enumerate() {

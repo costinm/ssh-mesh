@@ -89,7 +89,7 @@ async fn test_local_tcp_forwarding() -> Result<()> {
         assert_eq!(&buffer[..n], message);
 
         ssh_client_process.kill()?;
-        setup.server_handle.abort();
+        setup.abort_server();
 
         Ok(())
     })
@@ -148,7 +148,7 @@ async fn test_remote_tcp_forwarding() -> Result<()> {
         assert_eq!(&buffer[..n], message);
 
         ssh_client_process.kill()?;
-        setup.server_handle.abort();
+        setup.abort_server();
 
         Ok(())
     })
@@ -211,7 +211,7 @@ async fn test_local_tcp_forwarding_large_data() -> Result<()> {
         }).await?;
 
         ssh_client_process.kill()?;
-        setup.server_handle.abort();
+        setup.abort_server();
 
         Ok(())
     })
@@ -258,7 +258,7 @@ async fn test_local_tcp_forwarding_localhost() -> Result<()> {
         assert_eq!(&buffer[..n], message);
 
         ssh_client_process.kill()?;
-        setup.server_handle.abort();
+        setup.abort_server();
 
         Ok(())
     })

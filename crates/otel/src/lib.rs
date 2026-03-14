@@ -254,6 +254,7 @@ where
 }
 
 pub fn init_telemetry() {
+    dotenvy::dotenv().ok();
     let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .or_else(|_| env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"));
 
@@ -295,7 +296,7 @@ pub fn init_telemetry() {
                 }
             );
             headers.insert("Authorization".to_string(), auth_val);
-            headers.insert("stream-name".to_string(), format!("default"));
+            headers.insert("stream-name".to_string(), format!("otrs"));
         }
 
         let insecure = env::var("OTEL_EXPORTER_OTLP_INSECURE")
@@ -368,3 +369,5 @@ pub fn init_telemetry() {
         .init();
 }
 pub mod perfetto_pull;
+pub mod proto_extractor;
+pub mod trace_server;

@@ -87,7 +87,7 @@ async fn test_uds_proxy() -> Result<()> {
     let data = frame.into_data().map_err(|_| anyhow::anyhow!("Not data"))?;
     assert_eq!(&data[..], &message[..]);
 
-    setup.server_handle.abort();
+    setup.abort_server();
     Ok(())
 }
 
@@ -126,7 +126,7 @@ async fn test_exec_cat() -> Result<()> {
     let data = frame.into_data().map_err(|_| anyhow::anyhow!("Not data"))?;
     assert_eq!(&data[..], &message[..]);
 
-    setup.server_handle.abort();
+    setup.abort_server();
     Ok(())
 }
 
@@ -165,6 +165,6 @@ async fn test_exec_env() -> Result<()> {
     let output = String::from_utf8(full_data)?;
     assert!(output.contains("SUCCESS"));
 
-    setup.server_handle.abort();
+    setup.abort_server();
     Ok(())
 }

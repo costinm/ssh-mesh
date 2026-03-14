@@ -475,6 +475,33 @@ impl ProcMon {
         Ok(())
     }
 
+    /// Freeze or unfreeze a process
+    pub fn freeze_process(&self, pid: u32, freeze: bool) -> Result<(), PmondError> {
+        let sig = if freeze { libc::SIGSTOP } else { libc::SIGCONT };
+        let res = unsafe { libc::kill(pid as i32, sig) };
+        if res == 0 {
+            info!("Successfully sent signal {} to process {}", sig, pid);
+            Ok(())
+        } else {
+            let err = std::io::Error::last_os_error();
+            error!("Failed to freeze/unfreeze process {}: {}", pid, err);
+            Err(PmondError::Io(err))
+        }
+    }
+
+    /// Freeze or unfreeze a cgroup
+    pub fn freeze_cgroup(&self, cgroup_path: &str, freeze: bool) -> Result<(), PmondError> {
+        let freeze_path = format!("{}/cgroup.freeze", cgroup_path);
+        let val = if freeze { "1" } else { "0" };
+        fs::write(&freeze_path, val).map_err(|e| {
+            let msg = format!("Failed to write to {}: {}", freeze_path, e);
+            error!("{}", msg);
+            PmondError::CgroupError(msg)
+        })?;
+        info!("Successfully set {} to {}", freeze_path, val);
+        Ok(())
+    }
+
     /// Get all PSI watches and their current status.
     pub fn get_psi_watches(&self) -> std::collections::HashMap<String, crate::psi::PressureInfo> {
         self.psi_watcher.watches.lock().clone()

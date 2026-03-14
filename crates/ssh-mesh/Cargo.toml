@@ -25,7 +25,7 @@ name = "sshmc"
 path = "src/bin/sshmc.rs"
 
 [features]
-default = ["test-utils", "sftp", "pmon", "ws"]
+default = ["test-utils", "sftp", "pmon"]
 test-utils = ["tempfile", "once_cell"]
 pmon = ["dep:pmond"]
 sftp = ["dep:sftp-server", "dep:russh-sftp"]
@@ -81,6 +81,8 @@ sftp-server = { path = "../sftp", optional = true }
 pmond = { path = "../pmond", optional = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 env_logger = "0.11"
+serde_yaml = "0.9.34"
+config = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] }

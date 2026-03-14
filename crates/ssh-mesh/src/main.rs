@@ -19,11 +19,13 @@ use tracing_subscriber::{EnvFilter, Registry, reload};
 ///
 /// The tracing level can be dynamically changed at runtime using the reload handle.
 /// All log events are also captured in the provided log buffer for viewing via WebSocket.
-fn init_telemetry(log_buffer: ssh_mesh::local_trace::LogBuffer) {
+fn init_telemetry() {
     let filter = EnvFilter::from_default_env();
     let (filter, reload_handle) = reload::Layer::new(filter);
+
     let fmt_layer = tracing_subscriber::fmt::layer().compact();
-    let buffer_layer = ssh_mesh::local_trace::LogBufferLayer::new(log_buffer);
+
+    let buffer_layer = ssh_mesh::local_trace::LogBufferLayer::new();
 
     Registry::default()
         .with(filter)
@@ -54,14 +56,11 @@ fn get_port_from_env(var_name: &str, default: u16) -> u16 {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Create log buffer early so we can initialize telemetry with it
-    let log_buffer = ssh_mesh::local_trace::create_log_buffer();
-
-    init_telemetry(log_buffer.clone());
+    init_telemetry();
 
     // Import required items
     use log::{error, info};
-    use ssh_mesh::{AppState, ExecConfig, SshServer, handlers, run_ssh_server};
+    use ssh_mesh::{AppState, ExecConfig, MeshNode, MeshNodeConfig, handlers, run_ssh_server};
 
     let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
 
@@ -84,17 +83,53 @@ async fn main() -> Result<(), anyhow::Error> {
             path
         });
 
-    let sftp_server_path = env::var("SFTP_SERVER_PATH").ok();
-    let sftp_root = env::var("SFTP_ROOT").ok().map(PathBuf::from);
+    // Create config from env vars, layering: defaults → config file → env vars
+    let cfg: MeshNodeConfig = {
+        let mut builder = config::Config::builder()
+            .set_default("ssh_port", ssh_port as i64)
+            .unwrap()
+            .set_default("sftp_server_path", env::var("SFTP_SERVER_PATH").ok())
+            .unwrap()
+            .set_default("sftp_root", env::var("SFTP_ROOT").ok())
+            .unwrap();
 
-    // Create SSH server instance
-    let ssh_server = Arc::new(SshServer::new(
-        0,
-        None,
-        base_dir.clone(),
-        sftp_server_path,
-        sftp_root,
-    ));
+        // Layer config file from base_dir (mesh.yaml, mesh.json, mesh.toml)
+        for ext in &["yaml", "json", "toml"] {
+            let path = base_dir.join(format!("mesh.{}", ext));
+            if path.exists() {
+                builder = builder.add_source(config::File::from(path));
+                break;
+            }
+        }
+
+        // Layer env overrides
+        if http_port > 0 {
+            builder = builder.set_override("http_port", http_port as i64).unwrap();
+        }
+
+        match builder.build().and_then(|c| c.try_deserialize()) {
+            Ok(mut c) => {
+                let c: &mut MeshNodeConfig = &mut c;
+                c.base_dir = Some(base_dir.clone());
+                c.ssh_port = Some(ssh_port);
+                c.clone()
+            }
+            Err(e) => {
+                log::warn!("Failed to load config via config-rs, using defaults: {}", e);
+                MeshNodeConfig {
+                    base_dir: Some(base_dir.clone()),
+                    ssh_port: Some(ssh_port),
+                    http_port: if http_port > 0 { Some(http_port) } else { None },
+                    sftp_server_path: env::var("SFTP_SERVER_PATH").ok(),
+                    sftp_root: env::var("SFTP_ROOT").ok().map(PathBuf::from),
+                    ..Default::default()
+                }
+            }
+        }
+    };
+
+    // Create MeshNode instance
+    let ssh_server = Arc::new(MeshNode::new(Some(base_dir.clone()), Some(cfg)));
 
     // Create WebSocket server instance
     #[cfg(feature = "ws")]
@@ -118,7 +153,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
         target_http_address: std::env::var("APP_HTTP_PORT").ok(),
-        log_buffer: log_buffer.clone(),
         ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new(
             ssh_server.private_key().clone(),
             (*ssh_server.ca_keys).clone(),

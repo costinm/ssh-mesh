@@ -19,9 +19,9 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::psi::{PressureData, PressureEvent, PressureInfo, PressureType};
 use crate::{
-    CGroupInfo, CgroupHighArgs, ClearRefsArgs, GetCgroupArgs, GetProcessArgs, ListCgroupsArgs,
-    ListProcessesArgs, MoveProcessArgs, ProcMemInfo, ProcessDetailedInfo, ProcessInfo,
-    PsiWatchesArgs,
+    CGroupInfo, CgroupHighArgs, ClearRefsArgs, FreezeCgroupArgs, FreezeProcessArgs,
+    GetCgroupArgs, GetProcessArgs, ListCgroupsArgs, ListProcessesArgs, MoveProcessArgs,
+    ProcMemInfo, ProcessDetailedInfo, ProcessInfo, PsiWatchesArgs,
 };
 
 #[derive(RustEmbed)]
@@ -49,14 +49,17 @@ pub struct AppState {
         handle_cgroup_high_request,
         handle_cgroup_procs_request,
         handle_move_process_request,
-        handle_clear_refs_request
+        handle_clear_refs_request,
+        handle_freeze_process_request,
+        handle_freeze_cgroup_request
     ),
     components(
         schemas(
             ProcessInfo, ProcessDetailedInfo, CGroupInfo, ProcMemInfo, CgroupProcsPayload,
             ListProcessesArgs, GetProcessArgs, ListCgroupsArgs, GetCgroupArgs,
             MoveProcessArgs, ClearRefsArgs, CgroupHighArgs, PsiWatchesArgs,
-            PressureInfo, PressureData, PressureEvent, PressureType
+            PressureInfo, PressureData, PressureEvent, PressureType,
+            FreezeProcessArgs, FreezeCgroupArgs
         )
     ),
     tags(
@@ -341,6 +344,68 @@ pub async fn handle_clear_refs_request(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/_m/pmon/_freeze_process",
+    tag = "pmond",
+    request_body = FreezeProcessArgs,
+    responses(
+        (status = 200, description = "Freeze or unfreeze a process by sending SIGSTOP/SIGCONT")
+    )
+)]
+pub async fn handle_freeze_process_request(
+    State(app_state): State<AppState>,
+    Json(payload): Json<FreezeProcessArgs>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let action = if payload.freeze { "freeze" } else { "unfreeze" };
+    info!("Received {} request for PID: {}", action, payload.pid);
+
+    match app_state.proc_mon.freeze_process(payload.pid, payload.freeze) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "message": format!("Successfully {}d process {}", action, payload.pid)
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/_m/pmon/_freeze_cgroup",
+    tag = "pmond",
+    request_body = FreezeCgroupArgs,
+    responses(
+        (status = 200, description = "Freeze or unfreeze all processes in a cgroup via cgroup.freeze")
+    )
+)]
+pub async fn handle_freeze_cgroup_request(
+    State(app_state): State<AppState>,
+    Json(payload): Json<FreezeCgroupArgs>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let action = if payload.freeze { "freeze" } else { "unfreeze" };
+    info!("Received {} request for cgroup: {}", action, payload.path);
+
+    match app_state.proc_mon.freeze_cgroup(&payload.path, payload.freeze) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "message": format!("Successfully {}d cgroup {}", action, payload.path)
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
 // ============================================================================
 // Static Pages
 // ============================================================================
@@ -421,6 +486,8 @@ pub fn app(proc_mon: Arc<ProcMon>) -> Router {
         .route("/_m/pmon/_cgroup_procs", post(handle_cgroup_procs_request))
         .route("/_m/pmon/_move_process", post(handle_move_process_request))
         .route("/_m/pmon/_clear_refs", post(handle_clear_refs_request))
+        .route("/_m/pmon/_freeze_process", post(handle_freeze_process_request))
+        .route("/_m/pmon/_freeze_cgroup", post(handle_freeze_cgroup_request))
         .route(
             "/_m/pmon/api-docs/openapi.json",
             get(|| async { Json(ApiDoc::openapi()) }),
