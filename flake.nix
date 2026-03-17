@@ -47,9 +47,6 @@
           inherit nativeBuildInputs buildInputs;
 
           CARGO_BUILD_TARGET = "${pkgs.stdenv.hostPlatform.config}";
-          # Fix for Rust 1.85+ defaulting to rust-lld which breaks nixpkgs glibc linking for build.rs
-          # CARGO_TARGET_*_RUSTFLAGS are ignored by cargo for host build scripts, but CARGO_HOST_RUSTFLAGS works.
-          CARGO_HOST_RUSTFLAGS = "-C link-arg=-fuse-ld=bfd -C linker-flavor=gcc";
         };
 
         # MUSL target string for the current system

@@ -1,17 +1,6 @@
 [build]
 #target-dir = "out/rust1"
-#target = "x86_64-unknown-linux-musl"
-
-[host]
-rustflags = ["-C", "linker=gcc"]
-
-[target.x86_64-unknown-linux-gnu]
-linker = "gcc"
-rustflags = ["-C", "linker=gcc"]
-
-[target.aarch64-unknown-linux-gnu]
-linker = "gcc"
-rustflags = ["-C", "linker=gcc"]
+target = "x86_64-unknown-linux-musl"
 
 [env]
 BORING_BSSL_FIPS_PATH = { value = "vendor/boringssl-fips/linux_x86_64", force = true, relative = true }
