@@ -25,10 +25,7 @@
           inherit system overlays;
         };
 
-        crossPkgs = import nixpkgs {
-          inherit system overlays;
-          crossSystem.config = muslTarget;
-        };
+
 
         # Properly spliced toolchain for cross-compilation within Crane
         craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default.override {
