@@ -1,4 +1,4 @@
-name: docker
+name: CI
 
 on:
   push:
@@ -11,6 +11,58 @@ permissions:
   contents: write
 
 jobs:
+  # ── Nix build: native (x86_64 + ARM64 via matrix) ──────────────
+  nix-build:
+    name: Nix (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64-linux
+            runner: ubuntu-latest
+          - arch: aarch64-linux
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build all packages
+        run: nix build .#ssh-mesh .#pmond .#h2t .#meshkeys .#sshmc --print-build-logs
+
+      - name: Create NAR archives
+        run: |
+          mkdir -p artifacts
+
+          for pkg in ssh-mesh pmond h2t meshkeys sshmc; do
+            nix build .#${pkg} --print-build-logs
+            nix-store --dump ./result > artifacts/${pkg}-${{ matrix.arch }}.nar
+          done
+
+          # Also create a combined archive with all binaries
+          mkdir -p combined/bin
+          for pkg in ssh-mesh pmond h2t meshkeys sshmc; do
+            nix build .#${pkg} --print-build-logs
+            cp -L ./result/bin/* combined/bin/ 2>/dev/null || true
+          done
+          nix-store --dump combined > artifacts/ssh-mesh-all-${{ matrix.arch }}.nar
+
+          ls -lh artifacts/
+
+      - name: Upload NAR artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nar-${{ matrix.arch }}
+          path: artifacts/*.nar
+          retention-days: 90
+
+  # ── Docker build (existing) ────────────────────────────────────
   build-docker:
     name: Build-in-docker
     runs-on: ubuntu-latest
@@ -39,3 +91,24 @@ jobs:
           tags: ghcr.io/costinm/sshm:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ── Release: attach NARs to GitHub releases ────────────────────
+  release:
+    name: Attach NARs to release
+    needs: [nix-build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all NAR artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nar-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.nar

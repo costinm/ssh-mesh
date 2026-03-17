@@ -1,4 +1,4 @@
-//! 9P filesystem server.
+                //! 9P filesystem server.
 //!
 //! Serves the unpfs (Unix Passthrough Filesystem) using the 9P2000.L protocol.
 //! Can serve over stdin/stdout (default) or listen on a Unix Domain Socket.

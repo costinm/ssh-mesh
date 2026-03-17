@@ -1,8 +1,0 @@
-{
-  "owner_key": [
-    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15"
-  ],
-  "sshd_addr": ":2223",
-  "h2c-addr": ":2282",
-  "trustDomain": "s.webinf.duckdns.org"
-}
