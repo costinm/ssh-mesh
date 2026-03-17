@@ -1,0 +1,24 @@
+[build]
+#target-dir = "out/rust1"
+#target = "x86_64-unknown-linux-musl"
+
+[host]
+rustflags = ["-C", "linker=gcc"]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "gcc"
+rustflags = ["-C", "linker=gcc"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "gcc"
+rustflags = ["-C", "linker=gcc"]
+
+[env]
+BORING_BSSL_FIPS_PATH = { value = "vendor/boringssl-fips/linux_x86_64", force = true, relative = true }
+BORING_BSSL_FIPS_INCLUDE_PATH = { value = "vendor/boringssl-fips/include/", force = true, relative = true }
+
+[target.86_64-linux-android]
+ar = "/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android26-ar"
+# linker = "/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
+linker = "XXX/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
+cc = "/opt/Android/Sdk/ndk/default/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
