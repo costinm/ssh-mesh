@@ -14,17 +14,28 @@
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
+        # MUSL target string for the current system
+        muslTarget =
+          if system == "x86_64-linux" then "x86_64-unknown-linux-musl"
+          else if system == "aarch64-linux" then "aarch64-unknown-linux-musl"
+          else throw "Unsupported system: ${system}";
+
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
           inherit system overlays;
         };
 
-        # Use latest stable Rust (edition 2024 requires >= 1.85)
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl" ];
+        crossPkgs = import nixpkgs {
+          inherit system overlays;
+          crossSystem.config = muslTarget;
         };
 
-        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        # Use latest stable Rust (edition 2024 requires >= 1.85)
+        rustToolchain = crossPkgs.rust-bin.stable.latest.default.override {
+          targets = [ muslTarget ];
+        };
+
+        craneLib = (crane.mkLib crossPkgs).overrideToolchain rustToolchain;
 
         # Common source filtering
         src = craneLib.cleanCargoSource ./.;
@@ -49,39 +60,10 @@
           CARGO_BUILD_TARGET = "${pkgs.stdenv.hostPlatform.config}";
         };
 
-        # MUSL target string for the current system
-        muslTarget =
-          if system == "x86_64-linux" then "x86_64-unknown-linux-musl"
-          else if system == "aarch64-linux" then "aarch64-unknown-linux-musl"
-          else throw "Unsupported system: ${system}";
-
-        muslTargetEnvName =
-          if system == "x86_64-linux" then "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"
-          else if system == "aarch64-linux" then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"
-          else throw "Unsupported system";
-
-        muslTargetLinkerEnvName =
-          if system == "x86_64-linux" then "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
-          else if system == "aarch64-linux" then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
-          else throw "Unsupported system";
-
-        muslTargetCcEnvName =
-          if system == "x86_64-linux" then "CC_x86_64_unknown_linux_musl"
-          else if system == "aarch64-linux" then "CC_aarch64_unknown_linux_musl"
-          else throw "Unsupported system";
-
-        # Extract the correct cross pkgs depending on the architecture
-        crossPkgs =
-          if system == "x86_64-linux" then pkgs.pkgsCross.musl64
-          else if system == "aarch64-linux" then pkgs.pkgsCross.aarch64-multiplatform-musl
-          else throw "Unsupported system";
-
         # Common args for static MUSL builds
         muslArgs = commonArgs // {
           CARGO_BUILD_TARGET = muslTarget;
-          "${muslTargetEnvName}" = "-C target-feature=+crt-static";
-          "${muslTargetLinkerEnvName}" = "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
-          "${muslTargetCcEnvName}" = "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
         };
 
         # Build workspace dependencies first (for caching)
