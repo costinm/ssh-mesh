@@ -24,6 +24,44 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 use tracing_subscriber::{EnvFilter, Registry};
 
+#[cfg(target_env = "musl")]
+#[no_mangle]
+pub static __libc_single_threaded: u8 = 0;
+
+/// Add missing __cmsg_nxthdr symbol for musl build.
+/// This is used by perfetto C++ code to iterate over ancillary data (cmsghdr).
+/// On musl, CMSG_NXTHDR is usually a macro or an inline function that doesn't have an external symbol.
+#[cfg(target_env = "musl")]
+#[no_mangle]
+pub unsafe extern "C" fn __cmsg_nxthdr(
+    mhdr: *mut libc::msghdr,
+    cmsg: *mut libc::cmsghdr,
+) -> *mut libc::cmsghdr {
+    if cmsg.is_null() {
+        if (*mhdr).msg_controllen >= std::mem::size_of::<libc::cmsghdr>() as _ {
+            return (*mhdr).msg_control as *mut _;
+        } else {
+            return std::ptr::null_mut();
+        }
+    }
+    // Simple implementation following musl/glibc:
+    if ((*cmsg).cmsg_len as usize) < std::mem::size_of::<libc::cmsghdr>() {
+        return std::ptr::null_mut();
+    }
+
+    // Align to size of size_t (8 on 64-bit)
+    let align = std::mem::size_of::<usize>();
+    let cmsg_len_aligned = ((*cmsg).cmsg_len as usize + (align - 1)) & !(align - 1);
+    let next = (cmsg as *mut u8).add(cmsg_len_aligned) as *mut libc::cmsghdr;
+
+    if (next as *mut u8).add(std::mem::size_of::<libc::cmsghdr>())
+        > ((*mhdr).msg_control as *mut u8).add((*mhdr).msg_controllen as _)
+    {
+        return std::ptr::null_mut();
+    }
+    next
+}
+
 track_event_categories! {
     pub mod te_ns {
         ( "default", "Default category", [] ),
