@@ -242,9 +242,9 @@ impl MuxClient {
     pub async fn open_local_forward(
         &mut self,
         listen_host: &str,
-        listen_port: u16,
+        listen_port: u32,
         connect_host: &str,
-        connect_port: u16,
+        connect_port: u32,
     ) -> Result<Option<u32>> {
         let req_id = self.alloc_req_id();
 
@@ -288,9 +288,9 @@ impl MuxClient {
     pub async fn open_remote_forward(
         &mut self,
         listen_host: &str,
-        listen_port: u16,
+        listen_port: u32,
         connect_host: &str,
-        connect_port: u16,
+        connect_port: u32,
     ) -> Result<Option<u32>> {
         let req_id = self.alloc_req_id();
 
@@ -325,9 +325,9 @@ impl MuxClient {
         &mut self,
         fwd_type: u32,
         listen_host: &str,
-        listen_port: u16,
+        listen_port: u32,
         connect_host: &str,
-        connect_port: u16,
+        connect_port: u32,
     ) -> Result<()> {
         let req_id = self.alloc_req_id();
 

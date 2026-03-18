@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use hyper::body::Bytes;
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
@@ -799,6 +799,8 @@ impl server::Handler for SshHandler {
                 listeners.insert((bind_addr.clone(), bind_port), shutdown_tx);
             }
 
+            let remote_forward_listeners_weak = Arc::downgrade(&remote_forward_listeners);
+
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -830,7 +832,7 @@ impl server::Handler for SshHandler {
                                         // Set up bidirectional data forwarding
                                         let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
-                                        // Store the TCP writer for SSH to TCP forwarding
+                                        // Store the TCP writer for SSH→TCP forwarding
                                         let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
                                         {
                                             let mut writers = tcp_writers_clone.lock().await;
@@ -862,11 +864,16 @@ impl server::Handler for SshHandler {
                             info!("Shutting down remote forward listener on {}:{}", bind_addr, bind_port);
                             break;
                         }
+                        else => {
+                            break;
+                        }
                     }
                 }
                 // Cleanup
-                let mut listeners = remote_forward_listeners.lock().await;
-                listeners.remove(&(bind_addr, bind_port));
+                if let Some(listeners_arc) = remote_forward_listeners_weak.upgrade() {
+                    let mut listeners = listeners_arc.lock().await;
+                    listeners.remove(&(bind_addr, bind_port));
+                }
             });
 
             (Ok(()), actual_port)
@@ -910,6 +917,184 @@ impl server::Handler for SshHandler {
                     "No active forwarding found for {}:{} to cancel",
                     address,
                     port
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Handle streamlocal-forward@openssh.com — remote UDS forwarding.
+    ///
+    /// The client asks us to listen on a Unix domain socket path on the
+    /// server side. When a connection arrives we open a
+    /// `forwarded-streamlocal@openssh.com` channel back to the client so
+    /// it can pipe data to its local socket.
+    #[instrument(skip(self, session), fields(socket_path = %socket_path))]
+    fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        session: &mut server::Session,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        info!("streamlocal_forward request for {}", socket_path);
+
+        let session_handle = session.handle();
+        let channel_writers = self.channel_writers.clone();
+        let remote_forward_listeners = self.remote_forward_listeners.clone();
+        let socket_path_owned = socket_path.to_string();
+
+        async move {
+            // Remove stale socket if present
+            let _ = tokio::fs::remove_file(&socket_path_owned).await;
+
+            // Ensure parent directory exists
+            if let Some(parent) = std::path::Path::new(&socket_path_owned).parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+
+            let listener = match UnixListener::bind(&socket_path_owned) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Failed to bind UDS {}: {}", socket_path_owned, e);
+                    return Ok(false);
+                }
+            };
+
+            info!("Listening on UDS {} for streamlocal forward", socket_path_owned);
+
+            // Channel to signal shutdown
+            let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+
+            {
+                let mut listeners = remote_forward_listeners.lock().await;
+                // Use port 0 as the key component for UDS forwards
+                listeners.insert((socket_path_owned.clone(), 0), shutdown_tx);
+            }
+
+            let sp = socket_path_owned.clone();
+            let remote_forward_listeners_weak = Arc::downgrade(&remote_forward_listeners);
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            match accepted {
+                                Ok((uds_stream, _addr)) => {
+                                    info!("Accepted connection on UDS {}", sp);
+                                    let session_handle_clone = session_handle.clone();
+                                    let channel_writers_clone = channel_writers.clone();
+                                    let sp_clone = sp.clone();
+
+                                    tokio::spawn(async move {
+                                        // Open a forwarded-streamlocal channel
+                                        // back to the client
+                                        let channel = match session_handle_clone
+                                            .channel_open_forwarded_streamlocal(&sp_clone)
+                                            .await
+                                        {
+                                            Ok(channel) => channel,
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to open forwarded-streamlocal channel for {}: {}",
+                                                    sp_clone, e
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let channel_id = channel.id();
+                                        info!(
+                                            "Opened forwarded-streamlocal channel {:?} for {}",
+                                            channel_id, sp_clone
+                                        );
+
+                                        // Set up bidirectional data forwarding
+                                        let (uds_reader, uds_writer) = uds_stream.into_split();
+
+                                        // Store the UDS writer for SSH→UDS forwarding
+                                        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                                        {
+                                            let mut writers = channel_writers_clone.lock().await;
+                                            writers.insert(channel_id, tx);
+                                        }
+
+                                        // UDS → SSH channel
+                                        let session_handle_clone2 = session_handle_clone.clone();
+                                        let cw2 = channel_writers_clone.clone();
+                                        tokio::spawn(async move {
+                                            crate::utils::pipe_read_to_ssh(
+                                                uds_reader,
+                                                session_handle_clone2,
+                                                channel_id,
+                                                "streamlocal UDS to SSH",
+                                            )
+                                            .await;
+                                            let mut writers = cw2.lock().await;
+                                            writers.remove(&channel_id);
+                                        });
+
+                                        // SSH channel → UDS
+                                        let cw3 = channel_writers_clone.clone();
+                                        tokio::spawn(async move {
+                                            crate::utils::pipe_rx_to_write(
+                                                rx,
+                                                uds_writer,
+                                                "SSH to streamlocal UDS",
+                                            )
+                                            .await;
+                                            let mut writers = cw3.lock().await;
+                                            writers.remove(&channel_id);
+                                        });
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Failed to accept on UDS {}: {}", sp, e);
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            info!("Shutting down streamlocal forward listener on {}", sp);
+                            break;
+                        }
+                        else => {
+                            // If shutdown channel is closed (sender dropped) or
+                            // both branches are unreachable, stop the loop.
+                            break;
+                        }
+                    }
+                }
+                // Cleanup socket file
+                let _ = tokio::fs::remove_file(&sp).await;
+                // Only attempt to remove from listener map if SshHandler still exists
+                if let Some(listeners_arc) = remote_forward_listeners_weak.upgrade() {
+                    let mut listeners = listeners_arc.lock().await;
+                    listeners.remove(&(sp, 0));
+                }
+            });
+
+            Ok(true)
+        }
+    }
+
+    /// Cancel a streamlocal forward — stop listening on the UDS path.
+    #[instrument(skip(self, _session), fields(socket_path = %socket_path))]
+    fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut server::Session,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        info!("cancel_streamlocal_forward for {}", socket_path);
+        let remote_forward_listeners = self.remote_forward_listeners.clone();
+        let socket_path_owned = socket_path.to_string();
+
+        async move {
+            let mut listeners = remote_forward_listeners.lock().await;
+            if let Some(shutdown_tx) = listeners.remove(&(socket_path_owned.clone(), 0)) {
+                let _ = shutdown_tx.send(());
+                info!("Cancelled streamlocal forward for {}", socket_path_owned);
+                Ok(true)
+            } else {
+                log::warn!(
+                    "No active streamlocal forward found for {} to cancel",
+                    socket_path_owned
                 );
                 Ok(false)
             }

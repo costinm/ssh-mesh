@@ -315,6 +315,11 @@ pub async fn run_ssh_server(
             }
 
             // Explicit cleanup after session ends (for any reason: disconnect, kill, error)
+            {
+                let mut active_handlers = server_clone.active_handlers.lock().unwrap();
+                active_handlers.remove(&handler_id);
+            }
+
             let mut clients = server_clone.connected_clients.lock().await;
             if clients.remove(&handler_id).is_some() {
                 debug!("Removed client {} from connected_clients", handler_id);

@@ -37,16 +37,23 @@
 //! The `-S` option can override this and point to a specific file.
 use anyhow::{Context, Result};
 use clap::Parser;
+use http_body_util::Full;
+use hyper::Request;
+use hyper::body::Bytes;
+use hyper_util::rt::TokioIo;
 use log::debug;
 use nix::unistd;
+use serde_json::json;
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::net::UnixStream;
+use tokio::time::sleep;
 
-// TODO: 
+// TODO:
 // - add '-f -N' - to put in background or drop stdin (backward compat)
-// - if forward + command is passed, exit 
+// - if forward + command is passed, exit
 // - add option to stop forwarding
 // - fix terminal echo and exit in shell
-
 
 #[derive(Parser, Debug)]
 #[command(name = "sshmc", about = "OpenSSH mux protocol client")]
@@ -94,15 +101,24 @@ enum ForwardSpec {
         connect_host: String,
         connect_port: u16,
     },
-    // Unix sockets not fully supported/implemented in parsing yet based on simple strings,
-    // but structure allows expansion.
+    Unix {
+        listen_path: String,
+        connect_path: String,
+    },
 }
 
 fn parse_forward_spec(s: &str, is_remote: bool) -> Result<ForwardSpec> {
-    // Simplified parsing logic to handle common cases:
-    // [bind_addr:]port:host:hostport
-    // port:host:hostport (bind_addr defaults to "localhost" or "*" depending on mode, but doc says localhost for -L)
+    // Check if it looks like unix socket forwarding: /path/to/socket:/another/path
+    if s.starts_with('/') {
+        if let Some((listen, connect)) = s.split_once(':') {
+            return Ok(ForwardSpec::Unix {
+                listen_path: listen.to_string(),
+                connect_path: connect.to_string(),
+            });
+        }
+    }
 
+    // [bind_addr:]port:host:hostport
     let parts: Vec<&str> = s.split(':').collect();
 
     let (listen_host, listen_port, connect, connect_port_idx) = if parts.len() == 4 {
@@ -144,10 +160,10 @@ fn resolve_socket_path(cli: &Cli) -> Result<PathBuf> {
     }
 
     let dest = &cli.destination;
-    let (_user, host) = if let Some((u, h)) = dest.split_once('@') {
+    let (user, host) = if let Some((u, h)) = dest.split_once('@') {
         (u.to_string(), h.to_string())
     } else {
-        let current_user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        let current_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
         (current_user, dest.clone())
     };
 
@@ -158,7 +174,7 @@ fn resolve_socket_path(cli: &Cli) -> Result<PathBuf> {
             PathBuf::from(format!("/run/user/{}/sshmux", uid))
         });
 
-    let filename = format!("{}", host);
+    let filename = format!("ssh-{}@{}", user, host);
     Ok(mux_dir.join(filename))
 }
 
@@ -170,17 +186,95 @@ async fn main() -> Result<()> {
     let socket_path = resolve_socket_path(&cli)?;
     debug!("Connecting to mux socket at {:?}", socket_path);
 
-    let mut client = ssh_mesh::sshmuxc::MuxClient::connect(&socket_path)
-        .await
-        .context(format!(
-            "Failed to connect to mux socket at {:?}",
-            socket_path
-        ))?;
+    let mut client = match ssh_mesh::sshmuxc::MuxClient::connect(&socket_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("Failed to connect to mux, trying UDS HTTP fallback: {}", e);
+
+            let base_dir = std::env::var("SSH_BASEDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let mut path = std::env::var("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+                    path.push(".ssh");
+                    path
+                });
+            let control_uds_path = base_dir.join("control.sock");
+
+            // Fallback: try to request a connection via HTTP API over UDS
+            let (user, host) = if let Some((u, h)) = cli.destination.split_once('@') {
+                (u.to_string(), h.to_string())
+            } else {
+                (
+                    std::env::var("USER").unwrap_or_else(|_| "root".to_string()),
+                    cli.destination.clone(),
+                )
+            };
+
+            let json_body = json!({
+                "host": host,
+                "port": 15022,
+                "user": user,
+                "server_key": ""
+            })
+            .to_string();
+
+            let stream = UnixStream::connect(&control_uds_path)
+                .await
+                .context(format!("Failed to connect to control UDS at {:?}", control_uds_path))?;
+
+            let (mut request_sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .context("HTTP handshake failed")?;
+
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    debug!("Error in UDS connection: {}", e);
+                }
+            });
+
+            let request = Request::builder()
+                .uri("/_m/api/sshc/connect")
+                .method("POST")
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(json_body)))
+                .context("Failed to build HTTP request")?;
+
+            let response = request_sender
+                .send_request(request)
+                .await
+                .context("Failed to send HTTP request over UDS")?;
+
+            if response.status().is_success() {
+                debug!("HTTP connect request successful, waiting for mux socket...");
+                // Wait for the mux socket to be created
+                let mut maybe_client = None;
+                for _ in 0..10 {
+                    sleep(Duration::from_millis(500)).await;
+                    if let Ok(c) = ssh_mesh::sshmuxc::MuxClient::connect(&socket_path).await {
+                        maybe_client = Some(c);
+                        break;
+                    }
+                }
+                match maybe_client {
+                    Some(c) => c,
+                    None => anyhow::bail!("Mux socket failed to appear after HTTP connect request"),
+                }
+            } else {
+                anyhow::bail!(
+                    "HTTP fallback failed with status {}: {:?}",
+                    response.status(),
+                    response.into_body()
+                );
+            }
+        }
+    };
 
     // Handle Local Forwards
     for spec_str in &cli.local_forward {
-        // Attempt to parse. Note: Handling UDS paths with colons might be tricky with split(':').
-        // For now implementing TCP parsing as per simplified spec.
         let spec = parse_forward_spec(spec_str, false)?;
         match spec {
             ForwardSpec::Tcp {
@@ -190,11 +284,28 @@ async fn main() -> Result<()> {
                 connect_port,
             } => {
                 let actual = client
-                    .open_local_forward(&listen_host, listen_port, &connect_host, connect_port)
+                    .open_local_forward(
+                        &listen_host,
+                        listen_port as u32,
+                        &connect_host,
+                        connect_port as u32,
+                    )
                     .await?;
                 if let Some(port) = actual {
                     println!("Allocated port {}", port);
                 }
+            }
+            ForwardSpec::Unix {
+                listen_path,
+                connect_path,
+            } => {
+                client
+                    .open_local_forward(&listen_path, 0xFFFF_FFFE, &connect_path, 0xFFFF_FFFE)
+                    .await?;
+                println!(
+                    "Local Unix forward established: {} -> {}",
+                    listen_path, connect_path
+                );
             }
         }
     }
@@ -210,12 +321,29 @@ async fn main() -> Result<()> {
                 connect_port,
             } => {
                 let actual = client
-                    .open_remote_forward(&listen_host, listen_port, &connect_host, connect_port)
+                    .open_remote_forward(
+                        &listen_host,
+                        listen_port as u32,
+                        &connect_host,
+                        connect_port as u32,
+                    )
                     .await?;
                 match actual {
                     Some(port) => println!("Remote forward established on port {}", port),
                     None => println!("Remote forward established"),
                 }
+            }
+            ForwardSpec::Unix {
+                listen_path,
+                connect_path,
+            } => {
+                client
+                    .open_remote_forward(&listen_path, 0xFFFF_FFFE, &connect_path, 0xFFFF_FFFE)
+                    .await?;
+                println!(
+                    "Remote Unix forward established: {} -> {}",
+                    listen_path, connect_path
+                );
             }
         }
     }

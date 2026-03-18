@@ -577,25 +577,46 @@ async fn handle_open_fwd(
         MUX_FWD_REMOTE => {
             // Ask SSH server to listen on remote side
             let mut handle = session.lock().await;
-            match handle.tcpip_forward(&listen_host, listen_port).await {
-                Ok(actual_port) => {
-                    if listen_port == 0 {
-                        // Dynamic port — send REMOTE_PORT
-                        let mut resp = payload_with_type(MUX_S_REMOTE_PORT);
-                        push_u32(&mut resp, req_id);
-                        push_u32(&mut resp, actual_port);
-                        stream.write_all(&build_packet(&resp)).await?;
-                    } else {
+
+            if listen_port == 0xFFFF_FFFE || connect_port == 0xFFFF_FFFE {
+                // Streamlocal forwarding (UDS)
+                info!("Requesting remote streamlocal forward for {}", listen_host);
+
+                match handle.streamlocal_forward(&listen_host).await {
+                    Ok(()) => {
                         let mut resp = payload_with_type(MUX_S_OK);
                         push_u32(&mut resp, req_id);
                         stream.write_all(&build_packet(&resp)).await?;
                     }
+                    Err(e) => {
+                        let msg = format!("{}", e);
+                        let mut resp = payload_with_type(MUX_S_FAILURE);
+                        push_u32(&mut resp, req_id);
+                        push_string(&mut resp, &msg);
+                        stream.write_all(&build_packet(&resp)).await?;
+                    }
                 }
-                Err(e) => {
-                    let mut resp = payload_with_type(MUX_S_FAILURE);
-                    push_u32(&mut resp, req_id);
-                    push_string(&mut resp, &e.to_string());
-                    stream.write_all(&build_packet(&resp)).await?;
+            } else {
+                match handle.tcpip_forward(&listen_host, listen_port).await {
+                    Ok(actual_port) => {
+                        if listen_port == 0 {
+                            // Dynamic port — send REMOTE_PORT
+                            let mut resp = payload_with_type(MUX_S_REMOTE_PORT);
+                            push_u32(&mut resp, req_id);
+                            push_u32(&mut resp, actual_port);
+                            stream.write_all(&build_packet(&resp)).await?;
+                        } else {
+                            let mut resp = payload_with_type(MUX_S_OK);
+                            push_u32(&mut resp, req_id);
+                            stream.write_all(&build_packet(&resp)).await?;
+                        }
+                    }
+                    Err(e) => {
+                        let mut resp = payload_with_type(MUX_S_FAILURE);
+                        push_u32(&mut resp, req_id);
+                        push_string(&mut resp, &e.to_string());
+                        stream.write_all(&build_packet(&resp)).await?;
+                    }
                 }
             }
         }
@@ -614,11 +635,16 @@ async fn handle_open_fwd(
                                 Ok((tcp_stream, _)) => {
                                     let session = session.clone();
                                     let ch = connect_host.clone();
-                                    let cp = connect_port as u16;
-                                    tokio::spawn(async move {
-                                        if let Err(e) = super::sshc::handle_local_forward(
-                                            tcp_stream, session, &ch, cp,
-                                        )
+                                     let cp = connect_port as u16;
+                                     if listen_port == 0xFFFF_FFFE || connect_port == 0xFFFF_FFFE {
+                                         // TODO: handle local UDS forwarding
+                                         warn!("Local UDS forwarding not implemented in mux server yet");
+                                         return;
+                                     }
+                                     tokio::spawn(async move {
+                                         if let Err(e) = super::sshc::handle_local_forward(
+                                             tcp_stream, session, &ch, cp,
+                                         )
                                         .await
                                         {
                                             debug!("Mux local forward error: {}", e);

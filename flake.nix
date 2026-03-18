@@ -25,108 +25,92 @@
           inherit system overlays;
         };
 
-
-
-        # Properly spliced toolchain for cross-compilation within Crane
-        craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default.override {
+        # Rust toolchain with musl target support
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ muslTarget ];
-        });
+        };
+
+        craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
         # Common source filtering
         src = craneLib.cleanCargoSource ./.;
 
+        # Pre-fetch Swagger UI zip for utoipa-swagger-ui (no network in Nix sandbox)
+        swaggerUiZip = pkgs.fetchurl {
+          url = "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip";
+          sha256 = "1p6cf4zf3jrswqa9b7wwgxhp3ca2v5qrzxzfp8gv35r0h78484j8";
+        };
+
         # Common build inputs
         nativeBuildInputs = with pkgs; [
           pkg-config
+          curl
         ];
 
-        buildInputs = with pkgs; [
-          musl
-        ];
-
-        # Common args for all builds
+        # Common args for static MUSL builds
+        # Following the official Crane cross-musl pattern:
+        # just set CARGO_BUILD_TARGET + crt-static, no cross-compiler needed
+        # for same-architecture builds.
         commonArgs = {
-          inherit src;
+          inherit src nativeBuildInputs;
           strictDeps = true;
           doCheck = false; # Tests require network/system resources
 
-          inherit nativeBuildInputs buildInputs;
-
-          CARGO_BUILD_TARGET = "${pkgs.stdenv.hostPlatform.config}";
-        };
-
-        muslTargetEnvName =
-          if system == "x86_64-linux" then "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"
-          else if system == "aarch64-linux" then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"
-          else throw "Unsupported system";
-
-        muslTargetLinkerEnvName =
-          if system == "x86_64-linux" then "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
-          else if system == "aarch64-linux" then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
-          else throw "Unsupported system";
-
-        muslTargetCcEnvName =
-          if system == "x86_64-linux" then "CC_x86_64_unknown_linux_musl"
-          else if system == "aarch64-linux" then "CC_aarch64_unknown_linux_musl"
-          else throw "Unsupported system";
-
-        # Extract the correct cross pkgs depending on the architecture
-        crossPkgs =
-          if system == "x86_64-linux" then pkgs.pkgsCross.musl64
-          else if system == "aarch64-linux" then pkgs.pkgsCross.aarch64-multiplatform-musl
-          else throw "Unsupported system";
-
-        # Common args for static MUSL builds
-        muslArgs = commonArgs // {
           CARGO_BUILD_TARGET = muslTarget;
-          "${muslTargetEnvName}" = "-C target-feature=+crt-static";
-          "${muslTargetLinkerEnvName}" = "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
-          "${muslTargetCcEnvName}" = "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+
+          # Copy pre-fetched Swagger UI zip so utoipa-swagger-ui's build.rs
+          # can find it via the file:// protocol. Use install to set writable
+          # permissions (nix store files are read-only).
+          preBuild = ''
+            install -m644 ${swaggerUiZip} $PWD/v5.17.14.zip
+            export SWAGGER_UI_DOWNLOAD_URL="file://$PWD/v5.17.14.zip"
+          '';
         };
 
         # Build workspace dependencies first (for caching)
-        cargoArtifacts = craneLib.buildDepsOnly (muslArgs // {
+        cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
           pname = "ssh-mesh-deps";
           cargoExtraArgs = "--features pmon";
         });
 
         # ssh-mesh binary — the primary binary
-        ssh-mesh = craneLib.buildPackage (muslArgs // {
+        ssh-mesh = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "ssh-mesh";
           cargoExtraArgs = "--features pmon -p ssh-mesh";
         });
 
         # pmond binary
-        pmond = craneLib.buildPackage (muslArgs // {
+        pmond = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "pmond";
           cargoExtraArgs = "-p pmond";
         });
 
         # h2t binary
-        h2t = craneLib.buildPackage (muslArgs // {
+        h2t = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "h2t";
           cargoExtraArgs = "-p ssh-mesh --bin h2t";
         });
 
         # meshkeys binary
-        meshkeys = craneLib.buildPackage (muslArgs // {
+        meshkeys = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "meshkeys";
           cargoExtraArgs = "-p ssh-mesh --bin meshkeys";
         });
 
         # sshmc binary
-        sshmc = craneLib.buildPackage (muslArgs // {
+        sshmc = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "sshmc";
           cargoExtraArgs = "-p ssh-mesh --bin sshmc";
         });
 
         # otel binary
-        otel = craneLib.buildPackage (muslArgs // {
+        otel = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "otel";
           cargoExtraArgs = "-p otel";
@@ -143,7 +127,6 @@
           packages = with pkgs; [
             rustToolchain
             pkg-config
-            musl
             cargo-watch
             cargo-edit
           ];
@@ -152,7 +135,7 @@
         checks = {
           inherit ssh-mesh pmond;
           # Run clippy
-          ssh-mesh-clippy = craneLib.cargoClippy (muslArgs // {
+          ssh-mesh-clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
             cargoClippyExtraArgs = "--all-targets -- --deny warnings";
           });
@@ -164,3 +147,4 @@
       }
     );
 }
+

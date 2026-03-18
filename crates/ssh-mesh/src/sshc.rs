@@ -634,7 +634,7 @@ impl SshClientManager {
 }
 
 /// Handles one local-forward connection by piping TCP⇄SSH channel.
-pub(crate) async fn handle_local_forward(
+pub async fn handle_local_forward(
     mut tcp_stream: TcpStream,
     session: Arc<Mutex<client::Handle<ClientHandler>>>,
     remote_host: &str,

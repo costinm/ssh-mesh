@@ -66,7 +66,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Get SSH port from environment variable or use default
     let ssh_port = get_port_from_env("SSH_PORT", 15022);
-    let http_port = get_port_from_env("HTTP_PORT", 0);
+    let http_port = get_port_from_env("HTTP_PORT", 15080);
     let https_port = get_port_from_env("HTTPS_PORT", 15028);
     // Start SOCKS5 server if SOCKS_PORT is set
     let socks_port = get_port_from_env("SOCKS_PORT", 0);
@@ -82,6 +82,9 @@ async fn main() -> Result<(), anyhow::Error> {
             path.push(".ssh");
             path
         });
+
+    // Ensure base directory exists
+    let _ = std::fs::create_dir_all(&base_dir);
 
     // Create config from env vars, layering: defaults → config file → env vars
     let cfg: MeshNodeConfig = {
@@ -168,7 +171,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     None
                 }
             },
-            env::var("MUX_DIR").ok().map(PathBuf::from),
+            env::var("SSH_MUX").ok().map(PathBuf::from),
         )),
     };
 
@@ -238,7 +241,7 @@ async fn main() -> Result<(), anyhow::Error> {
         app = app.merge(ws::app_ws(ws_state));
     }
 
-    app = app.nest_service("/", pmond::handlers::app(proc_mon.clone()));
+    app = app.nest("/", pmond::handlers::app(proc_mon.clone()));
 
     // HTTPS server - WIP, authz and authn not implemented.
     if https_port > 0 {
@@ -268,6 +271,16 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
     }
+
+    // HTTP over UDS server
+    let control_uds = base_dir.join("control.sock");
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let _ = tokio::fs::remove_file(&control_uds).await;
+        if let Err(e) = mesh::uds::run_uds_server(app_clone, control_uds.to_str().unwrap(), None).await {
+            error!("UDS HTTP server failed: {}", e);
+        }
+    });
 
     // HTTP server - forwards to the app's port, with handlers for
     // ssh tunneling and an admin interface.
