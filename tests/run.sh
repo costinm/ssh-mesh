@@ -91,12 +91,12 @@ connect_host8() {
         start_share
         sleep 1
     fi
-    echo "Connecting to $host with /tmp/unpfs.sock forwarding..."
+    echo "Connecting to $host with /tmp/unpfs.sock -> /tmp/9p.sock forwarding (auto-mount)..."
     ssh -p 15022 \
         -o ControlMaster=no -o ControlPath=none \
         -o StreamLocalBindUnlink=yes \
-        -R /tmp/unpfs.sock:/tmp/unpfs.sock "$host" \
-        "sudo mkdir -p /mnt/1; sudo umount /mnt/1 2>/dev/null; sudo mount -t 9p -o trans=unix,version=9p2000.L /tmp/unpfs.sock /mnt/1; bash -i"
+        -R /tmp/9p.sock:/tmp/unpfs.sock "$host" \
+        bash -i
 }
 
 connect_host8_sshmx() {
@@ -106,14 +106,15 @@ connect_host8_sshmx() {
         start_share
         sleep 1
     fi
-    echo "Connecting to $host using sshmc with /tmp/unpfs.sock forwarding..."
+    echo "Connecting to $host using sshmc with /tmp/9p.sock forwarding (auto-mount)..."
     # sshmc uses the same syntax for UDS forwarding: -R local_path:remote_path
+    # The remote path /tmp/9p.sock triggers per-peer directory + auto-mount on the server.
     local IGNORE=""
     if [ "$host" == "127.0.0.1" ]; then
         IGNORE="SSHMUX_IGNORE=1"
     fi
-    env $IGNORE ${BIN_DIR}/sshmc  -R /tmp/unpfs.sock:/tmp/unpfs.sock "$host" \
-        "sudo mkdir -p /mnt/1; sudo umount /mnt/1 2>/dev/null; sudo mount -t 9p -o trans=unix,version=9p2000.L /tmp/unpfs.sock /mnt/1; bash -i"
+    env $IGNORE ${BIN_DIR}/sshmc -R /tmp/9p.sock:/tmp/unpfs.sock "$host" \
+        bash -i
 }
 
 connect_host8_http() {

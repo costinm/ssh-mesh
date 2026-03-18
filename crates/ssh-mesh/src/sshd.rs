@@ -46,6 +46,11 @@ pub struct SshHandler {
 
     comment: String,
     options: Option<String>,
+
+    /// SHA-256 fingerprint of the authenticated peer's public key,
+    /// stored as a filesystem-safe hex string (e.g. "SHA256:abc..."
+    /// with non-alphanum replaced). Empty until auth succeeds.
+    peer_key_sha: String,
 }
 
 const DEBUG_PTY: bool = false;
@@ -101,6 +106,7 @@ impl SshHandler {
             user: String::new(),
             comment: String::new(),
             options: None,
+            peer_key_sha: String::new(),
         }
     }
 
@@ -524,6 +530,12 @@ impl server::Handler for SshHandler {
                     clients.insert(handler_id, client_info);
                     self.comment = auth_res.comment.clone();
                     self.options = auth_res.options.clone();
+                    // Store a filesystem-safe version of the key fingerprint.
+                    // keyfp is like "SHA256:abc+/def="; keep only alphanumerics.
+                    self.peer_key_sha = keyfp
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect();
                 }
             } else {
                 error!("Auth failed {}", self.id)
@@ -941,37 +953,120 @@ impl server::Handler for SshHandler {
         let channel_writers = self.channel_writers.clone();
         let remote_forward_listeners = self.remote_forward_listeners.clone();
         let socket_path_owned = socket_path.to_string();
+        let peer_key_sha = self.peer_key_sha.clone();
 
         async move {
+            // If the path is /tmp/<name>.sock where <name> is a 9p socket,
+            // rewrite it into a per-peer directory and auto-mount.
+            let (actual_socket_path, mount_dir) =
+                if socket_path_owned.starts_with("/tmp/") && socket_path_owned.ends_with("/9p.sock")
+                {
+                    if peer_key_sha.is_empty() {
+                        error!("Cannot create per-peer 9p directory: peer key not available");
+                        return Ok(false);
+                    }
+                    let peer_dir = format!("/tmp/{}", peer_key_sha);
+                    let sock = format!("{}/9p.sock", peer_dir);
+                    let rootfs = format!("{}/rootfs", peer_dir);
+                    (sock, Some(rootfs))
+                } else {
+                    (socket_path_owned.clone(), None)
+                };
+
             // Remove stale socket if present
-            let _ = tokio::fs::remove_file(&socket_path_owned).await;
+            let _ = tokio::fs::remove_file(&actual_socket_path).await;
 
             // Ensure parent directory exists
-            if let Some(parent) = std::path::Path::new(&socket_path_owned).parent() {
+            if let Some(parent) = std::path::Path::new(&actual_socket_path).parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
 
-            let listener = match UnixListener::bind(&socket_path_owned) {
+            // Create the rootfs mount-point directory if needed
+            if let Some(ref rootfs_dir) = mount_dir {
+                if let Err(e) = tokio::fs::create_dir_all(rootfs_dir).await {
+                    error!("Failed to create rootfs directory {}: {}", rootfs_dir, e);
+                    return Ok(false);
+                }
+                info!("Created rootfs directory {}", rootfs_dir);
+            }
+
+            let listener = match UnixListener::bind(&actual_socket_path) {
                 Ok(l) => l,
                 Err(e) => {
-                    error!("Failed to bind UDS {}: {}", socket_path_owned, e);
+                    error!("Failed to bind UDS {}: {}", actual_socket_path, e);
                     return Ok(false);
                 }
             };
 
-            info!("Listening on UDS {} for streamlocal forward", socket_path_owned);
+            info!(
+                "Listening on UDS {} for streamlocal forward",
+                actual_socket_path
+            );
+
+            // Auto-mount 9p filesystem if rootfs directory was created
+            if let Some(ref rootfs_dir) = mount_dir {
+                let is_root = nix::unistd::getuid().is_root();
+                if is_root {
+                    // Unmount any previous mount, ignoring errors
+                    let _ = tokio::process::Command::new("umount")
+                        .arg(rootfs_dir)
+                        .output()
+                        .await;
+
+                    info!(
+                        "Mounting 9p filesystem: {} -> {}",
+                        actual_socket_path, rootfs_dir
+                    );
+                    match tokio::process::Command::new("mount")
+                        .args([
+                            "-t",
+                            "9p",
+                            "-o",
+                            "trans=unix,version=9p2000.L",
+                            &actual_socket_path,
+                            rootfs_dir,
+                        ])
+                        .output()
+                        .await
+                    {
+                        Ok(output) if output.status.success() => {
+                            info!("Successfully mounted 9p at {}", rootfs_dir);
+                        }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            error!(
+                                "Failed to mount 9p at {}: {}",
+                                rootfs_dir,
+                                stderr.trim()
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to run mount command: {}", e);
+                        }
+                    }
+                } else {
+                    info!(
+                        "Not running as root, skipping 9p mount for {}",
+                        rootfs_dir
+                    );
+                }
+            }
 
             // Channel to signal shutdown
             let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
 
             {
                 let mut listeners = remote_forward_listeners.lock().await;
-                // Use port 0 as the key component for UDS forwards
+                // Use port 0 as the key component for UDS forwards.
+                // Key under the *original* path so cancel_streamlocal_forward
+                // still matches the path the client sends.
                 listeners.insert((socket_path_owned.clone(), 0), shutdown_tx);
             }
 
-            let sp = socket_path_owned.clone();
+            let sp = actual_socket_path.clone();
+            let sp_original = socket_path_owned.clone();
             let remote_forward_listeners_weak = Arc::downgrade(&remote_forward_listeners);
+            let mount_dir_cleanup = mount_dir.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -982,11 +1077,12 @@ impl server::Handler for SshHandler {
                                     info!("Accepted connection on UDS {}", sp);
                                     let session_handle_clone = session_handle.clone();
                                     let channel_writers_clone = channel_writers.clone();
-                                    let sp_clone = sp.clone();
+                                    let sp_clone = sp_original.clone();
 
                                     tokio::spawn(async move {
                                         // Open a forwarded-streamlocal channel
-                                        // back to the client
+                                        // back to the client using the *original*
+                                        // path so the client recognises it.
                                         let channel = match session_handle_clone
                                             .channel_open_forwarded_streamlocal(&sp_clone)
                                             .await
@@ -1061,12 +1157,22 @@ impl server::Handler for SshHandler {
                         }
                     }
                 }
+                // Cleanup: unmount 9p if we mounted it
+                if let Some(ref rootfs_dir) = mount_dir_cleanup {
+                    if nix::unistd::getuid().is_root() {
+                        info!("Unmounting 9p at {}", rootfs_dir);
+                        let _ = tokio::process::Command::new("umount")
+                            .arg(rootfs_dir)
+                            .output()
+                            .await;
+                    }
+                }
                 // Cleanup socket file
                 let _ = tokio::fs::remove_file(&sp).await;
                 // Only attempt to remove from listener map if SshHandler still exists
                 if let Some(listeners_arc) = remote_forward_listeners_weak.upgrade() {
                     let mut listeners = listeners_arc.lock().await;
-                    listeners.remove(&(sp, 0));
+                    listeners.remove(&(sp_original, 0));
                 }
             });
 
