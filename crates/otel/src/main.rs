@@ -2,11 +2,7 @@ use clap::{Parser, Subcommand};
 use otel::perfetto_pull::PerfettoPull;
 use tracing::{info, info_span};
 
-// Shim for libstdc++ or perfetto code expecting __libc_single_threaded
-// This symbol is a glibc extension not present in musl, but some C++ headers/code might reference it.
-#[cfg(target_env = "musl")]
-#[no_mangle]
-pub static __libc_single_threaded: u8 = 0;
+// Shim for libstdc++ or perfetto code expecting __libc_single_threaded already in lib.rs
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

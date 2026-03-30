@@ -26,6 +26,9 @@ p256 = { version = "0.13", features = ["pem", "ecdsa"] }
 rand = "0.8"
 anyhow = "1.0"
 env_logger = "0.10"
+axum = { version = "0.7", features = ["json"] }
+clap = { version = "4.5", features = ["derive"] }
+mesh = { path = "../mesh" }
 
 [lib]
 name = "lmesh"

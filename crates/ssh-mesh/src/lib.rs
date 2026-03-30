@@ -7,7 +7,6 @@ use russh::keys::PrivateKey;
 use russh::server;
 use russh::server::Server;
 use serde::{Deserialize, Serialize};
-use ssh_key;
 use std::collections::HashMap;
 #[allow(dead_code, unused)]
 use std::{

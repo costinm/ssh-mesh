@@ -42,17 +42,16 @@ pub async fn validate_public_key(
         .to_string();
 
     // TODO: use a hash map keyed by incoming_fp.
-    for (_i, entry) in authorized_keys.iter().enumerate() {
+    for entry in authorized_keys.iter() {
         let mut matched = false;
 
         if let Some(auth_key) = &entry.key {
             if auth_key.key_data() == incoming_key.key_data() {
                 matched = true;
             }
-        } else if let Some(auth_fp) = &entry.fingerprint {
-            if auth_fp == &incoming_fp {
-                matched = true;
-            }
+        } else if let Some(auth_fp) = &entry.fingerprint
+            && auth_fp == &incoming_fp {
+            matched = true;
         }
 
         if matched {
@@ -247,8 +246,8 @@ pub fn parse_authorized_cas_content(content: &str) -> Result<Vec<ssh_key::Public
     for line in content.lines() {
         let line = line.trim();
         if !line.is_empty() && !line.starts_with('#') {
-            let key_str = if line.starts_with("@cert-authority") {
-                line["@cert-authority".len()..].trim()
+            let key_str = if let Some(stripped) = line.strip_prefix("@cert-authority") {
+                stripped.trim()
             } else {
                 line
             };

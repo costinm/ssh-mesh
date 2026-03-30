@@ -6,8 +6,12 @@ target = "x86_64-unknown-linux-musl"
 BORING_BSSL_FIPS_PATH = { value = "vendor/boringssl-fips/linux_x86_64", force = true, relative = true }
 BORING_BSSL_FIPS_INCLUDE_PATH = { value = "vendor/boringssl-fips/include/", force = true, relative = true }
 
-[target.86_64-linux-android]
+[target.x86_64-linux-android]
 ar = "/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android26-ar"
-# linker = "/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
-linker = "XXX/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
+linker = "/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
 cc = "/opt/Android/Sdk/ndk/default/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
+
+[target.x86_64-unknown-linux-musl]
+linker = "/opt/musl/bin/x86_64-linux-musl-gcc"
+ar = "/opt/musl/bin/ar"
+rustflags = ["-C", "link-arg=-fno-use-linker-plugin"]

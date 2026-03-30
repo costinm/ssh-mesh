@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 /// Configuration for a mesh application
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MeshConfig {
     /// Optional TCP port for HTTP server
     pub http_port: Option<u16>,
@@ -16,16 +16,6 @@ pub struct MeshConfig {
     pub http_uds_path: Option<String>,
     /// Authorized UID for UDS connections
     pub auth_uid: Option<u32>,
-}
-
-impl Default for MeshConfig {
-    fn default() -> Self {
-        Self {
-            http_port: None,
-            http_uds_path: None,
-            auth_uid: None,
-        }
-    }
 }
 
 /// A handler trait or structure for incoming generic JSON lines.

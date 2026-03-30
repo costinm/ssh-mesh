@@ -47,7 +47,7 @@ pub async fn setup_test_environment(
     _start_http: bool,
 ) -> Result<TestSetup> {
     Lazy::force(&INIT_LOGGING);
-    let start_http = true;
+    let start_http = _start_http;
 
     let td = tempfile::Builder::new().prefix("ssh-mesh-test").tempdir()?;
     let path = td.path().to_path_buf();

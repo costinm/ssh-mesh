@@ -29,7 +29,7 @@ const CGROUP_BASE: &str = "/sys/fs/cgroup";
 
 /// Read process name from /proc/[pid]/comm
 pub fn read_comm(pid: u32) -> String {
-    let comm_path = format!("/proc/{}/comm", pid);
+    let comm_path = format!("{}/{}/comm", PROC_BASE, pid);
     std::fs::read_to_string(comm_path)
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "(unknown)".to_string())
@@ -449,8 +449,9 @@ pub fn read_process_info_impl(pid: u32) -> Result<ProcessInfo, Box<dyn std::erro
 
     // Remove parentheses from comm. 16 chars max, no spaces.
     let comm = comm
-        .trim_start_matches('(')
-        .trim_end_matches(')')
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(comm)
         .to_string();
 
     let _state = parts.next().unwrap_or("?");
@@ -476,8 +477,7 @@ pub fn read_cgroup_path(pid: u32) -> Option<String> {
     match std::fs::read_to_string(&cgroup_file) {
         Ok(content) => {
             for line in content.lines() {
-                if line.starts_with("0::") {
-                    let cgroup = &line[3..];
+                if let Some(cgroup) = line.strip_prefix("0::") {
                     if cgroup == "/" {
                         return Some(CGROUP_BASE.to_string());
                     } else if !cgroup.is_empty() {
@@ -485,13 +485,12 @@ pub fn read_cgroup_path(pid: u32) -> Option<String> {
                     }
                 }
             }
-            None
         }
         Err(e) => {
             trace!("Failed to read {}: {}", cgroup_file, e);
-            None
         }
     }
+    None
 }
 
 /// Read memory information for a process from /proc/[pid]/smaps_rollup, /proc/[pid]/status, /proc/[pid]/stat and /proc/[pid]/statm as fallback
@@ -541,16 +540,14 @@ fn read_fault_stats(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
                 let maj_faults: u64 = parts[11].parse().unwrap_or(0);
                 mem_info.pgfault = min_faults + maj_faults;
                 mem_info.pgmajfault = maj_faults;
-                true
-            } else {
-                false
+                return true;
             }
         }
         Err(e) => {
             trace!("Failed to read {}: {}", stat_path, e);
-            false
         }
     }
+    false
 }
 
 /// Read PSS and RSS breakdown from /proc/[pid]/smaps_rollup
@@ -568,7 +565,6 @@ fn read_smaps_rollup(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
                         .next()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-
                     match key {
                         "Rss" => {
                             mem_info.rss = val_kb * 1024;
@@ -622,7 +618,6 @@ fn read_proc_status_memory(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
                         .next()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-
                     match key {
                         "RssAnon" if mem_info.anon == 0 => {
                             mem_info.anon = val_kb * 1024;
@@ -688,7 +683,6 @@ fn read_statm_fallback(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
                     let resident_pages: u64 = parts[1].parse().unwrap_or(0);
                     let shared_pages: u64 = parts[2].parse().unwrap_or(0);
                     let mut found = false;
-
                     if mem_info.rss == 0 {
                         mem_info.rss = resident_pages * page_size;
                         found = true;
@@ -707,13 +701,12 @@ fn read_statm_fallback(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
                     return found;
                 }
             }
-            false
         }
         Err(e) => {
             trace!("Failed to read {}: {}", statm_path, e);
-            false
         }
     }
+    false
 }
 
 /// Read cmdline for a process
@@ -740,7 +733,7 @@ pub fn read_cmdline(pid: u32) -> Option<String> {
 pub fn read_exe(pid: u32) -> Option<String> {
     let exe_path = format!("{}/{}/exe", PROC_BASE, pid);
     match std::fs::read_link(&exe_path) {
-        Ok(target) => Some(target.to_string_lossy().to_string()),
+        Ok(target) => Some(target.to_string_lossy().into_owned()),
         Err(e) => {
             trace!("Failed to read {}: {}", exe_path, e);
             None
@@ -748,28 +741,23 @@ pub fn read_exe(pid: u32) -> Option<String> {
     }
 }
 
-/// Read UID for a process from /proc/[pid]/status
 pub fn read_process_uid(pid: u32) -> Option<u32> {
     let status_path = format!("{}/{}/status", PROC_BASE, pid);
-    match std::fs::read_to_string(&status_path) {
-        Ok(content) => {
-            for line in content.lines() {
-                if line.starts_with("Uid:") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let Ok(uid) = parts[1].parse::<u32>() {
-                            return Some(uid);
-                        }
+    if let Ok(content) = std::fs::read_to_string(&status_path) {
+        for line in content.lines() {
+            if line.starts_with("Uid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(uid) = parts[1].parse::<u32>() {
+                        return Some(uid);
                     }
                 }
             }
-            None
         }
-        Err(e) => {
-            trace!("Failed to read {}: {}", status_path, e);
-            None
-        }
+    } else {
+        trace!("Failed to read {}: {}", status_path, "error");
     }
+    None
 }
 
 /// Create ProcessInfo for a given PID, including cgroup information

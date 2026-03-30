@@ -278,7 +278,7 @@ impl Handler for FileSystemHandler {
                 return Err(StatusCode::Eof);
             }
             // Drain all remaining entries and return them in one batch.
-            let dir_entries: Vec<std::fs::DirEntry> = entries.drain(..).collect();
+            let dir_entries = std::mem::take(entries);
             let mut files = Vec::with_capacity(dir_entries.len());
             for entry in &dir_entries {
                 let filename = entry.file_name().to_string_lossy().to_string();

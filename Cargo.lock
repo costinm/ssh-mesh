@@ -2172,7 +2172,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.7.9",
  "bytes",
+ "clap",
  "embedded-io",
  "embedded-io-async",
  "env_logger 0.10.2",
@@ -2182,6 +2184,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "log",
+ "mesh",
  "mio 0.8.11",
  "nix 0.29.0",
  "p256",
@@ -2306,6 +2309,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "mesh-init"
+version = "0.1.0"
 
 [[package]]
 name = "mime"
@@ -4431,6 +4438,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "log",
  "mesh",
  "mime_guess",
@@ -4442,6 +4450,7 @@ dependencies = [
  "pmond",
  "rand 0.8.5",
  "rcgen",
+ "reqwest",
  "ring",
  "russh",
  "russh-keys",

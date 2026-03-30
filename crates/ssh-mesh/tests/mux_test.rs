@@ -100,7 +100,7 @@ async fn test_mux_functionality() -> Result<()> {
 
     // open_local_forward(listen_host, listen_port, connect_host, connect_port)
     let local_port = client
-        .open_local_forward("127.0.0.1", 0, target_host, target_port)
+        .open_local_forward("127.0.0.1", 0, target_host, target_port.into())
         .await
         .expect("Open local forward failed");
 
@@ -113,9 +113,7 @@ async fn test_mux_functionality() -> Result<()> {
 
     // Verify connectivity through forward
     // We can try to connect to the forwarded port using a TcpStream and see if we get SSH banner
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", forwarded_port))
-        .await
-        .expect("Failed to connect to forwarded port");
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", forwarded_port)).await?;
 
     // Read SSH banner (starts with "SSH-2.0")
     let mut buf = [0u8; 8];
@@ -127,17 +125,23 @@ async fn test_mux_functionality() -> Result<()> {
     let banner = String::from_utf8_lossy(&buf);
     assert!(banner.starts_with("SSH-"), "Should receive SSH banner");
     println!("Received banner from forwarded port: {}", banner);
+    drop(stream);
+    drop(client);
 
-    // 9. Cleanup
+    println!("Step 9.1: Disconnecting manager");
     manager
         .disconnect(conn_id)
         .await
         .expect("Disconnect failed");
+    println!("Step 9.2: Waiting for socket removal");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !socket_path.exists(),
         "Mux socket should be removed after disconnect"
     );
 
+    println!("Step 9.3: Aborting server");
+    setup.abort_server();
+    println!("Step 9.4: Test finished");
     Ok(())
 }

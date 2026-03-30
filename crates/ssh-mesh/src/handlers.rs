@@ -138,19 +138,14 @@ pub async fn handle_web_request(
     // Check local filesystem first (for dev)
     let local_path = Path::new("web").join(path);
 
-    if local_path.exists() && local_path.is_file() {
-        match std::fs::read(&local_path) {
-            Ok(content) => {
-                let mime = mime_for_path(&local_path.to_string_lossy());
-                return (
-                    StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, mime)],
-                    content,
-                )
-                    .into_response();
-            }
-            Err(_) => {}
-        }
+    if local_path.is_file() && let Ok(content) = std::fs::read(&local_path) {
+        let mime = mime_for_path(&local_path.to_string_lossy());
+        return (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, mime)],
+            content,
+        )
+            .into_response();
     }
 
     match Assets::get(path) {
@@ -159,7 +154,7 @@ pub async fn handle_web_request(
             (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, mime)],
-                content.data.to_owned(),
+                content.data.clone(),
             )
                 .into_response()
         }
@@ -256,20 +251,17 @@ pub async fn handle_ssh_request(
             let response_stream =
                 tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-            let response = Response::builder()
+            Response::builder()
                 .status(200)
                 .body(Body::from_stream(response_stream))
-                .unwrap();
-
-            response
+                .unwrap()
         }
         Err(e) => {
             tracing_error!("Failed to start SSH session: {:?}", e);
-            let response = Response::builder()
+            Response::builder()
                 .status(500)
                 .body(Body::from(format!("SSH session failed: {:?}", e)))
-                .unwrap();
-            response
+                .unwrap()
         }
     }
 }
@@ -280,18 +272,14 @@ async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Err
     while let Some(frame_res) = body.frame().await {
         match frame_res {
             Ok(frame) => {
-                if let Ok(data) = frame.into_data() {
-                    if tx.send(Ok(data)).await.is_err() {
-                        return;
-                    }
+                if let Ok(data) = frame.into_data()
+                    && tx.send(Ok(data)).await.is_err() {
+                    return;
                 }
             }
             Err(e) => {
                 let _ = tx
-                    .send(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Body read error: {}", e),
-                    )))
+                    .send(Err(std::io::Error::other(format!("Body read error: {}", e))))
                     .await;
                 return;
             }
@@ -494,8 +482,8 @@ pub async fn handle_exec(
     let mut env_vars = std::collections::HashMap::new();
     for (name, value) in req.headers() {
         let name_str = name.as_str().to_lowercase();
-        if name_str.starts_with("x-e-") {
-            let env_name = name_str[4..].to_uppercase().replace('-', "_");
+        if let Some(stripped) = name_str.strip_prefix("x-e-") {
+            let env_name = stripped.to_uppercase().replace('-', "_");
             if let Ok(val_str) = value.to_str() {
                 debug!("Setting env var: {}={}", env_name, val_str);
                 env_vars.insert(env_name, val_str.to_string());

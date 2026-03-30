@@ -23,11 +23,10 @@ pub fn load_keys(base_dir: &Path) -> (PrivateKey, Option<String>) {
         let key_data = fs::read(&key_path).expect("Failed to read SSH key file");
         if !key_data.is_empty() {
             // Try decoding as secret key (supports OpenSSH and PEM/PKCS#8)
-            if let Ok(content) = String::from_utf8(key_data.clone()) {
-                if let Ok(key) = russh::keys::decode_secret_key(&content, None) {
-                    debug!("Loading key from existing file");
-                    return (key, None);
-                }
+            if let Ok(content) = String::from_utf8(key_data.clone())
+                && let Ok(key) = russh::keys::decode_secret_key(&content, None) {
+                debug!("Loading key from existing file");
+                return (key, None);
             }
             if let Ok(key) = PrivateKey::from_bytes(&key_data) {
                 debug!("Loading key from existing file (binary format)");

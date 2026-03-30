@@ -31,7 +31,7 @@ pub async fn trace_set_level(Json(req): Json<TraceLevelRequest>) -> impl IntoRes
             let status = if resp
                 .message
                 .as_deref()
-                .map_or(false, |m| m.starts_with("Invalid"))
+                .is_some_and(|m| m.starts_with("Invalid"))
             {
                 StatusCode::BAD_REQUEST
             } else {
@@ -54,10 +54,9 @@ pub async fn stream_logs_sse(
     let stream = stream::unfold(
         (existing.into_iter(), rx),
         |(mut existing, mut rx)| async move {
-            if let Some(entry) = existing.next() {
-                if let Ok(json) = serde_json::to_string(&entry) {
-                    return Some((Ok(Event::default().data(json)), (existing, rx)));
-                }
+            if let Some(entry) = existing.next()
+                && let Ok(json) = serde_json::to_string(&entry) {
+                return Some((Ok(Event::default().data(json)), (existing, rx)));
             }
 
             match rx.recv().await {

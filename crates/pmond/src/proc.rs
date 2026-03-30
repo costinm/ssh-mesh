@@ -177,10 +177,7 @@ impl ProcMon {
     pub fn get_process(&self, pid: u32) -> Option<ProcessInfo> {
         trace!("Getting process by PID: {}", pid);
 
-        match read_process_info_from_proc(pid) {
-            Ok(process_info) => Some(process_info),
-            Err(_) => None,
-        }
+        read_process_info_from_proc(pid).ok()
     }
 
     /// Get all processes.

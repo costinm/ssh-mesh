@@ -136,6 +136,12 @@ pub struct ProtoExtractor {
     actions: HashMap<String, ActionFn>,
 }
 
+impl Default for ProtoExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProtoExtractor {
     pub fn new() -> Self {
         let mut actions: HashMap<String, ActionFn> = HashMap::new();
@@ -375,7 +381,7 @@ pub fn encode_varint(mut val: u64) -> Vec<u8> {
 
 /// Encode a varint field (wire type 0).
 pub fn encode_varint_field(field_number: u32, value: u64) -> Vec<u8> {
-    let tag = ((field_number as u64) << 3) | 0;
+    let tag = (field_number as u64) << 3;
     let mut buf = encode_varint(tag);
     buf.extend(encode_varint(value));
     buf

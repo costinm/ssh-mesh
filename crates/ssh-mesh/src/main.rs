@@ -274,6 +274,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // HTTP over UDS server - let MeshApp auto-detect app_name from $0
     let control_uds = format!("/run/user/{}/ssh-mesh.sock", unsafe { libc::getuid() });
+    let app_clone = app.clone();
     tokio::spawn(async move {
         if let Err(e) = mesh::uds::run_uds_server(app_clone, &control_uds, None).await {
             error!("UDS HTTP server failed: {}", e);

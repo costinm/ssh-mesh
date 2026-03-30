@@ -252,9 +252,9 @@ impl MuxClient {
         push_u32(&mut pkt, req_id);
         push_u32(&mut pkt, MUX_FWD_LOCAL);
         push_string(&mut pkt, listen_host);
-        push_u32(&mut pkt, listen_port as u32);
+        push_u32(&mut pkt, listen_port);
         push_string(&mut pkt, connect_host);
-        push_u32(&mut pkt, connect_port as u32);
+        push_u32(&mut pkt, connect_port);
         self.stream.write_all(&build_packet(&pkt)).await?;
 
         let (msg_type, payload) = read_packet(&mut self.stream).await?;
@@ -298,9 +298,9 @@ impl MuxClient {
         push_u32(&mut pkt, req_id);
         push_u32(&mut pkt, MUX_FWD_REMOTE);
         push_string(&mut pkt, listen_host);
-        push_u32(&mut pkt, listen_port as u32);
+        push_u32(&mut pkt, listen_port);
         push_string(&mut pkt, connect_host);
-        push_u32(&mut pkt, connect_port as u32);
+        push_u32(&mut pkt, connect_port);
         self.stream.write_all(&build_packet(&pkt)).await?;
 
         let (msg_type, payload) = read_packet(&mut self.stream).await?;
@@ -335,9 +335,9 @@ impl MuxClient {
         push_u32(&mut pkt, req_id);
         push_u32(&mut pkt, fwd_type);
         push_string(&mut pkt, listen_host);
-        push_u32(&mut pkt, listen_port as u32);
+        push_u32(&mut pkt, listen_port);
         push_string(&mut pkt, connect_host);
-        push_u32(&mut pkt, connect_port as u32);
+        push_u32(&mut pkt, connect_port);
         self.stream.write_all(&build_packet(&pkt)).await?;
 
         let (msg_type, payload) = read_packet(&mut self.stream).await?;

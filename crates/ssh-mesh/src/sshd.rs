@@ -40,6 +40,7 @@ pub struct SshHandler {
     channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
 
     // Listeners for remote forwarding ((address, port) -> shutdown_sender)
+    #[allow(clippy::type_complexity)]
     remote_forward_listeners: Arc<Mutex<HashMap<(String, u32), mpsc::UnboundedSender<()>>>>,
 
     user: String,
@@ -194,13 +195,13 @@ impl SshHandler {
                 // Ensure the child becomes session leader and has controlling terminal.
                 unsafe {
                     cmd.pre_exec(move || {
-                        setsid().map_err(|e| std::io::Error::other(e))?;
+                        setsid().map_err(std::io::Error::other)?;
                         if ioctl(slave_fd, TIOCSCTTY, 0) < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        dup2(slave_fd, 0).map_err(|e| std::io::Error::other(e))?;
-                        dup2(slave_fd, 1).map_err(|e| std::io::Error::other(e))?;
-                        dup2(slave_fd, 2).map_err(|e| std::io::Error::other(e))?;
+                        dup2(slave_fd, 0).map_err(std::io::Error::other)?;
+                        dup2(slave_fd, 1).map_err(std::io::Error::other)?;
+                        dup2(slave_fd, 2).map_err(std::io::Error::other)?;
                         Ok(())
                     });
                 }
@@ -363,10 +364,10 @@ impl SshHandler {
         );
 
         // Handle abstract namespace: replace leading '_' with '\0'
-        let path_bytes = if socket_path_str.starts_with('_') {
+        let path_bytes = if let Some(stripped) = socket_path_str.strip_prefix('_') {
             let mut bytes = Vec::with_capacity(socket_path_str.len());
             bytes.push(0);
-            bytes.extend_from_slice(socket_path_str[1..].as_bytes());
+            bytes.extend_from_slice(stripped.as_bytes());
             bytes
         } else {
             socket_path_str.clone().into_bytes()
@@ -1158,14 +1159,12 @@ impl server::Handler for SshHandler {
                     }
                 }
                 // Cleanup: unmount 9p if we mounted it
-                if let Some(ref rootfs_dir) = mount_dir_cleanup {
-                    if nix::unistd::getuid().is_root() {
-                        info!("Unmounting 9p at {}", rootfs_dir);
-                        let _ = tokio::process::Command::new("umount")
-                            .arg(rootfs_dir)
-                            .output()
-                            .await;
-                    }
+                if let (Some(rootfs_dir), true) = (mount_dir_cleanup.as_ref(), nix::unistd::getuid().is_root()) {
+                    info!("Unmounting 9p at {}", rootfs_dir);
+                    let _ = tokio::process::Command::new("umount")
+                        .arg(rootfs_dir)
+                        .output()
+                        .await;
                 }
                 // Cleanup socket file
                 let _ = tokio::fs::remove_file(&sp).await;
@@ -1547,7 +1546,7 @@ impl server::Handler for SshHandler {
                         self.server.base_dir()
                     );
                     let mut cmd = Command::new(sftp_server_path);
-                    cmd.current_dir(&self.server.base_dir())
+                    cmd.current_dir(self.server.base_dir())
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped());

@@ -130,6 +130,12 @@ pub struct LogBufferLayer {
     buffer: LogBuffer,
 }
 
+impl Default for LogBufferLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogBufferLayer {
     pub fn new() -> Self {
         let buffer = create_log_buffer();

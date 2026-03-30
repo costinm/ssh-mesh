@@ -165,7 +165,7 @@ impl PsiWatcher {
     pub fn new() -> Self {
         // Broadcast requires creating one receiver even if we don't use it
         let (event_tx, _) = broadcast::channel(100);
-        let watcher = PsiWatcher {
+        PsiWatcher {
             running: Arc::new(AtomicBool::new(false)),
             watches: Arc::new(Mutex::new(HashMap::new())),
             new_cgroup_events: Arc::new(Mutex::new(Vec::new())),
@@ -175,8 +175,7 @@ impl PsiWatcher {
             event_tx,
             interval_us: DEFAULT_INTERVAL_US,
             threshold_us: DEFAULT_THRESHOLD_US,
-        };
-        watcher
+        }
     }
 
     /// Add a cgroup to the watch list.
@@ -322,6 +321,7 @@ impl PsiWatcher {
             *waker.lock() = Some(new_waker);
 
             /// Helper to open and register a cgroup for PSI monitoring
+            #[allow(clippy::too_many_arguments)]
             fn setup_cgroup_watch(
                 cgroup_path: &str,
                 interval_us: u64,

@@ -461,7 +461,7 @@ async fn scan_sockets(base_dir: &Path) -> Vec<(String, String)> {
     if let Ok(mut entries) = tokio::fs::read_dir(base_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "sock") {
+            if path.extension().is_some_and(|ext| ext == "sock") {
                 if let Some(stem) = path.file_stem() {
                     sockets.push((
                         stem.to_string_lossy().to_string(),

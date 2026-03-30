@@ -411,7 +411,7 @@ pub async fn handle_freeze_cgroup_request(
 // ============================================================================
 
 pub async fn handle_root_request(_state: State<AppState>) -> Html<String> {
-    Html(format!(
+    Html(
         r#"
         <!DOCTYPE html>
         <html>
@@ -427,7 +427,8 @@ pub async fn handle_root_request(_state: State<AppState>) -> Html<String> {
         </body>
         </html>
     "#
-    ))
+        .to_string(),
+    )
 }
 
 pub async fn handle_web_request(
@@ -437,17 +438,14 @@ pub async fn handle_web_request(
     let local_path = Path::new("web").join(path);
 
     if local_path.exists() && local_path.is_file() {
-        match std::fs::read(&local_path) {
-            Ok(content) => {
-                let mime = mime_guess::from_path(&local_path).first_or_octet_stream();
-                return (
-                    StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, mime.to_string())],
-                    content,
-                )
-                    .into_response();
-            }
-            Err(_) => {}
+        if let Ok(content) = std::fs::read(&local_path) {
+            let mime = mime_guess::from_path(&local_path).first_or_octet_stream();
+            return (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, mime.to_string())],
+                content,
+            )
+                .into_response();
         }
     }
 
@@ -457,7 +455,7 @@ pub async fn handle_web_request(
             (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, mime.to_string())],
-                content.data.to_owned(),
+                content.data.clone(),
             )
                 .into_response()
         }

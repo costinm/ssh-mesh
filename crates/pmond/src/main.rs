@@ -134,10 +134,10 @@ async fn run_monitor(
                 tokio::spawn(async move {
                     while let Ok(msg) = rx.recv().await {
                         let json = serde_json::to_vec(&msg).unwrap();
-                        if let Err(_) = stream.write_all(&json).await {
+                        if stream.write_all(&json).await.is_err() {
                             break;
                         }
-                        if let Err(_) = stream.write_all(b"\n").await {
+                        if stream.write_all(b"\n").await.is_err() {
                             break;
                         }
                     }

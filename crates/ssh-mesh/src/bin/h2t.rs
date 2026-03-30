@@ -26,7 +26,6 @@ use url::Url;
 ///   `ssh -o ProxyCommand="h2t ws://localhost:8080/_ws" user@host`
 ///   `ssh -o ProxyCommand="h2t http://localhost:8081/_ssh" user@host`
 ///   `ssh -o ProxyCommand="h2t %h" user@host`
-
 async fn handle_uds(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(path).await?;
     let (mut read, mut write) = tokio::io::split(stream);

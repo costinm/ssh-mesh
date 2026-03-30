@@ -290,7 +290,7 @@ async fn handle_mux_client(
                         handle_new_session(&mut stream, &payload, &session, sid).await?;
                     }
                     MUX_C_OPEN_FWD => {
-                        handle_open_fwd(&mut stream, &payload, &session).await?;
+                        handle_open_fwd(&mut stream, &payload, &session, cancel_rx.clone()).await?;
                     }
                     MUX_C_CLOSE_FWD => {
                         handle_close_fwd(&mut stream, &payload).await?;
@@ -343,15 +343,11 @@ async fn recv_fd_blocking(stream: &tokio::net::UnixStream) -> Result<std::os::un
         ) {
             Ok(msg) => {
                 let mut received_fd = None;
-                let mut cmsg_iter = msg.cmsgs()?;
-                while let Some(cmsg_item) = cmsg_iter.next() {
-                    match cmsg_item {
-                        ControlMessageOwned::ScmRights(fds) => {
-                            if !fds.is_empty() {
-                                received_fd = Some(fds[0]);
-                            }
-                        }
-                        _ => {}
+                let cmsg_iter = msg.cmsgs()?;
+                for cmsg_item in cmsg_iter {
+                    if let ControlMessageOwned::ScmRights(fds) = cmsg_item
+                        && !fds.is_empty() {
+                        received_fd = Some(fds[0]);
                     }
                 }
 
@@ -553,6 +549,7 @@ async fn handle_open_fwd(
     stream: &mut tokio::net::UnixStream,
     payload: &[u8],
     session: &Arc<Mutex<client::Handle<ClientHandler>>>,
+    cancel_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     // Parse:
     //   u32 request_id
@@ -629,31 +626,39 @@ async fn handle_open_fwd(
                     let session = session.clone();
                     let connect_host = connect_host.clone();
 
+                    let mut cancel_rx_clone = cancel_rx.clone();
                     tokio::spawn(async move {
                         loop {
-                            match listener.accept().await {
-                                Ok((tcp_stream, _)) => {
-                                    let session = session.clone();
-                                    let ch = connect_host.clone();
-                                     let cp = connect_port as u16;
-                                     if listen_port == 0xFFFF_FFFE || connect_port == 0xFFFF_FFFE {
-                                         // TODO: handle local UDS forwarding
-                                         warn!("Local UDS forwarding not implemented in mux server yet");
-                                         return;
-                                     }
-                                     tokio::spawn(async move {
-                                         if let Err(e) = super::sshc::handle_local_forward(
-                                             tcp_stream, session, &ch, cp,
-                                         )
-                                        .await
-                                        {
-                                            debug!("Mux local forward error: {}", e);
-                                        }
-                                    });
-                                }
-                                Err(e) => {
-                                    error!("Mux local fwd accept error: {}", e);
+                            tokio::select! {
+                                _ = cancel_rx_clone.changed() => {
+                                    debug!("Mux local fwd listener cancelled");
                                     break;
+                                }
+                                result = listener.accept() => {
+                                    match result {
+                                        Ok((tcp_stream, _)) => {
+                                            let session = session.clone();
+                                            let ch = connect_host.clone();
+                                            let cp = connect_port as u16;
+                                            if listen_port == 0xFFFF_FFFE || connect_port == 0xFFFF_FFFE {
+                                                warn!("Local UDS forwarding not implemented in mux server yet");
+                                                return;
+                                            }
+                                            tokio::spawn(async move {
+                                                if let Err(e) = super::sshc::handle_local_forward(
+                                                    tcp_stream, session, &ch, cp,
+                                                )
+                                                .await
+                                                {
+                                                    debug!("Mux local forward error: {}", e);
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            error!("Mux local fwd accept error: {}", e);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }

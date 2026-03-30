@@ -31,6 +31,10 @@ pub static __libc_single_threaded: u8 = 0;
 /// Add missing __cmsg_nxthdr symbol for musl build.
 /// This is used by perfetto C++ code to iterate over ancillary data (cmsghdr).
 /// On musl, CMSG_NXTHDR is usually a macro or an inline function that doesn't have an external symbol.
+///
+/// # Safety
+/// This function is safe to call if `mhdr` and `cmsg` are valid pointers to `msghdr` and `cmsghdr` respectively,
+/// and `mhdr.msg_control` points to a buffer of at least `mhdr.msg_controllen` bytes.
 #[cfg(target_env = "musl")]
 #[no_mangle]
 pub unsafe extern "C" fn __cmsg_nxthdr(
@@ -334,7 +338,7 @@ pub fn init_telemetry() {
                 }
             );
             headers.insert("Authorization".to_string(), auth_val);
-            headers.insert("stream-name".to_string(), format!("otrs"));
+            headers.insert("stream-name".to_string(), "otrs".to_string());
         }
 
         let insecure = env::var("OTEL_EXPORTER_OTLP_INSECURE")

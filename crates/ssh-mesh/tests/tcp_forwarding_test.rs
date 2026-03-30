@@ -184,7 +184,7 @@ async fn test_local_tcp_forwarding_large_data() -> Result<()> {
 
         tokio::time::sleep(Duration::from_millis(2000)).await;
 
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", local_forward_port)).await?;
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", local_forward_port)).await?;
         
         // 1MB of data
         let size = 1024 * 1024;
