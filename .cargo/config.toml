@@ -12,6 +12,6 @@ linker = "/opt/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_
 cc = "/opt/Android/Sdk/ndk/default/toolchains/llvm/prebuilt/linux-x86_64/x86/bin/x86_64-linux-android26-clang"
 
 [target.x86_64-unknown-linux-musl]
-linker = "/opt/musl/bin/x86_64-linux-musl-gcc"
-ar = "/opt/musl/bin/ar"
+# linker = "/opt/musl/bin/x86_64-linux-musl-gcc"
+# ar = "/opt/musl/bin/ar"
 rustflags = ["-C", "link-arg=-fno-use-linker-plugin"]
