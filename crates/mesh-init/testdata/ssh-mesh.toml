@@ -1,0 +1,24 @@
+[service]
+name = "ssh-mesh"
+command = "./ssh-mesh"
+priority = 100
+oneshot = false
+
+[resources]
+memory_max = "1G"
+cpu_weight = 100
+
+[environment]
+RUST_LOG = "info"
+SSH_PORT = "14022"
+HTTP_PORT = "14080"
+
+# Socket activation: mesh-init listens on the SSH and HTTP ports.
+# When a connection arrives, ssh-mesh is started and passed the listening FDs.
+[[activation]]
+port = 14022
+wait = true
+
+[[activation]]
+port = 14080
+wait = true

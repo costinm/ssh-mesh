@@ -1,0 +1,11 @@
+[service]
+name = "otel"
+command = "./otel"
+priority = 300
+oneshot = false
+
+[resources]
+memory_max = "512M"
+
+[environment]
+RUST_LOG = "info"

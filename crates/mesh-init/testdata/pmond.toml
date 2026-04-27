@@ -1,0 +1,18 @@
+[service]
+name = "pmond"
+command = "./pmond"
+args = ["--server", "--refresh", "5"]
+priority = 200
+oneshot = false
+
+[resources]
+memory_max = "256M"
+
+[environment]
+RUST_LOG = "info"
+
+# Socket activation: mesh-init listens on pmond's HTTP port.
+# pmond is started when a request arrives and handles accept() itself.
+[[activation]]
+port = 14090
+wait = true
