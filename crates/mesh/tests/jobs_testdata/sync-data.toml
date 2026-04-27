@@ -1,0 +1,26 @@
+name = "sync-data"
+command = "echo"
+args = ["Mocking sync data!"]
+priority = 300
+persisted = true
+save_result = true
+
+[schedule]
+periodic_secs = 3600
+flex_secs = 900
+
+[constraints]
+network_type = "unmetered"
+requires_charging = false
+requires_battery_not_low = true
+
+[constraints.custom]
+vpn_connected = true
+
+[backoff]
+initial_secs = 30
+policy = "exponential"
+max_retries = 5
+
+[environment]
+SYNC_MODE = "incremental"

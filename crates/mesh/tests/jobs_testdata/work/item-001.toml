@@ -1,0 +1,7 @@
+id = "item-001"
+enqueued_at = "2026-04-26T22:00:00Z"
+delivery_count = 0
+
+[data]
+source = "/data/uploads/file1.dat"
+destination = "remote:/backup/"
