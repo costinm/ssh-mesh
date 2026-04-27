@@ -57,8 +57,8 @@ pub struct ConnectionInfo {
 pub struct ClientHandler {
     /// Path on disk for storing the known server key.
     key_file: PathBuf,
-    /// Expected server key (if provided or previously saved). Empty ⇒ TOFU.
-    expected_key: Option<RusshPublicKey>,
+    /// Expected server keys (if provided or previously saved). Empty ⇒ TOFU.
+    expected_keys: Vec<RusshPublicKey>,
     /// CA keys for validating server certificates.
     ca_keys: Arc<Vec<ssh_key::PublicKey>>,
     /// Shared forwards list to look up target for incoming channels.
@@ -111,19 +111,21 @@ impl client::Handler for ClientHandler {
         }
 
         // 2. Fallback to standard Expected Key / TOFU logic
-        if let Some(ref expected) = self.expected_key {
-            // Validate against known key: compare OpenSSH string representation
-            let expected_str = expected
-                .to_openssh()
-                .context("Failed to serialize expected key")?;
+        if !self.expected_keys.is_empty() {
+            // Validate against known keys: compare OpenSSH string representation
             let actual_str = server_public_key
                 .to_openssh()
                 .context("Failed to serialize server key")?;
-            if expected_str != actual_str {
-                error!("Server key mismatch!");
-                return Ok(false);
+            for expected in &self.expected_keys {
+                let expected_str = expected
+                    .to_openssh()
+                    .context("Failed to serialize expected key")?;
+                if expected_str == actual_str {
+                    return Ok(true);
+                }
             }
-            Ok(true)
+            error!("Server key mismatch! None of {} expected keys matched", self.expected_keys.len());
+            Ok(false)
         } else {
             // TOFU: save the key for future connections
             info!(
@@ -373,29 +375,29 @@ impl SshClientManager {
 
         let key_file = PathBuf::from(format!("{}_{}.pub", connect_host, connect_port));
 
-        // Determine expected server key
-        let expected_key = if !server_key.is_empty() {
-            Some(
+        // Determine expected server key(s)
+        let expected_keys = if !server_key.is_empty() {
+            vec![
                 RusshPublicKey::from_openssh(server_key)
                     .context("Failed to parse supplied server key")?,
-            )
+            ]
         } else if key_file.exists() {
             // Try loading a previously TOFU-saved key
             let data =
                 std::fs::read_to_string(&key_file).context("Failed to read saved server key")?;
-            Some(
+            vec![
                 RusshPublicKey::from_openssh(data.trim())
                     .context("Failed to parse saved server key")?,
-            )
+            ]
         } else {
-            None
+            vec![]
         };
 
         let forwards = Arc::new(Mutex::new(Vec::new()));
 
         let handler = ClientHandler {
             key_file,
-            expected_key,
+            expected_keys,
             ca_keys: self.ca_keys.clone(),
             forwards: forwards.clone(),
             host: connect_host.clone(),
@@ -630,6 +632,222 @@ impl SshClientManager {
             stderr: String::from_utf8_lossy(&stderr).to_string(),
             exit_code: exit_code.unwrap_or(0),
         })
+    }
+
+    /// Connect to an SSH server using a `SshClientConfig`.
+    ///
+    /// Resolves hostname from the config name if not explicitly set.
+    /// Uses the `keys` list for host key verification; falls back to TOFU
+    /// if no keys are specified. Sets up local and remote forwards.
+    ///
+    /// Returns the connection ID on success.
+    pub async fn connect_with_config(
+        &self,
+        name: &str,
+        cfg: &crate::SshClientConfig,
+    ) -> Result<u64> {
+        let connect_host = cfg.hostname.as_deref().unwrap_or(name).to_string();
+        let connect_port = cfg.port;
+        let connect_user = if cfg.user.is_empty() {
+            "root".to_string()
+        } else {
+            cfg.user.clone()
+        };
+
+        let key_file = PathBuf::from(format!("{}_{}.pub", connect_host, connect_port));
+
+        // Parse expected host keys from config
+        let mut expected_keys = Vec::new();
+        for key_str in &cfg.keys {
+            match RusshPublicKey::from_openssh(key_str) {
+                Ok(k) => expected_keys.push(k),
+                Err(e) => {
+                    error!("Failed to parse host key for '{}': {} - {}", name, key_str, e);
+                }
+            }
+        }
+
+        // If no keys configured, try TOFU file
+        if expected_keys.is_empty()
+            && key_file.exists()
+            && let Ok(data) = std::fs::read_to_string(&key_file)
+            && let Ok(k) = RusshPublicKey::from_openssh(data.trim())
+        {
+            expected_keys.push(k);
+        }
+
+        let forwards = Arc::new(Mutex::new(Vec::new()));
+
+        let handler = ClientHandler {
+            key_file,
+            expected_keys,
+            ca_keys: self.ca_keys.clone(),
+            forwards: forwards.clone(),
+            host: connect_host.clone(),
+        };
+
+        let config = Arc::new(client::Config {
+            nodelay: true,
+            ..Default::default()
+        });
+
+        let mut session =
+            client::connect(config, (connect_host.as_str(), connect_port), handler).await?;
+
+        // Authenticate with the server's private key
+        let key_with_alg = PrivateKeyWithHashAlg::new(self.private_key.clone(), None);
+        let auth_res = session
+            .authenticate_publickey(&connect_user, key_with_alg)
+            .await?;
+        if auth_res != client::AuthResult::Success {
+            anyhow::bail!("Authentication failed for '{}'", name);
+        }
+
+        let session = Arc::new(Mutex::new(session));
+
+        // Start mux server if mux_dir is configured
+        let mux_server = if let Some(ref mux_dir) = self.mux_dir {
+            let socket_path = crate::mux::mux_socket_path(mux_dir, &connect_user, name);
+            match crate::mux::MuxServer::start(socket_path, session.clone()) {
+                Ok(server) => Some(server),
+                Err(e) => {
+                    error!("Failed to start mux server for '{}': {}", name, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut next_id = self.next_id.lock().await;
+        let id = *next_id;
+        *next_id += 1;
+        drop(next_id);
+
+        let conn = SshClientConnection {
+            id,
+            host: connect_host.clone(),
+            port: connect_port,
+            user: connect_user.clone(),
+            session,
+            forwards,
+            _forward_tasks: Vec::new(),
+            mux_server,
+        };
+
+        self.connections.lock().await.insert(id, conn);
+        info!(
+            "SSH client '{}' connected to {}:{} as {} (id={})",
+            name, connect_host, connect_port, connect_user, id
+        );
+
+        // Set up local forwards
+        for lf in &cfg.local_forward {
+            if let Err(e) = self
+                .add_local_forward(id, lf.port, &lf.host, lf.host_port)
+                .await
+            {
+                error!(
+                    "Failed to add local forward {}:{} -> {}:{} for '{}': {}",
+                    lf.bind_address, lf.port, lf.host, lf.host_port, name, e
+                );
+            }
+        }
+
+        // Set up remote forwards
+        for rf in &cfg.remote_forward {
+            if let Err(e) = self
+                .add_remote_forward(id, rf.port, &rf.host, rf.host_port)
+                .await
+            {
+                error!(
+                    "Failed to add remote forward {}:{} -> {}:{} for '{}': {}",
+                    rf.bind_address, rf.port, rf.host, rf.host_port, name, e
+                );
+            }
+        }
+
+        Ok(id)
+    }
+
+    /// Check if a connection is still alive by executing a no-op.
+    pub async fn is_alive(&self, id: u64) -> bool {
+        let conns = self.connections.lock().await;
+        if let Some(conn) = conns.get(&id) {
+            let session = conn.session.lock().await;
+            // Try opening and immediately closing a session channel
+            match session.channel_open_session().await {
+                Ok(channel) => {
+                    let _ = channel.close().await;
+                    true
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        }
+    }
+}
+
+/// Start all configured SSH client connections from `MeshNodeConfig.clients`.
+///
+/// For each entry, spawns a task that connects and (optionally) keeps the
+/// connection alive with automatic reconnection.
+pub async fn start_configured_clients(
+    manager: Arc<SshClientManager>,
+    clients: std::collections::HashMap<String, crate::SshClientConfig>,
+) {
+    for (name, cfg) in clients {
+        let manager = manager.clone();
+        let name = name.clone();
+        let cfg = cfg.clone();
+
+        tokio::spawn(async move {
+            if cfg.keep_alive {
+                // Keep-alive loop: connect, monitor, reconnect on failure.
+                let interval = std::time::Duration::from_secs(
+                    if cfg.reconnect_interval_secs > 0 {
+                        cfg.reconnect_interval_secs
+                    } else {
+                        5
+                    },
+                );
+
+                loop {
+                    info!("Connecting to configured client '{}'...", name);
+                    match manager.connect_with_config(&name, &cfg).await {
+                        Ok(id) => {
+                            info!("Client '{}' connected (id={}), monitoring...", name, id);
+                            // Monitor the connection
+                            loop {
+                                tokio::time::sleep(interval).await;
+                                if !manager.is_alive(id).await {
+                                    info!("Client '{}' (id={}) connection lost, reconnecting...", name, id);
+                                    let _ = manager.disconnect(id).await;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to '{}': {}", name, e);
+                        }
+                    }
+                    info!("Retrying '{}' in {} seconds...", name, interval.as_secs());
+                    tokio::time::sleep(interval).await;
+                }
+            } else {
+                // One-shot connection, no reconnect.
+                info!("Connecting to configured client '{}' (one-shot)...", name);
+                match manager.connect_with_config(&name, &cfg).await {
+                    Ok(id) => {
+                        info!("Client '{}' connected (id={})", name, id);
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to '{}': {}", name, e);
+                    }
+                }
+            }
+        });
     }
 }
 

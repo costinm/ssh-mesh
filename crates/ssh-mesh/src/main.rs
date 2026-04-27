@@ -138,18 +138,18 @@ async fn main() -> Result<(), anyhow::Error> {
     #[cfg(feature = "ws")]
     let ws_server = Arc::new(WSServer::new());
 
-    // Initialize ProcMon if enabled
-    #[cfg(feature = "pmon")]
-    let proc_mon = {
-        let pm = Arc::new(pmond::ProcMon::new().expect("Failed to create ProcMon"));
-        // Start monitoring: read_sync=true, watch_psi=true, event_tx=None
-        if let Err(e) = pm.start(true, true, None) {
-            error!("Failed to start ProcMon: {}", e);
-        } else {
-            info!("ProcMon started successfully");
-        }
-        pm
-    };
+    // // Initialize ProcMon if enabled
+    // #[cfg(feature = "pmon")]
+    // let proc_mon = {
+    //     let pm = Arc::new(pmond::ProcMon::new().expect("Failed to create ProcMon"));
+    //     // Start monitoring: read_sync=true, watch_psi=true, event_tx=None
+    //     if let Err(e) = pm.start(true, true, None) {
+    //         error!("Failed to start ProcMon: {}", e);
+    //     } else {
+    //         info!("ProcMon started successfully");
+    //     }
+    //     pm
+    // };
 
     // Create AppState
 
@@ -174,6 +174,19 @@ async fn main() -> Result<(), anyhow::Error> {
             env::var("SSH_MUX").ok().map(PathBuf::from),
         )),
     };
+
+    // Start configured SSH client connections from config
+    let configured_clients = ssh_server.cfg.clients.clone();
+    if !configured_clients.is_empty() {
+        info!(
+            "Starting {} configured SSH client connections",
+            configured_clients.len()
+        );
+        let manager_clone = app_state.ssh_client_manager.clone();
+        tokio::spawn(async move {
+            ssh_mesh::sshc::start_configured_clients(manager_clone, configured_clients).await;
+        });
+    }
 
     info!(
         "Starting SSH_PORT {} and HTTPS_PORT={} HTTP_PORT={} SSH_BASEDIR={:?} app_port={:?} ip={}",
@@ -241,9 +254,10 @@ async fn main() -> Result<(), anyhow::Error> {
         app = app.merge(ws::app_ws(ws_state));
     }
 
-    app = app.nest("/", pmond::handlers::app(proc_mon.clone()));
+    // app = app.nest("/", pmond::handlers::app(proc_mon.clone()));
 
     // HTTPS server - WIP, authz and authn not implemented.
+    // SSH is tunneled over H2 - doing its own auth.
     if https_port > 0 {
         let cert_path = base_dir.join("id_ecdsa.crt");
         let key_path = base_dir.join("id_ecdsa");

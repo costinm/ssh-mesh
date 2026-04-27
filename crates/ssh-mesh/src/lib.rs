@@ -40,22 +40,126 @@ pub mod utils;
 
 pub use sshd::SshHandler;
 
+/// A local port forward configuration.
+///
+/// Listens on `bind_address:port` locally and forwards through the SSH
+/// tunnel to `host:host_port` on the remote side.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct LocalForwardConfig {
+    /// Local address to bind (default "127.0.0.1").
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+    /// Local port to listen on.
+    pub port: u16,
+    /// Remote host to forward to.
+    pub host: String,
+    /// Remote port to forward to.
+    pub host_port: u16,
+}
+
+/// A remote port forward configuration.
+///
+/// Asks the SSH server to listen on `bind_address:port` and forward
+/// connections back through the tunnel to `host:host_port` locally.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RemoteForwardConfig {
+    /// Remote address the server binds (default "127.0.0.1").
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+    /// Remote port the server listens on.
+    pub port: u16,
+    /// Local host to connect to.
+    pub host: String,
+    /// Local port to connect to.
+    pub host_port: u16,
+}
+
+fn default_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+/// Configuration for an outgoing SSH client connection.
+///
+/// Modeled after `~/.ssh/config` Host entries, with local/remote
+/// forward support and optional known host keys.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct SshClientConfig {
+    /// Hostname or IP to connect to.
+    #[serde(alias = "Hostname", alias = "HostName")]
+    pub hostname: Option<String>,
+
+    /// SSH port (default 22).
+    #[serde(default = "default_ssh_port", alias = "Port")]
+    pub port: u16,
+
+    /// Username for authentication.
+    #[serde(default, alias = "User")]
+    pub user: String,
+
+    /// Expected host public keys (OpenSSH format).
+    /// If empty, TOFU (Trust-On-First-Use) is used.
+    /// If set, the server's key must match one of these.
+    #[serde(default, alias = "HostKey")]
+    pub keys: Vec<String>,
+
+    /// Keep the connection alive and reconnect on failure.
+    #[serde(default, alias = "KeepAlive")]
+    pub keep_alive: bool,
+
+    /// Reconnect interval in seconds when keep_alive is true.
+    #[serde(default = "default_reconnect_interval")]
+    pub reconnect_interval_secs: u64,
+
+    /// Local port forwards (like `ssh -L`).
+    #[serde(default, alias = "LocalForward")]
+    pub local_forward: Vec<LocalForwardConfig>,
+
+    /// Remote port forwards (like `ssh -R`).
+    #[serde(default, alias = "RemoteForward")]
+    pub remote_forward: Vec<RemoteForwardConfig>,
+}
+
+fn default_reconnect_interval() -> u64 {
+    5
+}
+
 /// Configurable fields for MeshNode, loadable from JSON or YAML.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MeshNodeConfig {
+    /// All configs are relative to this directory.
     pub base_dir: Option<PathBuf>,
+
+    /// SSH server port.
     pub ssh_port: Option<u16>,
+
+    /// HTTP server port (plain http)
     pub http_port: Option<u16>,
+
+    /// Path to the sftp server binary. Not using built-in to
+    /// keep server isolated.
     pub sftp_server_path: Option<String>,
+
+    /// Root directory for SFTP access.
     pub sftp_root: Option<PathBuf>,
+
     /// Optional list of authorized public keys (OpenSSH format lines).
     /// If present, these are used in addition to keys loaded from the
     /// `authorized_keys` file in base_dir.
     pub authorized_keys: Option<Vec<String>>,
+
     /// Optional list of CA public keys (OpenSSH format).
     /// If present, these are used in addition to CAs loaded from
     /// the `authorized_cas` file in base_dir.
     pub ca_keys: Option<Vec<String>>,
+
+    /// Map of named SSH client connections to establish at startup.
+    /// Keys are logical names; values are `SshClientConfig` entries.
+    #[serde(default)]
+    pub clients: HashMap<String, SshClientConfig>,
 }
 
 // MeshNode is the main server struct (formerly SshServer).
@@ -65,17 +169,21 @@ pub struct MeshNode {
     pub cfg: MeshNodeConfig,
 
     keys: PrivateKey,
+
     clients: Arc<tokio::sync::Mutex<Vec<usize>>>,
     id_counter: Arc<std::sync::Mutex<usize>>,
 
     pub authorized_keys: Arc<Vec<crate::auth::AuthorizedKeyEntry>>,
     pub ca_keys: Arc<Vec<ssh_key::PublicKey>>,
 
-    /// Active SSH handlers indexed by their ID
+    /// Active SSH handlers indexed by their ID.
+    /// This is the list of incoming mux connections.
     active_handlers:
         Arc<std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<sshd::SshHandler>>>>>,
+    
     /// Track connected clients with their remote forward listeners
     pub connected_clients: Arc<tokio::sync::Mutex<HashMap<usize, ConnectedClientInfo>>>,
+    
     pub server_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -280,11 +388,26 @@ pub async fn run_ssh_server(
     config: server::Config,
     server: MeshNode,
 ) -> Result<(), anyhow::Error> {
-    let addr = format!("0.0.0.0:{}", port);
-    info!("Starting SSH server on {}", addr);
-
     let config = Arc::new(config);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    // Check for socket activation via LISTEN_FD
+    let listener = if let Ok(fd_str) = std::env::var("LISTEN_FD") {
+        if let Ok(fd) = fd_str.parse::<i32>() {
+            info!("Using activated listener FD {} for SSH server", fd);
+            use std::os::fd::FromRawFd;
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+            std_listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(std_listener)?
+        } else {
+            let addr = format!("0.0.0.0:{}", port);
+            info!("Starting SSH server on {}", addr);
+            tokio::net::TcpListener::bind(&addr).await?
+        }
+    } else {
+        let addr = format!("0.0.0.0:{}", port);
+        info!("Starting SSH server on {}", addr);
+        tokio::net::TcpListener::bind(&addr).await?
+    };
 
     loop {
         debug!("Waiting for new connection...");
@@ -405,6 +528,7 @@ mod tests {
         assert!(cfg.http_port.is_none());
         assert!(cfg.authorized_keys.is_none());
         assert!(cfg.ca_keys.is_none());
+        assert!(cfg.clients.is_empty());
     }
 
     #[test]
@@ -441,5 +565,66 @@ mod tests {
             cfg.sftp_server_path,
             Some("/usr/lib/sftp-server".to_string())
         );
+    }
+
+    #[test]
+    fn test_mesh_node_config_clients_yaml() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("mesh_cfg_test")
+            .tempdir()
+            .expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().to_path_buf();
+
+        let yaml_content = r#"
+clients:
+  gateway:
+    hostname: gw.example.com
+    port: 2222
+    user: deploy
+    keep_alive: true
+    reconnect_interval_secs: 10
+    keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTestingOnly"
+    local_forward:
+      - bind_address: "127.0.0.1"
+        port: 8080
+        host: "10.0.0.1"
+        host_port: 80
+    remote_forward:
+      - port: 9090
+        host: "127.0.0.1"
+        host_port: 3000
+  backup:
+    hostname: backup.local
+    user: root
+"#;
+        std::fs::write(base_dir.join("mesh.yaml"), yaml_content).unwrap();
+
+        let cfg = MeshNode::load_config(&base_dir);
+        assert_eq!(cfg.clients.len(), 2);
+
+        let gw = cfg.clients.get("gateway").expect("gateway client");
+        assert_eq!(gw.hostname.as_deref(), Some("gw.example.com"));
+        assert_eq!(gw.port, 2222);
+        assert_eq!(gw.user, "deploy");
+        assert!(gw.keep_alive);
+        assert_eq!(gw.reconnect_interval_secs, 10);
+        assert_eq!(gw.keys.len(), 1);
+        assert_eq!(gw.local_forward.len(), 1);
+        assert_eq!(gw.local_forward[0].port, 8080);
+        assert_eq!(gw.local_forward[0].host, "10.0.0.1");
+        assert_eq!(gw.local_forward[0].host_port, 80);
+        assert_eq!(gw.remote_forward.len(), 1);
+        assert_eq!(gw.remote_forward[0].port, 9090);
+        assert_eq!(gw.remote_forward[0].host_port, 3000);
+
+        let backup = cfg.clients.get("backup").expect("backup client");
+        assert_eq!(backup.hostname.as_deref(), Some("backup.local"));
+        assert_eq!(backup.port, 22); // default
+        assert_eq!(backup.user, "root");
+        assert!(!backup.keep_alive); // default
+        assert!(backup.keys.is_empty()); // default - use TOFU
+        assert!(backup.local_forward.is_empty());
+        assert!(backup.remote_forward.is_empty());
     }
 }

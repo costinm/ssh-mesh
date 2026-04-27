@@ -1,5 +1,7 @@
 pub mod local_trace;
+pub mod protocol;
 pub mod uds;
+pub mod jobs;
 
 use axum::serve;
 use serde::{Deserialize, Serialize};
@@ -49,23 +51,41 @@ impl MeshApp {
     /// Run the HTTP/H2C over TCP server
     pub async fn run_tcp_server(&self) -> Result<(), anyhow::Error> {
         if let Some(router) = &self.router {
-            let uid = unsafe { libc::getuid() };
-            // Fallback default port logic similar to pmond if not specified
-            let port = self.config.http_port.unwrap_or(if uid == 0 {
-                8081
+            // Check for socket activation via LISTEN_FD
+            let listener = if let Ok(fd_str) = std::env::var("LISTEN_FD") {
+                if let Ok(fd) = fd_str.parse::<i32>() {
+                    info!("MeshApp: Using activated listener FD {}", fd);
+                    use std::os::fd::FromRawFd;
+                    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+                    std_listener.set_nonblocking(true)?;
+                    TcpListener::from_std(std_listener)?
+                } else {
+                    self.bind_default_tcp().await?
+                }
             } else {
-                8082 + (uid as u16 - 1000)
-            });
-
-            let addr = format!("127.0.0.1:{}", port);
-            let listener = TcpListener::bind(&addr).await?;
-            info!("MeshApp HTTP listening on http://{}", addr);
+                self.bind_default_tcp().await?
+            };
 
             serve(listener, router.clone().into_make_service()).await?;
         } else {
             error!("MeshApp: No router configured for TCP server");
         }
         Ok(())
+    }
+
+    /// Bind the default TCP port.
+    async fn bind_default_tcp(&self) -> Result<TcpListener, anyhow::Error> {
+        let uid = unsafe { libc::getuid() };
+        let port = self.config.http_port.unwrap_or(if uid == 0 {
+            8081
+        } else {
+            8082 + (uid as u16 - 1000)
+        });
+
+        let addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&addr).await?;
+        info!("MeshApp HTTP listening on http://{}", addr);
+        Ok(listener)
     }
 
     /// Run the HTTP server on UDS socket using the extracted logic
