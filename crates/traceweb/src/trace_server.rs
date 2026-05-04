@@ -1,8 +1,7 @@
 //! Trace server: HTTP server for observability hub.
 //!
 //! Discovers UDS trace sockets in a base directory, aggregates logs,
-//! and serves a rich trace viewer UI. Also provides controls for
-//! Perfetto tracer and OTEL push.
+//! and serves a rich trace viewer UI. 
 
 use axum::{
     extract::{Query, State},
@@ -44,9 +43,6 @@ pub struct TraceServerState {
     /// Track which sources are currently connected
     pub connected_sources: Arc<Mutex<HashMap<String, SourceInfo>>>,
 
-    /// Perfetto consumer socket path (configurable)
-    pub perfetto_socket: Arc<Mutex<String>>,
-
     /// Whether OTEL push is currently active
     pub otel_push_active: Arc<Mutex<bool>>,
 }
@@ -85,13 +81,6 @@ pub struct DiscoveredSocket {
     pub connected: bool,
 }
 
-/// Perfetto config request/response
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PerfettoConfig {
-    pub socket: String,
-    pub connected: bool,
-}
-
 /// OTEL push status
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OtelPushStatus {
@@ -106,7 +95,6 @@ impl TraceServerState {
             base_dir,
             aggregated_tx,
             connected_sources: Arc::new(Mutex::new(HashMap::new())),
-            perfetto_socket: Arc::new(Mutex::new("/tmp/perfetto-consumer".to_string())),
             otel_push_active: Arc::new(Mutex::new(false)),
         }
     }
@@ -121,8 +109,6 @@ pub fn trace_router(state: TraceServerState) -> Router {
         .route("/api/sources/disconnect", get(disconnect_source))
         .route("/api/stream", get(stream_aggregated_sse))
         .route("/api/discover", get(discover_sockets))
-        .route("/api/perfetto", get(get_perfetto_config))
-        .route("/api/perfetto/pull", post(perfetto_pull_handler))
         .route("/api/otel", get(get_otel_status))
         .route("/api/otel/toggle", post(otel_toggle_handler))
         .route("/assets/*path", get(serve_asset))
@@ -307,60 +293,6 @@ async fn stream_aggregated_sse(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-/// Get current Perfetto configuration
-async fn get_perfetto_config(State(state): State<TraceServerState>) -> impl IntoResponse {
-    let socket = state.perfetto_socket.lock().await.clone();
-    (
-        StatusCode::OK,
-        Json(PerfettoConfig {
-            socket,
-            connected: false, // TODO: track actual connection status
-        }),
-    )
-}
-
-/// Query parameters for the Perfetto pull request
-#[derive(Debug, Deserialize)]
-pub struct PerfettoPullQuery {
-    pub socket: Option<String>,
-    pub duration: Option<u64>,
-}
-
-/// Handler for POST /api/perfetto/pull
-///
-/// Starts a Perfetto pull session for the specified duration.
-async fn perfetto_pull_handler(
-    State(state): State<TraceServerState>,
-    Query(query): Query<PerfettoPullQuery>,
-) -> impl IntoResponse {
-    let socket = match query.socket {
-        Some(s) => s,
-        None => state.perfetto_socket.lock().await.clone(),
-    };
-    let duration = query.duration.unwrap_or(10);
-
-    // Spawn the pull in a background task so we don't block the HTTP response
-    tokio::task::spawn_blocking(move || {
-        match crate::perfetto_pull::PerfettoPull::new_system(&socket) {
-            Ok(mut pull) => {
-                pull.start();
-                std::thread::sleep(std::time::Duration::from_secs(duration));
-                if let Err(e) = pull.stop() {
-                    tracing::error!("Perfetto pull stop error: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to create Perfetto pull session: {}", e);
-            }
-        }
-    });
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "pulling", "duration": duration})),
-    )
 }
 
 /// Get OTEL push status

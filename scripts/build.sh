@@ -40,8 +40,12 @@ _all() {
     local target=$1
     local mode=$2
     
-    cargo build --target $target ${mode} -p pmond
-    cargo build --target $target ${mode} --features pmon -p ssh-mesh
+    cargo build -j 1 --target $target ${mode} -p mesh
+    cargo build -j 1 --target $target ${mode} -p pmond
+    cargo build -j 1 --target $target ${mode} -p ssh-mesh
+    cargo build -j 1 --target $target ${mode} -p mesh-init
+    cargo build -j 1 --target $target ${mode} -p unpfs
+    #cargo build --target $target ${mode} --features pmon -p ssh-mesh
 }
 
 unpfs() {

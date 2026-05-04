@@ -30,6 +30,13 @@ export RUST_LOG="info"
 ./target/debug/mesh-init &
 ```
 
+As regular user, '$HOME/.config/mesh-init' is used as default for configs and
+'$HOME/.run/mesh-init' for sockets.
+
+Top slice is /sys/fs/cgroup/mesh.slice is used for cgroups and should be owned by the 
+user. TODO: make this customizable so different users can manage their groups (like /run/user).
+
+
 ### Running the automated test environment
 
 The project includes an integration script that runs tests and starts up test config examples. 
