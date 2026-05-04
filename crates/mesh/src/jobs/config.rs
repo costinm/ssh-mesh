@@ -62,8 +62,8 @@ pub struct ConstraintConfig {
     #[serde(default)]
     pub requires_storage_not_low: bool,
     #[serde(default)]
-    pub trigger_content_uris: Vec<String>,
-    pub trigger_content_max_delay_secs: Option<u64>,
+    pub triggers: Vec<String>,
+    pub trigger_max_delay_secs: Option<u64>,
     #[serde(default)]
     pub custom: HashMap<String, bool>,
 }
@@ -90,6 +90,14 @@ pub struct JobConfig {
     pub environment: HashMap<String, String>,
     #[serde(default)]
     pub save_result: bool,
+    pub trace_tag: Option<String>,
+    #[serde(default)]
+    pub user_initiated: bool,
+    #[serde(default)]
+    pub expedited: bool,
+    pub estimated_download_bytes: Option<u64>,
+    pub estimated_upload_bytes: Option<u64>,
+    pub minimum_network_chunk_bytes: Option<u64>,
 }
 
 fn default_priority() -> u32 {

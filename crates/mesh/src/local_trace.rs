@@ -1,12 +1,16 @@
-//! Local trace provides a configurable telemetry with an in-memory buffer.
+//! Local trace provides configurable telemetry with an in-memory buffer.
+//! 
+//! Events - trace, log, metrics, general purpose - are generated using rust tracing API.
+//! Events are held in a circular buffer - and can be accessed by other components 
+//! in process.
 //!
-//! The messages are distributed via a Unix domain socket to one or more
-//! consumers.
+//! The events are also distributed via a Unix domain socket to one or more
+//! consumers. A consumer conencts and subscribes to specific events, using pubsub pattern.
 //!
 //! This module provides:
 //! - Dynamic trace level configuration.
-//! - In-memory circular buffer for recent log entries
-//! - Real-time event streaming using UDS.
+//! - In-memory circular buffer for recent events
+//! - event distribution using UDS.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -19,7 +23,7 @@ use tokio::sync::broadcast;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::{reload, EnvFilter, Registry};
 
-/// Global handle for dynamically reloading the tracing filter.
+/// Global handle for dynamically reloading the tracing filter, required to integrate.
 ///
 /// Any binary using this module should set this handle after initializing
 /// the tracing subscriber with a reload layer.
@@ -45,7 +49,8 @@ pub struct LogEntry {
     pub fields: Option<serde_json::Value>,
 }
 
-/// Request body for setting trace level
+/// Request body for setting trace level, using EnvFilter patterns, i.e. comma separated
+/// list of "(topic=level,)*default"
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraceLevelRequest {
     /// The new trace level filter directive (e.g., "info", "debug", "trace", "ssh_mesh=debug,info")
@@ -163,6 +168,7 @@ where
             fields: if visitor.fields.is_empty() {
                 None
             } else {
+                // TODO: maybe delay json conversion until it is needed.
                 Some(serde_json::to_value(&visitor.fields).unwrap_or(serde_json::Value::Null))
             },
         };

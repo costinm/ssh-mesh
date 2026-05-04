@@ -1,22 +1,16 @@
 [package]
-name = "otel"
+name = "traceweb"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-opentelemetry = { version = "0.27.0", features = ["logs", "trace"] }
-opentelemetry_sdk = { version = "0.27.0", features = ["rt-tokio", "logs", "trace"] }
-opentelemetry-otlp = { version = "0.27.0", features = ["http-json", "reqwest-rustls", "logs", "trace"] }
-opentelemetry-appender-tracing = "0.27.0"
 tracing = "0.1"
-tracing-opentelemetry = "0.28.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 log = "0.4"
 base64 = "0.22.1"
-perfetto-sdk = "0.2"
 mesh = { path = "../mesh" }
 axum = { version = "0.7", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }

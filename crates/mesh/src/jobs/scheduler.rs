@@ -25,6 +25,7 @@ pub struct JobEntry {
     pub state: JobState,
     pub last_run: Option<u64>,
     pub next_eligible: Option<u64>,
+    pub scheduled_at: u64,
     pub failure_count: u32,
     pub work_items: Vec<WorkItem>,
 }
@@ -36,6 +37,7 @@ impl JobEntry {
             state: JobState::Pending,
             last_run: None,
             next_eligible: None,
+            scheduled_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             failure_count: 0,
             work_items: Vec::new(),
         }
@@ -44,7 +46,7 @@ impl JobEntry {
 
 pub struct JobScheduler {
     jobs_dir: PathBuf,
-    jobs: Mutex<HashMap<String, JobEntry>>,
+    pub(crate) jobs: Mutex<HashMap<String, JobEntry>>,
     state: Mutex<SystemState>,
     executor: Arc<dyn JobExecutor>,
 }
@@ -59,7 +61,7 @@ impl JobScheduler {
         }
     }
 
-    fn now_secs() -> u64 {
+    pub(crate) fn now_secs() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
     }
 
@@ -71,7 +73,11 @@ impl JobScheduler {
         }
         
         let mut jobs = self.jobs.lock().await;
-        jobs.insert(name, JobEntry::new(config));
+        let mut entry = JobEntry::new(config);
+        if let Some(latency) = entry.config.schedule.minimum_latency_secs {
+            entry.next_eligible = Some(Self::now_secs() + latency);
+        }
+        jobs.insert(name, entry);
         Ok(())
     }
 
@@ -151,7 +157,11 @@ impl JobScheduler {
         let mut jobs = self.jobs.lock().await;
         let now = Self::now_secs();
 
-        for (name, entry) in jobs.iter_mut() {
+        // Sort by priority (lowest number first)
+        let mut job_refs: Vec<(&String, &mut JobEntry)> = jobs.iter_mut().collect();
+        job_refs.sort_by_key(|(_, entry)| entry.config.priority);
+
+        for (name, entry) in job_refs {
             if entry.state == JobState::Running {
                 continue;
             }
@@ -162,7 +172,18 @@ impl JobScheduler {
                 }
             }
 
-            if Self::evaluate_constraints(&entry.config, &state) {
+            let deadline_passed = entry.config.schedule.override_deadline_secs
+                .map(|d| now >= entry.scheduled_at + d)
+                .unwrap_or(false);
+
+            let transient_trigger_fired = match &event {
+                SystemEvent::CustomCondition { key, value: true } => {
+                    entry.config.constraints.triggers.contains(key)
+                }
+                _ => false,
+            };
+
+            if deadline_passed || Self::evaluate_constraints(&entry.config, &state, transient_trigger_fired) {
                 // Execute
                 entry.state = JobState::Running;
                 entry.last_run = Some(now);
@@ -172,10 +193,12 @@ impl JobScheduler {
                 let executor = self.executor.clone();
                 let config = entry.config.clone();
                 let work_items = entry.work_items.clone();
+                let trace_tag = config.trace_tag.clone().unwrap_or_else(|| "none".to_string());
                 
                 tokio::spawn(async move {
+                    info!(trace_tag = %trace_tag, "JobScheduler starting job {}", config.name);
                     if let Err(e) = executor.execute(&config, &work_items).await {
-                        error!("Failed to execute job {}: {}", config.name, e);
+                        error!(trace_tag = %trace_tag, "Failed to execute job {}: {}", config.name, e);
                     }
                 });
             }
@@ -207,7 +230,11 @@ impl JobScheduler {
                 
                 if let Some(periodic) = entry.config.schedule.periodic_secs {
                     entry.state = JobState::Pending;
-                    entry.next_eligible = Some(now + periodic);
+                    let flex = entry.config.schedule.flex_secs.unwrap_or(periodic).min(periodic);
+                    // Next eligible is period minus flex window
+                    entry.next_eligible = Some(now + periodic - flex);
+                    // Also reset scheduled_at so override_deadline works on the new period
+                    entry.scheduled_at = now;
                 }
             }
 
@@ -228,20 +255,22 @@ impl JobScheduler {
         }
     }
 
-    fn evaluate_constraints(config: &JobConfig, state: &SystemState) -> bool {
+    fn evaluate_constraints(config: &JobConfig, state: &SystemState, transient_trigger_fired: bool) -> bool {
         let c = &config.constraints;
+
+        if !c.triggers.is_empty() && !transient_trigger_fired {
+            return false;
+        }
 
         if let Some(net) = &c.network_type {
             match net {
                 NetworkType::None => {} // no req
-                NetworkType::Any | NetworkType::Unmetered | NetworkType::NotRoaming | NetworkType::Cellular => {
-                    if !state.network_connected {
-                        return false;
-                    }
-                    // For a real implementation, we'd check if the active network matches the specific type requested.
-                    // For now, we just ensure ANY network is connected.
-                    if matches!(net, NetworkType::Unmetered) && state.network_type != NetworkType::Unmetered {
-                        // This assumes state.network_type holds the actual active network type.
+                NetworkType::Any => {
+                    if !state.network_connected { return false; }
+                }
+                NetworkType::Unmetered | NetworkType::NotRoaming | NetworkType::Cellular => {
+                    if !state.network_connected { return false; }
+                    if state.network_type != *net {
                         return false; 
                     }
                 }
