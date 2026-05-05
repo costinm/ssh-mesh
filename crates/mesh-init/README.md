@@ -114,3 +114,8 @@ not restarted automatically.
 - env variable to set system and app config dir.
 - check peer identity - allow 0, 1000 and current user if not 
 running as root.
+
+Useful crates:
+- unshare https://github.com/tailhook/unshare
+- https://harrystern.net/extrasafe-user-namespaces.html
+- https://crates.io/crates/unshare_petbox

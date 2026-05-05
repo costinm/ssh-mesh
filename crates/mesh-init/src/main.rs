@@ -63,13 +63,14 @@ async fn run_daemon(config_dir: String, socket_path: String) -> Result<()> {
     );
 
     let daemon = Daemon::new(config);
-    
+
     // Start job scheduler
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let jobs_dir = format!("{}/.config/mesh/jobs", home);
     let executor = std::sync::Arc::new(mesh::jobs::executor::MeshInitExecutor::new(socket_path));
-    let scheduler = std::sync::Arc::new(mesh::jobs::scheduler::JobScheduler::new(jobs_dir, executor));
-    
+    let scheduler =
+        std::sync::Arc::new(mesh::jobs::scheduler::JobScheduler::new(jobs_dir, executor));
+
     let sched_clone = scheduler.clone();
     tokio::spawn(async move {
         if let Err(e) = sched_clone.check_jobs().await {
@@ -153,15 +154,11 @@ async fn run_and_exit(config_dir: String, socket_path: String, command: Vec<Stri
         gid: default_cfg.and_then(|d| d.gid),
         user: default_cfg.and_then(|d| d.user.clone()),
         group: default_cfg.and_then(|d| d.group.clone()),
-        env: default_cfg
-            .map(|d| d.env.clone())
-            .unwrap_or_default(),
+        env: default_cfg.map(|d| d.env.clone()).unwrap_or_default(),
         priority: 0,
         oneshot: true,
         oom_score_adjust: default_cfg.and_then(|d| d.oom_score_adjust),
-        resources: default_cfg
-            .map(|d| d.resources.clone())
-            .unwrap_or_default(),
+        resources: default_cfg.map(|d| d.resources.clone()).unwrap_or_default(),
         activation: vec![],
         source_path: None,
     };
@@ -191,7 +188,6 @@ async fn wait_for_service_exit(daemon: &std::sync::Arc<Daemon>, name: &str) {
     }
 }
 
-
 fn get_config_dir() -> String {
     if let Ok(dir) = std::env::var("MESH_INIT_DIR") {
         return dir;
@@ -204,13 +200,8 @@ fn get_socket_path() -> String {
     let run_dir = if let Ok(dir) = std::env::var("MESH_INIT_RUN") {
         dir
     } else {
-        let uid = unsafe { libc::getuid() };
-        if uid == 0 {
-            "/run/mesh-init".to_string()
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{}/.run/mesh-init", home)
-        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/mesh-init", home)
     };
     format!("{}/control.sock", run_dir)
 }
