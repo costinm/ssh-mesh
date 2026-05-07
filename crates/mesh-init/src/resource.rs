@@ -384,6 +384,7 @@ Cached:         32937264 kB
             },
             activation: vec![],
             source_path: None,
+            ..Default::default()
         };
         let mut p = ManagedProcess::new(cfg);
         p.state = ServiceState::Running;
@@ -411,6 +412,7 @@ Cached:         32937264 kB
             },
             activation: vec![],
             source_path: None,
+            ..Default::default()
         };
         let p2 = ManagedProcess::new(cfg2);
         // p2.state defaults to Stopped
@@ -487,6 +489,7 @@ full avg10=0.10 avg60=0.20 avg300=0.30 total=5678
             resources: ResolvedResourceLimits::default(),
             activation: vec![],
             source_path: None,
+            ..Default::default()
         };
 
         let services = Arc::new(Mutex::new(HashMap::new()));

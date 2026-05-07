@@ -1,22 +1,24 @@
 [package]
-name = "fsd"
+name = "mesh9p"
 version = "0.0.1"
 edition = "2021"
-authors = ["Ryo Munakata (pfpacket) <afpacket@gmail.com>"]
-description = "Filesystems library using 9P2000.L protocol, an extended variant of 9P from Plan 9"
-documentation = "https://pfpacket.github.io/rust-9p/rs9p/index.html"
-repository = "https://github.com/pfpacket/rust-9p"
+description = "Modified unpfs 9p fs for ssh, used like sshfs"
+# Based on:
+#authors = ["Ryo Munakata (pfpacket) <afpacket@gmail.com>"]
+#description = "Filesystems library using 9P2000.L protocol, an extended variant of 9P from Plan 9"
+#documentation = "https://pfpacket.github.io/rust-9p/rs9p/index.html"
+#repository = "https://github.com/pfpacket/rust-9p"
 readme = "README.md"
 keywords = ["9p", "Plan9", "v9fs", "filesystem", "network"]
 categories = ["filesystem", "network-programming"]
 license-file = "LICENSE"
 
 [lib]
-name = "fsd"
+name = "mesh9p"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "unpfs"
+name = "mesh9p"
 path = "src/main.rs"
 
 [dependencies]

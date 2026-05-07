@@ -1,7 +1,8 @@
+pub mod config;
+pub mod jobs;
 pub mod local_trace;
 pub mod protocol;
 pub mod uds;
-pub mod jobs;
 
 use axum::serve;
 use serde::{Deserialize, Serialize};
@@ -94,8 +95,13 @@ impl MeshApp {
             let path_str = if let Some(path) = &self.config.http_uds_path {
                 path.clone()
             } else {
-                let uid = unsafe { libc::getuid() };
-                format!("/run/user/{}/pmond.sock", uid)
+                let current_exe = std::env::current_exe()?;
+                let app = current_exe
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                format!("{}/.run/{}/control.sock", home, app)
             };
 
             let path = std::path::PathBuf::from(&path_str);

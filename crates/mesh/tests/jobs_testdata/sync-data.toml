@@ -1,7 +1,9 @@
+[service]
 name = "sync-data"
 command = "echo"
 args = ["Mocking sync data!"]
 priority = 300
+
 persisted = true
 save_result = true
 

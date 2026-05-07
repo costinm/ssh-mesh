@@ -1,118 +1,57 @@
 # ssh-mesh
 
-This is an opinionated SSH library and L4 proxy, with a Istio-like
-certificate and JWT based authentication and providing a secure L4 transport.
+This is basically local 'serverless' combined with Android and Istio concepts.
 
-The implementation is compatible with OpenSSH, dropbear and other libraries
-and clients/servers - and also supports HTTP/2 and HTTP/3 tunneling. 
+Each node (physical machine or VM) runs a mesh-init server that coordinates the process
+lifecycle - it should be the only component that requires root and is as small as
+it can be, no features that can be implemented in a non-root process.
 
-A ssh-mesh node includes both client and server - the node can auto-connect to
-other nodes as a client and forward the port 22 or 5022
+The nodes are passive - the config is pushed or pulled (git or remote filesystems) and
+stored on local disk. 
 
-Features for ssh-mesh server side:
+The K8S concept of 'Pod' is used - as a set of isolated processes running as the
+same user ID. This is similar to an Android application, with minimal access to other
+pods and the host.
+
+
+## SSH and HTTP transports
+
+SSH is used as a base L4 proxy, with Istio-like certificates - both ends can use regular
+ssh client/server implementations. ssh-mesh server just simplifies the 'opinionated'
+layout and removes the ability to use it in an arbitrary way. It also supports
+HTTP tunneling - both 'SSH of HTTP/2', SSH over websocket and full Istio-like tunnels
+over H2C plus websocket. 
+
+A ssh-mesh server includes both client and server, and can maintain connections to
+other nodes and forward ports using a local http API.  
+
+Extra features for ssh-mesh server side:
 - allows multiple clients to 'remote forward' (-R) ports 22, 80 and 443
-- allows the password to be a JWT token with audience ssh://HOSTNAME, issued
-  by one of the configured issuers (with normalization for k8s and google tokens)
-- X509 certificate based authentication
 
 Features for ssh-mesh client side:
-- auto-register the forwarding ports and maintains connection. This is optional
-  and should be used for CloudRun or home machines behind a firewall.
-- can chain a second command, so it can be added to a docker image and Pod.
-- includes a sshd server and exec/shell for the configured owner key, equivalent
-  to running openssh or dropbear ssh server with custom config and as regular user.
+- auto-register the forwarding ports and maintains connection. 
 
-In progress/TODO:
-- auto-register the forwarding clients in EndpointSlice and support sharding (for scale).
-  Until this is done - a single (large) instance must be run per IP. In K8S it 
-  means 1 replica if LoadBalancer service is used.
+## Opinionated layout
 
-A SSH CA maintains a root CA (backed by a k8s or other Secret), and signs
-host and user certificates. The format has same information as Istio Spiffe,
-a trust domain, namespace and service account, but 2 certificates are issued,
-one for server and one for client (with same key). The certificates can be 
-generated from a JWT with a trusted issuer, mapping the "sub" claim. Any 
-other SSH CA or `keygen` can be used to generate certs.  
+Each workload (or namespace, application, profile, pod) has a home directory, identified with $HOME. By default this is in /home/$USER - where USER is the name of the application.  On android - it is the /data/... standard
+location.
 
-For K8S, the identity will be:
+All relevant files in $HOME. Or almost - binaries can be in /nix or some OCI rootfs, /apex - or /opt. They can also be in $HOME/bin - mounted from a signed Erofs disk.
 
-  ${KSA}@${Namespace}.${TrustDomain}
-  ${KSA}.${Namespace}.svc.${TrustDomain}
+Configs used by mesh go to $HOME/.config - with subdirectories for each component. All components run 
+with the user ID or subuids for the main UID.
 
-TODO: watch Service and ServiceEntry and allow KSA configured to get cert for the service.
+Other locations: $HOME/.logs, $HOME/.run, $HOME/.cache, $HOME/.ssh (all secrets go here, not only ssh).
 
-# WIP: Mesh communication
+## No background daemons
 
-Client will initiate a remote forward, with *:MESH_PORT address. Server will accept
-forward request of this type but will not open new ports.
-
-Depending on MESH_PORT, SSH-mesh Gateway it should support Ztunnel HBONE 
-protocol, HAProxy or SNI routing. Port 22, 80 and 443 are multiplexing the expected protocols.
+The goal is to not allow installed application to run as daemons - instead they should run as Jobs, UI/Frontend apps or Services, activated by events and frozen/terminated when idle. 
 
 
-## Automatic certificate signing
+## User mode
 
-This is similar with Istiod/Citadel signing of workload certificates,
-but for SSH certificates. To simplify the deployment and optimize strtup time,
-the gate includes cert signing code - but a separate CA can also be used.
+mesh-init can also run as a normal user - for example in a K8S pod or container running
+as not-root user. It will manage processes and may use subuid - but with less power. This is intended for containers and development, the main use case is running as root to allow changing the UID of the process.
 
-
-# Usage with Openssh/dropbear
-
-Useful ssh args:
-
-- "-N" - don't start a shell/terminal - just port forwards
-- UserKnownHostsFile /dev/null - don't save the key
-- StrictHostKeyChecking=no - don't check server key (for example if a tunnel authenticates)
-- "-F /dev/null" - ignore host config
-
-```shell
-export SSH_ASKPASS=... # script doing /usr/bin/curl -H "Metadata-Flavor: Google" http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity?audience=ssh://
-
-ssh -v  -p 15022 -i id_ecdsa  -o "UserKnownHostsFile known_hosts" costin@localhost
-
-ssh -v -p 15022 s.webinf.duckdns.org -R NAME:22:localhost:22 
-
-# To disable host checking:
-# -F /dev/null -o "UserKnownHostsFile /dev/null" -o StrictHostKeyChecking=no
-```
-
-# Alternatives
-
-- use an extension is appealing - for example allow servers to initiate direct-tcpip 
-channels will make the code simpler. However interop with existing ssh tools is the
-main goal - otherwise H2/H3 should be used.
-
-- provide a rich API with support for global requests, extensions, etc - nice but 
-not required.
-
-- SSH3 - it doesn't use the original SSH protocol, not compatible with ssh clients/servers.
-The idea of using both SSH keys and X509, JWTs - and HTTP/2 and HTTP/3 is 
-
-# SSH certificates - manually 
-
-```shell
-
-ssh-keygen -t ecdsa -f ca 
-
-ssh-keygen -f user-key -t ecdsa 
-ssh-keygen -s ca -I user@domain -n user,honda -V +1y user-key.pub
-
-# Host config
-ssh-keygen -s ca -I host.example.com -h -n host,host.example.com -V +1y ssh_host_rsa_key.pub
-
-#  /etc/ssh/sshd_config
-# TrustedUserCAKeys /etc/ssh/ssh_user_key.pub
-# HostCertificate /etc/ssh/ssh_host_ecdsa_key-cert.pub
-
-# .ssh/known-hosts
-# @cert-authority *.example.com ecdsa-sha2-nistp256 AAAAE...=  
-
-
-
-# Debug - print cert
-ssh-keygen -L -f id_ecdsa-cert.pub
-
-
-
-```
+In user mode it can delegate execution to bubblewrap or podman or similar tools, it is a solved problem. Note that root in a user container has access to user home/ssh if shared,
+and all containers share same IDs.

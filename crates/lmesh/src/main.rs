@@ -21,8 +21,8 @@ struct Args {
     client: bool,
 
     /// UDS path for the server to listen on
-    #[arg(long, default_value = "/tmp/lmesh.sock")]
-    uds: String,
+    #[arg(long)]
+    uds: Option<String>,
 
     /// Authorized UID for UDS connections
     #[arg(long)]
@@ -87,7 +87,11 @@ struct NodeInfo {
 }
 
 async fn run_server(args: Args) -> Result<()> {
-    info!("Starting lmesh server on {}...", args.uds);
+    let uds_path = args.uds.unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/lmesh/control.sock", home)
+    });
+    info!("Starting lmesh server on {}...", uds_path);
     let mut discovery = LocalDiscovery::new(None).await?;
     discovery.start().await?;
 
@@ -109,7 +113,7 @@ async fn run_server(args: Args) -> Result<()> {
         .route("/announce", post(handle_announce))
         .layer(Extension(discovery_clone));
 
-    run_uds_server(app, &args.uds, args.authorized_uid)
+    run_uds_server(app, &uds_path, args.authorized_uid)
         .await
         .map_err(|e| anyhow::anyhow!("UDS server error: {}", e))?;
 

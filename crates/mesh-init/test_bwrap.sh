@@ -61,7 +61,7 @@ assert_contains() {
 # ============================================================================
 
 echo "=== Building mesh and mesh-init ==="
-cargo build -p mesh -p mesh-init 2>&1 | tail -1
+cargo build -p mesh -p mesh-init -p fsd 2>&1 | tail -1
 
 echo "Copying test configs..."
 bash "${WORKSPACE_DIR}/crates/mesh-init/copy_testdata.sh" 2>&1 | tail -1
@@ -291,6 +291,44 @@ rm -rf "$EXEC_DIR"
 # Clean up cgroup if possible
 rmdir "$CGROUP_PATH" 2>/dev/null || true
 rmdir /sys/fs/cgroup/mesh.slice 2>/dev/null || true
+
+# ============================================================================
+# Test 10: 9p Mounting (xinetd UDS)
+# ============================================================================
+
+echo ""
+echo "=== Test: 9p Mount ==="
+
+MNT_DIR=$(mktemp -d)
+mkdir -p "$MNT_DIR"
+
+# Start daemon with unpfs_xinetd_uds configuration
+export MESH_INIT_DIR="$TESTDIR"
+cp "${WORKSPACE_DIR}/crates/mesh-init/testdata/unpfs_xinetd_uds.toml" "$TESTDIR/"
+sed -i "s|command = \"./unpfs\"|command = \"$BIN_DIR/unpfs\"|g" "$TESTDIR/unpfs_xinetd_uds.toml"
+RUST_LOG=info "$MESH_INIT" &
+DAEMON_PID=$!
+sleep 1
+
+# Try to connect with 9mount if available
+if command -v 9mount >/dev/null; then
+    echo "Attempting to use 9mount..."
+    # 9mount may fail because it defaults to 9P2000 instead of 9P2000.L
+    9mount -i 'unix!/tmp/unpfs_xinetd.sock' "$MNT_DIR" 2>/dev/null || echo "9mount failed (expected if it does not support 9P2000.L default)"
+fi
+
+# Fallback/Primary test with standard mount
+echo "Testing with sudo mount..."
+if sudo mount -t 9p -o version=9p2000.L,trans=unix,uname=$USER /tmp/unpfs_xinetd.sock "$MNT_DIR" 2>/dev/null; then
+    pass "Successfully mounted 9p using sudo mount"
+    sudo umount "$MNT_DIR"
+else
+    fail "Failed to mount 9p using sudo mount"
+fi
+
+kill "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+rm -rf "$MNT_DIR"
 rm -rf "$TESTDIR"
 
 # ============================================================================

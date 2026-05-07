@@ -29,7 +29,7 @@ impl JobExecutor for CommandExecutor {
         cmd.args(&job.args);
         
         // Pass environment variables
-        for (k, v) in &job.environment {
+        for (k, v) in &job.env {
             cmd.env(k, v);
         }
 
@@ -76,7 +76,7 @@ impl JobExecutor for MeshInitExecutor {
     async fn execute(&self, job: &JobConfig, work_items: &[WorkItem]) -> Result<()> {
         info!("MeshInitExecutor requesting start for job: {}", job.name);
         
-        let mut env = job.environment.clone();
+        let mut env = job.env.clone();
         if !work_items.is_empty() {
             let ids: Vec<String> = work_items.iter().map(|w| w.id.clone()).collect();
             env.insert("MESH_JOB_WORK_ITEMS".to_string(), ids.join(","));

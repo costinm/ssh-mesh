@@ -40,13 +40,22 @@ fn create_base_job(name: &str) -> JobConfig {
         name: name.to_string(),
         command: "mock".to_string(),
         args: vec![],
-        schedule: ScheduleConfig::default(),
-        constraints: ConstraintConfig::default(),
-        backoff: BackoffConfig::default(),
+        uid: None,
+        gid: None,
+        user: None,
+        group: None,
+        env: Default::default(),
         priority: 500,
+        oneshot: false,
+        oom_score_adjust: None,
+        resources: Default::default(),
+        activation: vec![],
+        source_path: None,
+        schedule: Some(ScheduleConfig::default()),
+        constraints: Some(ConstraintConfig::default()),
+        backoff: BackoffConfig::default(),
         persisted: false,
         prefetch: false,
-        environment: Default::default(),
         save_result: false,
         trace_tag: None,
         user_initiated: false,
@@ -81,7 +90,7 @@ async fn test_constraint_charging() {
     let scheduler = JobScheduler::new("/tmp/mock_jobs", executor.clone());
 
     let mut job = create_base_job("charge_job");
-    job.constraints.requires_charging = true;
+    job.constraints.as_mut().unwrap().requires_charging = true;
     scheduler.schedule(job).await.unwrap();
 
     // Not charging - shouldn't start
@@ -100,7 +109,7 @@ async fn test_constraint_network() {
     let scheduler = JobScheduler::new("/tmp/mock_jobs", executor.clone());
 
     let mut job = create_base_job("net_job");
-    job.constraints.network_type = Some(NetworkType::Unmetered);
+    job.constraints.as_mut().unwrap().network_type = Some(NetworkType::Unmetered);
     scheduler.schedule(job).await.unwrap();
 
     // Any network (e.g. Cellular) - shouldn't start
@@ -119,7 +128,7 @@ async fn test_minimum_latency() {
     let scheduler = JobScheduler::new("/tmp/mock_jobs", executor.clone());
 
     let mut job = create_base_job("latency_job");
-    job.schedule.minimum_latency_secs = Some(3600); // 1 hour
+    job.schedule.as_mut().unwrap().minimum_latency_secs = Some(3600); // 1 hour
     scheduler.schedule(job).await.unwrap();
 
     // All constraints met (none), but latency not elapsed
@@ -143,8 +152,8 @@ async fn test_override_deadline() {
     let scheduler = JobScheduler::new("/tmp/mock_jobs", executor.clone());
 
     let mut job = create_base_job("deadline_job");
-    job.constraints.requires_charging = true; // Never met
-    job.schedule.override_deadline_secs = Some(10); 
+    job.constraints.as_mut().unwrap().requires_charging = true; // Never met
+    job.schedule.as_mut().unwrap().override_deadline_secs = Some(10); 
     scheduler.schedule(job).await.unwrap();
 
     // Deadline not passed, charging not met
@@ -168,7 +177,7 @@ async fn test_pubsub_event_triggers() {
     let scheduler = JobScheduler::new("/tmp/mock_jobs", executor.clone());
 
     let mut job = create_base_job("pubsub_job");
-    job.constraints.triggers = vec!["my_custom_event".to_string()];
+    job.constraints.as_mut().unwrap().triggers = vec!["my_custom_event".to_string()];
     scheduler.schedule(job).await.unwrap();
 
     // Wrong event
@@ -213,8 +222,8 @@ async fn test_periodic_flex() {
     let scheduler = JobScheduler::new("/tmp/mock_jobs", executor.clone());
 
     let mut job = create_base_job("periodic_job");
-    job.schedule.periodic_secs = Some(3600);
-    job.schedule.flex_secs = Some(600); // 10 minutes flex
+    job.schedule.as_mut().unwrap().periodic_secs = Some(3600);
+    job.schedule.as_mut().unwrap().flex_secs = Some(600); // 10 minutes flex
     scheduler.schedule(job).await.unwrap();
 
     // Complete the first run
@@ -225,4 +234,61 @@ async fn test_periodic_flex() {
     // 3600 - 600 = 3000 seconds latency
     let expected = JobScheduler::now_secs() + 3000;
     assert!(entry.next_eligible.unwrap() >= expected - 1 && entry.next_eligible.unwrap() <= expected + 1);
+}
+
+#[tokio::test]
+async fn test_programmatic_job_registration() {
+    // 1. Create a custom executor that runs a local function instead of spawning a process
+    struct LocalFunctionExecutor {
+        executed: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait]
+    impl JobExecutor for LocalFunctionExecutor {
+        async fn execute(&self, job: &JobConfig, _work_items: &[crate::jobs::config::WorkItem]) -> anyhow::Result<()> {
+            if job.name == "programmatic_job" {
+                let mut exec = self.executed.lock().await;
+                *exec = true;
+                // Example: execute local logic here
+                println!("Local function executed for job: {}", job.name);
+            }
+            Ok(())
+        }
+    }
+
+    let executed = Arc::new(Mutex::new(false));
+    let executor = Arc::new(LocalFunctionExecutor { executed: executed.clone() });
+    
+    // Create the scheduler
+    let scheduler = JobScheduler::new("/tmp/mock_programmatic_jobs", executor);
+
+    // 2. Register a job programmatically (no config file)
+    let mut job = JobConfig::default();
+    job.name = "programmatic_job".to_string();
+    job.command = "local_exec".to_string(); // Not used by our custom executor, but required by validation
+    
+    // Set up a constraint and a trigger event
+    let mut constraints = ConstraintConfig::default();
+    constraints.triggers.push("my_programmatic_event".to_string());
+    job.constraints = Some(constraints);
+
+    // Schedule the job
+    scheduler.schedule(job).await.unwrap();
+
+    // 3. Inject an event to trigger the job
+    let event = SystemEvent::CustomCondition { 
+        key: "my_programmatic_event".to_string(), 
+        value: true 
+    };
+    
+    // The scheduler processes the event and dispatches the job if constraints are met
+    let started = scheduler.on_event(event).await.unwrap();
+    assert!(started.contains(&"programmatic_job".to_string()));
+
+    // Wait a brief moment for the async executor task to run
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Verify the local function was called
+    let was_executed = *executed.lock().await;
+    assert!(was_executed, "The programmatic job should have been executed");
 }

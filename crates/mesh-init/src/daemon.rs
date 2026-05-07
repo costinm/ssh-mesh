@@ -98,6 +98,10 @@ impl Daemon {
         let mut init_configs: Vec<&AppConfig> = Vec::new();
         let mut other_configs: Vec<&AppConfig> = Vec::new();
         for cfg in &loaded_configs {
+            if cfg.name == "default" {
+                // default.toml only provides defaults for execution mode
+                continue;
+            }
             if cfg.name.starts_with("init-") {
                 init_configs.push(cfg);
             } else {
@@ -119,16 +123,6 @@ impl Daemon {
         self.start_child_manager();
     }
 
-    /// Start only the resource manager and child reaper, without loading
-    /// configs or auto-starting services.
-    ///
-    /// Used by execution mode, which manages its own startup sequence.
-    pub fn start_background_tasks_minimal(self: &Arc<Self>) {
-        if let Some(ref rm) = self.resource_manager {
-            rm.start();
-        }
-        self.start_child_manager();
-    }
 
     /// Spawn the child process manager (zombie reaper + restart loop).
     fn start_child_manager(self: &Arc<Self>) {
@@ -460,8 +454,32 @@ impl Daemon {
                     // crashed or was killed for restart!
                     proc.consecutive_failures += 1;
 
-                    // Calculate exponential backoff: 1s, 2s, 4s, 8s, 16s... max 60s
-                    let backoff_secs = (1 << (proc.consecutive_failures - 1)).min(60);
+                    if let Some(max_retries) = proc.config.backoff.max_retries {
+                        if proc.consecutive_failures > max_retries {
+                            warn!(
+                                "Service '{}' crashed {} times, exceeding max_retries ({}). Marking as stopped.",
+                                name, proc.consecutive_failures, max_retries
+                            );
+                            proc.target_state = ServiceState::Stopped;
+                            return;
+                        }
+                    }
+
+                    let initial = proc.config.backoff.initial_secs;
+                    let mut backoff_secs = match proc.config.backoff.policy {
+                        crate::config::BackoffPolicy::Linear => {
+                            initial.saturating_mul(proc.consecutive_failures as u64)
+                        }
+                        crate::config::BackoffPolicy::Exponential => {
+                            let multiplier = 1_u64.checked_shl(proc.consecutive_failures - 1).unwrap_or(u64::MAX);
+                            initial.saturating_mul(multiplier)
+                        }
+                    };
+
+                    if proc.config.backoff.max_retries.is_none() {
+                        backoff_secs = backoff_secs.min(24 * 3600);
+                    }
+
                     info!(
                         "Service '{}' crashed. Scheduling restart #{} in {}s",
                         name, proc.consecutive_failures, backoff_secs
@@ -469,7 +487,7 @@ impl Daemon {
 
                     proc.next_restart_at = Some(
                         std::time::Instant::now()
-                            + std::time::Duration::from_secs(backoff_secs as u64),
+                            + std::time::Duration::from_secs(backoff_secs),
                     );
                 }
 

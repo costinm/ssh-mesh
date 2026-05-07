@@ -114,18 +114,30 @@ async fn run_monitor(
     let path_str = if let Some(path) = mon_uds {
         format!("{}/pwatch.sock", path)
     } else {
-        let uid = unsafe { libc::getuid() };
-        format!("/tmp/user/{}/pwatch.sock", uid)
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/pmond/pwatch.sock", home)
     };
 
     // Ensure parent directory exists
     let path = std::path::Path::new(&path_str);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        if let Ok(metadata) = std::fs::metadata(parent) {
+            let mut perms = metadata.permissions();
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o770);
+            let _ = std::fs::set_permissions(parent, perms);
+        }
     }
     let _ = std::fs::remove_file(path);
 
     let listener = UnixListener::bind(path)?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o660);
+        let _ = std::fs::set_permissions(path, perms);
+    }
 
     loop {
         match listener.accept().await {

@@ -109,16 +109,8 @@ fn get_socket_path(app: &str) -> String {
     let run_dir = if let Ok(dir) = std::env::var(&env_var) {
         dir
     } else {
-        let uid = unsafe { libc::getuid() };
-        if uid == 0 {
-            format!("/run/{}", app)
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let path = format!("{}/.run/{}", home, app);
-            // Ensure path exists for non-root
-            let _ = std::fs::create_dir_all(&path);
-            path
-        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/{}", home, app)
     };
     format!("{}/control.sock", run_dir)
 }

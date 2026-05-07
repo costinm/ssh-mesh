@@ -1,112 +1,15 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum NetworkType {
-    #[default]
-    None,
-    Any,
-    Unmetered,
-    NotRoaming,
-    Cellular,
-}
+// Re-export the unified configuration types from the base mesh config.
+pub use crate::config::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum BackoffPolicy {
-    Linear,
-    #[default]
-    Exponential,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackoffConfig {
-    pub initial_secs: u64,
-    #[serde(default)]
-    pub policy: BackoffPolicy,
-    pub max_retries: Option<u32>,
-}
-
-impl Default for BackoffConfig {
-    fn default() -> Self {
-        Self {
-            initial_secs: 30,
-            policy: BackoffPolicy::Exponential,
-            max_retries: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ScheduleConfig {
-    pub periodic_secs: Option<u64>,
-    pub flex_secs: Option<u64>,
-    pub minimum_latency_secs: Option<u64>,
-    pub override_deadline_secs: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ConstraintConfig {
-    pub network_type: Option<NetworkType>,
-    #[serde(default)]
-    pub requires_charging: bool,
-    #[serde(default)]
-    pub requires_device_idle: bool,
-    #[serde(default)]
-    pub requires_battery_not_low: bool,
-    #[serde(default)]
-    pub requires_storage_not_low: bool,
-    #[serde(default)]
-    pub triggers: Vec<String>,
-    pub trigger_max_delay_secs: Option<u64>,
-    #[serde(default)]
-    pub custom: HashMap<String, bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobConfig {
-    pub name: String,
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub schedule: ScheduleConfig,
-    #[serde(default)]
-    pub constraints: ConstraintConfig,
-    #[serde(default)]
-    pub backoff: BackoffConfig,
-    #[serde(default = "default_priority")]
-    pub priority: u32,
-    #[serde(default = "default_true")]
-    pub persisted: bool,
-    #[serde(default)]
-    pub prefetch: bool,
-    #[serde(default)]
-    pub environment: HashMap<String, String>,
-    #[serde(default)]
-    pub save_result: bool,
-    pub trace_tag: Option<String>,
-    #[serde(default)]
-    pub user_initiated: bool,
-    #[serde(default)]
-    pub expedited: bool,
-    pub estimated_download_bytes: Option<u64>,
-    pub estimated_upload_bytes: Option<u64>,
-    pub minimum_network_chunk_bytes: Option<u64>,
-}
-
-fn default_priority() -> u32 {
-    500
-}
-
-fn default_true() -> bool {
-    true
-}
+// Type alias for backwards compatibility and clarity in job modules.
+pub type JobConfig = crate::config::AppConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
@@ -128,7 +31,7 @@ pub struct WorkResult {
 
 impl JobConfig {
     pub fn parse(content: &str) -> Result<Self> {
-        toml::from_str(content).context("Failed to parse JobConfig from TOML")
+        crate::config::parse_toml(content).map_err(|e| anyhow::anyhow!("Failed to parse JobConfig from TOML: {}", e))
     }
 
     pub async fn load(path: &Path) -> Result<Self> {
@@ -137,7 +40,44 @@ impl JobConfig {
     }
 
     pub async fn save(&self, dir: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self)?;
+        let file = crate::config::AppConfigFile {
+            service: crate::config::ServiceSection {
+                name: self.name.clone(),
+                command: self.command.clone(),
+                args: self.args.clone(),
+                user: self.user.clone(),
+                group: self.group.clone(),
+                uid: self.uid,
+                gid: self.gid,
+                priority: self.priority,
+                oneshot: self.oneshot,
+                oom_score_adjust: self.oom_score_adjust,
+            },
+            resources: crate::config::ResourceLimits {
+                // These are resolved in runtime, saving doesn't reconstruct human strings currently
+                // Usually we don't save back these configs dynamically anyway.
+                memory_low: None,
+                memory_high: None,
+                memory_max: None,
+                cpu_weight: self.resources.cpu_weight,
+            },
+            environment: self.env.clone(),
+            activation: self.activation.clone(),
+            schedule: self.schedule.clone(),
+            constraints: self.constraints.clone(),
+            backoff: self.backoff.clone(),
+            persisted: self.persisted,
+            prefetch: self.prefetch,
+            save_result: self.save_result,
+            trace_tag: self.trace_tag.clone(),
+            user_initiated: self.user_initiated,
+            expedited: self.expedited,
+            estimated_download_bytes: self.estimated_download_bytes,
+            estimated_upload_bytes: self.estimated_upload_bytes,
+            minimum_network_chunk_bytes: self.minimum_network_chunk_bytes,
+        };
+        
+        let content = toml::to_string_pretty(&file)?;
         let path = dir.join(format!("{}.toml", self.name));
         fs::write(&path, content).await.context("Failed to write JobConfig")
     }

@@ -4,6 +4,8 @@ This create provides an optional library for interacting with a Mesh, defined as
 
 Any application using stdin/stdout/stderr or UDS or HTTP/1.1 or H2C can be used with no changes by SSH mesh - the library is optional, defining helpers and examples for the patterns used by ssh-mesh.
 
+
+
 ## Core service - networking
 
 In many cases H2C is overkill - many apps can just expose

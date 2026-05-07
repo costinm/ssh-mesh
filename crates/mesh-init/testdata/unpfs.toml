@@ -16,5 +16,5 @@ RUST_LOG = "info"
 # mesh-init accepts the TCP connection and passes the socket FD
 # as stdin/stdout to unpfs (which already supports this mode).
 [[activation]]
-port = 14009
+port = 14019
 wait = false

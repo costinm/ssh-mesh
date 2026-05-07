@@ -9,20 +9,6 @@ pub async fn run_uds_server(
     path: &str,
     authorized_uid: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-        if let Ok(metadata) = std::fs::metadata(parent) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o770);
-            let _ = std::fs::set_permissions(parent, perms);
-        }
-        if let Some(parent_str) = parent.to_str() {
-            if let Ok(c_parent) = std::ffi::CString::new(parent_str) {
-                unsafe { libc::chown(c_parent.as_ptr(), (!0) as libc::uid_t, 1000 as libc::gid_t) };
-            }
-        }
-    }
-
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     info!("MeshApp HTTP UDS server listening on {}", path);
@@ -30,9 +16,6 @@ pub async fn run_uds_server(
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(0o660);
     std::fs::set_permissions(path, perms)?;
-    if let Ok(c_path) = std::ffi::CString::new(path) {
-        unsafe { libc::chown(c_path.as_ptr(), (!0) as libc::uid_t, 1000 as libc::gid_t) };
-    }
 
     let current_uid = unsafe { libc::getuid() };
 

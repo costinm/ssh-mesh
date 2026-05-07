@@ -96,9 +96,20 @@ async fn main() -> Result<(), anyhow::Error> {
             .set_default("sftp_root", env::var("SFTP_ROOT").ok())
             .unwrap();
 
-        // Layer config file from base_dir (mesh.yaml, mesh.json, mesh.toml)
+        let config_dir = env::var("SSH_MESH_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let mut path = env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"));
+                path.push(".config");
+                path.push("ssh-mesh");
+                path
+            });
+
+        // Layer config file from config_dir (mesh.yaml, mesh.json, mesh.toml)
         for ext in &["yaml", "json", "toml"] {
-            let path = base_dir.join(format!("mesh.{}", ext));
+            let path = config_dir.join(format!("mesh.{}", ext));
             if path.exists() {
                 builder = builder.add_source(config::File::from(path));
                 break;
@@ -287,7 +298,8 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // HTTP over UDS server - let MeshApp auto-detect app_name from $0
-    let control_uds = format!("/run/user/{}/ssh-mesh.sock", unsafe { libc::getuid() });
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let control_uds = format!("{}/.run/ssh-mesh/control.sock", home);
     let app_clone = app.clone();
     tokio::spawn(async move {
         if let Err(e) = mesh::uds::run_uds_server(app_clone, &control_uds, None).await {

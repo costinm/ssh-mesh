@@ -40,33 +40,38 @@ async fn main() -> Result<()> {
     let socket_path = get_socket_path();
     let config_dir = get_config_dir();
 
-    if args.command.is_empty() {
-        run_daemon(config_dir, socket_path).await?
+    let command = if args.command.is_empty() {
+        None
     } else {
-        run_and_exit(config_dir, socket_path, args.command).await?
-    }
+        Some(args.command)
+    };
 
-    Ok(())
+    run(config_dir, socket_path, command).await
 }
 
-/// Run the daemon.
-async fn run_daemon(config_dir: String, socket_path: String) -> Result<()> {
+/// Common startup: create daemon, start everything, optionally run a CLI command.
+async fn run(config_dir: String, socket_path: String, command: Option<Vec<String>>) -> Result<()> {
     let config = DaemonConfig {
         config_dirs: vec![config_dir],
         socket_path: socket_path.clone(),
     };
 
     info!(
-        "Starting mesh-init daemon (PID {}, UID {})",
+        "Starting mesh-init (PID {}, UID {}, mode={})",
         std::process::id(),
-        unsafe { libc::getuid() }
+        unsafe { libc::getuid() },
+        if command.is_some() { "exec" } else { "daemon" }
     );
 
     let daemon = Daemon::new(config);
 
+    // Start all background tasks: load configs, start init-* services,
+    // start regular services/activation listeners, resource manager, child reaper.
+    daemon.start_background_tasks();
+
     // Start job scheduler
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let jobs_dir = format!("{}/.config/mesh/jobs", home);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let jobs_dir = format!("{}/.config/mesh-init/jobs", home);
     let executor = std::sync::Arc::new(mesh::jobs::executor::MeshInitExecutor::new(socket_path));
     let scheduler =
         std::sync::Arc::new(mesh::jobs::scheduler::JobScheduler::new(jobs_dir, executor));
@@ -78,98 +83,61 @@ async fn run_daemon(config_dir: String, socket_path: String) -> Result<()> {
         }
     });
 
-    daemon.run().await?;
-    Ok(())
-}
-
-/// Run as a supervisor for a single command, then exit.
-///
-/// Loads configs from the config directory. If `default.toml` exists,
-/// its settings (UID, GID, resources, environment) are applied to the
-/// main command. Any `init-*` configs are executed first (sorted by priority).
-async fn run_and_exit(config_dir: String, socket_path: String, command: Vec<String>) -> Result<()> {
-    let daemon_config = DaemonConfig {
-        config_dirs: vec![config_dir.clone()],
-        socket_path,
-    };
-
-    let daemon = Daemon::new(daemon_config);
-
-    // Load all configs from the config directory
-    let loaded_configs = mesh_init::config::load_system_configs(&[&config_dir]);
-
-    // Store them in the daemon's config registry
-    {
-        let mut configs = daemon.configs.lock();
-        for cfg in &loaded_configs {
-            configs.insert(cfg.name.clone(), cfg.clone());
-        }
-    }
-
-    // Start resource manager
-    daemon.start_background_tasks_minimal();
-
-    // Separate init-* configs from the rest
-    let mut init_configs: Vec<&mesh_init::config::AppConfig> = loaded_configs
-        .iter()
-        .filter(|c| c.name.starts_with("init-"))
-        .collect();
-    init_configs.sort_by_key(|c| c.priority);
-
-    // Run init-* services first and wait for oneshots to complete
-    for cfg in &init_configs {
-        info!("Running init service '{}'", cfg.name);
-        match daemon.start_service_with_config((*cfg).clone(), None) {
-            Ok(_pid) => {
-                if cfg.oneshot {
-                    // Wait for oneshot init services to finish
-                    wait_for_service_exit(&daemon, &cfg.name).await;
-                }
+    if let Some(command) = command {
+        // Execution mode: start the CLI command, run control server in background, exit when done.
+        let server =
+            mesh_init::server::ControlServer::new(daemon.config.socket_path.clone(), daemon.clone());
+        tokio::spawn(async move {
+            if let Err(e) = server.run().await {
+                tracing::error!("Control server error: {}", e);
             }
-            Err(e) => {
-                tracing::error!("Failed to start init service '{}': {}", cfg.name, e);
-            }
-        }
+        });
+
+        let app_name = "cmd";
+        let cmd = command[0].clone();
+        let args = command[1..].to_vec();
+
+        // Apply defaults from default.toml if present
+        let default_cfg = daemon.configs.lock().get("default").cloned();
+
+        let cfg = mesh_init::config::AppConfig {
+            name: app_name.to_string(),
+            command: cmd,
+            args,
+            uid: default_cfg.as_ref().and_then(|d| d.uid),
+            gid: default_cfg.as_ref().and_then(|d| d.gid),
+            user: default_cfg.as_ref().and_then(|d| d.user.clone()),
+            group: default_cfg.as_ref().and_then(|d| d.group.clone()),
+            env: default_cfg
+                .as_ref()
+                .map(|d| d.env.clone())
+                .unwrap_or_default(),
+            priority: 0,
+            oneshot: true,
+            oom_score_adjust: default_cfg.as_ref().and_then(|d| d.oom_score_adjust),
+            resources: default_cfg
+                .as_ref()
+                .map(|d| d.resources.clone())
+                .unwrap_or_default(),
+            activation: vec![],
+            source_path: None,
+            ..Default::default()
+        };
+
+        info!("Executing command: {} {:?}", cfg.command, cfg.args);
+        let _pid = daemon.start_service_with_config(cfg, None)?;
+
+        // Wait for the main command to end
+        wait_for_service_exit(&daemon, app_name).await;
+
+        daemon.shutdown().await;
+    } else {
+        // Daemon mode: run the control server in the foreground (blocks until shutdown).
+        let server =
+            mesh_init::server::ControlServer::new(daemon.config.socket_path.clone(), daemon.clone());
+        server.run().await?;
     }
 
-    // Start activation listeners for non-init services
-    for cfg in &loaded_configs {
-        if !cfg.name.starts_with("init-") && cfg.name != "default" && !cfg.activation.is_empty() {
-            mesh_init::activation::start_listeners(daemon.clone(), cfg);
-        }
-    }
-
-    // Build the main command config, applying defaults from default.toml if present
-    let cmd = command[0].clone();
-    let args = command[1..].to_vec();
-    let app_name = "cmd";
-
-    let default_cfg = loaded_configs.iter().find(|c| c.name == "default");
-
-    let cfg = mesh_init::config::AppConfig {
-        name: app_name.to_string(),
-        command: cmd,
-        args,
-        uid: default_cfg.and_then(|d| d.uid),
-        gid: default_cfg.and_then(|d| d.gid),
-        user: default_cfg.and_then(|d| d.user.clone()),
-        group: default_cfg.and_then(|d| d.group.clone()),
-        env: default_cfg.map(|d| d.env.clone()).unwrap_or_default(),
-        priority: 0,
-        oneshot: true,
-        oom_score_adjust: default_cfg.and_then(|d| d.oom_score_adjust),
-        resources: default_cfg.map(|d| d.resources.clone()).unwrap_or_default(),
-        activation: vec![],
-        source_path: None,
-    };
-
-    info!("Executing command: {} {:?}", cfg.command, cfg.args);
-    let _pid = daemon.start_service_with_config(cfg, None)?;
-
-    // Wait for the main command to end
-    wait_for_service_exit(&daemon, app_name).await;
-
-    daemon.shutdown().await;
     Ok(())
 }
 
@@ -192,7 +160,7 @@ fn get_config_dir() -> String {
     if let Ok(dir) = std::env::var("MESH_INIT_DIR") {
         return dir;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     format!("{}/.config/mesh-init", home)
 }
 
@@ -200,7 +168,7 @@ fn get_socket_path() -> String {
     let run_dir = if let Ok(dir) = std::env::var("MESH_INIT_RUN") {
         dir
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         format!("{}/.run/mesh-init", home)
     };
     format!("{}/control.sock", run_dir)

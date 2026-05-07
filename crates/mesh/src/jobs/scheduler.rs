@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use super::config::{JobConfig, NetworkType, WorkItem, WorkResult};
 use super::event::{SystemEvent, SystemState};
@@ -74,8 +74,10 @@ impl JobScheduler {
         
         let mut jobs = self.jobs.lock().await;
         let mut entry = JobEntry::new(config);
-        if let Some(latency) = entry.config.schedule.minimum_latency_secs {
-            entry.next_eligible = Some(Self::now_secs() + latency);
+        if let Some(schedule) = &entry.config.schedule {
+            if let Some(latency) = schedule.minimum_latency_secs {
+                entry.next_eligible = Some(Self::now_secs() + latency);
+            }
         }
         jobs.insert(name, entry);
         Ok(())
@@ -172,13 +174,14 @@ impl JobScheduler {
                 }
             }
 
-            let deadline_passed = entry.config.schedule.override_deadline_secs
+            let deadline_passed = entry.config.schedule.as_ref()
+                .and_then(|s| s.override_deadline_secs)
                 .map(|d| now >= entry.scheduled_at + d)
                 .unwrap_or(false);
 
             let transient_trigger_fired = match &event {
                 SystemEvent::CustomCondition { key, value: true } => {
-                    entry.config.constraints.triggers.contains(key)
+                    entry.config.constraints.as_ref().map_or(false, |c| c.triggers.contains(key))
                 }
                 _ => false,
             };
@@ -228,13 +231,15 @@ impl JobScheduler {
             } else {
                 entry.failure_count = 0;
                 
-                if let Some(periodic) = entry.config.schedule.periodic_secs {
-                    entry.state = JobState::Pending;
-                    let flex = entry.config.schedule.flex_secs.unwrap_or(periodic).min(periodic);
-                    // Next eligible is period minus flex window
-                    entry.next_eligible = Some(now + periodic - flex);
-                    // Also reset scheduled_at so override_deadline works on the new period
-                    entry.scheduled_at = now;
+                if let Some(schedule) = &entry.config.schedule {
+                    if let Some(periodic) = schedule.periodic_secs {
+                        entry.state = JobState::Pending;
+                        let flex = schedule.flex_secs.unwrap_or(periodic).min(periodic);
+                        // Next eligible is period minus flex window
+                        entry.next_eligible = Some(now + periodic - flex);
+                        // Also reset scheduled_at so override_deadline works on the new period
+                        entry.scheduled_at = now;
+                    }
                 }
             }
 
@@ -256,7 +261,9 @@ impl JobScheduler {
     }
 
     fn evaluate_constraints(config: &JobConfig, state: &SystemState, transient_trigger_fired: bool) -> bool {
-        let c = &config.constraints;
+        let Some(c) = &config.constraints else {
+            return true;
+        };
 
         if !c.triggers.is_empty() && !transient_trigger_fired {
             return false;

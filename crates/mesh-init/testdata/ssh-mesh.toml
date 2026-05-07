@@ -18,7 +18,3 @@ HTTP_PORT = "14080"
 [[activation]]
 port = 14022
 wait = true
-
-[[activation]]
-port = 14080
-wait = true

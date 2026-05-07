@@ -26,28 +26,36 @@ setup() {
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
 }
 
-release() {
-    (cd crates/otel && docker run --rm -v /ws/rust/ssh-mesh:/home/rust/src \
-      -w /home/rust/src/crates/otel \
-      messense/rust-musl-cross:x86_64-musl \
-      cargo build --release --bin otel)
+#RUST_FLAGS="-j 1"
 
+export DEST=${DEST:-/opt/ssh-mesh}
+
+CRATES="mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh"
+BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh"
+
+release() {
+    # (cd crates/otel && docker run --rm -v /ws/rust/ssh-mesh:/home/rust/src \
+    #   -w /home/rust/src/crates/otel \
+    #   messense/rust-musl-cross:x86_64-musl \
+    #   cargo build --release --bin otel)
 
     _all x86_64-unknown-linux-musl --release
+
 }
 
 _all() {
     local target=$1
     local mode=$2
     
-    cargo build -j 1 --target $target ${mode} -p mesh
-    cargo build -j 1 --target $target ${mode} -p pmond
-    cargo build -j 1 --target $target ${mode} -p ssh-mesh
-    cargo build -j 1 --target $target ${mode} -p mesh-init
-    cargo build -j 1 --target $target ${mode} -p unpfs
+    for bin in $CRATES; do
+        cargo build ${RUST_FLAGS} --target $target ${mode} -p $bin
+    done
+
+
     #cargo build --target $target ${mode} --features pmon -p ssh-mesh
 }
 
+# upstream one 
 unpfs() {
     cargo install --target x86_64-unknown-linux-musl unpfs
 }
@@ -62,26 +70,26 @@ push() {
     scp target/x86_64-unknown-linux-musl/release/{pmond,ssh-mesh} a1:/data/INITOS/bin
 }
 
-install() {
-	"$@"mkdir -p /opt/ssh-mesh/bin ; cp target/x86_64-unknown-linux-musl/debug/{pmond,sshmc,unpfs,sftp-server,otel,meshkeys,mesh-init,lmesh,h2t,ssh-mesh} /opt/ssh-mesh/bin
-}
-
 dist() {
-    local dest="${1:-$HOME/.local/opt/ssh-mesh}"
+    local dest="${1:-$HOME/opt/ssh-mesh}"
     mkdir -p "$dest/bin"
 
     echo "Building release binaries with musl..."
-    release
+    #release
     cargo build --target x86_64-unknown-linux-musl --release --workspace
-
     echo "Copying binaries..."
-    find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -executable -exec cp {} "$dest/bin/" \;
+    for bin in $BIN_TARGETS; do
+        cp target/x86_64-unknown-linux-musl/release/$bin $dest/bin
+    done
+
+    #find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -executable -exec cp {} "$dest/bin/" \;
     
     echo "Stripping binaries..."
     strip "$dest/bin/"* || true
 
     local root_conf="$dest/root/.config/mesh-init"
     local root_jobs="$dest/root/.config/mesh/jobs"
+
     local sys_conf="$dest/system/.config/mesh-init"
     local sys_jobs="$dest/system/.config/mesh/jobs"
 

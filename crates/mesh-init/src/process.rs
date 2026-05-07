@@ -350,6 +350,7 @@ mod tests {
             resources: crate::config::ResolvedResourceLimits::default(),
             activation: vec![],
             source_path: None,
+            ..Default::default()
         }
     }
 

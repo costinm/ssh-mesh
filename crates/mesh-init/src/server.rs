@@ -43,13 +43,18 @@ impl ControlServer {
         // Ensure parent directory exists
         if let Some(parent) = std::path::Path::new(&self.socket_path).parent() {
             let _ = std::fs::create_dir_all(parent);
+            if let Ok(metadata) = std::fs::metadata(parent) {
+                let mut perms = metadata.permissions();
+                std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o770);
+                let _ = std::fs::set_permissions(parent, perms);
+            }
         }
 
         let listener = UnixListener::bind(&self.socket_path)?;
 
-        // Set permissions so only root/owner can connect
+        // Set permissions so root/owner/group can connect
         let mut perms = std::fs::metadata(&self.socket_path)?.permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o660);
         std::fs::set_permissions(&self.socket_path, perms)?;
 
         info!("Control server listening on {}", self.socket_path);

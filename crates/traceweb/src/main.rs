@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let base_dir = base_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
                 let span = info_span!("otel-cli-trace", message = "hi");
                 let _guard = span.enter();
-                let uid = unsafe { libc::getuid() };
-                std::path::PathBuf::from(format!("/run/user/{}/trace", uid))
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                std::path::PathBuf::from(format!("{}/.run/traceweb", home))
             });
 
             info!("Starting trace hub at http://127.0.0.1:{}", port);
