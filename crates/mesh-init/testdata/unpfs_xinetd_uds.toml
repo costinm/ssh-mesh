@@ -1,0 +1,20 @@
+[service]
+name = "mesh9p-xinetd-uds"
+command = "./mesh9p"
+args = ["/tmp"]
+priority = 400
+oneshot = false
+
+[resources]
+memory_max = "128M"
+cpu_weight = 50
+
+[environment]
+RUST_LOG = "info"
+
+# Socket activation: xinetd-style with Unix Domain Socket (wait = true).
+# mesh-init binds the UDS socket and passes the listening socket FD to
+# mesh9p via the LISTEN_FD environment variable.
+[[activation]]
+socket = "/tmp/mesh9p_xinetd.sock"
+wait = true
