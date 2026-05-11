@@ -1,0 +1,26 @@
+[package]
+name = "dmesh"
+version = "0.0.1"
+edition = "2021" 
+
+[dependencies]
+ssh-mesh = { path = "../ssh-mesh" }
+pmond = { path = "../pmond" }
+lmesh = { path = "../lmesh" }
+mesh = { path = "../mesh" }
+jni = "0.21.1"
+libc = "0.2.161"
+log = "0.4.26"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = "0.7"
+hyper-util = { version = "0.1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3.3"
+serial_test = "3.0"
+
+[lib]
+name = "dmesh"
+crate-type = ["cdylib", "rlib"]
