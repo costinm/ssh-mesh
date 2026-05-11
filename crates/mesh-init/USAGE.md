@@ -43,7 +43,7 @@ The project includes an integration script that runs tests and starts up test co
 
 ```bash
 # This builds the project and runs the test suite
-bash crates/mesh-init/test_bwrap.sh
+bash crates/mesh-init/test.sh
 ```
 Test configs are located at `crates/mesh-init/testdata/` and the built artifacts go to `target/debug/testdata/`.
 

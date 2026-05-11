@@ -115,7 +115,11 @@ pub enum ActivationFd {
 ///
 /// Uses `std::process::Command` to fork and exec. Sets uid/gid if configured.
 /// After spawn, moves the child into the service's cgroup and sets OOM score.
-pub fn spawn_process(config: &AppConfig, cgroup_path: &str, passed_fd: Option<ActivationFd>) -> Result<u32, ProcessError> {
+pub fn spawn_process(
+    config: &AppConfig,
+    cgroup_path: &str,
+    passed_fd: Option<ActivationFd>,
+) -> Result<u32, ProcessError> {
     info!(
         "Spawning service '{}': {} {:?}",
         config.name, config.command, config.args
@@ -146,10 +150,10 @@ pub fn spawn_process(config: &AppConfig, cgroup_path: &str, passed_fd: Option<Ac
         Some(ActivationFd::Stdio(fd)) => {
             // inetd-style: map client socket to stdin/stdout/stderr
             let stdout_fd = fd.try_clone().map_err(ProcessError::Io)?;
-            let stderr_fd = fd.try_clone().map_err(ProcessError::Io)?;
+            //let stderr_fd = fd.try_clone().map_err(ProcessError::Io)?;
             cmd.stdin(std::process::Stdio::from(fd));
             cmd.stdout(std::process::Stdio::from(stdout_fd));
-            cmd.stderr(std::process::Stdio::from(stderr_fd));
+            //cmd.stderr(std::process::Stdio::from(stderr_fd));
         }
         Some(ActivationFd::Listen(fd)) => {
             // xinetd-style: pass as extra FD and set env var.

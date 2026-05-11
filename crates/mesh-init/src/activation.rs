@@ -7,13 +7,34 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tokio::io::unix::AsyncFd;
 
 use crate::config::AppConfig;
 use crate::daemon::Daemon;
 use crate::process::ActivationFd;
 use crate::protocol::ServiceState;
+
+/// Get peer UID from a raw file descriptor using SO_PEERCRED.
+fn get_peer_uid(fd: i32) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Some(cred.uid)
+    } else {
+        warn!("Failed to get peer credentials for fd {}", fd);
+        None
+    }
+}
 
 /// Start activation listeners for a given service.
 pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
@@ -107,6 +128,10 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
 
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
             if let Some(config) = config_opt {
+                if config.auth.is_some() {
+                    warn!("Auth configuration is ignored for wait=true activation on service '{}'", service_name);
+                }
+
                 let passed_fd = async_fd.get_ref().try_clone().ok()
                     .map(ActivationFd::Listen);
                 if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
@@ -153,7 +178,51 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
             let client_owned = unsafe { OwnedFd::from_raw_fd(client_fd) };
 
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
-            if let Some(config) = config_opt {
+            if let Some(mut config) = config_opt {
+                // UDS peer auth check
+                if let Some(ref auth) = config.auth {
+                    // Get peer UID from the accepted client fd
+                    use std::os::fd::AsRawFd;
+                    let peer_uid = get_peer_uid(client_owned.as_raw_fd());
+                    let current_uid = unsafe { libc::getuid() };
+
+                    if let Some(peer_uid) = peer_uid {
+                        if !auth.is_uid_authorized(peer_uid, current_uid) {
+                            error!(
+                                "Rejected activation for '{}' from unauthorized UID {}",
+                                service_name, peer_uid
+                            );
+                            drop(client_owned);
+                            continue;
+                        }
+
+                        // Check if this peer is a delegate — set env vars accordingly
+                        if let Some(_pattern) = auth.get_delegate(peer_uid) {
+                            // Delegate: env vars will be set by the service itself
+                            // after reading the delegation envelope from stdin.
+                            // We just mark the connection as delegated.
+                            config.env.insert(
+                                "X_PEER_DELEGATE_UID".to_string(),
+                                peer_uid.to_string(),
+                            );
+                        } else {
+                            // Direct peer: set UID env var
+                            config.env.insert(
+                                "X_PEER_UID".to_string(),
+                                peer_uid.to_string(),
+                            );
+                        }
+                    } else {
+                        // Peer UID is None (e.g. TCP connection), but auth is configured
+                        error!(
+                            "Rejected activation for '{}': auth configured but peer UID unavailable (TCP?)",
+                            service_name
+                        );
+                        drop(client_owned);
+                        continue;
+                    }
+                }
+
                 let cg = crate::cgroup::create_cgroup(&service_name)
                     .unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
                 

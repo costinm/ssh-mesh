@@ -51,6 +51,7 @@ fn create_base_job(name: &str) -> JobConfig {
         resources: Default::default(),
         activation: vec![],
         source_path: None,
+        auth: None,
         schedule: Some(ScheduleConfig::default()),
         constraints: Some(ConstraintConfig::default()),
         backoff: BackoffConfig::default(),

@@ -67,7 +67,6 @@ impl LocalDiscovery {
     /// If no key is provided, attempts to load from $HOME/.ssh/key.pem or generates a new one
     #[instrument(skip(key))]
     pub async fn new(key: Option<SecretKey>) -> Result<Self> {
-        debug!("Creating new LocalDiscovery instance");
         // Get the private key either from parameter or by loading/generating
         let private_key_ec = match key {
             Some(key) => key,
@@ -77,14 +76,12 @@ impl LocalDiscovery {
             }
         };
 
-        debug!("Serializing private key to DER format");
         // Serialize the private key to DER format
         let secret_key_der = private_key_ec
             .to_pkcs8_der()
             .context("Failed to serialize private key")?;
         let private_key = secret_key_der.to_bytes().to_vec();
 
-        debug!("Serializing public key to DER format");
         // Get the public key and serialize it to DER format (SPKI)
         let public_key_ec = private_key_ec.public_key();
         let public_key_der = public_key_ec
@@ -93,7 +90,6 @@ impl LocalDiscovery {
         let public_key = public_key_der.to_vec();
 
         let public_key_b64 = base64_url_encode(&public_key);
-        debug!("Generated public key ({} bytes)", public_key_b64.len());
 
         Ok(Self {
             private_key,
@@ -119,13 +115,11 @@ impl LocalDiscovery {
                 if let Ok(key) = SecretKey::from_pkcs8_pem(&key_data) {
                     return Ok(key);
                 }
-                // If PKCS8 fails, try to load it from our own previous format if it was different
-                // but for now let's assume PKCS8 PEM.
             }
         }
 
         // Generate new keypair
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let key = SecretKey::random(&mut rng);
 
         // Save the generated key to file
@@ -143,7 +137,6 @@ impl LocalDiscovery {
     /// Start the UDP multicast listeners
     #[instrument(skip(self))]
     pub async fn start(&mut self) -> Result<()> {
-        debug!("Starting UDP multicast listeners");
         // Setup IPv4 multicast socket
         match Self::setup_multicast_v4().await {
             Ok(socket) => {
@@ -176,14 +169,12 @@ impl LocalDiscovery {
             anyhow::bail!("Failed to setup any multicast sockets");
         }
 
-        debug!("Starting receiver tasks");
         // Start receiver tasks
         if let Some(socket) = &self.socket_v4 {
             let nodes = self.nodes.clone();
             let socket = socket.clone();
             let local_public_key = self.public_key_b64.clone();
             tokio::spawn(async move {
-                debug!("Starting IPv4 receive loop");
                 if let Err(e) = Self::receive_loop(socket, nodes, local_public_key).await {
                     error!("IPv4 receive loop error: {}", e);
                 }
@@ -195,14 +186,12 @@ impl LocalDiscovery {
             let socket = socket.clone();
             let local_public_key = self.public_key_b64.clone();
             tokio::spawn(async move {
-                debug!("Starting IPv6 receive loop");
                 if let Err(e) = Self::receive_loop(socket, nodes, local_public_key).await {
                     error!("IPv6 receive loop error: {}", e);
                 }
             });
         }
 
-        info!("LocalDiscovery started successfully");
         Ok(())
     }
 
@@ -247,17 +236,13 @@ impl LocalDiscovery {
         nodes: Arc<RwLock<HashMap<String, Node>>>,
         local_public_key: String,
     ) -> Result<()> {
-        debug!("Starting receive loop");
         let mut buf = vec![0u8; 65536];
 
         loop {
-            trace!("Waiting for incoming data");
             let (len, addr) = socket
                 .recv_from(&mut buf)
                 .await
                 .context("Failed to receive from socket")?;
-
-            //trace!("Received {} bytes from {}", len, addr);
 
             let data = &buf[..len];
 
@@ -282,7 +267,6 @@ impl LocalDiscovery {
 
                     // Update nodes map
                     let mut nodes_map = nodes.write().await;
-                    trace!("Updating node map with {} entries", nodes_map.len());
                     nodes_map.insert(announce.public_key, node);
                 }
                 Err(e) => {
@@ -304,14 +288,12 @@ impl LocalDiscovery {
         &self,
         metadata: Option<HashMap<String, String>>,
     ) -> Result<()> {
-        //debug!("Sending announcement with metadata");
         let announce = Announce {
             public_key: self.public_key_b64.clone(),
             metadata,
         };
 
         let json = serde_json::to_vec(&announce).context("Failed to serialize announcement")?;
-        //trace!("Serialized announcement ({} bytes)", json.len());
 
         // Send to IPv4 multicast
         if let Some(socket) = &self.socket_v4 {
@@ -320,7 +302,6 @@ impl LocalDiscovery {
                 .send_to(&json, addr)
                 .await
                 .context("Failed to send IPv4 announcement")?;
-            //debug!("Sent IPv4 announcement to {}", addr);
         }
 
         // Send to IPv6 multicast
@@ -330,10 +311,8 @@ impl LocalDiscovery {
                 .send_to(&json, addr)
                 .await
                 .context("Failed to send IPv6 announcement")?;
-            //debug!("Sent IPv6 announcement to {}", addr);
         }
 
-        //info!("Announcement sent successfully");
         Ok(())
     }
 

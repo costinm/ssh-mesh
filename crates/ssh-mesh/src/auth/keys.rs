@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use log::info;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
 use pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use russh::keys::PrivateKey;
 use ssh_key::LineEnding;
@@ -37,7 +36,7 @@ pub fn load_keys(base_dir: &Path) -> (PrivateKey, Option<String>) {
 
     info!("Generating new EC-256 key (PKCS#8 format)");
     let ssh_pk = ssh_key::PrivateKey::random(
-        &mut rand::rngs::OsRng,
+        &mut rand::rng(),
         ssh_key::Algorithm::Ecdsa {
             curve: ssh_key::EcdsaCurve::NistP256,
         },
@@ -83,10 +82,11 @@ pub fn ssh_to_pkcs8_pem(ssh_key: &ssh_key::PrivateKey) -> Result<String> {
 }
 
 pub fn ssh_key_from_pkcs8_pem(pem: &str) -> Result<ssh_key::PrivateKey> {
+    use p256::elliptic_curve::sec1::ToSec1Point;
     let secret_key = p256::SecretKey::from_pkcs8_pem(pem)?;
     let public_key = secret_key.public_key();
 
-    let encoded = public_key.to_encoded_point(false);
+    let encoded = public_key.to_sec1_point(false);
     let public = ssh_key::sec1::EncodedPoint::from_bytes(encoded.as_bytes())
         .map_err(|e| anyhow::anyhow!("SEC1 encoding error: {}", e))?;
 

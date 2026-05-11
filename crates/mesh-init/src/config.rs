@@ -6,10 +6,8 @@
 //! - Socket configs define FDs to listen on; accept triggers service start.
 //! - Resource limits map to cgroup v2 knobs (memory.low/high/max, cpu.weight).
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 pub use mesh::config::*;
@@ -137,6 +135,29 @@ wait = false
         assert_eq!(config.activation[0].wait, true);
         assert_eq!(config.activation[1].port, Some(14022));
         assert_eq!(config.activation[1].wait, false);
+    }
+
+    #[test]
+    fn test_parse_toml_with_peer() {
+        let toml = r#"
+[service]
+name = "auth-svc"
+command = "/bin/true"
+
+[[peer]]
+uid = 1000
+
+[[peer]]
+uid = 1001
+delegate = "*.mesh.local"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.name, "auth-svc");
+        let auth = config.auth.expect("auth should be present");
+        assert_eq!(auth.peers.len(), 2);
+        assert_eq!(auth.peers[0].uid, Some(1000));
+        assert_eq!(auth.peers[1].uid, Some(1001));
+        assert_eq!(auth.peers[1].delegate.as_deref(), Some("*.mesh.local"));
     }
 
     #[test]

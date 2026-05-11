@@ -162,35 +162,30 @@ pub struct MeshNodeConfig {
     pub clients: HashMap<String, SshClientConfig>,
 }
 
+pub trait MeshListener: Send + Sync {
+    fn on_ssh_connection(&self, client_id: u64, user: &str);
+    fn on_stream(&self, client_id: u64, host: &str, port: u16, stream: tokio::io::DuplexStream);
+}
+
 // MeshNode is the main server struct (formerly SshServer).
 #[derive(Clone)]
-#[allow(unused)]
 pub struct MeshNode {
     pub cfg: MeshNodeConfig,
-
-    keys: PrivateKey,
-
-    clients: Arc<tokio::sync::Mutex<Vec<usize>>>,
-    id_counter: Arc<std::sync::Mutex<usize>>,
-
-    pub authorized_keys: Arc<Vec<crate::auth::AuthorizedKeyEntry>>,
+    pub keys: PrivateKey,
+    pub clients: Arc<tokio::sync::Mutex<Vec<SshClientConfig>>>,
+    pub id_counter: Arc<std::sync::Mutex<u64>>,
+    pub authorized_keys: Arc<Vec<auth::AuthorizedKeyEntry>>,
     pub ca_keys: Arc<Vec<ssh_key::PublicKey>>,
-
-    /// Active SSH handlers indexed by their ID.
-    /// This is the list of incoming mux connections.
-    active_handlers:
-        Arc<std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<sshd::SshHandler>>>>>,
-    
-    /// Track connected clients with their remote forward listeners
-    pub connected_clients: Arc<tokio::sync::Mutex<HashMap<usize, ConnectedClientInfo>>>,
-    
-    pub server_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    pub active_handlers: Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<sshd::SshHandler>>>>>,
+    pub connected_clients: Arc<tokio::sync::Mutex<HashMap<u64, ConnectedClientInfo>>>,
+    pub server_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>>,
+    pub listeners: Arc<tokio::sync::Mutex<Vec<Arc<dyn MeshListener>>>>,
 }
 
 /// Information about a connected client
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ConnectedClientInfo {
-    pub id: usize,
+    pub id: u64,
     pub user: String,
     pub comment: String,
     pub options: Option<String>,
@@ -315,14 +310,20 @@ impl MeshNode {
             active_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             connected_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             server_handle: Arc::new(std::sync::Mutex::new(None)),
+            listeners: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn add_listener(&self, listener: Arc<dyn MeshListener>) {
+        let mut listeners = self.listeners.blocking_lock();
+        listeners.push(listener);
     }
 
     pub fn get_config(&self) -> server::Config {
         let mut config = server::Config::default();
         config.keys.push(self.keys.clone());
         config.max_auth_attempts = 3;
-        config.server_id = russh::SshId::Standard(String::from("SSH-2.0-Rust-SSH-Server"));
+        config.server_id = russh::SshId::Standard(std::borrow::Cow::Borrowed("SSH-2.0-Rust-SSH-Server"));
         config
     }
 
@@ -376,6 +377,16 @@ impl server::Server for MeshNode {
         let handler_arc = Arc::new(tokio::sync::Mutex::new(handler.clone()));
         let mut active_handlers = self.active_handlers.lock().unwrap();
         active_handlers.insert(*id, handler_arc);
+
+        // Notify listeners about the new connection
+        let listeners = self.listeners.clone();
+        let id_val = *id;
+        tokio::spawn(async move {
+            let listeners = listeners.lock().await;
+            for l in listeners.iter() {
+                l.on_ssh_connection(id_val, ""); // User is not yet known
+            }
+        });
 
         handler
     }

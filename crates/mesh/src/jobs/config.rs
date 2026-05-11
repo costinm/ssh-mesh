@@ -75,6 +75,7 @@ impl JobConfig {
             estimated_download_bytes: self.estimated_download_bytes,
             estimated_upload_bytes: self.estimated_upload_bytes,
             minimum_network_chunk_bytes: self.minimum_network_chunk_bytes,
+            peers: self.auth.as_ref().map(|a| a.peers.clone()).unwrap_or_default(),
         };
         
         let content = toml::to_string_pretty(&file)?;

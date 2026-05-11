@@ -11,8 +11,8 @@ pub struct ServerConfig {
     pub refresh_interval: u64,
     /// Optional UDS path for HTTP server
     pub http_uds_path: Option<String>,
-    /// Authorized UID for UDS connections
-    pub auth_uid: Option<u32>,
+    /// Authorization config for UDS connections
+    pub auth: Option<mesh::auth::AuthConfig>,
 }
 
 impl Default for ServerConfig {
@@ -20,7 +20,7 @@ impl Default for ServerConfig {
         Self {
             refresh_interval: 10,
             http_uds_path: None,
-            auth_uid: None,
+            auth: None,
         }
     }
 }
@@ -49,25 +49,10 @@ impl PmonServer {
         let mesh_config = MeshConfig {
             http_port: None, // Will use default logic in MeshApp
             http_uds_path: self.config.http_uds_path.clone(),
-            auth_uid: self.config.auth_uid,
+            auth: self.config.auth.clone(),
         };
 
         MeshApp::new(mesh_config).with_router(crate::handlers::app(self.proc_mon.clone()))
-    }
-
-    /// Run the default HTTP server - for debug. In prod - use UDS or
-    /// embed the library.
-    pub async fn run_server(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let (tx, _rx) = tokio::sync::mpsc::channel(100);
-
-        // Start monitoring
-        self.proc_mon.start(true, true, Some(tx.clone()))?;
-
-        // Set up HTTP server via MeshApp
-        let app = self.create_mesh_app();
-        app.run_tcp_server().await?;
-
-        Ok(())
     }
 
     /// Run the HTTP server on UDS socket
@@ -79,11 +64,7 @@ impl PmonServer {
 
         let app = self.create_mesh_app();
 
-        tokio::spawn(async move {
-            if let Err(e) = app.run_uds_server().await {
-                error!("UDS HTTP server error: {}", e);
-            }
-        });
+        app.run_uds_server().await?;
 
         Ok(())
     }

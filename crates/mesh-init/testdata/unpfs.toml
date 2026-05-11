@@ -1,6 +1,6 @@
 [service]
-name = "unpfs"
-command = "./unpfs"
+name = "mesh9p"
+command = "./mesh9p"
 args = ["/tmp"]
 priority = 400
 oneshot = false
@@ -14,7 +14,7 @@ RUST_LOG = "info"
 
 # Socket activation: inetd-style, per-connection.
 # mesh-init accepts the TCP connection and passes the socket FD
-# as stdin/stdout to unpfs (which already supports this mode).
+# as stdin/stdout to mesh9p (which already supports this mode).
 [[activation]]
 port = 14019
 wait = false

@@ -35,7 +35,8 @@ unpfs --listen '/tmp/unpfs-socket' /exportdir
 Mounting:
 
 ```bash
-# mount -t 9p -o version=9p2000.L,trans=tcp,port=564,uname=$USER 127.0.0.1 /mountdir
+
+mount -t 9p -o version=9p2000.L,trans=tcp,port=15101,uname=$USER $HOST /mountdir
 
 mount -t 9p -o version=9p2000.L,trans=unix,uname=$USER /tmp/unpfs-socket:0 /mountdir
 ```

@@ -127,13 +127,10 @@ pub async fn setup_test_environment(
                     Err(e) => eprintln!("Axum server failed: {}", e),
                 }
             }
+            Ok(())
         } else {
             let config = mesh_node_clone.get_config();
-            if let Err(e) =
-                crate::run_ssh_server(ssh_port, config, (*mesh_node_clone).clone()).await
-            {
-                eprintln!("SSH server failed: {}", e);
-            }
+            crate::run_ssh_server(ssh_port, config, (*mesh_node_clone).clone()).await
         }
     });
 

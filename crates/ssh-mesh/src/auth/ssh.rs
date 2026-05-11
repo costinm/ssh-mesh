@@ -8,7 +8,7 @@ use log::warn;
 use rcgen::{CertificateParams, DistinguishedName, IsCa, KeyPair, SanType};
 use russh::{MethodKind, server};
 use ssh_key::certificate::{Builder, CertType};
-use ssh_key::rand_core::OsRng;
+
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -264,7 +264,7 @@ pub fn generate_ca(cadir: &Path, domain: &str) -> Result<()> {
     info!("Generating CA in {:?}", cadir);
 
     let ca_ssh_key = ssh_key::PrivateKey::random(
-        &mut OsRng,
+        &mut rand::rng(),
         ssh_key::Algorithm::Ecdsa {
             curve: ssh_key::EcdsaCurve::NistP256,
         },
@@ -299,7 +299,7 @@ pub fn generate_node(nodedir: &Path, name: &str, domain: &str) -> Result<()> {
     info!("Generating node keys in {:?}", nodedir);
 
     let ssh_key = ssh_key::PrivateKey::random(
-        &mut OsRng,
+        &mut rand::rng(),
         ssh_key::Algorithm::Ecdsa {
             curve: ssh_key::EcdsaCurve::NistP256,
         },
@@ -366,7 +366,7 @@ pub fn sign_node(cadir: &Path, nodedir: &Path, name: &str, domain: &str) -> Resu
     fs::write(nodedir.join("id_ecdsa.crt"), node_cert.pem())?;
 
     let mut host_cert_builder = Builder::new_with_random_nonce(
-        &mut OsRng,
+        &mut rand::rng(),
         node_pub.key_data().clone(),
         2000000000,
         2000000000 + 3600 * 24 * 365,
@@ -383,7 +383,7 @@ pub fn sign_node(cadir: &Path, nodedir: &Path, name: &str, domain: &str) -> Resu
     )?;
 
     let mut user_cert_builder = Builder::new_with_random_nonce(
-        &mut OsRng,
+        &mut rand::rng(),
         node_pub.key_data().clone(),
         2000000000,
         2000000000 + 3600 * 24 * 365,
@@ -405,7 +405,7 @@ pub fn sign_node(cadir: &Path, nodedir: &Path, name: &str, domain: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ssh_key::rand_core::OsRng;
+
 
     #[test]
     fn test_parse_authorized_keys() {
@@ -424,12 +424,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_certificate() {
-        let ca_key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        let ca_key = ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
         let user_key =
-            ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
         let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
-            &mut OsRng,
+            &mut rand::rng(),
             user_key.public_key().key_data().clone(),
             0,
             2000000000 + 100000,

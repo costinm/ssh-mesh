@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use axum::{routing::post, Extension, Json, Router};
 use clap::Parser;
 use lmesh::LocalDiscovery;
-use mesh::uds::run_uds_server;
+use mesh::server::run_axum_server;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,7 +24,7 @@ struct Args {
     #[arg(long)]
     uds: Option<String>,
 
-    /// Authorized UID for UDS connections
+    /// Authorized UID for UDS connections (legacy, prefer auth.toml)
     #[arg(long)]
     authorized_uid: Option<u32>,
 }
@@ -87,11 +87,7 @@ struct NodeInfo {
 }
 
 async fn run_server(args: Args) -> Result<()> {
-    let uds_path = args.uds.unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/lmesh/control.sock", home)
-    });
-    info!("Starting lmesh server on {}...", uds_path);
+    info!("Starting lmesh server...");
     let mut discovery = LocalDiscovery::new(None).await?;
     discovery.start().await?;
 
@@ -113,7 +109,7 @@ async fn run_server(args: Args) -> Result<()> {
         .route("/announce", post(handle_announce))
         .layer(Extension(discovery_clone));
 
-    run_uds_server(app, &uds_path, args.authorized_uid)
+    run_axum_server("lmesh", args.uds.as_deref(), app)
         .await
         .map_err(|e| anyhow::anyhow!("UDS server error: {}", e))?;
 

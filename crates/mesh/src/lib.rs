@@ -1,8 +1,9 @@
+pub mod auth;
 pub mod config;
 pub mod jobs;
 pub mod local_trace;
 pub mod protocol;
-pub mod uds;
+pub mod server;
 
 use axum::serve;
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,9 @@ pub struct MeshConfig {
     pub http_port: Option<u16>,
     /// Optional UDS path for HTTP/H2C server
     pub http_uds_path: Option<String>,
-    /// Authorized UID for UDS connections
-    pub auth_uid: Option<u32>,
+    /// Authorization config for UDS connections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<auth::AuthConfig>,
 }
 
 /// A handler trait or structure for incoming generic JSON lines.
@@ -92,25 +94,15 @@ impl MeshApp {
     /// Run the HTTP server on UDS socket using the extracted logic
     pub async fn run_uds_server(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(router) = &self.router {
-            let path_str = if let Some(path) = &self.config.http_uds_path {
-                path.clone()
-            } else {
-                let current_exe = std::env::current_exe()?;
-                let app = current_exe
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                format!("{}/.run/{}/control.sock", home, app)
-            };
+            let current_exe = std::env::current_exe()?;
+            let app = current_exe
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
 
-            let path = std::path::PathBuf::from(&path_str);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+            let listen_path = self.config.http_uds_path.as_deref().unwrap_or("control.sock");
 
-            let auth_uid = self.config.auth_uid;
-            crate::uds::run_uds_server(router.clone(), &path_str, auth_uid).await?;
+            crate::server::run_axum_server(&app, Some(listen_path), router.clone()).await?;
         } else {
             error!("MeshApp: No router configured for UDS server");
         }

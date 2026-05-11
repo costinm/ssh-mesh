@@ -76,13 +76,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Authorized UID for UDS
-    let auth_uid = std::env::var("PMOND_AUTHORIZED_UID")
+    // Auth config: CLI env var, then $HOME/.config/pmond/auth.toml
+    let auth = if let Some(uid) = std::env::var("PMOND_AUTHORIZED_UID")
         .ok()
-        .and_then(|s| s.parse::<u32>().ok());
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(mesh::auth::AuthConfig {
+            peers: vec![mesh::auth::PeerConfig {
+                uid: Some(uid),
+                ..Default::default()
+            }],
+        })
+    } else {
+        mesh::auth::AuthConfig::load_for_app("pmond")
+    };
 
     // Default server mode
-    run_server(args.refresh, args.http_uds, auth_uid).await?;
+    run_server(args.refresh, args.http_uds, auth).await?;
 
     Ok(())
 }
@@ -441,14 +451,14 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
 async fn run_server(
     refresh: u64,
     http_uds: Option<String>,
-    auth_uid: Option<u32>,
+    auth: Option<mesh::auth::AuthConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = pmond::ServerConfig {
         refresh_interval: refresh,
         http_uds_path: http_uds,
-        auth_uid,
+        auth,
     };
 
     let server = pmond::PmonServer::new(config)?;
-    server.run_server().await
+    server.run_uds_server().await
 }

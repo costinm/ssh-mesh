@@ -74,7 +74,18 @@ impl ControlServer {
             };
 
             let peer_uid = peer_cred.uid();
-            if peer_uid != 0 && peer_uid != current_uid {
+
+            // Use daemon's auth config if available, otherwise fallback to root+self
+            let is_authorized = {
+                let configs = self.daemon.configs.lock();
+                // Check if any loaded config has auth rules
+                let auth = configs.values().find_map(|c| c.auth.as_ref());
+                match auth {
+                    Some(auth_config) => auth_config.is_uid_authorized(peer_uid, current_uid),
+                    None => peer_uid == 0 || peer_uid == current_uid,
+                }
+            };
+            if !is_authorized {
                 error!(
                     "Rejected connection from UID {} (expected 0 or {})",
                     peer_uid, current_uid

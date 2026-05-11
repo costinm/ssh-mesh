@@ -65,6 +65,10 @@ pub struct ClientHandler {
     forwards: Arc<Mutex<Vec<ForwardInfo>>>,
     /// Hostname we are connecting to (used for certificate validation).
     host: String,
+    /// Connection ID for identifying this connection in callbacks.
+    conn_id: u64,
+    /// Listeners to notify about incoming channels.
+    listeners: Arc<Mutex<Vec<Arc<dyn SshClientListener>>>>,
 }
 
 impl client::Handler for ClientHandler {
@@ -150,7 +154,49 @@ impl client::Handler for ClientHandler {
             connected_address, connected_port, originator_address, originator_port
         );
 
-        // Find the matching forward configuration
+        let listeners = self.listeners.lock().await;
+        if !listeners.is_empty() {
+            let (s1, s2) = tokio::io::duplex(64 * 1024);
+            let conn_id = self.conn_id;
+            let host = connected_address.to_string();
+            let port = connected_port as u16;
+
+            if let Some(l) = listeners.first() {
+                l.on_forwarded_tcpip(conn_id, &host, port, s1);
+            }
+
+            // Bridge s2 to SSH channel
+            let mut channel = channel;
+            let (mut reader, mut writer) = tokio::io::split(s2);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    tokio::select! {
+                        r = reader.read(&mut buf) => {
+                            match r {
+                                Ok(0) => { let _ = channel.eof().await; break; }
+                                Ok(n) => { if let Err(_) = channel.data(&buf[..n]).await { break; } }
+                                Err(_) => break,
+                            }
+                        }
+                        msg = channel.wait() => {
+                            match msg {
+                                Some(russh::ChannelMsg::Data { data }) => {
+                                    if let Err(_) = writer.write_all(&data).await { break; }
+                                }
+                                Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                let _ = channel.close().await;
+            });
+            return Ok(());
+        }
+        drop(listeners);
+
+        // Find the matching forward configuration (Default behavior)
         let forwards = self.forwards.lock().await;
         // In most SSH server implementations, 'connected_port' is the port on the server
         // that the client asked to listen on.
@@ -161,7 +207,7 @@ impl client::Handler for ClientHandler {
         });
 
         if let Some(info) = forward_info {
-            let target_host = info.local_host.clone(); // The host we should connect to locally
+            let target_host = info.local_host.clone();
             let target_port = info.local_port;
 
             info!(
@@ -174,32 +220,19 @@ impl client::Handler for ClientHandler {
                 // Connect to the local target
                 match TcpStream::connect(format!("{}:{}", target_host, target_port)).await {
                     Ok(tcp_stream) => {
-                        info!("Connected to local target {}:{}", target_host, target_port);
                         let channel_stream = channel.into_stream();
                         crate::utils::bridge(channel_stream, tcp_stream, "Remote Forward").await;
                     }
                     Err(e) => {
-                        error!(
-                            "Failed to connect to local target {}:{}: {}",
-                            target_host, target_port, e
-                        );
+                        error!("Failed to connect to local target {}:{}: {}", target_host, target_port, e);
                         let _ = channel.close().await;
                     }
                 }
             });
-
             Ok(())
         } else {
-            error!(
-                "No remote forward found for port {}. Rejecting channel.",
-                connected_port
-            );
-            // Verify if we need to explicitly reject or if dropping/returning Err does it.
-            // Returning Err usually closes the channel.
-            Err(anyhow::anyhow!(
-                "No forward found for port {}",
-                connected_port
-            ))
+            error!("No remote forward found for port {}. Rejecting channel.", connected_port);
+            Err(anyhow::anyhow!("No forward found for port {}", connected_port))
         }
     }
 }
@@ -238,6 +271,10 @@ impl SshClientConnection {
 // SSH Client Manager
 // ---------------------------------------------------------------------------
 
+pub trait SshClientListener: Send + Sync {
+    fn on_forwarded_tcpip(&self, conn_id: u64, host: &str, port: u16, stream: tokio::io::DuplexStream);
+}
+
 /// Manages multiple SSH client connections.
 pub struct SshClientManager {
     connections: Mutex<HashMap<u64, SshClientConnection>>,
@@ -250,6 +287,7 @@ pub struct SshClientManager {
     ssh_config_path: Option<PathBuf>,
     /// Optional directory for mux sockets.
     mux_dir: Option<PathBuf>,
+    pub(crate) listeners: Arc<Mutex<Vec<Arc<dyn SshClientListener>>>>,
 }
 
 impl SshClientManager {
@@ -259,12 +297,6 @@ impl SshClientManager {
         ssh_config_path: Option<PathBuf>,
         mux_dir: Option<PathBuf>,
     ) -> Self {
-        if let Some(ref path) = ssh_config_path {
-            info!("SSH client manager using config: {:?}", path);
-        }
-        if let Some(ref dir) = mux_dir {
-            info!("SSH client manager mux dir: {:?}", dir);
-        }
         Self {
             connections: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
@@ -272,7 +304,13 @@ impl SshClientManager {
             ca_keys: Arc::new(ca_keys),
             ssh_config_path,
             mux_dir,
+            listeners: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn add_listener(&self, listener: Arc<dyn SshClientListener>) {
+        let mut listeners = self.listeners.blocking_lock();
+        listeners.push(listener);
     }
 
     /// Look up host configuration from the SSH config file.
@@ -395,12 +433,19 @@ impl SshClientManager {
 
         let forwards = Arc::new(Mutex::new(Vec::new()));
 
+        let mut next_id_lock = self.next_id.lock().await;
+        let id = *next_id_lock;
+        *next_id_lock += 1;
+        drop(next_id_lock);
+
         let handler = ClientHandler {
             key_file,
             expected_keys,
             ca_keys: self.ca_keys.clone(),
             forwards: forwards.clone(),
             host: connect_host.clone(),
+            conn_id: id,
+            listeners: self.listeners.clone(),
         };
 
         let config = Arc::new(client::Config {
@@ -435,11 +480,6 @@ impl SshClientManager {
         } else {
             None
         };
-
-        let mut next_id = self.next_id.lock().await;
-        let id = *next_id;
-        *next_id += 1;
-        drop(next_id);
 
         let conn = SshClientConnection {
             id,
@@ -634,6 +674,69 @@ impl SshClientManager {
         })
     }
 
+    /// Open a bidirectional stream to a remote host:port through the SSH tunnel.
+    pub async fn open_stream(
+        &self,
+        id: u64,
+        host: &str,
+        port: u16,
+    ) -> Result<tokio::io::DuplexStream> {
+        let conns = self.connections.lock().await;
+        let conn = conns
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Connection {} not found", id))?;
+
+        let mut channel = {
+            let session = conn.session.lock().await;
+            session
+                .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
+                .await?
+        };
+
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(s2);
+            let mut stream_closed = false;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                tokio::select! {
+                    r = reader.read(&mut buf), if !stream_closed => {
+                        match r {
+                            Ok(0) => {
+                                stream_closed = true;
+                                let _ = channel.eof().await;
+                            }
+                            Ok(n) => {
+                                if let Err(_) = channel.data(&buf[..n]).await {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Some(msg) = channel.wait() => {
+                        match msg {
+                            russh::ChannelMsg::Data { ref data } => {
+                                if let Err(_) = writer.write_all(data).await {
+                                    break;
+                                }
+                            }
+                            russh::ChannelMsg::Eof => {
+                                break;
+                            }
+                            russh::ChannelMsg::Close => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let _ = channel.close().await;
+        });
+
+        Ok(s1)
+    }
+
     /// Connect to an SSH server using a `SshClientConfig`.
     ///
     /// Resolves hostname from the config name if not explicitly set.
@@ -678,12 +781,19 @@ impl SshClientManager {
 
         let forwards = Arc::new(Mutex::new(Vec::new()));
 
+        let mut next_id_lock = self.next_id.lock().await;
+        let id = *next_id_lock;
+        *next_id_lock += 1;
+        drop(next_id_lock);
+
         let handler = ClientHandler {
             key_file,
             expected_keys,
             ca_keys: self.ca_keys.clone(),
             forwards: forwards.clone(),
             host: connect_host.clone(),
+            conn_id: id,
+            listeners: self.listeners.clone(),
         };
 
         let config = Arc::new(client::Config {
@@ -718,11 +828,6 @@ impl SshClientManager {
         } else {
             None
         };
-
-        let mut next_id = self.next_id.lock().await;
-        let id = *next_id;
-        *next_id += 1;
-        drop(next_id);
 
         let conn = SshClientConnection {
             id,

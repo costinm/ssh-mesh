@@ -149,19 +149,6 @@ async fn main() -> Result<(), anyhow::Error> {
     #[cfg(feature = "ws")]
     let ws_server = Arc::new(WSServer::new());
 
-    // // Initialize ProcMon if enabled
-    // #[cfg(feature = "pmon")]
-    // let proc_mon = {
-    //     let pm = Arc::new(pmond::ProcMon::new().expect("Failed to create ProcMon"));
-    //     // Start monitoring: read_sync=true, watch_psi=true, event_tx=None
-    //     if let Err(e) = pm.start(true, true, None) {
-    //         error!("Failed to start ProcMon: {}", e);
-    //     } else {
-    //         info!("ProcMon started successfully");
-    //     }
-    //     pm
-    // };
-
     // Create AppState
 
     let app_state = AppState {
@@ -302,7 +289,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let control_uds = format!("{}/.run/ssh-mesh/control.sock", home);
     let app_clone = app.clone();
     tokio::spawn(async move {
-        if let Err(e) = mesh::uds::run_uds_server(app_clone, &control_uds, None).await {
+        if let Err(e) = mesh::server::run_axum_server("ssh-mesh", Some(&control_uds), app_clone).await {
             error!("UDS HTTP server failed: {}", e);
         }
     });

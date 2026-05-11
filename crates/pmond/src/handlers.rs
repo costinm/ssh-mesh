@@ -513,7 +513,7 @@ pub fn app(proc_mon: Arc<ProcMon>) -> Router {
 pub async fn run_uds_http_server(
     proc_mon: Arc<ProcMon>,
     path: &str,
-    authorized_uid: Option<u32>,
+    auth: Option<mesh::auth::AuthConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -535,9 +535,10 @@ pub async fn run_uds_http_server(
         let peer_cred = stream.peer_cred()?;
         let peer_uid = peer_cred.uid();
 
-        let is_authorized = peer_uid == 0
-            || peer_uid == current_uid
-            || (authorized_uid.is_some() && authorized_uid == Some(peer_uid));
+        let is_authorized = match &auth {
+            Some(auth_config) => auth_config.is_uid_authorized(peer_uid, current_uid),
+            None => peer_uid == 0 || peer_uid == current_uid,
+        };
 
         if !is_authorized {
             error!("Unauthorized UDS HTTP connection from UID {}", peer_uid);

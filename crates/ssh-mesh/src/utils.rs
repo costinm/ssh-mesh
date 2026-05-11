@@ -230,7 +230,7 @@ pub async fn pipe_read_to_ssh<R>(
             }
             Ok(n) => {
                 if session_handle
-                    .data(channel_id, (&buf[..n]).into())
+                    .data(channel_id, Bytes::copy_from_slice(&buf[..n]))
                     .await
                     .is_err()
                 {
@@ -284,7 +284,7 @@ pub async fn pipe_read_to_ssh_extended<R>(
             Ok(0) => break,
             Ok(n) => {
                 if session_handle
-                    .extended_data(channel_id, ext, (&buf[..n]).into())
+                    .extended_data(channel_id, ext, Bytes::copy_from_slice(&buf[..n]))
                     .await
                     .is_err()
                 {

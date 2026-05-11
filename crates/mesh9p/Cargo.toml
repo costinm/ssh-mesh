@@ -38,3 +38,4 @@ bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 filetime = "0.2"
 clap = { version = "4.5", features = ["derive"] }
+mesh = { version = "0.1.0", path = "../mesh" }

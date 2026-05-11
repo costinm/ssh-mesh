@@ -28,7 +28,7 @@ use crate::{ConnectedClientInfo, MeshNode};
 #[allow(unused)]
 #[derive(Clone)]
 pub struct SshHandler {
-    pub(crate) id: usize,
+    pub(crate) id: u64,
     pub(crate) server: MeshNode,
 
     // streams multiplexed on the client TCP connection
@@ -97,7 +97,7 @@ fn build_command(command: &Option<String>) -> Command {
 }
 
 impl SshHandler {
-    pub(crate) fn new(id: usize, server: MeshNode) -> Self {
+    pub(crate) fn new(id: u64, server: MeshNode) -> Self {
         SshHandler {
             id,
             server,
@@ -531,6 +531,18 @@ impl server::Handler for SshHandler {
                     clients.insert(handler_id, client_info);
                     self.comment = auth_res.comment.clone();
                     self.options = auth_res.options.clone();
+
+                    // Notify listeners about the authenticated connection
+                    let listeners = self.server.listeners.clone();
+                    let id_val = handler_id;
+                    let u_str = user_str.clone();
+                    tokio::spawn(async move {
+                        let listeners = listeners.lock().await;
+                        for l in listeners.iter() {
+                            l.on_ssh_connection(id_val, &u_str);
+                        }
+                    });
+
                     // Store a filesystem-safe version of the key fingerprint.
                     // keyfp is like "SHA256:abc+/def="; keep only alphanumerics.
                     self.peer_key_sha = keyfp
@@ -641,10 +653,46 @@ impl server::Handler for SshHandler {
             sessions_lock.insert(channel_id, channel_session);
             drop(sessions_lock);
 
-            trace!(
-                "Created new direct TCP/IP session for channel {:?} in handler {}",
-                channel_id, handler_id
-            );
+            // Handle "local" host - trigger callback
+            if host == "local" {
+                let (s1, s2) = tokio::io::duplex(64 * 1024);
+                
+                // Notify listeners
+                let listeners = me.server.listeners.clone();
+                let client_id = handler_id;
+                let port_val = port as u16;
+                    tokio::spawn(async move {
+                        let listeners = listeners.lock().await;
+                        if let Some(l) = listeners.first() {
+                            l.on_stream(client_id, "local", port_val, s1);
+                        }
+                    });
+
+                // Bridge s2 to SSH channel
+                let (reader, writer) = tokio::io::split(s2);
+                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                {
+                    let mut writers = me.channel_writers.lock().await;
+                    writers.insert(channel_id, tx);
+                }
+
+                let session_handle_clone = session_handle.clone();
+                let channel_writers_clone = me.channel_writers.clone();
+                tokio::spawn(async move {
+                    crate::utils::pipe_read_to_ssh(reader, session_handle_clone, channel_id, "Local Stream to SSH").await;
+                    let mut writers = channel_writers_clone.lock().await;
+                    writers.remove(&channel_id);
+                });
+
+                let channel_writers_clone2 = me.channel_writers.clone();
+                tokio::spawn(async move {
+                    crate::utils::pipe_rx_to_write(rx, writer, "SSH to Local Stream").await;
+                    let mut writers = channel_writers_clone2.lock().await;
+                    writers.remove(&channel_id);
+                });
+
+                return Ok(true);
+            }
 
             // Establish a TCP connection to the target host:port
             let target_addr = format!("{}:{}", host, port);
@@ -768,7 +816,7 @@ impl server::Handler for SshHandler {
                     data_vec.len(),
                     channel_id
                 );
-                let _ = session_handle.data(channel_id, data_vec.into()).await;
+                let _ = session_handle.data(channel_id, bytes::Bytes::from(data_vec)).await;
             }
             Ok(())
         }
@@ -1505,7 +1553,7 @@ impl server::Handler for SshHandler {
                     tokio::spawn(async move {
                         while let Some(data) = rx_out.recv().await {
                             if session_handle_clone
-                                .data(channel_id, data.as_ref().into())
+                                .data(channel_id, bytes::Bytes::copy_from_slice(data.as_ref()))
                                 .await
                                 .is_err()
                             {
