@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "dmesh"
+version = "0.1.0"
+description = "Python wrapper for the DMesh network stack"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[tool.maturin]
+manifest-path = "../crates/dmesh/Cargo.toml"
+module-name = "dmesh.dmesh_py"
+python-source = "."
+python-packages = ["dmesh"]
+features = ["python"]

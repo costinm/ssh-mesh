@@ -1,0 +1,39 @@
+#!/bin/bash
+# Wrapper script to run dmesh using Rust, Python, or Java backend.
+
+set -e
+
+# Use DMESH_LANG env var, default to python
+DMESH_LANG=${DMESH_LANG:-py}
+
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+BASE_DIR=$(dirname "$SCRIPT_DIR")
+
+export PYTHONPATH="$BASE_DIR/python:$PYTHONPATH"
+
+if [ "$DMESH_LANG" == "py" ]; then
+    if [ -f "$BASE_DIR/.venv/bin/python" ]; then
+        exec "$BASE_DIR/.venv/bin/python" -m dmesh "$@"
+    else
+        exec python3 -m dmesh "$@"
+    fi
+elif [ "$DMESH_LANG" == "java" ]; then
+    if [ -d "$BASE_DIR/java/classes" ]; then
+        # Installed via build.sh install
+        exec java -Djava.library.path="$BASE_DIR/lib" -cp "$BASE_DIR/java/classes" com.github.costinm.dmeshnative.Main "$@"
+    else
+        # In git repo
+        mkdir -p "$BASE_DIR/target/classes"
+        javac -d "$BASE_DIR/target/classes" $(find "$BASE_DIR/java/rust/src/main/java" -name "*.java")
+        exec java -Djava.library.path="$BASE_DIR/target/x86_64-unknown-linux-musl/debug:$BASE_DIR/target/release" -cp "$BASE_DIR/target/classes" com.github.costinm.dmeshnative.Main "$@"
+    fi
+else 
+    if [ -x "$SCRIPT_DIR/dmesh_rs" ]; then
+        exec "$SCRIPT_DIR/dmesh_rs" "$@"
+    elif [ -x "$BASE_DIR/target/x86_64-unknown-linux-musl/debug/dmesh" ]; then
+        exec "$BASE_DIR/target/x86_64-unknown-linux-musl/debug/dmesh" "$@"
+    else
+        echo "Rust binary not found. Try running 'cargo build -p dmesh'"
+        exit 1
+    fi
+fi
