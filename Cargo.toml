@@ -2,6 +2,9 @@
 members = [
     "crates/*",
 ]
+exclude = [
+    "crates/python",
+]
 resolver = "2"
 
 [profile.release]

@@ -5,17 +5,22 @@
 ///
 ///
 use anyhow::{Context, Result};
+
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use p256::SecretKey;
+
 use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, instrument, trace, warn};
+
+use tracing::{debug, error, info, instrument, warn};
 
 const MULTICAST_PORT: u16 = 5227;
 const MULTICAST_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
@@ -324,12 +329,9 @@ impl LocalDiscovery {
     /// Get a snapshot of currently discovered nodes
     #[instrument(skip(self))]
     pub async fn get_nodes(&self) -> HashMap<String, Node> {
-        debug!("Getting all discovered nodes");
         let nodes = self.nodes.read().await;
-        let count = nodes.len();
         drop(nodes); // Release the lock early
         let result = self.nodes.read().await.clone();
-        debug!("Returning {} nodes", count);
         result
     }
 

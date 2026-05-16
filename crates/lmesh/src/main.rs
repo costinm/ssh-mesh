@@ -52,31 +52,24 @@ async fn main() -> Result<()> {
 }
 
 async fn run_client() -> Result<()> {
-    info!("Starting lmesh discovery client...");
     let mut discovery = LocalDiscovery::new(None).await?;
     discovery.start().await?;
     discovery.announce().await?;
 
-    info!("Searching for nodes...");
-    for i in 0..30 {
-        let nodes_map = discovery.get_nodes().await;
-        if !nodes_map.is_empty() {
-            println!("Discovered {} node(s):", nodes_map.len());
-            for (_, node) in nodes_map {
-                println!("- Public Key: {}", node.public_key);
-                println!("  Address:    {}", node.address);
-                if let Some(meta) = node.metadata {
-                    println!("  Metadata:   {:?}", meta);
-                }
+    sleep(Duration::from_secs(1)).await;
+    let nodes_map = discovery.get_nodes().await;
+    if !nodes_map.is_empty() {
+        println!("Discovered {} node(s):", nodes_map.len());
+        for (_, node) in nodes_map {
+            println!("- Public Key: {}", node.public_key);
+            println!("  Address:    {}", node.address);
+            if let Some(meta) = node.metadata {
+                println!("  Metadata:   {:?}", meta);
             }
-            return Ok(());
         }
-        if i % 10 == 0 && i > 0 {
-            info!("Searching... ({}s elapsed)", i);
-        }
-        sleep(Duration::from_secs(1)).await;
+        return Ok(());
     }
-    bail!("No other nodes discovered after 30 seconds");
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -87,7 +80,6 @@ struct NodeInfo {
 }
 
 async fn run_server(args: Args) -> Result<()> {
-    info!("Starting lmesh server...");
     let mut discovery = LocalDiscovery::new(None).await?;
     discovery.start().await?;
 

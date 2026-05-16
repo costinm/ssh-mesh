@@ -34,21 +34,4 @@ public class Rust {
         loadLibrary();
         return new Rust();
     }
-    public static native void invokeCallbackViaJNI(Callback c);
-
-    public static class Callback {
-        public void callback(String s) {
-            System.out.println("Callback received: " + s);
-        };
-    }
-
-    public static void main(String[] args) {
-        try {
-            load(); // Try loading from standard target paths
-        } catch (UnsatisfiedLinkError e) {
-            System.err.println("Could not load native library: " + e.getMessage());
-            return;
-        }
-        invokeCallbackViaJNI(new Callback());
-    }
 }

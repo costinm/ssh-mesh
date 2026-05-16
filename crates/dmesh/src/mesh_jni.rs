@@ -1,14 +1,25 @@
-use anyhow::{Context, Result};
+//! JNI bindings for the mesh node.
+//!
+//! This module provides Java/Android bindings via JNI. All core logic
+//! is delegated to [`crate::mesh_common`]; this module handles only
+//! JNI-specific marshalling (JString ↔ Rust String, jlong ↔ pointer casts)
+//! and callback plumbing.
+//!
+//! See also:
+//! - Rust binary: `src/main.rs`
+//! - Python wrapper: `mesh_python.rs`
+//! - Java launcher: `java/rust/src/main/java/.../Main.java`
+//! - Java test: `java/rust/src/main/java/.../MainTest.java`
+
 use jni::{JavaVM, JNIEnv};
 use jni::objects::{GlobalRef, JByteArray, JClass, JString};
-use jni::sys::{jint, jlong, jobject};
-use std::path::PathBuf;
+use jni::sys::{jint, jlong};
 use std::sync::Arc;
-use tokio::runtime::Runtime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use ssh_mesh::{MeshNode, MeshNodeConfig, run_ssh_server, MeshListener};
+use tokio::io::DuplexStream;
+use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
-use ssh_mesh::sshc::SshClientManager;
+
+use crate::mesh_common::{MeshHandle, MeshStreamHandle};
 
 struct JniMeshListener {
     jvm: Arc<JavaVM>,
@@ -104,24 +115,9 @@ impl SshClientListener for JniSshClientListener {
     }
 }
 
-/// Opaque handle for a stream (channel).
-pub struct MeshStreamHandle {
-    pub stream: DuplexStream,
-    pub runtime_handle: tokio::runtime::Handle,
-}
-
-/// Opaque handle for a Mesh node instance.
-pub struct MeshHandle {
-    pub node: Arc<MeshNode>,
-    pub client_manager: Arc<SshClientManager>,
-    pub runtime: Runtime,
-    pub ssh_server_handle: Option<tokio::task::JoinHandle<()>>,
-    pub http_server_handle: Option<tokio::task::JoinHandle<()>>,
-}
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCallback(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
     callback: jni::objects::JObject,
@@ -158,67 +154,13 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartM
         Err(_) => return 0,
     };
 
-    let base_path = PathBuf::from(base_dir_str);
-    let _ = std::fs::create_dir_all(&base_path);
-
-    let runtime = match Runtime::new() {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-
-    let mut cfg = MeshNodeConfig::default();
-    cfg.base_dir = Some(base_path.clone());
-    cfg.ssh_port = if ssh_port > 0 { Some(ssh_port as u16) } else { Some(0) };
-    cfg.http_port = if http_port > 0 { Some(http_port as u16) } else { None };
-
-    let node = Arc::new(MeshNode::new(Some(base_path.clone()), Some(cfg)));
-    
-    let client_manager = Arc::new(SshClientManager::new(
-        node.private_key().clone(),
-        (*node.ca_keys).clone(),
-        Some(base_path.join("config")),
-        None,
-    ));
-
-    let node_clone = node.clone();
-    let ssh_server_handle = runtime.spawn(async move {
-        let config = node_clone.get_config();
-        let port = node_clone.ssh_port();
-        if let Err(e) = run_ssh_server(port, config, (*node_clone).clone()).await {
-            log::error!("SSH server failed: {}", e);
+    match crate::mesh_common::start_mesh(&base_dir_str, ssh_port, http_port) {
+        Ok(handle) => Box::into_raw(Box::new(handle)) as jlong,
+        Err(e) => {
+            log::error!("Failed to start mesh: {}", e);
+            0
         }
-    });
-
-    let mut http_server_handle = None;
-    if let Some(h_port) = node.http_port() {
-        let app_state = ssh_mesh::AppState {
-            ssh_server: node.clone(),
-            target_http_address: None,
-            ssh_client_manager: client_manager.clone(),
-        };
-        let app = ssh_mesh::handlers::app(app_state);
-        http_server_handle = Some(runtime.spawn(async move {
-            let addr = format!("0.0.0.0:{}", h_port);
-            match tokio::net::TcpListener::bind(&addr).await {
-                Ok(listener) => {
-                    if let Err(e) = axum::serve(listener, app.into_make_service()).await {
-                        log::error!("HTTP server failed: {}", e);
-                    }
-                }
-                Err(e) => log::error!("Failed to bind HTTP server to {}: {}", addr, e),
-            }
-        }));
     }
-
-    let handle = MeshHandle {
-        node,
-        client_manager,
-        runtime,
-        ssh_server_handle: Some(ssh_server_handle),
-        http_server_handle,
-    };
-
-    Box::into_raw(Box::new(handle)) as jlong
 }
 
 #[unsafe(no_mangle)]
@@ -229,13 +171,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStop(
 ) {
     if handle != 0 {
         let handle = unsafe { Box::from_raw(handle as *mut MeshHandle) };
-        if let Some(h) = handle.ssh_server_handle {
-            h.abort();
-        }
-        if let Some(h) = handle.http_server_handle {
-            h.abort();
-        }
-        handle.runtime.shutdown_background();
+        crate::mesh_common::stop_mesh(*handle);
     }
 }
 
@@ -254,11 +190,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeConnec
     let user_str: String = env.get_string(&user).unwrap().into();
     let key_str: String = env.get_string(&server_key).unwrap().into();
 
-    let res = handle.runtime.block_on(async {
-        handle.client_manager.connect(&host_str, port as u16, &user_str, &key_str).await
-    });
-
-    match res {
+    match crate::mesh_common::mesh_connect(handle, &host_str, port as u16, &user_str, &key_str) {
         Ok(id) => id as jlong,
         Err(e) => {
             log::error!("Connect failed: {}", e);
@@ -278,12 +210,8 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeExec<'
     let handle = unsafe { &*(handle as *const MeshHandle) };
     let cmd_str: String = env.get_string(&command).unwrap().into();
 
-    let res = handle.runtime.block_on(async {
-        handle.client_manager.exec(conn_id as u64, &cmd_str).await
-    });
-
-    match res {
-        Ok(exec_res) => env.new_string(exec_res.stdout).unwrap(),
+    match crate::mesh_common::mesh_exec(handle, conn_id as u64, &cmd_str) {
+        Ok(stdout) => env.new_string(stdout).unwrap(),
         Err(e) => {
             log::error!("Exec failed: {}", e);
             env.new_string("").unwrap()
@@ -298,8 +226,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeGetPub
     handle: jlong,
 ) -> JString<'a> {
     let handle = unsafe { &*(handle as *const MeshHandle) };
-    let pk = handle.node.private_key().public_key();
-    let pk_str = pk.to_openssh().unwrap_or_default();
+    let pk_str = crate::mesh_common::mesh_get_public_key(handle);
     env.new_string(pk_str).unwrap()
 }
 
@@ -315,18 +242,8 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeOpenSt
     let handle = unsafe { &*(handle as *const MeshHandle) };
     let host_str: String = env.get_string(&host).unwrap().into();
 
-    let res = handle.runtime.block_on(async {
-        handle.client_manager.open_stream(conn_id as u64, &host_str, port as u16).await
-    });
-
-    match res {
-        Ok(stream) => {
-            let stream_handle = MeshStreamHandle {
-                stream,
-                runtime_handle: handle.runtime.handle().clone(),
-            };
-            Box::into_raw(Box::new(stream_handle)) as jlong
-        }
+    match crate::mesh_common::mesh_open_stream(handle, conn_id as u64, &host_str, port as u16) {
+        Ok(stream_handle) => Box::into_raw(Box::new(stream_handle)) as jlong,
         Err(e) => {
             log::error!("Open stream failed: {}", e);
             0
@@ -347,9 +264,9 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddLoc
     let handle = unsafe { &*(handle as *const MeshHandle) };
     let host_str: String = env.get_string(&remote_host).unwrap().into();
 
-    let _ = handle.runtime.block_on(async {
-        handle.client_manager.add_local_forward(conn_id as u64, local_port as u16, &host_str, remote_port as u16).await
-    });
+    let _ = crate::mesh_common::mesh_add_local_forward(
+        handle, conn_id as u64, local_port as u16, &host_str, remote_port as u16,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -365,11 +282,9 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddRem
     let handle = unsafe { &*(handle as *const MeshHandle) };
     let host_str: String = env.get_string(&local_host).unwrap().into();
 
-    let res = handle.runtime.block_on(async {
-        handle.client_manager.add_remote_forward(conn_id as u64, remote_port as u16, &host_str, local_port as u16).await
-    });
-
-    match res {
+    match crate::mesh_common::mesh_add_remote_forward(
+        handle, conn_id as u64, remote_port as u16, &host_str, local_port as u16,
+    ) {
         Ok(port) => port as jint,
         Err(e) => {
             log::error!("Remote forward failed: {}", e);
@@ -380,7 +295,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddRem
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStreamRead(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
     buf: JByteArray,
@@ -388,11 +303,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
     let handle = unsafe { &mut *(handle as *mut MeshStreamHandle) };
     let mut data = vec![0u8; env.get_array_length(&buf).unwrap() as usize];
     
-    let res = handle.runtime_handle.block_on(async {
-        handle.stream.read(&mut data).await
-    });
-
-    match res {
+    match crate::mesh_common::stream_read(handle, &mut data) {
         Ok(n) => {
             let byte_data: Vec<i8> = data[..n].iter().map(|&b| b as i8).collect();
             env.set_byte_array_region(&buf, 0, &byte_data).unwrap();
@@ -412,9 +323,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
     let handle = unsafe { &mut *(handle as *mut MeshStreamHandle) };
     let bytes = env.convert_byte_array(&data).unwrap();
     
-    let _ = handle.runtime_handle.block_on(async {
-        handle.stream.write_all(&bytes).await
-    });
+    let _ = crate::mesh_common::stream_write(handle, &bytes);
 }
 
 #[unsafe(no_mangle)]
@@ -426,5 +335,28 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
     if handle != 0 {
         let _ = unsafe { Box::from_raw(handle as *mut MeshStreamHandle) };
         // Dropping closes the stream
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_costinm_dmesh_MeshNode_nativeCreateTun(
+    mut _env: JNIEnv,
+    _class: JClass,
+    fd: jint,
+) -> jlong {
+    log::info!("nativeCreateTun called with fd: {}", fd);
+    
+    // Create the MeshTun wrapper from the Android VPN file descriptor
+    match unsafe { mesh_tun::MeshTun::from_fd(fd) } {
+        Ok(_tun) => {
+            // For now, we return a pointer/handle. Ideally we would box it and run it.
+            // Returning the fd as a placeholder success
+            fd as jlong
+        }
+        Err(e) => {
+            log::error!("Failed to create MeshTun from fd: {}", e);
+            -1
+        }
     }
 }

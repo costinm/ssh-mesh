@@ -610,10 +610,15 @@ impl SshClientManager {
 
         let actual_port = {
             let mut session = conn.session.lock().await;
-            session
+            let port = session
                 .tcpip_forward("127.0.0.1", remote_port as u32)
                 .await
-                .context("tcpip_forward failed")?
+                .context("tcpip_forward failed")?;
+            if port == 0 && remote_port != 0 {
+                remote_port as u32
+            } else {
+                port
+            }
         };
 
         let mut forwards = conn.forwards.lock().await;

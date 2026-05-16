@@ -4,6 +4,7 @@ pub mod jobs;
 pub mod local_trace;
 pub mod protocol;
 pub mod server;
+pub mod tun;
 
 use axum::serve;
 use serde::{Deserialize, Serialize};
