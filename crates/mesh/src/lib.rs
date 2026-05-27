@@ -15,16 +15,20 @@ use tracing::{error, info};
 /// Configuration for a mesh application
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MeshConfig {
-    /// Optional TCP port for HTTP server
-    pub http_port: Option<u16>,
-    /// Optional UDS path for HTTP/H2C server
-    pub http_uds_path: Option<String>,
     /// Authorization config for UDS connections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<auth::AuthConfig>,
+    /// Optional TCP port for HTTP server
+    /// By default only a default control UDS socket is exposed, accepting JSON
+    /// messages - as well as 'inetd' and 'xinetd' modes for use with mesh-init or
+    /// other compatible 'activation' services.
+    /// If specified, this will configure H2C server on this port.
+    pub http_port: Option<u16>,
+    /// Optional UDS path for HTTP/H2C server
+    pub http_uds_path: Option<String>,
 }
 
-/// A handler trait or structure for incoming generic JSON lines.
+/// A handler trait or structure for incoming lines-based protocol, usually json.
 /// Typically implemented by the user of the library.
 #[async_trait::async_trait]
 pub trait LineHandler: Send + Sync + 'static {
@@ -34,6 +38,7 @@ pub trait LineHandler: Send + Sync + 'static {
 /// Mesh application builder and runner
 pub struct MeshApp {
     config: MeshConfig,
+    /// Optional Axum router for HTTP/H2C server. 
     router: Option<axum::Router>,
 }
 

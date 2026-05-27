@@ -61,7 +61,7 @@ async fn test_tcp_proxy_with_method(method: Method) -> Result<()> {
         .build(https_connector);
 
     let uri = format!(
-        "http://127.0.0.1:{}/_tcp/127.0.0.1/{}",
+        "http://127.0.0.1:{}/_m/_tcp/127.0.0.1/{}",
         http_port, echo_port
     );
 

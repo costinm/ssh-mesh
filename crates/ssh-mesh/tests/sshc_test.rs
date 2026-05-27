@@ -154,7 +154,7 @@ async fn test_sshc_local_forwarding() -> Result<()> {
 async fn test_sshc_disconnect_not_found() -> Result<()> {
     // We still need a valid key to construct the manager, even if we don't connect.
     let key =
-        russh::keys::PrivateKey::random(&mut rand::rngs::OsRng, russh::keys::Algorithm::Ed25519)
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
             .unwrap();
     let manager = Arc::new(SshClientManager::new(key, Vec::new(), None, None));
     let result = manager.disconnect(999).await;

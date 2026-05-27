@@ -1,57 +1,29 @@
 #!/bin/bash
 set -e
 
-# Configuration
-TARGET_DIR="target"
-JAVA_OUT_DIR="$TARGET_DIR/java-classes"
-JNI_LIB_NAME="libdmesh.so"
-HOST_TARGET="x86_64-unknown-linux-gnu"
-MUSL_TARGET="x86_64-unknown-linux-musl"
+# JNI integration test — builds the JAR + native library, then runs MainTest.
+#
+# Layout created under target/opt/ssh-mesh/:
+#   bin/dmesh.jar
+#   lib/<arch>/libdmesh.so
 
-# 1. Build the JNI library for the host (GNU)
-echo "Building JNI library for host (GNU)..."
-cargo build -p dmesh --target "$HOST_TARGET" --release
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+BASE_DIR=$(dirname "$SCRIPT_DIR")
+cd "$BASE_DIR"
 
-# 2. Build for musl if requested/available
-if [[ "$1" == "--musl" ]]; then
-    if command -v musl-gcc &> /dev/null; then
-        echo "Building JNI library for musl..."
-        cargo build -p dmesh --target "$MUSL_TARGET" --release
-    else
-        echo "Warning: musl-gcc not found. Skipping musl build."
-    fi
-fi
+DEST="target/opt/ssh-mesh"
 
-# 3. Find android.jar for compilation (needed for some classes potentially)
-# Although for basic JNI test we might not need it if we only use standard Java APIs.
-# However, Rust.java might use some android-isms if it's shared.
-# Let's try compiling without it first, or find it if possible.
-ANDROID_JAR=$(find /opt/Android/Sdk/platforms -name "android.jar" | sort -V | tail -n 1 2>/dev/null || echo "")
+echo "=== Building JNI JAR + native library ==="
+source scripts/build.sh
+jni "$DEST"
 
-# 4. Compile Java classes
-echo "Compiling Java classes..."
-mkdir -p "$JAVA_OUT_DIR"
-SRC_DIR="java/rust/src/main/java"
-find "$SRC_DIR" -name "*.java" > "$TARGET_DIR/java_sources.txt"
+echo ""
+echo "=== Running MainTest ==="
+java -jar "$DEST/bin/dmesh.jar" --help  # Quick smoke test
 
-if [ -n "$ANDROID_JAR" ]; then
-    javac -d "$JAVA_OUT_DIR" -cp "$ANDROID_JAR" @"$TARGET_DIR/java_sources.txt"
-else
-    javac -d "$JAVA_OUT_DIR" @"$TARGET_DIR/java_sources.txt"
-fi
+# For the full integration test, run MainTest directly from the JAR's classpath
+# since MainTest isn't the Main-Class in the manifest.
+java -cp "$DEST/bin/dmesh.jar" com.github.costinm.dmeshnative.MainTest
 
-# 5. Run the test
-echo "Running JNI test (amd64)..."
-
-# Determine which library to use
-LIB_PATH="$TARGET_DIR/$HOST_TARGET/release"
-if [[ "$1" == "--musl" && -f "$TARGET_DIR/$MUSL_TARGET/release/$JNI_LIB_NAME" ]]; then
-    LIB_PATH="$TARGET_DIR/$MUSL_TARGET/release"
-fi
-
-echo "Using library from: $LIB_PATH"
-
-# Set LD_LIBRARY_PATH just in case, though java.library.path should be enough for System.loadLibrary
-export LD_LIBRARY_PATH="$LIB_PATH:$LD_LIBRARY_PATH"
-
-java -Djava.library.path="$LIB_PATH" -cp "$JAVA_OUT_DIR" com.github.costinm.dmeshnative.Main
+echo ""
+echo "=== All JNI tests passed ==="

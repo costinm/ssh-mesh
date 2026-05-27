@@ -4843,6 +4843,7 @@ version = "0.7.0-rc.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7011527e7cb07beea761652129ded405e47fdc153eb83dcc2dcefab39b50b08a"
 dependencies = [
+ "ed25519-dalek",
  "p256",
  "rand_core 0.10.1",
  "rsa",

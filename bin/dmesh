@@ -18,14 +18,17 @@ if [ "$DMESH_LANG" == "py" ]; then
         exec python3 -m dmesh "$@"
     fi
 elif [ "$DMESH_LANG" == "java" ]; then
-    if [ -d "$BASE_DIR/java/classes" ]; then
-        # Installed via build.sh install
-        exec java -Djava.library.path="$BASE_DIR/lib" -cp "$BASE_DIR/java/classes" com.github.costinm.dmeshnative.Main "$@"
+    # Prefer installed JAR (production layout: bin/dmesh.jar + lib/<arch>/libdmesh.so)
+    if [ -f "$BASE_DIR/bin/dmesh.jar" ]; then
+        exec java -jar "$BASE_DIR/bin/dmesh.jar" "$@"
+    elif [ -f "$BASE_DIR/target/opt/ssh-mesh/bin/dmesh.jar" ]; then
+        # Built via: scripts/build.sh jni
+        exec java -jar "$BASE_DIR/target/opt/ssh-mesh/bin/dmesh.jar" "$@"
     else
-        # In git repo
-        mkdir -p "$BASE_DIR/target/classes"
-        javac -d "$BASE_DIR/target/classes" $(find "$BASE_DIR/java/rust/src/main/java" -name "*.java")
-        exec java -Djava.library.path="$BASE_DIR/target/x86_64-unknown-linux-musl/debug:$BASE_DIR/target/release" -cp "$BASE_DIR/target/classes" com.github.costinm.dmeshnative.Main "$@"
+        # Local dev fallback: compile from source, load .so from target/
+        mkdir -p "$BASE_DIR/target/java/classes"
+        javac -d "$BASE_DIR/target/java/classes" $(find "$BASE_DIR/java/rust/src/main/java" -name "*.java")
+        exec java -cp "$BASE_DIR/target/java/classes" com.github.costinm.dmeshnative.Main "$@"
     fi
 else 
     if [ -x "$SCRIPT_DIR/dmesh_rs" ]; then

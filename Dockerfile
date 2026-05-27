@@ -33,8 +33,8 @@ COPY crates ./crates
 RUN cargo build --target x86_64-unknown-linux-musl --release -p pmond
 RUN cargo build --features pmon --target x86_64-unknown-linux-musl --release -p ssh-mesh
 
-# Build otel with glibc
-RUN cargo build --release -p otel
+# Build traceweb with glibc
+RUN cargo build --release -p traceweb
 
 RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
     cargo build --features pmon --target aarch64-unknown-linux-musl --release -p ssh-mesh
@@ -96,8 +96,9 @@ FROM scratch as bin
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/h2t .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/meshkeys .
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/sshmc .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond .
-COPY --from=build /src/target/release/otel .
+COPY --from=build /src/target/release/traceweb .
 
 COPY --from=build /src/target/aarch64-unknown-linux-musl/release/pmond aarch64/
 COPY --from=build /src/target/aarch64-unknown-linux-musl/release/ssh-mesh aarch64/
@@ -109,7 +110,7 @@ FROM nicolaka/netshoot
 # Copy the statically linked binaries from the build stage
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh /usr/local/bin/ssh-mesh
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond /usr/local/bin/pmond
-COPY --from=build /src/target/release/otel /usr/local/bin/otel
+COPY --from=build /src/target/release/traceweb /usr/local/bin/traceweb
 
 # Use ssh-mesh as the default entrypoint
 ENTRYPOINT ["/usr/local/bin/ssh-mesh"]

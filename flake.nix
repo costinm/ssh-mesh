@@ -33,7 +33,7 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
         # Common source filtering
-        src = craneLib.cleanCargoSource ./.;
+        src = ./.;
 
         # Pre-fetch Swagger UI zip for utoipa-swagger-ui (no network in Nix sandbox)
         swaggerUiZip = pkgs.fetchurl {
@@ -71,7 +71,7 @@
         # Build workspace dependencies first (for caching)
         cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
           pname = "ssh-mesh-deps";
-          cargoExtraArgs = "--features pmon";
+          cargoExtraArgs = "--features pmon -p ssh-mesh -p pmond";
         });
 
         # ssh-mesh binary — the primary binary
@@ -109,16 +109,16 @@
           cargoExtraArgs = "-p ssh-mesh --bin sshmc";
         });
 
-        # otel binary
-        otel = craneLib.buildPackage (commonArgs // {
+        # traceweb binary
+        traceweb = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          pname = "otel";
-          cargoExtraArgs = "-p otel";
+          pname = "traceweb";
+          cargoExtraArgs = "-p traceweb";
         });
       in
       {
         packages = {
-          inherit ssh-mesh pmond h2t meshkeys sshmc otel;
+          inherit ssh-mesh pmond h2t meshkeys sshmc traceweb;
           default = ssh-mesh;
         };
 

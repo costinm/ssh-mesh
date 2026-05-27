@@ -5,13 +5,12 @@ async fn test_certificate_validation_logic() -> Result<()> {
     // This test verifies the lower-level validation function works as expected
     // independent of the full connection flow, which might depend on server support.
 
-    use ssh_key::rand_core::OsRng;
     use ssh_mesh::auth::validate_certificate;
     use std::sync::Arc;
 
     // 1. Generate CA
     let ca_key = ssh_key::PrivateKey::random(
-        &mut OsRng,
+        &mut rand::rng(),
         ssh_key::Algorithm::Ecdsa {
             curve: ssh_key::EcdsaCurve::NistP256,
         },
@@ -22,7 +21,7 @@ async fn test_certificate_validation_logic() -> Result<()> {
 
     // 2. Generate Host Key
     let host_key = ssh_key::PrivateKey::random(
-        &mut OsRng,
+        &mut rand::rng(),
         ssh_key::Algorithm::Ecdsa {
             curve: ssh_key::EcdsaCurve::NistP256,
         },
@@ -32,7 +31,7 @@ async fn test_certificate_validation_logic() -> Result<()> {
 
     // 3. Sign Host Key to create Certificate
     let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
-        &mut OsRng,
+        &mut rand::rng(),
         host_pub.key_data().clone(),
         0,
         2000000000 + 10000,

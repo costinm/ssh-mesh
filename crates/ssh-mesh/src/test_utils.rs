@@ -1,6 +1,7 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use russh::keys::PublicKeyBase64;
+use ssh_key::LineEnding;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -56,6 +57,14 @@ pub async fn setup_test_environment(
     let client_key_path = base_dir.join("id_ecdsa");
 
     let key = crate::auth::load_or_generate_keys_save(&base_dir);
+
+    // Re-save the key in OpenSSH format so the system SSH client can read it.
+    // load_or_generate_keys_save saves in PKCS#8 PEM which OpenSSH client doesn't support.
+    let pem_data = std::fs::read_to_string(&client_key_path)?;
+    if let Ok(ssh_key) = crate::auth::ssh_key_from_pkcs8_pem(&pem_data) {
+        let openssh_pem = ssh_key.to_openssh(LineEnding::LF)?;
+        std::fs::write(&client_key_path, openssh_pem.as_bytes())?;
+    }
 
     if temp_dir.is_some() {
         // For temporary test setups, we need to populate authorized_keys

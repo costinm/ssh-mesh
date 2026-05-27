@@ -1,0 +1,49 @@
+[package]
+name = "mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP (Model Context Protocol) server implementation for pmond"
+
+[[bin]]
+name = "mcp-pmond"
+path = "src/main.rs"
+
+[dependencies]
+# MCP protocol implementation
+rmcp = { version = "0.13.0", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+    "schemars"
+]}
+
+# Core pmond functionality (uses only public API)
+pmond = { path = "../pmond" }
+mesh = { path = "../mesh" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = "0.8"
+
+# Async runtime
+tokio = { version = "1", features = ["net", "sync", "io-util", "rt", "macros"] }
+
+# Logging
+tracing = "0.1"
+log = "0.4"
+
+# Unix socket support
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+
+[dependencies.clap]
+version = "4.5"
+features = ["derive"]
+
+[dependencies.tracing-subscriber]
+version = "0.3"
+features = ["env-filter"]
