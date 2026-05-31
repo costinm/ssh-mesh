@@ -6,16 +6,18 @@ use nix::unistd::{dup2, setsid};
 
 use openpty::openpty;
 
-use russh::keys::{HashAlg, PublicKey, PublicKeyBase64};
+use russh::keys::{Certificate, HashAlg, PublicKey, PublicKeyBase64};
 use russh::{ChannelId, MethodKind, server};
 
 use std::collections::HashMap;
+use std::io::{IoSlice, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use hyper::body::Bytes;
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
@@ -52,6 +54,10 @@ pub struct SshHandler {
     /// stored as a filesystem-safe hex string (e.g. "SHA256:abc..."
     /// with non-alphanum replaced). Empty until auth succeeds.
     peer_key_sha: String,
+
+    authenticated_with_certificate: bool,
+    cert_user: Option<String>,
+    terminal_user: Option<String>,
 }
 
 const DEBUG_PTY: bool = false;
@@ -72,6 +78,15 @@ struct ChannelSession {
     // Process handling for PTY/shell sessions
     process: Option<tokio::process::Child>,
     pty_master: Option<std::fs::File>,
+}
+
+#[derive(Clone, Debug)]
+struct MeshInitTerminal {
+    socket_path: String,
+    user: String,
+    home: String,
+    uid: u32,
+    gid: Option<u32>,
 }
 
 /// Build a `Command` for the given program and arguments.
@@ -108,6 +123,9 @@ impl SshHandler {
             comment: String::new(),
             options: None,
             peer_key_sha: String::new(),
+            authenticated_with_certificate: false,
+            cert_user: None,
+            terminal_user: None,
         }
     }
 
@@ -127,6 +145,7 @@ impl SshHandler {
         sessions: Arc<Mutex<HashMap<ChannelId, ChannelSession>>>,
         channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
         session: &mut server::Session,
+        mesh_init_terminal: Option<MeshInitTerminal>,
     ) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send {
         let session_handle = session.handle();
         let mut cmd = build_command(&command);
@@ -175,39 +194,55 @@ impl SshHandler {
                 let slave_fd = pty.1.as_raw_fd();
                 let slave_file = &pty.1;
 
-                cmd.env("TERM", "xterm-256color");
-                cmd.stdin(
-                    slave_file
-                        .try_clone()
-                        .map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?,
-                );
-                cmd.stdout(
-                    slave_file
-                        .try_clone()
-                        .map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?,
-                );
-                cmd.stderr(
-                    slave_file
-                        .try_clone()
-                        .map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?,
-                );
+                let delegated = if command.is_none() {
+                    if let Some(terminal) = mesh_init_terminal {
+                        let slave_for_mesh_init = slave_file
+                            .try_clone()
+                            .map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?;
+                        send_terminal_to_mesh_init(terminal, slave_for_mesh_init).await?;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
 
-                // Ensure the child becomes session leader and has controlling terminal.
-                unsafe {
-                    cmd.pre_exec(move || {
-                        setsid().map_err(std::io::Error::other)?;
-                        if ioctl(slave_fd, TIOCSCTTY, 0) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        dup2(slave_fd, 0).map_err(std::io::Error::other)?;
-                        dup2(slave_fd, 1).map_err(std::io::Error::other)?;
-                        dup2(slave_fd, 2).map_err(std::io::Error::other)?;
-                        Ok(())
-                    });
+                if !delegated {
+                    cmd.env("TERM", "xterm-256color");
+                    cmd.stdin(
+                        slave_file
+                            .try_clone()
+                            .map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?,
+                    );
+                    cmd.stdout(
+                        slave_file
+                            .try_clone()
+                            .map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?,
+                    );
+                    cmd.stderr(
+                        slave_file
+                            .try_clone()
+                            .map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?,
+                    );
+
+                    // Ensure the child becomes session leader and has controlling terminal.
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            setsid().map_err(std::io::Error::other)?;
+                            if ioctl(slave_fd, TIOCSCTTY, 0) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            dup2(slave_fd, 0).map_err(std::io::Error::other)?;
+                            dup2(slave_fd, 1).map_err(std::io::Error::other)?;
+                            dup2(slave_fd, 2).map_err(std::io::Error::other)?;
+                            Ok(())
+                        });
+                    }
+
+                    let child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
+                    channel_session.process = Some(child);
                 }
-
-                let child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
-                channel_session.process = Some(child);
 
                 // Set up PTY I/O forwarding
                 let master = channel_session.pty_master.as_ref().unwrap();
@@ -241,8 +276,13 @@ impl SshHandler {
                 // PTY master -> SSH channel
                 let sh = session_handle.clone();
                 let ch = channel_id;
+                let close_on_pty_eof = delegated;
                 tokio::spawn(async move {
-                    crate::utils::pipe_read_to_ssh(master_read, sh, ch, "PTY to SSH").await;
+                    crate::utils::pipe_read_to_ssh(master_read, sh.clone(), ch, "PTY to SSH").await;
+                    if close_on_pty_eof {
+                        let _ = sh.eof(ch).await;
+                        let _ = sh.close(ch).await;
+                    }
                 });
 
                 // SSH channel -> PTY master
@@ -302,7 +342,8 @@ impl SshHandler {
                 });
             }
 
-            // Monitor child process for exit status
+            // Monitor child process for exit status. Delegated mesh-init PTYs do
+            // not have a local child handle; EOF on the PTY closes the channel.
             let sessions_for_exit = sessions.clone();
             let tw_exit = channel_writers.clone();
             let sh_exit = session_handle.clone();
@@ -452,6 +493,109 @@ impl SshHandler {
     }
 }
 
+fn mesh_init_socket_path() -> String {
+    if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
+        return path;
+    }
+    if unsafe { libc::getuid() } == 0 {
+        "/run/mesh-init/control.sock".to_string()
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/mesh-init/control.sock", home)
+    }
+}
+
+fn user_part(identity: &str) -> String {
+    identity
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or(identity)
+        .to_string()
+}
+
+fn safe_user_part(identity: &str) -> Option<String> {
+    let user = user_part(identity);
+    if user.is_empty()
+        || user == "."
+        || user == ".."
+        || user.contains('/')
+        || user.contains('\\')
+        || user.contains('\0')
+    {
+        None
+    } else {
+        Some(user)
+    }
+}
+
+fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
+    let home = format!("/home/{}", user);
+    let metadata = std::fs::metadata(&home).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    use std::os::unix::fs::MetadataExt;
+    Some(MeshInitTerminal {
+        socket_path: mesh_init_socket_path(),
+        user: user.to_string(),
+        home,
+        uid: metadata.uid(),
+        gid: Some(metadata.gid()),
+    })
+}
+
+async fn send_terminal_to_mesh_init(
+    terminal: MeshInitTerminal,
+    slave: std::fs::File,
+) -> Result<(), anyhow::Error> {
+    tokio::task::spawn_blocking(move || send_terminal_to_mesh_init_blocking(terminal, slave))
+        .await
+        .map_err(|e| anyhow::anyhow!("mesh-init terminal task failed: {}", e))?
+}
+
+fn send_terminal_to_mesh_init_blocking(
+    terminal: MeshInitTerminal,
+    slave: std::fs::File,
+) -> Result<(), anyhow::Error> {
+    let mut stream = std::os::unix::net::UnixStream::connect(&terminal.socket_path)?;
+    let request = mesh::protocol::Request::StartTerminal {
+        name: terminal.user.clone(),
+        home: terminal.home.clone(),
+        uid: terminal.uid,
+        gid: terminal.gid,
+        env: std::collections::HashMap::from([
+            ("HOME".to_string(), terminal.home),
+            ("USER".to_string(), terminal.user.clone()),
+            ("LOGNAME".to_string(), terminal.user),
+            ("TERM".to_string(), "xterm-256color".to_string()),
+        ]),
+    };
+    let line = serde_json::to_string(&request)?;
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let iov = [IoSlice::new(b"F")];
+    let fds = [slave.as_raw_fd()];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
+    sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let response: mesh::protocol::Response = serde_json::from_str(response.trim())?;
+    if response.success {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "mesh-init rejected terminal: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        ))
+    }
+}
+
 /// Handler deals with one SSH connection, after crypto and
 /// low level networking.
 impl server::Handler for SshHandler {
@@ -482,8 +626,10 @@ impl server::Handler for SshHandler {
     ) -> impl std::future::Future<Output = Result<server::Auth, Self::Error>> + Send {
         let authorized_keys = self.server.authorized_keys.clone();
         let ca_keys = self.server.ca_keys.clone();
+        let config_dir = self.server.config_dir();
 
         let user_str = user.to_string();
+        let user_part = safe_user_part(&user_str);
 
         let connected_clients = self.server.connected_clients.clone();
         let handler_id = self.id;
@@ -498,10 +644,11 @@ impl server::Handler for SshHandler {
         let key_type_name = algorithm.as_str();
 
         let key_openssh = format!("{} {}", key_type_name, key_base64);
+        let is_certificate = key_openssh.contains("-cert-v01@openssh.com");
 
         async move {
             // Detect if this is a certificate or regular key
-            let auth_result = if key_openssh.contains("-cert-v01@openssh.com") {
+            let auth_result = if is_certificate {
                 info!(
                     "Certificate auth attempt for user: {} {} {}",
                     user, self.id, &key_openssh
@@ -514,7 +661,24 @@ impl server::Handler for SshHandler {
                     user, self.id, &key_openssh, &keyfp,
                 );
 
-                crate::auth::validate_public_key(&user_str, &key_openssh, &authorized_keys).await
+                let mut result =
+                    crate::auth::validate_public_key(&user_str, &key_openssh, &authorized_keys)
+                        .await?;
+                if !matches!(result.status, server::Auth::Accept)
+                    && let Some(ref safe_user) = user_part
+                {
+                    let user_keys_path = config_dir
+                        .join("users")
+                        .join(safe_user)
+                        .join("authorized_keys");
+                    result = crate::auth::validate_public_key_file(
+                        &user_str,
+                        &key_openssh,
+                        &user_keys_path,
+                    )
+                    .await?;
+                }
+                Ok(result)
             };
 
             if let Ok(ref auth_res) = auth_result {
@@ -549,9 +713,81 @@ impl server::Handler for SshHandler {
                         .chars()
                         .filter(|c| c.is_ascii_alphanumeric())
                         .collect();
+                    self.authenticated_with_certificate = is_certificate;
+                    if is_certificate {
+                        self.cert_user = user_part.clone();
+                    }
+                    self.terminal_user = user_part.clone();
                 }
             } else {
                 error!("Auth failed {}", self.id)
+            }
+
+            auth_result.map(|r| r.status)
+        }
+    }
+
+    #[instrument(skip(self, certificate), fields(user = %user, key_id = %certificate.key_id()))]
+    fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &Certificate,
+    ) -> impl std::future::Future<Output = Result<server::Auth, Self::Error>> + Send {
+        let ca_keys = self.server.ca_keys.clone();
+        let user_str = user.to_string();
+        let user_part = safe_user_part(&user_str);
+        let connected_clients = self.server.connected_clients.clone();
+        let handler_id = self.id;
+        self.user = user_str.clone();
+        let cert_openssh = certificate.to_openssh();
+
+        async move {
+            let auth_result = match cert_openssh {
+                Ok(cert_openssh) => {
+                    info!(
+                        "Certificate auth attempt for user: {} {} {}",
+                        user, self.id, cert_openssh
+                    );
+                    crate::auth::validate_certificate(&cert_openssh, &user_str, &ca_keys).await
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "failed to serialize SSH certificate: {}",
+                    e
+                )),
+            };
+
+            if let Ok(ref auth_res) = auth_result {
+                if let server::Auth::Accept = auth_res.status {
+                    let mut clients = connected_clients.lock().await;
+                    clients.insert(
+                        handler_id,
+                        ConnectedClientInfo {
+                            id: handler_id,
+                            user: user_str.clone(),
+                            comment: auth_res.comment.clone(),
+                            options: auth_res.options.clone(),
+                            remote_forward_listeners: Vec::new(),
+                            connected_at: SystemTime::now(),
+                        },
+                    );
+                    self.comment = auth_res.comment.clone();
+                    self.options = auth_res.options.clone();
+                    self.authenticated_with_certificate = true;
+                    self.cert_user = user_part.clone();
+                    self.terminal_user = user_part.clone();
+
+                    let listeners = self.server.listeners.clone();
+                    let id_val = handler_id;
+                    let u_str = user_str.clone();
+                    tokio::spawn(async move {
+                        let listeners = listeners.lock().await;
+                        for l in listeners.iter() {
+                            l.on_ssh_connection(id_val, &u_str);
+                        }
+                    });
+                }
+            } else {
+                error!("Certificate auth failed {}", self.id)
             }
 
             auth_result.map(|r| r.status)
@@ -656,17 +892,17 @@ impl server::Handler for SshHandler {
             // Handle "local" host - trigger callback
             if host == "local" {
                 let (s1, s2) = tokio::io::duplex(64 * 1024);
-                
+
                 // Notify listeners
                 let listeners = me.server.listeners.clone();
                 let client_id = handler_id;
                 let port_val = port as u16;
-                    tokio::spawn(async move {
-                        let listeners = listeners.lock().await;
-                        if let Some(l) = listeners.first() {
-                            l.on_stream(client_id, "local", port_val, s1);
-                        }
-                    });
+                tokio::spawn(async move {
+                    let listeners = listeners.lock().await;
+                    if let Some(l) = listeners.first() {
+                        l.on_stream(client_id, "local", port_val, s1);
+                    }
+                });
 
                 // Bridge s2 to SSH channel
                 let (reader, writer) = tokio::io::split(s2);
@@ -679,7 +915,13 @@ impl server::Handler for SshHandler {
                 let session_handle_clone = session_handle.clone();
                 let channel_writers_clone = me.channel_writers.clone();
                 tokio::spawn(async move {
-                    crate::utils::pipe_read_to_ssh(reader, session_handle_clone, channel_id, "Local Stream to SSH").await;
+                    crate::utils::pipe_read_to_ssh(
+                        reader,
+                        session_handle_clone,
+                        channel_id,
+                        "Local Stream to SSH",
+                    )
+                    .await;
                     let mut writers = channel_writers_clone.lock().await;
                     writers.remove(&channel_id);
                 });
@@ -816,7 +1058,9 @@ impl server::Handler for SshHandler {
                     data_vec.len(),
                     channel_id
                 );
-                let _ = session_handle.data(channel_id, bytes::Bytes::from(data_vec)).await;
+                let _ = session_handle
+                    .data(channel_id, bytes::Bytes::from(data_vec))
+                    .await;
             }
             Ok(())
         }
@@ -1007,20 +1251,20 @@ impl server::Handler for SshHandler {
         async move {
             // If the path is /tmp/<name>.sock where <name> is a 9p socket,
             // rewrite it into a per-peer directory and auto-mount.
-            let (actual_socket_path, mount_dir) =
-                if socket_path_owned.starts_with("/tmp/") && socket_path_owned.ends_with("/9p.sock")
-                {
-                    if peer_key_sha.is_empty() {
-                        error!("Cannot create per-peer 9p directory: peer key not available");
-                        return Ok(false);
-                    }
-                    let peer_dir = format!("/tmp/{}", peer_key_sha);
-                    let sock = format!("{}/9p.sock", peer_dir);
-                    let rootfs = format!("{}/rootfs", peer_dir);
-                    (sock, Some(rootfs))
-                } else {
-                    (socket_path_owned.clone(), None)
-                };
+            let (actual_socket_path, mount_dir) = if socket_path_owned.starts_with("/tmp/")
+                && socket_path_owned.ends_with("/9p.sock")
+            {
+                if peer_key_sha.is_empty() {
+                    error!("Cannot create per-peer 9p directory: peer key not available");
+                    return Ok(false);
+                }
+                let peer_dir = format!("/tmp/{}", peer_key_sha);
+                let sock = format!("{}/9p.sock", peer_dir);
+                let rootfs = format!("{}/rootfs", peer_dir);
+                (sock, Some(rootfs))
+            } else {
+                (socket_path_owned.clone(), None)
+            };
 
             // Remove stale socket if present
             let _ = tokio::fs::remove_file(&actual_socket_path).await;
@@ -1083,21 +1327,14 @@ impl server::Handler for SshHandler {
                         }
                         Ok(output) => {
                             let stderr = String::from_utf8_lossy(&output.stderr);
-                            error!(
-                                "Failed to mount 9p at {}: {}",
-                                rootfs_dir,
-                                stderr.trim()
-                            );
+                            error!("Failed to mount 9p at {}: {}", rootfs_dir, stderr.trim());
                         }
                         Err(e) => {
                             error!("Failed to run mount command: {}", e);
                         }
                     }
                 } else {
-                    info!(
-                        "Not running as root, skipping 9p mount for {}",
-                        rootfs_dir
-                    );
+                    info!("Not running as root, skipping 9p mount for {}", rootfs_dir);
                 }
             }
 
@@ -1207,7 +1444,9 @@ impl server::Handler for SshHandler {
                     }
                 }
                 // Cleanup: unmount 9p if we mounted it
-                if let (Some(rootfs_dir), true) = (mount_dir_cleanup.as_ref(), nix::unistd::getuid().is_root()) {
+                if let (Some(rootfs_dir), true) =
+                    (mount_dir_cleanup.as_ref(), nix::unistd::getuid().is_root())
+                {
                     info!("Unmounting 9p at {}", rootfs_dir);
                     let _ = tokio::process::Command::new("umount")
                         .arg(rootfs_dir)
@@ -1344,6 +1583,7 @@ impl server::Handler for SshHandler {
             self.sessions.clone(),
             self.channel_writers.clone(),
             session,
+            None,
         )
     }
 
@@ -1355,6 +1595,10 @@ impl server::Handler for SshHandler {
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         info!("Shell request for channel {:?}", channel);
         debug!("SSH handler ID: {}", self.id);
+        let mesh_init_terminal = self
+            .terminal_user
+            .as_deref()
+            .and_then(cert_terminal_for_user);
 
         Self::spawn_command(
             None,
@@ -1362,6 +1606,7 @@ impl server::Handler for SshHandler {
             self.sessions.clone(),
             self.channel_writers.clone(),
             session,
+            mesh_init_terminal,
         )
     }
 

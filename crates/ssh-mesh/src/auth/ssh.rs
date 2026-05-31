@@ -24,11 +24,11 @@ pub struct AuthorizedKeyEntry {
     pub comment: Option<String>,
 }
 
-/// Validate a regular public key against authorized_keys
-/// Using the authorized keys allow any user to be impersonated - this
-/// is the node admin/owner.
+/// Validate a regular public key against authorized_keys.
 ///
-/// All other users need to use certificate.
+/// Node-level authorized keys are administrative keys and may authenticate as
+/// any SSH username. Per-user keys are loaded from the ssh-mesh config tree and
+/// only authenticate that user.
 pub async fn validate_public_key(
     user: &str,
     key_openssh: &str,
@@ -50,7 +50,8 @@ pub async fn validate_public_key(
                 matched = true;
             }
         } else if let Some(auth_fp) = &entry.fingerprint
-            && auth_fp == &incoming_fp {
+            && auth_fp == &incoming_fp
+        {
             matched = true;
         }
 
@@ -74,6 +75,29 @@ pub async fn validate_public_key(
         options: None,
         user: String::new(),
     })
+}
+
+/// Validate a regular public key against a concrete authorized_keys path.
+pub async fn validate_public_key_file(
+    user: &str,
+    key_openssh: &str,
+    path: &Path,
+) -> Result<SshAuthResult> {
+    if !path.exists() {
+        return Ok(SshAuthResult {
+            status: server::Auth::Reject {
+                proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
+                partial_success: false,
+            },
+            comment: String::new(),
+            options: None,
+            user: String::new(),
+        });
+    }
+
+    let content = fs::read_to_string(path)?;
+    let authorized_keys = parse_authorized_keys_content(&content)?;
+    validate_public_key(user, key_openssh, &authorized_keys).await
 }
 
 /// Validate a CA-signed certificate
@@ -406,7 +430,6 @@ pub fn sign_node(cadir: &Path, nodedir: &Path, name: &str, domain: &str) -> Resu
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_parse_authorized_keys() {
         let key = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBICtPKa3mXZss+k6LqtiNOQ3TbJFqLvjsvZGubtILlkV2Kz3HjO9+fghwCT/bb1R2SrvqHWWEj+QH6G4+ogPns=";
@@ -424,7 +447,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_certificate() {
-        let ca_key = ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let ca_key =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
         let user_key =
             ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
@@ -453,5 +477,31 @@ mod tests {
         assert!(matches!(res.status, server::Auth::Accept));
         assert_eq!(res.comment, "test-cert");
         assert!(res.options.as_ref().unwrap().contains("force-command=ls"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_public_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_dir = dir.path().join("users").join("alice");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        let key =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let public_key = key.public_key().to_openssh().unwrap();
+        std::fs::write(user_dir.join("authorized_keys"), &public_key).unwrap();
+
+        let res = validate_public_key_file("alice", &public_key, &user_dir.join("authorized_keys"))
+            .await
+            .unwrap();
+        assert!(matches!(res.status, server::Auth::Accept));
+
+        let res = validate_public_key_file(
+            "alice",
+            &public_key,
+            &dir.path().join("missing").join("authorized_keys"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res.status, server::Auth::Reject { .. }));
     }
 }

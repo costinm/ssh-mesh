@@ -27,6 +27,21 @@ pub enum Request {
         env: HashMap<String, String>,
     },
 
+    /// Start a terminal session using one passed file descriptor.
+    ///
+    /// The daemon uses a service config named `name` when one exists. Otherwise
+    /// it creates a one-shot dynamic shell rooted at `home` and running as
+    /// `uid`/`gid` when possible.
+    #[serde(rename = "start_terminal")]
+    StartTerminal {
+        name: String,
+        home: String,
+        uid: u32,
+        gid: Option<u32>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+
     /// Stop a running service.
     #[serde(rename = "stop")]
     Stop {
@@ -65,7 +80,10 @@ pub enum Request {
 
     /// Enqueue a work item to an existing job.
     #[serde(rename = "enqueue_work")]
-    EnqueueWork { job_name: String, work: serde_json::Value },
+    EnqueueWork {
+        job_name: String,
+        work: serde_json::Value,
+    },
 
     /// List all scheduled jobs.
     #[serde(rename = "list_jobs")]
@@ -73,13 +91,16 @@ pub enum Request {
 
     /// Mark a job as finished.
     #[serde(rename = "job_finished")]
-    JobFinished { name: String, reschedule: bool, result: Option<serde_json::Value> },
+    JobFinished {
+        name: String,
+        reschedule: bool,
+        result: Option<serde_json::Value>,
+    },
 
     /// Deliver a system event to the job scheduler.
     #[serde(rename = "event")]
     Event { event: serde_json::Value },
 }
-
 
 // ============================================================================
 // Responses
@@ -249,6 +270,7 @@ mod tests {
             r#"{"method":"status","name":null}"#,
             r#"{"method":"shutdown"}"#,
             r#"{"method":"reload"}"#,
+            r#"{"method":"start_terminal","name":"alice","home":"/home/alice","uid":1000,"gid":1000,"env":{}}"#,
         ];
         for json in cases {
             let _req: Request = serde_json::from_str(json).unwrap();

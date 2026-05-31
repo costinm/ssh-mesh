@@ -3,10 +3,15 @@
 //! Accepts JSON-lines requests over a Unix domain socket with peer credential
 //! verification. Only root (UID 0) or the daemon's own UID may connect.
 
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use nix::cmsg_space;
+use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+use std::io::IoSliceMut;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{debug, error, info, warn};
 
@@ -110,13 +115,12 @@ impl ControlServer {
 /// Reads JSON lines from the stream, dispatches each to the daemon,
 /// and writes back JSON responses.
 async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    let mut stream = stream;
     let mut line = String::new();
 
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
+        let bytes_read = read_json_line(&mut stream, &mut line).await?;
         if bytes_read == 0 {
             break; // Client disconnected
         }
@@ -129,7 +133,20 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
         let response = match serde_json::from_str::<Request>(trimmed) {
             Ok(request) => {
                 debug!("Received request: {:?}", request);
-                daemon.handle_request(request).await
+                match request {
+                    request @ Request::StartTerminal { .. } => {
+                        let mut std_stream = stream.into_std()?;
+                        std_stream.set_nonblocking(false)?;
+                        let fd = recv_one_fd(&std_stream)?;
+                        let response = daemon.handle_request_with_fd(request, fd).await;
+                        let response_json = serde_json::to_string(&response)?;
+                        std_stream.write_all(response_json.as_bytes())?;
+                        std_stream.write_all(b"\n")?;
+                        std_stream.flush()?;
+                        return Ok(());
+                    }
+                    request => daemon.handle_request(request).await,
+                }
             }
             Err(e) => {
                 warn!("Invalid request: {}", e);
@@ -138,13 +155,52 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
         };
 
         let response_json = serde_json::to_string(&response)?;
-        writer.write_all(response_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        stream.write_all(response_json.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        stream.flush().await?;
     }
 
     debug!("Control connection closed");
     Ok(())
+}
+
+async fn read_json_line(stream: &mut tokio::net::UnixStream, line: &mut String) -> Result<usize> {
+    let mut bytes_read = 0;
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            return Ok(bytes_read);
+        }
+        bytes_read += n;
+        line.push(byte[0] as char);
+        if byte[0] == b'\n' {
+            return Ok(bytes_read);
+        }
+    }
+}
+
+fn recv_one_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd> {
+    let mut buf = [0u8; 1];
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    let mut cmsgspace = cmsg_space!([std::os::fd::RawFd; 1]);
+    let msg = recvmsg::<()>(
+        stream.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsgspace),
+        MsgFlags::empty(),
+    )?;
+
+    for cmsg in msg.cmsgs()? {
+        if let ControlMessageOwned::ScmRights(fds) = cmsg
+            && let Some(fd) = fds.first()
+        {
+            // SAFETY: recvmsg transferred ownership of this descriptor.
+            return Ok(unsafe { OwnedFd::from_raw_fd(*fd) });
+        }
+    }
+
+    anyhow::bail!("missing passed file descriptor")
 }
 
 // ============================================================================

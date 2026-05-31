@@ -125,6 +125,7 @@ async fn main() -> Result<(), anyhow::Error> {
             Ok(mut c) => {
                 let c: &mut MeshNodeConfig = &mut c;
                 c.base_dir = Some(base_dir.clone());
+                c.config_dir = Some(config_dir.clone());
                 c.ssh_port = Some(ssh_port);
                 c.clone()
             }
@@ -132,6 +133,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 log::warn!("Failed to load config via config-rs, using defaults: {}", e);
                 MeshNodeConfig {
                     base_dir: Some(base_dir.clone()),
+                    config_dir: Some(config_dir.clone()),
                     ssh_port: Some(ssh_port),
                     http_port: if http_port > 0 { Some(http_port) } else { None },
                     sftp_server_path: env::var("SFTP_SERVER_PATH").ok(),
@@ -289,7 +291,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let control_uds = format!("{}/.run/ssh-mesh/control.sock", home);
     let app_clone = app.clone();
     tokio::spawn(async move {
-        if let Err(e) = mesh::server::run_axum_server("ssh-mesh", Some(&control_uds), app_clone).await {
+        if let Err(e) =
+            mesh::server::run_axum_server("ssh-mesh", Some(&control_uds), app_clone).await
+        {
             error!("UDS HTTP server failed: {}", e);
         }
     });

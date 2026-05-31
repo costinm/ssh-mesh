@@ -4,6 +4,7 @@
 //! handles control requests, manages signal handling and zombie reaping.
 
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -123,7 +124,6 @@ impl Daemon {
         self.start_child_manager();
     }
 
-
     /// Spawn the child process manager (zombie reaper + restart loop).
     fn start_child_manager(self: &Arc<Self>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -149,6 +149,9 @@ impl Daemon {
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
             Request::Start { name, args, env } => self.handle_start(&name, args, env),
+            Request::StartTerminal { .. } => {
+                Response::err("start_terminal requires a passed file descriptor")
+            }
             Request::Stop { name, signal } => self.handle_stop(&name, signal).await,
             Request::Freeze { name } => self.handle_freeze(&name),
             Request::Unfreeze { name } => self.handle_unfreeze(&name),
@@ -156,14 +159,28 @@ impl Daemon {
             Request::Shutdown => self.handle_shutdown().await,
             Request::Reload => self.handle_reload(),
             // Job scheduling requests are handled by the JobScheduler, not the main Daemon service manager
-            Request::ScheduleJob { .. } |
-            Request::CancelJob { .. } |
-            Request::EnqueueWork { .. } |
-            Request::ListJobs |
-            Request::JobFinished { .. } |
-            Request::Event { .. } => {
-                Response::err("Job scheduling requests are not handled directly by the daemon socket yet.")
-            }
+            Request::ScheduleJob { .. }
+            | Request::CancelJob { .. }
+            | Request::EnqueueWork { .. }
+            | Request::ListJobs
+            | Request::JobFinished { .. }
+            | Request::Event { .. } => Response::err(
+                "Job scheduling requests are not handled directly by the daemon socket yet.",
+            ),
+        }
+    }
+
+    /// Handle a control request that carries one Unix file descriptor.
+    pub async fn handle_request_with_fd(&self, request: Request, fd: OwnedFd) -> Response {
+        match request {
+            Request::StartTerminal {
+                name,
+                home,
+                uid,
+                gid,
+                env,
+            } => self.handle_start_terminal(&name, &home, uid, gid, env, fd),
+            _ => Response::err("request does not accept a passed file descriptor"),
         }
     }
 
@@ -198,8 +215,8 @@ impl Daemon {
                     cfg.clone()
                 }
             } else {
-                let base_dir = std::env::var("USER_INIT")
-                    .unwrap_or_else(|_| "/data/mesh".to_string());
+                let base_dir =
+                    std::env::var("USER_INIT").unwrap_or_else(|_| "/data/mesh".to_string());
                 let app_dir = std::path::Path::new(&base_dir).join(name);
                 let toml_path = app_dir.join("init.toml");
 
@@ -214,13 +231,16 @@ impl Daemon {
                                 new_cfg.user = None;
                                 new_cfg.group = None;
                             }
-                            
+
                             info!("Loaded on-demand user config for '{}'", name);
                             configs.insert(name.to_string(), new_cfg.clone());
                             new_cfg
                         }
                         Err(e) => {
-                            return Response::err(format!("failed to load user config for '{}': {}", name, e));
+                            return Response::err(format!(
+                                "failed to load user config for '{}': {}",
+                                name, e
+                            ));
                         }
                     }
                 } else {
@@ -281,6 +301,91 @@ impl Daemon {
         }
 
         match self.start_service_with_config(config, None) {
+            Ok(pid) => Response::ok_with_data(serde_json::json!({"pid": pid})),
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn handle_start_terminal(
+        &self,
+        name: &str,
+        home: &str,
+        uid: u32,
+        gid: Option<u32>,
+        extra_env: HashMap<String, String>,
+        fd: OwnedFd,
+    ) -> Response {
+        let home_path = std::path::Path::new(home);
+        if !home_path.is_dir() {
+            return Response::err(format!("home directory '{}' does not exist", home));
+        }
+
+        let mut config = {
+            let configs = self.configs.lock();
+            configs.get(name).cloned()
+        }
+        .unwrap_or_else(|| {
+            let current_uid = unsafe { libc::getuid() };
+            let current_gid = unsafe { libc::getgid() };
+            let run_as_uid = if current_uid == 0 { uid } else { current_uid };
+            let run_as_gid = if current_uid == 0 {
+                gid.unwrap_or(uid)
+            } else {
+                current_gid
+            };
+
+            let mut env = HashMap::new();
+            env.insert("HOME".to_string(), home.to_string());
+            env.insert("USER".to_string(), name.to_string());
+            env.insert("LOGNAME".to_string(), name.to_string());
+            env.insert("SHELL".to_string(), "/bin/sh".to_string());
+            env.insert("TERM".to_string(), "xterm-256color".to_string());
+
+            AppConfig {
+                name: name.to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec!["-l".to_string()],
+                uid: Some(run_as_uid),
+                gid: Some(run_as_gid),
+                user: None,
+                group: None,
+                env,
+                oneshot: true,
+                ..Default::default()
+            }
+        });
+
+        if config.uid.is_none() {
+            config.uid = Some(if unsafe { libc::getuid() } == 0 {
+                uid
+            } else {
+                unsafe { libc::getuid() }
+            });
+        }
+        if config.gid.is_none() {
+            config.gid = Some(if unsafe { libc::getuid() } == 0 {
+                gid.unwrap_or(uid)
+            } else {
+                unsafe { libc::getgid() }
+            });
+        }
+        config
+            .env
+            .entry("HOME".to_string())
+            .or_insert_with(|| home.to_string());
+        config
+            .env
+            .entry("USER".to_string())
+            .or_insert_with(|| name.to_string());
+        config
+            .env
+            .entry("LOGNAME".to_string())
+            .or_insert_with(|| name.to_string());
+        config.env.extend(extra_env);
+
+        let cg =
+            crate::cgroup::create_cgroup(name).unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
+        match process::spawn_process(&config, &cg, Some(process::ActivationFd::Stdio(fd))) {
             Ok(pid) => Response::ok_with_data(serde_json::json!({"pid": pid})),
             Err(e) => Response::err(e.to_string()),
         }
@@ -471,7 +576,9 @@ impl Daemon {
                             initial.saturating_mul(proc.consecutive_failures as u64)
                         }
                         crate::config::BackoffPolicy::Exponential => {
-                            let multiplier = 1_u64.checked_shl(proc.consecutive_failures - 1).unwrap_or(u64::MAX);
+                            let multiplier = 1_u64
+                                .checked_shl(proc.consecutive_failures - 1)
+                                .unwrap_or(u64::MAX);
                             initial.saturating_mul(multiplier)
                         }
                     };
@@ -486,8 +593,7 @@ impl Daemon {
                     );
 
                     proc.next_restart_at = Some(
-                        std::time::Instant::now()
-                            + std::time::Duration::from_secs(backoff_secs),
+                        std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
                     );
                 }
 
@@ -575,7 +681,11 @@ impl Daemon {
     }
 
     /// Start a service from a config.
-    pub fn start_service_with_config(&self, config: AppConfig, passed_fd: Option<crate::process::ActivationFd>) -> Result<u32> {
+    pub fn start_service_with_config(
+        &self,
+        config: AppConfig,
+        passed_fd: Option<crate::process::ActivationFd>,
+    ) -> Result<u32> {
         let name = config.name.clone();
 
         // Create cgroup
@@ -674,6 +784,8 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
 
     #[test]
     fn test_daemon_config_loading() {
@@ -706,5 +818,110 @@ priority = 300
         };
         let daemon = Daemon::new(cfg);
         assert!(daemon.services.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_start_terminal_uses_named_config_and_passed_fd() {
+        let cfg = DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test.sock".to_string(),
+        };
+        let daemon = Daemon::new(cfg);
+        let current_uid = unsafe { libc::getuid() };
+        let current_gid = unsafe { libc::getgid() };
+        let home = tempfile::tempdir().unwrap();
+
+        daemon.configs.lock().insert(
+            "alice".to_string(),
+            AppConfig {
+                name: "alice".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'uid=%s home=%s user=%s\\n' \"$(id -u)\" \"$HOME\" \"$USER\""
+                        .to_string(),
+                ],
+                uid: Some(current_uid),
+                gid: Some(current_gid),
+                oneshot: true,
+                ..Default::default()
+            },
+        );
+
+        let (child_end, mut parent_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let request = Request::StartTerminal {
+            name: "alice".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+            uid: current_uid,
+            gid: Some(current_gid),
+            env: HashMap::from([
+                (
+                    "HOME".to_string(),
+                    home.path().to_string_lossy().into_owned(),
+                ),
+                ("USER".to_string(), "alice".to_string()),
+            ]),
+        };
+
+        let response = daemon
+            .handle_request_with_fd(request, OwnedFd::from(child_end))
+            .await;
+        assert!(response.success, "{:?}", response.error);
+
+        let mut output = String::new();
+        parent_end.read_to_string(&mut output).unwrap();
+        assert!(output.contains(&format!("uid={}", current_uid)), "{output}");
+        assert!(
+            output.contains(&format!("home={}", home.path().display())),
+            "{output}"
+        );
+        assert!(output.contains("user=alice"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn test_start_terminal_dynamic_config_uses_current_uid_for_user_daemon() {
+        let cfg = DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test.sock".to_string(),
+        };
+        let daemon = Daemon::new(cfg);
+        let current_uid = unsafe { libc::getuid() };
+        let current_gid = unsafe { libc::getgid() };
+        let home = tempfile::tempdir().unwrap();
+
+        let (child_end, _parent_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let request = Request::StartTerminal {
+            name: "dynamic-user".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+            uid: if current_uid == 0 {
+                current_uid
+            } else {
+                current_uid.saturating_add(1)
+            },
+            gid: Some(if current_uid == 0 {
+                current_gid
+            } else {
+                current_gid.saturating_add(1)
+            }),
+            env: HashMap::new(),
+        };
+
+        let response = daemon
+            .handle_request_with_fd(request, OwnedFd::from(child_end))
+            .await;
+        assert!(response.success, "{:?}", response.error);
+
+        let pid = response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("pid"))
+            .and_then(|pid| pid.as_u64())
+            .expect("pid in response") as u32;
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        assert!(
+            status.contains(&format!("Uid:\t{}", current_uid)),
+            "{status}"
+        );
+        let _ = process::send_signal(pid, libc::SIGTERM);
     }
 }

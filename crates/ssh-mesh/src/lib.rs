@@ -133,6 +133,12 @@ pub struct MeshNodeConfig {
     /// All configs are relative to this directory.
     pub base_dir: Option<PathBuf>,
 
+    /// ssh-mesh application config directory.
+    ///
+    /// Per-user SSH authorization lives under `users/<USER>/authorized_keys`
+    /// in this directory.
+    pub config_dir: Option<PathBuf>,
+
     /// SSH server port.
     pub ssh_port: Option<u16>,
 
@@ -176,9 +182,11 @@ pub struct MeshNode {
     pub id_counter: Arc<std::sync::Mutex<u64>>,
     pub authorized_keys: Arc<Vec<auth::AuthorizedKeyEntry>>,
     pub ca_keys: Arc<Vec<ssh_key::PublicKey>>,
-    pub active_handlers: Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<sshd::SshHandler>>>>>,
+    pub active_handlers:
+        Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<sshd::SshHandler>>>>>,
     pub connected_clients: Arc<tokio::sync::Mutex<HashMap<u64, ConnectedClientInfo>>>,
-    pub server_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>>,
+    pub server_handle:
+        Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>>,
     pub listeners: Arc<tokio::sync::Mutex<Vec<Arc<dyn MeshListener>>>>,
 }
 
@@ -323,7 +331,8 @@ impl MeshNode {
         let mut config = server::Config::default();
         config.keys.push(self.keys.clone());
         config.max_auth_attempts = 3;
-        config.server_id = russh::SshId::Standard(std::borrow::Cow::Borrowed("SSH-2.0-Rust-SSH-Server"));
+        config.server_id =
+            russh::SshId::Standard(std::borrow::Cow::Borrowed("SSH-2.0-Rust-SSH-Server"));
         config
     }
 
@@ -338,6 +347,22 @@ impl MeshNode {
             .base_dir
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    }
+
+    /// Convenience accessor for ssh-mesh config directory.
+    pub fn config_dir(&self) -> PathBuf {
+        self.cfg
+            .config_dir
+            .clone()
+            .or_else(|| std::env::var("SSH_MESH_CONFIG").ok().map(PathBuf::from))
+            .unwrap_or_else(|| {
+                let mut path = std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"));
+                path.push(".config");
+                path.push("ssh-mesh");
+                path
+            })
     }
 
     /// Convenience accessor for ssh_port from config.
