@@ -529,8 +529,9 @@ fn safe_user_part(identity: &str) -> Option<String> {
 }
 
 fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
-    let home = format!("/home/{}", user);
-    let metadata = std::fs::metadata(&home).ok()?;
+    let home_root = std::env::var("SSH_MESH_HOME_ROOT").unwrap_or_else(|_| "/home".to_string());
+    let home_path = std::path::Path::new(&home_root).join(user);
+    let metadata = std::fs::metadata(&home_path).ok()?;
     if !metadata.is_dir() {
         return None;
     }
@@ -539,7 +540,7 @@ fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
     Some(MeshInitTerminal {
         socket_path: mesh_init_socket_path(),
         user: user.to_string(),
-        home,
+        home: home_path.to_string_lossy().into_owned(),
         uid: metadata.uid(),
         gid: Some(metadata.gid()),
     })

@@ -128,8 +128,14 @@ fn ctrlc_or_wait(tx: std::sync::mpsc::Sender<()>) {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static STOP: AtomicBool = AtomicBool::new(false);
                 unsafe {
-                    libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
-                    libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
+                    libc::signal(
+                        libc::SIGINT,
+                        handle_signal as *const () as libc::sighandler_t,
+                    );
+                    libc::signal(
+                        libc::SIGTERM,
+                        handle_signal as *const () as libc::sighandler_t,
+                    );
                 }
                 extern "C" fn handle_signal(_: libc::c_int) {
                     STOP.store(true, Ordering::SeqCst);

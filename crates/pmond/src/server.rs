@@ -2,7 +2,6 @@ use crate::ProcMon;
 use mesh::{MeshApp, MeshConfig};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::error;
 
 /// Configuration for the Pmon server
 #[derive(Debug, Clone, Serialize, Deserialize)]

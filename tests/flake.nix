@@ -11,9 +11,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        ssh-mesh = ssh-mesh-flake.packages.${system}.ssh-mesh;
-        pmond = ssh-mesh-flake.packages.${system}.pmond;
-        otel = ssh-mesh-flake.packages.${system}.otel;
+        ssh-mesh = ssh-mesh-flake.packages.${system}.ssh-mesh-full;
       in
       {
         devShells.default = pkgs.mkShell {
@@ -21,8 +19,6 @@
             pkgs.curl
             pkgs.tmux
             ssh-mesh
-            pmond
-            otel
           ];
         };
       }

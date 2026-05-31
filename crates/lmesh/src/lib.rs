@@ -6,6 +6,7 @@
 ///
 use anyhow::{Context, Result};
 
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use p256::SecretKey;
 
@@ -124,8 +125,7 @@ impl LocalDiscovery {
         }
 
         // Generate new keypair
-        let mut rng = rand::rng();
-        let key = SecretKey::random(&mut rng);
+        let key = SecretKey::generate();
 
         // Save the generated key to file
         if let Some(parent) = key_path.parent() {

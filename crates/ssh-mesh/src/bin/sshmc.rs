@@ -42,7 +42,6 @@ use hyper::Request;
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use log::debug;
-use nix::unistd;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;

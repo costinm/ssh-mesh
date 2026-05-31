@@ -609,7 +609,7 @@ impl SshClientManager {
             .ok_or_else(|| anyhow::anyhow!("Connection {} not found", id))?;
 
         let actual_port = {
-            let mut session = conn.session.lock().await;
+            let session = conn.session.lock().await;
             let port = session
                 .tcpip_forward("127.0.0.1", remote_port as u32)
                 .await

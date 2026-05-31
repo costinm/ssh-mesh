@@ -45,6 +45,7 @@
         nativeBuildInputs = with pkgs; [
           pkg-config
           curl
+          python3
         ];
 
         # Common args for static MUSL builds
@@ -53,6 +54,7 @@
         # for same-architecture builds.
         commonArgs = {
           inherit src nativeBuildInputs;
+          version = "0.1.0";
           strictDeps = true;
           doCheck = false; # Tests require network/system resources
 
@@ -74,6 +76,19 @@
           cargoExtraArgs = "--features pmon -p ssh-mesh -p pmond";
         });
 
+        # Build dependencies for the aggregate workspace package.
+        allCargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+          pname = "ssh-mesh-all-deps";
+          cargoExtraArgs = "--workspace --bins --features ssh-mesh/pmon";
+        });
+
+        # Aggregate package containing all workspace binaries/components.
+        ssh-mesh-full = craneLib.buildPackage (commonArgs // {
+          cargoArtifacts = allCargoArtifacts;
+          pname = "ssh-mesh-full";
+          cargoExtraArgs = "--workspace --bins --features ssh-mesh/pmon";
+        });
+
         # ssh-mesh binary — the primary binary
         ssh-mesh = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
@@ -86,6 +101,13 @@
           inherit cargoArtifacts;
           pname = "pmond";
           cargoExtraArgs = "-p pmond";
+        });
+
+        # mesh-init binary
+        mesh-init = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "mesh-init";
+          cargoExtraArgs = "-p mesh-init";
         });
 
         # h2t binary
@@ -118,8 +140,8 @@
       in
       {
         packages = {
-          inherit ssh-mesh pmond h2t meshkeys sshmc traceweb;
-          default = ssh-mesh;
+          inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc traceweb;
+          default = ssh-mesh-full;
         };
 
         # Development shell with all tools
@@ -133,18 +155,20 @@
         };
 
         checks = {
-          inherit ssh-mesh pmond;
+          inherit ssh-mesh ssh-mesh-full mesh-init pmond;
           # Run clippy
           ssh-mesh-clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
+            pname = "ssh-mesh-clippy";
             cargoClippyExtraArgs = "--all-targets -- --deny warnings";
           });
           # Check formatting
           ssh-mesh-fmt = craneLib.cargoFmt {
             inherit src;
+            pname = "ssh-mesh-fmt";
+            version = "0.1.0";
           };
         };
       }
     );
 }
-

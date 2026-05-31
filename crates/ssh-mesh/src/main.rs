@@ -218,7 +218,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Create Axum app
-    let mut app = handlers::app(app_state.clone());
+    let app = handlers::app(app_state.clone());
 
     #[cfg(feature = "ws")]
     {

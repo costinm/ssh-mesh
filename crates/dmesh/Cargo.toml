@@ -33,7 +33,7 @@ serial_test = "3.0"
 
 [lib]
 name = "dmesh"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "dmesh"

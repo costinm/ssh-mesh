@@ -573,7 +573,7 @@ async fn handle_open_fwd(
     match fwd_type {
         MUX_FWD_REMOTE => {
             // Ask SSH server to listen on remote side
-            let mut handle = session.lock().await;
+            let handle = session.lock().await;
 
             if listen_port == 0xFFFF_FFFE || connect_port == 0xFFFF_FFFE {
                 // Streamlocal forwarding (UDS)

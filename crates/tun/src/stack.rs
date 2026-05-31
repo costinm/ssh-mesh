@@ -223,9 +223,8 @@ impl StackState {
         dns_handler: Arc<dyn TunDnsHandler>,
         mut rx_queue: mpsc::UnboundedReceiver<Vec<u8>>,
     ) {
-        let mut processed = smoltcp::iface::PollResult::None;
-
         loop {
+            let processed;
             // Process queue
             let mut has_new_packets = false;
             while let Ok(packet) = rx_queue.try_recv() {
