@@ -5,7 +5,6 @@ use anyhow::Context as AnyhowContext;
 use log::{error, info};
 use russh::keys::PrivateKey;
 use russh::server;
-use russh::server::Server;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[allow(dead_code, unused)]
@@ -36,6 +35,7 @@ pub mod socks5;
 pub mod sshc;
 pub mod sshd;
 pub mod sshmuxc;
+pub mod trusted_transport;
 pub mod utils;
 
 pub use sshd::SshHandler;
@@ -88,6 +88,10 @@ fn default_ssh_port() -> u16 {
 /// forward support and optional known host keys.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SshClientConfig {
+    /// Transport to use for the outgoing connection: "tcp", "vsock", or "uds".
+    #[serde(default = "default_client_transport", alias = "Transport")]
+    pub transport: String,
+
     /// Hostname or IP to connect to.
     #[serde(alias = "Hostname", alias = "HostName")]
     pub hostname: Option<String>,
@@ -99,6 +103,18 @@ pub struct SshClientConfig {
     /// Username for authentication.
     #[serde(default, alias = "User")]
     pub user: String,
+
+    /// Virtio-vsock CID for trusted transport connections.
+    #[serde(default, alias = "VsockCid")]
+    pub vsock_cid: Option<u32>,
+
+    /// Virtio-vsock port for trusted transport connections.
+    #[serde(default, alias = "VsockPort")]
+    pub vsock_port: Option<u32>,
+
+    /// Unix domain socket path for trusted transport connections.
+    #[serde(default, alias = "UdsPath")]
+    pub uds_path: Option<PathBuf>,
 
     /// Expected host public keys (OpenSSH format).
     /// If empty, TOFU (Trust-On-First-Use) is used.
@@ -127,6 +143,10 @@ fn default_reconnect_interval() -> u64 {
     5
 }
 
+fn default_client_transport() -> String {
+    "tcp".to_string()
+}
+
 /// Configurable fields for MeshNode, loadable from JSON or YAML.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MeshNodeConfig {
@@ -144,6 +164,16 @@ pub struct MeshNodeConfig {
 
     /// HTTP server port (plain http)
     pub http_port: Option<u16>,
+
+    /// Trusted SSH listener over virtio-vsock. This transport uses SSH as a mux
+    /// with none-auth and no payload encryption.
+    pub trusted_vsock_port: Option<u32>,
+
+    /// CID to bind for the trusted virtio-vsock listener. Defaults to ANY.
+    pub trusted_vsock_cid: Option<u32>,
+
+    /// Trusted SSH listener over a Unix domain socket.
+    pub trusted_uds_path: Option<PathBuf>,
 
     /// Path to the sftp server binary. Not using built-in to
     /// keep server isolated.
@@ -336,6 +366,20 @@ impl MeshNode {
         config
     }
 
+    pub fn get_trusted_transport_config(&self) -> server::Config {
+        let mut config = self.get_config();
+        config.methods = (&[russh::MethodKind::None][..]).into();
+        config.auth_rejection_time = std::time::Duration::ZERO;
+        config.auth_rejection_time_initial = Some(std::time::Duration::ZERO);
+        config.limits = russh::Limits::new(
+            1 << 30,
+            1 << 30,
+            std::time::Duration::from_secs(365 * 24 * 60 * 60),
+        );
+        config.preferred = trusted_transport::trusted_preferred();
+        config
+    }
+
     /// Get a reference to the server's private key.
     pub fn private_key(&self) -> &PrivateKey {
         &self.keys
@@ -394,9 +438,16 @@ impl server::Server for MeshNode {
 
     #[instrument(skip(self))]
     fn new_client(&mut self, _peer_addr: Option<SocketAddr>) -> Self::Handler {
+        self.new_client_for_transport(false)
+    }
+}
+
+impl MeshNode {
+    fn new_client_for_transport(&mut self, trusted_transport: bool) -> SshHandler {
         let mut id = self.id_counter.lock().unwrap();
         *id += 1;
-        let handler = SshHandler::new(*id, self.clone());
+        let mut handler = SshHandler::new(*id, self.clone());
+        handler.set_trusted_transport(trusted_transport);
 
         // Store the handler in active_handlers
         let handler_arc = Arc::new(tokio::sync::Mutex::new(handler.clone()));
@@ -415,6 +466,61 @@ impl server::Server for MeshNode {
 
         handler
     }
+}
+
+pub async fn run_ssh_stream<S>(
+    config: Arc<server::Config>,
+    stream: S,
+    mut server: MeshNode,
+    peer_addr: Option<SocketAddr>,
+    label: &'static str,
+    trusted_transport: bool,
+) -> Result<(), anyhow::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let _ = peer_addr;
+    let handler = server.new_client_for_transport(trusted_transport);
+    let handler_id = handler.id;
+
+    debug!("Starting {} SSH session for handler {}", label, handler_id);
+
+    match russh::server::run_stream(config, stream, handler).await {
+        Ok(session) => {
+            info!(
+                "{} SSH session stream started for handler {}",
+                label, handler_id
+            );
+            if let Err(e) = session.await {
+                error!(
+                    "{} SSH session error for handler {}: {:?}",
+                    label, handler_id, e
+                );
+            }
+            info!(
+                "{} SSH session future finished for handler {}",
+                label, handler_id
+            );
+        }
+        Err(e) => {
+            error!(
+                "{} SSH handshake failed for handler {}: {}",
+                label, handler_id, e
+            );
+        }
+    }
+
+    {
+        let mut active_handlers = server.active_handlers.lock().unwrap();
+        active_handlers.remove(&handler_id);
+    }
+
+    let mut clients = server.connected_clients.lock().await;
+    if clients.remove(&handler_id).is_some() {
+        debug!("Removed client {} from connected_clients", handler_id);
+    }
+
+    Ok(())
 }
 
 // Function to start the SSH server
@@ -450,37 +556,13 @@ pub async fn run_ssh_server(
         let (stream, peer_addr) = listener.accept().await?;
         info!("Accepted connection from {:?}", peer_addr);
         let config = config.clone();
-        let mut server_clone = server.clone();
+        let server_clone = server.clone();
 
         tokio::spawn(async move {
-            let handler = server_clone.new_client(Some(peer_addr));
-            let handler_id = handler.id;
-
-            debug!("Starting session for handler {}", handler_id);
-
-            match russh::server::run_stream(config, stream, handler).await {
-                Ok(session) => {
-                    info!("SSH session stream started for handler {}", handler_id);
-                    // Drive the session to completion
-                    if let Err(e) = session.await {
-                        error!("SSH session error for handler {}: {:?}", handler_id, e);
-                    }
-                    info!("SSH session future finished for handler {}", handler_id);
-                }
-                Err(e) => {
-                    error!("SSH handshake failed for handler {}: {}", handler_id, e);
-                }
-            }
-
-            // Explicit cleanup after session ends (for any reason: disconnect, kill, error)
+            if let Err(e) =
+                run_ssh_stream(config, stream, server_clone, Some(peer_addr), "tcp", false).await
             {
-                let mut active_handlers = server_clone.active_handlers.lock().unwrap();
-                active_handlers.remove(&handler_id);
-            }
-
-            let mut clients = server_clone.connected_clients.lock().await;
-            if clients.remove(&handler_id).is_some() {
-                debug!("Removed client {} from connected_clients", handler_id);
+                error!("TCP SSH stream failed: {}", e);
             }
         });
     }

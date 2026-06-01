@@ -138,7 +138,9 @@ pub async fn handle_web_request(
     // Check local filesystem first (for dev)
     let local_path = Path::new("web").join(path);
 
-    if local_path.is_file() && let Ok(content) = std::fs::read(&local_path) {
+    if local_path.is_file()
+        && let Ok(content) = std::fs::read(&local_path)
+    {
         let mime = mime_for_path(&local_path.to_string_lossy());
         return (
             StatusCode::OK,
@@ -273,13 +275,17 @@ async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Err
         match frame_res {
             Ok(frame) => {
                 if let Ok(data) = frame.into_data()
-                    && tx.send(Ok(data)).await.is_err() {
+                    && tx.send(Ok(data)).await.is_err()
+                {
                     return;
                 }
             }
             Err(e) => {
                 let _ = tx
-                    .send(Err(std::io::Error::other(format!("Body read error: {}", e))))
+                    .send(Err(std::io::Error::other(format!(
+                        "Body read error: {}",
+                        e
+                    ))))
                     .await;
                 return;
             }

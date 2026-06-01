@@ -36,7 +36,8 @@ fn extract_common_name(cert: &X509Certificate) -> Option<String> {
     for rdn in cert.subject().iter() {
         for attr in rdn.iter() {
             if attr.attr_type() == &oid_registry::OID_X509_COMMON_NAME
-                && let Ok(cn) = attr.attr_value().as_str() {
+                && let Ok(cn) = attr.attr_value().as_str()
+            {
                 return Some(cn.to_string());
             }
         }

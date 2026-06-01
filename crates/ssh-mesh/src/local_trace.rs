@@ -55,7 +55,8 @@ pub async fn stream_logs_sse(
         (existing.into_iter(), rx),
         |(mut existing, mut rx)| async move {
             if let Some(entry) = existing.next()
-                && let Ok(json) = serde_json::to_string(&entry) {
+                && let Ok(json) = serde_json::to_string(&entry)
+            {
                 return Some((Ok(Event::default().data(json)), (existing, rx)));
             }
 

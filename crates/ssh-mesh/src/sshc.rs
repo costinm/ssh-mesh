@@ -69,6 +69,8 @@ pub struct ClientHandler {
     conn_id: u64,
     /// Listeners to notify about incoming channels.
     listeners: Arc<Mutex<Vec<Arc<dyn SshClientListener>>>>,
+    /// Trusted transports such as vsock/UDS skip server key checks.
+    trust_server_key: bool,
 }
 
 impl client::Handler for ClientHandler {
@@ -78,6 +80,10 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
+        if self.trust_server_key {
+            return Ok(true);
+        }
+
         // 1. If we have CA keys, check if the server key is signed by one of them.
         if !self.ca_keys.is_empty() {
             let key_str = server_public_key
@@ -128,7 +134,10 @@ impl client::Handler for ClientHandler {
                     return Ok(true);
                 }
             }
-            error!("Server key mismatch! None of {} expected keys matched", self.expected_keys.len());
+            error!(
+                "Server key mismatch! None of {} expected keys matched",
+                self.expected_keys.len()
+            );
             Ok(false)
         } else {
             // TOFU: save the key for future connections
@@ -224,15 +233,24 @@ impl client::Handler for ClientHandler {
                         crate::utils::bridge(channel_stream, tcp_stream, "Remote Forward").await;
                     }
                     Err(e) => {
-                        error!("Failed to connect to local target {}:{}: {}", target_host, target_port, e);
+                        error!(
+                            "Failed to connect to local target {}:{}: {}",
+                            target_host, target_port, e
+                        );
                         let _ = channel.close().await;
                     }
                 }
             });
             Ok(())
         } else {
-            error!("No remote forward found for port {}. Rejecting channel.", connected_port);
-            Err(anyhow::anyhow!("No forward found for port {}", connected_port))
+            error!(
+                "No remote forward found for port {}. Rejecting channel.",
+                connected_port
+            );
+            Err(anyhow::anyhow!(
+                "No forward found for port {}",
+                connected_port
+            ))
         }
     }
 }
@@ -272,7 +290,13 @@ impl SshClientConnection {
 // ---------------------------------------------------------------------------
 
 pub trait SshClientListener: Send + Sync {
-    fn on_forwarded_tcpip(&self, conn_id: u64, host: &str, port: u16, stream: tokio::io::DuplexStream);
+    fn on_forwarded_tcpip(
+        &self,
+        conn_id: u64,
+        host: &str,
+        port: u16,
+        stream: tokio::io::DuplexStream,
+    );
 }
 
 /// Manages multiple SSH client connections.
@@ -446,6 +470,7 @@ impl SshClientManager {
             host: connect_host.clone(),
             conn_id: id,
             listeners: self.listeners.clone(),
+            trust_server_key: false,
         };
 
         let config = Arc::new(client::Config {
@@ -770,7 +795,10 @@ impl SshClientManager {
             match RusshPublicKey::from_openssh(key_str) {
                 Ok(k) => expected_keys.push(k),
                 Err(e) => {
-                    error!("Failed to parse host key for '{}': {} - {}", name, key_str, e);
+                    error!(
+                        "Failed to parse host key for '{}': {} - {}",
+                        name, key_str, e
+                    );
                 }
             }
         }
@@ -791,7 +819,7 @@ impl SshClientManager {
         *next_id_lock += 1;
         drop(next_id_lock);
 
-        let handler = ClientHandler {
+        let mut handler = ClientHandler {
             key_file,
             expected_keys,
             ca_keys: self.ca_keys.clone(),
@@ -799,24 +827,75 @@ impl SshClientManager {
             host: connect_host.clone(),
             conn_id: id,
             listeners: self.listeners.clone(),
+            trust_server_key: false,
         };
 
-        let config = Arc::new(client::Config {
-            nodelay: true,
-            ..Default::default()
-        });
+        let transport = cfg.transport.to_ascii_lowercase();
+        let session = match transport.as_str() {
+            "tcp" | "" => {
+                let config = Arc::new(client::Config {
+                    nodelay: true,
+                    ..Default::default()
+                });
+                let mut session =
+                    client::connect(config, (connect_host.as_str(), connect_port), handler).await?;
 
-        let mut session =
-            client::connect(config, (connect_host.as_str(), connect_port), handler).await?;
-
-        // Authenticate with the server's private key
-        let key_with_alg = PrivateKeyWithHashAlg::new(self.private_key.clone(), None);
-        let auth_res = session
-            .authenticate_publickey(&connect_user, key_with_alg)
-            .await?;
-        if auth_res != client::AuthResult::Success {
-            anyhow::bail!("Authentication failed for '{}'", name);
-        }
+                let key_with_alg = PrivateKeyWithHashAlg::new(self.private_key.clone(), None);
+                let auth_res = session
+                    .authenticate_publickey(&connect_user, key_with_alg)
+                    .await?;
+                if auth_res != client::AuthResult::Success {
+                    anyhow::bail!("Authentication failed for '{}'", name);
+                }
+                session
+            }
+            "vsock" => {
+                handler.trust_server_key = true;
+                let vsock_port = cfg.vsock_port.unwrap_or(connect_port as u32);
+                #[cfg(target_os = "linux")]
+                let vsock_cid = cfg
+                    .vsock_cid
+                    .unwrap_or(crate::trusted_transport::VMADDR_CID_HOST);
+                #[cfg(not(target_os = "linux"))]
+                let vsock_cid = cfg.vsock_cid.unwrap_or(2);
+                let stream = crate::trusted_transport::VsockStream::connect(vsock_cid, vsock_port)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "connect trusted vsock cid={} port={} for '{}'",
+                            vsock_cid, vsock_port, name
+                        )
+                    })?;
+                let config = Arc::new(crate::trusted_transport::trusted_client_config());
+                let mut session = client::connect_stream(config, stream, handler).await?;
+                let auth_res = session.authenticate_none(&connect_user).await?;
+                if auth_res != client::AuthResult::Success {
+                    anyhow::bail!("Trusted vsock none-auth failed for '{}'", name);
+                }
+                session
+            }
+            "uds" | "unix" => {
+                handler.trust_server_key = true;
+                let socket_path = cfg.uds_path.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Client '{}' uses transport=uds without uds_path", name)
+                })?;
+                let stream = crate::trusted_transport::connect_trusted_uds(socket_path).await?;
+                let config = Arc::new(crate::trusted_transport::trusted_client_config());
+                let mut session = client::connect_stream(config, stream, handler).await?;
+                let auth_res = session.authenticate_none(&connect_user).await?;
+                if auth_res != client::AuthResult::Success {
+                    anyhow::bail!("Trusted UDS none-auth failed for '{}'", name);
+                }
+                session
+            }
+            other => {
+                anyhow::bail!(
+                    "Unsupported client transport '{}' for '{}'; expected tcp, vsock, or uds",
+                    other,
+                    name
+                );
+            }
+        };
 
         let session = Arc::new(Mutex::new(session));
 
@@ -915,13 +994,11 @@ pub async fn start_configured_clients(
         tokio::spawn(async move {
             if cfg.keep_alive {
                 // Keep-alive loop: connect, monitor, reconnect on failure.
-                let interval = std::time::Duration::from_secs(
-                    if cfg.reconnect_interval_secs > 0 {
-                        cfg.reconnect_interval_secs
-                    } else {
-                        5
-                    },
-                );
+                let interval = std::time::Duration::from_secs(if cfg.reconnect_interval_secs > 0 {
+                    cfg.reconnect_interval_secs
+                } else {
+                    5
+                });
 
                 loop {
                     info!("Connecting to configured client '{}'...", name);
@@ -932,7 +1009,10 @@ pub async fn start_configured_clients(
                             loop {
                                 tokio::time::sleep(interval).await;
                                 if !manager.is_alive(id).await {
-                                    info!("Client '{}' (id={}) connection lost, reconnecting...", name, id);
+                                    info!(
+                                        "Client '{}' (id={}) connection lost, reconnecting...",
+                                        name, id
+                                    );
                                     let _ = manager.disconnect(id).await;
                                     break;
                                 }

@@ -1,7 +1,15 @@
 # Using public key instead of certs for workload identity.
 
-- each workload (or host) has a private key, in-memory (not saved)
-- DANE and K8S hold the SPKI hash - RFC7671
+TLS and SSH certs are very useful and important, but they are complex and 
+in some cases not required. Using ssh without certs is extremely common,
+and uploading public key in configs for git is considered secure enough.
+
+- each host - or VM/Pod/Container - has a private key
+- DNS publishes the SPKI hash, relying on DNS-SEC to sign it - RFC7671 
+- control plane/discovery publishes the same key - it is trusted anyways.
+- config files or discovery documents are signed - and may include the same hash.
+
+
 
 ```
 

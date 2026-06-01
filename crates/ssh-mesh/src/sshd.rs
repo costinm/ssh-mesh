@@ -58,6 +58,7 @@ pub struct SshHandler {
     authenticated_with_certificate: bool,
     cert_user: Option<String>,
     terminal_user: Option<String>,
+    trusted_transport: bool,
 }
 
 const DEBUG_PTY: bool = false;
@@ -126,7 +127,12 @@ impl SshHandler {
             authenticated_with_certificate: false,
             cert_user: None,
             terminal_user: None,
+            trusted_transport: false,
         }
+    }
+
+    pub(crate) fn set_trusted_transport(&mut self, trusted_transport: bool) {
+        self.trusted_transport = trusted_transport;
     }
 
     /// Shared implementation for both exec_request and shell_request.
@@ -616,6 +622,50 @@ impl server::Handler for SshHandler {
                 proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
                 partial_success: false,
             })
+        }
+    }
+
+    #[instrument(skip(self), fields(user = %user))]
+    fn auth_none(
+        &mut self,
+        user: &str,
+    ) -> impl std::future::Future<Output = Result<server::Auth, Self::Error>> + Send {
+        let allow = self.trusted_transport;
+        let user_part = safe_user_part(user);
+        let user_str = user.to_string();
+        let connected_clients = self.server.connected_clients.clone();
+        let handler_id = self.id;
+        let comment = self.comment.clone();
+        let options = self.options.clone();
+
+        async move {
+            if !allow {
+                return Ok(server::Auth::Reject {
+                    proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
+                    partial_success: false,
+                });
+            }
+
+            if user_part.is_some() {
+                let mut clients = connected_clients.lock().await;
+                clients.insert(
+                    handler_id,
+                    ConnectedClientInfo {
+                        id: handler_id,
+                        user: user_str,
+                        comment,
+                        options,
+                        remote_forward_listeners: Vec::new(),
+                        connected_at: SystemTime::now(),
+                    },
+                );
+                Ok(server::Auth::Accept)
+            } else {
+                Ok(server::Auth::Reject {
+                    proceed_with_methods: Some((&[MethodKind::None][..]).into()),
+                    partial_success: false,
+                })
+            }
         }
     }
 

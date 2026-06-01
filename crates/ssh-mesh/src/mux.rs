@@ -346,7 +346,8 @@ async fn recv_fd_blocking(stream: &tokio::net::UnixStream) -> Result<std::os::un
                 let cmsg_iter = msg.cmsgs()?;
                 for cmsg_item in cmsg_iter {
                     if let ControlMessageOwned::ScmRights(fds) = cmsg_item
-                        && !fds.is_empty() {
+                        && !fds.is_empty()
+                    {
                         received_fd = Some(fds[0]);
                     }
                 }

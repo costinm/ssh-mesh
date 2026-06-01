@@ -147,6 +147,66 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create MeshNode instance
     let ssh_server = Arc::new(MeshNode::new(Some(base_dir.clone()), Some(cfg)));
 
+    if env::var("SSH_MESH_TRUSTED_STDIO")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        info!("Starting trusted SSH transport on stdin/stdout");
+        ssh_mesh::trusted_transport::run_trusted_server_stdio((*ssh_server).clone()).await?;
+        return Ok(());
+    }
+
+    let trusted_uds_path = env::var("SSH_MESH_TRUSTED_UDS_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| ssh_server.cfg.trusted_uds_path.clone());
+    if let Some(uds_path) = trusted_uds_path {
+        let trusted_server = ssh_server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ssh_mesh::trusted_transport::run_trusted_uds_server(
+                (*trusted_server).clone(),
+                uds_path,
+            )
+            .await
+            {
+                error!("trusted UDS SSH server failed: {}", e);
+            }
+        });
+    }
+
+    let trusted_vsock_port = env::var("SSH_MESH_VSOCK_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or(ssh_server.cfg.trusted_vsock_port);
+    if let Some(vsock_port) = trusted_vsock_port {
+        #[cfg(target_os = "linux")]
+        {
+            let vsock_cid = env::var("SSH_MESH_VSOCK_CID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .or(ssh_server.cfg.trusted_vsock_cid)
+                .unwrap_or(ssh_mesh::trusted_transport::VMADDR_CID_ANY);
+            let trusted_server = ssh_server.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ssh_mesh::trusted_transport::run_trusted_vsock_server(
+                    (*trusted_server).clone(),
+                    vsock_cid,
+                    vsock_port,
+                )
+                .await
+                {
+                    error!("trusted vsock SSH server failed: {}", e);
+                }
+            });
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = vsock_port;
+            error!("SSH_MESH_VSOCK_PORT is set, but virtio-vsock is only supported on Linux");
+        }
+    }
+
     // Create WebSocket server instance
     #[cfg(feature = "ws")]
     let ws_server = Arc::new(WSServer::new());
