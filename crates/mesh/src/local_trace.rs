@@ -147,6 +147,11 @@ impl LogBufferLayer {
 
         Self { buffer }
     }
+
+    /// Return a handle to the in-memory log buffer used by this layer.
+    pub fn buffer(&self) -> LogBuffer {
+        self.buffer.clone()
+    }
 }
 
 impl<S> Layer<S> for LogBufferLayer

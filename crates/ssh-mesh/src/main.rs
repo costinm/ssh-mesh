@@ -19,13 +19,14 @@ use tracing_subscriber::{EnvFilter, Registry, reload};
 ///
 /// The tracing level can be dynamically changed at runtime using the reload handle.
 /// All log events are also captured in the provided log buffer for viewing via WebSocket.
-fn init_telemetry() {
+fn init_telemetry() -> ssh_mesh::local_trace::LogBuffer {
     let filter = EnvFilter::from_default_env();
     let (filter, reload_handle) = reload::Layer::new(filter);
 
     let fmt_layer = tracing_subscriber::fmt::layer().compact();
 
     let buffer_layer = ssh_mesh::local_trace::LogBufferLayer::new();
+    let log_buffer = buffer_layer.buffer();
 
     Registry::default()
         .with(filter)
@@ -37,6 +38,7 @@ fn init_telemetry() {
     let _ = ssh_mesh::TRACING_RELOAD_HANDLE.set(reload_handle);
 
     tracing::trace!(hello = "world", foo = 2, "Test {}", 1);
+    log_buffer
 }
 
 fn get_local_ip() -> Option<String> {
@@ -56,7 +58,7 @@ fn get_port_from_env(var_name: &str, default: u16) -> u16 {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    init_telemetry();
+    let log_buffer = init_telemetry();
 
     // Import required items
     use log::{error, info};
@@ -278,7 +280,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Create Axum app
-    let app = handlers::app(app_state.clone());
+    let mut app = handlers::app(app_state.clone());
 
     #[cfg(feature = "ws")]
     {
@@ -307,7 +309,7 @@ async fn main() -> Result<(), anyhow::Error> {
             ws_server: ws_server.clone(),
             stream_handlers: ws_handlers,
             push_handler: Some(Arc::new(ssh_mesh::local_trace::TracePushHandler {
-                log_buffer: app_state.log_buffer.clone(),
+                log_buffer: log_buffer.clone(),
             })),
         };
 
