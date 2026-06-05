@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+installed_vm_dir="$(cd "${script_dir}/.." 2>/dev/null && pwd)/share/bob-vm"
+
+if [ -d "${script_dir}/../share/bob-vm" ]; then
+  default_vm_dir="${installed_vm_dir}"
+else
+  default_vm_dir="/opt/ssh-mesh/share/bob-vm"
+fi
+
+vm_dir="${SSH_MESH_BOB_VM_DIR:-${default_vm_dir}}"
+kernel="${SSH_MESH_BOB_KERNEL:-${vm_dir}/bzImage}"
+initrd="${SSH_MESH_BOB_INITRD:-${vm_dir}/initrd.img}"
+rootfs="${SSH_MESH_BOB_ROOTFS:-${vm_dir}/initos.erofs}"
+
+node="bob"
+root_dir="${SSH_MESH_EXAMPLE_ROOT:-${HOME}/.local/share/ssh-mesh/examples}"
+state_dir="${root_dir}/${node}"
+home_dir="${state_dir}/home/${node}"
+shared_dir="${root_dir}/shared"
+work_dir="${state_dir}/vm"
+share_dir="${work_dir}/share"
+host_ssh_port="${SSH_MESH_BOB_HOST_SSH_PORT:-18322}"
+host_http_port="${SSH_MESH_BOB_HOST_HTTP_PORT:-18380}"
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required command: $1" >&2
+    exit 1
+  }
+}
+
+need qemu-system-x86_64
+
+for f in "${kernel}" "${initrd}" "${rootfs}" "${vm_dir}/initos-pod"; do
+  if [ ! -r "${f}" ]; then
+    cat >&2 <<EOF
+Bob requires readable Initos VM artifacts.
+
+Missing: ${f}
+
+Set SSH_MESH_BOB_VM_DIR, or set SSH_MESH_BOB_KERNEL,
+SSH_MESH_BOB_INITRD, and SSH_MESH_BOB_ROOTFS.
+EOF
+    exit 2
+  fi
+done
+
+mkdir -p \
+  "${home_dir}/.config/mesh-init" \
+  "${home_dir}/.config/ssh-mesh" \
+  "${home_dir}/.run/mesh-init" \
+  "${home_dir}/.run/ssh-mesh/mux" \
+  "${home_dir}/.ssh" \
+  "${shared_dir}/${node}" \
+  "${share_dir}/bin" \
+  "${share_dir}/bob/config" \
+  "${share_dir}/bob/home"
+
+rm -rf "${share_dir}/bin" "${share_dir}/bob/config" "${share_dir}/initos"
+mkdir -p "${share_dir}/bin" "${share_dir}/bob" "${share_dir}/initos"
+
+cp -R "${vm_dir}/config" "${share_dir}/bob/config"
+cp "${vm_dir}/initos-pod" "${share_dir}/initos/initos-pod"
+cp "${vm_dir}/bin/"* "${share_dir}/bin/"
+ln -sfn "${home_dir}" "${share_dir}/bob/home/bob"
+ln -sfn "${shared_dir}" "${share_dir}/shared"
+
+echo "bob kernel: ${kernel}"
+echo "bob initrd: ${initrd}"
+echo "bob rootfs: ${rootfs}"
+echo "bob src share: ${share_dir}"
+echo "bob HOME inside guest: /home/bob"
+echo "bob persistent HOME source: /src/bob/home/bob"
+echo "bob host forwards: 127.0.0.1:${host_ssh_port}->18322, 127.0.0.1:${host_http_port}->18380"
+
+qemu_mem="${SSH_MESH_BOB_QEMU_MEMORY:-1024}"
+qemu_cpus="${SSH_MESH_BOB_QEMU_CPUS:-2}"
+
+qemu_args=(
+  -name "${node}"
+  -m "${qemu_mem}"
+  -smp "${qemu_cpus}"
+  -kernel "${kernel}"
+  -initrd "${initrd}"
+  -drive "id=vda,format=raw,file=${rootfs},if=none,read-only=on"
+  -device "virtio-blk-pci,drive=vda"
+  -append "root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro console=hvc0 panic=5 net.ifnames=0 initos_host=bob"
+  -fsdev "local,security_model=mapped-xattr,id=fsdev0,path=${share_dir}"
+  -device "virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${host_ssh_port}-:18322,hostfwd=tcp:127.0.0.1:${host_http_port}-:18380"
+  -device "virtio-net-pci,netdev=net0"
+  -device "virtio-serial-pci"
+  -chardev "stdio,id=hvc0,signal=off"
+  -device "virtconsole,chardev=hvc0"
+  -display "none"
+  -serial "none"
+  -monitor "none"
+)
+
+if [ "${SSH_MESH_BOB_ENABLE_VSOCK:-auto}" != "0" ] && [ -e /dev/vhost-vsock ]; then
+  qemu_args+=(
+    -device "vhost-vsock-pci,guest-cid=${SSH_MESH_BOB_VSOCK_CID:-42}"
+  )
+fi
+
+# shellcheck disable=SC2086
+exec qemu-system-x86_64 "${qemu_args[@]}" ${SSH_MESH_BOB_QEMU_EXTRA:-}

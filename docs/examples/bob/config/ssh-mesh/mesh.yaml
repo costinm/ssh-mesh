@@ -1,0 +1,57 @@
+# ssh-mesh node configuration for bob.
+#
+# Bob is the VM/QEMU example. The expected guest layout is the same as a real
+# install:
+#
+#   $HOME/.ssh
+#   $HOME/.config/ssh-mesh/mesh.yaml
+#   $HOME/.run/ssh-mesh
+#
+# Fixed guest ports are forwarded by bob/start.sh when QEMU user networking is
+# used:
+#
+#   host 18322 -> guest 18322
+#   host 18380 -> guest 18380
+
+ssh_port: 18322
+http_port: 18380
+trusted_uds_path: /tmp/mesh/shared/bob/trusted.sock
+
+clients:
+  alice:
+    transport: uds
+    user: bob
+    uds_path: /tmp/mesh/shared/alice/trusted.sock
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 19003
+        host: 127.0.0.1
+        host_port: 18222
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 19103
+        host: 127.0.0.1
+        host_port: 18380
+
+  user:
+    transport: uds
+    user: bob
+    uds_path: /tmp/mesh/shared/user/trusted.sock
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 19004
+        host: 127.0.0.1
+        host_port: 18422
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 19104
+        host: 127.0.0.1
+        host_port: 18380

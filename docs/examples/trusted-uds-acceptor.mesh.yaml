@@ -1,0 +1,10 @@
+# Accept trusted SSH-mesh connections over a Unix domain socket.
+#
+# This is the local fallback when virtio-vsock is not available in the host
+# environment. Keep this socket in a directory with appropriate filesystem
+# permissions because auth is intentionally disabled on this transport.
+ssh_port: 15022
+http_port: 15080
+
+trusted_uds_path: /run/user/1000/ssh-mesh/trusted.sock
+

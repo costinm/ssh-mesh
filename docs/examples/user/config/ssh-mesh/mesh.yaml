@@ -1,0 +1,47 @@
+# ssh-mesh node configuration for the non-root "user" example host.
+#
+# This node runs under mesh-init user mode and still participates in the local
+# three-node mesh using trusted UDS connections.
+
+ssh_port: 18422
+http_port: 18480
+trusted_uds_path: /tmp/mesh/shared/user/trusted.sock
+
+clients:
+  alice:
+    transport: uds
+    user: user
+    uds_path: /tmp/mesh/shared/alice/trusted.sock
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 19005
+        host: 127.0.0.1
+        host_port: 18222
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 19105
+        host: 127.0.0.1
+        host_port: 18480
+
+  bob:
+    transport: uds
+    user: user
+    uds_path: /tmp/mesh/shared/bob/trusted.sock
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 19006
+        host: 127.0.0.1
+        host_port: 18322
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 19106
+        host: 127.0.0.1
+        host_port: 18480

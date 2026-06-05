@@ -1,0 +1,22 @@
+# Example OpenSSH client entries installed at $HOME/.ssh/config for user.
+
+Host alice-tcp
+  HostName 127.0.0.1
+  Port 18222
+  User user
+
+Host alice-http
+  HostName alice-over-http
+  User user
+  ProxyCommand h2t http://127.0.0.1:18280/_m/_ssh
+
+Host bob-tcp
+  HostName 127.0.0.1
+  Port 18322
+  User user
+
+Host bob-http
+  HostName bob-over-http
+  User user
+  ProxyCommand h2t http://127.0.0.1:18380/_m/_ssh
+

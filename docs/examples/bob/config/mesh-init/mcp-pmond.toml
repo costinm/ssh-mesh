@@ -1,0 +1,17 @@
+# MCP facade for bob's pmond instance.
+
+[service]
+name = "mcp-pmond"
+command = "mcp-pmond"
+args = ["--uds", "control.sock"]
+priority = 200
+oneshot = false
+
+[resources]
+memory_high = "128M"
+memory_max = "256M"
+cpu_weight = 50
+
+[environment]
+PATH = "/out/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
+RUST_LOG = "info"

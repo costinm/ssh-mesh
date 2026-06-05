@@ -1,0 +1,18 @@
+# Local mesh discovery for the user-mode node.
+
+[service]
+name = "lmesh"
+command = "lmesh"
+args = ["--uds", "control.sock"]
+priority = 190
+oneshot = false
+
+[resources]
+memory_high = "64M"
+memory_max = "128M"
+cpu_weight = 50
+
+[environment]
+PATH = "/out/ssh-mesh/bin:/opt/ssh-mesh/bin"
+RUST_LOG = "info"
+

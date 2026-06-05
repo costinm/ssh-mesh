@@ -1,0 +1,13 @@
+# Accept trusted SSH-mesh connections over virtio-vsock.
+#
+# Put this at $SSH_MESH_CONFIG/mesh.yaml, or start ssh-mesh with
+# SSH_MESH_CONFIG pointing at the directory containing this file.
+#
+# This side listens. The peer uses transport: vsock in its clients map.
+ssh_port: 15022
+http_port: 15080
+
+# VMADDR_CID_ANY. Accept connections addressed to this VM's vsock CID.
+trusted_vsock_cid: 4294967295
+trusted_vsock_port: 15022
+

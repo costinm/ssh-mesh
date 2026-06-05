@@ -1,0 +1,26 @@
+# Maintain an outgoing trusted SSH-mesh connection over a Unix domain socket.
+#
+# The acceptor must have trusted_uds_path set to the same socket path.
+ssh_port: 15023
+http_port: 15081
+
+clients:
+  local-uds:
+    transport: uds
+    user: root
+    uds_path: /run/user/1000/ssh-mesh/trusted.sock
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 10022
+        host: 127.0.0.1
+        host_port: 22
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 10080
+        host: 127.0.0.1
+        host_port: 8080
+

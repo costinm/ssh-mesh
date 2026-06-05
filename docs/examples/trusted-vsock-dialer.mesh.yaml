@@ -1,0 +1,29 @@
+# Maintain an outgoing trusted SSH-mesh connection over virtio-vsock.
+#
+# In a guest connecting to a host listener, use CID 2. For guest-to-guest or
+# host-to-guest, replace vsock_cid with the destination VM CID.
+ssh_port: 15023
+http_port: 15081
+
+clients:
+  host-vsock:
+    transport: vsock
+    user: root
+    vsock_cid: 2
+    vsock_port: 15022
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    # Optional forwards over the maintained SSH channel.
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 10022
+        host: 127.0.0.1
+        host_port: 22
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 10080
+        host: 127.0.0.1
+        host_port: 8080
+

@@ -1,0 +1,18 @@
+# Process monitor for the non-root user-mode node.
+
+[service]
+name = "pmond"
+command = "pmond"
+args = ["--uds", "control.sock"]
+priority = 180
+oneshot = false
+
+[resources]
+memory_high = "128M"
+memory_max = "256M"
+cpu_weight = 50
+
+[environment]
+PATH = "/out/ssh-mesh/bin:/opt/ssh-mesh/bin"
+RUST_LOG = "info"
+

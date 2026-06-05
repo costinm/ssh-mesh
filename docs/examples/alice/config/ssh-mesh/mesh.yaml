@@ -1,0 +1,66 @@
+# ssh-mesh node configuration for alice.
+#
+# This file is installed by alice/start.sh at:
+#
+#   $HOME/.config/ssh-mesh/mesh.yaml
+#
+# Other ssh-mesh state uses normal defaults:
+#
+#   $HOME/.ssh                 host key and authorized_keys
+#   $HOME/.config/ssh-mesh     per-user authorized_keys and this mesh.yaml
+#   $HOME/.run/ssh-mesh        mux sockets when MUX_DIR is set
+#
+# Capabilities shown by this node:
+#
+#   TCP SSH:          ssh -p 18222 alice@127.0.0.1
+#   HTTP/admin:       curl http://127.0.0.1:18280/_m/api/ssh/clients
+#   SSH over HTTP/2:  ssh -o 'ProxyCommand h2t http://127.0.0.1:18280/_m/_ssh' alice@ignored
+#   HTTP UDS proxy:   POST /_m/_uds/home/alice/.run/pmond/control.sock
+#   Trusted UDS mux:  /tmp/mesh/shared/alice/trusted.sock
+
+ssh_port: 18222
+http_port: 18280
+trusted_uds_path: /tmp/mesh/shared/alice/trusted.sock
+
+# Maintained outgoing connections. These use trusted UDS because it works in
+# unprivileged bubblewrap without certificates, host keys, or root privileges.
+clients:
+  bob:
+    transport: uds
+    user: alice
+    uds_path: /tmp/mesh/shared/bob/trusted.sock
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    # Local forward on alice's network namespace into bob's SSH listener.
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 19001
+        host: 127.0.0.1
+        host_port: 18322
+
+    # Ask bob to expose a reverse forward back to alice's HTTP listener.
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 19101
+        host: 127.0.0.1
+        host_port: 18280
+
+  user:
+    transport: uds
+    user: alice
+    uds_path: /tmp/mesh/shared/user/trusted.sock
+    keep_alive: true
+    reconnect_interval_secs: 2
+
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 19002
+        host: 127.0.0.1
+        host_port: 18422
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 19102
+        host: 127.0.0.1
+        host_port: 18280
