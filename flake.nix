@@ -12,13 +12,10 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
+    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         # MUSL target string for the current system
-        muslTarget =
-          if system == "x86_64-linux" then "x86_64-unknown-linux-musl"
-          else if system == "aarch64-linux" then "aarch64-unknown-linux-musl"
-          else throw "Unsupported system: ${system}";
+        muslTarget = "x86_64-unknown-linux-musl";
 
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
@@ -155,6 +152,84 @@
           src = kernelConfigSrc;
         };
 
+        vm-cloud-profile = pkgs.runCommand "ssh-mesh-vm-cloud-profile" { } ''
+          mkdir -p "$out"/{bin,img,nix-support,opt/busybox/bin,opt/initos/bin}
+
+          ln -s ${kernel-cloud}/img/bzImage "$out/img/bzImage"
+          ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
+          ln -s ${kernel-cloud}/img/config "$out/img/kernel.config"
+
+          for m in ${kernel-cloud}/img/modules-*.erofs; do
+            if [ -f "$m" ]; then
+              ln -s "$m" "$out/img/modules-cloud.erofs"
+            fi
+          done
+
+          ln -s ${pkgs.cloud-hypervisor}/bin/cloud-hypervisor "$out/bin/cloud-hypervisor"
+          ln -s ${pkgs.cloud-hypervisor}/bin/ch-remote "$out/bin/ch-remote"
+          ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
+          ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
+          ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
+          ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
+          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
+          ln -s ${./linux/bin/vrun} "$out/bin/vrun.lib"
+          ln -s ${./linux/bin/initos-vrun} "$out/bin/initos-vrun"
+          ln -s ${./linux/bin/initos-init-vm} "$out/opt/initos/bin/initos-init-vm"
+          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/opt/busybox/bin/busybox"
+
+          cat > "$out/nix-support/artifacts.tsv" <<EOF
+          vm-cloud-profile	$out
+          kernel-cloud	${kernel-cloud}
+          cloud-hypervisor	${pkgs.cloud-hypervisor}
+          virtiofsd	${pkgs.virtiofsd}
+          qemu	${pkgs.qemu_kvm}
+          crosvm	${pkgs.crosvm}
+          busybox	${pkgs.pkgsStatic.busybox}
+          EOF
+
+          cat > "$out/README" <<EOF
+          ssh-mesh VM cloud profile
+
+          Important paths:
+            $out/img/bzImage
+            $out/img/vmlinux-cloud
+            $out/img/modules-cloud.erofs
+            $out/bin/initos-vrun
+          EOF
+        '';
+
+        vm-cloud-profile-image = pkgs.dockerTools.buildLayeredImageWithNixDb {
+          name = "ghcr.io/costinm/ssh-mesh-vm-cloud-profile";
+          tag = "latest";
+          contents = [
+            vm-cloud-profile
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.findutils
+            pkgs.nix
+          ];
+          config = {
+            Cmd = [ "/bin/bash" ];
+            Env = [
+              "NIX_PAGER=cat"
+              "PATH=/bin:/usr/bin"
+              "USER=root"
+            ];
+            Labels = {
+              "org.opencontainers.image.description" = "ssh-mesh VM cloud profile with kernel artifacts, hypervisors, and Nix closure";
+              "org.opencontainers.image.source" = "https://github.com/costinm/ssh-mesh";
+              "org.ssh-mesh.nix.artifacts-file" = "/nix-support/artifacts.tsv";
+              "org.ssh-mesh.nix.store-paths-file" = "/nix-support/artifact-store-paths";
+            };
+          };
+          extraCommands = ''
+            mkdir -p nix-support
+            cat > nix-support/artifact-store-paths <<EOF
+            ${vm-cloud-profile}
+            EOF
+          '';
+        };
+
         bob-rootfs = pkgs.runCommand "bob-rootfs" {
           nativeBuildInputs = with pkgs; [ erofs-utils ];
         } ''
@@ -179,7 +254,9 @@
       in
       {
         packages = {
-          inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc traceweb;
+          inherit
+            ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc traceweb
+            vm-cloud-profile vm-cloud-profile-image;
           default = ssh-mesh-full;
         } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           inherit bob-rootfs bob-vm kernel-cloud;

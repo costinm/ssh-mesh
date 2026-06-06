@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   kernel-cloud:
@@ -47,3 +48,21 @@ jobs:
         with:
           name: ssh-mesh-kernel-cloud
           path: ssh-mesh-kernel-cloud.tar.gz
+
+      - name: Build VM cloud profile image
+        run: nix build .#vm-cloud-profile-image -o result-vm-cloud-profile-image --print-build-logs
+
+      - name: Load VM cloud profile image
+        run: docker load < result-vm-cloud-profile-image
+
+      - name: Log in to the Container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: https://ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push VM cloud profile image
+        if: github.event_name != 'pull_request'
+        run: docker push ghcr.io/costinm/ssh-mesh-vm-cloud-profile:latest

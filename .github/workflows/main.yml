@@ -11,18 +11,10 @@ permissions:
   contents: write
 
 jobs:
-  # ── Nix build: native (x86_64 + ARM64 via matrix) ──────────────
+  # ── Nix build: native x86_64 ───────────────────────────────────
   nix-build:
-    name: Nix (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64-linux
-            runner: ubuntu-latest
-          - arch: aarch64-linux
-            runner: ubuntu-24.04-arm
+    name: Nix (x86_64-linux)
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -36,17 +28,13 @@ jobs:
       - name: Build all packages
         run: nix build .#ssh-mesh .#pmond .#h2t .#meshkeys .#sshmc --print-build-logs
 
-      - name: Build Bob VM artifact
-        if: matrix.arch == 'x86_64-linux'
-        run: nix build .#bob-vm --print-build-logs
-
       - name: Create NAR archives
         run: |
           mkdir -p artifacts
 
           for pkg in ssh-mesh pmond h2t meshkeys sshmc; do
             nix build .#${pkg} --print-build-logs
-            nix-store --dump ./result > artifacts/${pkg}-${{ matrix.arch }}.nar
+            nix-store --dump ./result > artifacts/${pkg}-x86_64-linux.nar
           done
 
           # Also create a combined archive with all binaries
@@ -55,14 +43,14 @@ jobs:
             nix build .#${pkg} --print-build-logs
             cp -L ./result/bin/* combined/bin/ 2>/dev/null || true
           done
-          nix-store --dump combined > artifacts/ssh-mesh-all-${{ matrix.arch }}.nar
+          nix-store --dump combined > artifacts/ssh-mesh-all-x86_64-linux.nar
 
           ls -lh artifacts/
 
       - name: Upload NAR artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nar-${{ matrix.arch }}
+          name: nar-x86_64-linux
           path: artifacts/*.nar
           retention-days: 90
 
