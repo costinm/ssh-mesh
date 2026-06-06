@@ -1,0 +1,49 @@
+name: Cloud Kernel
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - linux/**
+      - .github/workflows/kernel-cloud.yml
+  pull_request:
+    paths:
+      - linux/**
+      - .github/workflows/kernel-cloud.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kernel-cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build cloud kernel
+        run: nix build ./linux#kernel-cloud -o result-kernel-cloud --print-build-logs
+
+      - name: Check cloud kernel output
+        run: |
+          test -f result-kernel-cloud/img/bzImage
+          test -f result-kernel-cloud/img/vmlinux
+          test -f result-kernel-cloud/img/config
+          find -L result-kernel-cloud/img -maxdepth 1 -type f -name 'modules-*.erofs' | grep -q .
+
+      - name: Package cloud kernel
+        run: tar -C result-kernel-cloud -czf ssh-mesh-kernel-cloud.tar.gz .
+
+      - name: Upload cloud kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-mesh-kernel-cloud
+          path: ssh-mesh-kernel-cloud.tar.gz

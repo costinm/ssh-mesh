@@ -1,0 +1,246 @@
+#!/opt/busybox/bin/sh
+
+export PATH=/opt/initos/bin:/opt/busybox/bin:/z/a/initos/bin:/bin:/sbin:/usr/bin:/usr/sbin
+ver=$(uname -r)
+
+initos_dbg=${initos_dbg:-0}
+initos_data=${initos_data:-}
+initos_cache=${initos_cache:-}
+initos_root=${initos_root:-}
+initos_host=${initos_host:-initos-vm}
+initos_ip=${initos_ip:-}
+initos_gw=${initos_gw:-}
+ipv6_addr=${ipv6_addr:-}
+ipv6_gw=${ipv6_gw:-}
+ipv4_addr=${ipv4_addr:-}
+br_addr=${br_addr:-}
+
+if [ "${initos_dbg}" = 1 ]; then
+  set -x
+  sh
+fi
+
+mount_disks() {
+  if [ -n "${initos_data}" ]; then 
+    mount ${initos_data} /x || true
+  fi
+
+  if [ -n "${initos_cache}" ]; then 
+    mount ${initos_cache} /x/@cache || true
+  fi
+
+  # TODO: For a VM, can use a separate swap disk (if we find a way to identify it...)
+  if [ -f /x/@cache/swap ]; then
+    swapon /x/@cache/swap
+  fi
+
+  # Rootfs can be on virtiofs or /dev/vda
+  if [ -n "${initos_root}" ]; then
+      # We may use custom label for EXT4
+      mount ${initos_root} /sysroot
+  fi
+
+	  for tag9p in /sys/bus/virtio/drivers/9pnet_virtio/virtio*/mount_tag; do
+	    if [ -f ${tag9p} ]; then
+	      echo "INITOS-VM: mounting 9p tag $(cat ${tag9p}) from ${tag9p}"
+      mkdir -p /src
+      if mount -t 9p -o trans=virtio,version=9p2000.L $(cat ${tag9p}) /src; then
+        echo "INITOS-VM: mounted 9p share on /src"
+        break
+      fi
+	      echo "INITOS-VM: failed to mount 9p tag $(cat ${tag9p})"
+	    fi
+	  done
+
+	  if [ ! -d /src/initos ]; then
+	    mkdir -p /src
+	    if mount -t virtiofs src /src 2>/dev/null; then
+	      echo "INITOS-VM: mounted virtiofs tag src on /src"
+	    fi
+	  fi
+
+	  #local tagvfs=/sys/fs/virtiofs
+  # TODO: find directory, read tag
+  # mount -t virtiofs $TAG /mnt
+
+}
+
+# Main function after mounting proc and dealing with busybox.
+# For VMs with custom kernel, virtiofs is compiled in along with
+# all required drviers - and virtofs is already mounted as root.
+# 
+# Init network and:
+# - execute /initos/init if present (no pivot)
+# - pivot to /dev/vda as rootfs
+initramfs_init_vm() {
+  net_cfg
+  mount_disks
+
+  # Simplest case: run a startup script directly, using virtiofs 
+  # as root.
+  if [ -f /initos/initos-pod ]; then
+    echo "INITOS-VM: executing /initos/initos-pod"
+    /initos/initos-pod start
+    pod_exit=$?
+    echo "INITOS-VM: /initos/initos-pod exited with status ${pod_exit}; powering off"
+    sync
+    poweroff -f || reboot -f
+    while true; do sleep 60; done
+  fi 
+  if [ -f /src/initos/initos-pod ]; then
+    echo "INITOS-VM: executing /src/initos/initos-pod"
+    /src/initos/initos-pod start
+    pod_exit=$?
+    echo "INITOS-VM: /src/initos/initos-pod exited with status ${pod_exit}; powering off"
+    sync
+    poweroff -f || reboot -f
+    while true; do sleep 60; done
+  fi
+  echo "INITOS-VM: no initos-pod found"
+
+  if [ -f /sysroot/sbin/init-pod ]; then
+      move_mounted_to_sysroot
+      pivot_root /sysroot /z
+      exec /sbin/init-pod start
+  elif [ -f /sysroot/usr/lib/systemd/systemd ]; then
+    move_mounted_to_sysroot
+    cd /sysroot
+    mkdir -p mnt/initos
+    pivot_root . mnt/initos || sh
+    exec /usr/lib/systemd/systemd --system 
+    #--log-level=err  --system \
+    #    --default-standard-output=tty --default-standard-error=tty
+    # --unit=rescule.target
+  else
+    exec sh
+  fi 
+}
+
+## First step - expand busybox and mount the basic filesystems.
+# Extracted from alpine init.
+initramfs_1st() {
+  mkdir -p \
+    /sbin /usr/bin \
+    /usr/sbin \
+    /dev \
+    /media/cdrom \
+    /media/usb \
+    /tmp \
+    /etc \
+    /dev/shm \
+    /run /proc /sys /out \
+    /sysroot /x /z /boot/efi /lib/modules \
+    /lib/firmware /var/cache /var/log /home /initos
+
+  [ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
+
+  if [ -e /proc/cmdline ]; then
+    return
+  fi
+
+  mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
+
+  mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null \
+    || mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev && mdev -f -s
+
+  [ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11u
+
+  mount -t proc -o noexec,nosuid,nodev proc /proc
+  [ -c /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 uub
+  [ -d /dev/pts ] || mkdir -m 755 /dev/pts
+
+  mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts  
+  mount -t tmpfs tmpfs /run
+  mount -t tmpfs tmpfs /tmp
+  mount -t tmpfs tmpfs /home
+  mount -t tmpfs tmpfs /out
+}
+
+
+move_mounted_to_sysroot() {
+  cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
+    if [ "$DIR" != "/" -a "$DIR" != "/sysroot" -a -d "$DIR" ]; then
+      mkdir -p /sysroot$DIR
+      mount -o move $DIR /sysroot$DIR
+    fi
+  done
+
+  sync
+}
+
+log_net_state() {
+  ip link show 2>&1 | sed 's/^/INITOS-VM: ip-link: /' >/dev/kmsg || true
+  ip addr show 2>&1 | sed 's/^/INITOS-VM: ip-addr: /' >/dev/kmsg || true
+  ip route show 2>&1 | sed 's/^/INITOS-VM: ip-route: /' >/dev/kmsg || true
+}
+
+wait_netdev() {
+  dev="$1"
+  n=0
+  while [ "$n" -lt 50 ]; do
+    [ -e "/sys/class/net/${dev}" ] && return 0
+    sleep 0.1
+    n=$((n + 1))
+  done
+  echo "INITOS-VM: network device ${dev} not found" >/dev/kmsg
+  log_net_state
+  return 1
+}
+
+net_cfg() {
+  ip link set dev lo up
+
+  # Use IPAM or static config - no DHCP in VMs please!
+
+  if [ -n "$ipv6_addr" ] ; then
+    wait_netdev eth0 || return
+
+    ip link add name br-lan type bridge
+    ip link set dev br-lan up
+
+    ip link set dev eth0 master br-lan
+    ip link set dev eth0 up
+
+    ip addr add ${ipv4_addr}/22 dev br-lan
+
+    ip -6 addr add ${ipv6_addr}/64 dev br-lan
+    ip -6 route add default via ${ipv6_gw} dev br-lan
+
+  elif [ -n "$br_addr" ] ; then
+    wait_netdev eth0 || return
+  
+    ip link add name br-lan type bridge
+    ip link set dev br-lan up
+
+    ip link set dev eth0 master br-lan
+    ip link set dev eth0 up
+
+    ip addr add ${br_addr}/17 dev br-lan
+
+  elif [ -n "$initos_ip" ] ; then
+    wait_netdev eth0 || return
+  
+    ip link set dev eth0 up
+
+    case "$initos_ip" in
+      */*) ip addr add ${initos_ip} dev eth0 ;;
+      *) ip addr add ${initos_ip}/22 dev eth0 ;;
+    esac
+  fi
+
+  if [ -n "$initos_gw" ]; then
+    ip route replace default via ${initos_gw} dev eth0 || route add default gw ${initos_gw}
+  fi
+  log_net_state
+  hostname $initos_host
+}
+
+
+if [ "$$" = "1" ]; then
+  initramfs_1st
+  echo "INITOS-VM: $@" > /dev/kmsg
+
+  initramfs_init_vm
+else
+  "$@"
+fi

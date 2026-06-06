@@ -23,20 +23,18 @@ The example creates three independent nodes:
 | Node | Mode | SSH port | HTTP port | Trusted socket |
 |------|------|----------|-----------|----------------|
 | alice | bwrap user namespace, uid 0 inside sandbox | 18222 | 18280 | `shared/alice/trusted.sock` |
-| bob | QEMU VM using an Initos-based Nix artifact | 18322 | 18380 | `shared/bob/trusted.sock` |
+| bob | QEMU VM using this repo's cloud-kernel artifact | 18322 | 18380 | SSH/HTTP host forwards |
 | user | non-root mesh-init user mode | 18422 | 18480 | `shared/user/trusted.sock` |
 
 Alice and user use bubblewrap and share the host network namespace. Bob boots
-the Initos rolling-release kernel, initrd, and EROFS rootfs packaged by
-`.#bob-vm`, then starts ssh-mesh through Bob's checked-in `initos-pod` script.
-QEMU user networking provides host port forwards for SSH and HTTP.
+the local `linux#kernel-cloud` kernel and EROFS rootfs packaged by `.#bob-vm`,
+then starts ssh-mesh through Bob's checked-in `initos-pod` script. QEMU user
+networking provides host port forwards for SSH and HTTP.
 
-Each ssh-mesh node also exposes a trusted UDS transport. The nodes maintain
-outgoing SSH-mesh client connections to each other over those UDS sockets using
-SSH as the mux, with trusted none-auth and no SSH payload encryption on that
-transport. This exercises the client-maintained connection path without needing
-certificates. When bob's VM has `/dev/vhost-vsock`, `bob/start.sh` also attaches
-a virtio-vsock device for vsock experiments.
+User owns the maintained client connections. It reaches Alice over trusted UDS
+and reaches Bob over SSH-over-vsock, then opens local forwards into both nodes.
+Bob also exposes forwarded SSH and HTTP ports for host smoke checks. Bob is not
+reached through a shared Unix socket over the 9p filesystem.
 
 Each node also starts:
 
@@ -74,8 +72,9 @@ Each node directory has:
 
 `start_all.sh` starts all three nodes together and writes logs under the
 example state directory. Bob requires `SSH_MESH_BOB_VM_DIR`, or explicit
-`SSH_MESH_BOB_KERNEL`, `SSH_MESH_BOB_INITRD`, and `SSH_MESH_BOB_ROOTFS` paths,
-unless the artifact is installed at `/opt/ssh-mesh/share/bob-vm`.
+`SSH_MESH_BOB_KERNEL` and `SSH_MESH_BOB_ROOTFS` paths, unless the artifact is
+installed at `/opt/ssh-mesh/share/bob-vm`. `SSH_MESH_BOB_INITRD` is optional
+for custom boot experiments.
 
 ## Runtime state
 
@@ -100,11 +99,14 @@ $HOME/.ssh
 $HOME/.run
 ```
 
-The shared trusted sockets are created under the host state root:
+The local shared trusted sockets are created under the host state root:
 
 ```bash
 $SSH_MESH_EXAMPLE_ROOT/shared
 ```
+
+Bob is intentionally not represented by a socket in that directory; user reaches
+Bob through the VM's vsock device.
 
 Per-node writable state includes ssh keys, mux sockets, mesh-init runtime
 sockets, copied ssh-mesh config, logs, and example home directories.
@@ -138,7 +140,6 @@ You can also point Bob at direct artifact paths:
 
 ```bash
 export SSH_MESH_BOB_KERNEL=/path/to/bzImage
-export SSH_MESH_BOB_INITRD=/path/to/initrd.img
 export SSH_MESH_BOB_ROOTFS=/path/to/initos.erofs
 ./bob/start.sh
 ```
@@ -169,17 +170,18 @@ The examples enable:
 - lmesh multicast discovery and UDS query API
 - separate HOME-relative SSH, config, and runtime directories per node
 - user-home lookup roots under private `/home` layouts
-- Bob boot through Initos `initos-init-vm` and Bob's checked-in `initos-pod`
+- Bob boot through the vendored `initos-init-vm` shim and Bob's checked-in `initos-pod`
   adapter
 
 The trusted UDS transport exercises the same trusted SSH mux path as vsock
 without requiring VM support. Bob attaches a virtio-vsock device when the host
 exposes `/dev/vhost-vsock`.
 
-Bob uses the Initos EROFS rootfs as a read-only QEMU block device. Its writable
-state and packaged ssh-mesh binaries are exposed through a QEMU 9p share mounted
-by Initos as `/src`. The Bob adapter starts `mesh-init` with `/out/ssh-mesh/bin` on
-`PATH` and HOME backed by the example state tree at `/src/bob/home/bob`.
+Bob uses this repo's generated EROFS rootfs as a read-only QEMU block device.
+Its writable state and packaged ssh-mesh binaries are exposed through a QEMU 9p
+share mounted by the vendored VM init script as `/src`. The Bob adapter starts
+`mesh-init` with `/out/ssh-mesh/bin` on `PATH` and HOME backed by the example
+state tree at `/src/bob/home/bob`.
 
 ## Ports and forwards
 

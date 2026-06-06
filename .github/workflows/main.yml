@@ -36,6 +36,10 @@ jobs:
       - name: Build all packages
         run: nix build .#ssh-mesh .#pmond .#h2t .#meshkeys .#sshmc --print-build-logs
 
+      - name: Build Bob VM artifact
+        if: matrix.arch == 'x86_64-linux'
+        run: nix build .#bob-vm --print-build-logs
+
       - name: Create NAR archives
         run: |
           mkdir -p artifacts

@@ -28,7 +28,7 @@ mkdir -p \
   /out/ssh-mesh \
   /out/ssh-mesh/bin \
   /tmp/mesh \
-  /tmp/mesh/shared/bob
+  /tmp/mesh/shared
 
 if [ -d /src/bin ]; then
   if mount -o bind /src/bin /out/ssh-mesh/bin 2>/dev/null; then

@@ -26,22 +26,3 @@ clients:
         port: 19105
         host: 127.0.0.1
         host_port: 18480
-
-  bob:
-    transport: uds
-    user: user
-    uds_path: /tmp/mesh/shared/bob/trusted.sock
-    keep_alive: true
-    reconnect_interval_secs: 2
-
-    local_forward:
-      - bind_address: 127.0.0.1
-        port: 19006
-        host: 127.0.0.1
-        host_port: 18322
-
-    remote_forward:
-      - bind_address: 127.0.0.1
-        port: 19106
-        host: 127.0.0.1
-        host_port: 18480

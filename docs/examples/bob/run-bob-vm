@@ -12,8 +12,11 @@ fi
 
 vm_dir="${SSH_MESH_BOB_VM_DIR:-${default_vm_dir}}"
 kernel="${SSH_MESH_BOB_KERNEL:-${vm_dir}/bzImage}"
-initrd="${SSH_MESH_BOB_INITRD:-${vm_dir}/initrd.img}"
 rootfs="${SSH_MESH_BOB_ROOTFS:-${vm_dir}/initos.erofs}"
+initrd="${SSH_MESH_BOB_INITRD:-}"
+if [ -z "${initrd}" ] && [ -r "${vm_dir}/initrd.img" ]; then
+  initrd="${vm_dir}/initrd.img"
+fi
 
 node="bob"
 root_dir="${SSH_MESH_EXAMPLE_ROOT:-${HOME}/.local/share/ssh-mesh/examples}"
@@ -21,9 +24,11 @@ state_dir="${root_dir}/${node}"
 home_dir="${state_dir}/home/${node}"
 shared_dir="${root_dir}/shared"
 work_dir="${state_dir}/vm"
-share_dir="${work_dir}/share"
+share_dir="${root_dir}"
 host_ssh_port="${SSH_MESH_BOB_HOST_SSH_PORT:-18322}"
 host_http_port="${SSH_MESH_BOB_HOST_HTTP_PORT:-18380}"
+guest_ip="${SSH_MESH_BOB_GUEST_IP:-10.0.2.15/24}"
+guest_gw="${SSH_MESH_BOB_GUEST_GW:-10.0.2.2}"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -34,19 +39,31 @@ need() {
 
 need qemu-system-x86_64
 
-for f in "${kernel}" "${initrd}" "${rootfs}" "${vm_dir}/initos-pod"; do
+for f in "${kernel}" "${rootfs}" "${vm_dir}/initos-pod"; do
   if [ ! -r "${f}" ]; then
     cat >&2 <<EOF
-Bob requires readable Initos VM artifacts.
+Bob requires readable VM artifacts.
 
 Missing: ${f}
 
 Set SSH_MESH_BOB_VM_DIR, or set SSH_MESH_BOB_KERNEL,
-SSH_MESH_BOB_INITRD, and SSH_MESH_BOB_ROOTFS.
+and SSH_MESH_BOB_ROOTFS.
 EOF
     exit 2
   fi
 done
+
+if [ -n "${initrd}" ] && [ ! -r "${initrd}" ]; then
+  cat >&2 <<EOF
+Bob initrd was set but is not readable.
+
+Missing: ${initrd}
+
+Unset SSH_MESH_BOB_INITRD to boot directly from the rootfs, or set it to
+a readable initrd image.
+EOF
+  exit 2
+fi
 
 mkdir -p \
   "${home_dir}/.config/mesh-init" \
@@ -54,10 +71,11 @@ mkdir -p \
   "${home_dir}/.run/mesh-init" \
   "${home_dir}/.run/ssh-mesh/mux" \
   "${home_dir}/.ssh" \
-  "${shared_dir}/${node}" \
+  "${shared_dir}" \
   "${share_dir}/bin" \
   "${share_dir}/bob/config" \
-  "${share_dir}/bob/home"
+  "${share_dir}/bob/home" \
+  "${work_dir}"
 
 rm -rf "${share_dir}/bin" "${share_dir}/bob/config" "${share_dir}/initos"
 mkdir -p "${share_dir}/bin" "${share_dir}/bob" "${share_dir}/initos"
@@ -65,16 +83,15 @@ mkdir -p "${share_dir}/bin" "${share_dir}/bob" "${share_dir}/initos"
 cp -R "${vm_dir}/config" "${share_dir}/bob/config"
 cp "${vm_dir}/initos-pod" "${share_dir}/initos/initos-pod"
 cp "${vm_dir}/bin/"* "${share_dir}/bin/"
-ln -sfn "${home_dir}" "${share_dir}/bob/home/bob"
-ln -sfn "${shared_dir}" "${share_dir}/shared"
 
 echo "bob kernel: ${kernel}"
-echo "bob initrd: ${initrd}"
+echo "bob initrd: ${initrd:-<none>}"
 echo "bob rootfs: ${rootfs}"
 echo "bob src share: ${share_dir}"
 echo "bob HOME inside guest: /home/bob"
 echo "bob persistent HOME source: /src/bob/home/bob"
 echo "bob host forwards: 127.0.0.1:${host_ssh_port}->18322, 127.0.0.1:${host_http_port}->18380"
+echo "bob guest network: ${guest_ip} via ${guest_gw}"
 
 qemu_mem="${SSH_MESH_BOB_QEMU_MEMORY:-1024}"
 qemu_cpus="${SSH_MESH_BOB_QEMU_CPUS:-2}"
@@ -84,11 +101,10 @@ qemu_args=(
   -m "${qemu_mem}"
   -smp "${qemu_cpus}"
   -kernel "${kernel}"
-  -initrd "${initrd}"
   -drive "id=vda,format=raw,file=${rootfs},if=none,read-only=on"
   -device "virtio-blk-pci,drive=vda"
-  -append "root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro console=hvc0 panic=5 net.ifnames=0 initos_host=bob"
-  -fsdev "local,security_model=mapped-xattr,id=fsdev0,path=${share_dir}"
+  -append "root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro console=hvc0 panic=5 net.ifnames=0 initos_host=bob initos_ip=${guest_ip} initos_gw=${guest_gw}"
+  -fsdev "local,security_model=none,id=fsdev0,path=${share_dir}"
   -device "virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${host_ssh_port}-:18322,hostfwd=tcp:127.0.0.1:${host_http_port}-:18380"
   -device "virtio-net-pci,netdev=net0"
@@ -99,6 +115,15 @@ qemu_args=(
   -serial "none"
   -monitor "none"
 )
+
+if [ -n "${initrd}" ]; then
+  qemu_args+=(-initrd "${initrd}")
+fi
+
+if [ "${SSH_MESH_BOB_ENABLE_VSOCK:-auto}" = "1" ] && [ ! -e /dev/vhost-vsock ]; then
+  echo "SSH_MESH_BOB_ENABLE_VSOCK=1 requires /dev/vhost-vsock" >&2
+  exit 2
+fi
 
 if [ "${SSH_MESH_BOB_ENABLE_VSOCK:-auto}" != "0" ] && [ -e /dev/vhost-vsock ]; then
   qemu_args+=(

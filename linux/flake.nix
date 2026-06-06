@@ -14,10 +14,24 @@
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
+        pkgs = import nixpkgs {
+          inherit system;
+        };
+
+        kernelConfigSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            let
+              rel = pkgs.lib.removePrefix "${toString ./.}/" (toString path);
+            in
+            rel == "6.18" || pkgs.lib.hasPrefix "6.18/" rel
+            || rel == "fragments" || pkgs.lib.hasPrefix "fragments/" rel;
+        };
 
         kernel-cloud = import ./kernel-cloud.nix {
+          inherit pkgs;
+          src = kernelConfigSrc;
         };
-        pkgs = import nixpkgs;
 
         vm-cloud-profile = pkgs.runCommand "initos-vm-cloud-profile" { } ''
           mkdir -p "$out"/{bin,boot,img}
@@ -36,15 +50,14 @@
           ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
           ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
           ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
-          ln -s ${./bin/vrun} "$out/bin/vrun"
+          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
+          ln -s ${./bin/vrun} "$out/bin/vrun.lib"
 
-          cat > "$out/bin/vrun" <<EOF
-#!${pkgs.runtimeShell}
-export VIRT="\''${VIRT:-$out}"
-export PATH="$out/bin:\$PATH"
-exec "$out/bin/vrun" "\$@"
-EOF
-          chmod 755 "$out/bin/vrun"
+          mkdir -p "$out/opt"/{busybox/bin,initos/bin}
+          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/opt/busybox/bin/busybox"
+          ln -s ${./bin/initos-init-vm} "$out/opt/initos/bin/initos-init-vm"
+          chmod 755 "$out/opt/initos/bin/initos-init-vm"
+          ln -s ${./bin/initos-vrun} "$out/bin/initos-vrun"
 
           cat > "$out/README" <<EOF
           initos VM cloud profile
@@ -54,7 +67,8 @@ EOF
             $out/img/modules-cloud.erofs
             $out/opt
 
-            $out/bin/vrun
+          sidecar/bin/vrun-compatible entrypoint:
+            $out/bin/initos-vrun
           EOF
         '';
 

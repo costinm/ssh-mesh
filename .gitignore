@@ -4,7 +4,7 @@ GEMINI.md
 AGENT.md
 .idea
 tmp
-result
+result*
 python/dmesh/__pycache__
 java/classes
 .antigravitycli

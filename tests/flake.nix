@@ -17,6 +17,8 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.curl
+            pkgs.bubblewrap
+            pkgs.qemu
             pkgs.tmux
             ssh-mesh
           ];

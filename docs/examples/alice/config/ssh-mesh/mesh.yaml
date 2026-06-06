@@ -25,27 +25,6 @@ trusted_uds_path: /tmp/mesh/shared/alice/trusted.sock
 # Maintained outgoing connections. These use trusted UDS because it works in
 # unprivileged bubblewrap without certificates, host keys, or root privileges.
 clients:
-  bob:
-    transport: uds
-    user: alice
-    uds_path: /tmp/mesh/shared/bob/trusted.sock
-    keep_alive: true
-    reconnect_interval_secs: 2
-
-    # Local forward on alice's network namespace into bob's SSH listener.
-    local_forward:
-      - bind_address: 127.0.0.1
-        port: 19001
-        host: 127.0.0.1
-        host_port: 18322
-
-    # Ask bob to expose a reverse forward back to alice's HTTP listener.
-    remote_forward:
-      - bind_address: 127.0.0.1
-        port: 19101
-        host: 127.0.0.1
-        host_port: 18280
-
   user:
     transport: uds
     user: alice

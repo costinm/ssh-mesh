@@ -8,14 +8,13 @@ set -euo pipefail
 #   user:  user-mode mesh-init + ssh-mesh on SSH 18422 / HTTP 18480
 #
 # Alice and user run in bubblewrap. Bob is started with QEMU and requires a
-# Nix-built Initos VM artifact:
+# Nix-built VM artifact:
 #
 #   SSH_MESH_BOB_VM_DIR=/path/to/share/bob-vm
 #
 # or:
 #
 #   SSH_MESH_BOB_KERNEL=/path/to/bzImage
-#   SSH_MESH_BOB_INITRD=/path/to/initrd.img
 #   SSH_MESH_BOB_ROOTFS=/path/to/initos.erofs
 #
 # The examples share a private state root. Alice and user share the host network
@@ -46,10 +45,11 @@ initrd="${SSH_MESH_BOB_INITRD:-${vm_dir}/initrd.img}"
 rootfs="${SSH_MESH_BOB_ROOTFS:-${vm_dir}/initos.erofs}"
 bob_host_ssh_port="${SSH_MESH_BOB_HOST_SSH_PORT:-18322}"
 bob_host_http_port="${SSH_MESH_BOB_HOST_HTTP_PORT:-18380}"
+export SSH_MESH_BOB_ENABLE_VSOCK="${SSH_MESH_BOB_ENABLE_VSOCK:-0}"
 
-if [ ! -r "${kernel}" ] || [ ! -r "${initrd}" ] || [ ! -r "${rootfs}" ]; then
+if [ ! -r "${kernel}" ] || [ ! -r "${rootfs}" ]; then
   cat >&2 <<EOF
-Bob requires a readable Initos kernel, initrd, and rootfs to start all three nodes.
+Bob requires a readable kernel and rootfs to start all three nodes.
 
 Build it with:
   nix build .#bob-vm
@@ -59,12 +59,21 @@ Then set:
 
 Or set:
   SSH_MESH_BOB_KERNEL=/path/to/bzImage
-  SSH_MESH_BOB_INITRD=/path/to/initrd.img
   SSH_MESH_BOB_ROOTFS=/path/to/initos.erofs
 
 To run only the bwrap nodes:
   ./alice/start.sh
   ./user/start.sh
+EOF
+  exit 2
+fi
+
+if [ "${SSH_MESH_BOB_ENABLE_VSOCK}" = "1" ] && [ ! -e /dev/vhost-vsock ]; then
+  cat >&2 <<EOF
+Bob was configured to require /dev/vhost-vsock.
+
+The default example uses the shared 9p trusted UDS sockets. Set
+SSH_MESH_BOB_ENABLE_VSOCK=1 only on hosts that provide /dev/vhost-vsock.
 EOF
   exit 2
 fi
