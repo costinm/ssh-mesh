@@ -8,10 +8,10 @@ http_port: 18480
 trusted_uds_path: /tmp/mesh/shared/user/trusted.sock
 
 clients:
-  alice:
+  bwrap-net:
     transport: uds
     user: user
-    uds_path: /tmp/mesh/shared/alice/trusted.sock
+    uds_path: /tmp/mesh/shared/bwrap-net/trusted.sock
     keep_alive: true
     reconnect_interval_secs: 2
 
@@ -26,3 +26,16 @@ clients:
         port: 19105
         host: 127.0.0.1
         host_port: 18480
+
+ssh_routes:
+  - name: bwrap-nonet
+    user: system@bwrap-nonet.example.m
+    jump_host: bwrap-nonet.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    activation_service: activate-bwrap-nonet
+    client:
+      transport: uds
+      user: system
+      uds_path: /tmp/mesh/shared/bwrap-nonet/trusted.sock

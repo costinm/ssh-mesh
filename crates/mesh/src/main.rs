@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
             name,
             args,
             env: HashMap::new(),
+            context: None,
         },
         Command::Stop { name, signal } => Request::Stop { name, signal },
         Command::Freeze { name } => Request::Freeze { name },

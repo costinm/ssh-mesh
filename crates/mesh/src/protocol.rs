@@ -7,6 +7,72 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Extra metadata describing why a service is being activated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActivationContext {
+    /// Protocol or caller-specific activation kind, for example `ssh`.
+    #[serde(default)]
+    pub kind: String,
+    /// Authenticated incoming username or route identity.
+    #[serde(default)]
+    pub user: String,
+    /// Optional command that triggered the activation.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Optional certificate principal/user from the authenticated peer.
+    #[serde(default)]
+    pub certificate_user: Option<String>,
+    /// Optional fingerprint of the authenticated peer key.
+    #[serde(default)]
+    pub peer_key_sha: Option<String>,
+    /// Optional caller connection id.
+    #[serde(default)]
+    pub client_id: Option<u64>,
+    /// Additional environment fields to pass to the activated service.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+impl ActivationContext {
+    /// Convert context into environment variables for an activated service.
+    pub fn to_env(&self) -> HashMap<String, String> {
+        let mut env = self.env.clone();
+        if !self.kind.is_empty() {
+            env.insert("MESH_INIT_CONTEXT_KIND".to_string(), self.kind.clone());
+        }
+        if !self.user.is_empty() {
+            env.insert("MESH_INIT_CONTEXT_USER".to_string(), self.user.clone());
+            env.insert("SSH_MESH_ROUTE_USER".to_string(), self.user.clone());
+        }
+        if let Some(command) = &self.command {
+            env.insert("MESH_INIT_CONTEXT_COMMAND".to_string(), command.clone());
+            env.insert("SSH_MESH_ROUTE_COMMAND".to_string(), command.clone());
+        }
+        if let Some(certificate_user) = &self.certificate_user {
+            env.insert(
+                "SSH_MESH_ROUTE_CERTIFICATE_USER".to_string(),
+                certificate_user.clone(),
+            );
+        }
+        if let Some(peer_key_sha) = &self.peer_key_sha {
+            env.insert(
+                "SSH_MESH_ROUTE_PEER_KEY_SHA".to_string(),
+                peer_key_sha.clone(),
+            );
+        }
+        if let Some(client_id) = self.client_id {
+            env.insert(
+                "SSH_MESH_ROUTE_CLIENT_ID".to_string(),
+                client_id.to_string(),
+            );
+        }
+        if let Ok(json) = serde_json::to_string(self) {
+            env.insert("MESH_INIT_CONTEXT_JSON".to_string(), json);
+        }
+        env
+    }
+}
+
 // ============================================================================
 // Requests
 // ============================================================================
@@ -25,6 +91,19 @@ pub enum Request {
         /// Additional env vars merged with the config's environment.
         #[serde(default)]
         env: HashMap<String, String>,
+        /// Optional activation context from the caller.
+        #[serde(default)]
+        context: Option<ActivationContext>,
+    },
+
+    /// Prepare context for a later socket activation connection.
+    ///
+    /// This is used when the control request and the activated stdin/stdout
+    /// socket are separate connections.
+    #[serde(rename = "prepare_activation")]
+    PrepareActivation {
+        name: String,
+        context: ActivationContext,
     },
 
     /// Start a terminal session using one passed file descriptor.
@@ -40,6 +119,8 @@ pub enum Request {
         gid: Option<u32>,
         #[serde(default)]
         env: HashMap<String, String>,
+        #[serde(default)]
+        context: Option<ActivationContext>,
     },
 
     /// Stop a running service.
@@ -201,6 +282,7 @@ mod tests {
             name: "chrome".to_string(),
             args: vec!["--headless".to_string()],
             env: HashMap::from([("DISPLAY".to_string(), ":0".to_string())]),
+            context: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"method\":\"start\""));

@@ -69,7 +69,10 @@ pub struct MeshListener {
 }
 
 impl MeshListener {
-    pub fn new(app_name: &str, listen_path: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        app_name: &str,
+        listen_path: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let auth = AuthConfig::load_for_app(app_name);
         let current_uid = unsafe { libc::getuid() };
 
@@ -116,34 +119,39 @@ impl MeshListener {
             ListenerMode::Stdio(false)
         };
 
-        Ok(Self { mode, auth, current_uid })
+        Ok(Self {
+            mode,
+            auth,
+            current_uid,
+        })
     }
 
     pub async fn accept(&mut self) -> Result<Option<MeshStream>, Box<dyn std::error::Error>> {
         match &mut self.mode {
-            ListenerMode::Uds(listener) => {
-                loop {
-                    let (stream, _) = listener.accept().await?;
-                    let peer_uid = stream.peer_cred()?.uid();
+            ListenerMode::Uds(listener) => loop {
+                let (stream, _) = listener.accept().await?;
+                let peer_uid = stream.peer_cred()?.uid();
 
-                    let is_authorized = match &self.auth {
-                        Some(a) => a.is_uid_authorized(peer_uid, self.current_uid),
-                        None => peer_uid == 0 || peer_uid == self.current_uid,
-                    };
+                let is_authorized = match &self.auth {
+                    Some(a) => a.is_uid_authorized(peer_uid, self.current_uid),
+                    None => peer_uid == 0 || peer_uid == self.current_uid,
+                };
 
-                    if is_authorized {
-                        return Ok(Some(MeshStream::Uds(stream)));
-                    } else {
-                        error!("MeshListener: Unauthorized UDS connection from UID {}", peer_uid);
-                    }
+                if is_authorized {
+                    return Ok(Some(MeshStream::Uds(stream)));
+                } else {
+                    error!(
+                        "MeshListener: Unauthorized UDS connection from UID {}",
+                        peer_uid
+                    );
                 }
-            }
+            },
             ListenerMode::Stdio(yielded) => {
                 if *yielded {
                     return Ok(None);
                 }
                 *yielded = true;
-                
+
                 // For stdio mode, mesh-init handles auth checking prior to activation
                 // No need to check X_PEER_UID here.
                 Ok(Some(MeshStream::Stdio {
@@ -172,7 +180,9 @@ pub async fn run_axum_server(
                 .await
             {
                 let err_str = err.to_string();
-                if !err_str.contains("connection error: not connected") && !err_str.contains("early eof") {
+                if !err_str.contains("connection error: not connected")
+                    && !err_str.contains("early eof")
+                {
                     error!("Error serving HTTP connection: {:?}", err);
                 }
             }

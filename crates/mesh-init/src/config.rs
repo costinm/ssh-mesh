@@ -131,7 +131,10 @@ wait = false
         assert_eq!(config.resources.cpu_weight, Some(100));
         assert_eq!(config.env.get("DISPLAY").unwrap(), ":0");
         assert_eq!(config.activation.len(), 2);
-        assert_eq!(config.activation[0].socket.as_deref(), Some("/run/mesh-init/chrome.sock"));
+        assert_eq!(
+            config.activation[0].socket.as_deref(),
+            Some("/run/mesh-init/chrome.sock")
+        );
         assert_eq!(config.activation[0].wait, true);
         assert_eq!(config.activation[1].port, Some(14022));
         assert_eq!(config.activation[1].wait, false);

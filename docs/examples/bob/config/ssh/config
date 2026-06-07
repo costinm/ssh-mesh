@@ -1,12 +1,12 @@
 # Example OpenSSH client entries installed at $HOME/.ssh/config for bob.
 
-Host alice-tcp
+Host bwrap-net-tcp
   HostName 127.0.0.1
   Port 18222
   User bob
 
-Host alice-http
-  HostName alice-over-http
+Host bwrap-net-http
+  HostName bwrap-net-over-http
   User bob
   ProxyCommand h2t http://127.0.0.1:18280/_m/_ssh
 

@@ -2840,18 +2840,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "python-wrapper"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.7.9",
- "pyo3",
- "serde",
- "ssh-mesh",
- "tokio",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3735,6 +3723,7 @@ version = "0.7.0-rc.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7011527e7cb07beea761652129ded405e47fdc153eb83dcc2dcefab39b50b08a"
 dependencies = [
+ "ed25519-dalek",
  "p256",
  "rand_core 0.10.1",
  "rsa",
@@ -3801,6 +3790,20 @@ dependencies = [
  "url",
  "utoipa",
  "x509-parser",
+]
+
+[[package]]
+name = "ssh-mesh-python"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "pyo3",
+ "serde",
+ "ssh-mesh",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

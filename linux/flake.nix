@@ -33,7 +33,7 @@
           src = kernelConfigSrc;
         };
 
-        vm-cloud-profile = pkgs.runCommand "initos-vm-cloud-profile" { } ''
+        initos-vm = pkgs.runCommand "initos-vm" { } ''
           mkdir -p "$out"/{bin,boot,img}
 
           ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
@@ -72,18 +72,33 @@
           EOF
         '';
 
+        initos-vm-image = pkgs.dockerTools.buildLayeredImage {
+          name = "ghcr.io/costinm/initos-vm";
+          tag = "latest";
+          contents = [
+            initos-vm
+            pkgs.bash
+            pkgs.coreutils
+          ];
+          config = {
+            Cmd = [ "${initos-vm}/bin/initos-vrun" ];
+            Env = [
+              "PATH=/bin:/usr/bin"
+            ];
+          };
+        };
+
       in
       {
         packages = {
-          inherit kernel-cloud 
-                  vm-cloud-profile;
-          default = vm-cloud-profile;
+          inherit kernel-cloud initos-vm initos-vm-image;
+          default = initos-vm;
         };
 
         apps = {
           vm-cloud = {
             type = "app";
-            program = "${vm-cloud-profile}/bin/initos-vrun";
+            program = "${initos-vm}/bin/initos-vrun";
           };
         };
       }

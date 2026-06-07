@@ -8,12 +8,12 @@
 //! Java launcher (`java/.../Main.java`) all start a single node using the same
 //! feature set. Keep them in sync when adding new capabilities.
 
+use ssh_mesh::sshc::SshClientManager;
+use ssh_mesh::{run_ssh_server, MeshNode, MeshNodeConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::Runtime;
-use ssh_mesh::{MeshNode, MeshNodeConfig, run_ssh_server};
-use ssh_mesh::sshc::SshClientManager;
 
 /// Opaque handle for a running mesh node instance.
 ///
@@ -38,7 +38,11 @@ pub struct MeshStreamHandle {
 /// Initialises the node from `base_dir`, spawns SSH server (and optionally
 /// HTTP server), and returns a handle that can be used for subsequent
 /// operations.
-pub fn start_mesh(base_dir: &str, ssh_port: i32, http_port: i32) -> Result<MeshHandle, anyhow::Error> {
+pub fn start_mesh(
+    base_dir: &str,
+    ssh_port: i32,
+    http_port: i32,
+) -> Result<MeshHandle, anyhow::Error> {
     let base_path = PathBuf::from(base_dir);
     let _ = std::fs::create_dir_all(&base_path);
 
@@ -46,8 +50,16 @@ pub fn start_mesh(base_dir: &str, ssh_port: i32, http_port: i32) -> Result<MeshH
 
     let mut cfg = MeshNodeConfig::default();
     cfg.base_dir = Some(base_path.clone());
-    cfg.ssh_port = if ssh_port > 0 { Some(ssh_port as u16) } else { Some(0) };
-    cfg.http_port = if http_port > 0 { Some(http_port as u16) } else { None };
+    cfg.ssh_port = if ssh_port > 0 {
+        Some(ssh_port as u16)
+    } else {
+        Some(0)
+    };
+    cfg.http_port = if http_port > 0 {
+        Some(http_port as u16)
+    } else {
+        None
+    };
 
     let node = Arc::new(MeshNode::new(Some(base_path.clone()), Some(cfg)));
 
@@ -119,7 +131,10 @@ pub fn mesh_connect(
     server_key: &str,
 ) -> Result<u64, anyhow::Error> {
     handle.runtime.block_on(async {
-        handle.client_manager.connect(host, port, user, server_key).await
+        handle
+            .client_manager
+            .connect(host, port, user, server_key)
+            .await
     })
 }
 
@@ -129,9 +144,9 @@ pub fn mesh_exec(
     conn_id: u64,
     command: &str,
 ) -> Result<String, anyhow::Error> {
-    let res = handle.runtime.block_on(async {
-        handle.client_manager.exec(conn_id, command).await
-    })?;
+    let res = handle
+        .runtime
+        .block_on(async { handle.client_manager.exec(conn_id, command).await })?;
     Ok(res.stdout)
 }
 
@@ -142,9 +157,9 @@ pub fn mesh_open_stream(
     host: &str,
     port: u16,
 ) -> Result<MeshStreamHandle, anyhow::Error> {
-    let stream = handle.runtime.block_on(async {
-        handle.client_manager.open_stream(conn_id, host, port).await
-    })?;
+    let stream = handle
+        .runtime
+        .block_on(async { handle.client_manager.open_stream(conn_id, host, port).await })?;
     Ok(MeshStreamHandle {
         stream,
         runtime_handle: handle.runtime.handle().clone(),
@@ -153,7 +168,12 @@ pub fn mesh_open_stream(
 
 /// Get the node's public key in OpenSSH format.
 pub fn mesh_get_public_key(handle: &MeshHandle) -> String {
-    handle.node.private_key().public_key().to_openssh().unwrap_or_default()
+    handle
+        .node
+        .private_key()
+        .public_key()
+        .to_openssh()
+        .unwrap_or_default()
 }
 
 /// Add a local port forward on an SSH connection.
@@ -165,7 +185,10 @@ pub fn mesh_add_local_forward(
     remote_port: u16,
 ) -> Result<(), anyhow::Error> {
     handle.runtime.block_on(async {
-        handle.client_manager.add_local_forward(conn_id, local_port, remote_host, remote_port).await
+        handle
+            .client_manager
+            .add_local_forward(conn_id, local_port, remote_host, remote_port)
+            .await
     })?;
     Ok(())
 }
@@ -179,23 +202,26 @@ pub fn mesh_add_remote_forward(
     local_port: u16,
 ) -> Result<u32, anyhow::Error> {
     handle.runtime.block_on(async {
-        handle.client_manager.add_remote_forward(conn_id, remote_port, local_host, local_port).await
+        handle
+            .client_manager
+            .add_remote_forward(conn_id, remote_port, local_host, local_port)
+            .await
     })
 }
 
 /// Read from a stream into a buffer. Returns the number of bytes read.
 pub fn stream_read(handle: &mut MeshStreamHandle, buf: &mut [u8]) -> Result<usize, anyhow::Error> {
-    let n = handle.runtime_handle.block_on(async {
-        handle.stream.read(buf).await
-    })?;
+    let n = handle
+        .runtime_handle
+        .block_on(async { handle.stream.read(buf).await })?;
     Ok(n)
 }
 
 /// Write data to a stream.
 pub fn stream_write(handle: &mut MeshStreamHandle, data: &[u8]) -> Result<(), anyhow::Error> {
-    handle.runtime_handle.block_on(async {
-        handle.stream.write_all(data).await
-    })?;
+    handle
+        .runtime_handle
+        .block_on(async { handle.stream.write_all(data).await })?;
     Ok(())
 }
 

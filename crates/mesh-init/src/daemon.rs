@@ -3,7 +3,7 @@
 //! Manages service lifecycle: loads configs, starts system services,
 //! handles control requests, manages signal handling and zombie reaping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{self, AppConfig};
 use crate::process::{self, ManagedProcess};
-use crate::protocol::{Request, Response, ServiceState, ServiceStatus};
+use crate::protocol::{ActivationContext, Request, Response, ServiceState, ServiceStatus};
 use crate::resource::ResourceManager;
 
 // ============================================================================
@@ -38,7 +38,15 @@ pub struct Daemon {
     pub services: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     /// All loaded configs, including those not yet started.
     pub configs: Arc<Mutex<HashMap<String, AppConfig>>>,
+    /// Context prepared by a control request for a later socket activation.
+    pub pending_activation_contexts: Arc<Mutex<HashMap<String, VecDeque<ActivationContext>>>>,
     resource_manager: Option<ResourceManager>,
+}
+
+fn apply_activation_context_env(config: &mut AppConfig, context: Option<ActivationContext>) {
+    if let Some(context) = context {
+        config.env.extend(context.to_env());
+    }
 }
 
 impl Daemon {
@@ -51,6 +59,7 @@ impl Daemon {
             config,
             services,
             configs: Arc::new(Mutex::new(HashMap::new())),
+            pending_activation_contexts: Arc::new(Mutex::new(HashMap::new())),
             resource_manager,
         })
     }
@@ -148,7 +157,15 @@ impl Daemon {
     /// Handle a control protocol request.
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
-            Request::Start { name, args, env } => self.handle_start(&name, args, env),
+            Request::Start {
+                name,
+                args,
+                env,
+                context,
+            } => self.handle_start(&name, args, env, context),
+            Request::PrepareActivation { name, context } => {
+                self.prepare_activation_context(name, context)
+            }
             Request::StartTerminal { .. } => {
                 Response::err("start_terminal requires a passed file descriptor")
             }
@@ -179,7 +196,8 @@ impl Daemon {
                 uid,
                 gid,
                 env,
-            } => self.handle_start_terminal(&name, &home, uid, gid, env, fd),
+                context,
+            } => self.handle_start_terminal(&name, &home, uid, gid, env, context, fd),
             _ => Response::err("request does not accept a passed file descriptor"),
         }
     }
@@ -193,6 +211,7 @@ impl Daemon {
         name: &str,
         extra_args: Vec<String>,
         extra_env: HashMap<String, String>,
+        context: Option<ActivationContext>,
     ) -> Response {
         // Attempt to reload the config from disk before checking state
         let mut config = {
@@ -292,6 +311,7 @@ impl Daemon {
         // Merge extra args and env
         config.args.extend(extra_args);
         config.env.extend(extra_env);
+        apply_activation_context_env(&mut config, context);
 
         // Check resource availability
         if let Some(ref rm) = self.resource_manager
@@ -313,6 +333,7 @@ impl Daemon {
         uid: u32,
         gid: Option<u32>,
         extra_env: HashMap<String, String>,
+        context: Option<ActivationContext>,
         fd: OwnedFd,
     ) -> Response {
         let home_path = std::path::Path::new(home);
@@ -382,6 +403,7 @@ impl Daemon {
             .entry("LOGNAME".to_string())
             .or_insert_with(|| name.to_string());
         config.env.extend(extra_env);
+        apply_activation_context_env(&mut config, context);
 
         let cg =
             crate::cgroup::create_cgroup(name).unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
@@ -389,6 +411,25 @@ impl Daemon {
             Ok(pid) => Response::ok_with_data(serde_json::json!({"pid": pid})),
             Err(e) => Response::err(e.to_string()),
         }
+    }
+
+    fn prepare_activation_context(&self, name: String, context: ActivationContext) -> Response {
+        let mut pending = self.pending_activation_contexts.lock();
+        let queue = pending.entry(name).or_default();
+        queue.push_back(context);
+        while queue.len() > 32 {
+            queue.pop_front();
+        }
+        Response::ok()
+    }
+
+    pub fn take_activation_context(&self, name: &str) -> Option<ActivationContext> {
+        let mut pending = self.pending_activation_contexts.lock();
+        let context = pending.get_mut(name).and_then(VecDeque::pop_front);
+        if pending.get(name).is_some_and(VecDeque::is_empty) {
+            pending.remove(name);
+        }
+        context
     }
 
     async fn handle_stop(&self, name: &str, signal: Option<i32>) -> Response {
@@ -861,6 +902,7 @@ priority = 300
                 ),
                 ("USER".to_string(), "alice".to_string()),
             ]),
+            context: None,
         };
 
         let response = daemon
@@ -904,6 +946,7 @@ priority = 300
                 current_gid.saturating_add(1)
             }),
             env: HashMap::new(),
+            context: None,
         };
 
         let response = daemon

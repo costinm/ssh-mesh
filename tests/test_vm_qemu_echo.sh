@@ -9,7 +9,7 @@ POD="${POD:-echo-hi-qemu-test}"
 VM_STATE="${VM_STATE:-${PROJECT_ROOT}/target/vm/${POD}}"
 SRC="${SRC:-${VM_STATE}/src}"
 LOG="${VM_STATE}/qemu.log"
-PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/vm-cloud-profile}"
+PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/initos-vm}"
 
 rm -rf "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
 mkdir -p "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
@@ -31,7 +31,7 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-nix build "path:${PROJECT_ROOT}/linux#vm-cloud-profile" -o "${PROFILE}"
+nix build "path:${PROJECT_ROOT}/linux#initos-vm" -o "${PROFILE}"
 
 timeout --foreground "${TIMEOUT:-90}s" \
   env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \

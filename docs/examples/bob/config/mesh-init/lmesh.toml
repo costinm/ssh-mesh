@@ -1,5 +1,5 @@
 # Local mesh discovery for bob. If the VM uses QEMU user networking, multicast
-# discovery may be limited; with tap/bridge networking it should discover alice
+# discovery may be limited; with tap/bridge networking it should discover bwrap-net
 # and user just like a normal host.
 
 [service]

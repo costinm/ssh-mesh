@@ -26,7 +26,10 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Build all packages
-        run: nix build .#ssh-mesh .#pmond .#h2t .#meshkeys .#sshmc --print-build-logs
+        run: nix build .#ssh-mesh .#pmond .#h2t .#meshkeys .#sshmc .#ssh-mesh-full --print-build-logs
+
+      - name: Build Nix Docker image
+        run: nix build .#sshm --print-build-logs
 
       - name: Create NAR archives
         run: |
@@ -37,13 +40,9 @@ jobs:
             nix-store --dump ./result > artifacts/${pkg}-x86_64-linux.nar
           done
 
-          # Also create a combined archive with all binaries
-          mkdir -p combined/bin
-          for pkg in ssh-mesh pmond h2t meshkeys sshmc; do
-            nix build .#${pkg} --print-build-logs
-            cp -L ./result/bin/* combined/bin/ 2>/dev/null || true
-          done
-          nix-store --dump combined > artifacts/ssh-mesh-all-x86_64-linux.nar
+          # Directly create combined NAR archive from the ssh-mesh-full build
+          nix build .#ssh-mesh-full --print-build-logs
+          nix-store --dump ./result > artifacts/ssh-mesh-all-x86_64-linux.nar
 
           ls -lh artifacts/
 

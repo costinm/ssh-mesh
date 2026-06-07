@@ -38,7 +38,7 @@ pub trait LineHandler: Send + Sync + 'static {
 /// Mesh application builder and runner
 pub struct MeshApp {
     config: MeshConfig,
-    /// Optional Axum router for HTTP/H2C server. 
+    /// Optional Axum router for HTTP/H2C server.
     router: Option<axum::Router>,
 }
 
@@ -106,7 +106,11 @@ impl MeshApp {
                 .unwrap_or_default()
                 .to_string_lossy();
 
-            let listen_path = self.config.http_uds_path.as_deref().unwrap_or("control.sock");
+            let listen_path = self
+                .config
+                .http_uds_path
+                .as_deref()
+                .unwrap_or("control.sock");
 
             crate::server::run_axum_server(&app, Some(listen_path), router.clone()).await?;
         } else {

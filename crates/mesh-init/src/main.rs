@@ -85,8 +85,10 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
 
     if let Some(command) = command {
         // Execution mode: start the CLI command, run control server in background, exit when done.
-        let server =
-            mesh_init::server::ControlServer::new(daemon.config.socket_path.clone(), daemon.clone());
+        let server = mesh_init::server::ControlServer::new(
+            daemon.config.socket_path.clone(),
+            daemon.clone(),
+        );
         tokio::spawn(async move {
             if let Err(e) = server.run().await {
                 tracing::error!("Control server error: {}", e);
@@ -133,8 +135,10 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
         daemon.shutdown().await;
     } else {
         // Daemon mode: run the control server in the foreground (blocks until shutdown).
-        let server =
-            mesh_init::server::ControlServer::new(daemon.config.socket_path.clone(), daemon.clone());
+        let server = mesh_init::server::ControlServer::new(
+            daemon.config.socket_path.clone(),
+            daemon.clone(),
+        );
         server.run().await?;
     }
 

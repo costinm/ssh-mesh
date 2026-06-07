@@ -1,4 +1,4 @@
-# MCP facade for pmond on alice.
+# MCP facade for pmond on bwrap-nonet.
 #
 # This demonstrates the MCP-over-UDS mode. The socket is:
 #

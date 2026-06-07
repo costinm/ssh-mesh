@@ -1,4 +1,4 @@
-# Local mesh discovery for alice.
+# Local mesh discovery for bwrap-net.
 #
 # lmesh announces on multicast UDP and serves a small UDS HTTP API at:
 #

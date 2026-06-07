@@ -1,0 +1,24 @@
+# Example OpenSSH client entries installed at $HOME/.ssh/config for bwrap-nonet.
+#
+# These are for human testing from inside the bwrap-nonet sandbox.
+
+Host bob-tcp
+  HostName 127.0.0.1
+  Port 18322
+  User bwrap-nonet
+
+Host bob-http
+  HostName bob-over-http
+  User bwrap-nonet
+  ProxyCommand h2t http://127.0.0.1:18380/_m/_ssh
+
+Host user-tcp
+  HostName 127.0.0.1
+  Port 18422
+  User bwrap-nonet
+
+Host user-http
+  HostName user-over-http
+  User bwrap-nonet
+  ProxyCommand h2t http://127.0.0.1:18480/_m/_ssh
+

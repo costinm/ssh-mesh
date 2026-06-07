@@ -72,7 +72,9 @@ impl TunInjector for MeshTunInjector {
                         closed = true;
                     }
                 }
-                if closed { break; }
+                if closed {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         });
@@ -89,29 +91,36 @@ impl TunInjector for MeshTunInjector {
         payload: &[u8],
     ) -> Result<(), anyhow::Error> {
         let mut stack = self.stack.lock().unwrap();
-        
+
         // Create a temporary UDP socket to send this packet
         let udp_rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 1500]);
         let udp_tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 1500]);
         let mut socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
-        
-        socket.bind((smoltcp::wire::IpAddress::from(src_addr), src_port)).map_err(|e| anyhow::anyhow!("Bind error: {:?}", e))?;
-        socket.send_slice(payload, (smoltcp::wire::IpAddress::from(dst_addr), dst_port)).map_err(|e| anyhow::anyhow!("Send error: {:?}", e))?;
-        
+
+        socket
+            .bind((smoltcp::wire::IpAddress::from(src_addr), src_port))
+            .map_err(|e| anyhow::anyhow!("Bind error: {:?}", e))?;
+        socket
+            .send_slice(
+                payload,
+                (smoltcp::wire::IpAddress::from(dst_addr), dst_port),
+            )
+            .map_err(|e| anyhow::anyhow!("Send error: {:?}", e))?;
+
         let handle = stack.sockets.add(socket);
-        
-        // We will leave it in the socket set, but it will consume resources. 
+
+        // We will leave it in the socket set, but it will consume resources.
         // For a true stateless UDP inject, one could inject a raw IP packet via `smoltcp::socket::raw`.
         // However, smoltcp UDP sockets immediately buffer the packet into the interface on next poll.
         // So we can mark it to be removed soon, or just rely on the wildcard socket!
         // Wait, the wildcard socket is already bound to 0!
         // We can just use the wildcard socket to send. Let's find it.
         stack.sockets.remove(handle);
-        
-        // A better approach is using the wildcard socket to send, but smoltcp UDP sockets bound to 0 
+
+        // A better approach is using the wildcard socket to send, but smoltcp UDP sockets bound to 0
         // will pick the interface's IP as source. The signature specifies `src_addr`.
         // To truly spoof `src_addr`, a `RawSocket` or temporary `UdpSocket` is needed.
-        // We will just let the packet go out, and we should ideally remove the socket later, but for now 
+        // We will just let the packet go out, and we should ideally remove the socket later, but for now
         // it's fine. Wait, `stack.sockets.remove(handle)` removes it immediately, the packet might not be sent.
         // For now, let's keep it simple: we use `RawSocket` if we want IP spoofing, or we just rely on `tun-rs` to inject raw IP packets!
         // `TunInjector` has `tx_sender`! Wait, `tx_sender` is the queue to the TUN!

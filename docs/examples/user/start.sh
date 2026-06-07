@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Start the user-mode example in bubblewrap using installed binaries.
 #
-# Unlike alice, this script does not remap to uid 0. mesh-init runs as the
+# Unlike bwrap-net, this script does not remap to uid 0. mesh-init runs as the
 # invoking non-root user and uses its ordinary HOME-relative defaults.
 
 export PATH="/out/ssh-mesh/bin:/opt/ssh-mesh/bin:${PATH}"
@@ -25,6 +25,7 @@ need h2t
 
 node="user"
 example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+examples_dir="$(cd "${example_dir}/.." && pwd)"
 root_dir="${SSH_MESH_EXAMPLE_ROOT:-${HOME}/.local/share/ssh-mesh/examples}"
 state_dir="${root_dir}/${node}"
 home_dir="${state_dir}/home/${node}"
@@ -60,7 +61,8 @@ mkdir -p \
   "${home_dir}/.run/mesh-init" \
   "${home_dir}/.run/ssh-mesh/mux" \
   "${home_dir}/.ssh" \
-  "${shared_dir}/${node}"
+  "${shared_dir}/${node}" \
+  "${shared_dir}/bwrap-nonet"
 
 cp "${example_dir}/config/mesh-init/"*.toml "${home_dir}/.config/mesh-init/"
 cp "${example_dir}/config/ssh-mesh/mesh.yaml" "${home_dir}/.config/ssh-mesh/mesh.yaml"
@@ -82,6 +84,8 @@ exec bwrap \
   --dir /home/user \
   --dir /tmp/mesh \
   --dir /tmp/mesh/shared \
+  --ro-bind "${examples_dir}" /examples \
+  --bind "${root_dir}" /tmp/mesh/state \
   --bind "${home_dir}" /home/user \
   --bind "${shared_dir}" /tmp/mesh/shared \
   --unshare-pid \
@@ -94,4 +98,5 @@ exec bwrap \
   --setenv LOGNAME user \
   --setenv PATH "/out/ssh-mesh/bin:/opt/ssh-mesh/bin:${PATH}" \
   --setenv RUST_LOG "${RUST_LOG:-info}" \
+  --setenv SSH_MESH_EXAMPLE_ROOT /tmp/mesh/state \
   mesh-init

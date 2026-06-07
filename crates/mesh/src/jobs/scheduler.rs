@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use tokio::sync::Mutex;
@@ -37,7 +37,10 @@ impl JobEntry {
             state: JobState::Pending,
             last_run: None,
             next_eligible: None,
-            scheduled_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            scheduled_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             failure_count: 0,
             work_items: Vec::new(),
         }
@@ -62,7 +65,10 @@ impl JobScheduler {
     }
 
     pub(crate) fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     pub async fn schedule(&self, config: JobConfig) -> Result<()> {
@@ -71,7 +77,7 @@ impl JobScheduler {
             tokio::fs::create_dir_all(&self.jobs_dir).await?;
             config.save(&self.jobs_dir).await?;
         }
-        
+
         let mut jobs = self.jobs.lock().await;
         let mut entry = JobEntry::new(config);
         if let Some(schedule) = &entry.config.schedule {
@@ -87,12 +93,12 @@ impl JobScheduler {
         let mut jobs = self.jobs.lock().await;
         if let Some(entry) = jobs.get_mut(job_name) {
             work.enqueued_at = chrono::Utc::now().to_rfc3339();
-            
+
             if entry.config.persisted {
                 let job_dir = self.jobs_dir.join(job_name);
                 work.save(&job_dir).await?;
             }
-            
+
             entry.work_items.push(work);
             Ok(())
         } else {
@@ -124,27 +130,27 @@ impl JobScheduler {
 
         let mut jobs_guard = self.jobs.lock().await;
         let mut entries = tokio::fs::read_dir(&self.jobs_dir).await?;
-        
+
         while let Some(file) = entries.next_entry().await? {
             let path = file.path();
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("toml") {
                 if let Ok(config) = JobConfig::load(&path).await {
                     let name = config.name.clone();
-                    
+
                     if !jobs_guard.contains_key(&name) {
                         let mut entry = JobEntry::new(config);
                         let job_dir = self.jobs_dir.join(&name);
-                        
+
                         if let Ok(work_items) = WorkItem::load_all(&job_dir).await {
                             entry.work_items = work_items;
                         }
-                        
+
                         jobs_guard.insert(name, entry);
                     }
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -174,30 +180,40 @@ impl JobScheduler {
                 }
             }
 
-            let deadline_passed = entry.config.schedule.as_ref()
+            let deadline_passed = entry
+                .config
+                .schedule
+                .as_ref()
                 .and_then(|s| s.override_deadline_secs)
                 .map(|d| now >= entry.scheduled_at + d)
                 .unwrap_or(false);
 
             let transient_trigger_fired = match &event {
-                SystemEvent::CustomCondition { key, value: true } => {
-                    entry.config.constraints.as_ref().map_or(false, |c| c.triggers.contains(key))
-                }
+                SystemEvent::CustomCondition { key, value: true } => entry
+                    .config
+                    .constraints
+                    .as_ref()
+                    .map_or(false, |c| c.triggers.contains(key)),
                 _ => false,
             };
 
-            if deadline_passed || Self::evaluate_constraints(&entry.config, &state, transient_trigger_fired) {
+            if deadline_passed
+                || Self::evaluate_constraints(&entry.config, &state, transient_trigger_fired)
+            {
                 // Execute
                 entry.state = JobState::Running;
                 entry.last_run = Some(now);
                 started.push(name.clone());
-                
+
                 // We'll execute async to avoid holding the lock
                 let executor = self.executor.clone();
                 let config = entry.config.clone();
                 let work_items = entry.work_items.clone();
-                let trace_tag = config.trace_tag.clone().unwrap_or_else(|| "none".to_string());
-                
+                let trace_tag = config
+                    .trace_tag
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string());
+
                 tokio::spawn(async move {
                     info!(trace_tag = %trace_tag, "JobScheduler starting job {}", config.name);
                     if let Err(e) = executor.execute(&config, &work_items).await {
@@ -210,12 +226,21 @@ impl JobScheduler {
         Ok(started)
     }
 
-    pub async fn job_finished(&self, name: &str, reschedule: bool, result: Option<WorkResult>) -> Result<()> {
+    pub async fn job_finished(
+        &self,
+        name: &str,
+        reschedule: bool,
+        result: Option<WorkResult>,
+    ) -> Result<()> {
         let mut jobs = self.jobs.lock().await;
         if let Some(entry) = jobs.get_mut(name) {
-            entry.state = if reschedule { JobState::Pending } else { JobState::Completed };
+            entry.state = if reschedule {
+                JobState::Pending
+            } else {
+                JobState::Completed
+            };
             let now = Self::now_secs();
-            
+
             if reschedule {
                 entry.failure_count += 1;
                 // apply backoff
@@ -230,7 +255,7 @@ impl JobScheduler {
                 entry.next_eligible = Some(now + backoff_secs);
             } else {
                 entry.failure_count = 0;
-                
+
                 if let Some(schedule) = &entry.config.schedule {
                     if let Some(periodic) = schedule.periodic_secs {
                         entry.state = JobState::Pending;
@@ -253,14 +278,18 @@ impl JobScheduler {
                 }
                 entry.work_items.clear();
             }
-            
+
             Ok(())
         } else {
             anyhow::bail!("Job not found")
         }
     }
 
-    fn evaluate_constraints(config: &JobConfig, state: &SystemState, transient_trigger_fired: bool) -> bool {
+    fn evaluate_constraints(
+        config: &JobConfig,
+        state: &SystemState,
+        transient_trigger_fired: bool,
+    ) -> bool {
         let Some(c) = &config.constraints else {
             return true;
         };
@@ -273,12 +302,16 @@ impl JobScheduler {
             match net {
                 NetworkType::None => {} // no req
                 NetworkType::Any => {
-                    if !state.network_connected { return false; }
+                    if !state.network_connected {
+                        return false;
+                    }
                 }
                 NetworkType::Unmetered | NetworkType::NotRoaming | NetworkType::Cellular => {
-                    if !state.network_connected { return false; }
+                    if !state.network_connected {
+                        return false;
+                    }
                     if state.network_type != *net {
-                        return false; 
+                        return false;
                     }
                 }
             }

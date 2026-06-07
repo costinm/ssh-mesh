@@ -113,7 +113,10 @@ impl AuthConfig {
     /// Otherwise, the identity's `id` or `email` must match at least one
     /// `[[peer]]` entry.
     pub fn is_peer_allowed(&self, identity: &PeerIdentity) -> bool {
-        let has_identity_rules = self.peers.iter().any(|p| p.id.is_some() || p.email.is_some());
+        let has_identity_rules = self
+            .peers
+            .iter()
+            .any(|p| p.id.is_some() || p.email.is_some());
         if !has_identity_rules {
             // No identity-based rules — accept all delegated identities.
             return true;
@@ -182,8 +185,8 @@ impl AuthConfig {
     /// Load an `AuthConfig` from a TOML file.
     pub fn load(path: &std::path::Path) -> Result<Self, crate::config::ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let config: AuthConfig = toml::from_str(&content)
-            .map_err(crate::config::ConfigError::Toml)?;
+        let config: AuthConfig =
+            toml::from_str(&content).map_err(crate::config::ConfigError::Toml)?;
         Ok(config)
     }
 
@@ -192,10 +195,7 @@ impl AuthConfig {
     /// Returns `None` if the file does not exist. Logs a warning on parse errors.
     pub fn load_for_app(app_name: &str) -> Option<Self> {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let path = std::path::PathBuf::from(format!(
-            "{}/.config/{}/auth.toml",
-            home, app_name
-        ));
+        let path = std::path::PathBuf::from(format!("{}/.config/{}/auth.toml", home, app_name));
         if !path.exists() {
             return None;
         }
@@ -507,14 +507,8 @@ mod tests {
     #[test]
     fn test_auth_pattern_subdomain_no_match() {
         assert!(!matches_delegate_pattern("*.example.com", "evil.com"));
-        assert!(!matches_delegate_pattern(
-            "*.example.com",
-            "notexample.com"
-        ));
-        assert!(!matches_delegate_pattern(
-            "*.example.com",
-            "fooexample.com"
-        ));
+        assert!(!matches_delegate_pattern("*.example.com", "notexample.com"));
+        assert!(!matches_delegate_pattern("*.example.com", "fooexample.com"));
     }
 
     #[test]
@@ -549,14 +543,8 @@ email = "bob@example.com"
         assert_eq!(config.peers.len(), 4);
         assert_eq!(config.peers[0].uid, Some(1000));
         assert_eq!(config.peers[1].delegate.as_deref(), Some("*.mesh.local"));
-        assert_eq!(
-            config.peers[2].id.as_deref(),
-            Some("worker-1.mesh.local")
-        );
-        assert_eq!(
-            config.peers[3].email.as_deref(),
-            Some("bob@example.com")
-        );
+        assert_eq!(config.peers[2].id.as_deref(), Some("worker-1.mesh.local"));
+        assert_eq!(config.peers[3].email.as_deref(), Some("bob@example.com"));
     }
 
     #[test]
@@ -573,23 +561,16 @@ email = "bob@example.com"
     fn test_auth_delegation_envelope_deserialize() {
         let json = r#"{"peer": {"id": "worker-1.mesh.local", "ip": "10.0.0.5"}}"#;
         let envelope: DelegationEnvelope = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            envelope.peer.id.as_deref(),
-            Some("worker-1.mesh.local")
-        );
+        assert_eq!(envelope.peer.id.as_deref(), Some("worker-1.mesh.local"));
         assert_eq!(envelope.peer.ip.as_deref(), Some("10.0.0.5"));
         assert_eq!(envelope.peer.email, None);
     }
 
     #[test]
     fn test_auth_delegation_envelope_with_email() {
-        let json =
-            r#"{"peer": {"id": "worker-1.mesh.local", "ip": "10.0.0.5", "email": "alice@mesh.local"}}"#;
+        let json = r#"{"peer": {"id": "worker-1.mesh.local", "ip": "10.0.0.5", "email": "alice@mesh.local"}}"#;
         let envelope: DelegationEnvelope = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            envelope.peer.email.as_deref(),
-            Some("alice@mesh.local")
-        );
+        assert_eq!(envelope.peer.email.as_deref(), Some("alice@mesh.local"));
     }
 
     #[test]

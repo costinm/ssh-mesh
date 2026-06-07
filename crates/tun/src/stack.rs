@@ -26,7 +26,9 @@ fn parse_packet_and_add_socket(stack: &mut TunStack, p: &[u8]) {
             if let Ok(ipv4) = smoltcp::wire::Ipv4Packet::new_checked(p) {
                 if ipv4.next_header() == smoltcp::wire::IpProtocol::Tcp {
                     if let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()) {
-                        if tcp.syn() && !tcp.ack() { dst_port = Some(tcp.dst_port()); }
+                        if tcp.syn() && !tcp.ack() {
+                            dst_port = Some(tcp.dst_port());
+                        }
                     }
                 }
             }
@@ -34,7 +36,9 @@ fn parse_packet_and_add_socket(stack: &mut TunStack, p: &[u8]) {
             if let Ok(ipv6) = smoltcp::wire::Ipv6Packet::new_checked(p) {
                 if ipv6.next_header() == smoltcp::wire::IpProtocol::Tcp {
                     if let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(ipv6.payload()) {
-                        if tcp.syn() && !tcp.ack() { dst_port = Some(tcp.dst_port()); }
+                        if tcp.syn() && !tcp.ack() {
+                            dst_port = Some(tcp.dst_port());
+                        }
                     }
                 }
             }
@@ -47,8 +51,13 @@ fn parse_packet_and_add_socket(stack: &mut TunStack, p: &[u8]) {
         for (handle, socket) in stack.sockets.iter_mut() {
             if let smoltcp::socket::Socket::Tcp(tcp) = socket {
                 if tcp.state() == tcp::State::Listen {
-                    if tcp.listen_endpoint().port == port { already_listening = true; break; }
-                } else if tcp.state() == tcp::State::Closed { idle_handle = Some(handle); }
+                    if tcp.listen_endpoint().port == port {
+                        already_listening = true;
+                        break;
+                    }
+                } else if tcp.state() == tcp::State::Closed {
+                    idle_handle = Some(handle);
+                }
             }
         }
         if !already_listening {
@@ -172,9 +181,9 @@ impl StackState {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        
+
         let mut interface = Interface::new(config, &mut device, smoltcp::time::Instant::now());
-        
+
         // Add IP address
         let ip_addr = match address {
             IpAddr::V4(v4) => IpAddress::Ipv4(v4.into()),
@@ -183,7 +192,7 @@ impl StackState {
         interface.update_ip_addrs(|addrs| {
             addrs.push(IpCidr::new(ip_addr, prefix_len)).unwrap();
         });
-        
+
         // Enable any IP to accept all incoming packets
         interface.set_any_ip(true);
 
@@ -198,8 +207,14 @@ impl StackState {
         }
 
         // Add one wildcard UDP socket to catch all incoming UDP traffic
-        let udp_rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; udp_sockets], vec![0; 1500 * udp_sockets]);
-        let udp_tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; udp_sockets], vec![0; 1500 * udp_sockets]);
+        let udp_rx_buffer = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; udp_sockets],
+            vec![0; 1500 * udp_sockets],
+        );
+        let udp_tx_buffer = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; udp_sockets],
+            vec![0; 1500 * udp_sockets],
+        );
         let mut udp_socket = UdpSocket::new(udp_rx_buffer, udp_tx_buffer);
         udp_socket.bind(53).unwrap();
         sockets.add(udp_socket);
@@ -238,31 +253,39 @@ impl StackState {
             let mut spawn_tcp_tasks = Vec::new();
             let mut spawn_udp_tasks = Vec::new();
             let mut spawn_dns_tasks = Vec::new();
-            
+
             let delay;
             {
                 let mut stack = self.stack.lock().unwrap();
                 let now = smoltcp::time::Instant::now();
-                let TunStack { interface, sockets, device, active_tcp_sockets } = &mut *stack;
+                let TunStack {
+                    interface,
+                    sockets,
+                    device,
+                    active_tcp_sockets,
+                } = &mut *stack;
                 processed = interface.poll(now, device, sockets);
 
                 // Handle incoming TCP connections
                 for (handle, socket) in sockets.iter_mut() {
                     if let smoltcp::socket::Socket::Tcp(tcp) = socket {
-                        if tcp.is_active() && tcp.state() != tcp::State::Listen && !active_tcp_sockets.contains(&handle) {
+                        if tcp.is_active()
+                            && tcp.state() != tcp::State::Listen
+                            && !active_tcp_sockets.contains(&handle)
+                        {
                             active_tcp_sockets.insert(handle);
                             sockets_to_replace.push(handle);
-                            
+
                             let local_ep = tcp.local_endpoint().unwrap();
                             let remote_ep = tcp.remote_endpoint().unwrap();
-                            
+
                             let meta = TunTcpMeta {
                                 src_addr: remote_ep.addr.into(),
                                 src_port: remote_ep.port,
                                 dst_addr: local_ep.addr.into(),
                                 dst_port: local_ep.port,
                             };
-                            
+
                             spawn_tcp_tasks.push((handle, meta));
                         }
                     }
@@ -284,11 +307,11 @@ impl StackState {
                                 let pkt = TunUdpPacket {
                                     src_addr: meta.endpoint.addr.into(),
                                     src_port: meta.endpoint.port,
-                                    dst_addr: "0.0.0.0".parse().unwrap(), 
+                                    dst_addr: "0.0.0.0".parse().unwrap(),
                                     dst_port: 0,
                                     payload: payload.to_vec(),
                                 };
-                                
+
                                 if pkt.src_port == 53 || pkt.dst_port == 53 {
                                     spawn_dns_tasks.push(pkt);
                                 } else {
@@ -318,7 +341,7 @@ impl StackState {
                         tcp_handler_clone.handle_tcp(meta, server_s).await;
                     });
                     let _ = tokio::io::copy_bidirectional(&mut client_s, &mut stack_s).await;
-            
+
                     // Wait for the socket to cleanly close before removing it
                     loop {
                         let mut closed = false;
@@ -336,7 +359,9 @@ impl StackState {
                                 closed = true;
                             }
                         }
-                        if closed { break; }
+                        if closed {
+                            break;
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 });

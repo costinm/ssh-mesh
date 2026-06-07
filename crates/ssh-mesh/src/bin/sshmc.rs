@@ -109,7 +109,8 @@ enum ForwardSpec {
 fn parse_forward_spec(s: &str, is_remote: bool) -> Result<ForwardSpec> {
     // Check if it looks like unix socket forwarding: /path/to/socket:/another/path
     if s.starts_with('/')
-        && let Some((listen, connect)) = s.split_once(':') {
+        && let Some((listen, connect)) = s.split_once(':')
+    {
         return Ok(ForwardSpec::Unix {
             listen_path: listen.to_string(),
             connect_path: connect.to_string(),
@@ -212,7 +213,10 @@ async fn main() -> Result<()> {
 
             let stream = UnixStream::connect(&control_uds_path)
                 .await
-                .context(format!("Failed to connect to control UDS at {:?}", control_uds_path))?;
+                .context(format!(
+                    "Failed to connect to control UDS at {:?}",
+                    control_uds_path
+                ))?;
 
             let (mut request_sender, connection) =
                 hyper::client::conn::http1::handshake(TokioIo::new(stream))

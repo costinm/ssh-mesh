@@ -1,7 +1,7 @@
 //! Local trace provides configurable telemetry with an in-memory buffer.
-//! 
+//!
 //! Events - trace, log, metrics, general purpose - are generated using rust tracing API.
-//! Events are held in a circular buffer - and can be accessed by other components 
+//! Events are held in a circular buffer - and can be accessed by other components
 //! in process.
 //!
 //! The events are also distributed via a Unix domain socket to one or more

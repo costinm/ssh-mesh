@@ -18,11 +18,12 @@ use std::time::SystemTime;
 
 use hyper::body::Bytes;
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{ConnectedClientInfo, MeshNode};
+use crate::{ConnectedClientInfo, MeshNode, SshRouteConfig};
 
 /// SshHandler is responsible for one server multiplexed connection.
 ///
@@ -133,6 +134,247 @@ impl SshHandler {
 
     pub(crate) fn set_trusted_transport(&mut self, trusted_transport: bool) {
         self.trusted_transport = trusted_transport;
+    }
+
+    fn matching_ssh_route(&self, command: Option<&str>) -> Option<SshRouteConfig> {
+        self.server
+            .cfg
+            .ssh_routes
+            .iter()
+            .find(|route| route_matches(route, &self.user, command))
+            .cloned()
+    }
+
+    fn matching_jump_route(&self, host: &str, port: u16) -> Option<SshRouteConfig> {
+        self.server
+            .cfg
+            .ssh_routes
+            .iter()
+            .find(|route| jump_route_matches(route, host, port))
+            .cloned()
+    }
+
+    fn activation_context(&self, command: Option<String>) -> mesh::protocol::ActivationContext {
+        mesh::protocol::ActivationContext {
+            kind: "ssh".to_string(),
+            user: self.user.clone(),
+            command,
+            certificate_user: self.cert_user.clone(),
+            peer_key_sha: if self.peer_key_sha.is_empty() {
+                None
+            } else {
+                Some(self.peer_key_sha.clone())
+            },
+            client_id: Some(self.id),
+            env: HashMap::new(),
+        }
+    }
+
+    fn jump_activation_context(
+        &self,
+        host: &str,
+        port: u16,
+        originator_ip: &str,
+        originator_port: u32,
+    ) -> mesh::protocol::ActivationContext {
+        mesh::protocol::ActivationContext {
+            kind: "ssh-direct-tcpip".to_string(),
+            user: self.user.clone(),
+            command: None,
+            certificate_user: self.cert_user.clone(),
+            peer_key_sha: if self.peer_key_sha.is_empty() {
+                None
+            } else {
+                Some(self.peer_key_sha.clone())
+            },
+            client_id: Some(self.id),
+            env: HashMap::from([
+                ("SSH_MESH_JUMP_HOST".to_string(), host.to_string()),
+                ("SSH_MESH_JUMP_PORT".to_string(), port.to_string()),
+                (
+                    "SSH_MESH_JUMP_ORIGINATOR_IP".to_string(),
+                    originator_ip.to_string(),
+                ),
+                (
+                    "SSH_MESH_JUMP_ORIGINATOR_PORT".to_string(),
+                    originator_port.to_string(),
+                ),
+            ]),
+        }
+    }
+
+    async fn prepare_route_activation(
+        activation_service: &str,
+        context: mesh::protocol::ActivationContext,
+    ) -> Result<(), anyhow::Error> {
+        let stream = UnixStream::connect(mesh_init_socket_path()).await?;
+        let mut stream = BufReader::new(stream);
+        let request = mesh::protocol::Request::PrepareActivation {
+            name: activation_service.to_string(),
+            context,
+        };
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        stream.get_mut().write_all(&line).await?;
+        stream.get_mut().flush().await?;
+
+        let mut response = String::new();
+        stream.read_line(&mut response).await?;
+        let response: mesh::protocol::Response = serde_json::from_str(response.trim())?;
+        if response.success {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "mesh-init rejected activation prepare: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string())
+            ))
+        }
+    }
+
+    async fn routed_connection_id(
+        server: &MeshNode,
+        route: &SshRouteConfig,
+        context: mesh::protocol::ActivationContext,
+    ) -> Result<u64, anyhow::Error> {
+        if let Some(id) = server
+            .route_connections
+            .lock()
+            .await
+            .get(&route.name)
+            .copied()
+        {
+            return Ok(id);
+        }
+
+        if let Some(service) = route.activation_service.as_deref() {
+            Self::prepare_route_activation(service, context).await?;
+        }
+
+        let id = server
+            .route_client_manager
+            .connect_with_config(&route.name, &route.client)
+            .await?;
+        server
+            .route_connections
+            .lock()
+            .await
+            .insert(route.name.clone(), id);
+        Ok(id)
+    }
+
+    async fn routed_exec(
+        server: MeshNode,
+        route: SshRouteConfig,
+        context: mesh::protocol::ActivationContext,
+        command: String,
+        channel_id: ChannelId,
+        session_handle: server::Handle,
+    ) -> Result<(), anyhow::Error> {
+        let id = Self::routed_connection_id(&server, &route, context.clone()).await?;
+        let result = match server.route_client_manager.exec(id, &command).await {
+            Ok(result) => result,
+            Err(first_error) => {
+                let _ = server.route_client_manager.disconnect(id).await;
+                server.route_connections.lock().await.remove(&route.name);
+                let id = Self::routed_connection_id(&server, &route, context).await?;
+                server
+                    .route_client_manager
+                    .exec(id, &command)
+                    .await
+                    .map_err(|retry_error| {
+                        anyhow::anyhow!(
+                            "route '{}' exec failed after reconnect: {}; first error: {}",
+                            route.name,
+                            retry_error,
+                            first_error
+                        )
+                    })?
+            }
+        };
+
+        if !result.stdout.is_empty() {
+            let _ = session_handle
+                .data(channel_id, Bytes::from(result.stdout))
+                .await;
+        }
+        if !result.stderr.is_empty() {
+            let _ = session_handle
+                .extended_data(channel_id, 1, Bytes::from(result.stderr))
+                .await;
+        }
+        let _ = session_handle
+            .exit_status_request(channel_id, result.exit_code)
+            .await;
+        let _ = session_handle.eof(channel_id).await;
+        let _ = session_handle.close(channel_id).await;
+        Ok(())
+    }
+
+    async fn routed_stream(
+        server: MeshNode,
+        route: SshRouteConfig,
+        context: mesh::protocol::ActivationContext,
+        host: String,
+        port: u16,
+    ) -> Result<tokio::io::DuplexStream, anyhow::Error> {
+        let id = Self::routed_connection_id(&server, &route, context.clone()).await?;
+        match server
+            .route_client_manager
+            .open_stream(id, &host, port)
+            .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(first_error) => {
+                let _ = server.route_client_manager.disconnect(id).await;
+                server.route_connections.lock().await.remove(&route.name);
+                let id = Self::routed_connection_id(&server, &route, context).await?;
+                server
+                    .route_client_manager
+                    .open_stream(id, &host, port)
+                    .await
+                    .map_err(|retry_error| {
+                        anyhow::anyhow!(
+                            "route '{}' stream failed after reconnect: {}; first error: {}",
+                            route.name,
+                            retry_error,
+                            first_error
+                        )
+                    })
+            }
+        }
+    }
+
+    async fn bridge_stream_to_channel(
+        stream: tokio::io::DuplexStream,
+        channel_id: ChannelId,
+        channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
+        session_handle: server::Handle,
+        label: String,
+    ) {
+        let (reader, writer) = tokio::io::split(stream);
+        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+        {
+            let mut writers = channel_writers.lock().await;
+            writers.insert(channel_id, tx);
+        }
+
+        let channel_writers_clone = channel_writers.clone();
+        let label_to_ssh = format!("{} to SSH", label);
+        tokio::spawn(async move {
+            crate::utils::pipe_read_to_ssh(reader, session_handle, channel_id, &label_to_ssh).await;
+            let mut writers = channel_writers_clone.lock().await;
+            writers.remove(&channel_id);
+        });
+
+        let channel_writers_clone = channel_writers.clone();
+        let label_from_ssh = format!("SSH to {}", label);
+        tokio::spawn(async move {
+            crate::utils::pipe_rx_to_write(rx, writer, &label_from_ssh).await;
+            let mut writers = channel_writers_clone.lock().await;
+            writers.remove(&channel_id);
+        });
     }
 
     /// Shared implementation for both exec_request and shell_request.
@@ -552,6 +794,55 @@ fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
     })
 }
 
+fn route_matches(route: &SshRouteConfig, user: &str, command: Option<&str>) -> bool {
+    if route.name.is_empty() {
+        return false;
+    }
+
+    let user_matches = match (&route.user, &route.user_prefix) {
+        (Some(expected), _) if user != expected => false,
+        (_, Some(prefix)) if !user.starts_with(prefix) => false,
+        (None, None) => false,
+        _ => true,
+    };
+    if !user_matches {
+        return false;
+    }
+
+    if let Some(expected) = &route.command
+        && command != Some(expected.as_str())
+    {
+        return false;
+    }
+    if let Some(prefix) = &route.command_prefix
+        && !command.is_some_and(|cmd| cmd.starts_with(prefix))
+    {
+        return false;
+    }
+    if let Some(needle) = &route.command_contains
+        && !command.is_some_and(|cmd| cmd.contains(needle))
+    {
+        return false;
+    }
+
+    true
+}
+
+fn jump_route_matches(route: &SshRouteConfig, host: &str, port: u16) -> bool {
+    let Some(jump_host) = &route.jump_host else {
+        return false;
+    };
+    if route.name.is_empty() || jump_host != host {
+        return false;
+    }
+    if let Some(jump_port) = route.jump_port
+        && jump_port != port
+    {
+        return false;
+    }
+    true
+}
+
 async fn send_terminal_to_mesh_init(
     terminal: MeshInitTerminal,
     slave: std::fs::File,
@@ -577,6 +868,7 @@ fn send_terminal_to_mesh_init_blocking(
             ("LOGNAME".to_string(), terminal.user),
             ("TERM".to_string(), "xterm-256color".to_string()),
         ]),
+        context: None,
     };
     let line = serde_json::to_string(&request)?;
     stream.write_all(line.as_bytes())?;
@@ -909,6 +1201,12 @@ impl server::Handler for SshHandler {
         let host = host_to_connect.to_string();
         let port = port_to_connect;
         let originator_ip = originator_ip_address.to_string();
+        let jump_route = u16::try_from(port)
+            .ok()
+            .and_then(|port| self.matching_jump_route(&host, port));
+        let jump_context = u16::try_from(port).ok().map(|port| {
+            self.jump_activation_context(&host, port, originator_ip_address, originator_port)
+        });
 
         let session_handle = session.handle();
 
@@ -939,6 +1237,48 @@ impl server::Handler for SshHandler {
             let mut sessions_lock = sessions.lock().await;
             sessions_lock.insert(channel_id, channel_session);
             drop(sessions_lock);
+
+            if let (Some(route), Some(context), Ok(incoming_port)) =
+                (jump_route, jump_context, u16::try_from(port))
+            {
+                let target_host = route.target_host.clone().unwrap_or_else(|| host.clone());
+                let target_port = route.target_port.unwrap_or(incoming_port);
+                match Self::routed_stream(
+                    me.server.clone(),
+                    route.clone(),
+                    context,
+                    target_host.clone(),
+                    target_port,
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        Self::bridge_stream_to_channel(
+                            stream,
+                            channel_id,
+                            me.channel_writers.clone(),
+                            session_handle,
+                            format!(
+                                "routed jump {}:{} via {}",
+                                target_host, target_port, route.name
+                            ),
+                        )
+                        .await;
+                        info!(
+                            "Routed jump established for {}:{} via {} to {}:{}",
+                            host, incoming_port, route.name, target_host, target_port
+                        );
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed routed jump for {}:{} via route '{}': {}",
+                            host, incoming_port, route.name, e
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
 
             // Handle "local" host - trigger callback
             if host == "local" {
@@ -1628,14 +1968,50 @@ impl server::Handler for SshHandler {
         let command = String::from_utf8_lossy(data).to_string();
         info!("Exec request: {} {}", command, self.id);
 
-        Self::spawn_command(
-            Some(command),
-            channel,
-            self.sessions.clone(),
-            self.channel_writers.clone(),
-            session,
-            None,
-        )
+        let route = self.matching_ssh_route(Some(&command));
+        let session_handle = session.handle();
+        let local_future = if route.is_none() {
+            Some(Self::spawn_command(
+                Some(command.clone()),
+                channel,
+                self.sessions.clone(),
+                self.channel_writers.clone(),
+                session,
+                None,
+            ))
+        } else {
+            None
+        };
+        let context = self.activation_context(Some(command.clone()));
+        let server = self.server.clone();
+
+        async move {
+            if let Some(future) = local_future {
+                return future.await;
+            }
+
+            if let Some(route) = route {
+                if let Err(e) = Self::routed_exec(
+                    server,
+                    route,
+                    context,
+                    command,
+                    channel,
+                    session_handle.clone(),
+                )
+                .await
+                {
+                    error!("Routed exec failed: {}", e);
+                    let _ = session_handle
+                        .extended_data(channel, 1, Bytes::from(format!("{}\n", e)))
+                        .await;
+                    let _ = session_handle.exit_status_request(channel, 255).await;
+                    let _ = session_handle.eof(channel).await;
+                    let _ = session_handle.close(channel).await;
+                }
+            }
+            Ok(())
+        }
     }
 
     #[instrument(skip(self, session), fields(channel_id = ?channel))]

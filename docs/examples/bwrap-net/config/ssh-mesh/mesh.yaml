@@ -1,6 +1,6 @@
-# ssh-mesh node configuration for alice.
+# ssh-mesh node configuration for bwrap-net.
 #
-# This file is installed by alice/start.sh at:
+# This file is installed by bwrap-net/start.sh at:
 #
 #   $HOME/.config/ssh-mesh/mesh.yaml
 #
@@ -12,22 +12,22 @@
 #
 # Capabilities shown by this node:
 #
-#   TCP SSH:          ssh -p 18222 alice@127.0.0.1
+#   TCP SSH:          ssh -p 18222 bwrap-net@127.0.0.1
 #   HTTP/admin:       curl http://127.0.0.1:18280/_m/api/ssh/clients
-#   SSH over HTTP/2:  ssh -o 'ProxyCommand h2t http://127.0.0.1:18280/_m/_ssh' alice@ignored
-#   HTTP UDS proxy:   POST /_m/_uds/home/alice/.run/pmond/control.sock
-#   Trusted UDS mux:  /tmp/mesh/shared/alice/trusted.sock
+#   SSH over HTTP/2:  ssh -o 'ProxyCommand h2t http://127.0.0.1:18280/_m/_ssh' bwrap-net@ignored
+#   HTTP UDS proxy:   POST /_m/_uds/home/bwrap-net/.run/pmond/control.sock
+#   Trusted UDS mux:  /tmp/mesh/shared/bwrap-net/trusted.sock
 
 ssh_port: 18222
 http_port: 18280
-trusted_uds_path: /tmp/mesh/shared/alice/trusted.sock
+trusted_uds_path: /tmp/mesh/shared/bwrap-net/trusted.sock
 
 # Maintained outgoing connections. These use trusted UDS because it works in
 # unprivileged bubblewrap without certificates, host keys, or root privileges.
 clients:
   user:
     transport: uds
-    user: alice
+    user: bwrap-net
     uds_path: /tmp/mesh/shared/user/trusted.sock
     keep_alive: true
     reconnect_interval_secs: 2

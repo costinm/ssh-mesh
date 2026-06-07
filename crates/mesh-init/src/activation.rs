@@ -1,14 +1,14 @@
 //! Socket activation for mesh-init services.
 //!
 //! Handles listening on TCP ports and UDS sockets on behalf of services.
-//! Uses the xinetd model: configurable inetd-style per-connection invocation or 
+//! Uses the xinetd model: configurable inetd-style per-connection invocation or
 //! xinetd-style pass-listening-FD behavior.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
-use tracing::{debug, error, info, warn};
 use tokio::io::unix::AsyncFd;
+use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use crate::daemon::Daemon;
@@ -61,12 +61,18 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
 
 async fn run_tcp_listener(port: u16, service_name: String, wait: bool, daemon: Arc<Daemon>) {
     let addr = format!("0.0.0.0:{}", port);
-    info!("Starting TCP activation listener for '{}' on {}", service_name, addr);
-    
+    info!(
+        "Starting TCP activation listener for '{}' on {}",
+        service_name, addr
+    );
+
     let listener = match std::net::TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
-            error!("Failed to bind TCP activation port {} for '{}': {}", port, service_name, e);
+            error!(
+                "Failed to bind TCP activation port {} for '{}': {}",
+                port, service_name, e
+            );
             return;
         }
     };
@@ -74,20 +80,26 @@ async fn run_tcp_listener(port: u16, service_name: String, wait: bool, daemon: A
         error!("Failed to set TCP listener non-blocking: {}", e);
         return;
     }
-    
+
     // Convert to OwnedFd to pass around generically
     let fd = listener.into();
     handle_listener(fd, service_name, wait, daemon).await;
 }
 
 async fn run_uds_listener(path: String, service_name: String, wait: bool, daemon: Arc<Daemon>) {
-    info!("Starting UDS activation listener for '{}' on {}", service_name, path);
+    info!(
+        "Starting UDS activation listener for '{}' on {}",
+        service_name, path
+    );
     let _ = std::fs::remove_file(&path);
-    
+
     let listener = match std::os::unix::net::UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
-            error!("Failed to bind UDS activation socket {} for '{}': {}", path, service_name, e);
+            error!(
+                "Failed to bind UDS activation socket {} for '{}': {}",
+                path, service_name, e
+            );
             return;
         }
     };
@@ -95,12 +107,17 @@ async fn run_uds_listener(path: String, service_name: String, wait: bool, daemon
         error!("Failed to set UDS listener non-blocking: {}", e);
         return;
     }
-    
+
     let fd = listener.into();
     handle_listener(fd, service_name, wait, daemon).await;
 }
 
-async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool, daemon: Arc<Daemon>) {
+async fn handle_listener(
+    listener_fd: OwnedFd,
+    service_name: String,
+    wait: bool,
+    daemon: Arc<Daemon>,
+) {
     let async_fd = match AsyncFd::new(listener_fd) {
         Ok(afd) => afd,
         Err(e) => {
@@ -127,12 +144,22 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
             // But we must wait for the child to exit before polling again.
 
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
-            if let Some(config) = config_opt {
+            if let Some(mut config) = config_opt {
                 if config.auth.is_some() {
-                    warn!("Auth configuration is ignored for wait=true activation on service '{}'", service_name);
+                    warn!(
+                        "Auth configuration is ignored for wait=true activation on service '{}'",
+                        service_name
+                    );
                 }
 
-                let passed_fd = async_fd.get_ref().try_clone().ok()
+                if let Some(context) = daemon.take_activation_context(&service_name) {
+                    config.env.extend(context.to_env());
+                }
+
+                let passed_fd = async_fd
+                    .get_ref()
+                    .try_clone()
+                    .ok()
                     .map(ActivationFd::Listen);
                 if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
                     error!("Failed to activate service {}: {}", service_name, e);
@@ -151,7 +178,7 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
                     }
                 }
             }
-            
+
             // Re-arm readiness (since child accepted the connection hopefully)
             guard.clear_ready();
         } else {
@@ -159,8 +186,9 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
             // We accept the connection and pass the client socket.
             // Since we're working with raw FDs, we'll use libc::accept or tokio wrapper.
             let raw_fd = async_fd.get_ref().as_raw_fd();
-            let client_fd = unsafe { libc::accept(raw_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
-            
+            let client_fd =
+                unsafe { libc::accept(raw_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+
             if client_fd < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -179,6 +207,10 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
 
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
             if let Some(mut config) = config_opt {
+                if let Some(context) = daemon.take_activation_context(&service_name) {
+                    config.env.extend(context.to_env());
+                }
+
                 // UDS peer auth check
                 if let Some(ref auth) = config.auth {
                     // Get peer UID from the accepted client fd
@@ -201,16 +233,14 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
                             // Delegate: env vars will be set by the service itself
                             // after reading the delegation envelope from stdin.
                             // We just mark the connection as delegated.
-                            config.env.insert(
-                                "X_PEER_DELEGATE_UID".to_string(),
-                                peer_uid.to_string(),
-                            );
+                            config
+                                .env
+                                .insert("X_PEER_DELEGATE_UID".to_string(), peer_uid.to_string());
                         } else {
                             // Direct peer: set UID env var
-                            config.env.insert(
-                                "X_PEER_UID".to_string(),
-                                peer_uid.to_string(),
-                            );
+                            config
+                                .env
+                                .insert("X_PEER_UID".to_string(), peer_uid.to_string());
                         }
                     } else {
                         // Peer UID is None (e.g. TCP connection), but auth is configured
@@ -225,15 +255,22 @@ async fn handle_listener(listener_fd: OwnedFd, service_name: String, wait: bool,
 
                 let cg = crate::cgroup::create_cgroup(&service_name)
                     .unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
-                
+
                 // Spawn the process directly, passing the client socket.
                 // We do NOT use start_service_with_config because there could be multiple instances.
-                match crate::process::spawn_process(&config, &cg, Some(ActivationFd::Stdio(client_owned))) {
+                match crate::process::spawn_process(
+                    &config,
+                    &cg,
+                    Some(ActivationFd::Stdio(client_owned)),
+                ) {
                     Ok(pid) => {
                         debug!("Spawned activated instance (wait=false) PID {}", pid);
                     }
                     Err(e) => {
-                        error!("Failed to spawn activated instance for {}: {}", service_name, e);
+                        error!(
+                            "Failed to spawn activated instance for {}: {}",
+                            service_name, e
+                        );
                     }
                 }
             }

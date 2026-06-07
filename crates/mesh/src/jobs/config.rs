@@ -31,7 +31,8 @@ pub struct WorkResult {
 
 impl JobConfig {
     pub fn parse(content: &str) -> Result<Self> {
-        crate::config::parse_toml(content).map_err(|e| anyhow::anyhow!("Failed to parse JobConfig from TOML: {}", e))
+        crate::config::parse_toml(content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse JobConfig from TOML: {}", e))
     }
 
     pub async fn load(path: &Path) -> Result<Self> {
@@ -75,12 +76,18 @@ impl JobConfig {
             estimated_download_bytes: self.estimated_download_bytes,
             estimated_upload_bytes: self.estimated_upload_bytes,
             minimum_network_chunk_bytes: self.minimum_network_chunk_bytes,
-            peers: self.auth.as_ref().map(|a| a.peers.clone()).unwrap_or_default(),
+            peers: self
+                .auth
+                .as_ref()
+                .map(|a| a.peers.clone())
+                .unwrap_or_default(),
         };
-        
+
         let content = toml::to_string_pretty(&file)?;
         let path = dir.join(format!("{}.toml", self.name));
-        fs::write(&path, content).await.context("Failed to write JobConfig")
+        fs::write(&path, content)
+            .await
+            .context("Failed to write JobConfig")
     }
 }
 
@@ -109,17 +116,19 @@ impl WorkItem {
         fs::create_dir_all(&work_dir).await?;
         let content = toml::to_string_pretty(self)?;
         let path = work_dir.join(format!("{}.toml", self.id));
-        fs::write(&path, content).await.context("Failed to save WorkItem")
+        fs::write(&path, content)
+            .await
+            .context("Failed to save WorkItem")
     }
 
     pub async fn complete(&self, job_dir: &Path, result: Option<WorkResult>) -> Result<()> {
         let work_dir = job_dir.join("work");
         let completed_dir = job_dir.join("completed");
         fs::create_dir_all(&completed_dir).await?;
-        
+
         let src = work_dir.join(format!("{}.toml", self.id));
         let dst = completed_dir.join(format!("{}.toml", self.id));
-        
+
         if src.exists() {
             fs::rename(&src, &dst).await?;
         }
@@ -129,7 +138,7 @@ impl WorkItem {
             let res_dst = completed_dir.join(format!("{}_result.toml", self.id));
             fs::write(&res_dst, res_content).await?;
         }
-        
+
         Ok(())
     }
 }

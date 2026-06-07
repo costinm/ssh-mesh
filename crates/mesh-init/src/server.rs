@@ -245,6 +245,7 @@ mod tests {
             name: "test".to_string(),
             args: vec![],
             env: std::collections::HashMap::new(),
+            context: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();

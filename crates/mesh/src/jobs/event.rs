@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use super::config::NetworkType;
 
@@ -7,15 +7,32 @@ use super::config::NetworkType;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SystemEvent {
-    NetworkChanged { network_type: NetworkType, connected: bool },
-    ChargingChanged { is_charging: bool },
-    IdleChanged { is_idle: bool },
-    BatteryChanged { level: u8, is_low: bool },
-    StorageChanged { is_low: bool },
-    ContentChanged { uri: String },
+    NetworkChanged {
+        network_type: NetworkType,
+        connected: bool,
+    },
+    ChargingChanged {
+        is_charging: bool,
+    },
+    IdleChanged {
+        is_idle: bool,
+    },
+    BatteryChanged {
+        level: u8,
+        is_low: bool,
+    },
+    StorageChanged {
+        is_low: bool,
+    },
+    ContentChanged {
+        uri: String,
+    },
     BootCompleted,
     TimerTick,
-    CustomCondition { key: String, value: bool },
+    CustomCondition {
+        key: String,
+        value: bool,
+    },
 }
 
 /// Snapshot of current system state, maintained by the scheduler.
@@ -34,7 +51,10 @@ pub struct SystemState {
 impl SystemState {
     pub fn update(&mut self, event: &SystemEvent) {
         match event {
-            SystemEvent::NetworkChanged { network_type, connected } => {
+            SystemEvent::NetworkChanged {
+                network_type,
+                connected,
+            } => {
                 self.network_type = network_type.clone();
                 self.network_connected = *connected;
             }

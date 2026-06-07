@@ -9,10 +9,10 @@
 //! Both wrappers share common logic in `mesh_common`.
 
 // Re-export workspace crates
-pub use ssh_mesh;
-pub use pmond;
 pub use lmesh;
 pub use mesh_tun;
+pub use pmond;
+pub use ssh_mesh;
 
 pub mod mesh_common;
 

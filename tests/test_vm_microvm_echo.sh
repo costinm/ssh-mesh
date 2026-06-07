@@ -8,7 +8,7 @@ cd "${PROJECT_ROOT}"
 FLAKE_DIR="${PROJECT_ROOT}/tests/microvm-echo"
 WORK="${WORK:-${PROJECT_ROOT}/target/vm/microvm-echo}"
 SHARE="${WORK}/share"
-PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/vm-cloud-profile}"
+PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/initos-vm}"
 MICROVM_HYPERVISOR="${MICROVM_HYPERVISOR:-crosvm}"
 RUNNER_PACKAGE="runner-${MICROVM_HYPERVISOR}"
 RUNNER_LINK="${WORK}/${RUNNER_PACKAGE}"
@@ -51,7 +51,7 @@ esac
 EOF
 chmod 755 "${SHARE}/initos/initos-pod"
 
-nix build "path:${PROJECT_ROOT}/linux#vm-cloud-profile" -o "${PROFILE}"
+nix build "path:${PROJECT_ROOT}/linux#initos-vm" -o "${PROFILE}"
 PROFILE_REAL="$(readlink -f "${PROFILE}")"
 
 flake_hash="$(printf '%s\n' "${PROFILE_REAL}" "${MICROVM_HYPERVISOR}" "$(sha256sum "${FLAKE_DIR}/flake.nix" | awk '{print $1}')" | sha256sum | awk '{print $1}')"

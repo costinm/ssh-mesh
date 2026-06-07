@@ -1,7 +1,7 @@
 //! Trace server: HTTP server for observability hub.
 //!
 //! Discovers UDS trace sockets in a base directory, aggregates logs,
-//! and serves a rich trace viewer UI. 
+//! and serves a rich trace viewer UI.
 
 use axum::{
     extract::{Query, State},

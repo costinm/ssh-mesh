@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
+
 set -e
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+src=${src:-${PROJECT_ROOT}}
+out=${out:-${src}/target}
+
+export NIX_PROFILE=${out}/ssh-mesh-profile
+export PATH=${PATH}:${NIX_PROFILE}/bin
 
 # Function to install the latest Nix with Flakes enabled
 install_nix() {
@@ -32,16 +44,24 @@ update_flake() {
     nix --extra-experimental-features "nix-command flakes" flake update
 }
 
-# Function to enter the development shell
-develop() {
-    echo "Entering Nix development shell..."
-    nix --extra-experimental-features "nix-command flakes" develop
-}
+# # Function to enter the development shell
+# develop() {
+#     echo "Entering Nix development shell..."
+#     nix --extra-experimental-features "nix-command flakes" develop
+# }
 
 # Function to run the default package
 run() {
     echo "Running default application with Nix..."
     nix --extra-experimental-features "nix-command flakes" run .
+}
+
+setup() {
+
+  nix profile add linux --profile target/ssh-mesh-profile
+  # list, upgrade
+  export PATH="~/my-custom-dev-profile/bin:$PATH"
+
 }
 
 # Function to show help message

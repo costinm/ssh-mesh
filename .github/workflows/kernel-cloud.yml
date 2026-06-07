@@ -49,11 +49,11 @@ jobs:
           name: ssh-mesh-kernel-cloud
           path: ssh-mesh-kernel-cloud.tar.gz
 
-      - name: Build VM cloud profile image
-        run: nix build .#vm-cloud-profile-image -o result-vm-cloud-profile-image --print-build-logs
+      - name: Build initos VM image
+        run: nix build ./linux#initos-vm-image -o result-initos-vm-image --print-build-logs
 
-      - name: Load VM cloud profile image
-        run: docker load < result-vm-cloud-profile-image
+      - name: Load initos VM image
+        run: docker load < result-initos-vm-image
 
       - name: Log in to the Container registry
         if: github.event_name != 'pull_request'
@@ -63,6 +63,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push VM cloud profile image
+      - name: Push initos VM image
         if: github.event_name != 'pull_request'
-        run: docker push ghcr.io/costinm/ssh-mesh-vm-cloud-profile:latest
+        run: docker push ghcr.io/costinm/initos-vm:latest

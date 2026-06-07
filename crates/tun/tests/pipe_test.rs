@@ -1,4 +1,6 @@
-use mesh::tun::{TunDnsHandler, TunInjector, TunTcpHandler, TunTcpMeta, TunUdpHandler, TunUdpPacket};
+use mesh::tun::{
+    TunDnsHandler, TunInjector, TunTcpHandler, TunTcpMeta, TunUdpHandler, TunUdpPacket,
+};
 use mesh_tun::{MeshTun, MeshTunConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -44,8 +46,12 @@ async fn test_pipe_tun() {
 
     let count = Arc::new(AtomicUsize::new(0));
 
-    let tcp1 = Arc::new(MockTcpHandler { count: count.clone() });
-    let tcp2 = Arc::new(MockTcpHandler { count: count.clone() });
+    let tcp1 = Arc::new(MockTcpHandler {
+        count: count.clone(),
+    });
+    let tcp2 = Arc::new(MockTcpHandler {
+        count: count.clone(),
+    });
 
     let udp = Arc::new(MockUdpHandler);
     let dns = Arc::new(MockDnsHandler);
@@ -53,8 +59,14 @@ async fn test_pipe_tun() {
     let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    let (inj1, tun1_tx, mut stack1_rx) = tun1.run_with_channels(tcp1, udp.clone(), dns.clone(), tx1, rx1).await.unwrap();
-    let (_inj2, tun2_tx, mut stack2_rx) = tun2.run_with_channels(tcp2, udp.clone(), dns.clone(), tx2, rx2).await.unwrap();
+    let (inj1, tun1_tx, mut stack1_rx) = tun1
+        .run_with_channels(tcp1, udp.clone(), dns.clone(), tx1, rx1)
+        .await
+        .unwrap();
+    let (_inj2, tun2_tx, mut stack2_rx) = tun2
+        .run_with_channels(tcp2, udp.clone(), dns.clone(), tx2, rx2)
+        .await
+        .unwrap();
 
     // Bridge the two stacks
     tokio::spawn(async move {
@@ -81,7 +93,7 @@ async fn test_pipe_tun() {
         .expect("Failed to connect");
 
     stream.write_all(b"hello").await.unwrap();
-    
+
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"hello");

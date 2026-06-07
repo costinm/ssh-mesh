@@ -81,7 +81,8 @@ impl MeshTun {
 
         if let Some(fd) = self.config.fd {
             // Android VPN Mode (or pre-opened TUN fd)
-            let tun = unsafe { tun_rs::AsyncDevice::from_fd(fd) }.map_err(|e| anyhow::anyhow!("TUN FD error: {}", e))?;
+            let tun = unsafe { tun_rs::AsyncDevice::from_fd(fd) }
+                .map_err(|e| anyhow::anyhow!("TUN FD error: {}", e))?;
             let tun_arc = Arc::new(tun);
             let tun_read = tun_arc.clone();
             let tun_write = tun_arc;
@@ -107,14 +108,17 @@ impl MeshTun {
                 }
             });
         } else {
-            // Test Mode: We leave the queues open. Tests can push/pull to them if we exposed them, 
+            // Test Mode: We leave the queues open. Tests can push/pull to them if we exposed them,
             // but for a pipe test, we can just use the config fd or we expose a method to inject.
             // Wait, tun-rs also supports creating a real TUN by name.
             let mut builder = tun_rs::DeviceBuilder::new();
             if let Some(name) = &self.config.name {
                 builder = builder.name(name);
             }
-            let tun = builder.mtu(self.config.mtu as u16).build_async().map_err(|e| anyhow::anyhow!("TUN create error: {}", e))?;
+            let tun = builder
+                .mtu(self.config.mtu as u16)
+                .build_async()
+                .map_err(|e| anyhow::anyhow!("TUN create error: {}", e))?;
             let tun_arc = Arc::new(tun);
             let tun_read = tun_arc.clone();
             let tun_write = tun_arc;
@@ -142,7 +146,9 @@ impl MeshTun {
         }
 
         tokio::spawn(async move {
-            stack_state.run_loop(tcp_handler, udp_handler, dns_handler, tun_rx).await;
+            stack_state
+                .run_loop(tcp_handler, udp_handler, dns_handler, tun_rx)
+                .await;
         });
 
         Ok(injector)
@@ -156,7 +162,14 @@ impl MeshTun {
         dns_handler: Arc<dyn mesh::tun::TunDnsHandler>,
         _tun_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
         _stack_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    ) -> Result<(Arc<dyn mesh::tun::TunInjector>, tokio::sync::mpsc::UnboundedSender<Vec<u8>>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>), anyhow::Error> {
+    ) -> Result<
+        (
+            Arc<dyn mesh::tun::TunInjector>,
+            tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+            tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        ),
+        anyhow::Error,
+    > {
         let (inner_tun_tx, tun_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stack_tx, inner_stack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -174,7 +187,9 @@ impl MeshTun {
         let injector = Arc::new(injector::MeshTunInjector::new(stack_arc, waker));
 
         tokio::spawn(async move {
-            stack_state.run_loop(tcp_handler, udp_handler, dns_handler, tun_rx).await;
+            stack_state
+                .run_loop(tcp_handler, udp_handler, dns_handler, tun_rx)
+                .await;
         });
 
         Ok((injector, inner_tun_tx, inner_stack_rx))

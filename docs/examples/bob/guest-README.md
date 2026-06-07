@@ -49,7 +49,7 @@ export MESH_INIT_SOCK=$HOME/.run/mesh-init/control.sock
 mesh-init
 ```
 
-With that contract, bob uses the same HOME-relative layout as alice and user:
+With that contract, bob uses the same HOME-relative layout as bwrap-net and user:
 
 ```text
 $HOME/.config/mesh-init/*.toml

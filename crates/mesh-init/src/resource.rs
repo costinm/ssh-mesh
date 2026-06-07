@@ -206,11 +206,7 @@ impl ResourceManager {
                 warn!(
                     "Cannot start '{}': memory.low admission failed. \
                      committed={} + new={} = {} > available={}",
-                    config.name,
-                    committed,
-                    new_low,
-                    total_needed,
-                    available
+                    config.name, committed, new_low, total_needed, available
                 );
                 return false;
             }

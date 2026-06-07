@@ -147,6 +147,45 @@ fn default_client_transport() -> String {
     "tcp".to_string()
 }
 
+/// SSH session routing rule.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct SshRouteConfig {
+    /// Logical route name, also used as the cached connection key.
+    pub name: String,
+    /// Exact incoming SSH username to match.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Prefix match for incoming SSH username.
+    #[serde(default)]
+    pub user_prefix: Option<String>,
+    /// Exact command to match.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Prefix match for incoming command.
+    #[serde(default)]
+    pub command_prefix: Option<String>,
+    /// Substring match for incoming command.
+    #[serde(default)]
+    pub command_contains: Option<String>,
+    /// Exact incoming direct-tcpip host to match for jump-host routing.
+    #[serde(default)]
+    pub jump_host: Option<String>,
+    /// Exact incoming direct-tcpip port to match for jump-host routing.
+    #[serde(default)]
+    pub jump_port: Option<u16>,
+    /// Host to connect to from inside the routed target. Defaults to the incoming host.
+    #[serde(default)]
+    pub target_host: Option<String>,
+    /// Port to connect to from inside the routed target. Defaults to the incoming port.
+    #[serde(default)]
+    pub target_port: Option<u16>,
+    /// Optional mesh-init service to prepare before connecting.
+    #[serde(default)]
+    pub activation_service: Option<String>,
+    /// Client connection to use after activation.
+    pub client: SshClientConfig,
+}
+
 /// Configurable fields for MeshNode, loadable from JSON or YAML.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MeshNodeConfig {
@@ -196,6 +235,10 @@ pub struct MeshNodeConfig {
     /// Keys are logical names; values are `SshClientConfig` entries.
     #[serde(default)]
     pub clients: HashMap<String, SshClientConfig>,
+
+    /// Incoming SSH exec/shell routing rules.
+    #[serde(default)]
+    pub ssh_routes: Vec<SshRouteConfig>,
 }
 
 pub trait MeshListener: Send + Sync {
@@ -215,6 +258,8 @@ pub struct MeshNode {
     pub active_handlers:
         Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<sshd::SshHandler>>>>>,
     pub connected_clients: Arc<tokio::sync::Mutex<HashMap<u64, ConnectedClientInfo>>>,
+    pub route_client_manager: Arc<sshc::SshClientManager>,
+    pub route_connections: Arc<tokio::sync::Mutex<HashMap<String, u64>>>,
     pub server_handle:
         Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>>,
     pub listeners: Arc<tokio::sync::Mutex<Vec<Arc<dyn MeshListener>>>>,
@@ -338,6 +383,13 @@ impl MeshNode {
             info!("Added {} CA keys from config", config_cas.len());
         }
 
+        let route_client_manager = Arc::new(sshc::SshClientManager::new(
+            keys.clone(),
+            ca_keys_vec.clone(),
+            None,
+            None,
+        ));
+
         MeshNode {
             cfg,
             keys,
@@ -347,6 +399,8 @@ impl MeshNode {
             ca_keys: Arc::new(ca_keys_vec),
             active_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             connected_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            route_client_manager,
+            route_connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             server_handle: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }

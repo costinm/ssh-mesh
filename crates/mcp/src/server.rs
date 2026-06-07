@@ -48,11 +48,11 @@ pub async fn run_mcp_server(
 
     while let Some(stream) = listener.accept().await? {
         let proc_mon_clone = proc_mon.clone();
-        
+
         tokio::spawn(async move {
             let handler = PmonMcpHandler::new(proc_mon_clone);
             let (read, write) = tokio::io::split(stream);
-            
+
             // `serve()` takes an `AsyncRead + AsyncWrite` implementation.
             if let Err(e) = handler.serve((read, write)).await {
                 error!("MCP session error: {}", e);
@@ -61,6 +61,6 @@ pub async fn run_mcp_server(
             }
         });
     }
-    
+
     Ok(())
 }

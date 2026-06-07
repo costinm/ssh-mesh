@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start alice in bubblewrap using installed binaries.
+# Start bwrap-net in bubblewrap using installed binaries.
 #
 # This example intentionally uses the default HOME-relative runtime layout:
 #
@@ -10,7 +10,7 @@ set -euo pipefail
 #   $HOME/.ssh
 #   $HOME/.run
 #
-# The only ssh-mesh-specific override is MESH_INIT_SOCK, because alice runs as
+# The only ssh-mesh-specific override is MESH_INIT_SOCK, because bwrap-net runs as
 # uid 0 inside the bwrap user namespace while mesh-init is kept in the
 # HOME-relative user layout for readability.
 
@@ -31,7 +31,7 @@ need lmesh
 need mcp-pmond
 need h2t
 
-node="alice"
+node="bwrap-net"
 example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="${SSH_MESH_EXAMPLE_ROOT:-${HOME}/.local/share/ssh-mesh/examples}"
 state_dir="${root_dir}/${node}"
@@ -76,8 +76,8 @@ cp "${example_dir}/config/ssh/config" "${home_dir}/.ssh/config"
 chmod 700 "${home_dir}/.ssh"
 chmod 600 "${home_dir}/.ssh/config"
 
-echo "alice HOME: ${home_dir}"
-echo "alice shared sockets: ${shared_dir}/${node}"
+echo "bwrap-net HOME: ${home_dir}"
+echo "bwrap-net shared sockets: ${shared_dir}/${node}"
 
 exec bwrap \
   --tmpfs / \
@@ -87,10 +87,10 @@ exec bwrap \
   --tmpfs /tmp \
   --tmpfs /run \
   --tmpfs /home \
-  --dir /home/alice \
+  --dir /home/bwrap-net \
   --dir /tmp/mesh \
   --dir /tmp/mesh/shared \
-  --bind "${home_dir}" /home/alice \
+  --bind "${home_dir}" /home/bwrap-net \
   --bind "${shared_dir}" /tmp/mesh/shared \
   --unshare-user \
   --uid 0 \
@@ -98,12 +98,12 @@ exec bwrap \
   --unshare-pid \
   --unshare-uts \
   --share-net \
-  --hostname ssh-mesh-alice \
-  --chdir /home/alice \
-  --setenv HOME /home/alice \
-  --setenv USER alice \
-  --setenv LOGNAME alice \
+  --hostname ssh-mesh-bwrap-net \
+  --chdir /home/bwrap-net \
+  --setenv HOME /home/bwrap-net \
+  --setenv USER bwrap-net \
+  --setenv LOGNAME bwrap-net \
   --setenv PATH "/out/ssh-mesh/bin:/opt/ssh-mesh/bin:${PATH}" \
   --setenv RUST_LOG "${RUST_LOG:-info}" \
-  --setenv MESH_INIT_SOCK /home/alice/.run/mesh-init/control.sock \
+  --setenv MESH_INIT_SOCK /home/bwrap-net/.run/mesh-init/control.sock \
   mesh-init

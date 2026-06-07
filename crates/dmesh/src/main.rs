@@ -23,10 +23,7 @@ fn main() {
 
     let args: Vec<String> = env::args().collect();
 
-    let mut base_dir = env::var("SSH_BASEDIR")
-        .unwrap_or_else(|_| {
-            dirs_or_default("HOME")
-        });
+    let mut base_dir = env::var("SSH_BASEDIR").unwrap_or_else(|_| dirs_or_default("HOME"));
     let mut ssh_port: i32 = env::var("SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -62,13 +59,23 @@ fn main() {
                 eprintln!("Usage: dmesh [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -d, --base-dir <DIR>    Base directory (default: $SSH_BASEDIR or $HOME)");
-                eprintln!("  -s, --ssh-port <PORT>   SSH server port (default: $SSH_PORT or 15022)");
-                eprintln!("  -h, --http-port <PORT>  HTTP server port (default: $HTTP_PORT or 8080)");
+                eprintln!(
+                    "  -d, --base-dir <DIR>    Base directory (default: $SSH_BASEDIR or $HOME)"
+                );
+                eprintln!(
+                    "  -s, --ssh-port <PORT>   SSH server port (default: $SSH_PORT or 15022)"
+                );
+                eprintln!(
+                    "  -h, --http-port <PORT>  HTTP server port (default: $HTTP_PORT or 8080)"
+                );
                 eprintln!();
                 eprintln!("See also:");
-                eprintln!("  Python: python -m dmesh --base-dir ... --ssh-port ... --http-port ...");
-                eprintln!("  Java:   java -cp ... com.github.costinm.dmeshnative.Main --base-dir ...");
+                eprintln!(
+                    "  Python: python -m dmesh --base-dir ... --ssh-port ... --http-port ..."
+                );
+                eprintln!(
+                    "  Java:   java -cp ... com.github.costinm.dmeshnative.Main --base-dir ..."
+                );
                 std::process::exit(0);
             }
             _ => {
@@ -81,7 +88,9 @@ fn main() {
 
     log::info!(
         "Starting dmesh node: base_dir={}, ssh_port={}, http_port={}",
-        base_dir, ssh_port, http_port
+        base_dir,
+        ssh_port,
+        http_port
     );
 
     match dmesh::mesh_common::start_mesh(&base_dir, ssh_port, http_port) {
@@ -113,10 +122,8 @@ fn dirs_or_default(var: &str) -> String {
 
 fn ctrlc_or_wait(tx: std::sync::mpsc::Sender<()>) {
     // Wait for Ctrl-C or indefinitely
-    std::thread::spawn(move || {
-        loop {
-            std::thread::park();
-        }
+    std::thread::spawn(move || loop {
+        std::thread::park();
     });
     // Try to install Ctrl-C handler; if that fails, just block forever
     let _ = std::thread::Builder::new()

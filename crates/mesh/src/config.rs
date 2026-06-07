@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::auth::{AuthConfig, PeerConfig};
 
@@ -27,7 +27,7 @@ pub struct AppConfigFile {
     /// Authorization peer entries. Same `[[peer]]` keyword as standalone `auth.toml`.
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
-    
+
     // Job-specific metadata
     #[serde(default = "default_true")]
     pub persisted: bool,
@@ -175,12 +175,12 @@ pub struct AppConfig {
     pub source_path: Option<String>,
     /// Resolved authorization config from `[[peer]]` entries.
     pub auth: Option<AuthConfig>,
-    
+
     // Job optional sections
     pub schedule: Option<ScheduleConfig>,
     pub constraints: Option<ConstraintConfig>,
     pub backoff: BackoffConfig,
-    
+
     // Job metadata
     pub persisted: bool,
     pub prefetch: bool,
@@ -319,7 +319,7 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
         } else {
             Some(AuthConfig { peers: file.peers })
         },
-        
+
         schedule: file.schedule,
         constraints: file.constraints,
         backoff: file.backoff,

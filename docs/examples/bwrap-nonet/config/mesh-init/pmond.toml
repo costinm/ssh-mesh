@@ -1,4 +1,4 @@
-# Process monitor for alice.
+# Process monitor for bwrap-nonet.
 #
 # pmond exposes an HTTP API over UDS at:
 #

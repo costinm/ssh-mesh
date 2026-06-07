@@ -25,7 +25,10 @@ impl Device for QueueDevice {
     type RxToken<'a> = RxTokenImpl;
     type TxToken<'a> = TxTokenImpl<'a>;
 
-    fn receive(&mut self, _timestamp: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.rx_queue.pop_front().map(|buffer| {
             (
                 RxTokenImpl(buffer),
@@ -77,11 +80,21 @@ impl<'a> smoltcp::phy::TxToken for TxTokenImpl<'a> {
             if let Ok(ipv4) = smoltcp::wire::Ipv4Packet::new_checked(&buffer) {
                 if ipv4.next_header() == smoltcp::wire::IpProtocol::Tcp {
                     if let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()) {
-                        if tcp.syn() { flags.push_str("SYN "); }
-                        if tcp.ack() { flags.push_str("ACK "); }
-                        if tcp.rst() { flags.push_str("RST "); }
-                        if tcp.fin() { flags.push_str("FIN "); }
-                        if tcp.psh() { flags.push_str("PSH "); }
+                        if tcp.syn() {
+                            flags.push_str("SYN ");
+                        }
+                        if tcp.ack() {
+                            flags.push_str("ACK ");
+                        }
+                        if tcp.rst() {
+                            flags.push_str("RST ");
+                        }
+                        if tcp.fin() {
+                            flags.push_str("FIN ");
+                        }
+                        if tcp.psh() {
+                            flags.push_str("PSH ");
+                        }
                     }
                 }
             }

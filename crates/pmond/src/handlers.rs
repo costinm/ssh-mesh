@@ -19,9 +19,9 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::psi::{PressureData, PressureEvent, PressureInfo, PressureType};
 use crate::{
-    CGroupInfo, CgroupHighArgs, ClearRefsArgs, FreezeCgroupArgs, FreezeProcessArgs,
-    GetCgroupArgs, GetProcessArgs, ListCgroupsArgs, ListProcessesArgs, MoveProcessArgs,
-    ProcMemInfo, ProcessDetailedInfo, ProcessInfo, PsiWatchesArgs,
+    CGroupInfo, CgroupHighArgs, ClearRefsArgs, FreezeCgroupArgs, FreezeProcessArgs, GetCgroupArgs,
+    GetProcessArgs, ListCgroupsArgs, ListProcessesArgs, MoveProcessArgs, ProcMemInfo,
+    ProcessDetailedInfo, ProcessInfo, PsiWatchesArgs,
 };
 
 #[derive(RustEmbed)]
@@ -246,10 +246,11 @@ pub async fn handle_cgroup_high_request(
         payload.path, payload.percentage, payload.interval
     );
 
-    match app_state
-        .proc_mon
-        .adjust_cgroup_memory_high(payload.path, payload.percentage, payload.interval)
-    {
+    match app_state.proc_mon.adjust_cgroup_memory_high(
+        payload.path,
+        payload.percentage,
+        payload.interval,
+    ) {
         Ok(()) => (StatusCode::OK, Json(json!({"status": "ok"}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -360,7 +361,10 @@ pub async fn handle_freeze_process_request(
     let action = if payload.freeze { "freeze" } else { "unfreeze" };
     info!("Received {} request for PID: {}", action, payload.pid);
 
-    match app_state.proc_mon.freeze_process(payload.pid, payload.freeze) {
+    match app_state
+        .proc_mon
+        .freeze_process(payload.pid, payload.freeze)
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
@@ -391,7 +395,10 @@ pub async fn handle_freeze_cgroup_request(
     let action = if payload.freeze { "freeze" } else { "unfreeze" };
     info!("Received {} request for cgroup: {}", action, payload.path);
 
-    match app_state.proc_mon.freeze_cgroup(&payload.path, payload.freeze) {
+    match app_state
+        .proc_mon
+        .freeze_cgroup(&payload.path, payload.freeze)
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
@@ -484,8 +491,14 @@ pub fn app(proc_mon: Arc<ProcMon>) -> Router {
         .route("/_m/pmon/_cgroup_procs", post(handle_cgroup_procs_request))
         .route("/_m/pmon/_move_process", post(handle_move_process_request))
         .route("/_m/pmon/_clear_refs", post(handle_clear_refs_request))
-        .route("/_m/pmon/_freeze_process", post(handle_freeze_process_request))
-        .route("/_m/pmon/_freeze_cgroup", post(handle_freeze_cgroup_request))
+        .route(
+            "/_m/pmon/_freeze_process",
+            post(handle_freeze_process_request),
+        )
+        .route(
+            "/_m/pmon/_freeze_cgroup",
+            post(handle_freeze_cgroup_request),
+        )
         .route(
             "/_m/pmon/api-docs/openapi.json",
             get(|| async { Json(ApiDoc::openapi()) }),
@@ -508,7 +521,7 @@ pub fn app(proc_mon: Arc<ProcMon>) -> Router {
 // ============================================================================
 
 /// Run a HTTP server over UDS - to avoid opening a port (security).
-/// 
+///
 /// The SSH server can forard local ports to UDS, safer and simpler.
 pub async fn run_uds_http_server(
     proc_mon: Arc<ProcMon>,

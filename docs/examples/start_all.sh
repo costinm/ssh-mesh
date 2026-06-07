@@ -3,11 +3,15 @@ set -euo pipefail
 
 # Start the full three-node example mesh:
 #
-#   alice: mesh-init + ssh-mesh on SSH 18222 / HTTP 18280
+#   bwrap-net: mesh-init + ssh-mesh on SSH 18222 / HTTP 18280
 #   bob:   QEMU VM node on SSH 18322 / HTTP 18380
 #   user:  user-mode mesh-init + ssh-mesh on SSH 18422 / HTTP 18480
 #
-# Alice and user run in bubblewrap. Bob is started with QEMU and requires a
+# The user node also installs a mesh-init activation socket for bwrap-nonet.
+# bwrap-nonet is started on demand with no network namespace and ssh-mesh over
+# stdin/stdout.
+#
+# Bwrap-net and user run in bubblewrap. Bob is started with QEMU and requires a
 # Nix-built VM artifact:
 #
 #   SSH_MESH_BOB_VM_DIR=/path/to/share/bob-vm
@@ -17,7 +21,7 @@ set -euo pipefail
 #   SSH_MESH_BOB_KERNEL=/path/to/bzImage
 #   SSH_MESH_BOB_ROOTFS=/path/to/initos.erofs
 #
-# The examples share a private state root. Alice and user share the host network
+# The examples share a private state root. Bwrap-net and user share the host network
 # namespace. Bob's TCP ports are forwarded from QEMU user networking.
 #
 #   $SSH_MESH_EXAMPLE_ROOT/shared
@@ -62,7 +66,7 @@ Or set:
   SSH_MESH_BOB_ROOTFS=/path/to/initos.erofs
 
 To run only the bwrap nodes:
-  ./alice/start.sh
+  ./bwrap-net/start.sh
   ./user/start.sh
 EOF
   exit 2
@@ -101,7 +105,7 @@ start_node() {
   pids="${pids} $!"
 }
 
-start_node alice
+start_node bwrap-net
 start_node bob
 start_node user
 
@@ -113,17 +117,18 @@ State root:
   ${root_dir}
 
 Logs:
-  ${log_dir}/alice.log
+  ${log_dir}/bwrap-net.log
   ${log_dir}/bob.log
   ${log_dir}/user.log
 
 Fixed listeners:
-  alice: ssh 127.0.0.1:18222, http 127.0.0.1:18280
+  bwrap-net: ssh 127.0.0.1:18222, http 127.0.0.1:18280
   bob:   qemu hostfwd ssh 127.0.0.1:${bob_host_ssh_port}, http 127.0.0.1:${bob_host_http_port}
   user:  ssh 127.0.0.1:18422, http 127.0.0.1:18480
 
 Trusted UDS sockets:
-  ${root_dir}/shared/alice/trusted.sock
+  ${root_dir}/shared/bwrap-net/trusted.sock
+  ${root_dir}/shared/bwrap-nonet/trusted.sock  (activated by user mesh-init)
   ${root_dir}/shared/bob/trusted.sock
   ${root_dir}/shared/user/trusted.sock
 

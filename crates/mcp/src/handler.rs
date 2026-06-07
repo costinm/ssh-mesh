@@ -322,10 +322,7 @@ impl ServerHandler for PmonMcpHandler {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                 Ok(CallToolResult {
                     content: vec![Annotated {
-                        raw: RawContent::Text(RawTextContent {
-                            text,
-                            meta: None,
-                        }),
+                        raw: RawContent::Text(RawTextContent { text, meta: None }),
                         annotations: None,
                     }],
                     is_error: None,
@@ -361,10 +358,7 @@ impl ServerHandler for PmonMcpHandler {
                 raw: RawResource {
                     uri: "cgroup://list".to_string(),
                     name: "CGroup List".to_string(),
-                    description: Some(
-                        "List of all cgroups and their memory info"
-                            .to_string(),
-                    ),
+                    description: Some("List of all cgroups and their memory info".to_string()),
                     mime_type: Some("application/json".to_string()),
                     size: None,
                     meta: None,

@@ -1,4 +1,4 @@
-# mesh-init service definition for alice's ssh-mesh node.
+# mesh-init service definition for bwrap-nonet's ssh-mesh node.
 #
 # The start script copies this file to:
 #
@@ -12,7 +12,7 @@
 #   $HOME/.run/ssh-mesh        mux sockets and local runtime sockets
 
 [service]
-name = "init-ssh-mesh-alice"
+name = "init-ssh-mesh-bwrap-nonet"
 command = "ssh-mesh"
 priority = 100
 oneshot = false
@@ -33,18 +33,18 @@ RUST_LOG = "info"
 # Fixed and unique TCP listeners for the example mesh. These are env vars
 # because ssh-mesh currently reads listener ports from SSH_PORT/HTTP_PORT during
 # startup even when mesh.yaml also contains port fields.
-SSH_PORT = "18222"
-HTTP_PORT = "18280"
+SSH_PORT = "18522"
+HTTP_PORT = "18580"
 
 # Enable OpenSSH ControlMaster-compatible mux sockets for maintained client
 # connections. sshmc can use these sockets from inside the node.
-MUX_DIR = "/home/alice/.run/ssh-mesh/mux"
+MUX_DIR = "/home/bwrap-nonet/.run/ssh-mesh/mux"
 
-# Alice runs as uid 0 inside the bwrap user namespace. ssh-mesh's root default
+# Bwrap-nonet runs as uid 0 inside the bwrap user namespace. ssh-mesh's root default
 # for mesh-init is /run/mesh-init/control.sock, while this example intentionally
 # keeps mesh-init in the HOME-relative user layout, so this one override is
 # needed.
-MESH_INIT_SOCK = "/home/alice/.run/mesh-init/control.sock"
+MESH_INIT_SOCK = "/home/bwrap-nonet/.run/mesh-init/control.sock"
 
 # Terminal/user examples check /home/USER. Inside the sandbox /home is private
 # example state, not the host /home.

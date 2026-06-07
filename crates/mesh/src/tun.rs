@@ -15,11 +15,7 @@ pub struct TunTcpMeta {
 /// the TCP flow and the connection metadata.
 #[async_trait]
 pub trait TunTcpHandler: Send + Sync + 'static {
-    async fn handle_tcp(
-        &self,
-        meta: TunTcpMeta,
-        stream: tokio::io::DuplexStream,
-    );
+    async fn handle_tcp(&self, meta: TunTcpMeta, stream: tokio::io::DuplexStream);
 }
 
 /// A received UDP datagram from the TUN device.

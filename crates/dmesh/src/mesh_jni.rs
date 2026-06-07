@@ -11,13 +11,13 @@
 //! - Java launcher: `java/rust/src/main/java/.../Main.java`
 //! - Java test: `java/rust/src/main/java/.../MainTest.java`
 
-use jni::{JavaVM, JNIEnv};
 use jni::objects::{GlobalRef, JByteArray, JClass, JString};
 use jni::sys::{jint, jlong};
+use jni::{JNIEnv, JavaVM};
+use ssh_mesh::sshc::SshClientListener;
+use ssh_mesh::MeshListener;
 use std::sync::Arc;
 use tokio::io::DuplexStream;
-use ssh_mesh::MeshListener;
-use ssh_mesh::sshc::SshClientListener;
 
 use crate::mesh_common::{MeshHandle, MeshStreamHandle};
 
@@ -32,11 +32,14 @@ impl MeshListener for JniMeshListener {
         let jvm = self.jvm.clone();
         let callback = self.callback.clone();
         let user_str = user.to_string();
-        
+
         std::thread::spawn(move || {
             let mut env = match jvm.attach_current_thread() {
                 Ok(e) => e,
-                Err(e) => { log::error!("Failed to attach thread: {}", e); return; }
+                Err(e) => {
+                    log::error!("Failed to attach thread: {}", e);
+                    return;
+                }
             };
             let j_user = env.new_string(user_str).unwrap();
             let _ = env.call_method(
@@ -53,26 +56,34 @@ impl MeshListener for JniMeshListener {
         let callback = self.callback.clone();
         let host_str = host.to_string();
         let rt = self.runtime.clone();
-        
+
         std::thread::spawn(move || {
             let mut env = match jvm.attach_current_thread() {
                 Ok(e) => e,
-                Err(e) => { log::error!("Failed to attach thread: {}", e); return; }
+                Err(e) => {
+                    log::error!("Failed to attach thread: {}", e);
+                    return;
+                }
             };
             let j_host = env.new_string(host_str).unwrap();
-            
+
             let stream_handle = MeshStreamHandle {
                 stream,
                 runtime_handle: rt,
             };
-            
+
             let h = Box::into_raw(Box::new(stream_handle)) as jlong;
 
             let _ = env.call_method(
                 &callback,
                 "onStream",
                 "(JLjava/lang/String;IJ)V",
-                &[(client_id as i64).into(), (&j_host).into(), (port as i32).into(), h.into()],
+                &[
+                    (client_id as i64).into(),
+                    (&j_host).into(),
+                    (port as i32).into(),
+                    h.into(),
+                ],
             );
         });
     }
@@ -90,26 +101,34 @@ impl SshClientListener for JniSshClientListener {
         let callback = self.callback.clone();
         let host_str = host.to_string();
         let rt = self.runtime.clone();
-        
+
         std::thread::spawn(move || {
             let mut env = match jvm.attach_current_thread() {
                 Ok(e) => e,
-                Err(e) => { log::error!("Failed to attach thread: {}", e); return; }
+                Err(e) => {
+                    log::error!("Failed to attach thread: {}", e);
+                    return;
+                }
             };
             let j_host = env.new_string(host_str).unwrap();
-            
+
             let stream_handle = MeshStreamHandle {
                 stream,
                 runtime_handle: rt,
             };
-            
+
             let h = Box::into_raw(Box::new(stream_handle)) as jlong;
 
             let _ = env.call_method(
                 &callback,
                 "onForwardedTcpip",
                 "(JLjava/lang/String;IJ)V",
-                &[(conn_id as i64).into(), (&j_host).into(), (port as i32).into(), h.into()],
+                &[
+                    (conn_id as i64).into(),
+                    (&j_host).into(),
+                    (port as i32).into(),
+                    h.into(),
+                ],
             );
         });
     }
@@ -125,7 +144,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
     let handle = unsafe { &*(handle as *const MeshHandle) };
     let jvm = Arc::new(env.get_java_vm().unwrap());
     let callback_ref = env.new_global_ref(callback).unwrap();
-    
+
     let mesh_listener = Arc::new(JniMeshListener {
         jvm: jvm.clone(),
         callback: callback_ref.clone(),
@@ -265,7 +284,11 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddLoc
     let host_str: String = env.get_string(&remote_host).unwrap().into();
 
     let _ = crate::mesh_common::mesh_add_local_forward(
-        handle, conn_id as u64, local_port as u16, &host_str, remote_port as u16,
+        handle,
+        conn_id as u64,
+        local_port as u16,
+        &host_str,
+        remote_port as u16,
     );
 }
 
@@ -283,7 +306,11 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddRem
     let host_str: String = env.get_string(&local_host).unwrap().into();
 
     match crate::mesh_common::mesh_add_remote_forward(
-        handle, conn_id as u64, remote_port as u16, &host_str, local_port as u16,
+        handle,
+        conn_id as u64,
+        remote_port as u16,
+        &host_str,
+        local_port as u16,
     ) {
         Ok(port) => port as jint,
         Err(e) => {
@@ -302,7 +329,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
 ) -> jint {
     let handle = unsafe { &mut *(handle as *mut MeshStreamHandle) };
     let mut data = vec![0u8; env.get_array_length(&buf).unwrap() as usize];
-    
+
     match crate::mesh_common::stream_read(handle, &mut data) {
         Ok(n) => {
             let byte_data: Vec<i8> = data[..n].iter().map(|&b| b as i8).collect();
@@ -322,7 +349,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
 ) {
     let handle = unsafe { &mut *(handle as *mut MeshStreamHandle) };
     let bytes = env.convert_byte_array(&data).unwrap();
-    
+
     let _ = crate::mesh_common::stream_write(handle, &bytes);
 }
 
@@ -346,7 +373,7 @@ pub extern "C" fn Java_costinm_dmesh_MeshNode_nativeCreateTun(
     fd: jint,
 ) -> jlong {
     log::info!("nativeCreateTun called with fd: {}", fd);
-    
+
     // Create the MeshTun wrapper from the Android VPN file descriptor
     match unsafe { mesh_tun::MeshTun::from_fd(fd) } {
         Ok(_tun) => {

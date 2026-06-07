@@ -1,9 +1,11 @@
+use async_trait::async_trait;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use async_trait::async_trait;
 
-use crate::jobs::config::{BackoffConfig, BackoffPolicy, ConstraintConfig, JobConfig, NetworkType, ScheduleConfig};
+use crate::jobs::config::{
+    BackoffConfig, BackoffPolicy, ConstraintConfig, JobConfig, NetworkType, ScheduleConfig,
+};
 use crate::jobs::event::SystemEvent;
 use crate::jobs::executor::JobExecutor;
 use crate::jobs::scheduler::{JobScheduler, JobState};
@@ -24,7 +26,11 @@ impl MockExecutor {
 
 #[async_trait]
 impl JobExecutor for MockExecutor {
-    async fn execute(&self, job: &JobConfig, _work_items: &[crate::jobs::config::WorkItem]) -> anyhow::Result<()> {
+    async fn execute(
+        &self,
+        job: &JobConfig,
+        _work_items: &[crate::jobs::config::WorkItem],
+    ) -> anyhow::Result<()> {
         let fails = self.fail_next.load(Ordering::SeqCst);
         if fails > 0 {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
@@ -95,11 +101,17 @@ async fn test_constraint_charging() {
     scheduler.schedule(job).await.unwrap();
 
     // Not charging - shouldn't start
-    scheduler.on_event(SystemEvent::IdleChanged { is_idle: true }).await.unwrap();
+    scheduler
+        .on_event(SystemEvent::IdleChanged { is_idle: true })
+        .await
+        .unwrap();
     assert!(executor.executed_jobs.lock().await.is_empty());
 
     // Charging - should start
-    scheduler.on_event(SystemEvent::ChargingChanged { is_charging: true }).await.unwrap();
+    scheduler
+        .on_event(SystemEvent::ChargingChanged { is_charging: true })
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(executor.executed_jobs.lock().await.len(), 1);
 }
@@ -114,11 +126,23 @@ async fn test_constraint_network() {
     scheduler.schedule(job).await.unwrap();
 
     // Any network (e.g. Cellular) - shouldn't start
-    scheduler.on_event(SystemEvent::NetworkChanged { network_type: NetworkType::Cellular, connected: true }).await.unwrap();
+    scheduler
+        .on_event(SystemEvent::NetworkChanged {
+            network_type: NetworkType::Cellular,
+            connected: true,
+        })
+        .await
+        .unwrap();
     assert!(executor.executed_jobs.lock().await.is_empty());
 
     // Unmetered network - should start
-    scheduler.on_event(SystemEvent::NetworkChanged { network_type: NetworkType::Unmetered, connected: true }).await.unwrap();
+    scheduler
+        .on_event(SystemEvent::NetworkChanged {
+            network_type: NetworkType::Unmetered,
+            connected: true,
+        })
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(executor.executed_jobs.lock().await.len(), 1);
 }
@@ -154,7 +178,7 @@ async fn test_override_deadline() {
 
     let mut job = create_base_job("deadline_job");
     job.constraints.as_mut().unwrap().requires_charging = true; // Never met
-    job.schedule.as_mut().unwrap().override_deadline_secs = Some(10); 
+    job.schedule.as_mut().unwrap().override_deadline_secs = Some(10);
     scheduler.schedule(job).await.unwrap();
 
     // Deadline not passed, charging not met
@@ -182,15 +206,33 @@ async fn test_pubsub_event_triggers() {
     scheduler.schedule(job).await.unwrap();
 
     // Wrong event
-    scheduler.on_event(SystemEvent::CustomCondition { key: "wrong_event".to_string(), value: true }).await.unwrap();
+    scheduler
+        .on_event(SystemEvent::CustomCondition {
+            key: "wrong_event".to_string(),
+            value: true,
+        })
+        .await
+        .unwrap();
     assert!(executor.executed_jobs.lock().await.is_empty());
 
     // Right event, but value false (doesn't trigger)
-    scheduler.on_event(SystemEvent::CustomCondition { key: "my_custom_event".to_string(), value: false }).await.unwrap();
+    scheduler
+        .on_event(SystemEvent::CustomCondition {
+            key: "my_custom_event".to_string(),
+            value: false,
+        })
+        .await
+        .unwrap();
     assert!(executor.executed_jobs.lock().await.is_empty());
 
     // Right event, value true - should trigger
-    scheduler.on_event(SystemEvent::CustomCondition { key: "my_custom_event".to_string(), value: true }).await.unwrap();
+    scheduler
+        .on_event(SystemEvent::CustomCondition {
+            key: "my_custom_event".to_string(),
+            value: true,
+        })
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(executor.executed_jobs.lock().await.len(), 1);
 }
@@ -209,7 +251,7 @@ async fn test_priority_ordering() {
     scheduler.schedule(job2).await.unwrap();
 
     scheduler.on_event(SystemEvent::TimerTick).await.unwrap();
-    
+
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let jobs = executor.executed_jobs.lock().await;
     assert_eq!(jobs.len(), 2);
@@ -228,13 +270,19 @@ async fn test_periodic_flex() {
     scheduler.schedule(job).await.unwrap();
 
     // Complete the first run
-    scheduler.job_finished("periodic_job", false, None).await.unwrap();
+    scheduler
+        .job_finished("periodic_job", false, None)
+        .await
+        .unwrap();
 
     let jobs = scheduler.jobs.lock().await;
     let entry = jobs.get("periodic_job").unwrap();
     // 3600 - 600 = 3000 seconds latency
     let expected = JobScheduler::now_secs() + 3000;
-    assert!(entry.next_eligible.unwrap() >= expected - 1 && entry.next_eligible.unwrap() <= expected + 1);
+    assert!(
+        entry.next_eligible.unwrap() >= expected - 1
+            && entry.next_eligible.unwrap() <= expected + 1
+    );
 }
 
 #[tokio::test]
@@ -246,7 +294,11 @@ async fn test_programmatic_job_registration() {
 
     #[async_trait]
     impl JobExecutor for LocalFunctionExecutor {
-        async fn execute(&self, job: &JobConfig, _work_items: &[crate::jobs::config::WorkItem]) -> anyhow::Result<()> {
+        async fn execute(
+            &self,
+            job: &JobConfig,
+            _work_items: &[crate::jobs::config::WorkItem],
+        ) -> anyhow::Result<()> {
             if job.name == "programmatic_job" {
                 let mut exec = self.executed.lock().await;
                 *exec = true;
@@ -258,8 +310,10 @@ async fn test_programmatic_job_registration() {
     }
 
     let executed = Arc::new(Mutex::new(false));
-    let executor = Arc::new(LocalFunctionExecutor { executed: executed.clone() });
-    
+    let executor = Arc::new(LocalFunctionExecutor {
+        executed: executed.clone(),
+    });
+
     // Create the scheduler
     let scheduler = JobScheduler::new("/tmp/mock_programmatic_jobs", executor);
 
@@ -267,21 +321,23 @@ async fn test_programmatic_job_registration() {
     let mut job = JobConfig::default();
     job.name = "programmatic_job".to_string();
     job.command = "local_exec".to_string(); // Not used by our custom executor, but required by validation
-    
+
     // Set up a constraint and a trigger event
     let mut constraints = ConstraintConfig::default();
-    constraints.triggers.push("my_programmatic_event".to_string());
+    constraints
+        .triggers
+        .push("my_programmatic_event".to_string());
     job.constraints = Some(constraints);
 
     // Schedule the job
     scheduler.schedule(job).await.unwrap();
 
     // 3. Inject an event to trigger the job
-    let event = SystemEvent::CustomCondition { 
-        key: "my_programmatic_event".to_string(), 
-        value: true 
+    let event = SystemEvent::CustomCondition {
+        key: "my_programmatic_event".to_string(),
+        value: true,
     };
-    
+
     // The scheduler processes the event and dispatches the job if constraints are met
     let started = scheduler.on_event(event).await.unwrap();
     assert!(started.contains(&"programmatic_job".to_string()));
@@ -291,5 +347,8 @@ async fn test_programmatic_job_registration() {
 
     // Verify the local function was called
     let was_executed = *executed.lock().await;
-    assert!(was_executed, "The programmatic job should have been executed");
+    assert!(
+        was_executed,
+        "The programmatic job should have been executed"
+    );
 }
