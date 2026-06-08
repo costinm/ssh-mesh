@@ -8,7 +8,17 @@ cd "${PROJECT_ROOT}"
 FLAKE_DIR="${PROJECT_ROOT}/tests/microvm-echo"
 WORK="${WORK:-${PROJECT_ROOT}/target/vm/microvm-echo}"
 SHARE="${WORK}/share"
-PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/initos-vm}"
+NIX_PROFILE="${NIX_PROFILE:-}"
+if [[ -z "${NIX_PROFILE}" ]]; then
+  if [[ -d "${PROJECT_ROOT}/target/nix/profiles" ]]; then
+    NIX_PROFILE="${PROJECT_ROOT}/target/nix/profiles"
+  elif [[ -d "${PROJECT_ROOT}/target/nix" ]]; then
+    NIX_PROFILE="${PROJECT_ROOT}/target/nix"
+  else
+    NIX_PROFILE="/ws/initos/target/nix"
+  fi
+fi
+PROFILE="${PROFILE:-${NIX_PROFILE}}"
 MICROVM_HYPERVISOR="${MICROVM_HYPERVISOR:-crosvm}"
 RUNNER_PACKAGE="runner-${MICROVM_HYPERVISOR}"
 RUNNER_LINK="${WORK}/${RUNNER_PACKAGE}"
@@ -51,13 +61,16 @@ esac
 EOF
 chmod 755 "${SHARE}/initos/initos-pod"
 
-nix build .#default -o "${PROFILE}"
+if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
+  echo "Error: VM profile not found at ${PROFILE}. Build it first (e.g. scripts/build.sh vm)." >&2
+  exit 1
+fi
 PROFILE_REAL="$(readlink -f "${PROFILE}")"
 
 flake_hash="$(printf '%s\n' "${PROFILE_REAL}" "${MICROVM_HYPERVISOR}" "$(sha256sum "${FLAKE_DIR}/flake.nix" | awk '{print $1}')" | sha256sum | awk '{print $1}')"
 if [[ ! -x "${RUNNER_LINK}/bin/microvm-run" ]] || [[ ! -f "${STAMP}" ]] || [[ "$(cat "${STAMP}")" != "${flake_hash}" ]]; then
   rm -f "${RUNNER_LINK}"
-  nix build ./tests/microvm-echo#${RUNNER_PACKAGE} --override-input initosProfile "path:${PROFILE_REAL}" -o "${RUNNER_LINK}"
+  echo "Error: microvm runner not built." >&2; exit 1
   printf '%s\n' "${flake_hash}" > "${STAMP}"
 fi
 

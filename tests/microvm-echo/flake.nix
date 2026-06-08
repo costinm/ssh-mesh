@@ -25,7 +25,7 @@
       inherit hypervisor;
       vmHostPackages = pkgs;
       inherit kernel;
-      initrdPath = "${initosProfile}/boot/initrd.img";
+      initrdPath = null;
       vcpu = 1;
       mem = 512;
       hugepageMem = false;

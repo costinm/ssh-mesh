@@ -100,8 +100,7 @@ Each node directory has:
 `start_all.sh` starts all three nodes together and writes logs under the
 example state directory. Bob requires `SSH_MESH_BOB_VM_DIR`, or explicit
 `SSH_MESH_BOB_KERNEL` and `SSH_MESH_BOB_ROOTFS` paths, unless the artifact is
-installed at `/opt/ssh-mesh/share/bob-vm`. `SSH_MESH_BOB_INITRD` is optional
-for custom boot experiments.
+installed at `/opt/ssh-mesh/share/bob-vm`.
 
 ## Runtime state
 

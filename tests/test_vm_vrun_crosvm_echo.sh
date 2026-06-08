@@ -14,7 +14,11 @@ POD="${POD:-echocros}"
 VM_STATE="${VM_STATE:-${PROJECT_ROOT}/target/vm/${POD}}"
 SRC="${SRC:-${VM_STATE}/src}"
 LOG="${VM_STATE}/crosvm.log"
-PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/initos-vm}"
+NIX_PROFILE="${NIX_PROFILE:-}"
+if [[ -z "${NIX_PROFILE}" ]]; then
+  NIX_PROFILE="${PROJECT_ROOT}/target/nix/profiles"
+fi
+PROFILE="${PROFILE:-${NIX_PROFILE}}"
 
 rm -rf "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
 mkdir -p "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
@@ -36,7 +40,10 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-nix build .#default -o "${PROFILE}"
+if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
+  echo "Error: VM profile not found at ${PROFILE}. Build it first (e.g. scripts/build.sh vm)." >&2
+  exit 1
+fi
 
 timeout --foreground "${TIMEOUT:-90}s" \
   env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \

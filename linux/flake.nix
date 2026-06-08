@@ -1,5 +1,5 @@
 {
-  description = "kernel for VMs without initrd";
+  description = "kernel for VMs";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -35,7 +35,6 @@
 
         initos-vm = pkgs.runCommand "initos-vm" { } ''
           mkdir -p "$out"/{bin,boot,img}
-          touch "$out/boot/initrd.img"
 
           ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
 
@@ -52,6 +51,9 @@
           ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
           ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
           ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
+          ln -s ${pkgs.tmux}/bin/tmux "$out/bin/tmux"
+          ln -s ${pkgs.curl}/bin/curl "$out/bin/curl"
+          ln -s ${pkgs.bubblewrap}/bin/bwrap "$out/bin/bwrap"
           
           cp ${./bin/vrun} "$out/bin/vrun"
           chmod +x "$out/bin/vrun"

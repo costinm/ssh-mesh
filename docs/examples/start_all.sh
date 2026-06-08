@@ -45,7 +45,6 @@ need qemu-system-x86_64
 
 vm_dir="${SSH_MESH_BOB_VM_DIR:-/opt/ssh-mesh/share/bob-vm}"
 kernel="${SSH_MESH_BOB_KERNEL:-${vm_dir}/bzImage}"
-initrd="${SSH_MESH_BOB_INITRD:-${vm_dir}/initrd.img}"
 rootfs="${SSH_MESH_BOB_ROOTFS:-${vm_dir}/initos.erofs}"
 bob_host_ssh_port="${SSH_MESH_BOB_HOST_SSH_PORT:-18322}"
 bob_host_http_port="${SSH_MESH_BOB_HOST_HTTP_PORT:-18380}"

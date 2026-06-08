@@ -277,12 +277,42 @@ erofs() {
     local out="${1:-$PWD/target/erofs}"
     local busybox="${2:-busybox}"
     local initos_vm="${3:-bin/initos-init-vm}"
-    local mesh_bin="${4:-target/x86_64-unknown-linux-musl/release}"
+    local mesh_bin="${4:-}"
+
+    # Fallback to system busybox if busybox is not found at the specified path
+    if [ ! -f "$busybox" ] && command -v busybox >/dev/null 2>&1; then
+        busybox=$(command -v busybox)
+    fi
+    if [ ! -f "$busybox" ] && [ -f "/ws/initos/target/nix/bin/busybox" ]; then
+        busybox="/ws/initos/target/nix/bin/busybox"
+    fi
+    if [ ! -f "$busybox" ] && [ -f "/usr/bin/busybox" ]; then
+        busybox="/usr/bin/busybox"
+    fi
+
+    # Fallback for mesh_bin to debug if release is not found
+    if [ -z "$mesh_bin" ] || [ ! -d "$mesh_bin" ]; then
+        if [ -d "target/x86_64-unknown-linux-musl/release" ]; then
+            mesh_bin="target/x86_64-unknown-linux-musl/release"
+        elif [ -d "target/x86_64-unknown-linux-musl/debug" ]; then
+            mesh_bin="target/x86_64-unknown-linux-musl/debug"
+        else
+            mesh_bin="target/x86_64-unknown-linux-musl/release"
+        fi
+    fi
+
+    if [ ! -f "$busybox" ]; then
+        echo "Error: busybox binary not found" >&2
+        return 1
+    fi
 
     mkdir -p "$out/img" "$out/bin"
     local rootfs="$out/rootfs"
     rm -rf "$rootfs"
-    mkdir -p "$rootfs"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin,dev,proc,sys,etc,tmp}
+    
+    # Pre-create all expected VM directories/mountpoints to avoid Read-only FS errors
+    mkdir -p "$rootfs"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin}
+    mkdir -p "$rootfs"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,usr/bin,usr/sbin,usr/lib,usr/lib64}
 
     cp "$busybox" "$rootfs/opt/busybox/bin/busybox"
     chmod +x "$rootfs/opt/busybox/bin/busybox"
@@ -310,6 +340,7 @@ erofs() {
     fi
 
     mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "$out/img/ssh-mesh.erofs" "$rootfs"
+    ln -sf ssh-mesh.erofs "$out/img/initos.erofs"
 
     cat > "$out/bin/ssh-mesh-erofs" <<EOF
 #!/bin/sh
@@ -320,4 +351,64 @@ EOF
     echo "EROFS image created at $out/img/ssh-mesh.erofs"
 }
 
+
+vm() {
+    local profile="${1:-$PWD/target/vm/initos-vm}"
+    echo "Building VM profile into $profile..."
+    nix build .#default -o "$profile"
+}
+
+profile() {
+    # Default NIX_PROFILE target path
+    local target_profile="${1:-${NIX_PROFILE:-$PWD/target/nix/profiles}}"
+
+    # If target_profile is a real directory and not a symlink, delete it so Nix can manage it
+    if [ -d "${target_profile}" ] && [ ! -L "${target_profile}" ]; then
+        echo "Removing non-symlink directory at ${target_profile} so Nix can manage the profile..."
+        rm -rf "${target_profile}"
+    fi
+
+    echo "Updating Nix profile: ${target_profile}"
+    if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "ssh-mesh"; then
+        echo "Upgrading ssh-mesh package in profile..."
+        nix profile upgrade --profile "${target_profile}" --all
+    else
+        echo "Adding ssh-mesh package to profile..."
+        nix profile add . --profile "${target_profile}"
+    fi
+
+    # Build microvm runners and create their stamps
+    local microvm_work="target/vm/microvm-echo"
+    local profile_real=$(readlink -f "${target_profile}")
+    mkdir -p "${microvm_work}"
+    for hv in crosvm qemu cloud-hypervisor; do
+        local rlink="${microvm_work}/runner-${hv}"
+        local stamp="${microvm_work}/runner-${hv}.sha256"
+        local fhash
+        fhash=$(printf '%s\n' "${profile_real}" "${hv}" "$(sha256sum "tests/microvm-echo/flake.nix" 2>/dev/null | awk '{print $1}')" | sha256sum | awk '{print $1}')
+        if [ ! -L "${rlink}" ] || [ ! -f "${stamp}" ] || [ "$(cat "${stamp}" 2>/dev/null)" != "${fhash}" ]; then
+            rm -f "${rlink}"
+            echo "Building microvm runner for ${hv}..."
+            nix build ./tests/microvm-echo#runner-${hv} --override-input initosProfile "path:${profile_real}" -o "${rlink}"
+            printf '%s\n' "${fhash}" > "${stamp}"
+        fi
+    done
+}
+
+build() {
+    # Default NIX_PROFILE target path
+    local target_profile="${1:-${NIX_PROFILE:-$PWD/target/nix/profiles}}"
+    
+    echo "=== 1. Building release binaries with musl ==="
+    cargo build --target x86_64-unknown-linux-musl --release --workspace
+    
+    echo "=== 2. Building JNI native library and Java classes ==="
+    jni "target/opt/ssh-mesh"
+    
+    echo "=== 3. Building EROFS rootfs ==="
+    erofs "target/erofs" "$(which busybox 2>/dev/null || echo "")" "bin/initos-init-vm" "target/x86_64-unknown-linux-musl/release"
+    
+    echo "=== 4. Assembling and upgrading local VM profile ==="
+    profile "${target_profile}"
+}
 "$@"

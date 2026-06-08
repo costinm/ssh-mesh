@@ -50,17 +50,7 @@ EOF
   fi
 done
 
-if [ -n "${initrd}" ] && [ ! -r "${initrd}" ]; then
-  cat >&2 <<EOF
-Bob initrd was set but is not readable.
 
-Missing: ${initrd}
-
-Unset SSH_MESH_BOB_INITRD to boot directly from the rootfs, or set it to
-a readable initrd image.
-EOF
-  exit 2
-fi
 
 mkdir -p \
   "${home_dir}/.config/mesh-init" \
@@ -82,7 +72,6 @@ cp "${vm_dir}/initos-pod" "${share_dir}/initos/initos-pod"
 cp "${vm_dir}/bin/"* "${share_dir}/bin/"
 
 echo "bob kernel: ${kernel}"
-echo "bob initrd: ${initrd:-<none>}"
 echo "bob rootfs: ${rootfs}"
 echo "bob src share: ${share_dir}"
 echo "bob HOME inside guest: /home/bob"

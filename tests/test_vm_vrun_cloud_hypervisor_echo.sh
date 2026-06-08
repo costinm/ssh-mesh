@@ -13,7 +13,11 @@ cd "${PROJECT_ROOT}"
 POD="${POD:-echoch}"
 VM_STATE="${VM_STATE:-${PROJECT_ROOT}/target/vm/${POD}}"
 SRC="${SRC:-${VM_STATE}/src}"
-PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/initos-vm}"
+NIX_PROFILE="${NIX_PROFILE:-}"
+if [[ -z "${NIX_PROFILE}" ]]; then
+  NIX_PROFILE="${PROJECT_ROOT}/target/nix/profiles"
+fi
+PROFILE="${PROFILE:-${NIX_PROFILE}}"
 SERIAL_LOG="${VM_STATE}/run/serial.log"
 PHASES="${VM_STATE}/run/phases.tsv"
 
@@ -47,7 +51,10 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-nix build .#default -o "${PROFILE}"
+if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
+  echo "Error: VM profile not found at ${PROFILE}. Build it first (e.g. scripts/build.sh vm)." >&2
+  exit 1
+fi
 
 start_ns="$(now_ns)"
 env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
