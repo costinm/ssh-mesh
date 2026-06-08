@@ -41,20 +41,14 @@ build() {
 # Function to update Nix flake inputs
 update_flake() {
     echo "Updating Nix flake inputs..."
-    nix --extra-experimental-features "nix-command flakes" flake update
+    nix  flake update
 }
 
-# # Function to enter the development shell
-# develop() {
-#     echo "Entering Nix development shell..."
-#     nix --extra-experimental-features "nix-command flakes" develop
-# }
-
-# Function to run the default package
-run() {
-    echo "Running default application with Nix..."
-    nix --extra-experimental-features "nix-command flakes" run .
-}
+# nix flake show PATH
+# nix store gc
+# 
+# ls /nix/var/nix/gcroots/auto
+## all profiles created in random places.
 
 setup() {
 
@@ -72,7 +66,6 @@ help() {
     echo "  install_nix   Install the latest Nix with Flakes enabled (via Determinate Systems)"
     echo "  build         Build the project using Nix flake"
     echo "  update_flake  Update Nix flake inputs"
-    echo "  develop       Enter the Nix development shell"
     echo "  run           Run the default package using Nix flake"
     echo "  help          Show this help message"
 }

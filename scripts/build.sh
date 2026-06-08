@@ -273,4 +273,51 @@ arm_release() {
     echo "aarch64 release completed at $dest"
 }
 
+erofs() {
+    local out="${1:-$PWD/target/erofs}"
+    local busybox="${2:-busybox}"
+    local initos_vm="${3:-bin/initos-init-vm}"
+    local mesh_bin="${4:-target/x86_64-unknown-linux-musl/release}"
+
+    mkdir -p "$out/img" "$out/bin"
+    local rootfs="$out/rootfs"
+    rm -rf "$rootfs"
+    mkdir -p "$rootfs"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin,dev,proc,sys,etc,tmp}
+
+    cp "$busybox" "$rootfs/opt/busybox/bin/busybox"
+    chmod +x "$rootfs/opt/busybox/bin/busybox"
+
+    # Create all busybox applet symlinks
+    (
+        cd "$rootfs/opt/busybox/bin"
+        for applet in $(./busybox --list); do
+            if [ "$applet" != "busybox" ]; then
+                ln -s busybox "$applet"
+            fi
+        done
+    )
+
+    ln -s opt/busybox/bin "$rootfs/bin"
+    ln -s opt/busybox/bin "$rootfs/sbin"
+
+    if [ -f "$initos_vm" ]; then
+        cp "$initos_vm" "$rootfs/opt/initos/bin/initos-init-vm"
+        chmod +x "$rootfs/opt/initos/bin/initos-init-vm"
+    fi
+
+    if [ -d "$mesh_bin" ]; then
+        cp -L "$mesh_bin"/* "$rootfs/opt/ssh-mesh/bin/" 2>/dev/null || true
+    fi
+
+    mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "$out/img/ssh-mesh.erofs" "$rootfs"
+
+    cat > "$out/bin/ssh-mesh-erofs" <<EOF
+#!/bin/sh
+echo "$out/img/ssh-mesh.erofs"
+EOF
+    chmod +x "$out/bin/ssh-mesh-erofs"
+    
+    echo "EROFS image created at $out/img/ssh-mesh.erofs"
+}
+
 "$@"

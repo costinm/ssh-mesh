@@ -47,7 +47,7 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-nix build "path:${PROJECT_ROOT}/linux#initos-vm" -o "${PROFILE}"
+nix build .#default -o "${PROFILE}"
 
 start_ns="$(now_ns)"
 env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \

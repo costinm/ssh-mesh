@@ -51,13 +51,13 @@ esac
 EOF
 chmod 755 "${SHARE}/initos/initos-pod"
 
-nix build "path:${PROJECT_ROOT}/linux#initos-vm" -o "${PROFILE}"
+nix build .#default -o "${PROFILE}"
 PROFILE_REAL="$(readlink -f "${PROFILE}")"
 
 flake_hash="$(printf '%s\n' "${PROFILE_REAL}" "${MICROVM_HYPERVISOR}" "$(sha256sum "${FLAKE_DIR}/flake.nix" | awk '{print $1}')" | sha256sum | awk '{print $1}')"
 if [[ ! -x "${RUNNER_LINK}/bin/microvm-run" ]] || [[ ! -f "${STAMP}" ]] || [[ "$(cat "${STAMP}")" != "${flake_hash}" ]]; then
   rm -f "${RUNNER_LINK}"
-  nix build "path:${FLAKE_DIR}#${RUNNER_PACKAGE}" --override-input initosProfile "path:${PROFILE_REAL}" -o "${RUNNER_LINK}"
+  nix build ./tests/microvm-echo#${RUNNER_PACKAGE} --override-input initosProfile "path:${PROFILE_REAL}" -o "${RUNNER_LINK}"
   printf '%s\n' "${flake_hash}" > "${STAMP}"
 fi
 

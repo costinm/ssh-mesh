@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 set -e
 
@@ -38,7 +38,7 @@ fi
 #      (default: for root /run/virt/${POD}, user ${HOME/.cache/c/${POD}} )
 #    SRC - $HOME/apps/${POD} - source directory, configs
 #
-#    VIRT - kernel, initrd, modules - read only (/opt/initos)
+#    VIRT - kernel,  modules - read only (/opt/initos)
 #    IMGDIR - RW disks for the pod, rootfs and data dirs.
 # 
 # Layout inside container/VM:
@@ -54,8 +54,20 @@ fi
 # - .cache link to /x/cache/home/USER/.cache
 # 
 
-# Directory with hypervisor binaries, kernel, initrd, recovery
-VIRT=${VIRT:-/opt/virt}
+# Directory with hypervisor binaries, kernel, recovery
+if [ -z "${NIX_PROFILE:-}" ]; then
+    SCRIPT_DIR=$(dirname "$0")
+    if [ "$SCRIPT_DIR" = "." ] && command -v "$0" >/dev/null 2>&1; then
+        SCRIPT_DIR=$(dirname "$(command -v "$0")")
+    fi
+    NIX_PROFILE=$(dirname "$SCRIPT_DIR")
+fi
+
+if [ -d "${NIX_PROFILE}/bin" ] && [[ ":$PATH:" != *":${NIX_PROFILE}/bin:"* ]]; then
+    export PATH="${NIX_PROFILE}/bin:$PATH"
+fi
+
+VIRT=${VIRT:-${NIX_PROFILE}}
 # Images - including RW disks
 IMGDIR=${IMGDIR:-/z/vol/images}
 
@@ -117,14 +129,10 @@ virt_resolve_layout() {
     "${VIRT}/vmlinux" \
     "${VIRT}/vmlinuz" 2>/dev/null || true)}
   VIRT_ROOTFS=${VIRT_ROOTFS:-$(virt_first_file \
+    "${VIRT_IMG}/ssh-mesh.erofs" \
     "${VIRT_IMG}/initos.erofs" \
     "${VIRT_ROOT}/initos.erofs" \
     "${VIRT}/initos.erofs" 2>/dev/null || true)}
-  VIRT_INITRD=${VIRT_INITRD:-$(virt_first_file \
-    "${VIRT_BOOT}/initrd.img" \
-    "${VIRT_BOOT}/EFI/BOOT/initrd.img" \
-    "${VIRT_ROOT}/initrd.img" \
-    "${VIRT}/initrd.img" 2>/dev/null || true)}
   VIRT_MODULES=${VIRT_MODULES:-$(virt_first_file \
     "${VIRT_IMG}/modules-cloud.erofs" \
     "${VIRT_ROOT}/modules.erofs" \
@@ -156,10 +164,6 @@ virt_resolve_layout() {
   }
   [ -n "${VIRT_BUSYBOX}" ] || {
     echo "Missing busybox. Set VIRT to a Nix VM profile or set VIRT_BUSYBOX." >&2
-    exit 1
-  }
-  [ -n "${VIRT_INITOS_INIT_VM}" ] || {
-    echo "Missing initos-init-vm. Set VIRT to a Nix VM profile or set VIRT_INITOS_INIT_VM." >&2
     exit 1
   }
 }
@@ -232,9 +236,6 @@ vm_init() {
   mkdir -p ${WORK}/share/initos ${WORK}/share/bin \
     ${WORK}/share/opt/initos/bin ${WORK}/share/opt/busybox/bin
 
-  cp ${VIRT_INITOS_INIT_VM} ${WORK}/share/initos/initos-init-vm
-  cp ${VIRT_INITOS_INIT_VM} ${WORK}/share/opt/initos/bin/initos-init-vm
-
   if [ ! -e ${WORK}/share/bin/sh ]; then
     cp ${VIRT_BUSYBOX} ${WORK}/share/bin
     (cd ${WORK}/share/bin && ln -s busybox sh)
@@ -246,7 +247,7 @@ vm_init() {
 }
 
 
-# Start a single Virtiofsd - should be mounted as /z - the initrd script will
+# Start a single Virtiofsd - should be mounted as /z - the init script will
 # take care of this and also detect if a rootfs is present.
 # Use bind mounts to manage the content.
 run_virtiofsd() {
@@ -309,7 +310,6 @@ run_virtiofsd() {
 # - DEBUG=init
 # - Run a command before swaproot, poweroff immediatly after.
 #          cmd=/bin/ls
-# - `CMD_OPTS=rdinit=/bin/sh` - start before the /init.
 # - Run a command after pivot, poweroff after
 #      `CMD_OPTS=initos.cmd1="df"`
 # 
@@ -317,7 +317,7 @@ run_virtiofsd() {
 #TIME="time "
 #
 # Alpine kernel includes no filesystem - virtiofs is a module - so modules must be loaded
-# by the initrd. Debian has similar issues. Using kernel with 
+# by the init. Debian has similar issues. Using kernel with 
 # core blk and fs built in.
 
 # Start will run run the pod (VM) in background, like a container.
@@ -327,121 +327,59 @@ run_virtiofsd() {
 start() {
   local p="$@"
 
-  if [ "${virt:-cloud-hypervisor}" != "qemu" ] ; then
-    validate_pod_name
-  fi
-
+  validate_pod_name
   vm_init
 
   # OPTS - cloud-hypervisor/qemu options
   # CMD_OPTS - kernel command line options
   
-  if [ "$virt" = "qemu" ] ; then
-    # -initrd - only for testing initrd 
-    OPTS="$OPTS -nodefaults -cpu host -enable-kvm -no-reboot"
-    OPTS="$OPTS -nographic"
-    # mon:stdio - C-a xa
-	  qemu_serial="-chardev stdio,mux=on,id=char0 -serial chardev:char0 -monitor chardev:char0" 
-    # stdio - no input ?
-    # -serial stdio
+  [ -n "${VIRT_ROOTFS}" ] || {
+    echo "Missing rootfs image. Set VIRT to a Nix VM profile or set VIRT_ROOTFS." >&2
+    exit 1
+  }
 
-    OPTS="$OPTS -m ${vm_mem:-1G}"
-    OPTS="$OPTS -smp ${vm_cpu:-4}"
-    OPTS="$OPTS -netdev user,id=n1,hostfwd=tcp::10022-:22 -device virtio-net-pci,netdev=n1"
-    #-net user,hostfwd=tcp::10022-:22 
-    # netdev: ,net=192.168.76.0/24,dhcpstart=192.168.76.9
-    # tap works as well
+  # Use the immutable initos EROFS as root and virtiofs only as the host share.
+  run_virtiofsd ${WORK}  
 
-    # -apend "${CMD_OPTS}"
-     # 9p volume exposing current dir
-    # Use: mount -t 9p -o trans=virtio,version=9p2000.L src /src
-    QDISKS="${QDISKS} -device virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
-    QDISKS="${QDISKS} -fsdev local,security_model=mapped,id=fsdev0,path=${WORK}/share"
+  OPTS="$OPTS --pvpanic"
+  OPTS="$OPTS --watchdog"
+  OPTS="$OPTS --seccomp true"
+  OPTS="$OPTS --api-socket=${WORK}/ch.sock"
+  OPTS="$OPTS --memory size=${vm_mem:-512M},shared=on"
+  OPTS="$OPTS --cpus boot=${vm_cpu:-1}"
+  if [ "${vm_balloon:-0}" != "0" ]; then
+    OPTS="$OPTS --balloon size=${vm_balloon},deflate_on_oom=on "
+  fi
 
-    # virtio-serial port for ssh-mesh host↔guest communication
-    QDISKS="${QDISKS} -chardev socket,id=mesh,path=${WORK}/mesh.sock,server=on,wait=off"
-    QDISKS="${QDISKS} -device virtserialport,chardev=mesh,name=org.ssh-mesh.control"
-    echo "  SSH-MESH: virtio-serial socket at ${WORK}/mesh.sock"
-    
-
-    OPTS="$OPTS -kernel ${VIRT_KERNEL}"
-    if [ -n "${USE_INITRD:-}" ] && [ -n "${VIRT_INITRD}" ]; then
-      OPTS="$OPTS -initrd ${VIRT_INITRD}"
-    fi
-    if [ -z "${QEMU_UI}" ]; then
-        qemu_base="${qemu_base} -nographic"
-    else
-        qemu_base="${qemu_base} -display gtk -vga std"
-    fi
-  else
-    [ -n "${VIRT_ROOTFS}" ] || {
-      echo "Missing rootfs image. Set VIRT to a Nix VM profile or set VIRT_ROOTFS." >&2
-      exit 1
-    }
-
-    # Use the immutable initos EROFS as root and virtiofs only as the host share.
-    run_virtiofsd ${WORK}  
-
-    OPTS="$OPTS --pvpanic"
-    OPTS="$OPTS --watchdog"
-    OPTS="$OPTS --seccomp true"
-    OPTS="$OPTS --api-socket=${WORK}/ch.sock"
-    OPTS="$OPTS --memory size=${vm_mem:-512M},shared=on"
-    OPTS="$OPTS --cpus boot=${vm_cpu:-1}"
-    if [ "${vm_balloon:-0}" != "0" ]; then
-      OPTS="$OPTS --balloon size=${vm_balloon},deflate_on_oom=on "
-    fi
-
-    # Only 2 supported ?
-    OPTS="$OPTS --disk direct=off,image_type=raw,path=${VIRT_ROOTFS},readonly=on"
-    OPTS="$OPTS --fs tag=src,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
-    OPTS="$OPTS --kernel ${VIRT_KERNEL}"
-    if [ -n "${USE_INITRD:-}" ] && [ -n "${VIRT_INITRD}" ]; then
-      OPTS="$OPTS --initramfs ${VIRT_INITRD}"
-    fi
-    
-    # virtio-net is used for eth
-    # tap is the address of the tap on the VM side
-    # Adding --net tap=ex,ip=10.0.0.1,mask=255.0.0.0 to kernel cmdline adds 10 sec delay - so using the vm script to set the IP, based on other command params.
-    
-    if [ -z "${NO_NET}" ]; then
-      OPTS="$OPTS --net tap=vm-${POD},iommu=on $NETX"
-    fi
-  fi 
+  # Only 2 supported ?
+  OPTS="$OPTS --disk direct=off,image_type=raw,path=${VIRT_ROOTFS},readonly=on"
+  OPTS="$OPTS --fs tag=src,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
+  OPTS="$OPTS --kernel ${VIRT_KERNEL}"
+  
+  # virtio-net is used for eth
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
+    OPTS="$OPTS --net tap=vm-${POD},iommu=on $NETX"
+  fi
   
   CMD_OPTS="$CMD_OPTS initos_host=${POD}"
   CMD_OPTS="$CMD_OPTS net.ifnames=0"
-  if [ -z "${NO_NET}" ]; then
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
     CMD_OPTS="$CMD_OPTS initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
   fi
   
-  if [ "$virt" = "qemu" ] ; then
-    CMD_OPTS="$CMD_OPTS root=/dev/root rootfstype=virtiofs init=/opt/initos/bin/initos-init-vm rw"
-  else
-    CMD_OPTS="$CMD_OPTS root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro"
-  fi
-
+  CMD_OPTS="$CMD_OPTS root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro"
   CMD_OPTS="$CMD_OPTS trace_clock=global panic=1  panic_on_oops=1 reboot=acpi "
   
   DISKS=""
 
   if [ -f ${IMGDIR}/${POD}-rootfs.img ] ; then
       DISKS="${DISKS} --disk path=${IMGDIR}/${POD}-rootfs.img"
-      QDISKS="${QDISKS} -drive file=${IMGDIR}/${POD}-rootfs.img,format=raw,if=virtio"
       CMD_OPTS="${CMD_OPTS} initos_root=/dev/vda "
-        
-      #QDISKS="${QDISKS} -device nvme,serial=deadbeef,drive=nvm -drive file=${BIN_DIR}/sidecar.ext4,format=raw,if=none,id=nvm,readonly=on" 
-
   fi
 
-  # Not sure if this is still useful.
-  #DISKS="${DISKS} path=${VIRT_MODULES},readonly=on"
-
   # All disks under ${IMGDIR} with file name starting with ${POD} are added as additional disks.
-  # This allows to add data disks, cache disks, etc.
   EXTRA_DISKS=$(ls ${IMGDIR}/${POD}-data*.img 2>/dev/null || echo "")
 
-  echo "${EXTRA_DISKS}"
   for disk in $EXTRA_DISKS; do
     if [ -f ${disk} ]; then
       DISKS="${DISKS} --disk path=${disk}"
@@ -462,53 +400,22 @@ start() {
   fi
   OPTS="$OPTS $DISKS"
     
-  #  --vsock \
-  #  --pmem file=${WORK}/boot/efi/recovery.sqfs \
-
   rm -f ${WORK}/ch.sock
   rm -f ${WORK}/serial.socket
   
   echo $p
   CMD_OPTS="$CMD_OPTS initos_cmd=\"${p}\""
-  if [ -n "${DEBUG}" ]; then
-    if [ "${DEBUG}" = "init" ]; then
-      # Debian kernel doesn't seem to work with hvc0, serial is fine
-      # Verbose
-      OPTS="$OPTS --serial tty --console off"
-      CMD_OPTS="$CMD_OPTS debug loglevel=8 ignore_loglevel"
-      CMD_OPTS="$CMD_OPTS console=hvc0 console=ttyS0 "
-      CMD_OPTS="$CMD_OPTS systemd.log_level=debug systemd.log_target=console"
-      CMD_OPTS="$CMD_OPTS systemd.debug_shell"
-      # --serial tty --console off --cmdline "console=ttyS0" results in ttyS0 as the console
-      # Otherwise the virtio-console driver is used - faster but less early messages
-    elif [ "${DEBUG}" = "serial" ]; then
-      OPTS="$OPTS --serial tty --console off"    
-      CMD_OPTS="$CMD_OPTS quiet console=ttyS0 "
-    fi
-  else 
-    if [ -n "${SERIAL_LOG}" ]; then
-      OPTS="$OPTS --serial off --console file=${SERIAL_LOG} "
-      CMD_OPTS="$CMD_OPTS console=hvc0 "
-    else
-      OPTS="$OPTS --serial socket=${WORK}/serial.socket --console off "
-      CMD_OPTS="$CMD_OPTS console=ttyS0 "
-    fi
-    CMD_OPTS="$CMD_OPTS quiet"
+  
+  if [ -n "${SERIAL_LOG}" ]; then
+    OPTS="$OPTS --serial off --console file=${SERIAL_LOG} "
+    CMD_OPTS="$CMD_OPTS console=hvc0 "
+  else
+    OPTS="$OPTS --serial off --console tty "
+    CMD_OPTS="$CMD_OPTS console=hvc0 "
   fi
+  CMD_OPTS="$CMD_OPTS quiet"
 
-  if [ -n "${DEBUG}" ]; then
-     # For now only debug for qemu  
-     if [ "$virt" = "qemu" ] ; then
-        ${VIRT_QEMU} $OPTS $QDISKS -append "${CMD_OPTS}"
-     else
-      $TIME ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
-     fi
-  elif [ "${RC_SVCNAME:-}" != "" ]; then
-    ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
-  else  
-    ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}" > ${WORK}/vmcmd.logs 2>&1 &
-    echo $! > ${WORK}/vm.pid
-  fi
+  $TIME ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
 }
 
 set -eu
@@ -527,13 +434,13 @@ fi
 # Unlike tests/run_qemu.sh and tests/test_img.sh - this does not use
 # EFI and the host kernel.
 qemuvirt() {
+  local p="$@"
   virt_resolve_layout
   vm_init
 
   KERNEL="${KERNEL:-${VIRT_KERNEL}}"
   ROOTFS="${ROOTFS:-${VIRT_ROOTFS}}"
-  INITRD="${INITRD:-${VIRT_INITRD}}"
-
+ 
   [ -n "${ROOTFS}" ] || {
     echo "Missing rootfs image. Set VIRT to a Nix VM profile or set ROOTFS." >&2
     exit 1
@@ -548,12 +455,14 @@ qemuvirt() {
   if [ "${DEBUG}" = "init" ]; then
     cmd="${cmd} debug_init initos_dbg=1"
   fi
-    
-  initrd_arg=
-  if [ -n "${USE_INITRD:-}" ] && [ -n "${INITRD}" ]; then
-    initrd_arg="-initrd ${INITRD}"
+  cmd="${cmd} initos_host=${POD}"
+  if [ -z "${NO_NET}" ]; then
+    cmd="${cmd} initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
   fi
-
+  cmd="${cmd} trace_clock=global panic_on_oops=1 reboot=acpi"
+  cmd="${cmd} initos_cmd=\"${p}\""
+    
+  
   qemu_mem="${vm_mem:-512M}"
   qemu_cpu="${vm_cpu:-1}"
 
@@ -563,6 +472,11 @@ qemuvirt() {
   else
     qemu_accel="-cpu max"
     qemu_machine="q35,accel=tcg,acpi=on,mem-merge=on"
+  fi
+
+  local qemu_net=""
+  if [ -z "${NO_NET}" ]; then
+    qemu_net="-netdev user,id=n1,hostfwd=tcp::10022-:22 -device virtio-net-pci,netdev=n1"
   fi
 
   ${VIRT_QEMU} \
@@ -578,7 +492,6 @@ qemuvirt() {
   -nographic \
   -sandbox on \
   -kernel "${KERNEL}" \
-  ${initrd_arg} \
   -drive "id=vda,format=raw,file=${ROOTFS},if=none,aio=io_uring,discard=unmap,cache=none,read-only=on" \
   -device virtio-blk-pci,drive=vda \
   -device virtio-rng-pci \
@@ -587,6 +500,9 @@ qemuvirt() {
   -chardev "socket,id=virtfs0,path=${WORK}/virtiofs.sock" \
   -device "vhost-user-fs-pci,chardev=virtfs0,tag=src" \
   -device virtio-serial-pci \
+  -chardev "socket,id=mesh,path=${WORK}/mesh.sock,server=on,wait=off" \
+  -device "virtserialport,chardev=mesh,name=org.ssh-mesh.control" \
+  ${qemu_net} \
   -chardev stdio,id=console,signal=off \
   -device virtconsole,chardev=console \
   -append "${cmd}"
@@ -594,12 +510,12 @@ qemuvirt() {
 }
 
 crosvmvirt() {
+  local p="$@"
   virt_resolve_layout
   vm_init
 
   KERNEL="${KERNEL:-${VIRT_KERNEL}}"
   ROOTFS="${ROOTFS:-${VIRT_ROOTFS}}"
-  INITRD="${INITRD:-${VIRT_INITRD}}"
 
   [ -n "${VIRT_CROSVM}" ] || {
     echo "Missing crosvm. Set VIRT to a Nix VM profile or set VIRT_CROSVM." >&2
@@ -612,31 +528,35 @@ crosvmvirt() {
 
   run_virtiofsd ${WORK}
 
-  cmd="console=ttyS0 reboot=k panic=1"
+  cmd="console=hvc0 reboot=k panic=1"
   cmd="${cmd} root=/dev/vda rootfstype=erofs rootwait"
   cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
   cmd="${cmd} net.ifnames=0 initos_host=${POD}"
   if [ "${DEBUG}" = "init" ]; then
     cmd="${cmd} debug_init initos_dbg=1 loglevel=8 ignore_loglevel"
   fi
-
-  initrd_arg=
-  if [ -n "${USE_INITRD:-}" ] && [ -n "${INITRD}" ]; then
-    initrd_arg="--initrd ${INITRD}"
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
+    cmd="${cmd} initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
   fi
+  cmd="${cmd} initos_cmd=\"${p}\""
 
   rm -f "${WORK}/crosvm.sock"
 
-  ${VIRT_CROSVM} --no-syslog run \
+  local crosvm_net=""
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
+    crosvm_net="--net tap-name=vm-${POD}"
+  fi
+
+    ${VIRT_CROSVM} --no-syslog run \
     -m "${vm_mem_mb:-512}" \
     -c "${vm_cpu:-1}" \
-    --serial "type=stdout,console=true,stdin=true" \
+    --serial "hardware=virtio-console,type=stdout,console=true,stdin=true" \
     -p "${cmd}" \
     --no-balloon \
     -s "${WORK}/crosvm.sock" \
     --block "${ROOTFS},o_direct=false,ro=true" \
     --vhost-user "type=fs,socket=${WORK}/virtiofs.sock" \
-    ${initrd_arg} \
+    ${crosvm_net} \
     --disable-sandbox \
     "${KERNEL}"
 }
@@ -650,7 +570,6 @@ layout() {
   echo "VIRT_BOOT=${VIRT_BOOT}"
   echo "VIRT_OPT=${VIRT_OPT}"
   echo "VIRT_KERNEL=${VIRT_KERNEL}"
-  echo "VIRT_INITRD=${VIRT_INITRD}"
   echo "VIRT_ROOTFS=${VIRT_ROOTFS}"
   echo "VIRT_MODULES=${VIRT_MODULES}"
   echo "VIRT_BUSYBOX=${VIRT_BUSYBOX}"

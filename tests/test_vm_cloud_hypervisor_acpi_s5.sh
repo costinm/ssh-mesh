@@ -118,7 +118,7 @@ sed -i "s|__POWEROFF_ARGS__|${POWEROFF_ARGS}|g" "${SRC}/initos-pod"
 chmod 755 "${SRC}/initos-pod"
 
 if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
-  nix build "path:${PROJECT_ROOT}/linux#initos-vm" -o "${PROFILE}"
+  nix build .#default -o "${PROFILE}"
 fi
 
 env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \

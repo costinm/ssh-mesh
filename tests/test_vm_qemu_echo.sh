@@ -31,7 +31,7 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-nix build "path:${PROJECT_ROOT}/linux#initos-vm" -o "${PROFILE}"
+nix build .#default -o "${PROFILE}"
 
 timeout --foreground "${TIMEOUT:-90}s" \
   env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \

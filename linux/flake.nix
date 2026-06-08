@@ -35,6 +35,7 @@
 
         initos-vm = pkgs.runCommand "initos-vm" { } ''
           mkdir -p "$out"/{bin,boot,img}
+          touch "$out/boot/initrd.img"
 
           ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
 
@@ -51,25 +52,10 @@
           ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
           ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
           ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
-          ln -s ${./bin/vrun} "$out/bin/vrun.lib"
-
-          mkdir -p "$out/opt"/{busybox/bin,initos/bin}
-          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/opt/busybox/bin/busybox"
-          ln -s ${./bin/initos-init-vm} "$out/opt/initos/bin/initos-init-vm"
-          chmod 755 "$out/opt/initos/bin/initos-init-vm"
-          ln -s ${./bin/initos-vrun} "$out/bin/initos-vrun"
-
-          cat > "$out/README" <<EOF
-          initos VM cloud profile
-
-          Important paths:
-            $out/img/vmlinux-cloud
-            $out/img/modules-cloud.erofs
-            $out/opt
-
-          sidecar/bin/vrun-compatible entrypoint:
-            $out/bin/initos-vrun
-          EOF
+          
+          cp ${./bin/vrun} "$out/bin/vrun"
+          chmod +x "$out/bin/vrun"
+          ln -s vrun "$out/bin/initos-vrun"
         '';
 
         initos-vm-image = pkgs.dockerTools.buildLayeredImage {
@@ -81,7 +67,7 @@
             pkgs.coreutils
           ];
           config = {
-            Cmd = [ "${initos-vm}/bin/initos-vrun" ];
+            Cmd = [ "${initos-vm}/bin/vrun" ];
             Env = [
               "PATH=/bin:/usr/bin"
             ];
@@ -98,7 +84,7 @@
         apps = {
           vm-cloud = {
             type = "app";
-            program = "${initos-vm}/bin/initos-vrun";
+            program = "${initos-vm}/bin/vrun";
           };
         };
       }

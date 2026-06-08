@@ -9,9 +9,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+    linux = { url = "path:./linux"; inputs.nixpkgs.follows = "nixpkgs"; };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, linux }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         muslTarget = "x86_64-unknown-linux-musl";
@@ -80,14 +81,6 @@
         ssh-mesh-full = mkPackage "ssh-mesh-full"
           "--workspace --bins --features ssh-mesh/pmon";
 
-        ssh-mesh  = mkPackage "ssh-mesh"  "--features pmon -p ssh-mesh";
-        pmond     = mkPackage "pmond"     "-p pmond";
-        mesh-init = mkPackage "mesh-init" "-p mesh-init";
-        h2t       = mkPackage "h2t"       "-p ssh-mesh --bin h2t";
-        meshkeys  = mkPackage "meshkeys"  "-p ssh-mesh --bin meshkeys";
-        sshmc     = mkPackage "sshmc"     "-p ssh-mesh --bin sshmc";
-        traceweb  = mkPackage "traceweb"  "-p traceweb";
-
         # ── Docker image ──────────────────────────────────────────
 
         sshm = pkgs.dockerTools.buildLayeredImage {
@@ -100,14 +93,22 @@
           };
         };
 
+        # ── EROFS VM Rootfs ───────────────────────────────────────
+
+        initos-erofs = pkgs.runCommand "ssh-mesh.erofs" {
+          nativeBuildInputs = [ pkgs.erofs-utils ];
+        } ''
+          bash ${./scripts/build.sh} erofs "$out" "${pkgs.pkgsStatic.busybox}/bin/busybox" "${./bin/initos-init-vm}" "${ssh-mesh-full}/bin"
+        '';
+
       in
       {
         packages = {
-          inherit
-            ssh-mesh ssh-mesh-full mesh-init pmond
-            h2t meshkeys sshmc traceweb
-            sshm;
-          default = ssh-mesh-full;
+            inherit ssh-mesh-full sshm initos-erofs;
+            default = pkgs.symlinkJoin {
+              name = "ssh-mesh-default";
+              paths = [ ssh-mesh-full initos-erofs linux.packages.${system}.initos-vm ];
+            };
         };
 
         devShells.default = craneLib.devShell {
@@ -120,7 +121,7 @@
         };
 
         checks = {
-          inherit ssh-mesh ssh-mesh-full mesh-init pmond;
+          inherit ssh-mesh-full;
           # Run clippy
           ssh-mesh-clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
