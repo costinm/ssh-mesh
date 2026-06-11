@@ -8,7 +8,7 @@ clients:
   local-uds:
     transport: uds
     user: root
-    uds_path: /run/user/1000/ssh-mesh/trusted.sock
+    uds_path: /run/host1/1000/ssh-mesh/trusted.sock
     keep_alive: true
     reconnect_interval_secs: 2
 

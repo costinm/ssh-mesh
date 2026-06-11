@@ -203,9 +203,10 @@ impl Daemon {
                 home,
                 uid,
                 gid,
+                pty,
                 env,
                 context,
-            } => self.handle_start_terminal(&name, &home, uid, gid, env, context, fd),
+            } => self.handle_start_terminal(&name, &home, uid, gid, pty, env, context, fd),
             _ => Response::err("request does not accept a passed file descriptor"),
         }
     }
@@ -340,6 +341,7 @@ impl Daemon {
         home: &str,
         uid: u32,
         gid: Option<u32>,
+        pty: bool,
         extra_env: HashMap<String, String>,
         context: Option<ActivationContext>,
         fd: OwnedFd,
@@ -416,7 +418,12 @@ impl Daemon {
 
         let cg =
             crate::cgroup::create_cgroup(name).unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
-        match process::spawn_process(&config, &cg, Some(process::ActivationFd::Stdio(fd))) {
+        let activation_fd = if pty {
+            process::ActivationFd::Pty(fd)
+        } else {
+            process::ActivationFd::Stdio(fd)
+        };
+        match process::spawn_process(&config, &cg, Some(activation_fd)) {
             Ok(pid) => Response::ok_with_data(serde_json::json!({"pid": pid})),
             Err(e) => Response::err(e.to_string()),
         }
@@ -904,6 +911,7 @@ priority = 300
             home: home.path().to_string_lossy().into_owned(),
             uid: current_uid,
             gid: Some(current_gid),
+            pty: false,
             env: HashMap::from([
                 (
                     "HOME".to_string(),
@@ -955,6 +963,7 @@ priority = 300
                 current_gid.saturating_add(1)
             }),
             env: HashMap::new(),
+            pty: false,
             context: None,
         };
 

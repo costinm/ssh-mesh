@@ -18,9 +18,7 @@ use std::time::SystemTime;
 
 use hyper::body::Bytes;
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
@@ -305,7 +303,11 @@ impl SshHandler {
             }
         }
 
-        let attempts = if route.activation_service.is_some() { 30 } else { 1 };
+        let attempts = if route.activation_service.is_some() {
+            30
+        } else {
+            1
+        };
         let mut last_error = None;
         for attempt in 0..attempts {
             match server
@@ -1072,6 +1074,7 @@ fn send_terminal_to_mesh_init_blocking(
         home: terminal.home.clone(),
         uid: terminal.uid,
         gid: terminal.gid,
+        pty: true,
         env: std::collections::HashMap::from([
             ("HOME".to_string(), terminal.home),
             ("USER".to_string(), terminal.user.clone()),

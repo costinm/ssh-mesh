@@ -65,6 +65,9 @@ Once the `mesh-init` daemon is running, you can interact with it using the `mesh
 ./target/debug/mesh mesh-init stop echo-service
 
 # Reload all service configurations (e.g. after editing a .toml file)
+./target/debug/mesh-init reload
+
+# The generic mesh control client can send the same request
 ./target/debug/mesh mesh-init reload
 
 # Shutdown the daemon and all services

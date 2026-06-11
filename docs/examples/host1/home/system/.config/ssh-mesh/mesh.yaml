@@ -1,0 +1,102 @@
+# ssh-mesh node configuration for the non-root "host1" example host.
+#
+# This node runs under mesh-init host1 mode and reaches the networked examples
+# through ordinary SSH. Trusted transports are reserved for no-network examples.
+
+ssh_port: 18422
+http_port: 18480
+trusted_uds_path: /tmp/mesh/shared/host1/trusted.sock
+
+clients:
+  host2:
+    transport: tcp
+    hostname: 127.0.0.1
+    port: 18222
+    user: system
+    #keep_alive: true
+    #reconnect_interval_secs: 2
+
+    local_forward:
+      - bind_address: 127.0.0.1
+        port: 19005
+        host: 127.0.0.1
+        host_port: 18222
+
+    remote_forward:
+      - bind_address: 127.0.0.1
+        port: 19105
+        host: 127.0.0.1
+        host_port: 18480
+
+ssh_routes:
+  - name: host2
+    user: system@host2.example.m
+    jump_host: host2.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    client:
+      transport: tcp
+      hostname: 127.0.0.1
+      port: 18222
+      user: system
+
+  - name: host3-vm
+    user: system@host3-vm.example.m
+    jump_host: host3-vm.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    client:
+      transport: tcp
+      hostname: 127.0.0.1
+      port: 18322
+      user: system
+
+  - name: app1-bwrap
+    user: system@app1-bwrap.example.m
+    jump_host: app1-bwrap.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    activation_service: activate-app1-bwrap
+    client:
+      transport: uds
+      user: system
+      uds_path: /tmp/mesh/shared/app1-bwrap/trusted.sock
+
+  - name: app2-qemu
+    user: system@app2-qemu.example.m
+    jump_host: app2-qemu.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    client:
+      transport: tcp
+      hostname: 127.0.0.1
+      port: 18322
+      user: system@app2-qemu.example.m
+
+  - name: app3-crosvm
+    user: system@app3-crosvm.example.m
+    jump_host: app3-crosvm.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    client:
+      transport: tcp
+      hostname: 127.0.0.1
+      port: 18322
+      user: system@app3-crosvm.example.m
+
+  - name: app4-ch
+    user: system@app4-ch.example.m
+    jump_host: app4-ch.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    client:
+      transport: tcp
+      hostname: 127.0.0.1
+      port: 18322
+      user: system@app4-ch.example.m

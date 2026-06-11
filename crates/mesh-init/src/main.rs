@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use tracing::info;
 
@@ -13,6 +14,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
 use mesh_init::daemon::{Daemon, DaemonConfig};
+use mesh_init::protocol::{Request, Response};
 
 #[derive(Parser, Debug)]
 #[clap(name = "mesh-init", version = "0.1.0", trailing_var_arg = true)]
@@ -54,6 +56,12 @@ async fn main() -> Result<()> {
     let socket_path = get_socket_path();
     let config_dir = get_config_dir();
 
+    if let Some(request) = control_request(&args.command)? {
+        let response = mesh_init::server::send_request(&socket_path, &request).await?;
+        print_response(response)?;
+        return Ok(());
+    }
+
     let command = if args.command.is_empty() {
         None
     } else {
@@ -61,6 +69,86 @@ async fn main() -> Result<()> {
     };
 
     run(config_dir, socket_path, command).await
+}
+
+fn control_request(command: &[String]) -> Result<Option<Request>> {
+    let Some(method) = command.first().map(String::as_str) else {
+        return Ok(None);
+    };
+
+    let request = match method {
+        "reload" => Request::Reload,
+        "status" => Request::Status {
+            name: command.get(1).cloned(),
+        },
+        "start" => {
+            let Some(name) = command.get(1) else {
+                anyhow::bail!("usage: mesh-init start SERVICE [ARGS...]");
+            };
+            Request::Start {
+                name: name.clone(),
+                args: command[2..].to_vec(),
+                env: HashMap::new(),
+                context: None,
+            }
+        }
+        "stop" => {
+            let Some(name) = command.get(1) else {
+                anyhow::bail!("usage: mesh-init stop SERVICE [--signal SIGNAL]");
+            };
+            let mut signal = None;
+            let mut i = 2;
+            while i < command.len() {
+                match command[i].as_str() {
+                    "--signal" => {
+                        let Some(value) = command.get(i + 1) else {
+                            anyhow::bail!("missing value for --signal");
+                        };
+                        signal = Some(value.parse()?);
+                        i += 2;
+                    }
+                    other => anyhow::bail!("unknown stop argument: {}", other),
+                }
+            }
+            Request::Stop {
+                name: name.clone(),
+                signal,
+            }
+        }
+        "shutdown" => Request::Shutdown,
+        "freeze" => {
+            let Some(name) = command.get(1) else {
+                anyhow::bail!("usage: mesh-init freeze SERVICE");
+            };
+            Request::Freeze { name: name.clone() }
+        }
+        "unfreeze" => {
+            let Some(name) = command.get(1) else {
+                anyhow::bail!("usage: mesh-init unfreeze SERVICE");
+            };
+            Request::Unfreeze { name: name.clone() }
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(request))
+}
+
+fn print_response(response: Response) -> Result<()> {
+    if response.success {
+        if let Some(data) = response.data {
+            println!("{}", serde_json::to_string_pretty(&data)?);
+        } else {
+            println!("OK");
+        }
+        Ok(())
+    } else {
+        eprintln!(
+            "Error: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
 }
 
 /// Common startup: create daemon, start everything, optionally run a CLI command.
@@ -190,4 +278,24 @@ fn get_socket_path() -> String {
         format!("{}/.run/mesh-init", home)
     };
     format!("{}/control.sock", run_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_is_control_request() {
+        let args = vec!["reload".to_string()];
+        assert!(matches!(
+            control_request(&args).unwrap(),
+            Some(Request::Reload)
+        ));
+    }
+
+    #[test]
+    fn unknown_command_remains_exec_mode() {
+        let args = vec!["echo".to_string(), "hi".to_string()];
+        assert!(control_request(&args).unwrap().is_none());
+    }
 }

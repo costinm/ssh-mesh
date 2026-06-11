@@ -11,8 +11,8 @@ use ssh_key::certificate::{Builder, CertType};
 
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::keys::{set_permissions, ssh_key_from_pkcs8_pem, ssh_to_pkcs8_pem};
 
@@ -416,8 +416,7 @@ pub fn sign_node_with_options(
     host_cert_builder
         .cert_type(CertType::Host)?
         .key_id(format!("{}-host", name))?;
-    let host_principals =
-        host_principals.unwrap_or_else(|| vec![format!("{}.{}", name, domain)]);
+    let host_principals = host_principals.unwrap_or_else(|| vec![format!("{}.{}", name, domain)]);
     for principal in host_principals {
         host_cert_builder.valid_principal(principal)?;
     }
@@ -437,8 +436,7 @@ pub fn sign_node_with_options(
     user_cert_builder
         .cert_type(CertType::User)?
         .key_id(format!("{}-user", name))?;
-    let user_principals =
-        user_principals.unwrap_or_else(|| vec![format!("{}@{}", name, domain)]);
+    let user_principals = user_principals.unwrap_or_else(|| vec![format!("{}@{}", name, domain)]);
     for principal in user_principals {
         user_cert_builder.valid_principal(principal)?;
     }

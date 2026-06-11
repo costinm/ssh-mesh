@@ -1,0 +1,108 @@
+#!/opt/busybox/bin/sh
+set -eu
+
+action="${1:-start}"
+
+if [ "${action}" != "start" ]; then
+  echo "app initos-pod only supports: start" >&2
+  exit 2
+fi
+
+export PATH=/out/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin
+node="${SSH_MESH_VM_NODE:-${initos_host:-app3-crosvm}}"
+case "${node}" in
+  app2-qemu) app_home="${SSH_MESH_APP_HOME:-app2}" ;;
+  app3-crosvm) app_home="${SSH_MESH_APP_HOME:-app3}" ;;
+  app4-ch) app_home="${SSH_MESH_APP_HOME:-app4}" ;;
+  *) app_home="${SSH_MESH_APP_HOME:-${node}}" ;;
+esac
+
+log() {
+  echo "${node}-POD: $*"
+}
+
+home_src=/src/${node}/home/${app_home}
+home=/home/${app_home}
+
+mkdir -p \
+  "${home}" \
+  "${home}/.config/mesh-init" \
+  "${home}/.config/ssh-mesh" \
+  "${home}/.run/mesh-init" \
+  "${home}/.run/ssh-mesh/mux" \
+  "${home}/.ssh" \
+  /out \
+  /out/ssh-mesh \
+  /out/ssh-mesh/bin \
+  /tmp/mesh \
+  /tmp/mesh/shared
+
+if [ -d /src/bin ]; then
+  if mount -o bind /src/bin /out/ssh-mesh/bin 2>/dev/null; then
+    log "bound /src/bin to /out/ssh-mesh/bin"
+  else
+    log "bind mount /src/bin failed; linking /out/ssh-mesh/bin to /src/bin"
+    rmdir /out/ssh-mesh/bin 2>/dev/null || true
+    ln -s /src/bin /out/ssh-mesh/bin
+  fi
+fi
+
+if [ -d /src/shared ]; then
+  if mount -o bind /src/shared /tmp/mesh/shared 2>/dev/null; then
+    log "bound /src/shared to /tmp/mesh/shared"
+  else
+    log "bind mount /src/shared failed; trusted UDS sharing may be unavailable"
+  fi
+fi
+
+if [ -d /src/nix ]; then
+  mkdir -p /nix
+  if mount -o bind,ro /src/nix /nix 2>/dev/null; then
+    log "mounted /src/nix to /nix read-only"
+  else
+    log "warning: failed to mount /src/nix to /nix"
+  fi
+fi
+
+if [ -d "${home_src}" ]; then
+  if mount -o bind "${home_src}" "${home}" 2>/dev/null; then
+    log "bound ${home_src} to ${home}"
+  else
+    log "bind mount failed; using ${home_src} directly"
+    home="${home_src}"
+  fi
+fi
+
+# Mount a tmpfs on ${home}/.run to avoid placing UDS sockets on 9p share which QEMU blocks
+mkdir -p "${home}/.run"
+if mount -t tmpfs -o mode=0777,nosuid,nodev tmpfs "${home}/.run" 2>/dev/null; then
+  log "mounted tmpfs on ${home}/.run"
+else
+  log "warning: failed to mount tmpfs on ${home}/.run"
+fi
+
+mkdir -p \
+  "${home}/.config/mesh-init" \
+  "${home}/.config/ssh-mesh" \
+  "${home}/.run/mesh-init" \
+  "${home}/.run/ssh-mesh/mux" \
+  "${home}/.ssh"
+
+chmod 700 "${home}/.ssh"
+chmod 600 "${home}/.ssh/config" 2>/dev/null || true
+
+ip link set lo up 2>/dev/null || true
+ip link set eth0 up 2>/dev/null || true
+udhcpc -i eth0 -q -n -t 5 2>/dev/null || log "dhcp on eth0 failed"
+
+export HOME="${home}"
+export USER="${app_home}"
+export LOGNAME="${app_home}"
+export RUST_LOG="${RUST_LOG:-info}"
+export MESH_INIT_SOCK="${home}/.run/mesh-init/control.sock"
+export MESH_INIT_RUN="${home}/.run/mesh-init"
+export MESH_INIT_DIR="${home}/.config/mesh-init"
+export SSH_MESH_HOME_ROOT=/home
+
+log "starting mesh-init from $(command -v mesh-init)"
+exec mesh-init

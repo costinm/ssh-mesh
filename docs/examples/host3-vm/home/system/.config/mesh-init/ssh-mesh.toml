@@ -1,0 +1,28 @@
+# mesh-init service definition for host3-vm's ssh-mesh node.
+#
+# Host3-vm is the VM/QEMU-oriented example. The guest should install this file at:
+#
+#   $HOME/.config/mesh-init/ssh-mesh.toml
+#
+# The same HOME-relative runtime layout is used whether host3-vm is booted from a
+# Nix-built VM artifact or started by a local fallback wrapper.
+
+[service]
+name = "init-ssh-mesh-host3-vm"
+command = "ssh-mesh"
+priority = 100
+oneshot = false
+
+[resources]
+memory_high = "256M"
+memory_max = "512M"
+cpu_weight = 100
+
+[environment]
+PATH = "/out/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
+RUST_LOG = "info"
+SSH_PORT = "18322"
+HTTP_PORT = "18380"
+MUX_DIR = "/home/system/.run/ssh-mesh/mux"
+MESH_INIT_SOCK = "/home/system/.run/mesh-init/control.sock"
+SSH_MESH_HOME_ROOT = "/home"

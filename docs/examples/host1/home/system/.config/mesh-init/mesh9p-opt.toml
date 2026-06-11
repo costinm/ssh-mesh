@@ -1,0 +1,16 @@
+[service]
+name = "mesh9p-opt"
+command = "mesh9p"
+args = ["/opt"]
+priority = 400
+
+[resources]
+memory_low = "64M"
+memory_high = "128M"
+cpu_weight = 50
+
+[environment]
+RUST_LOG = "debug"
+
+[[activation]]
+port = 15101

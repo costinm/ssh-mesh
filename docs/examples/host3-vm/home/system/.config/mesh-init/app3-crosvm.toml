@@ -1,0 +1,28 @@
+# On-demand activator for a no-network crosvm VM reached over virtio-vsock.
+
+[service]
+name = "activate-app3-crosvm"
+command = "/src/host3-vm/home/app3-crosvm/start.sh"
+args = ["--vsock"]
+priority = 232
+oneshot = true
+
+[[activation]]
+socket = "/tmp/mesh/shared/app3-crosvm/trusted.sock"
+wait = false
+
+[resources]
+memory_high = "384M"
+memory_max = "768M"
+cpu_weight = 50
+
+[environment]
+RUST_LOG = "info"
+SSH_MESH_EXAMPLE_ROOT = "/tmp/mesh/state"
+SSH_MESH_APP_VM_KERNEL = "/src/vm-artifacts/vmlinux-cloud"
+SSH_MESH_APP_VM_ROOTFS = "/src/vm-artifacts/ssh-mesh.erofs"
+SSH_MESH_VM_NODE = "app3-crosvm"
+SSH_MESH_VM_HYPERVISOR = "crosvm"
+SSH_MESH_VM_VSOCK_CID = "44"
+SSH_MESH_VM_VSOCK_PORT = "18522"
+SSH_MESH_VRUN = "/out/ssh-mesh/bin/vrun"

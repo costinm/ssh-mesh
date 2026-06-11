@@ -1,0 +1,85 @@
+# OpenSSH config for the local ssh-mesh examples.
+#
+# Run these aliases from this directory:
+#
+#   cd docs/examples
+#   ssh -F ssh_config host1
+#   ssh -F ssh_config app2-qemu
+#
+# The IdentityFile and CertificateFile paths are intentionally relative so the
+# examples can move with the checkout.
+
+Host *
+  IdentitiesOnly yes
+  ControlMaster no
+  ControlPath none
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  BatchMode yes
+  ConnectTimeout 10
+  LogLevel ERROR
+
+# Direct TCP entry points.
+Host host1
+  HostName 127.0.0.1
+  Port 18422
+  User system
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host host2-direct
+  HostName 127.0.0.1
+  Port 18222
+  User system
+  IdentityFile host2/home/system/.ssh/id_ecdsa
+  CertificateFile host2/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host host3-vm-direct
+  HostName 127.0.0.1
+  Port 18322
+  User system
+  IdentityFile host3-vm/home/system/.ssh/id_ecdsa
+  CertificateFile host3-vm/home/system/.ssh/id_ecdsa-user-cert.pub
+
+# Routed through host1's user-facing SSH port.
+Host host2
+  HostName 127.0.0.1
+  Port 18422
+  User system@host2.example.m
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host host3-vm
+  HostName 127.0.0.1
+  Port 18422
+  User system@host3-vm.example.m
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host app1-bwrap
+  HostName 127.0.0.1
+  Port 18422
+  User system@app1-bwrap.example.m
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host app2-qemu
+  HostName 127.0.0.1
+  Port 18422
+  User system@app2-qemu.example.m
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host app3-crosvm
+  HostName 127.0.0.1
+  Port 18422
+  User system@app3-crosvm.example.m
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host app4-ch
+  HostName 127.0.0.1
+  Port 18422
+  User system@app4-ch.example.m
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub

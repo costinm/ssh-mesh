@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+workspace_dir="$(cd "${script_dir}/../../.." 2>/dev/null && pwd)"
+target_dir="${SSH_MESH_TARGET_DIR:-${workspace_dir}/target}"
+default_nix_profile="${target_dir}/nix/profile"
+if [ ! -e "${default_nix_profile}" ] && [ -e "${target_dir}/nix/profiles" ]; then
+  default_nix_profile="${target_dir}/nix/profiles"
+fi
+nix_profile="${NIX_PROFILE:-${default_nix_profile}}"
+export NIX_PROFILE="${nix_profile}"
+if [ -d "${NIX_PROFILE}/bin" ]; then
+  export PATH="${NIX_PROFILE}/bin:${PATH}"
+fi
+
+# Try to locate the VM assets
+if [ -n "${SSH_MESH_HOST3_VM_DIR:-}" ]; then
+  vm_dir="${SSH_MESH_HOST3_VM_DIR}"
+elif [ -n "${SSH_MESH_HOST3_VM_DIR:-}" ]; then
+  vm_dir="${SSH_MESH_HOST3_VM_DIR}"
+elif [ -d "${workspace_dir}/result-default" ]; then
+  vm_dir="${workspace_dir}/result-default"
+elif [ -d "${script_dir}/../share/host3-vm-vm" ]; then
+  vm_dir="$(cd "${script_dir}/.." 2>/dev/null && pwd)/share/host3-vm-vm"
+elif [ -d "${nix_profile}/opt/ssh-mesh/share/host3-vm-vm" ]; then
+  vm_dir="${nix_profile}/opt/ssh-mesh/share/host3-vm-vm"
+else
+  vm_dir="/opt/ssh-mesh/share/host3-vm-vm"
+fi
+
+# Locate kernel
+if [ -f "${vm_dir}/img/vmlinux-cloud" ]; then
+  kernel="${vm_dir}/img/vmlinux-cloud"
+elif [ -f "${nix_profile}/img/vmlinux-cloud" ]; then
+  kernel="${nix_profile}/img/vmlinux-cloud"
+elif [ -f "${vm_dir}/bzImage" ]; then
+  kernel="${vm_dir}/bzImage"
+else
+  kernel="${SSH_MESH_HOST3_VM_KERNEL:-${SSH_MESH_HOST3_VM_KERNEL:-${vm_dir}/bzImage}}"
+fi
+
+# Locate rootfs
+if [ -f "${vm_dir}/img/ssh-mesh.erofs" ]; then
+  rootfs="${vm_dir}/img/ssh-mesh.erofs"
+elif [ -f "${vm_dir}/initos.erofs" ]; then
+  rootfs="${vm_dir}/initos.erofs"
+else
+  rootfs="${SSH_MESH_HOST3_VM_ROOTFS:-${SSH_MESH_HOST3_VM_ROOTFS:-${vm_dir}/initos.erofs}}"
+fi
+
+node="host3-vm"
+root_dir="${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}"
+export SSH_MESH_EXAMPLE_ROOT="${root_dir}"
+
+state_dir="${root_dir}/${node}"
+home_dir="${state_dir}/home/${node}"
+shared_dir="${root_dir}/shared"
+work_dir="${state_dir}/vm"
+share_dir="${root_dir}"
+host_ssh_port="${SSH_MESH_HOST3_VM_HOST_SSH_PORT:-${SSH_MESH_HOST3_VM_HOST_SSH_PORT:-18322}}"
+host_http_port="${SSH_MESH_HOST3_VM_HOST_HTTP_PORT:-${SSH_MESH_HOST3_VM_HOST_HTTP_PORT:-18380}}"
+guest_ip="${SSH_MESH_HOST3_VM_GUEST_IP:-${SSH_MESH_HOST3_VM_GUEST_IP:-10.0.2.15/24}}"
+guest_gw="${SSH_MESH_HOST3_VM_GUEST_GW:-${SSH_MESH_HOST3_VM_GUEST_GW:-10.0.2.2}}"
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required command: $1" >&2
+    exit 1
+  }
+}
+
+need qemu-system-x86_64
+
+for f in "${kernel}" "${rootfs}"; do
+  if [ ! -r "${f}" ]; then
+    cat >&2 <<EOF
+Host3-vm requires readable VM artifacts.
+
+Missing: ${f}
+
+Set SSH_MESH_HOST3_VM_DIR, or set SSH_MESH_HOST3_VM_KERNEL and SSH_MESH_HOST3_VM_ROOTFS.
+EOF
+    exit 2
+  fi
+done
+
+mkdir -p \
+  "${home_dir}/.config/mesh-init" \
+  "${home_dir}/.config/ssh-mesh" \
+  "${home_dir}/.run/mesh-init" \
+  "${home_dir}/.run/ssh-mesh/mux" \
+  "${home_dir}/.ssh" \
+  "${shared_dir}" \
+  "${share_dir}/bin" \
+  "${share_dir}/host3-vm/home" \
+  "${work_dir}"
+
+rm -rf "${share_dir}/initos"
+mkdir -p "${share_dir}/bin" "${share_dir}/host3-vm/home" "${share_dir}/initos"
+
+# Locate the guest initos-pod
+if [ -f "${script_dir}/initos-pod" ]; then
+  initos_pod_src="${script_dir}/initos-pod"
+elif [ -f "${vm_dir}/initos-pod" ]; then
+  initos_pod_src="${vm_dir}/initos-pod"
+else
+  echo "Error: initos-pod not found" >&2
+  exit 1
+fi
+
+for app_home in "${script_dir}/home/"*; do
+  [ -d "${app_home}" ] || continue
+  app_name="$(basename "${app_home}")"
+  mkdir -p "${share_dir}/host3-vm/home/${app_name}"
+  cp -a "${app_home}/." "${share_dir}/host3-vm/home/${app_name}/"
+done
+cp "${initos_pod_src}" "${share_dir}/initos/initos-pod"
+if [ -d "${vm_dir}/bin" ]; then
+  cp "${vm_dir}/bin/"* "${share_dir}/bin/"
+elif [ -d "${workspace_dir}/result-ssh-mesh-full/bin" ]; then
+  cp "${workspace_dir}/result-ssh-mesh-full/bin/"* "${share_dir}/bin/"
+fi
+
+echo "host3-vm kernel: ${kernel}"
+echo "host3-vm rootfs: ${rootfs}"
+echo "host3-vm src share: ${share_dir}"
+echo "host3-vm HOME inside guest: /home/system"
+echo "host3-vm persistent HOME source: /src/host3-vm/home/system"
+echo "host3-vm host forwards: 127.0.0.1:${host_ssh_port}->18322, 127.0.0.1:${host_http_port}->18380"
+echo "host3-vm guest network: ${guest_ip} via ${guest_gw}"
+
+qemu_mem="${SSH_MESH_HOST3_VM_QEMU_MEMORY:-${SSH_MESH_HOST3_VM_QEMU_MEMORY:-1024}}"
+qemu_cpus="${SSH_MESH_HOST3_VM_QEMU_CPUS:-${SSH_MESH_HOST3_VM_QEMU_CPUS:-2}}"
+nix_9p_args=()
+if [ -d /nix ]; then
+  nix_9p_args=(
+    -fsdev "local,security_model=none,readonly=on,id=fsdev_nix,path=/nix"
+    -device "virtio-9p-pci,id=fs_nix,fsdev=fsdev_nix,mount_tag=nix"
+  )
+fi
+
+qemu_args=(
+  -name "${node}"
+  -m "${qemu_mem}"
+  -smp "${qemu_cpus}"
+  -kernel "${kernel}"
+  -drive "id=vda,format=raw,file=${rootfs},if=none,read-only=on"
+  -device "virtio-blk-pci,drive=vda"
+  -append "root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro console=hvc0 panic=5 net.ifnames=0 initos_host=host3-vm initos_ip=${guest_ip} initos_gw=${guest_gw}"
+  -fsdev "local,security_model=none,id=fsdev0,path=${share_dir}"
+  -device "virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
+  "${nix_9p_args[@]}"
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${host_ssh_port}-:18322,hostfwd=tcp:127.0.0.1:${host_http_port}-:18380"
+  -device "virtio-net-pci,netdev=net0"
+  -device "virtio-serial-pci"
+  -chardev "stdio,id=hvc0,signal=off"
+  -device "virtconsole,chardev=hvc0"
+  -display "none"
+  -serial "none"
+  -monitor "none"
+)
+
+# shellcheck disable=SC2086
+exec qemu-system-x86_64 "${qemu_args[@]}" ${SSH_MESH_HOST3_VM_QEMU_EXTRA:-${SSH_MESH_HOST3_VM_QEMU_EXTRA:-}}

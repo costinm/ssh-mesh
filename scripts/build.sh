@@ -130,10 +130,6 @@ stage_examples() {
     ln -sf vrun "$opt/ssh-mesh/bin/initos-vrun"
     install_busybox_tree "$busybox" "$opt/busybox"
 
-    rm -rf "$root/examples/bwrap-nonet" "$root/examples/vm-nonet"
-    cp -a docs/examples/bwrap-nonet "$root/examples/bwrap-nonet"
-    cp -a docs/examples/vm-nonet "$root/examples/vm-nonet"
-
     echo "Examples staged under $root"
 }
 

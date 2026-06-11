@@ -1,0 +1,8 @@
+# init-setup.toml — Runs before the main application and other services.
+# Example: create directories, set permissions, etc.
+[service]
+name = "init-setup"
+command = "/opt/busybox/bin/sh"
+args = ["-c", "echo 'init-setup complete'"]
+priority = 10
+oneshot = true

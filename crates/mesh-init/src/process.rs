@@ -107,6 +107,8 @@ impl ManagedProcess {
 pub enum ActivationFd {
     /// inetd-style (wait=false): accepted client socket → stdin/stdout/stderr.
     Stdio(std::os::fd::OwnedFd),
+    /// Terminal-style activation: PTY slave → controlling terminal and stdio.
+    Pty(std::os::fd::OwnedFd),
     /// xinetd-style (wait=true): listening socket → FD 3(+), LISTEN_FD env var.
     Listen(std::os::fd::OwnedFd),
 }
@@ -154,6 +156,38 @@ pub fn spawn_process(
             cmd.stdin(std::process::Stdio::from(fd));
             cmd.stdout(std::process::Stdio::from(stdout_fd));
             //cmd.stderr(std::process::Stdio::from(stderr_fd));
+        }
+        Some(ActivationFd::Pty(fd)) => {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+
+            let raw_fd = fd.as_raw_fd();
+            let stdin_fd = fd.try_clone().map_err(ProcessError::Io)?;
+            let stdout_fd = fd.try_clone().map_err(ProcessError::Io)?;
+            let stderr_fd = fd.try_clone().map_err(ProcessError::Io)?;
+            cmd.stdin(std::process::Stdio::from(stdin_fd));
+            cmd.stdout(std::process::Stdio::from(stdout_fd));
+            cmd.stderr(std::process::Stdio::from(stderr_fd));
+
+            // SAFETY: pre_exec runs in the child after fork and before exec.
+            // It only calls async-signal-safe libc operations.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(raw_fd, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(raw_fd, 0) < 0
+                        || libc::dup2(raw_fd, 1) < 0
+                        || libc::dup2(raw_fd, 2) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         Some(ActivationFd::Listen(fd)) => {
             // xinetd-style: pass as extra FD and set env var.
@@ -337,6 +371,8 @@ pub fn is_pid1() -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     fn test_config(name: &str) -> AppConfig {
         AppConfig {
@@ -356,6 +392,49 @@ mod tests {
             source_path: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_pty_activation_gives_child_terminal() {
+        let mut config = test_config("pty-test");
+        config.command = "/bin/sh".to_string();
+        config.args = vec![
+            "-c".to_string(),
+            "if test -t 0; then echo tty-ok; else echo no-tty; fi".to_string(),
+        ];
+        config.oneshot = true;
+
+        let mut master = 0;
+        let mut slave = 0;
+        let open_result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            open_result,
+            0,
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let pid = spawn_process(&config, "/sys/fs/cgroup", Some(ActivationFd::Pty(slave))).unwrap();
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+        assert_eq!(waited, pid as i32);
+        assert!(libc::WIFEXITED(status), "status={status}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "status={status}");
+
+        let mut output = String::new();
+        let _ = master.read_to_string(&mut output);
+        assert!(output.contains("tty-ok"), "{output}");
     }
 
     #[test]

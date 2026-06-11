@@ -117,6 +117,10 @@ pub enum Request {
         home: String,
         uid: u32,
         gid: Option<u32>,
+        /// Treat the passed file descriptor as a PTY slave and make it the
+        /// child process's controlling terminal.
+        #[serde(default)]
+        pty: bool,
         #[serde(default)]
         env: HashMap<String, String>,
         #[serde(default)]

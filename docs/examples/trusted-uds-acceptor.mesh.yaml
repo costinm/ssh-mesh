@@ -6,5 +6,5 @@
 ssh_port: 15022
 http_port: 15080
 
-trusted_uds_path: /run/user/1000/ssh-mesh/trusted.sock
+trusted_uds_path: /run/host1/1000/ssh-mesh/trusted.sock
 
