@@ -1,13 +1,14 @@
 use clap::Parser;
 
-use pmond::{proc_netlink, psi::PsiWatcher, ProcMon};
+use pmond::{ProcMon, proc_netlink, psi::PsiWatcher};
 
+use std::fs::OpenOptions;
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use tracing::{debug, error, info};
 use tracing_subscriber::layer::SubscriberExt;
@@ -47,12 +48,24 @@ struct Args {
 }
 
 fn init_telemetry() {
-    let out_layer = tracing_subscriber::fmt::layer().compact();
+    let filter = EnvFilter::from_default_env();
+    let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/pmond/pmond.log", home)
+    });
 
-    Registry::default()
-        .with(EnvFilter::from_default_env())
-        .with(out_layer)
-        .init();
+    if let Some(parent) = std::path::Path::new(&log_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let out_layer = tracing_subscriber::fmt::layer()
+            .compact()
+            .with_writer(move || file.try_clone().expect("clone pmond log file"));
+        Registry::default().with(filter).with(out_layer).init();
+    } else {
+        Registry::default().with(filter).init();
+    }
 }
 
 #[tokio::main]
@@ -297,7 +310,14 @@ fn start_monitoring(
 
                         info!(
                             "exit: pid={} tgid={} code={} signal={} comm={:?} cmdline={:?} exe={:?} cgroup={:?}",
-                            process_pid, process_tgid, exit_code, exit_signal, comm, cmdline, exe, cgroup
+                            process_pid,
+                            process_tgid,
+                            exit_code,
+                            exit_signal,
+                            comm,
+                            cmdline,
+                            exe,
+                            cgroup
                         );
                     }
                     proc_netlink::NetlinkEvent::Uid {

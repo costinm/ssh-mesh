@@ -20,12 +20,13 @@
       ln -s "${initosProfile}/img/vmlinux-cloud" "$dev/vmlinux"
     '';
     emptyToplevel = pkgs.runCommand "initos-microvm-empty-toplevel" { } "mkdir -p $out";
+    dummyInitrd = pkgs.writeText "dummy-initrd" " ";
     mkMicrovmConfig = hypervisor: rec {
       hostName = "initos-microvm";
       inherit hypervisor;
       vmHostPackages = pkgs;
       inherit kernel;
-      initrdPath = null;
+      initrdPath = dummyInitrd;
       vcpu = 1;
       mem = 512;
       hugepageMem = false;

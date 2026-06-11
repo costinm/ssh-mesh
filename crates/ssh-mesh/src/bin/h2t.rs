@@ -6,6 +6,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use std::env;
+use std::fs::OpenOptions;
 use std::process;
 use std::str::FromStr;
 use std::time::Duration;
@@ -13,6 +14,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{error, info};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use url::Url;
 
 /// h2t is a minimal TCP tunnel supporting multiple transports:
@@ -47,7 +51,7 @@ async fn handle_uds(path: &str) -> Result<(), Box<dyn std::error::Error + Send +
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from stdin: {}", e);
+                    error!("Error reading from stdin: {}", e);
                     break;
                 }
             }
@@ -68,7 +72,7 @@ async fn handle_uds(path: &str) -> Result<(), Box<dyn std::error::Error + Send +
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from UDS: {}", e);
+                    error!("Error reading from UDS: {}", e);
                     break;
                 }
             }
@@ -103,15 +107,15 @@ async fn handle_websocket(
         );
     }
 
-    eprintln!("Connecting to {}", request.uri());
+    info!("Connecting to {}", request.uri());
 
     // Check TCP first
     let host = request.uri().host().unwrap_or("127.0.0.1");
     let port = request.uri().port_u16().unwrap_or(80);
     match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(_) => eprintln!("TCP connection successful"),
+        Ok(_) => info!("TCP connection successful"),
         Err(e) => {
-            eprintln!("TCP connection failed: {}", e);
+            error!("TCP connection failed: {}", e);
             return Err(e.into());
         }
     }
@@ -124,15 +128,15 @@ async fn handle_websocket(
     ) = match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
         Ok(Ok(res)) => res,
         Ok(Err(e)) => {
-            eprintln!("Failed to connect: {}", e);
+            error!("Failed to connect: {}", e);
             return Err(e.into());
         }
         Err(_) => {
-            eprintln!("Connection timeout during WebSocket handshake");
+            error!("Connection timeout during WebSocket handshake");
             return Err("Timeout".into());
         }
     };
-    eprintln!("Connected to WebSocket");
+    info!("Connected to WebSocket");
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -248,7 +252,7 @@ async fn handle_h2(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from stdin: {}", e);
+                    error!("Error reading from stdin: {}", e);
                     let _ = tx.send(Err(e.into())).await;
                     break;
                 }
@@ -260,7 +264,7 @@ async fn handle_h2(
     let mut response = client.request(request).await?;
 
     if response.status().as_u16() != 200 {
-        eprintln!("HTTP error: {}", response.status());
+        error!("HTTP error: {}", response.status());
         return Err("HTTP request failed".into());
     }
 
@@ -275,7 +279,7 @@ async fn handle_h2(
                 }
             }
             Err(e) => {
-                eprintln!("Error reading response body: {}", e);
+                error!("Error reading response body: {}", e);
                 break;
             }
         }
@@ -304,26 +308,46 @@ fn detect_transport(arg: &str) -> Transport {
     }
 }
 
+fn init_telemetry() {
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    let log_path = env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/h2t/h2t.log", home)
+    });
+
+    if let Some(parent) = std::path::Path::new(&log_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || file.try_clone().expect("clone h2t log file"))
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::registry().with(filter).init();
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
+    init_telemetry();
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <TARGET>", args[0]);
-        eprintln!();
-        eprintln!("TARGET formats:");
-        eprintln!("  /path/to/socket   - Unix Domain Socket");
-        eprintln!("  :path/to/socket   - Unix Domain Socket (abstract)");
-        eprintln!("  ws://host/path    - WebSocket");
-        eprintln!("  wss://host/path   - WebSocket (TLS)");
-        eprintln!("  http://host/path  - HTTP/2 (H2C)");
-        eprintln!("  https://host/path - HTTP/2 (H2)");
-        eprintln!("  hostname          - HTTPS (generates https://hostname/_m/_ssh)");
+        error!(
+            "Usage: {} <TARGET>\n\
+             TARGET formats:\n\
+               /path/to/socket   - Unix Domain Socket\n\
+               :path/to/socket   - Unix Domain Socket (abstract)\n\
+               ws://host/path    - WebSocket\n\
+               wss://host/path   - WebSocket (TLS)\n\
+               http://host/path  - HTTP/2 (H2C)\n\
+               https://host/path - HTTP/2 (H2)\n\
+               hostname          - HTTPS (generates https://hostname/_m/_ssh)",
+            args[0]
+        );
         process::exit(1);
     }
 

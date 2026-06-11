@@ -78,6 +78,23 @@ initramfs_init_vm() {
 
   # Simplest case: run a startup script directly, using virtiofs 
   # as root.
+  if [ -f /initos/initos.env ]; then
+    echo "INITOS-VM: sourcing /initos/initos.env"
+    . /initos/initos.env
+  elif [ -f /src/initos/initos.env ]; then
+    echo "INITOS-VM: sourcing /src/initos/initos.env"
+    . /src/initos/initos.env
+  fi
+
+  if [ -x /initos/init ]; then
+    echo "INITOS-VM: executing /initos/init"
+    exec /initos/init
+  fi
+  if [ -x /src/initos/init ]; then
+    echo "INITOS-VM: executing /src/initos/init"
+    exec /src/initos/init
+  fi
+
   if [ -f /initos/initos-pod ]; then
     echo "INITOS-VM: executing /initos/initos-pod"
     /initos/initos-pod start

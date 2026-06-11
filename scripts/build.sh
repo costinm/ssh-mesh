@@ -19,8 +19,123 @@ export PATH=$MUSL_DIR/bin:$PATH
 
 export DEST=${DEST:-/opt/ssh-mesh}
 
-CRATES="mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh"
-BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh"
+CRATES="mesh-init ssh-mesh mesh pmond mcp mesh9p traceweb sftp-server lmesh ssh-config"
+BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh pmond mcp-pmond mesh9p traceweb sftp-server lmesh ssh-config"
+INSTALL_BIN_TARGETS="$BIN_TARGETS dmesh"
+EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh sshmc pmond lmesh mcp-pmond mesh9p sftp-server h2t meshkeys"
+
+copy_runtime_bins() {
+    local src="$1"
+    local dest="$2"
+    shift 2
+    local bins="$*"
+    local missing=0
+
+    mkdir -p "$dest"
+    for bin in $bins; do
+        if [ -f "$src/$bin" ]; then
+            cp -f "$src/$bin" "$dest/"
+            chmod +x "$dest/$bin"
+        else
+            echo "Missing runtime binary: $src/$bin" >&2
+            missing=1
+        fi
+    done
+
+    return "$missing"
+}
+
+find_busybox() {
+    local busybox="${1:-}"
+
+    if [ -n "$busybox" ] && [ -x "$busybox" ]; then
+        printf '%s\n' "$busybox"
+        return 0
+    fi
+    if command -v busybox >/dev/null 2>&1; then
+        command -v busybox
+        return 0
+    fi
+    if [ -x "/ws/initos/target/nix/bin/busybox" ]; then
+        printf '%s\n' "/ws/initos/target/nix/bin/busybox"
+        return 0
+    fi
+    if [ -x "/usr/bin/busybox" ]; then
+        printf '%s\n' "/usr/bin/busybox"
+        return 0
+    fi
+
+    return 1
+}
+
+default_nix_profile() {
+    local target_profile="$PWD/target/nix/profile"
+    if [ ! -e "$target_profile" ] && [ -e "$PWD/target/nix/profiles" ]; then
+        target_profile="$PWD/target/nix/profiles"
+    fi
+    printf '%s\n' "$target_profile"
+}
+
+install_busybox_tree() {
+    local busybox="$1"
+    local dest="$2"
+
+    rm -rf "$dest/bin"
+    mkdir -p "$dest/bin"
+    cp -f "$busybox" "$dest/bin/busybox"
+    chmod +x "$dest/bin/busybox"
+    (
+        cd "$dest/bin"
+        for applet in $(./busybox --list); do
+            if [ "$applet" != "busybox" ] && [ ! -e "$applet" ]; then
+                ln -s busybox "$applet"
+            fi
+        done
+    )
+}
+
+stage_examples() {
+    local src="${1:-}"
+    local root="${2:-${SSH_MESH_EXAMPLE_ROOT:-$PWD/target/examples}}"
+    local opt="${3:-${SSH_MESH_OPT_DIR:-$root/opt}}"
+    local busybox
+
+    if [ -z "$src" ]; then
+        if [ -d "target/x86_64-unknown-linux-musl/release" ]; then
+            src="target/x86_64-unknown-linux-musl/release"
+        else
+            src="target/debug"
+        fi
+    fi
+
+    if [ ! -d "$src" ]; then
+        echo "Example binary source does not exist: $src" >&2
+        return 1
+    fi
+
+    busybox="$(find_busybox "${SSH_MESH_BUSYBOX:-}")" || {
+        echo "Missing required busybox; set SSH_MESH_BUSYBOX=/path/to/busybox" >&2
+        return 1
+    }
+
+    echo "Staging examples from $src"
+    echo "  state root: $root"
+    echo "  opt root:   $opt"
+
+    rm -rf "$root/bin" "$opt/ssh-mesh/bin"
+    mkdir -p "$opt/ssh-mesh/bin" "$root/examples"
+    copy_runtime_bins "$src" "$opt/ssh-mesh/bin" $EXAMPLE_BIN_TARGETS
+    cp -f linux/bin/vrun "$opt/ssh-mesh/bin/vrun"
+    chmod +x "$opt/ssh-mesh/bin/vrun"
+    ln -sf vrun "$opt/ssh-mesh/bin/initos-vrun"
+    install_busybox_tree "$busybox" "$opt/busybox"
+
+    rm -rf "$root/examples/bwrap-nonet" "$root/examples/vm-nonet"
+    cp -a docs/examples/bwrap-nonet "$root/examples/bwrap-nonet"
+    cp -a docs/examples/vm-nonet "$root/examples/vm-nonet"
+
+    echo "Examples staged under $root"
+}
 
 setup() {
     if [ ! -d "$MUSL_DIR" ]; then
@@ -75,7 +190,7 @@ push() {
 }
 
 dist() {
-    local dest="${1:-$HOME/opt/ssh-mesh}"
+    local dest="${1:-target/opt/ssh-mesh}"
     mkdir -p "$dest/bin"
 
     echo "Building release binaries with musl..."
@@ -111,7 +226,7 @@ dist() {
     echo "Creating job files..."
     cat <<EOF > "$root_jobs/status_network.toml"
 name = "status_network"
-command = "/bin/sh"
+command = "/opt/busybox/bin/sh"
 args = ["-c", "echo 'Network is unmetered' > $dest/root_network_status.txt"]
 priority = 500
 persisted = false
@@ -125,7 +240,7 @@ EOF
 
     cat <<EOF > "$root_jobs/status_periodic.toml"
 name = "status_periodic"
-command = "/bin/sh"
+command = "/opt/busybox/bin/sh"
 args = ["-c", "date > $dest/root_periodic_status.txt"]
 priority = 500
 persisted = false
@@ -145,34 +260,26 @@ EOF
 
 install() {
     local dest="${1:-/opt/ssh-mesh}"
+    local release_dir="target/x86_64-unknown-linux-musl/release"
     
-    mkdir -p "$dest/bin" "$dest/lib"
+    mkdir -p "$dest/bin"
 
     echo "Building release binaries with musl..."
     cargo build --target x86_64-unknown-linux-musl --release --workspace
 
-    echo "Copying Rust binaries..."
-    for bin in $BIN_TARGETS dmesh; do
-        if [ -f "target/x86_64-unknown-linux-musl/release/$bin" ]; then
-            if [ "$bin" == "dmesh" ]; then
-                cp "target/x86_64-unknown-linux-musl/release/$bin" "$dest/bin/${bin}_rs"
-            else
-                cp "target/x86_64-unknown-linux-musl/release/$bin" "$dest/bin/"
-            fi
-        fi
-    done
+    echo "Installing runtime binaries to $dest/bin..."
+    copy_runtime_bins "$release_dir" "$dest/bin" $BIN_TARGETS
+    if [ -f "$release_dir/dmesh" ]; then
+        cp -f "$release_dir/dmesh" "$dest/bin/dmesh_rs"
+        chmod +x "$dest/bin/dmesh_rs"
+    fi
     
     echo "Copying scripts..."
     cp -r bin/* "$dest/bin/"
+    cp -f linux/bin/vrun "$dest/bin/vrun"
+    ln -sf vrun "$dest/bin/initos-vrun"
     chmod +x "$dest/bin/"*
 
-    echo "Setting up Python environment..."
-    python3 -m venv "$dest/.venv"
-    "$dest/.venv/bin/pip" install -U pip maturin
-    (cd python && "$dest/.venv/bin/maturin" build --release -o "$dest/wheels")
-    "$dest/.venv/bin/pip" install --no-index --find-links="$dest/wheels" dmesh
-    
-    jni "$dest"
     echo "Install completed at $dest"
 }
 
@@ -279,16 +386,10 @@ erofs() {
     local initos_vm="${3:-bin/initos-init-vm}"
     local mesh_bin="${4:-}"
 
-    # Fallback to system busybox if busybox is not found at the specified path
-    if [ ! -f "$busybox" ] && command -v busybox >/dev/null 2>&1; then
-        busybox=$(command -v busybox)
-    fi
-    if [ ! -f "$busybox" ] && [ -f "/ws/initos/target/nix/bin/busybox" ]; then
-        busybox="/ws/initos/target/nix/bin/busybox"
-    fi
-    if [ ! -f "$busybox" ] && [ -f "/usr/bin/busybox" ]; then
-        busybox="/usr/bin/busybox"
-    fi
+    busybox="$(find_busybox "$busybox")" || {
+        echo "Error: busybox binary not found" >&2
+        return 1
+    }
 
     # Fallback for mesh_bin to debug if release is not found
     if [ -z "$mesh_bin" ] || [ ! -d "$mesh_bin" ]; then
@@ -301,31 +402,15 @@ erofs() {
         fi
     fi
 
-    if [ ! -f "$busybox" ]; then
-        echo "Error: busybox binary not found" >&2
-        return 1
-    fi
-
     mkdir -p "$out/img" "$out/bin"
     local rootfs="$out/rootfs"
     rm -rf "$rootfs"
     
     # Pre-create all expected VM directories/mountpoints to avoid Read-only FS errors
     mkdir -p "$rootfs"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin}
-    mkdir -p "$rootfs"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,usr/bin,usr/sbin,usr/lib,usr/lib64}
+    mkdir -p "$rootfs"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,usr/bin,usr/sbin,usr/lib,usr/lib64,out,lib}
 
-    cp "$busybox" "$rootfs/opt/busybox/bin/busybox"
-    chmod +x "$rootfs/opt/busybox/bin/busybox"
-
-    # Create all busybox applet symlinks
-    (
-        cd "$rootfs/opt/busybox/bin"
-        for applet in $(./busybox --list); do
-            if [ "$applet" != "busybox" ]; then
-                ln -s busybox "$applet"
-            fi
-        done
-    )
+    install_busybox_tree "$busybox" "$rootfs/opt/busybox"
 
     ln -s opt/busybox/bin "$rootfs/bin"
     ln -s opt/busybox/bin "$rootfs/sbin"
@@ -336,7 +421,7 @@ erofs() {
     fi
 
     if [ -d "$mesh_bin" ]; then
-        cp -L "$mesh_bin"/* "$rootfs/opt/ssh-mesh/bin/" 2>/dev/null || true
+        copy_runtime_bins "$mesh_bin" "$rootfs/opt/ssh-mesh/bin" $BIN_TARGETS
     fi
 
     mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "$out/img/ssh-mesh.erofs" "$rootfs"
@@ -360,7 +445,7 @@ vm() {
 
 profile() {
     # Default NIX_PROFILE target path
-    local target_profile="${1:-${NIX_PROFILE:-$PWD/target/nix/profiles}}"
+    local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
 
     # If target_profile is a real directory and not a symlink, delete it so Nix can manage it
     if [ -d "${target_profile}" ] && [ ! -L "${target_profile}" ]; then
@@ -397,7 +482,7 @@ profile() {
 
 build() {
     # Default NIX_PROFILE target path
-    local target_profile="${1:-${NIX_PROFILE:-$PWD/target/nix/profiles}}"
+    local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
     
     echo "=== 1. Building release binaries with musl ==="
     cargo build --target x86_64-unknown-linux-musl --release --workspace
@@ -405,10 +490,13 @@ build() {
     echo "=== 2. Building JNI native library and Java classes ==="
     jni "target/opt/ssh-mesh"
     
-    echo "=== 3. Building EROFS rootfs ==="
+    echo "=== 3. Staging local examples ==="
+    stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/examples" "$PWD/target/examples/opt"
+
+    echo "=== 4. Building EROFS rootfs ==="
     erofs "target/erofs" "$(which busybox 2>/dev/null || echo "")" "bin/initos-init-vm" "target/x86_64-unknown-linux-musl/release"
     
-    echo "=== 4. Assembling and upgrading local VM profile ==="
+    echo "=== 5. Assembling and upgrading local VM profile ==="
     profile "${target_profile}"
 }
 "$@"

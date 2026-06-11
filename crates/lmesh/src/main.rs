@@ -1,13 +1,14 @@
 use anyhow::Result;
-use axum::{routing::post, Extension, Json, Router};
+use axum::{Extension, Json, Router, routing::post};
 use clap::Parser;
 use lmesh::LocalDiscovery;
 use mesh::server::run_axum_server;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{error, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -30,11 +31,24 @@ struct Args {
 }
 
 fn init_telemetry() {
-    let out_layer = tracing_subscriber::fmt::layer().compact();
-    Registry::default()
-        .with(EnvFilter::from_default_env())
-        .with(out_layer)
-        .init();
+    let filter = EnvFilter::from_default_env();
+    let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/lmesh/lmesh.log", home)
+    });
+
+    if let Some(parent) = std::path::Path::new(&log_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let out_layer = tracing_subscriber::fmt::layer()
+            .compact()
+            .with_writer(move || file.try_clone().expect("clone lmesh log file"));
+        Registry::default().with(filter).with(out_layer).init();
+    } else {
+        Registry::default().with(filter).init();
+    }
 }
 
 #[tokio::main]

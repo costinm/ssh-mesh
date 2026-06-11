@@ -9,7 +9,7 @@ VM_STATE="${PROJECT_ROOT}/target/vm/pod-name"
 mkdir -p "${VM_STATE}/run" "${VM_STATE}/images"
 
 env POD=abcdefghijkl VIRT="${VM_STATE}/missing" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
-  sidecar/bin/vrun start 2>"${VM_STATE}/ok.err" && {
+  linux/bin/vrun start 2>"${VM_STATE}/ok.err" && {
     echo "expected missing VM artifact error for 12-byte POD" >&2
     exit 1
   }

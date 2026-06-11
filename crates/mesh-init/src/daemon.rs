@@ -21,6 +21,14 @@ use crate::resource::ResourceManager;
 // Daemon
 // ============================================================================
 
+fn preferred_shell() -> &'static str {
+    if std::path::Path::new("/opt/busybox/bin/sh").is_file() {
+        "/opt/busybox/bin/sh"
+    } else {
+        "/bin/sh"
+    }
+}
+
 /// Configuration for the daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -359,12 +367,13 @@ impl Daemon {
             env.insert("HOME".to_string(), home.to_string());
             env.insert("USER".to_string(), name.to_string());
             env.insert("LOGNAME".to_string(), name.to_string());
-            env.insert("SHELL".to_string(), "/bin/sh".to_string());
+            let shell = preferred_shell();
+            env.insert("SHELL".to_string(), shell.to_string());
             env.insert("TERM".to_string(), "xterm-256color".to_string());
 
             AppConfig {
                 name: name.to_string(),
-                command: "/bin/sh".to_string(),
+                command: shell.to_string(),
                 args: vec!["-l".to_string()],
                 uid: Some(run_as_uid),
                 gid: Some(run_as_gid),

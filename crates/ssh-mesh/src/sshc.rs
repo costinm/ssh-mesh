@@ -13,7 +13,7 @@ use axum::{
 };
 use log::{error, info};
 use russh::client;
-use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKey as RusshPublicKey};
+use russh::keys::{Certificate, PrivateKey, PrivateKeyWithHashAlg, PublicKey as RusshPublicKey};
 use russh::{ChannelMsg, Disconnect};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -305,6 +305,8 @@ pub struct SshClientManager {
     next_id: Mutex<u64>,
     /// Private key used for client authentication (same as server key).
     private_key: Arc<PrivateKey>,
+    /// Optional OpenSSH user certificate paired with `private_key`.
+    certificate: Option<Certificate>,
     /// CA keys for verifying server certificates
     ca_keys: Arc<Vec<ssh_key::PublicKey>>,
     /// Optional path to an SSH config file (~/.ssh/config format).
@@ -321,10 +323,21 @@ impl SshClientManager {
         ssh_config_path: Option<PathBuf>,
         mux_dir: Option<PathBuf>,
     ) -> Self {
+        Self::new_with_certificate(private_key, ca_keys, ssh_config_path, mux_dir, None)
+    }
+
+    pub fn new_with_certificate(
+        private_key: PrivateKey,
+        ca_keys: Vec<ssh_key::PublicKey>,
+        ssh_config_path: Option<PathBuf>,
+        mux_dir: Option<PathBuf>,
+        certificate: Option<Certificate>,
+    ) -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
             private_key: Arc::new(private_key),
+            certificate,
             ca_keys: Arc::new(ca_keys),
             ssh_config_path,
             mux_dir,
@@ -481,11 +494,16 @@ impl SshClientManager {
         let mut session =
             client::connect(config, (connect_host.as_str(), connect_port), handler).await?;
 
-        // Authenticate with the server's private key
-        let key_with_alg = PrivateKeyWithHashAlg::new(self.private_key.clone(), None);
-        let auth_res = session
-            .authenticate_publickey(&connect_user, key_with_alg)
-            .await?;
+        let auth_res = if let Some(cert) = self.certificate.clone() {
+            session
+                .authenticate_openssh_cert(&connect_user, self.private_key.clone(), cert)
+                .await?
+        } else {
+            let key_with_alg = PrivateKeyWithHashAlg::new(self.private_key.clone(), None);
+            session
+                .authenticate_publickey(&connect_user, key_with_alg)
+                .await?
+        };
         if auth_res != client::AuthResult::Success {
             anyhow::bail!("Authentication failed");
         }
@@ -767,6 +785,117 @@ impl SshClientManager {
         Ok(s1)
     }
 
+    /// Open a bidirectional stream to a remote Unix domain socket through the SSH tunnel.
+    pub async fn open_streamlocal(
+        &self,
+        id: u64,
+        socket_path: &str,
+    ) -> Result<tokio::io::DuplexStream> {
+        let conns = self.connections.lock().await;
+        let conn = conns
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Connection {} not found", id))?;
+
+        let mut channel = {
+            let session = conn.session.lock().await;
+            session.channel_open_direct_streamlocal(socket_path).await?
+        };
+
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(s2);
+            let mut stream_closed = false;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                tokio::select! {
+                    r = reader.read(&mut buf), if !stream_closed => {
+                        match r {
+                            Ok(0) => {
+                                stream_closed = true;
+                                let _ = channel.eof().await;
+                            }
+                            Ok(n) => {
+                                if channel.data(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Some(msg) = channel.wait() => {
+                        match msg {
+                            russh::ChannelMsg::Data { ref data } => {
+                                if writer.write_all(data).await.is_err() {
+                                    break;
+                                }
+                            }
+                            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let _ = channel.close().await;
+        });
+
+        Ok(s1)
+    }
+
+    /// Open a remote shell as a bidirectional stream through the SSH tunnel.
+    pub async fn open_shell(&self, id: u64) -> Result<tokio::io::DuplexStream> {
+        let conns = self.connections.lock().await;
+        let conn = conns
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Connection {} not found", id))?;
+
+        let mut channel = {
+            let session = conn.session.lock().await;
+            session.channel_open_session().await?
+        };
+        channel.request_shell(true).await?;
+
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(s2);
+            let mut stream_closed = false;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                tokio::select! {
+                    r = reader.read(&mut buf), if !stream_closed => {
+                        match r {
+                            Ok(0) => {
+                                stream_closed = true;
+                                let _ = channel.eof().await;
+                            }
+                            Ok(n) => {
+                                if channel.data(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Some(msg) = channel.wait() => {
+                        match msg {
+                            russh::ChannelMsg::Data { ref data } => {
+                                if writer.write_all(data).await.is_err() {
+                                    break;
+                                }
+                            }
+                            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let _ = channel.close().await;
+        });
+
+        Ok(s1)
+    }
+
     /// Connect to an SSH server using a `SshClientConfig`.
     ///
     /// Resolves hostname from the config name if not explicitly set.
@@ -840,10 +969,16 @@ impl SshClientManager {
                 let mut session =
                     client::connect(config, (connect_host.as_str(), connect_port), handler).await?;
 
-                let key_with_alg = PrivateKeyWithHashAlg::new(self.private_key.clone(), None);
-                let auth_res = session
-                    .authenticate_publickey(&connect_user, key_with_alg)
-                    .await?;
+                let auth_res = if let Some(cert) = self.certificate.clone() {
+                    session
+                        .authenticate_openssh_cert(&connect_user, self.private_key.clone(), cert)
+                        .await?
+                } else {
+                    let key_with_alg = PrivateKeyWithHashAlg::new(self.private_key.clone(), None);
+                    session
+                        .authenticate_publickey(&connect_user, key_with_alg)
+                        .await?
+                };
                 if auth_res != client::AuthResult::Success {
                     anyhow::bail!("Authentication failed for '{}'", name);
                 }

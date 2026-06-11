@@ -11,6 +11,7 @@ use ssh_key::certificate::{Builder, CertType};
 
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 use super::keys::{set_permissions, ssh_key_from_pkcs8_pem, ssh_to_pkcs8_pem};
@@ -357,6 +358,19 @@ pub fn generate_node(nodedir: &Path, name: &str, domain: &str) -> Result<()> {
 }
 
 pub fn sign_node(cadir: &Path, nodedir: &Path, name: &str, domain: &str) -> Result<()> {
+    sign_node_with_options(cadir, nodedir, name, domain, None, None, None, None)
+}
+
+pub fn sign_node_with_options(
+    cadir: &Path,
+    nodedir: &Path,
+    name: &str,
+    domain: &str,
+    host_principals: Option<Vec<String>>,
+    user_principals: Option<Vec<String>>,
+    valid_after: Option<u64>,
+    valid_before: Option<u64>,
+) -> Result<()> {
     info!("Signing node {:?} using CA {:?}", nodedir, cadir);
 
     let ca_key_pem = fs::read_to_string(cadir.join("id_ecdsa"))?;
@@ -389,16 +403,24 @@ pub fn sign_node(cadir: &Path, nodedir: &Path, name: &str, domain: &str) -> Resu
     let node_cert = node_params.signed_by(&node_key_pair, &issuer)?;
     fs::write(nodedir.join("id_ecdsa.crt"), node_cert.pem())?;
 
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let valid_after = valid_after.unwrap_or(now.saturating_sub(24 * 60 * 60));
+    let valid_before = valid_before.unwrap_or(now + 10 * 365 * 24 * 60 * 60);
+
     let mut host_cert_builder = Builder::new_with_random_nonce(
         &mut rand::rng(),
         node_pub.key_data().clone(),
-        2000000000,
-        2000000000 + 3600 * 24 * 365,
+        valid_after,
+        valid_before,
     )?;
     host_cert_builder
         .cert_type(CertType::Host)?
-        .key_id(format!("{}-host", name))?
-        .valid_principal(format!("{}.{}", name, domain))?;
+        .key_id(format!("{}-host", name))?;
+    let host_principals =
+        host_principals.unwrap_or_else(|| vec![format!("{}.{}", name, domain)]);
+    for principal in host_principals {
+        host_cert_builder.valid_principal(principal)?;
+    }
 
     let host_cert = host_cert_builder.sign(&ca_ssh_key)?;
     fs::write(
@@ -409,13 +431,17 @@ pub fn sign_node(cadir: &Path, nodedir: &Path, name: &str, domain: &str) -> Resu
     let mut user_cert_builder = Builder::new_with_random_nonce(
         &mut rand::rng(),
         node_pub.key_data().clone(),
-        2000000000,
-        2000000000 + 3600 * 24 * 365,
+        valid_after,
+        valid_before,
     )?;
     user_cert_builder
         .cert_type(CertType::User)?
-        .key_id(format!("{}-user", name))?
-        .valid_principal(format!("{}@{}", name, domain))?;
+        .key_id(format!("{}-user", name))?;
+    let user_principals =
+        user_principals.unwrap_or_else(|| vec![format!("{}@{}", name, domain)]);
+    for principal in user_principals {
+        user_cert_builder.valid_principal(principal)?;
+    }
 
     let user_cert = user_cert_builder.sign(&ca_ssh_key)?;
     fs::write(

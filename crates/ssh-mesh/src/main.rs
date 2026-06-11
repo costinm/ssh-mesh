@@ -23,16 +23,10 @@ fn init_telemetry() -> ssh_mesh::local_trace::LogBuffer {
     let filter = EnvFilter::from_default_env();
     let (filter, reload_handle) = reload::Layer::new(filter);
 
-    let fmt_layer = tracing_subscriber::fmt::layer().compact();
-
     let buffer_layer = ssh_mesh::local_trace::LogBufferLayer::new();
     let log_buffer = buffer_layer.buffer();
 
-    Registry::default()
-        .with(filter)
-        .with(fmt_layer)
-        .with(buffer_layer)
-        .init();
+    Registry::default().with(filter).with(buffer_layer).init();
 
     // Store the reload handle globally
     let _ = ssh_mesh::TRACING_RELOAD_HANDLE.set(reload_handle);
@@ -58,7 +52,10 @@ fn get_port_from_env(var_name: &str, default: u16) -> u16 {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    #[cfg(feature = "ws")]
     let log_buffer = init_telemetry();
+    #[cfg(not(feature = "ws"))]
+    let _log_buffer = init_telemetry();
 
     // Import required items
     use log::{error, info};
@@ -215,10 +212,27 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Create AppState
 
+    let user_certificate_path = base_dir.join("id_ecdsa-user-cert.pub");
+    let user_certificate = if user_certificate_path.exists() {
+        match russh::keys::load_openssh_certificate(&user_certificate_path) {
+            Ok(cert) => Some(cert),
+            Err(e) => {
+                error!(
+                    "Failed to load user certificate {}: {}",
+                    user_certificate_path.display(),
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
         target_http_address: std::env::var("APP_HTTP_PORT").ok(),
-        ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new(
+        ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new_with_certificate(
             ssh_server.private_key().clone(),
             (*ssh_server.ca_keys).clone(),
             {
@@ -234,6 +248,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
             },
             env::var("SSH_MUX").ok().map(PathBuf::from),
+            user_certificate,
         )),
     };
 
@@ -280,7 +295,10 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Create Axum app
+    #[cfg(feature = "ws")]
     let mut app = handlers::app(app_state.clone());
+    #[cfg(not(feature = "ws"))]
+    let app = handlers::app(app_state.clone());
 
     #[cfg(feature = "ws")]
     {

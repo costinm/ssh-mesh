@@ -23,6 +23,22 @@ struct Cli {
     #[arg(short = 'm', long = "name")]
     name: Option<String>,
 
+    /// Comma-separated host certificate principals for signing.
+    #[arg(long = "host-principals")]
+    host_principals: Option<String>,
+
+    /// Comma-separated user certificate principals for signing.
+    #[arg(long = "user-principals")]
+    user_principals: Option<String>,
+
+    /// OpenSSH certificate valid-after time as Unix seconds. Defaults to now minus one day.
+    #[arg(long = "valid-after")]
+    valid_after: Option<u64>,
+
+    /// OpenSSH certificate valid-before time as Unix seconds. Defaults to ten years from now.
+    #[arg(long = "valid-before")]
+    valid_before: Option<u64>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -55,14 +71,27 @@ fn main() -> Result<()> {
             let name = cli
                 .name
                 .context("Node name (--name) is required for signing")?;
-            auth::sign_node(
+            auth::sign_node_with_options(
                 Path::new(&cli.cadir),
                 Path::new(&cli.nodedir),
                 &name,
                 &cli.domain,
+                cli.host_principals.as_deref().map(split_principals),
+                cli.user_principals.as_deref().map(split_principals),
+                cli.valid_after,
+                cli.valid_before,
             )?;
         }
     }
 
     Ok(())
+}
+
+fn split_principals(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }

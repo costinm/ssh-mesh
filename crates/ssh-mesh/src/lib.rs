@@ -383,11 +383,29 @@ impl MeshNode {
             info!("Added {} CA keys from config", config_cas.len());
         }
 
-        let route_client_manager = Arc::new(sshc::SshClientManager::new(
+        let user_certificate_path = base_dir.join("id_ecdsa-user-cert.pub");
+        let user_certificate = if user_certificate_path.exists() {
+            match russh::keys::load_openssh_certificate(&user_certificate_path) {
+                Ok(cert) => Some(cert),
+                Err(e) => {
+                    error!(
+                        "Failed to load user certificate {}: {}",
+                        user_certificate_path.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let route_client_manager = Arc::new(sshc::SshClientManager::new_with_certificate(
             keys.clone(),
             ca_keys_vec.clone(),
             None,
             None,
+            user_certificate.clone(),
         ));
 
         MeshNode {
@@ -798,5 +816,52 @@ clients:
         assert!(backup.keys.is_empty()); // default - use TOFU
         assert!(backup.local_forward.is_empty());
         assert!(backup.remote_forward.is_empty());
+    }
+
+    #[test]
+    fn test_mesh_node_config_ssh_routes_yaml() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("mesh_cfg_test")
+            .tempdir()
+            .expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().to_path_buf();
+
+        let yaml_content = r#"
+ssh_routes:
+  - name: bwrap-nonet
+    user: system@bwrap-nonet.example.m
+    jump_host: bwrap-nonet.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    activation_service: activate-bwrap-nonet
+    client:
+      transport: uds
+      user: system
+      uds_path: /tmp/mesh/shared/bwrap-nonet/trusted.sock
+"#;
+        std::fs::write(base_dir.join("mesh.yaml"), yaml_content).unwrap();
+
+        let cfg = MeshNode::load_config(&base_dir);
+        assert_eq!(cfg.ssh_routes.len(), 1);
+
+        let route = &cfg.ssh_routes[0];
+        assert_eq!(route.name, "bwrap-nonet");
+        assert_eq!(route.jump_host.as_deref(), Some("bwrap-nonet.example.m"));
+        assert_eq!(route.jump_port, Some(22));
+        assert_eq!(route.target_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(route.target_port, Some(22));
+        assert_eq!(
+            route.activation_service.as_deref(),
+            Some("activate-bwrap-nonet")
+        );
+        assert_eq!(route.client.transport, "uds");
+        assert_eq!(route.client.user, "system");
+        assert_eq!(
+            route.client.uds_path.as_deref(),
+            Some(std::path::Path::new(
+                "/tmp/mesh/shared/bwrap-nonet/trusted.sock"
+            ))
+        );
     }
 }

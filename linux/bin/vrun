@@ -56,11 +56,17 @@ fi
 
 # Directory with hypervisor binaries, kernel, recovery
 if [ -z "${NIX_PROFILE:-}" ]; then
+    if [ -e "${PWD}/target/nix/profile" ]; then
+        NIX_PROFILE="${PWD}/target/nix/profile"
+    elif [ -e "${PWD}/target/nix/profiles" ]; then
+        NIX_PROFILE="${PWD}/target/nix/profiles"
+    else
     SCRIPT_DIR=$(dirname "$0")
     if [ "$SCRIPT_DIR" = "." ] && command -v "$0" >/dev/null 2>&1; then
         SCRIPT_DIR=$(dirname "$(command -v "$0")")
     fi
     NIX_PROFILE=$(dirname "$SCRIPT_DIR")
+    fi
 fi
 
 if [ -d "${NIX_PROFILE}/bin" ] && [[ ":$PATH:" != *":${NIX_PROFILE}/bin:"* ]]; then
@@ -104,7 +110,9 @@ virt_resolve_layout() {
   qemu_base=${qemu_base:-}
   QEMU_UI=${QEMU_UI:-}
   NO_NET=${NO_NET:-}
-  SERIAL_LOG=${SERIAL_LOG:-}
+  STDIO_ACTIVATION=${STDIO_ACTIVATION:-}
+  VSOCK_CID=${VSOCK_CID:-}
+  SSH_MESH_VSOCK_PORT=${SSH_MESH_VSOCK_PORT:-}
 
   if [ -d "${VIRT}/img" ] || [ -d "${VIRT}/boot" ]; then
     VIRT_ROOT=${VIRT_ROOT:-${VIRT}}
@@ -147,16 +155,16 @@ virt_resolve_layout() {
     "${VIRT}/initos-init-vm" 2>/dev/null || true)}
   VIRT_CLOUD_HYPERVISOR=${VIRT_CLOUD_HYPERVISOR:-$(virt_first_file \
     "${VIRT_BIN}/cloud-hypervisor" \
-    "${VIRT}/cloud-hypervisor" 2>/dev/null || command -v cloud-hypervisor)}
+    "${VIRT}/cloud-hypervisor" 2>/dev/null || command -v cloud-hypervisor || true)}
   VIRT_VIRTIOFSD=${VIRT_VIRTIOFSD:-$(virt_first_file \
     "${VIRT_BIN}/virtiofsd" \
-    "${VIRT}/virtiofsd" 2>/dev/null || command -v virtiofsd)}
+    "${VIRT}/virtiofsd" 2>/dev/null || command -v virtiofsd || true)}
   VIRT_QEMU=${VIRT_QEMU:-$(virt_first_file \
     "${VIRT_BIN}/qemu-system-x86_64" \
-    "${VIRT}/qemu-system-x86_64" 2>/dev/null || command -v qemu-system-x86_64)}
+    "${VIRT}/qemu-system-x86_64" 2>/dev/null || command -v qemu-system-x86_64 || true)}
   VIRT_CROSVM=${VIRT_CROSVM:-$(virt_first_file \
     "${VIRT_BIN}/crosvm" \
-    "${VIRT}/crosvm" 2>/dev/null || command -v crosvm)}
+    "${VIRT}/crosvm" 2>/dev/null || command -v crosvm || true)}
 
   [ -n "${VIRT_KERNEL}" ] || {
     echo "Missing VM kernel. Set VIRT to a Nix VM profile or set VIRT_KERNEL." >&2
@@ -169,6 +177,9 @@ virt_resolve_layout() {
 }
 
 validate_pod_name() {
+  if [ -n "${NO_NET:-}" ]; then
+    return 0
+  fi
   local tap="vm-${POD}"
   tap_bytes=$(printf '%s' "${tap}" | wc -c | tr -d '[:space:]')
   if [ "${tap_bytes}" -gt 15 ]; then
@@ -324,7 +335,7 @@ run_virtiofsd() {
 # 
 # Few env variables impact the startup:
 #  - DEBUG=init 
-start() {
+chvirt() {
   local p="$@"
 
   validate_pod_name
@@ -359,6 +370,12 @@ start() {
   # virtio-net is used for eth
   if [ -d "/sys/class/net/vm-${POD}" ]; then
     OPTS="$OPTS --net tap=vm-${POD},iommu=on $NETX"
+  elif [ -z "${NO_NET}" ]; then
+    OPTS="$OPTS --net $NETX"
+  fi
+
+  if [ -n "${VSOCK_CID}" ]; then
+    OPTS="$OPTS --vsock cid=${VSOCK_CID},socket=${WORK}/vsock.sock"
   fi
   
   CMD_OPTS="$CMD_OPTS initos_host=${POD}"
@@ -403,11 +420,13 @@ start() {
   rm -f ${WORK}/ch.sock
   rm -f ${WORK}/serial.socket
   
-  echo $p
   CMD_OPTS="$CMD_OPTS initos_cmd=\"${p}\""
   
-  if [ -n "${SERIAL_LOG}" ]; then
-    OPTS="$OPTS --serial off --console file=${SERIAL_LOG} "
+  if [ -n "${STDIO_ACTIVATION}" ]; then
+    OPTS="$OPTS --serial file=${WORK}/console.log --console off "
+    CMD_OPTS="$CMD_OPTS console=ttyS0 initos_mode=stdio "
+  elif [ -n "${VSOCK_CID}" ]; then
+    OPTS="$OPTS --serial off --console file=${WORK}/console.log "
     CMD_OPTS="$CMD_OPTS console=hvc0 "
   else
     OPTS="$OPTS --serial off --console tty "
@@ -415,7 +434,43 @@ start() {
   fi
   CMD_OPTS="$CMD_OPTS quiet"
 
-  $TIME ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
+  exec ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
+}
+
+start() {
+  validate_pod_name
+  virt_resolve_layout
+
+  local selected_virt="${virt:-}"
+
+  if [ -z "${selected_virt}" ]; then
+    if [ -n "${VIRT_CLOUD_HYPERVISOR}" ] && ( [ -x "${VIRT_CLOUD_HYPERVISOR}" ] || command -v "${VIRT_CLOUD_HYPERVISOR}" >/dev/null 2>&1 ); then
+      selected_virt="ch"
+    elif [ -n "${VIRT_QEMU}" ] && ( [ -x "${VIRT_QEMU}" ] || command -v "${VIRT_QEMU}" >/dev/null 2>&1 ); then
+      selected_virt="qemu"
+    elif [ -n "${VIRT_CROSVM}" ] && ( [ -x "${VIRT_CROSVM}" ] || command -v "${VIRT_CROSVM}" >/dev/null 2>&1 ); then
+      selected_virt="crosvm"
+    else
+      echo "No hypervisor binary found (cloud-hypervisor, qemu, crosvm)." >&2
+      exit 1
+    fi
+  fi
+
+  case "${selected_virt}" in
+    ch|cloud-hypervisor)
+      chvirt "$@"
+      ;;
+    qemu|qemuvirt)
+      qemuvirt "$@"
+      ;;
+    crosvm|crosvmvirt)
+      crosvmvirt "$@"
+      ;;
+    *)
+      echo "Unknown hypervisor type: ${selected_virt}" >&2
+      exit 1
+      ;;
+  esac
 }
 
 set -eu
@@ -452,7 +507,7 @@ qemuvirt() {
   cmd="${cmd} console=hvc0"
   cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
   cmd="${cmd} net.ifnames=0 panic=1"
-  if [ "${DEBUG}" = "init" ]; then
+  if [ "${DEBUG:-}" = "init" ]; then
     cmd="${cmd} debug_init initos_dbg=1"
   fi
   cmd="${cmd} initos_host=${POD}"
@@ -479,7 +534,28 @@ qemuvirt() {
     qemu_net="-netdev user,id=n1,hostfwd=tcp::10022-:22 -device virtio-net-pci,netdev=n1"
   fi
 
-  ${VIRT_QEMU} \
+  local qemu_vsock=""
+  if [ -n "${VSOCK_CID}" ]; then
+    qemu_vsock="-device vhost-vsock-pci,guest-cid=${VSOCK_CID}"
+  fi
+
+  local qemu_console="-chardev stdio,id=console,signal=off -device virtconsole,chardev=console"
+  local qemu_serial="-serial none"
+  local qemu_stdio_transport=""
+  if [ -n "${STDIO_ACTIVATION}" ]; then
+    qemu_console="-chardev socket,id=meshstdio,fd=0 -device virtserialport,chardev=meshstdio,name=ssh-mesh.stdio"
+    qemu_serial="-serial file:${WORK}/console.log"
+    cmd="${cmd} initos_mode=stdio quiet loglevel=0"
+  elif [ -n "${VSOCK_CID}" ]; then
+    qemu_console="-chardev file,id=console,path=${WORK}/console.log -device virtconsole,chardev=console"
+    qemu_serial="-serial none"
+  fi
+
+  if [ -n "${SSH_MESH_VSOCK_PORT}" ]; then
+    cmd="${cmd} SSH_MESH_VSOCK_PORT=${SSH_MESH_VSOCK_PORT}"
+  fi
+
+  exec ${VIRT_QEMU} \
   -name "${POD}" \
   -nodefaults \
   -no-user-config \
@@ -503,8 +579,9 @@ qemuvirt() {
   -chardev "socket,id=mesh,path=${WORK}/mesh.sock,server=on,wait=off" \
   -device "virtserialport,chardev=mesh,name=org.ssh-mesh.control" \
   ${qemu_net} \
-  -chardev stdio,id=console,signal=off \
-  -device virtconsole,chardev=console \
+  ${qemu_vsock} \
+  ${qemu_serial} \
+  ${qemu_console} \
   -append "${cmd}"
   
 }
@@ -532,7 +609,7 @@ crosvmvirt() {
   cmd="${cmd} root=/dev/vda rootfstype=erofs rootwait"
   cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
   cmd="${cmd} net.ifnames=0 initos_host=${POD}"
-  if [ "${DEBUG}" = "init" ]; then
+  if [ "${DEBUG:-}" = "init" ]; then
     cmd="${cmd} debug_init initos_dbg=1 loglevel=8 ignore_loglevel"
   fi
   if [ -d "/sys/class/net/vm-${POD}" ]; then
@@ -547,16 +624,30 @@ crosvmvirt() {
     crosvm_net="--net tap-name=vm-${POD}"
   fi
 
-    ${VIRT_CROSVM} --no-syslog run \
+  local crosvm_vsock=""
+  if [ -n "${VSOCK_CID}" ]; then
+    crosvm_vsock="--vsock cid=${VSOCK_CID}"
+  fi
+  if [ -n "${SSH_MESH_VSOCK_PORT}" ]; then
+    cmd="${cmd} SSH_MESH_VSOCK_PORT=${SSH_MESH_VSOCK_PORT}"
+  fi
+
+  local crosvm_serial="hardware=virtio-console,type=stdout,console=true,stdin=true"
+  if [ -n "${VSOCK_CID}" ]; then
+    crosvm_serial="hardware=virtio-console,type=file,path=${WORK}/console.log,console=true"
+  fi
+
+  exec ${VIRT_CROSVM} --no-syslog run \
     -m "${vm_mem_mb:-512}" \
     -c "${vm_cpu:-1}" \
-    --serial "hardware=virtio-console,type=stdout,console=true,stdin=true" \
+    --serial "${crosvm_serial}" \
     -p "${cmd}" \
     --no-balloon \
     -s "${WORK}/crosvm.sock" \
     --block "${ROOTFS},o_direct=false,ro=true" \
     --vhost-user "type=fs,socket=${WORK}/virtiofs.sock" \
     ${crosvm_net} \
+    ${crosvm_vsock} \
     --disable-sandbox \
     "${KERNEL}"
 }

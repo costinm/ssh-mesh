@@ -18,7 +18,9 @@ use std::time::SystemTime;
 
 use hyper::body::Bytes;
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
@@ -92,24 +94,54 @@ struct MeshInitTerminal {
 }
 
 /// Build a `Command` for the given program and arguments.
-/// For shell_request: program="/bin/sh", args=[].
-/// For exec_request: if command starts with "/" use it directly, otherwise use "sh -c <cmd>".
+/// For shell_request: use the preferred shell.
+/// For exec_request: if command starts with "/" use it directly, otherwise use the preferred shell with `-c <cmd>`.
+fn preferred_shell() -> &'static str {
+    if std::path::Path::new("/opt/busybox/bin/sh").is_file() {
+        "/opt/busybox/bin/sh"
+    } else {
+        "/bin/sh"
+    }
+}
+
 fn build_command(command: &Option<String>) -> Command {
     match command.as_deref() {
         None => {
             // shell_request: interactive shell
-            Command::new("/bin/sh")
+            Command::new(preferred_shell())
         }
         Some(cmd) if cmd.starts_with('/') => {
             // exec_request with absolute path: run directly
             Command::new(cmd)
         }
         Some(cmd) => {
-            // exec_request with relative command: wrap in sh -c
-            let mut c = Command::new("sh");
+            // exec_request with relative command: wrap in a shell
+            let mut c = Command::new(preferred_shell());
             c.arg("-c").arg(cmd);
             c
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jump_route_matches_direct_tcpip_host_and_port() {
+        let route = SshRouteConfig {
+            name: "bwrap-nonet".to_string(),
+            jump_host: Some("bwrap-nonet.example.m".to_string()),
+            jump_port: Some(22),
+            target_host: Some("127.0.0.1".to_string()),
+            target_port: Some(22),
+            activation_service: Some("activate-bwrap-nonet".to_string()),
+            ..Default::default()
+        };
+
+        assert!(jump_route_matches(&route, "bwrap-nonet.example.m", 22));
+        assert!(!jump_route_matches(&route, "vm-nonet.example.m", 22));
+        assert!(!jump_route_matches(&route, "bwrap-nonet.example.m", 2222));
     }
 }
 
@@ -250,18 +282,54 @@ impl SshHandler {
 
         if let Some(service) = route.activation_service.as_deref() {
             Self::prepare_route_activation(service, context).await?;
+            if !route.client.transport.eq_ignore_ascii_case("uds")
+                && let Some(socket_path) = route.client.uds_path.as_deref()
+            {
+                match UnixStream::connect(socket_path).await {
+                    Ok(_) => {
+                        debug!(
+                            "triggered activation service '{}' via {}",
+                            service,
+                            socket_path.display()
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            "activation trigger connect to {} failed for '{}': {}",
+                            socket_path.display(),
+                            service,
+                            e
+                        );
+                    }
+                }
+            }
         }
 
-        let id = server
-            .route_client_manager
-            .connect_with_config(&route.name, &route.client)
-            .await?;
-        server
-            .route_connections
-            .lock()
-            .await
-            .insert(route.name.clone(), id);
-        Ok(id)
+        let attempts = if route.activation_service.is_some() { 30 } else { 1 };
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            match server
+                .route_client_manager
+                .connect_with_config(&route.name, &route.client)
+                .await
+            {
+                Ok(id) => {
+                    server
+                        .route_connections
+                        .lock()
+                        .await
+                        .insert(route.name.clone(), id);
+                    return Ok(id);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("route connection failed")))
     }
 
     async fn routed_exec(
@@ -346,13 +414,92 @@ impl SshHandler {
         }
     }
 
-    async fn bridge_stream_to_channel(
-        stream: tokio::io::DuplexStream,
+    async fn routed_streamlocal(
+        server: MeshNode,
+        route: SshRouteConfig,
+        context: mesh::protocol::ActivationContext,
+        socket_path: &str,
+    ) -> Result<tokio::io::DuplexStream, anyhow::Error> {
+        let id = Self::routed_connection_id(&server, &route, context.clone()).await?;
+        match server
+            .route_client_manager
+            .open_streamlocal(id, socket_path)
+            .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(first_error) => {
+                let _ = server.route_client_manager.disconnect(id).await;
+                server.route_connections.lock().await.remove(&route.name);
+                let id = Self::routed_connection_id(&server, &route, context).await?;
+                server
+                    .route_client_manager
+                    .open_streamlocal(id, socket_path)
+                    .await
+                    .map_err(|retry_error| {
+                        anyhow::anyhow!(
+                            "route '{}' streamlocal failed after reconnect: {}; first error: {}",
+                            route.name,
+                            retry_error,
+                            first_error
+                        )
+                    })
+            }
+        }
+    }
+
+    async fn routed_shell_stream(
+        server: MeshNode,
+        route: SshRouteConfig,
+        context: mesh::protocol::ActivationContext,
+    ) -> Result<tokio::io::DuplexStream, anyhow::Error> {
+        let id = Self::routed_connection_id(&server, &route, context.clone()).await?;
+        match server.route_client_manager.open_shell(id).await {
+            Ok(stream) => Ok(stream),
+            Err(first_error) => {
+                let _ = server.route_client_manager.disconnect(id).await;
+                server.route_connections.lock().await.remove(&route.name);
+                let id = Self::routed_connection_id(&server, &route, context).await?;
+                server
+                    .route_client_manager
+                    .open_shell(id)
+                    .await
+                    .map_err(|retry_error| {
+                        anyhow::anyhow!(
+                            "route '{}' shell failed after reconnect: {}; first error: {}",
+                            route.name,
+                            retry_error,
+                            first_error
+                        )
+                    })
+            }
+        }
+    }
+
+    async fn routed_trusted_uds_stream(
+        route: &SshRouteConfig,
+        context: mesh::protocol::ActivationContext,
+    ) -> Result<UnixStream, anyhow::Error> {
+        if let Some(service) = route.activation_service.as_deref() {
+            Self::prepare_route_activation(service, context).await?;
+        }
+        let socket_path = route.client.uds_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "route '{}' uses trusted UDS routing without uds_path",
+                route.name
+            )
+        })?;
+        crate::trusted_transport::connect_trusted_uds(socket_path).await
+    }
+
+    async fn bridge_stream_to_channel<S>(
+        stream: S,
         channel_id: ChannelId,
         channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
         session_handle: server::Handle,
         label: String,
-    ) {
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (reader, writer) = tokio::io::split(stream);
         let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
         {
@@ -364,6 +511,69 @@ impl SshHandler {
         let label_to_ssh = format!("{} to SSH", label);
         tokio::spawn(async move {
             crate::utils::pipe_read_to_ssh(reader, session_handle, channel_id, &label_to_ssh).await;
+            let mut writers = channel_writers_clone.lock().await;
+            writers.remove(&channel_id);
+        });
+
+        let channel_writers_clone = channel_writers.clone();
+        let label_from_ssh = format!("SSH to {}", label);
+        tokio::spawn(async move {
+            crate::utils::pipe_rx_to_write(rx, writer, &label_from_ssh).await;
+            let mut writers = channel_writers_clone.lock().await;
+            writers.remove(&channel_id);
+        });
+    }
+
+    async fn bridge_shell_stream_to_channel<S>(
+        stream: S,
+        channel_id: ChannelId,
+        channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
+        session_handle: server::Handle,
+        label: String,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut reader, writer) = tokio::io::split(stream);
+        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+        {
+            let mut writers = channel_writers.lock().await;
+            writers.insert(channel_id, tx);
+        }
+
+        let channel_writers_clone = channel_writers.clone();
+        let label_to_ssh = format!("{} to SSH", label);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => {
+                        debug!("{} EOF", label_to_ssh);
+                        break;
+                    }
+                    Ok(n) => {
+                        if session_handle
+                            .data(channel_id, Bytes::copy_from_slice(&buf[..n]))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::Other || e.raw_os_error() == Some(5) =>
+                    {
+                        debug!("{} closed cleanly: {}", label_to_ssh, e);
+                        break;
+                    }
+                    Err(e) => {
+                        error!("{} read error: {}", label_to_ssh, e);
+                        break;
+                    }
+                }
+            }
+            let _ = session_handle.exit_status_request(channel_id, 0).await;
+            let _ = session_handle.eof(channel_id).await;
+            let _ = session_handle.close(channel_id).await;
             let mut writers = channel_writers_clone.lock().await;
             writers.remove(&channel_id);
         });
@@ -1243,6 +1453,36 @@ impl server::Handler for SshHandler {
             {
                 let target_host = route.target_host.clone().unwrap_or_else(|| host.clone());
                 let target_port = route.target_port.unwrap_or(incoming_port);
+                if route.activation_service.is_some()
+                    && route.client.transport.eq_ignore_ascii_case("uds")
+                    && route.client.uds_path.is_some()
+                {
+                    match Self::routed_trusted_uds_stream(&route, context).await {
+                        Ok(stream) => {
+                            Self::bridge_stream_to_channel(
+                                stream,
+                                channel_id,
+                                me.channel_writers.clone(),
+                                session_handle,
+                                format!("activated trusted UDS route {}", route.name),
+                            )
+                            .await;
+                            info!(
+                                "Routed jump established for {}:{} via activated trusted UDS route {}",
+                                host, incoming_port, route.name
+                            );
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed routed jump for {}:{} via route '{}': {}",
+                                host, incoming_port, route.name, e
+                            );
+                            return Ok(false);
+                        }
+                    }
+                }
+
                 match Self::routed_stream(
                     me.server.clone(),
                     route.clone(),
@@ -1345,9 +1585,8 @@ impl server::Handler for SshHandler {
                         writers.insert(channel_id, tx);
                     }
 
-                    // Spawn task to forward data from TCP -> SSH channel
                     let session_handle_clone = session_handle.clone();
-                    let tcp_writers_clone = tcp_writers.clone();
+                    let channel_writers_clone = me.channel_writers.clone();
                     tokio::spawn(async move {
                         crate::utils::pipe_read_to_ssh(
                             tcp_reader,
@@ -1356,27 +1595,23 @@ impl server::Handler for SshHandler {
                             "TCP to SSH",
                         )
                         .await;
-                        let mut writers = tcp_writers_clone.lock().await;
+                        let mut writers = channel_writers_clone.lock().await;
                         writers.remove(&channel_id);
                     });
 
-                    // Spawn task to forward data from SSH channel -> TCP connection
-                    let tcp_writers_clone2 = tcp_writers.clone();
+                    // Bridge SSH channel to TCP
+                    let channel_writers_clone2 = me.channel_writers.clone();
                     tokio::spawn(async move {
                         crate::utils::pipe_rx_to_write(rx, tcp_writer, "SSH to TCP").await;
-                        let mut writers = tcp_writers_clone2.lock().await;
+                        let mut writers = channel_writers_clone2.lock().await;
                         writers.remove(&channel_id);
                     });
 
-                    info!("Direct TCP/IP forwarding established for {}:{}", host, port);
                     Ok(true)
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to connect to target {}:{}: {} (handler ID: {})",
-                        host, port, e, handler_id
-                    );
-                    Ok(false) // Reject the channel if we can't connect
+                    error!("Failed to connect to {}:{}: {}", host, port, e);
+                    Ok(false)
                 }
             }
         }
@@ -1397,7 +1632,45 @@ impl server::Handler for SshHandler {
         let socket_path = socket_path.to_string();
         let handle = session.handle();
 
-        async move { me.connect_uds(channel, &socket_path, handle).await }
+        async move {
+            if let Some(route) = me.matching_ssh_route(None) {
+                let channel_id = channel.id();
+                let context = me.activation_context(None);
+                match Self::routed_streamlocal(
+                    me.server.clone(),
+                    route.clone(),
+                    context,
+                    &socket_path,
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        Self::bridge_stream_to_channel(
+                            stream,
+                            channel_id,
+                            me.channel_writers.clone(),
+                            handle,
+                            format!("routed streamlocal {} via {}", socket_path, route.name),
+                        )
+                        .await;
+                        info!(
+                            "Routed streamlocal established for {} via {}",
+                            socket_path, route.name
+                        );
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed routed streamlocal for {} via route '{}': {}",
+                            socket_path, route.name, e
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+
+            me.connect_uds(channel, &socket_path, handle).await
+        }
     }
 
     /// This is the message used by server to accept new streams on behalf of
@@ -2022,19 +2295,60 @@ impl server::Handler for SshHandler {
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         info!("Shell request for channel {:?}", channel);
         debug!("SSH handler ID: {}", self.id);
-        let mesh_init_terminal = self
-            .terminal_user
-            .as_deref()
-            .and_then(cert_terminal_for_user);
+        let route = self.matching_ssh_route(None);
+        let session_handle = session.handle();
+        let local_future = if route.is_none() {
+            let mesh_init_terminal = self
+                .terminal_user
+                .as_deref()
+                .and_then(cert_terminal_for_user);
 
-        Self::spawn_command(
-            None,
-            channel,
-            self.sessions.clone(),
-            self.channel_writers.clone(),
-            session,
-            mesh_init_terminal,
-        )
+            Some(Self::spawn_command(
+                None,
+                channel,
+                self.sessions.clone(),
+                self.channel_writers.clone(),
+                session,
+                mesh_init_terminal,
+            ))
+        } else {
+            None
+        };
+        let context = self.activation_context(None);
+        let server = self.server.clone();
+        let channel_writers = self.channel_writers.clone();
+
+        async move {
+            if let Some(future) = local_future {
+                return future.await;
+            }
+
+            if let Some(route) = route {
+                let route_name = route.name.clone();
+                match Self::routed_shell_stream(server, route, context).await {
+                    Ok(stream) => {
+                        Self::bridge_shell_stream_to_channel(
+                            stream,
+                            channel,
+                            channel_writers,
+                            session_handle.clone(),
+                            format!("shell:{}", route_name),
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!("Routed shell failed: {}", e);
+                        let _ = session_handle
+                            .extended_data(channel, 1, Bytes::from(format!("{}\n", e)))
+                            .await;
+                        let _ = session_handle.eof(channel).await;
+                        let _ = session_handle.close(channel).await;
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     #[instrument(skip(self, _session), fields(channel_id = ?channel, term = %term))]

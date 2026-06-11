@@ -134,7 +134,7 @@ fi
 env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
   vm_mem="${vm_mem:-512M}" vm_cpu="${vm_cpu:-1}" vm_balloon="${vm_balloon:-0}" \
   NO_NET=1 SERIAL_LOG="${SERIAL_LOG}" \
-  "${PROFILE}/bin/initos-vrun" start
+  "${PROFILE}/bin/initos-vrun" start > "${SERIAL_LOG}" 2>&1
 
 deadline=$((SECONDS + TIMEOUT))
 while [[ $SECONDS -lt $deadline ]]; do

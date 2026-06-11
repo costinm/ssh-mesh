@@ -45,10 +45,43 @@ pub fn trusted_client_config() -> client::Config {
 }
 
 pub async fn run_trusted_server_stdio(server: MeshNode) -> Result<()> {
+    set_stdio_raw_mode();
     let config = Arc::new(server.get_trusted_transport_config());
     let stream = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
     run_trusted_server_stream(config, stream, server, "stdio").await
 }
+
+#[cfg(unix)]
+fn set_stdio_raw_mode() {
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO] {
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+        if rc != 0 {
+            debug!(
+                "failed to read terminal mode for trusted stdio fd {}: {}",
+                fd,
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+
+        let mut termios = unsafe { termios.assume_init() };
+        unsafe {
+            libc::cfmakeraw(&mut termios);
+        }
+        let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
+        if rc != 0 {
+            debug!(
+                "failed to set raw terminal mode for trusted stdio fd {}: {}",
+                fd,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn set_stdio_raw_mode() {}
 
 pub async fn run_trusted_uds_server(server: MeshNode, socket_path: impl AsRef<Path>) -> Result<()> {
     let socket_path = socket_path.as_ref();

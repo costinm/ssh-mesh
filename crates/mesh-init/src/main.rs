@@ -5,7 +5,9 @@
 
 use anyhow::Result;
 use clap::Parser;
+use std::fs::OpenOptions;
 use tracing::info;
+
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
@@ -24,12 +26,24 @@ struct Args {
 // ============================================================================
 
 fn init_telemetry() {
-    let out_layer = tracing_subscriber::fmt::layer().compact();
+    let filter = EnvFilter::from_default_env();
+    let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/mesh-init/mesh-init.log", home)
+    });
 
-    Registry::default()
-        .with(EnvFilter::from_default_env())
-        .with(out_layer)
-        .init();
+    if let Some(parent) = std::path::Path::new(&log_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let out_layer = tracing_subscriber::fmt::layer()
+            .compact()
+            .with_writer(move || file.try_clone().expect("clone mesh-init log file"));
+        Registry::default().with(filter).with(out_layer).init();
+    } else {
+        Registry::default().with(filter).init();
+    }
 }
 
 #[tokio::main]

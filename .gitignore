@@ -3,8 +3,11 @@ AGENTS.md
 GEMINI.md
 AGENT.md
 .idea
+.venv
 tmp
 result*
 python/dmesh/__pycache__
 java/classes
 .antigravitycli
+result
+
