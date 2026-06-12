@@ -10,36 +10,37 @@ set -euo pipefail
 # The host1 node installs mesh-init activation sockets for app1-bwrap.
 # Host3-vm installs activation sockets for app2/app3/app4 VM apps.
 #
-# Host2 and host1 run in bubblewrap. Host3-vm is started with QEMU.
+# Host2 and host1 run through the shared bubblewrap launcher. Host3-vm is
+# started through vrun with QEMU.
 #
 # The examples share a private state root. Host2 and host1 share the host network
-# namespace. Host3-vm's TCP ports are forwarded from QEMU user networking.
+# namespace. Host3-vm's TCP ports are forwarded from vrun's QEMU user
+# networking.
 #
 #   $SSH_MESH_EXAMPLE_ROOT/shared
 #
-# Binaries are expected in PATH; package-scoped install locations are prepended
-# for host and test layouts.
+# Build scripts create package artifacts under target/dist. The example base dir
+# is state only; bwrap hosts bind target/dist/opt as /opt, and VMs get that same
+# /opt tree from the EROFS rootfs.
 
 examples_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace_dir="$(cd "${examples_dir}/../.." 2>/dev/null && pwd)"
 target_dir="${SSH_MESH_TARGET_DIR:-${workspace_dir}/target}"
-root_dir="${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}"
+root_dir="${1:-${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}}"
+artifact_dir="${target_dir}/dist"
 default_nix_profile="${target_dir}/nix/profile"
 if [ ! -e "${default_nix_profile}" ] && [ -e "${target_dir}/nix/profiles" ]; then
   default_nix_profile="${target_dir}/nix/profiles"
 fi
 nix_profile="${NIX_PROFILE:-${default_nix_profile}}"
-staged_opt="${SSH_MESH_OPT_DIR:-${root_dir}/opt}"
-staged_bin_dir="${staged_opt}/ssh-mesh/bin"
+staged_opt="${artifact_dir}/opt"
 log_dir="${root_dir}/logs"
 run_dir="${root_dir}/run"
 pid_file="${run_dir}/start_all.pids"
 
 export NIX_PROFILE="${nix_profile}"
 export SSH_MESH_EXAMPLE_ROOT="${root_dir}"
-export SSH_MESH_OPT_DIR="${staged_opt}"
-export SSH_MESH_EXAMPLE_BIN_DIR="${SSH_MESH_EXAMPLE_BIN_DIR:-${staged_bin_dir}}"
-export PATH="${SSH_MESH_EXAMPLE_BIN_DIR}:/out/ssh-mesh/bin:/opt/ssh-mesh/bin:${NIX_PROFILE}/bin:${PATH}"
+export PATH="${staged_opt}/ssh-mesh/bin:${staged_opt}/busybox/bin:${NIX_PROFILE}/bin:${PATH}"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -54,86 +55,48 @@ need setsid
 
 mkdir -p "${log_dir}" "${run_dir}" "${root_dir}/shared"
 
-example_bin_src=""
-if [ -x "${workspace_dir}/target/x86_64-unknown-linux-musl/release/ssh-mesh" ]; then
-  example_bin_src="${workspace_dir}/target/x86_64-unknown-linux-musl/release"
-elif [ -x "${workspace_dir}/target/debug/ssh-mesh" ]; then
-  example_bin_src="${workspace_dir}/target/debug"
-fi
+if [ ! -x "${staged_opt}/ssh-mesh/bin/ssh-mesh" ] || [ ! -x "${staged_opt}/busybox/bin/busybox" ]; then
+  cat >&2 <<EOF
+Missing dist /opt tree under:
+  ${staged_opt}
 
-if [ -n "${example_bin_src}" ] && [ -x "${workspace_dir}/scripts/build.sh" ]; then
-  "${workspace_dir}/scripts/build.sh" stage_examples \
-    "${example_bin_src}" \
-    "${root_dir}" \
-    "${staged_opt}"
+Build it with:
+  ${workspace_dir}/scripts/build.sh
+EOF
+  exit 2
 fi
 
 need mesh-init
 need ssh-mesh
 
-# Try to locate the VM assets
-if [ -n "${SSH_MESH_HOST3_VM_DIR:-}" ]; then
-  vm_dir="${SSH_MESH_HOST3_VM_DIR}"
-elif [ -d "${workspace_dir}/result-default" ]; then
-  vm_dir="${workspace_dir}/result-default"
-elif [ -d "${examples_dir}/share/host3-vm-vm" ]; then
-  vm_dir="${examples_dir}/share/host3-vm-vm"
-elif [ -d "${nix_profile}/opt/ssh-mesh/share/host3-vm-vm" ]; then
-  vm_dir="${nix_profile}/opt/ssh-mesh/share/host3-vm-vm"
-else
-  vm_dir="/opt/ssh-mesh/share/host3-vm-vm"
-fi
+kernel="${artifact_dir}/img/vmlinux-cloud"
+rootfs="${artifact_dir}/img/ssh-mesh.erofs"
+modules="${artifact_dir}/img/modules-cloud.erofs"
 
-# Locate kernel
-if [ -f "${vm_dir}/img/vmlinux-cloud" ]; then
-  kernel="${vm_dir}/img/vmlinux-cloud"
-elif [ -f "${nix_profile}/img/vmlinux-cloud" ]; then
-  kernel="${nix_profile}/img/vmlinux-cloud"
-elif [ -f "${vm_dir}/bzImage" ]; then
-  kernel="${vm_dir}/bzImage"
-else
-  kernel="${SSH_MESH_HOST3_VM_KERNEL:-${vm_dir}/bzImage}"
-fi
+if [ ! -r "${kernel}" ] || [ ! -r "${rootfs}" ] || [ ! -r "${modules}" ]; then
+  cat >&2 <<EOF
+Host3-vm requires readable dist VM artifacts.
 
-# Locate rootfs
-if [ -f "${vm_dir}/img/ssh-mesh.erofs" ]; then
-  rootfs="${vm_dir}/img/ssh-mesh.erofs"
-elif [ -f "${vm_dir}/initos.erofs" ]; then
-  rootfs="${vm_dir}/initos.erofs"
-else
-  rootfs="${SSH_MESH_HOST3_VM_ROOTFS:-${vm_dir}/initos.erofs}"
+Build it with:
+  ${workspace_dir}/scripts/build.sh profile
+  ${workspace_dir}/scripts/build.sh
+EOF
+  exit 2
 fi
 
 vm_artifact_dir="${root_dir}/vm-artifacts"
 mkdir -p "${vm_artifact_dir}"
 cp -f "${kernel}" "${vm_artifact_dir}/vmlinux-cloud"
 cp -f "${rootfs}" "${vm_artifact_dir}/ssh-mesh.erofs"
-export SSH_MESH_APP_VM_KERNEL="${SSH_MESH_APP_VM_KERNEL:-/tmp/mesh/state/vm-artifacts/vmlinux-cloud}"
-export SSH_MESH_APP_VM_ROOTFS="${SSH_MESH_APP_VM_ROOTFS:-/tmp/mesh/state/vm-artifacts/ssh-mesh.erofs}"
+cp -f "${modules}" "${vm_artifact_dir}/modules-cloud.erofs"
+export SSH_MESH_APP_VM_KERNEL="/tmp/mesh/state/vm-artifacts/vmlinux-cloud"
+export SSH_MESH_APP_VM_ROOTFS="/tmp/mesh/state/vm-artifacts/ssh-mesh.erofs"
+export SSH_MESH_APP_VM_MODULES="/tmp/mesh/state/vm-artifacts/modules-cloud.erofs"
 
 vm_host_ssh_port="${SSH_MESH_HOST3_VM_HOST_SSH_PORT:-18322}"
 vm_host_http_port="${SSH_MESH_HOST3_VM_HOST_HTTP_PORT:-18380}"
-
-if [ ! -r "${kernel}" ] || [ ! -r "${rootfs}" ]; then
-  cat >&2 <<EOF
-Host3-vm requires a readable kernel and rootfs to start the VM example.
-
-Build it with:
-  nix build .#default -o result-default
-
-Then set:
-  SSH_MESH_HOST3_VM_DIR=/path/to/result-default
-
-Or set:
-  SSH_MESH_HOST3_VM_KERNEL=/path/to/bzImage
-  SSH_MESH_HOST3_VM_ROOTFS=/path/to/initos.erofs
-
-To run only the bwrap nodes:
-  ./host2/start.sh
-  ./host1/start.sh
-EOF
-  exit 2
-fi
+export SSH_MESH_HOST3_VM_HOST_SSH_PORT="${vm_host_ssh_port}"
+export SSH_MESH_HOST3_VM_HOST_HTTP_PORT="${vm_host_http_port}"
 
 host1_key="${examples_dir}/host1/home/system/.ssh/id_ecdsa"
 host1_cert="${examples_dir}/host1/home/system/.ssh/id_ecdsa-user-cert.pub"
@@ -141,12 +104,15 @@ host2_key="${examples_dir}/host2/home/system/.ssh/id_ecdsa"
 host2_cert="${examples_dir}/host2/home/system/.ssh/id_ecdsa-user-cert.pub"
 host3_key="${examples_dir}/host3-vm/home/system/.ssh/id_ecdsa"
 host3_cert="${examples_dir}/host3-vm/home/system/.ssh/id_ecdsa-user-cert.pub"
+root_key="${examples_dir}/root/home/root/.ssh/id_ecdsa"
+root_cert="${examples_dir}/root/home/root/.ssh/id_ecdsa-user-cert.pub"
 ssh_config="${examples_dir}/ssh_config"
 
 for key_file in \
   "${host1_key}" "${host1_cert}" \
   "${host2_key}" "${host2_cert}" \
   "${host3_key}" "${host3_cert}" \
+  "${root_key}" "${root_cert}" \
   "${ssh_config}"
 do
   if [ ! -r "${key_file}" ]; then
@@ -160,12 +126,24 @@ node_pids=""
 node_pgroups=""
 cleanup_done=0
 
+get_pgid() {
+  pid="$1"
+  stat="$(cat "/proc/${pid}/stat" 2>/dev/null || true)"
+  [ -n "${stat}" ] || return 0
+
+  # After the command field, /proc/PID/stat fields are:
+  # state ppid pgrp session ...
+  stat="${stat#*) }"
+  set -- ${stat}
+  printf '%s\n' "${3:-}"
+}
+
 stop_pids() {
   pids="$1"
   [ -n "${pids}" ] || return 0
 
   for pid in ${pids}; do
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+    pgid="$(get_pgid "${pid}")"
     if [ -n "${pgid}" ]; then
       kill -TERM "-${pgid}" >/dev/null 2>&1 || true
     fi
@@ -186,7 +164,7 @@ stop_pids() {
   done
 
   for pid in ${pids}; do
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+    pgid="$(get_pgid "${pid}")"
     if [ -n "${pgid}" ]; then
       kill -KILL "-${pgid}" >/dev/null 2>&1 || true
     fi
@@ -195,7 +173,12 @@ stop_pids() {
 }
 
 find_existing_example_pids() {
-  ps -eo pid=,args= | while read -r pid args; do
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    [ "${pid}" != "$$" ] || continue
+    args="$(tr '\0' ' ' <"${proc}/cmdline" 2>/dev/null || true)"
+    [ -n "${args}" ] || continue
+
     case "${args}" in
       *"${root_dir}"*)
         case "${args}" in
@@ -269,9 +252,10 @@ stop_existing_examples
 
 start_node() {
   node="$1"
+  command="${2:-${examples_dir}/${node}/start.sh}"
   log="${log_dir}/${node}.log"
   echo "starting ${node}; log=${log}"
-  setsid "${examples_dir}/${node}/start.sh" >"${log}" 2>&1 &
+  setsid "${command}" "${root_dir}" >"${log}" 2>&1 &
   pid="$!"
   node_pgroups="${node_pgroups} ${pid}"
   node_pids="${node_pids} ${pid}"
@@ -279,7 +263,7 @@ start_node() {
 }
 
 start_node host2
-start_node host3-vm
+start_node host3-vm "${examples_dir}/host3-vm/run-host3-vm"
 start_node host1
 
 cat <<EOF
@@ -296,7 +280,7 @@ Logs:
 
 Fixed listeners:
   host2: ssh 127.0.0.1:18222, http 127.0.0.1:18280
-  host3-vm: qemu hostfwd ssh 127.0.0.1:${vm_host_ssh_port}, http 127.0.0.1:${vm_host_http_port}
+  host3-vm: vrun/qemu hostfwd ssh 127.0.0.1:${vm_host_ssh_port}, http 127.0.0.1:${vm_host_http_port}
   host1: ssh 127.0.0.1:18422, http 127.0.0.1:18480
 
 Trusted UDS sockets:
@@ -348,6 +332,7 @@ Example SSH shells:
   ssh -F ssh_config host1
   ssh -F ssh_config host2
   ssh -F ssh_config host3-vm
+  ssh -F ssh_config host3-vm-root
   ssh -F ssh_config app1-bwrap
   ssh -F ssh_config app2-qemu
   ssh -F ssh_config app3-crosvm
@@ -356,6 +341,7 @@ Example SSH shells:
 Direct SSH shells:
   ssh -F ssh_config host2-direct
   ssh -F ssh_config -p ${vm_host_ssh_port} host3-vm-direct
+  ssh -F ssh_config -p ${vm_host_ssh_port} host3-vm-root-direct
 
 Example pmond local forwards:
   ssh -N -F ssh_config \\

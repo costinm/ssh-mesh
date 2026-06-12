@@ -2,6 +2,10 @@
 
 # Keep the Dockerfile in sync
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc 
 
@@ -22,7 +26,48 @@ export DEST=${DEST:-/opt/ssh-mesh}
 CRATES="mesh-init ssh-mesh mesh pmond mcp mesh9p traceweb sftp-server lmesh ssh-config"
 BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh pmond mcp-pmond mesh9p traceweb sftp-server lmesh ssh-config"
 INSTALL_BIN_TARGETS="$BIN_TARGETS dmesh"
-EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh sshmc pmond lmesh mcp-pmond mesh9p sftp-server h2t meshkeys"
+EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh sshmc pmond lmesh mcp-pmond mesh9p sftp-server h2t meshkeys"
+
+help() {
+    cat <<'EOF'
+Usage: scripts/build.sh [command] [args...]
+
+Default command:
+  scripts/build.sh
+      Build Rust musl release binaries and create distributable artifacts under
+      target/dist, including target/dist/opt and target/dist/img/ssh-mesh.erofs.
+
+Fresh target/examples sequence:
+  scripts/build.sh profile
+      Build/update the repo-local Nix profile with VM helpers, kernels, rootfs
+      assets, and hypervisors used by the examples.
+
+  scripts/build.sh
+      Build the Rust binaries and create target/dist artifacts.
+
+  docs/examples/start_all.sh
+      Start host1, host2, host3-vm, and activated app environments.
+
+Common commands:
+  help                 Show this help.
+  rust                 Build x86_64 musl release Rust binaries.
+  deploy_examples      Compatibility alias for dist.
+  stage_examples       Compatibility alias for staging target/dist/opt.
+  stage_example_tree   Refresh checked-in example files under target/examples.
+  profile [path]       Build/update the Nix profile. Default: target/nix/profile,
+                       or existing target/nix/profiles.
+  dist [path]          Build release binaries into an install-like tree.
+  erofs [out ...]      Build the VM EROFS rootfs image.
+  install [path]       Install runtime binaries and scripts. Default: /opt/ssh-mesh.
+  dmesh_java [path]    Build dmesh plus the Java/JNI artifacts.
+  build [profile]      Full local build: Rust, examples, EROFS, profile.
+
+Environment:
+  SSH_MESH_BUSYBOX         Busybox path used for staged target/dist/opt/busybox.
+  NIX_PROFILE              Nix profile used by examples. Default: target/nix/profile,
+                           or existing target/nix/profiles.
+EOF
+}
 
 copy_runtime_bins() {
     local src="$1"
@@ -54,6 +99,18 @@ find_busybox() {
     fi
     if command -v busybox >/dev/null 2>&1; then
         command -v busybox
+        return 0
+    fi
+    if [ -n "${NIX_PROFILE:-}" ] && [ -x "${NIX_PROFILE}/bin/busybox" ]; then
+        printf '%s\n' "${NIX_PROFILE}/bin/busybox"
+        return 0
+    fi
+    if [ -x "$PWD/target/nix/profile/bin/busybox" ]; then
+        printf '%s\n' "$PWD/target/nix/profile/bin/busybox"
+        return 0
+    fi
+    if [ -x "$PWD/target/nix/profiles/bin/busybox" ]; then
+        printf '%s\n' "$PWD/target/nix/profiles/bin/busybox"
         return 0
     fi
     if [ -x "/ws/initos/target/nix/bin/busybox" ]; then
@@ -94,10 +151,31 @@ install_busybox_tree() {
     )
 }
 
+stage_opt_tree() {
+    local src="$1"
+    local opt="$2"
+    local busybox="$3"
+
+    rm -rf "$opt/ssh-mesh" "$opt/busybox" "$opt/initos"
+    mkdir -p "$opt/ssh-mesh/bin" "$opt/initos/bin"
+
+    copy_runtime_bins "$src" "$opt/ssh-mesh/bin" $EXAMPLE_BIN_TARGETS
+    cp -f linux/bin/vrun "$opt/ssh-mesh/bin/vrun"
+    ln -sf vrun "$opt/ssh-mesh/bin/initos-vrun"
+    cp -f bin/run_bwrap.sh "$opt/ssh-mesh/bin/run_bwrap.sh"
+    cp -f bin/run_podman.sh "$opt/ssh-mesh/bin/run_podman.sh"
+    chmod +x "$opt/ssh-mesh/bin/"*
+
+    cp -f bin/initos-init-vm "$opt/initos/bin/initos-init-vm"
+    chmod +x "$opt/initos/bin/initos-init-vm"
+
+    install_busybox_tree "$busybox" "$opt/busybox"
+}
+
 stage_examples() {
     local src="${1:-}"
-    local root="${2:-${SSH_MESH_EXAMPLE_ROOT:-$PWD/target/examples}}"
-    local opt="${3:-${SSH_MESH_OPT_DIR:-$root/opt}}"
+    local root="${2:-$PWD/target/dist}"
+    local opt="$root/opt"
     local busybox
 
     if [ -z "$src" ]; then
@@ -119,18 +197,55 @@ stage_examples() {
     }
 
     echo "Staging examples from $src"
-    echo "  state root: $root"
+    echo "  artifact root: $root"
     echo "  opt root:   $opt"
 
-    rm -rf "$root/bin" "$opt/ssh-mesh/bin"
-    mkdir -p "$opt/ssh-mesh/bin" "$root/examples"
-    copy_runtime_bins "$src" "$opt/ssh-mesh/bin" $EXAMPLE_BIN_TARGETS
-    cp -f linux/bin/vrun "$opt/ssh-mesh/bin/vrun"
-    chmod +x "$opt/ssh-mesh/bin/vrun"
-    ln -sf vrun "$opt/ssh-mesh/bin/initos-vrun"
-    install_busybox_tree "$busybox" "$opt/busybox"
+    mkdir -p "$root"
+    stage_opt_tree "$src" "$opt" "$busybox"
 
-    echo "Examples staged under $root"
+    echo "Artifacts staged under $root"
+}
+
+stage_example_tree() {
+    local root="${1:-$PWD/target/examples}"
+    local opt="${2:-$PWD/target/dist/opt}"
+
+    if [ ! -d "docs/examples" ]; then
+        echo "Missing docs/examples source tree" >&2
+        return 1
+    fi
+    if [ ! -d "$opt/ssh-mesh/bin" ]; then
+        echo "Missing staged /opt tree under $opt; run scripts/build.sh first" >&2
+        return 1
+    fi
+
+    echo "Refreshing example tree under $root"
+    mkdir -p "$root" "$root/bin"
+    cp -a docs/examples/. "$root/"
+    cp -a "$opt/ssh-mesh/bin/." "$root/bin/"
+    if [ -x "$opt/busybox/bin/busybox" ]; then
+        cp -f "$opt/busybox/bin/busybox" "$root/bin/busybox"
+        chmod +x "$root/bin/busybox"
+    fi
+}
+
+rust() {
+    echo "Building release binaries with musl..."
+    cargo build --target x86_64-unknown-linux-musl --release --workspace --exclude dmesh
+}
+
+deploy_examples() {
+    local src="${1:-target/x86_64-unknown-linux-musl/release}"
+    local root="${2:-$PWD/target/dist}"
+
+    stage_examples "$src" "$root"
+    stage_example_tree "$PWD/target/examples" "$root/opt"
+}
+
+default() {
+    rust
+    dist "$PWD/target/dist" "target/x86_64-unknown-linux-musl/release"
+    stage_example_tree "$PWD/target/examples" "$PWD/target/dist/opt"
 }
 
 setup() {
@@ -144,7 +259,7 @@ setup() {
 
 }
 debug() {
-    cargo build --target x86_64-unknown-linux-musl --workspace
+    cargo build --target x86_64-unknown-linux-musl --workspace --exclude dmesh
 
     #_all x86_64-unknown-linux-musl 
 }
@@ -186,70 +301,47 @@ push() {
 }
 
 dist() {
-    local dest="${1:-target/opt/ssh-mesh}"
-    mkdir -p "$dest/bin"
+    local dest="${1:-$PWD/target/dist}"
+    local release_dir="${2:-target/x86_64-unknown-linux-musl/release}"
+    local busybox
 
-    echo "Building release binaries with musl..."
-    #release
-    cargo build --target x86_64-unknown-linux-musl --release --workspace
-    echo "Copying binaries..."
-    for bin in $BIN_TARGETS; do
-        cp target/x86_64-unknown-linux-musl/release/$bin $dest/bin
-    done
+    if [ ! -x "$release_dir/ssh-mesh" ]; then
+        rust
+    fi
 
-    #find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -executable -exec cp {} "$dest/bin/" \;
-    
-    echo "Stripping binaries..."
-    strip "$dest/bin/"* || true
+    busybox="$(find_busybox "${SSH_MESH_BUSYBOX:-}")" || {
+        echo "Missing required busybox; set SSH_MESH_BUSYBOX=/path/to/busybox" >&2
+        return 1
+    }
 
-    local root_conf="$dest/root/.config/mesh-init"
-    local root_jobs="$dest/root/.config/mesh/jobs"
+    echo "Creating dist artifacts under $dest"
+    mkdir -p "$dest"
+    stage_opt_tree "$release_dir" "$dest/opt" "$busybox"
+    erofs "$dest" "$busybox" "bin/initos-init-vm" "$dest/opt"
 
-    local sys_conf="$dest/system/.config/mesh-init"
-    local sys_jobs="$dest/system/.config/mesh/jobs"
+    local profile_path="${NIX_PROFILE:-$(default_nix_profile)}"
+    if [ -f "$profile_path/img/vmlinux-cloud" ]; then
+        cp -f "$profile_path/img/vmlinux-cloud" "$dest/img/vmlinux-cloud"
+    elif [ -f "$profile_path/img/bzImage" ]; then
+        cp -f "$profile_path/img/bzImage" "$dest/img/bzImage"
+    else
+        echo "Warning: no VM kernel found under $profile_path/img; run scripts/build.sh profile for VM examples" >&2
+    fi
 
-    mkdir -p "$root_conf" "$root_jobs/work" "$sys_conf" "$sys_jobs/work"
-
-    echo "Setting up mesh-init configs..."
-    for f in crates/mesh-init/testdata/*.toml; do
-        cp "$f" "$root_conf/"
-        cp "$f" "$sys_conf/"
-    done
-
-    # Modify system configs to use different ports
-    sed -i 's/15022/25022/g; s/8080/8081/g; s/8081/8082/g; s/14022/24022/g' "$sys_conf/"*.toml
-
-    echo "Creating job files..."
-    cat <<EOF > "$root_jobs/status_network.toml"
-name = "status_network"
-command = "/opt/busybox/bin/sh"
-args = ["-c", "echo 'Network is unmetered' > $dest/root_network_status.txt"]
-priority = 500
-persisted = false
-
-[schedule]
-periodic_secs = 60
-
-[constraints]
-network_type = "unmetered"
-EOF
-
-    cat <<EOF > "$root_jobs/status_periodic.toml"
-name = "status_periodic"
-command = "/opt/busybox/bin/sh"
-args = ["-c", "date > $dest/root_periodic_status.txt"]
-priority = 500
-persisted = false
-
-[schedule]
-periodic_secs = 30
-EOF
-
-    cp "$root_jobs/status_network.toml" "$sys_jobs/status_network.toml"
-    sed -i "s|root_network_status|system_network_status|g" "$sys_jobs/status_network.toml"
-    
-    cp "$root_jobs/status_periodic.toml" "$sys_jobs/status_periodic.toml"
-    sed -i "s|root_periodic_status|system_periodic_status|g" "$sys_jobs/status_periodic.toml"
+    local modules_src=""
+    if [ -f "$profile_path/img/modules-cloud.erofs" ]; then
+        modules_src="$profile_path/img/modules-cloud.erofs"
+    elif [ -f "$profile_path/img/modules-cloudfs.erofs" ]; then
+        modules_src="$profile_path/img/modules-cloudfs.erofs"
+    elif [ -f "$profile_path/img/modules.erofs" ]; then
+        modules_src="$profile_path/img/modules.erofs"
+    fi
+    if [ -n "$modules_src" ]; then
+        cp -f "$modules_src" "$dest/img/modules-cloud.erofs"
+        ln -sf modules-cloud.erofs "$dest/img/modules-cloudfs.erofs"
+    else
+        echo "Warning: no VM modules EROFS found under $profile_path/img; run scripts/build.sh profile for VM examples" >&2
+    fi
 
     echo "Dist completed at $dest"
 }
@@ -261,14 +353,10 @@ install() {
     mkdir -p "$dest/bin"
 
     echo "Building release binaries with musl..."
-    cargo build --target x86_64-unknown-linux-musl --release --workspace
+    cargo build --target x86_64-unknown-linux-musl --release --workspace --exclude dmesh
 
     echo "Installing runtime binaries to $dest/bin..."
     copy_runtime_bins "$release_dir" "$dest/bin" $BIN_TARGETS
-    if [ -f "$release_dir/dmesh" ]; then
-        cp -f "$release_dir/dmesh" "$dest/bin/dmesh_rs"
-        chmod +x "$dest/bin/dmesh_rs"
-    fi
     
     echo "Copying scripts..."
     cp -r bin/* "$dest/bin/"
@@ -333,45 +421,42 @@ jni() {
     echo "  -> $dest/bin/dmesh.jar"
 }
 
+dmesh_java() {
+    local dest="${1:-target/opt/ssh-mesh}"
+    local release_dir="target/x86_64-unknown-linux-musl/release"
+
+    mkdir -p "$dest/bin"
+
+    echo "Building dmesh release binary with musl..."
+    cargo build -p dmesh --target x86_64-unknown-linux-musl --release
+
+    if [ -f "$release_dir/dmesh" ]; then
+        cp -f "$release_dir/dmesh" "$dest/bin/dmesh_rs"
+        chmod +x "$dest/bin/dmesh_rs"
+        echo "  -> $dest/bin/dmesh_rs"
+    fi
+
+    jni "$dest"
+}
+
 # Build aarch64 release binaries into a separate dist directory.
 arm_release() {
     local dest="${1:-target/dist-aarch64}"
     mkdir -p "$dest/bin" "$dest/lib/arm64-v8a"
 
-    echo "Building aarch64 release (musl) for all crates..."
-    cargo build --target aarch64-unknown-linux-musl --release --workspace
+    echo "Building aarch64 release (musl) for runtime crates..."
+    cargo build --target aarch64-unknown-linux-musl --release --workspace --exclude dmesh
 
     echo "Copying aarch64 binaries..."
-    for bin in $BIN_TARGETS dmesh; do
+    for bin in $BIN_TARGETS; do
         if [ -f "target/aarch64-unknown-linux-musl/release/$bin" ]; then
-            if [ "$bin" == "dmesh" ]; then
-                cp "target/aarch64-unknown-linux-musl/release/$bin" "$dest/bin/${bin}_rs"
-            else
-                cp "target/aarch64-unknown-linux-musl/release/$bin" "$dest/bin/"
-            fi
+            cp "target/aarch64-unknown-linux-musl/release/$bin" "$dest/bin/"
         fi
     done
-
-    echo "Building JNI .so for aarch64..."
-    cargo build -p dmesh --target aarch64-unknown-linux-gnu --release \
-        --no-default-features --features jni-wrapper
-    if [ -f "target/aarch64-unknown-linux-gnu/release/libdmesh.so" ]; then
-        cp "target/aarch64-unknown-linux-gnu/release/libdmesh.so" "$dest/lib/arm64-v8a/"
-    fi
 
     echo "Copying scripts..."
     cp -r bin/* "$dest/bin/"
     chmod +x "$dest/bin/"*
-
-    # Build the JAR (arch-independent) if not already present
-    if [ ! -f "$dest/bin/dmesh.jar" ]; then
-        local classes_dir="target/java/classes"
-        rm -rf "$classes_dir"
-        mkdir -p "$classes_dir" target/java
-        javac -d "$classes_dir" $(find java/rust/src/main/java -name "*.java")
-        echo "Main-Class: com.github.costinm.dmeshnative.Main" > target/java/MANIFEST.MF
-        jar cfm "$dest/bin/dmesh.jar" target/java/MANIFEST.MF -C "$classes_dir" .
-    fi
 
     echo "aarch64 release completed at $dest"
 }
@@ -380,23 +465,12 @@ erofs() {
     local out="${1:-$PWD/target/erofs}"
     local busybox="${2:-busybox}"
     local initos_vm="${3:-bin/initos-init-vm}"
-    local mesh_bin="${4:-}"
+    local opt_src="${4:-$PWD/target/dist/opt}"
 
     busybox="$(find_busybox "$busybox")" || {
         echo "Error: busybox binary not found" >&2
         return 1
     }
-
-    # Fallback for mesh_bin to debug if release is not found
-    if [ -z "$mesh_bin" ] || [ ! -d "$mesh_bin" ]; then
-        if [ -d "target/x86_64-unknown-linux-musl/release" ]; then
-            mesh_bin="target/x86_64-unknown-linux-musl/release"
-        elif [ -d "target/x86_64-unknown-linux-musl/debug" ]; then
-            mesh_bin="target/x86_64-unknown-linux-musl/debug"
-        else
-            mesh_bin="target/x86_64-unknown-linux-musl/release"
-        fi
-    fi
 
     mkdir -p "$out/img" "$out/bin"
     local rootfs="$out/rootfs"
@@ -404,20 +478,21 @@ erofs() {
     
     # Pre-create all expected VM directories/mountpoints to avoid Read-only FS errors
     mkdir -p "$rootfs"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin}
-    mkdir -p "$rootfs"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,usr/bin,usr/sbin,usr/lib,usr/lib64,out,lib}
-
-    install_busybox_tree "$busybox" "$rootfs/opt/busybox"
+    mkdir -p "$rootfs"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,out,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,usr/bin,usr/sbin,usr/lib,usr/lib64,lib,lib/modules,lib/firmware}
 
     ln -s opt/busybox/bin "$rootfs/bin"
     ln -s opt/busybox/bin "$rootfs/sbin"
 
-    if [ -f "$initos_vm" ]; then
-        cp "$initos_vm" "$rootfs/opt/initos/bin/initos-init-vm"
-        chmod +x "$rootfs/opt/initos/bin/initos-init-vm"
+    if [ -d "$opt_src/ssh-mesh/bin" ] && [ -d "$opt_src/busybox/bin" ]; then
+        cp -a "$opt_src/." "$rootfs/opt/"
+    else
+        echo "Staged opt tree not found at $opt_src; creating one from release binaries"
+        stage_opt_tree "target/x86_64-unknown-linux-musl/release" "$rootfs/opt" "$busybox"
     fi
 
-    if [ -d "$mesh_bin" ]; then
-        copy_runtime_bins "$mesh_bin" "$rootfs/opt/ssh-mesh/bin" $BIN_TARGETS
+    if [ -f "$initos_vm" ] && [ ! -x "$rootfs/opt/initos/bin/initos-init-vm" ]; then
+        cp -f "$initos_vm" "$rootfs/opt/initos/bin/initos-init-vm"
+        chmod +x "$rootfs/opt/initos/bin/initos-init-vm"
     fi
 
     mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "$out/img/ssh-mesh.erofs" "$rootfs"
@@ -481,18 +556,39 @@ build() {
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
     
     echo "=== 1. Building release binaries with musl ==="
-    cargo build --target x86_64-unknown-linux-musl --release --workspace
-    
-    echo "=== 2. Building JNI native library and Java classes ==="
-    jni "target/opt/ssh-mesh"
-    
-    echo "=== 3. Staging local examples ==="
-    stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/examples" "$PWD/target/examples/opt"
+    cargo build --target x86_64-unknown-linux-musl --release --workspace --exclude dmesh
 
-    echo "=== 4. Building EROFS rootfs ==="
-    erofs "target/erofs" "$(which busybox 2>/dev/null || echo "")" "bin/initos-init-vm" "target/x86_64-unknown-linux-musl/release"
-    
-    echo "=== 5. Assembling and upgrading local VM profile ==="
+
+    echo "=== 2. Assembling and upgrading local VM profile ==="
     profile "${target_profile}"
+
+    echo "=== 3. Creating dist artifacts ==="
+    dist "$PWD/target/dist" "target/x86_64-unknown-linux-musl/release"
+
+    echo "=== 4. Refreshing example tree ==="
+    stage_example_tree "$PWD/target/examples" "$PWD/target/dist/opt"
 }
-"$@"
+
+main() {
+    local cmd="${1:-default}"
+    if [ "$#" -gt 0 ]; then
+        shift
+    fi
+
+    case "$cmd" in
+        -h|--help|help)
+            help
+            ;;
+        default|rust|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|jni|dmesh_java|arm_release|erofs|vm|profile|build)
+            "$cmd" "$@"
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            echo >&2
+            help >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

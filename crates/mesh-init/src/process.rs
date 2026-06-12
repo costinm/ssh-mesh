@@ -148,14 +148,16 @@ pub fn spawn_process(
         }
     }
 
+    let mut _passed_fd_keepalive = None;
+
     match passed_fd {
         Some(ActivationFd::Stdio(fd)) => {
             // inetd-style: map client socket to stdin/stdout/stderr
             let stdout_fd = fd.try_clone().map_err(ProcessError::Io)?;
-            //let stderr_fd = fd.try_clone().map_err(ProcessError::Io)?;
+            let stderr_fd = fd.try_clone().map_err(ProcessError::Io)?;
             cmd.stdin(std::process::Stdio::from(fd));
             cmd.stdout(std::process::Stdio::from(stdout_fd));
-            //cmd.stderr(std::process::Stdio::from(stderr_fd));
+            cmd.stderr(std::process::Stdio::from(stderr_fd));
         }
         Some(ActivationFd::Pty(fd)) => {
             use std::os::fd::AsRawFd;
@@ -168,6 +170,7 @@ pub fn spawn_process(
             cmd.stdin(std::process::Stdio::from(stdin_fd));
             cmd.stdout(std::process::Stdio::from(stdout_fd));
             cmd.stderr(std::process::Stdio::from(stderr_fd));
+            _passed_fd_keepalive = Some(fd);
 
             // SAFETY: pre_exec runs in the child after fork and before exec.
             // It only calls async-signal-safe libc operations.

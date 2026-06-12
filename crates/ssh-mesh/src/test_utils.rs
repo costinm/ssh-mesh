@@ -29,12 +29,18 @@ pub struct TestSetup {
     pub base_dir: PathBuf,
     pub ssh_port: u16,
     pub http_port: Option<u16>,
+
+    pub mock_mesh_init_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl TestSetup {
     pub fn abort_server(&self) {
         let handle = self.mesh_node.server_handle.lock().unwrap();
         if let Some(ref h) = *handle {
+            h.abort();
+        }
+        let mock_handle = self.mock_mesh_init_handle.lock().unwrap();
+        if let Some(ref h) = *mock_handle {
             h.abort();
         }
     }
@@ -53,6 +59,10 @@ pub async fn setup_test_environment(
     let td = tempfile::Builder::new().prefix("ssh-mesh-test").tempdir()?;
     let path = td.path().to_path_buf();
     let (temp_dir, base_dir) = (Some(td), path);
+
+    // Start mock mesh-init server
+    let socket_path = base_dir.join("mesh-init-control.sock");
+    let mock_mesh_init_handle = start_mock_mesh_init(socket_path, base_dir.clone());
 
     let client_key_path = base_dir.join("id_ecdsa");
 
@@ -156,5 +166,121 @@ pub async fn setup_test_environment(
         ssh_port,
         http_port,
         mesh_node,
+        mock_mesh_init_handle: std::sync::Mutex::new(Some(mock_mesh_init_handle)),
+    })
+}
+
+pub fn start_mock_mesh_init(socket_path: PathBuf, base_dir: PathBuf) -> tokio::task::JoinHandle<()> {
+    // 1. Create a home directory for the test users
+    let _ = std::fs::create_dir_all(base_dir.join("alice"));
+    let _ = std::fs::create_dir_all(base_dir.join("testuser"));
+    let _ = std::fs::create_dir_all(base_dir.join("system"));
+
+    // 2. Set environment variables
+    unsafe {
+        std::env::set_var("SSH_MESH_HOME_ROOT", base_dir.to_str().unwrap());
+        std::env::set_var("MESH_INIT_SOCK", socket_path.to_str().unwrap());
+    }
+
+    // 3. Remove any stale UDS socket
+    let _ = std::fs::remove_file(&socket_path);
+
+    tokio::spawn(async move {
+        let listener = match tokio::net::UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Mock mesh-init failed to bind: {}", e);
+                return;
+            }
+        };
+
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // Read the JSON request line
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(&mut stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.is_err() {
+                    return;
+                }
+
+                // Parse the request
+                let val: serde_json::Value = serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                let command_opt = val.get("command").and_then(|c| c.as_str()).map(|s| s.to_string());
+
+                // Receive the file descriptor
+                let mut std_stream = match stream.into_std() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                if std_stream.set_nonblocking(false).is_err() {
+                    return;
+                }
+
+                use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
+                use nix::cmsg_space;
+                use std::io::IoSliceMut;
+                use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+                let mut buf = [0u8; 1];
+                let mut iov = [IoSliceMut::new(&mut buf)];
+                let mut cmsgspace = cmsg_space!([std::os::fd::RawFd; 1]);
+                let msg = match recvmsg::<()>(
+                    std_stream.as_raw_fd(),
+                    &mut iov,
+                    Some(&mut cmsgspace),
+                    MsgFlags::empty(),
+                ) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+
+                let mut passed_fd = None;
+                for cmsg in msg.cmsgs().unwrap() {
+                    if let ControlMessageOwned::ScmRights(fds) = cmsg {
+                        if let Some(fd) = fds.first() {
+                            passed_fd = Some(unsafe { OwnedFd::from_raw_fd(*fd) });
+                        }
+                    }
+                }
+
+                let fd = match passed_fd {
+                    Some(f) => f,
+                    None => return,
+                };
+
+                // Spawn the command
+                let cmd_str = command_opt.unwrap_or_else(|| "printf ok".to_string());
+
+                let mut child = match std::process::Command::new("/bin/sh")
+                    .args(&["-c", &cmd_str])
+                    .stdin(std::process::Stdio::from(fd.try_clone().unwrap()))
+                    .stdout(std::process::Stdio::from(fd.try_clone().unwrap()))
+                    .stderr(std::process::Stdio::from(fd))
+                    .spawn() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+
+                let pid = child.id();
+
+                let response = serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "pid": pid,
+                        "terminal_id": "term-0"
+                    }
+                });
+
+                let response_str = format!("{}\n", response.to_string());
+                use std::io::Write;
+                let _ = std_stream.write_all(response_str.as_bytes());
+                let _ = std_stream.flush();
+
+                tokio::task::spawn_blocking(move || {
+                    let _ = child.wait();
+                });
+            });
+        }
     })
 }

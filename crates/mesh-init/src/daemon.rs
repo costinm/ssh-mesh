@@ -4,8 +4,11 @@
 //! handles control requests, manages signal handling and zombie reaping.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::Result;
 
@@ -48,7 +51,15 @@ pub struct Daemon {
     pub configs: Arc<Mutex<HashMap<String, AppConfig>>>,
     /// Context prepared by a control request for a later socket activation.
     pub pending_activation_contexts: Arc<Mutex<HashMap<String, VecDeque<ActivationContext>>>>,
+    terminal_sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
+    next_terminal_id: AtomicU64,
     resource_manager: Option<ResourceManager>,
+}
+
+struct TerminalSession {
+    name: String,
+    pid: u32,
+    pty_fd: Option<OwnedFd>,
 }
 
 fn apply_activation_context_env(config: &mut AppConfig, context: Option<ActivationContext>) {
@@ -68,6 +79,8 @@ impl Daemon {
             services,
             configs: Arc::new(Mutex::new(HashMap::new())),
             pending_activation_contexts: Arc::new(Mutex::new(HashMap::new())),
+            terminal_sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_terminal_id: AtomicU64::new(1),
             resource_manager,
         })
     }
@@ -142,7 +155,7 @@ impl Daemon {
     }
 
     /// Spawn the child process manager (zombie reaper + restart loop).
-    fn start_child_manager(self: &Arc<Self>) {
+    pub fn start_child_manager(self: &Arc<Self>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         process::start_child_reaper(tx);
 
@@ -177,6 +190,24 @@ impl Daemon {
             Request::StartTerminal { .. } => {
                 Response::err("start_terminal requires a passed file descriptor")
             }
+            Request::TerminalResize {
+                terminal_id,
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            } => self.handle_terminal_resize(
+                &terminal_id,
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            ),
+            Request::TerminalCommand {
+                terminal_id,
+                command,
+                data,
+            } => self.handle_terminal_command(&terminal_id, &command, data),
             Request::Stop { name, signal } => self.handle_stop(&name, signal).await,
             Request::Freeze { name } => self.handle_freeze(&name),
             Request::Unfreeze { name } => self.handle_unfreeze(&name),
@@ -206,7 +237,8 @@ impl Daemon {
                 pty,
                 env,
                 context,
-            } => self.handle_start_terminal(&name, &home, uid, gid, pty, env, context, fd),
+                command,
+            } => self.handle_start_terminal(&name, &home, uid, gid, pty, env, context, command, fd),
             _ => Response::err("request does not accept a passed file descriptor"),
         }
     }
@@ -344,6 +376,7 @@ impl Daemon {
         pty: bool,
         extra_env: HashMap<String, String>,
         context: Option<ActivationContext>,
+        command: Option<String>,
         fd: OwnedFd,
     ) -> Response {
         let home_path = std::path::Path::new(home);
@@ -416,15 +449,126 @@ impl Daemon {
         config.env.extend(extra_env);
         apply_activation_context_env(&mut config, context);
 
+        if let Some(command) = command {
+            config.command = preferred_shell().to_string();
+            config.args = vec!["-c".to_string(), command];
+            config.oneshot = true;
+        }
+
         let cg =
             crate::cgroup::create_cgroup(name).unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
+        let retained_pty = if pty {
+            match fd.try_clone() {
+                Ok(fd) => Some(fd),
+                Err(e) => return Response::err(format!("failed to retain PTY fd: {}", e)),
+            }
+        } else {
+            None
+        };
         let activation_fd = if pty {
             process::ActivationFd::Pty(fd)
         } else {
             process::ActivationFd::Stdio(fd)
         };
+
         match process::spawn_process(&config, &cg, Some(activation_fd)) {
-            Ok(pid) => Response::ok_with_data(serde_json::json!({"pid": pid})),
+            Ok(pid) => {
+                let terminal_id = format!(
+                    "term-{}",
+                    self.next_terminal_id.fetch_add(1, Ordering::Relaxed)
+                );
+                self.terminal_sessions.lock().insert(
+                    terminal_id.clone(),
+                    TerminalSession {
+                        name: name.to_string(),
+                        pid,
+                        pty_fd: retained_pty,
+                    },
+                );
+                Response::ok_with_data(serde_json::json!({
+                    "pid": pid,
+                    "terminal_id": terminal_id
+                }))
+            }
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn handle_terminal_resize(
+        &self,
+        terminal_id: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+    ) -> Response {
+        let terminals = self.terminal_sessions.lock();
+        let Some(session) = terminals.get(terminal_id) else {
+            return Response::err(format!("terminal session '{}' not found", terminal_id));
+        };
+        let Some(fd) = session.pty_fd.as_ref() else {
+            return Response::err(format!("terminal session '{}' has no PTY", terminal_id));
+        };
+
+        let mut winsize = libc::winsize {
+            ws_row: row_height as u16,
+            ws_col: col_width as u16,
+            ws_xpixel: pix_width as u16,
+            ws_ypixel: pix_height as u16,
+        };
+        let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &mut winsize) };
+        if rc < 0 {
+            return Response::err(format!(
+                "failed to resize terminal '{}': {}",
+                terminal_id,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Response::ok_with_data(serde_json::json!({"terminal_id": terminal_id}))
+    }
+
+    fn handle_terminal_command(
+        &self,
+        terminal_id: &str,
+        command: &str,
+        data: serde_json::Value,
+    ) -> Response {
+        let signal = match command {
+            "close" | "hup" => Some(libc::SIGHUP),
+            "signal" => data
+                .get("signal")
+                .and_then(serde_json::Value::as_i64)
+                .map(|signal| signal as i32),
+            _ => {
+                return Response::err(format!(
+                    "unsupported terminal command '{}' for '{}'",
+                    command, terminal_id
+                ));
+            }
+        };
+
+        let Some(signal) = signal else {
+            return Response::err(format!(
+                "terminal command '{}' for '{}' requires a signal",
+                command, terminal_id
+            ));
+        };
+
+        let pid = {
+            let terminals = self.terminal_sessions.lock();
+            let Some(session) = terminals.get(terminal_id) else {
+                return Response::err(format!("terminal session '{}' not found", terminal_id));
+            };
+            session.pid
+        };
+
+        match process::send_signal(pid, signal) {
+            Ok(()) => Response::ok_with_data(serde_json::json!({
+                "terminal_id": terminal_id,
+                "pid": pid,
+                "signal": signal
+            })),
             Err(e) => Response::err(e.to_string()),
         }
     }
@@ -596,6 +740,35 @@ impl Daemon {
     // ========================================================================
 
     fn handle_child_exit(&self, pid: u32, exit_code: i32) {
+        let removed_terminals: Vec<String> = {
+            let mut terminals = self.terminal_sessions.lock();
+            let ids: Vec<String> = terminals
+                .iter()
+                .filter_map(|(id, session)| {
+                    if session.pid == pid {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for id in &ids {
+                if let Some(session) = terminals.remove(id) {
+                    debug!(
+                        "Terminal session '{}' for '{}' exited with PID {}",
+                        id, session.name, pid
+                    );
+                }
+            }
+            ids
+        };
+        if !removed_terminals.is_empty() {
+            debug!(
+                "Removed terminal sessions for PID {}: {:?}",
+                pid, removed_terminals
+            );
+        }
+
         let mut services = self.services.lock();
         for (name, proc) in services.iter_mut() {
             if proc.pid == Some(pid) {
@@ -920,6 +1093,7 @@ priority = 300
                 ("USER".to_string(), "alice".to_string()),
             ]),
             context: None,
+            command: None,
         };
 
         let response = daemon
@@ -965,6 +1139,7 @@ priority = 300
             env: HashMap::new(),
             pty: false,
             context: None,
+            command: None,
         };
 
         let response = daemon

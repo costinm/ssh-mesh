@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use pmond::{proc_netlink, psi::PsiWatcher, ProcMon};
+use pmond::{ProcMon, proc_netlink, psi::PsiWatcher};
 
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use tracing::{debug, error, info};
 use tracing_subscriber::layer::SubscriberExt;
@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 uid: Some(uid),
                 ..Default::default()
             }],
+            ..Default::default()
         })
     } else {
         mesh::auth::AuthConfig::load_for_app("pmond")

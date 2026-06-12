@@ -8,7 +8,7 @@ if [ "${action}" != "start" ]; then
   exit 2
 fi
 
-export PATH=/out/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin
+export PATH=/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin
 node="${SSH_MESH_VM_NODE:-${initos_host:-app4-ch}}"
 case "${node}" in
   app2-qemu) app_home="${SSH_MESH_APP_HOME:-app2}" ;;
@@ -31,21 +31,8 @@ mkdir -p \
   "${home}/.run/mesh-init" \
   "${home}/.run/ssh-mesh/mux" \
   "${home}/.ssh" \
-  /out \
-  /out/ssh-mesh \
-  /out/ssh-mesh/bin \
   /tmp/mesh \
   /tmp/mesh/shared
-
-if [ -d /src/bin ]; then
-  if mount -o bind /src/bin /out/ssh-mesh/bin 2>/dev/null; then
-    log "bound /src/bin to /out/ssh-mesh/bin"
-  else
-    log "bind mount /src/bin failed; linking /out/ssh-mesh/bin to /src/bin"
-    rmdir /out/ssh-mesh/bin 2>/dev/null || true
-    ln -s /src/bin /out/ssh-mesh/bin
-  fi
-fi
 
 if [ -d /src/shared ]; then
   if mount -o bind /src/shared /tmp/mesh/shared 2>/dev/null; then
@@ -99,10 +86,11 @@ export HOME="${home}"
 export USER="${app_home}"
 export LOGNAME="${app_home}"
 export RUST_LOG="${RUST_LOG:-info}"
+export MESH_LOG_FILE="${MESH_LOG_FILE:-/dev/console}"
 export MESH_INIT_SOCK="${home}/.run/mesh-init/control.sock"
 export MESH_INIT_RUN="${home}/.run/mesh-init"
 export MESH_INIT_DIR="${home}/.config/mesh-init"
 export SSH_MESH_HOME_ROOT=/home
 
-log "starting mesh-init from $(command -v mesh-init)"
-exec mesh-init
+log "starting mesh-init from /opt/ssh-mesh/bin/mesh-init"
+exec /opt/ssh-mesh/bin/mesh-init

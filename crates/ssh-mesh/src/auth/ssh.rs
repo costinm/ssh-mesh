@@ -107,6 +107,16 @@ pub async fn validate_certificate(
     user: &str,
     ca_keys: &Arc<Vec<ssh_key::PublicKey>>,
 ) -> Result<SshAuthResult> {
+    validate_certificate_with_authz(cert_data, user, ca_keys, None).await
+}
+
+/// Validate a CA-signed certificate, with optional impersonation authorization.
+pub async fn validate_certificate_with_authz(
+    cert_data: &str,
+    user: &str,
+    ca_keys: &Arc<Vec<ssh_key::PublicKey>>,
+    authz: Option<&mesh::auth::AuthConfig>,
+) -> Result<SshAuthResult> {
     let cert = match ssh_key::Certificate::from_openssh(cert_data) {
         Ok(c) => c,
         Err(e) => {
@@ -134,8 +144,18 @@ pub async fn validate_certificate(
         .unwrap_or_default()
         .as_secs();
 
-    if !cert.valid_principals().contains(&user.to_string()) || cert.valid_principals().is_empty() {
-        warn!("Certificate not valid for user: {}", user);
+    let valid_principals: Vec<String> = cert.valid_principals().iter().cloned().collect();
+    let authorized_principal = if valid_principals.iter().any(|principal| principal == user) {
+        Some(user)
+    } else {
+        authz.and_then(|authz| authz.authorized_impersonator(&valid_principals, user))
+    };
+
+    if authorized_principal.is_none() || valid_principals.is_empty() {
+        warn!(
+            "Certificate principals {:?} not authorized for user: {}",
+            valid_principals, user
+        );
         return Ok(SshAuthResult {
             status: server::Auth::Reject {
                 proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
@@ -148,6 +168,7 @@ pub async fn validate_certificate(
     }
 
     if cert.validate_at(now, fingerprints.iter()).is_ok() {
+        let authorized_principal = authorized_principal.unwrap_or(user);
         let mut opts = Vec::new();
         for (k, v) in cert.critical_options().iter() {
             if v.is_empty() {
@@ -173,7 +194,7 @@ pub async fn validate_certificate(
             status: server::Auth::Accept,
             comment: cert.key_id().to_string(),
             options,
-            user: user.to_string(),
+            user: authorized_principal.to_string(),
         });
     }
 
@@ -501,6 +522,56 @@ mod tests {
         assert!(matches!(res.status, server::Auth::Accept));
         assert_eq!(res.comment, "test-cert");
         assert!(res.options.as_ref().unwrap().contains("force-command=ls"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_certificate_with_impersonation() {
+        let ca_key =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let user_key =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rand::rng(),
+            user_key.public_key().key_data().clone(),
+            0,
+            2000000000 + 100000,
+        )
+        .unwrap();
+
+        builder
+            .cert_type(ssh_key::certificate::CertType::User)
+            .unwrap();
+        builder.valid_principal("root@example.m").unwrap();
+        builder.key_id("root-cert").unwrap();
+
+        let cert = builder.sign(&ca_key).unwrap();
+        let cert_openssh = cert.to_openssh().unwrap();
+        let ca_keys = Arc::new(vec![ca_key.public_key().clone()]);
+
+        let rejected = validate_certificate(&cert_openssh, "root@host3-vm.example.m", &ca_keys)
+            .await
+            .unwrap();
+        assert!(matches!(rejected.status, server::Auth::Reject { .. }));
+
+        let authz = mesh::auth::AuthConfig {
+            impersonation: vec![mesh::auth::ImpersonationRule {
+                from: "root@example.m".to_string(),
+                to: "*".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let accepted = validate_certificate_with_authz(
+            &cert_openssh,
+            "root@host3-vm.example.m",
+            &ca_keys,
+            Some(&authz),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(accepted.status, server::Auth::Accept));
+        assert_eq!(accepted.user, "root@example.m");
     }
 
     #[tokio::test]

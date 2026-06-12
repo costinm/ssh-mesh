@@ -7,7 +7,7 @@
 #   $HOME/.config/ssh-mesh/mesh.yaml
 #   $HOME/.run/ssh-mesh
 #
-# Fixed guest ports are forwarded by host3-vm/start.sh when QEMU user networking is
+# Fixed guest ports are forwarded by run-host3-vm when QEMU user networking is
 # used:
 #
 #   host 18322 -> guest 18322
@@ -16,6 +16,13 @@
 ssh_port: 18322
 http_port: 18380
 trusted_uds_path: /tmp/mesh/shared/host3-vm/trusted.sock
+
+auth:
+  impersonation:
+    - from: root@example.m
+      to: "*"
+    - from: host1
+      to: root@host3-vm.example.m
 
 ssh_routes:
   - name: app2-qemu
@@ -27,7 +34,7 @@ ssh_routes:
     activation_service: activate-app2-qemu
     client:
       transport: vsock
-      user: system
+      user: app2
       vsock_cid: 43
       vsock_port: 18522
       uds_path: /tmp/mesh/shared/app2-qemu/trusted.sock
@@ -41,7 +48,7 @@ ssh_routes:
     activation_service: activate-app3-crosvm
     client:
       transport: vsock
-      user: system
+      user: app3
       vsock_cid: 44
       vsock_port: 18522
       uds_path: /tmp/mesh/shared/app3-crosvm/trusted.sock
@@ -53,9 +60,12 @@ ssh_routes:
     target_host: 127.0.0.1
     target_port: 22
     activation_service: activate-app4-ch
+    activation_uds_path: /tmp/mesh/shared/app4-ch/trusted.sock
     client:
-      transport: vsock
-      user: system
-      vsock_cid: 45
+      transport: uds
+      user: app4
       vsock_port: 18522
-      uds_path: /tmp/mesh/shared/app4-ch/trusted.sock
+      uds_path: /src/app4-ch/vm/vsock.sock
+      line_handshake:
+        send: "connect {vsock_port}"
+        expect_prefix: "OK "

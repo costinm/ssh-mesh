@@ -2,26 +2,21 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_bin_dir="${root}/target/x86_64-unknown-linux-musl/release"
+artifact_dir="${root}/target/dist"
+example_bin_dir="${artifact_dir}/opt/ssh-mesh/bin"
 
 build_artifacts() {
   if [ "${SSH_MESH_TEST_REUSE_RESULTS:-0}" = "1" ] && \
-    [ -x "${root}/result-default/bin/ssh-mesh" ] && \
-    [ -f "${root}/result-default/img/ssh-mesh.erofs" ]; then
+    [ -x "${example_bin_dir}/ssh-mesh" ] && \
+    [ -x "${release_bin_dir}/ssh-mesh" ] && \
+    [ -f "${artifact_dir}/img/ssh-mesh.erofs" ]; then
     return
   fi
 
-  echo "Building Rust binaries with build.sh..."
-  rm -rf "${root}/result-default"
-  mkdir -p "${root}/result-default"
-  "${root}/scripts/build.sh" dist "${root}/result-default"
+  echo "Building Rust binaries and staging examples with build.sh..."
+  "${root}/scripts/build.sh"
 
-  echo "Building guest EROFS rootfs image..."
-  local busybox_path
-  busybox_path=$(command -v busybox || echo "/usr/bin/busybox")
-  if [ -f "${root}/target/nix/profiles/bin/busybox" ]; then
-    busybox_path="${root}/target/nix/profiles/bin/busybox"
-  fi
-  "${root}/scripts/build.sh" erofs "${root}/result-default" "${busybox_path}" "${root}/bin/initos-init-vm" "${root}/result-default/bin"
 }
 
 need() {
@@ -76,6 +71,23 @@ ssh_exec_ok() {
   )
 }
 
+ssh_shell_ok() {
+  local host="$1"
+  shift
+
+  (
+    cd "${root}/docs/examples"
+    local output
+    local status
+    set +e
+    output="$(printf 'printf "shell-"; printf "ok\\n"; exit\n' | timeout 15 ssh -tt -F ssh_config "$@" "${host}" 2>&1)"
+    status=$?
+    set -e
+    [ "${status}" -eq 0 ] || return "${status}"
+    printf '%s\n' "${output}" | grep -q "shell-ok"
+  )
+}
+
 port_free() {
   ! tcp_open "$1"
 }
@@ -103,10 +115,7 @@ trap cleanup EXIT
 
 build_artifacts
 
-export PATH="${root}/result-default/bin:${PATH}"
-export SSH_MESH_EXAMPLE_BIN_DIR="${root}/result-default/bin"
-export SSH_MESH_HOST3_VM_DIR="${root}/result-default"
-export SSH_MESH_APP_VM_DIR="${root}/result-default"
+export PATH="${example_bin_dir}:${PATH}"
 export SSH_MESH_HOST3_VM_ENABLE_VSOCK="${SSH_MESH_HOST3_VM_ENABLE_VSOCK:-0}"
 export SSH_MESH_HOST3_VM_QEMU_MEMORY="${SSH_MESH_HOST3_VM_QEMU_MEMORY:-768}"
 export SSH_MESH_HOST3_VM_QEMU_CPUS="${SSH_MESH_HOST3_VM_QEMU_CPUS:-1}"
@@ -135,7 +144,7 @@ fi
 state_root="$(mktemp -d -t ssh-mesh-examples.XXXXXX)"
 export SSH_MESH_EXAMPLE_ROOT="${state_root}"
 
-"${root}/docs/examples/start_all.sh" &
+"${root}/docs/examples/start_all.sh" "${state_root}" &
 suite_pid=$!
 
 wait_for "host2 HTTP admin" 60 http_ok "http://127.0.0.1:18280/_m/api/ssh/clients"
@@ -146,6 +155,26 @@ wait_for "host3-vm /nix over SSH" 60 ssh_exec_ok \
   host3-vm-direct \
   "test -d /nix && test -e /nix/store" \
   -p "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}"
+wait_for "host2 routed SSH exec" 60 ssh_exec_ok \
+  host2 \
+  "echo host2-routed-ok"
+wait_for "host3-vm routed SSH exec" 60 ssh_exec_ok \
+  host3-vm \
+  "echo host3-routed-ok"
+wait_for "host3-vm routed root SSH exec" 60 ssh_exec_ok \
+  host3-vm-root \
+  "test \"$(id -u)\" = 0 && echo host3-root-routed-ok"
+wait_for "host3-vm direct root SSH exec" 60 ssh_exec_ok \
+  host3-vm-root-direct \
+  "test \"$(id -u)\" = 0 && echo host3-root-direct-ok" \
+  -p "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}"
+wait_for "host1 SSH shell" 30 ssh_shell_ok host1
+wait_for "host2 routed SSH shell" 60 ssh_shell_ok host2
+wait_for "host3-vm routed SSH shell" 60 ssh_shell_ok host3-vm
+wait_for "app1-bwrap routed SSH exec" 60 ssh_exec_ok \
+  app1-bwrap \
+  "echo app1-routed-ok"
+wait_for "app1-bwrap routed SSH shell" 60 ssh_shell_ok app1-bwrap
 
 wait_for "host3-vm trusted UDS" 60 test -S "${state_root}/shared/host3-vm/trusted.sock"
 wait_for "host1 trusted UDS" 30 test -S "${state_root}/shared/host1/trusted.sock"

@@ -2626,6 +2626,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "log",
+ "nix 0.29.0",
  "notify",
  "schemars 0.8.22",
  "serde",

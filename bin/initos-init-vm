@@ -7,6 +7,7 @@ initos_dbg=${initos_dbg:-0}
 initos_data=${initos_data:-}
 initos_cache=${initos_cache:-}
 initos_root=${initos_root:-}
+initos_modules=${initos_modules:-}
 initos_host=${initos_host:-initos-vm}
 initos_ip=${initos_ip:-}
 initos_gw=${initos_gw:-}
@@ -21,6 +22,19 @@ if [ "${initos_dbg}" = 1 ]; then
 fi
 
 mount_disks() {
+  if [ -n "${initos_modules}" ]; then
+    mkdir -p /lib/modules 2>/dev/null || true
+    if ! mountpoint -q /lib/modules 2>/dev/null; then
+      mount -t tmpfs -o mode=0755 tmpfs /lib/modules 2>/dev/null || true
+    fi
+    mkdir -p /lib/modules/${ver}
+    if mount -t erofs -o ro ${initos_modules} /lib/modules/${ver}; then
+      echo "INITOS-VM: mounted modules ${initos_modules} on /lib/modules/${ver}"
+    else
+      echo "INITOS-VM: failed to mount modules ${initos_modules} on /lib/modules/${ver}"
+    fi
+  fi
+
   if [ -n "${initos_data}" ]; then 
     mount ${initos_data} /x || true
   fi
@@ -40,26 +54,53 @@ mount_disks() {
       mount ${initos_root} /sysroot
   fi
 
-	  for tag9p in /sys/bus/virtio/drivers/9pnet_virtio/virtio*/mount_tag; do
-	    if [ -f ${tag9p} ]; then
-	      echo "INITOS-VM: mounting 9p tag $(cat ${tag9p}) from ${tag9p}"
-      mkdir -p /src
-      if mount -t 9p -o trans=virtio,version=9p2000.L $(cat ${tag9p}) /src; then
-        echo "INITOS-VM: mounted 9p share on /src"
-        break
-      fi
-	      echo "INITOS-VM: failed to mount 9p tag $(cat ${tag9p})"
-	    fi
-	  done
+  for tag9p in /sys/bus/virtio/drivers/9pnet_virtio/virtio*/mount_tag; do
+    [ -f "${tag9p}" ] || continue
+    tag="$(cat "${tag9p}" 2>/dev/null || true)"
+    case "${tag}" in
+      src)
+        [ ! -d /src/initos ] || continue
+        echo "INITOS-VM: mounting 9p tag src from ${tag9p}"
+        mkdir -p /src
+        if mount -t 9p -o trans=virtio,version=9p2000.L src /src; then
+          echo "INITOS-VM: mounted 9p tag src on /src"
+        else
+          echo "INITOS-VM: failed to mount 9p tag src on /src; skipping"
+        fi
+        ;;
+      nix)
+        [ ! -e /nix/store ] || continue
+        echo "INITOS-VM: mounting 9p tag nix from ${tag9p}"
+        mkdir -p /nix
+        if mount -t 9p -o trans=virtio,version=9p2000.L,ro nix /nix; then
+          echo "INITOS-VM: mounted 9p tag nix on /nix"
+        else
+          echo "INITOS-VM: failed to mount 9p tag nix on /nix; skipping"
+        fi
+        ;;
+      "")
+        ;;
+      *)
+        echo "INITOS-VM: skipping unrecognized 9p tag ${tag}"
+        ;;
+    esac
+  done
 
-	  if [ ! -d /src/initos ]; then
-	    mkdir -p /src
-	    if mount -t virtiofs src /src 2>/dev/null; then
-	      echo "INITOS-VM: mounted virtiofs tag src on /src"
-	    fi
-	  fi
+  if [ ! -d /src/initos ]; then
+    mkdir -p /src
+    if mount -t virtiofs src /src 2>/dev/null; then
+      echo "INITOS-VM: mounted virtiofs tag src on /src"
+    fi
+  fi
 
-	  #local tagvfs=/sys/fs/virtiofs
+  if [ ! -e /nix/store ]; then
+    mkdir -p /nix
+    if mount -t virtiofs nix /nix 2>/dev/null; then
+      echo "INITOS-VM: mounted virtiofs tag nix on /nix"
+    fi
+  fi
+
+  #local tagvfs=/sys/fs/virtiofs
   # TODO: find directory, read tag
   # mount -t virtiofs $TAG /mnt
 

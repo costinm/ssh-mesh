@@ -27,7 +27,7 @@ cpu_weight = 100
 [environment]
 # Include the expected install location first, while still allowing a host1's
 # normal PATH to provide the binaries.
-PATH = "/out/ssh-mesh/bin:/opt/ssh-mesh/bin:/opt/busybox/bin"
+PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin"
 RUST_LOG = "info"
 
 # Fixed and unique TCP listeners for the example mesh. These are env vars

@@ -167,35 +167,22 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
 
     let daemon = Daemon::new(config);
 
-    // Start all background tasks: load configs, start init-* services,
-    // start regular services/activation listeners, resource manager, child reaper.
-    daemon.start_background_tasks();
-
-    // Start job scheduler
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let jobs_dir = format!("{}/.config/mesh-init/jobs", home);
-    let executor = std::sync::Arc::new(mesh::jobs::executor::MeshInitExecutor::new(socket_path));
-    let scheduler =
-        std::sync::Arc::new(mesh::jobs::scheduler::JobScheduler::new(jobs_dir, executor));
-
-    let sched_clone = scheduler.clone();
-    tokio::spawn(async move {
-        if let Err(e) = sched_clone.check_jobs().await {
-            tracing::error!("JobScheduler failed to check jobs: {}", e);
-        }
-    });
-
     if let Some(command) = command {
-        // Execution mode: start the CLI command, run control server in background, exit when done.
-        let server = mesh_init::server::ControlServer::new(
-            daemon.config.socket_path.clone(),
-            daemon.clone(),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = server.run().await {
-                tracing::error!("Control server error: {}", e);
+        // Execution mode: run only the requested command. Do not autostart
+        // configured services or bind the daemon control socket; doing so can
+        // steal the real daemon's socket when mesh-init is used as a shell.
+        {
+            let dirs: Vec<&str> = daemon.config.config_dirs.iter().map(|s| s.as_str()).collect();
+            let loaded_configs = mesh_init::config::load_system_configs(&dirs);
+            if let Some(default_cfg) = loaded_configs.into_iter().find(|cfg| cfg.name == "default")
+            {
+                daemon
+                    .configs
+                    .lock()
+                    .insert("default".to_string(), default_cfg);
             }
-        });
+        }
+        daemon.start_child_manager();
 
         let app_name = "cmd";
         let cmd = command[0].clone();
@@ -236,6 +223,25 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
 
         daemon.shutdown().await;
     } else {
+        // Start all background tasks: load configs, start init-* services,
+        // start regular services/activation listeners, resource manager, child reaper.
+        daemon.start_background_tasks();
+
+        // Start job scheduler
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let jobs_dir = format!("{}/.config/mesh-init/jobs", home);
+        let executor =
+            std::sync::Arc::new(mesh::jobs::executor::MeshInitExecutor::new(socket_path));
+        let scheduler =
+            std::sync::Arc::new(mesh::jobs::scheduler::JobScheduler::new(jobs_dir, executor));
+
+        let sched_clone = scheduler.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sched_clone.check_jobs().await {
+                tracing::error!("JobScheduler failed to check jobs: {}", e);
+            }
+        });
+
         // Daemon mode: run the control server in the foreground (blocks until shutdown).
         let server = mesh_init::server::ControlServer::new(
             daemon.config.socket_path.clone(),

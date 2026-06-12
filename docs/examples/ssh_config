@@ -41,6 +41,13 @@ Host host3-vm-direct
   IdentityFile host3-vm/home/system/.ssh/id_ecdsa
   CertificateFile host3-vm/home/system/.ssh/id_ecdsa-user-cert.pub
 
+Host host3-vm-root-direct
+  HostName 127.0.0.1
+  Port 18322
+  User root
+  IdentityFile root/home/root/.ssh/id_ecdsa
+  CertificateFile root/home/root/.ssh/id_ecdsa-user-cert.pub
+
 # Routed through host1's user-facing SSH port.
 Host host2
   HostName 127.0.0.1
@@ -55,6 +62,13 @@ Host host3-vm
   User system@host3-vm.example.m
   IdentityFile host1/home/system/.ssh/id_ecdsa
   CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host host3-vm-root
+  HostName 127.0.0.1
+  Port 18422
+  User root@host3-vm.example.m
+  IdentityFile root/home/root/.ssh/id_ecdsa
+  CertificateFile root/home/root/.ssh/id_ecdsa-user-cert.pub
 
 Host app1-bwrap
   HostName 127.0.0.1

@@ -27,7 +27,7 @@ cpu_weight = 100
 [environment]
 # Include the expected install location first, while still allowing a host1's
 # normal PATH to provide the binaries.
-PATH = "/out/ssh-mesh/bin:/opt/ssh-mesh/bin:/opt/busybox/bin"
+PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin"
 RUST_LOG = "info"
 
 # Fixed and unique TCP listeners for the example mesh. These are env vars
@@ -38,13 +38,13 @@ HTTP_PORT = "18580"
 
 # Enable OpenSSH ControlMaster-compatible mux sockets for maintained client
 # connections. sshmc can use these sockets from inside the node.
-MUX_DIR = "/home/app-bwrap/.run/ssh-mesh/mux"
+MUX_DIR = "/home/app1/.run/ssh-mesh/mux"
 
 # App-bwrap runs as uid 0 inside the bwrap host1 namespace. ssh-mesh's root default
 # for mesh-init is /run/mesh-init/control.sock, while this example intentionally
 # keeps mesh-init in the HOME-relative host1 layout, so this one override is
 # needed.
-MESH_INIT_SOCK = "/home/app-bwrap/.run/mesh-init/control.sock"
+MESH_INIT_SOCK = "/home/app1/.run/mesh-init/control.sock"
 
 # Terminal/host1 examples check /home/USER. Inside the sandbox /home is private
 # example state, not the host /home.

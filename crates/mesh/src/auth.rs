@@ -26,6 +26,9 @@ pub struct AuthConfig {
     /// Authorized peer entries.
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+    /// Explicit identity impersonation rules.
+    #[serde(default, rename = "impersonation")]
+    pub impersonation: Vec<ImpersonationRule>,
 }
 
 /// A single `[[peer]]` entry in the auth config.
@@ -44,6 +47,17 @@ pub struct PeerConfig {
     /// Delegation pattern. If set, this peer can assert identities
     /// matching the pattern. Examples: `*`, `*.mesh.local`.
     pub delegate: Option<String>,
+}
+
+/// A single identity impersonation rule.
+///
+/// `from` is an authenticated identity, such as a certificate principal.
+/// `to` is the requested identity that `from` may act as. Both fields accept
+/// exact values and the same wildcard style used by delegate patterns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ImpersonationRule {
+    pub from: String,
+    pub to: String,
 }
 
 // ============================================================================
@@ -182,6 +196,30 @@ impl AuthConfig {
         Ok(())
     }
 
+    /// Check whether authenticated identity `from` may act as requested
+    /// identity `to`.
+    pub fn can_impersonate(&self, from: &str, to: &str) -> bool {
+        if from == to {
+            return true;
+        }
+
+        self.impersonation.iter().any(|rule| {
+            matches_identity_pattern(&rule.from, from) && matches_identity_pattern(&rule.to, to)
+        })
+    }
+
+    /// Return the first candidate identity allowed to act as `to`.
+    pub fn authorized_impersonator<'a>(
+        &self,
+        candidates: &'a [String],
+        to: &str,
+    ) -> Option<&'a str> {
+        candidates
+            .iter()
+            .find(|candidate| self.can_impersonate(candidate, to))
+            .map(String::as_str)
+    }
+
     /// Load an `AuthConfig` from a TOML file.
     pub fn load(path: &std::path::Path) -> Result<Self, crate::config::ConfigError> {
         let content = std::fs::read_to_string(path)?;
@@ -233,6 +271,29 @@ pub fn matches_delegate_pattern(pattern: &str, value: &str) -> bool {
     }
 }
 
+/// Check if an identity value matches an authorization pattern.
+///
+/// In addition to `matches_delegate_pattern`, this understands email/login
+/// domain patterns:
+/// - `*@example.com` matches `alice@example.com`
+/// - `*.example.com` also matches the domain side of `alice@example.com`
+pub fn matches_identity_pattern(pattern: &str, value: &str) -> bool {
+    if matches_delegate_pattern(pattern, value) {
+        return true;
+    }
+
+    if let Some(domain) = value.rsplit_once('@').map(|(_, domain)| domain) {
+        if let Some(pattern_domain) = pattern.strip_prefix("*@") {
+            return matches_delegate_pattern(pattern_domain, domain);
+        }
+        if pattern.starts_with("*.") {
+            return matches_delegate_pattern(pattern, domain);
+        }
+    }
+
+    false
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -267,6 +328,16 @@ mod tests {
                 PeerConfig {
                     email: Some("bob@example.com".to_string()),
                     ..Default::default()
+                },
+            ],
+            impersonation: vec![
+                ImpersonationRule {
+                    from: "root@example.com".to_string(),
+                    to: "*".to_string(),
+                },
+                ImpersonationRule {
+                    from: "gateway.mesh.local".to_string(),
+                    to: "*.mesh.local".to_string(),
                 },
             ],
         }
@@ -362,6 +433,7 @@ mod tests {
                 uid: Some(1000),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let identity = PeerIdentity {
             id: Some("anything.example.com".to_string()),
@@ -485,6 +557,39 @@ mod tests {
     }
 
     // ========================================================================
+    // impersonation
+    // ========================================================================
+
+    #[test]
+    fn test_auth_impersonation_exact_source_wildcard_target() {
+        let config = sample_config();
+        assert!(config.can_impersonate("root@example.com", "root@host3-vm.example.m"));
+        assert!(config.can_impersonate("root@example.com", "system"));
+        assert!(!config.can_impersonate("alice@example.com", "root@host3-vm.example.m"));
+    }
+
+    #[test]
+    fn test_auth_impersonation_email_domain_target() {
+        let config = sample_config();
+        assert!(config.can_impersonate("gateway.mesh.local", "root@mesh.local"));
+        assert!(config.can_impersonate("gateway.mesh.local", "root@node.mesh.local"));
+        assert!(!config.can_impersonate("gateway.mesh.local", "root@example.com"));
+    }
+
+    #[test]
+    fn test_auth_authorized_impersonator() {
+        let config = sample_config();
+        let candidates = vec![
+            "alice@example.com".to_string(),
+            "root@example.com".to_string(),
+        ];
+        assert_eq!(
+            config.authorized_impersonator(&candidates, "root@host3-vm.example.m"),
+            Some("root@example.com")
+        );
+    }
+
+    // ========================================================================
     // matches_delegate_pattern
     // ========================================================================
 
@@ -518,6 +623,19 @@ mod tests {
         assert!(!matches_delegate_pattern("exact.host", "sub.exact.host"));
     }
 
+    #[test]
+    fn test_auth_identity_pattern_email_domain() {
+        assert!(matches_identity_pattern(
+            "*@example.com",
+            "root@example.com"
+        ));
+        assert!(matches_identity_pattern(
+            "*.example.com",
+            "root@host.example.com"
+        ));
+        assert!(!matches_identity_pattern("*@example.com", "root@evil.com"));
+    }
+
     // ========================================================================
     // TOML Parsing
     // ========================================================================
@@ -538,6 +656,10 @@ id = "worker-1.mesh.local"
 
 [[peer]]
 email = "bob@example.com"
+
+[[impersonation]]
+from = "root@example.com"
+to = "*"
 "#;
         let config: AuthConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.peers.len(), 4);
@@ -545,6 +667,8 @@ email = "bob@example.com"
         assert_eq!(config.peers[1].delegate.as_deref(), Some("*.mesh.local"));
         assert_eq!(config.peers[2].id.as_deref(), Some("worker-1.mesh.local"));
         assert_eq!(config.peers[3].email.as_deref(), Some("bob@example.com"));
+        assert_eq!(config.impersonation.len(), 1);
+        assert_eq!(config.impersonation[0].from.as_str(), "root@example.com");
     }
 
     #[test]

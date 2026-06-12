@@ -153,6 +153,10 @@ uid = 1000
 [[peer]]
 uid = 1001
 delegate = "*.mesh.local"
+
+[[impersonation]]
+from = "root@example.m"
+to = "*"
 "#;
         let config = parse_toml(toml).unwrap();
         assert_eq!(config.name, "auth-svc");
@@ -161,6 +165,8 @@ delegate = "*.mesh.local"
         assert_eq!(auth.peers[0].uid, Some(1000));
         assert_eq!(auth.peers[1].uid, Some(1001));
         assert_eq!(auth.peers[1].delegate.as_deref(), Some("*.mesh.local"));
+        assert_eq!(auth.impersonation.len(), 1);
+        assert!(auth.can_impersonate("root@example.m", "root@host3-vm.example.m"));
     }
 
     #[test]

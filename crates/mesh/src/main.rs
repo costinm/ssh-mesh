@@ -4,8 +4,11 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::IoSlice;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use mesh::protocol::{Request, Response};
@@ -47,6 +50,37 @@ enum Command {
     Shutdown,
     /// Reload configurations.
     Reload,
+    /// Start a mesh-init terminal/stdio session and bridge it to this process.
+    Terminal {
+        name: String,
+        #[clap(long)]
+        home: String,
+        #[clap(long)]
+        uid: u32,
+        #[clap(long)]
+        gid: Option<u32>,
+        #[clap(long)]
+        pty: bool,
+        #[clap(long)]
+        command: Option<String>,
+    },
+    /// Resize an active terminal session.
+    TerminalResize {
+        terminal_id: String,
+        cols: u32,
+        rows: u32,
+        #[clap(long, default_value_t = 0)]
+        pix_width: u32,
+        #[clap(long, default_value_t = 0)]
+        pix_height: u32,
+    },
+    /// Send a control command to an active terminal session.
+    TerminalCommand {
+        terminal_id: String,
+        command: String,
+        #[clap(long)]
+        data: Option<String>,
+    },
     /// Send a raw JSON request.
     Raw {
         method: String,
@@ -73,6 +107,52 @@ async fn main() -> Result<()> {
         Command::Status { name } => Request::Status { name },
         Command::Shutdown => Request::Shutdown,
         Command::Reload => Request::Reload,
+        Command::Terminal {
+            name,
+            home,
+            uid,
+            gid,
+            pty,
+            command,
+        } => {
+            let request = Request::StartTerminal {
+                name,
+                home,
+                uid,
+                gid,
+                pty,
+                env: HashMap::new(),
+                context: None,
+                command,
+            };
+            send_terminal_request(&socket_path, &request, pty).await?;
+            return Ok(());
+        }
+        Command::TerminalResize {
+            terminal_id,
+            cols,
+            rows,
+            pix_width,
+            pix_height,
+        } => Request::TerminalResize {
+            terminal_id,
+            col_width: cols,
+            row_height: rows,
+            pix_width,
+            pix_height,
+        },
+        Command::TerminalCommand {
+            terminal_id,
+            command,
+            data,
+        } => Request::TerminalCommand {
+            terminal_id,
+            command,
+            data: match data {
+                Some(data) => serde_json::from_str(&data)?,
+                None => json!({}),
+            },
+        },
         Command::Raw { method, params } => {
             // Very basic raw command construction
             let mut map = serde_json::Map::new();
@@ -86,6 +166,12 @@ async fn main() -> Result<()> {
 
     let response = send_request(&socket_path, &request).await?;
 
+    print_response(&response)?;
+
+    Ok(())
+}
+
+fn print_response(response: &Response) -> Result<()> {
     if response.success {
         if let Some(data) = &response.data {
             println!("{}", serde_json::to_string_pretty(data)?);
@@ -99,7 +185,6 @@ async fn main() -> Result<()> {
         );
         std::process::exit(1);
     }
-
     Ok(())
 }
 
@@ -141,4 +226,83 @@ async fn send_request(socket_path: &str, request: &Request) -> Result<Response> 
     let response: Response = serde_json::from_str(line.trim())
         .with_context(|| format!("failed to parse response: {}", line))?;
     Ok(response)
+}
+
+async fn send_terminal_request(socket_path: &str, request: &Request, pty: bool) -> Result<Response> {
+    let (passed_fd, mut stream): (OwnedFd, Box<dyn AsyncDuplex>) = if pty {
+        let (master, slave) = open_pty_pair()?;
+        let master_file = std::fs::File::from(master);
+        (slave, Box::new(tokio::fs::File::from_std(master_file)))
+    } else {
+        let (child_end, parent_end) = std::os::unix::net::UnixStream::pair()?;
+        parent_end.set_nonblocking(true)?;
+        (
+            child_end.into(),
+            Box::new(tokio::net::UnixStream::from_std(parent_end)?),
+        )
+    };
+
+    let response = send_request_with_fd(socket_path, request, &passed_fd)?;
+    print_response(&response)?;
+    if response.success {
+        let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+        let _ = tokio::io::copy_bidirectional(&mut stdio, &mut stream).await;
+    }
+    Ok(response)
+}
+
+trait AsyncDuplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T> AsyncDuplex for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+fn send_request_with_fd(socket_path: &str, request: &Request, fd: &OwnedFd) -> Result<Response> {
+    use std::io::{Read, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect to UDS at {}", socket_path))?;
+    let request_json = serde_json::to_string(request)?;
+    stream.write_all(request_json.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let iov = [IoSlice::new(b"F")];
+    let fds = [fd.as_raw_fd()];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
+    sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)?;
+
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            break;
+        }
+        response.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    anyhow::ensure!(!response.is_empty(), "empty response from server");
+    let response = String::from_utf8(response)?;
+    Ok(serde_json::from_str(response.trim())?)
+}
+
+fn open_pty_pair() -> Result<(OwnedFd, OwnedFd)> {
+    let mut master = -1;
+    let mut slave = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if rc < 0 {
+        anyhow::bail!("openpty failed: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: openpty returned owned file descriptors on success.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    Ok((master, slave))
 }

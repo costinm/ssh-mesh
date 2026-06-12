@@ -6,13 +6,9 @@
 # stdin/stdout. Inside app1-bwrap, ssh-mesh runs with SSH_MESH_TRUSTED_STDIO=1
 # and has no network namespace access.
 #
-# This is the current config-level primitive. Username-triggered activation
-# such as system@app1-bwrap.example.m needs a small ssh-mesh routing feature
-# that maps the requested SSH username/host to this activation socket.
-
 [service]
 name = "activate-app1-bwrap"
-command = "/tmp/mesh/state/host1/home/app1-bwrap/start.sh"
+command = "/opt/ssh-mesh/bin/run_bwrap.sh"
 args = ["--stdio"]
 priority = 220
 oneshot = true
@@ -29,3 +25,6 @@ cpu_weight = 50
 [environment]
 RUST_LOG = "info"
 SSH_MESH_EXAMPLE_ROOT = "/tmp/mesh/state"
+SSH_MESH_APP_NAME = "app1-bwrap"
+SSH_MESH_APP_HOME = "app1"
+SSH_MESH_APP_TEMPLATE_DIR = "/tmp/mesh/state/host1/home/app1-bwrap"

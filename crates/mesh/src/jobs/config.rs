@@ -81,6 +81,11 @@ impl JobConfig {
                 .as_ref()
                 .map(|a| a.peers.clone())
                 .unwrap_or_default(),
+            impersonation: self
+                .auth
+                .as_ref()
+                .map(|a| a.impersonation.clone())
+                .unwrap_or_default(),
         };
 
         let content = toml::to_string_pretty(&file)?;

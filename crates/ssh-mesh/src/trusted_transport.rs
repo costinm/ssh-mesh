@@ -8,7 +8,7 @@ use russh::client;
 use russh::{ChannelMsg, Disconnect};
 #[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
 
@@ -121,6 +121,117 @@ pub async fn connect_trusted_uds(socket_path: impl AsRef<Path>) -> Result<UnixSt
         .with_context(|| format!("connect trusted SSH UDS {}", socket_path.as_ref().display()))
 }
 
+pub fn render_client_line_handshake(
+    template: &str,
+    cfg: &crate::SshClientConfig,
+    user: &str,
+    port: u16,
+) -> String {
+    let port = port.to_string();
+    let vsock_port = cfg
+        .vsock_port
+        .map(|port| port.to_string())
+        .unwrap_or_else(|| port.clone());
+    let vsock_cid = cfg.vsock_cid.map(|cid| cid.to_string()).unwrap_or_default();
+    let uds_path = cfg
+        .uds_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+
+    template
+        .replace("{user}", user)
+        .replace("{port}", &port)
+        .replace("{vsock_port}", &vsock_port)
+        .replace("{vsock_cid}", &vsock_cid)
+        .replace("{uds_path}", &uds_path)
+}
+
+pub async fn apply_client_line_handshake<S>(
+    stream: &mut S,
+    cfg: &crate::SshClientConfig,
+    user: &str,
+    port: u16,
+    label: &str,
+) -> Result<Option<String>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(handshake) = cfg.line_handshake.as_ref() else {
+        return Ok(None);
+    };
+    if handshake.send.is_empty() {
+        anyhow::bail!("line handshake for '{}' has an empty send line", label);
+    }
+
+    let mut send = render_client_line_handshake(&handshake.send, cfg, user, port).into_bytes();
+    if !send.ends_with(b"\n") {
+        send.push(b'\n');
+    }
+    stream
+        .write_all(&send)
+        .await
+        .with_context(|| format!("write line handshake for '{}'", label))?;
+    stream
+        .flush()
+        .await
+        .with_context(|| format!("flush line handshake for '{}'", label))?;
+
+    let response = read_handshake_line(stream, handshake.max_response_bytes)
+        .await
+        .with_context(|| format!("read line handshake response for '{}'", label))?;
+    if let Some(expected) = handshake.expect.as_deref()
+        && response != expected
+    {
+        anyhow::bail!(
+            "line handshake for '{}' returned {:?}, expected {:?}",
+            label,
+            response,
+            expected
+        );
+    }
+    if let Some(prefix) = handshake.expect_prefix.as_deref()
+        && !response.starts_with(prefix)
+    {
+        anyhow::bail!(
+            "line handshake for '{}' returned {:?}, expected prefix {:?}",
+            label,
+            response,
+            prefix
+        );
+    }
+
+    debug!("line handshake for '{}' returned {:?}", label, response);
+    Ok(Some(response))
+}
+
+async fn read_handshake_line<S>(stream: &mut S, max_response_bytes: usize) -> Result<String>
+where
+    S: AsyncRead + Unpin,
+{
+    let limit = max_response_bytes.max(1);
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while response.len() < limit {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            anyhow::bail!("line handshake stream closed before response line");
+        }
+        if byte[0] == b'\n' {
+            if response.last() == Some(&b'\r') {
+                response.pop();
+            }
+            return String::from_utf8(response).context("line handshake response is not UTF-8");
+        }
+        response.push(byte[0]);
+    }
+
+    anyhow::bail!(
+        "line handshake response exceeded {} bytes without newline",
+        limit
+    );
+}
+
 pub async fn run_trusted_server_stream<S>(
     config: Arc<russh::server::Config>,
     stream: S,
@@ -222,9 +333,8 @@ where
                 exit_status: status,
             } => {
                 exit_status = status as i32;
-                break;
             }
-            ChannelMsg::Close => break,
+            ChannelMsg::Eof | ChannelMsg::Close => break,
             _ => {}
         }
     }
@@ -558,6 +668,49 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn line_handshake_sends_rendered_line_and_preserves_stream_tail() {
+        let (mut client_io, mut server_io) = tokio::io::duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                server_io.read_exact(&mut byte).await.unwrap();
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            assert_eq!(String::from_utf8(line).unwrap(), "connect 18522\n");
+            server_io
+                .write_all(b"OK 9\nSSH-2.0-test\r\n")
+                .await
+                .unwrap();
+        });
+
+        let cfg = crate::SshClientConfig {
+            user: "app4".to_string(),
+            uds_path: Some(std::path::PathBuf::from("/tmp/ch.vsock")),
+            vsock_port: Some(18522),
+            line_handshake: Some(crate::LineHandshakeConfig {
+                send: "connect {vsock_port}".to_string(),
+                expect_prefix: Some("OK ".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let response = apply_client_line_handshake(&mut client_io, &cfg, "app4", 22, "ch-test")
+            .await
+            .unwrap();
+        assert_eq!(response.as_deref(), Some("OK 9"));
+
+        let mut tail = [0u8; 7];
+        client_io.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"SSH-2.0");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn trusted_duplex_exec_uses_none_auth_and_none_crypto() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -569,6 +722,9 @@ mod tests {
             unique
         ));
         std::fs::create_dir_all(&base_dir).unwrap();
+
+        let mock_socket = base_dir.join("mesh-init-control.sock");
+        let _mock_handle = crate::test_utils::start_mock_mesh_init(mock_socket, base_dir.clone());
 
         let server = MeshNode::new(
             Some(base_dir.clone()),
@@ -614,6 +770,9 @@ mod tests {
             ));
         std::fs::create_dir_all(&base_dir).unwrap();
         let socket_path = base_dir.join("trusted.sock");
+
+        let mock_socket = base_dir.join("mesh-init-control.sock");
+        let _mock_handle = crate::test_utils::start_mock_mesh_init(mock_socket, base_dir.clone());
 
         let server = MeshNode::new(
             Some(base_dir.join("server")),

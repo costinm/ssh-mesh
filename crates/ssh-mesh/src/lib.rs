@@ -1,7 +1,6 @@
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-use anyhow::Context as AnyhowContext;
 use log::{error, info};
 use russh::keys::PrivateKey;
 use russh::server;
@@ -116,6 +115,11 @@ pub struct SshClientConfig {
     #[serde(default, alias = "UdsPath")]
     pub uds_path: Option<PathBuf>,
 
+    /// Optional one-line protocol handshake to run after transport connect and
+    /// before starting SSH on the stream.
+    #[serde(default, alias = "LineHandshake")]
+    pub line_handshake: Option<LineHandshakeConfig>,
+
     /// Expected host public keys (OpenSSH format).
     /// If empty, TOFU (Trust-On-First-Use) is used.
     /// If set, the server's key must match one of these.
@@ -137,6 +141,47 @@ pub struct SshClientConfig {
     /// Remote port forwards (like `ssh -R`).
     #[serde(default, alias = "RemoteForward")]
     pub remote_forward: Vec<RemoteForwardConfig>,
+}
+
+const DEFAULT_LINE_HANDSHAKE_MAX_RESPONSE_BYTES: usize = 4096;
+
+/// One-line stream handshake for transports that need a small prelude before
+/// they expose the raw SSH stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LineHandshakeConfig {
+    /// Line to send. A trailing newline is added if omitted.
+    ///
+    /// Supported placeholders: `{user}`, `{port}`, `{vsock_port}`,
+    /// `{vsock_cid}`, and `{uds_path}`.
+    #[serde(default, alias = "Send", alias = "Line")]
+    pub send: String,
+
+    /// Exact response line to require after trimming trailing CRLF.
+    #[serde(default, alias = "Expect")]
+    pub expect: Option<String>,
+
+    /// Response prefix to require after trimming trailing CRLF.
+    #[serde(default, alias = "ExpectPrefix")]
+    pub expect_prefix: Option<String>,
+
+    /// Maximum response line size to read.
+    #[serde(default = "default_line_handshake_max_response_bytes")]
+    pub max_response_bytes: usize,
+}
+
+impl Default for LineHandshakeConfig {
+    fn default() -> Self {
+        Self {
+            send: String::new(),
+            expect: None,
+            expect_prefix: None,
+            max_response_bytes: default_line_handshake_max_response_bytes(),
+        }
+    }
+}
+
+fn default_line_handshake_max_response_bytes() -> usize {
+    DEFAULT_LINE_HANDSHAKE_MAX_RESPONSE_BYTES
 }
 
 fn default_reconnect_interval() -> u64 {
@@ -182,6 +227,10 @@ pub struct SshRouteConfig {
     /// Optional mesh-init service to prepare before connecting.
     #[serde(default)]
     pub activation_service: Option<String>,
+    /// Optional UDS to connect after preparing activation. This is useful when
+    /// the activation socket is separate from the final client transport.
+    #[serde(default)]
+    pub activation_uds_path: Option<PathBuf>,
     /// Client connection to use after activation.
     pub client: SshClientConfig,
 }
@@ -230,6 +279,14 @@ pub struct MeshNodeConfig {
     /// If present, these are used in addition to CAs loaded from
     /// the `authorized_cas` file in base_dir.
     pub ca_keys: Option<Vec<String>>,
+
+    /// Optional identity authorization policy.
+    ///
+    /// This uses the shared mesh auth format. `impersonation` rules allow a
+    /// certificate principal such as `root@example.m` to authenticate as a
+    /// different SSH login identity such as `root@host3-vm.example.m`.
+    #[serde(default)]
+    pub auth: Option<mesh::auth::AuthConfig>,
 
     /// Map of named SSH client connections to establish at startup.
     /// Keys are logical names; values are `SshClientConfig` entries.
@@ -648,37 +705,11 @@ pub struct ExecConfig {
 
 /// Executes a command as a specific user.
 pub fn run_exec_command(config: ExecConfig) -> Result<(), anyhow::Error> {
-    let uid_val = config.uid;
-    let args = config.args;
-
-    info!("Executing command as user {}: {:?}", uid_val, args);
-
-    #[cfg(unix)]
-    {
-        use nix::unistd::{Uid, setuid};
-        // Drop privileges to the target user
-        setuid(Uid::from_raw(uid_val)).context(
-            "Failed to setuid - make sure you're running as root if you want to change users",
-        )?;
-    }
-
-    let mut child = std::process::Command::new(&args[0])
-        .args(&args[1..])
-        .spawn()
-        .context("Failed to spawn command")?;
-
-    let status = child.wait().context("Failed to wait for command")?;
-
-    if !status.success() {
-        error!("Command exited with status: {:?}", status);
-        if let Some(code) = status.code() {
-            std::process::exit(code);
-        } else {
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
+    anyhow::bail!(
+        "ssh-mesh no longer executes commands directly (uid={}, args={:?}); use mesh-init or mesh terminal instead",
+        config.uid,
+        config.args
+    )
 }
 
 /// Type alias for backward compatibility.
@@ -718,6 +749,7 @@ mod tests {
         assert!(cfg.http_port.is_none());
         assert!(cfg.authorized_keys.is_none());
         assert!(cfg.ca_keys.is_none());
+        assert!(cfg.auth.is_none());
         assert!(cfg.clients.is_empty());
     }
 
@@ -835,10 +867,15 @@ ssh_routes:
     target_host: 127.0.0.1
     target_port: 22
     activation_service: activate-bwrap-nonet
+    activation_uds_path: /tmp/mesh/shared/bwrap-nonet/activate.sock
     client:
       transport: uds
       user: system
       uds_path: /tmp/mesh/shared/bwrap-nonet/trusted.sock
+      line_handshake:
+        send: "connect {vsock_port}"
+        expect_prefix: "OK "
+      vsock_port: 18522
 "#;
         std::fs::write(base_dir.join("mesh.yaml"), yaml_content).unwrap();
 
@@ -855,6 +892,12 @@ ssh_routes:
             route.activation_service.as_deref(),
             Some("activate-bwrap-nonet")
         );
+        assert_eq!(
+            route.activation_uds_path.as_deref(),
+            Some(std::path::Path::new(
+                "/tmp/mesh/shared/bwrap-nonet/activate.sock"
+            ))
+        );
         assert_eq!(route.client.transport, "uds");
         assert_eq!(route.client.user, "system");
         assert_eq!(
@@ -863,5 +906,13 @@ ssh_routes:
                 "/tmp/mesh/shared/bwrap-nonet/trusted.sock"
             ))
         );
+        let handshake = route
+            .client
+            .line_handshake
+            .as_ref()
+            .expect("line handshake config");
+        assert_eq!(handshake.send, "connect {vsock_port}");
+        assert_eq!(handshake.expect_prefix.as_deref(), Some("OK "));
+        assert_eq!(route.client.vsock_port, Some(18522));
     }
 }

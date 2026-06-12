@@ -114,6 +114,187 @@ impl ControlServer {
 ///
 /// Reads JSON lines from the stream, dispatches each to the daemon,
 /// and writes back JSON responses.
+enum ProtocolFormat {
+    FlatJson { id: Option<serde_json::Value> },
+    JsonRpc { id: Option<serde_json::Value> },
+    TextCommand,
+}
+
+fn parse_incoming(trimmed: &str) -> (ProtocolFormat, Result<Request, String>) {
+    if !trimmed.starts_with('{') {
+        let parsed = parse_text_command(trimmed);
+        (ProtocolFormat::TextCommand, parsed.map_err(|e| e.to_string()))
+    } else {
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => return (ProtocolFormat::FlatJson { id: None }, Err(format!("Invalid JSON: {}", e))),
+        };
+
+        if let Some(obj) = val.as_object() {
+            let id = obj.get("id").cloned();
+            if obj.contains_key("jsonrpc") {
+                let format = ProtocolFormat::JsonRpc { id };
+                let method = match obj.get("method").and_then(|m| m.as_str()) {
+                    Some(m) => m,
+                    None => return (format, Err("Missing or invalid 'method' in JSON-RPC request".to_string())),
+                };
+
+                let mut flat = serde_json::Map::new();
+                flat.insert("method".to_string(), serde_json::json!(method));
+
+                if let Some(params) = obj.get("params") {
+                    if let Some(params_obj) = params.as_object() {
+                        for (k, v) in params_obj {
+                            flat.insert(k.clone(), v.clone());
+                        }
+                    } else if !params.is_null() {
+                        return (format, Err("JSON-RPC 'params' must be an object".to_string()));
+                    }
+                }
+
+                match serde_json::from_value::<Request>(serde_json::Value::Object(flat)) {
+                    Ok(req) => (format, Ok(req)),
+                    Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
+                }
+            } else {
+                let format = ProtocolFormat::FlatJson { id };
+                match serde_json::from_str::<Request>(trimmed) {
+                    Ok(req) => (format, Ok(req)),
+                    Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
+                }
+            }
+        } else {
+            (ProtocolFormat::FlatJson { id: None }, Err("JSON payload is not an object".to_string()))
+        }
+    }
+}
+
+fn parse_text_command(line: &str) -> Result<Request> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.is_empty() {
+        anyhow::bail!("Empty command");
+    }
+
+    match tokens[0] {
+        "status" => Ok(Request::Status {
+            name: tokens.get(1).map(|s| s.to_string()),
+        }),
+        "start" => {
+            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            Ok(Request::Start {
+                name: name.to_string(),
+                args: tokens[2..].iter().map(|s| s.to_string()).collect(),
+                env: std::collections::HashMap::new(),
+                context: None,
+            })
+        }
+        "stop" => {
+            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            let mut signal = None;
+            let mut i = 2;
+            while i < tokens.len() {
+                if tokens[i] == "--signal" && i + 1 < tokens.len() {
+                    signal = Some(tokens[i + 1].parse()?);
+                    break;
+                }
+                i += 1;
+            }
+            Ok(Request::Stop {
+                name: name.to_string(),
+                signal,
+            })
+        }
+        "freeze" => {
+            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            Ok(Request::Freeze { name: name.to_string() })
+        }
+        "unfreeze" => {
+            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            Ok(Request::Unfreeze { name: name.to_string() })
+        }
+        "reload" => Ok(Request::Reload),
+        "shutdown" => Ok(Request::Shutdown),
+        cmd => anyhow::bail!("Unsupported CLI command: {}", cmd),
+    }
+}
+
+fn format_text_success(data: &Option<serde_json::Value>) -> String {
+    let Some(data) = data else {
+        return "OK".to_string();
+    };
+
+    if let Some(obj) = data.as_object() {
+        let mut lines = Vec::new();
+        for (k, v) in obj {
+            let v_str = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                other => other.to_string(),
+            };
+            lines.push(format!("{}: {}", k, v_str));
+        }
+        lines.join("\n")
+    } else if let Some(arr) = data.as_array() {
+        let mut lines = Vec::new();
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                let state = obj.get("state").and_then(|s| s.as_str()).unwrap_or("unknown");
+                if let Some(pid) = obj.get("pid").and_then(|p| p.as_u64()) {
+                    lines.push(format!("{}: {} (PID {})", name, state, pid));
+                } else {
+                    lines.push(format!("{}: {}", name, state));
+                }
+            } else {
+                lines.push(item.to_string());
+            }
+        }
+        lines.join("\n")
+    } else {
+        data.to_string()
+    }
+}
+
+fn format_response(response: Response, format: &ProtocolFormat) -> Result<String> {
+    match format {
+        ProtocolFormat::FlatJson { id } => {
+            let mut val = serde_json::to_value(&response)?;
+            if let Some(obj) = val.as_object_mut() {
+                if let Some(id_val) = id {
+                    obj.insert("id".to_string(), id_val.clone());
+                }
+            }
+            Ok(serde_json::to_string(&val)?)
+        }
+        ProtocolFormat::JsonRpc { id } => {
+            let mut map = serde_json::Map::new();
+            map.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
+            if response.success {
+                map.insert("result".to_string(), response.data.clone().unwrap_or(serde_json::Value::Null));
+            } else {
+                let mut err_map = serde_json::Map::new();
+                err_map.insert("code".to_string(), serde_json::json!(-32603));
+                err_map.insert("message".to_string(), serde_json::json!(response.error.clone().unwrap_or_else(|| "Unknown error".to_string())));
+                map.insert("error".to_string(), serde_json::Value::Object(err_map));
+            }
+            map.insert("id".to_string(), id.clone().unwrap_or(serde_json::Value::Null));
+            Ok(serde_json::to_string(&serde_json::Value::Object(map))?)
+        }
+        ProtocolFormat::TextCommand => {
+            if response.success {
+                Ok(format_text_success(&response.data))
+            } else {
+                Ok(format!("Error: {}", response.error.as_deref().unwrap_or("Unknown error")))
+            }
+        }
+    }
+}
+
+/// Handle a single control connection.
+///
+/// Reads JSON or text command lines from the stream, dispatches each to the daemon,
+/// and writes back formatted responses.
 async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) -> Result<()> {
     let mut stream = stream;
     let mut line = String::new();
@@ -130,7 +311,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
             continue;
         }
 
-        let response = match serde_json::from_str::<Request>(trimmed) {
+        let (format, parsed_result) = parse_incoming(trimmed);
+
+        let response = match parsed_result {
             Ok(request) => {
                 debug!("Received request: {:?}", request);
                 match request {
@@ -139,11 +322,13 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
                         std_stream.set_nonblocking(false)?;
                         let fd = recv_one_fd(&std_stream)?;
                         let response = daemon.handle_request_with_fd(request, fd).await;
-                        let response_json = serde_json::to_string(&response)?;
-                        std_stream.write_all(response_json.as_bytes())?;
+                        let response_str = format_response(response, &format)?;
+                        std_stream.write_all(response_str.as_bytes())?;
                         std_stream.write_all(b"\n")?;
                         std_stream.flush()?;
-                        return Ok(());
+                        std_stream.set_nonblocking(true)?;
+                        stream = tokio::net::UnixStream::from_std(std_stream)?;
+                        continue;
                     }
                     request => daemon.handle_request(request).await,
                 }
@@ -154,8 +339,8 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
             }
         };
 
-        let response_json = serde_json::to_string(&response)?;
-        stream.write_all(response_json.as_bytes()).await?;
+        let response_str = format_response(response, &format)?;
+        stream.write_all(response_str.as_bytes()).await?;
         stream.write_all(b"\n").await?;
         stream.flush().await?;
     }
@@ -258,5 +443,61 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(parsed.success);
+    }
+
+    #[test]
+    fn test_parse_incoming_flat_json() {
+        let trimmed = r#"{"method":"status","name":"x","id":"req-id"}"#;
+        let (format, parsed) = parse_incoming(trimmed);
+        assert!(matches!(format, ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) } if s == "req-id"));
+        let req = parsed.unwrap();
+        match req {
+            Request::Status { name } => assert_eq!(name, Some("x".to_string())),
+            _ => panic!("Expected status request"),
+        }
+    }
+
+    #[test]
+    fn test_parse_incoming_jsonrpc() {
+        let trimmed = r#"{"jsonrpc":"2.0","method":"status","params":{"name":"x"},"id":100}"#;
+        let (format, parsed) = parse_incoming(trimmed);
+        assert!(matches!(format, ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) } if n.as_i64() == Some(100)));
+        let req = parsed.unwrap();
+        match req {
+            Request::Status { name } => assert_eq!(name, Some("x".to_string())),
+            _ => panic!("Expected status request"),
+        }
+    }
+
+    #[test]
+    fn test_parse_incoming_text() {
+        let trimmed = "status x";
+        let (format, parsed) = parse_incoming(trimmed);
+        assert!(matches!(format, ProtocolFormat::TextCommand));
+        let req = parsed.unwrap();
+        match req {
+            Request::Status { name } => assert_eq!(name, Some("x".to_string())),
+            _ => panic!("Expected status request"),
+        }
+    }
+
+    #[test]
+    fn test_format_response_jsonrpc() {
+        let response = Response::ok_with_data(serde_json::json!({"pid": 42}));
+        let format = ProtocolFormat::JsonRpc { id: Some(serde_json::json!(100)) };
+        let formatted = format_response(response, &format).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(val["jsonrpc"], "2.0");
+        assert_eq!(val["result"]["pid"], 42);
+        assert_eq!(val["id"], 100);
+    }
+
+    #[test]
+    fn test_format_response_text() {
+        let response = Response::ok_with_data(serde_json::json!({"pid": 42, "state": "running"}));
+        let format = ProtocolFormat::TextCommand;
+        let formatted = format_response(response, &format).unwrap();
+        assert!(formatted.contains("pid: 42"));
+        assert!(formatted.contains("state: running"));
     }
 }

@@ -221,6 +221,59 @@ pub async fn pipe_read_to_ssh<R>(
 ) where
     R: AsyncRead + Unpin,
 {
+    pipe_read_to_ssh_with_close(&mut reader, session_handle, channel_id, label, true).await;
+}
+
+/// Pipe data from an AsyncRead to an SSH session channel and send an exit status
+/// before EOF/close.
+pub async fn pipe_read_to_ssh_with_exit_status<R>(
+    mut reader: R,
+    session_handle: russh::server::Handle,
+    channel_id: russh::ChannelId,
+    label: &str,
+    exit_status: u32,
+) where
+    R: AsyncRead + Unpin,
+{
+    pipe_read_to_ssh_with_close(
+        &mut reader,
+        session_handle.clone(),
+        channel_id,
+        label,
+        false,
+    )
+    .await;
+    let _ = session_handle
+        .exit_status_request(channel_id, exit_status)
+        .await;
+    let _ = session_handle.eof(channel_id).await;
+    let _ = session_handle.close(channel_id).await;
+}
+
+/// Pipe data from an AsyncRead to an SSH channel without closing it on EOF.
+///
+/// Use this when another task owns the channel lifecycle, such as the child
+/// process waiter that must send exit-status before EOF/close.
+pub async fn pipe_read_to_ssh_no_close<R>(
+    mut reader: R,
+    session_handle: russh::server::Handle,
+    channel_id: russh::ChannelId,
+    label: &str,
+) where
+    R: AsyncRead + Unpin,
+{
+    pipe_read_to_ssh_with_close(&mut reader, session_handle, channel_id, label, false).await;
+}
+
+async fn pipe_read_to_ssh_with_close<R>(
+    reader: &mut R,
+    session_handle: russh::server::Handle,
+    channel_id: russh::ChannelId,
+    label: &str,
+    close_on_eof: bool,
+) where
+    R: AsyncRead + Unpin,
+{
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
@@ -248,8 +301,10 @@ pub async fn pipe_read_to_ssh<R>(
             }
         }
     }
-    let _ = session_handle.eof(channel_id).await;
-    let _ = session_handle.close(channel_id).await;
+    if close_on_eof {
+        let _ = session_handle.eof(channel_id).await;
+        let _ = session_handle.close(channel_id).await;
+    }
 }
 
 /// Pipe data from an MPSC receiver to an AsyncWrite

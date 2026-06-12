@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::auth::{AuthConfig, PeerConfig};
+use crate::auth::{AuthConfig, ImpersonationRule, PeerConfig};
 
 // ============================================================================
 // Service / Job Unified Config
@@ -27,6 +27,9 @@ pub struct AppConfigFile {
     /// Authorization peer entries. Same `[[peer]]` keyword as standalone `auth.toml`.
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+    /// Identity impersonation entries. Same `[[impersonation]]` keyword as standalone auth.
+    #[serde(default, rename = "impersonation")]
+    pub impersonation: Vec<ImpersonationRule>,
 
     // Job-specific metadata
     #[serde(default = "default_true")]
@@ -314,10 +317,13 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
         resources: resolved,
         activation: file.activation,
         source_path: None,
-        auth: if file.peers.is_empty() {
+        auth: if file.peers.is_empty() && file.impersonation.is_empty() {
             None
         } else {
-            Some(AuthConfig { peers: file.peers })
+            Some(AuthConfig {
+                peers: file.peers,
+                impersonation: file.impersonation,
+            })
         },
 
         schedule: file.schedule,

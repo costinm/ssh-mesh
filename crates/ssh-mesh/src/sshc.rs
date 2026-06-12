@@ -299,6 +299,16 @@ pub trait SshClientListener: Send + Sync {
     );
 }
 
+/// PTY settings for routed interactive shell sessions.
+#[derive(Clone, Debug)]
+pub struct ShellPty {
+    pub term: String,
+    pub col_width: u32,
+    pub row_height: u32,
+    pub pix_width: u32,
+    pub pix_height: u32,
+}
+
 /// Manages multiple SSH client connections.
 pub struct SshClientManager {
     connections: Mutex<HashMap<u64, SshClientConnection>>,
@@ -844,6 +854,15 @@ impl SshClientManager {
 
     /// Open a remote shell as a bidirectional stream through the SSH tunnel.
     pub async fn open_shell(&self, id: u64) -> Result<tokio::io::DuplexStream> {
+        self.open_shell_with_pty(id, None).await
+    }
+
+    /// Open a remote shell as a bidirectional stream with optional PTY settings.
+    pub async fn open_shell_with_pty(
+        &self,
+        id: u64,
+        pty: Option<ShellPty>,
+    ) -> Result<tokio::io::DuplexStream> {
         let conns = self.connections.lock().await;
         let conn = conns
             .get(&id)
@@ -853,6 +872,19 @@ impl SshClientManager {
             let session = conn.session.lock().await;
             session.channel_open_session().await?
         };
+        if let Some(pty) = pty {
+            channel
+                .request_pty(
+                    false,
+                    &pty.term,
+                    pty.col_width,
+                    pty.row_height,
+                    pty.pix_width,
+                    pty.pix_height,
+                    &[],
+                )
+                .await?;
+        }
         channel.request_shell(true).await?;
 
         let (s1, s2) = tokio::io::duplex(64 * 1024);
@@ -993,14 +1025,23 @@ impl SshClientManager {
                     .unwrap_or(crate::trusted_transport::VMADDR_CID_HOST);
                 #[cfg(not(target_os = "linux"))]
                 let vsock_cid = cfg.vsock_cid.unwrap_or(2);
-                let stream = crate::trusted_transport::VsockStream::connect(vsock_cid, vsock_port)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "connect trusted vsock cid={} port={} for '{}'",
-                            vsock_cid, vsock_port, name
-                        )
-                    })?;
+                let mut stream =
+                    crate::trusted_transport::VsockStream::connect(vsock_cid, vsock_port)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "connect trusted vsock cid={} port={} for '{}'",
+                                vsock_cid, vsock_port, name
+                            )
+                        })?;
+                crate::trusted_transport::apply_client_line_handshake(
+                    &mut stream,
+                    cfg,
+                    &connect_user,
+                    connect_port,
+                    name,
+                )
+                .await?;
                 let config = Arc::new(crate::trusted_transport::trusted_client_config());
                 let mut session = client::connect_stream(config, stream, handler).await?;
                 let auth_res = session.authenticate_none(&connect_user).await?;
@@ -1014,7 +1055,15 @@ impl SshClientManager {
                 let socket_path = cfg.uds_path.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("Client '{}' uses transport=uds without uds_path", name)
                 })?;
-                let stream = crate::trusted_transport::connect_trusted_uds(socket_path).await?;
+                let mut stream = crate::trusted_transport::connect_trusted_uds(socket_path).await?;
+                crate::trusted_transport::apply_client_line_handshake(
+                    &mut stream,
+                    cfg,
+                    &connect_user,
+                    connect_port,
+                    name,
+                )
+                .await?;
                 let config = Arc::new(crate::trusted_transport::trusted_client_config());
                 let mut session = client::connect_stream(config, stream, handler).await?;
                 let auth_res = session.authenticate_none(&connect_user).await?;

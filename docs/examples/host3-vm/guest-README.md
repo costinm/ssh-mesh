@@ -1,37 +1,36 @@
 # Host3-vm guest contract
 
-Host3-vm is a QEMU VM artifact built from this repo's cloud kernel, a small local
-EROFS rootfs, and ssh-mesh example files:
+Host3-vm is a QEMU VM launched from the repo-local dist artifacts:
 
 ```text
-share/host3-vm-vm/bzImage
-share/host3-vm-vm/host3-vm-rootfs.erofs
-share/host3-vm-vm/initos.erofs
-share/host3-vm-vm/initos-pod
-share/host3-vm-vm/config/
-share/host3-vm-vm/bin/
-bin/run-host3-vm-vm
+target/dist/img/vmlinux-cloud
+target/dist/img/ssh-mesh.erofs
+target/dist/img/modules-cloud.erofs
+target/dist/opt
 ```
 
-Build it from the repository with:
+Build those artifacts from the repository with:
 
 ```bash
-nix build .#host3-vm-vm
+scripts/build.sh profile
+scripts/build.sh
 ```
 
-`host3-vm/start.sh` delegates to `host3-vm/run-host3-vm-vm`. The installed package exposes the
-same runner as `bin/run-host3-vm-vm`.
-
-The runner boots the local cloud kernel and generated EROFS rootfs, and passes:
+`docs/examples/start_all.sh` launches `docs/examples/host3-vm/run-host3-vm`.
+That wrapper sets the example-specific environment and then execs
+`/opt/ssh-mesh/bin/vrun start`. `vrun` boots the dist cloud kernel, generated
+EROFS rootfs, and modules EROFS, and passes:
 
 ```text
 init=/opt/initos/bin/initos-init-vm
 root=/dev/vda
 rootfstype=erofs
+initos_modules=/dev/vdb
 ```
 
-It prepares a writable QEMU 9p share with mount tag `src`. The vendored
-`initos-init-vm` script mounts that share at `/src` and executes:
+It prepares a writable virtiofs share with tag `src`. The vendored
+`initos-init-vm` script mounts that share at `/src`, mounts the modules image at
+`/lib/modules/$(uname -r)`, and executes:
 
 ```text
 /src/initos/initos-pod start
@@ -40,7 +39,7 @@ It prepares a writable QEMU 9p share with mount tag `src`. The vendored
 Host3-vm's checked-in `initos-pod` script then starts `mesh-init` with:
 
 ```bash
-export PATH=/out/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin
+export PATH=/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin
 export HOME=/home/system
 export USER=system
 export LOGNAME=system
@@ -59,10 +58,9 @@ $HOME/.run/*
 ```
 
 Persistent config and runtime state come from the host example state tree,
-exposed to the guest as `/src/host3-vm/home/system`. The packaged configs under
-`share/host3-vm-vm/config` are copied into that HOME before `mesh-init` starts.
+exposed to the guest as `/src/host3-vm/home/system`.
 
-When QEMU host1 networking is used, `run-host3-vm-vm` forwards:
+When QEMU user networking is used, `vrun` forwards:
 
 ```text
 127.0.0.1:18322 -> guest:18322
@@ -71,5 +69,5 @@ When QEMU host1 networking is used, `run-host3-vm-vm` forwards:
 
 The host-side ports can be changed with `SSH_MESH_HOST3_VM_HOST_SSH_PORT` and
 `SSH_MESH_HOST3_VM_HOST_HTTP_PORT`; guest ports remain `18322` and `18380`. The
-example uses QEMU host1 networking only. The shared 9p filesystem is for config,
-state, and binaries, not for a host-visible Host3-vm trusted Unix socket.
+example uses QEMU user networking only. The shared 9p filesystem is for config
+and state. Runtime binaries come from `/opt` in the EROFS rootfs.

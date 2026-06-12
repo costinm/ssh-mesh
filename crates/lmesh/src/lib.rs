@@ -171,7 +171,7 @@ impl LocalDiscovery {
         }
 
         if self.socket_v4.is_none() && self.socket_v6.is_none() {
-            anyhow::bail!("Failed to setup any multicast sockets");
+            log::warn!("No multicast sockets available; discovery announcements disabled");
         }
 
         // Start receiver tasks

@@ -1,4 +1,4 @@
-# ssh-mesh node configuration for app-vm-ch.
+# ssh-mesh node configuration for app4-ch.
 
 ssh_port: 18522
 http_port: 18580

@@ -1,4 +1,4 @@
-# ssh-mesh node configuration for app-vm-crosvm.
+# ssh-mesh node configuration for app3-crosvm.
 
 ssh_port: 18522
 http_port: 18580

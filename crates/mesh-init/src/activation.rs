@@ -91,6 +91,17 @@ async fn run_uds_listener(path: String, service_name: String, wait: bool, daemon
         "Starting UDS activation listener for '{}' on {}",
         service_name, path
     );
+    if let Some(parent) = std::path::Path::new(&path).parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        error!(
+            "Failed to create UDS activation socket directory {} for '{}': {}",
+            parent.display(),
+            service_name,
+            e
+        );
+        return;
+    }
     let _ = std::fs::remove_file(&path);
 
     let listener = match std::os::unix::net::UnixListener::bind(&path) {

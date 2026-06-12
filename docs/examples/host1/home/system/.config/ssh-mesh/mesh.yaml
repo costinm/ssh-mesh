@@ -7,14 +7,19 @@ ssh_port: 18422
 http_port: 18480
 trusted_uds_path: /tmp/mesh/shared/host1/trusted.sock
 
+auth:
+  impersonation:
+    - from: root@example.m
+      to: "*"
+
 clients:
   host2:
     transport: tcp
     hostname: 127.0.0.1
     port: 18222
     user: system
-    #keep_alive: true
-    #reconnect_interval_secs: 2
+    keep_alive: true
+    reconnect_interval_secs: 2
 
     local_forward:
       - bind_address: 127.0.0.1
@@ -53,6 +58,18 @@ ssh_routes:
       port: 18322
       user: system
 
+  - name: host3-vm-root
+    user: root@host3-vm.example.m
+    jump_host: host3-vm.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    client:
+      transport: tcp
+      hostname: 127.0.0.1
+      port: 18322
+      user: root@host3-vm.example.m
+
   - name: app1-bwrap
     user: system@app1-bwrap.example.m
     jump_host: app1-bwrap.example.m
@@ -62,7 +79,7 @@ ssh_routes:
     activation_service: activate-app1-bwrap
     client:
       transport: uds
-      user: system
+      user: app1
       uds_path: /tmp/mesh/shared/app1-bwrap/trusted.sock
 
   - name: app2-qemu

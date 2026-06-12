@@ -1,7 +1,7 @@
-# mesh-init service definition for app-vm-crosvm's ssh-mesh node.
+# mesh-init service definition for app3-crosvm's ssh-mesh node.
 
 [service]
-name = "init-ssh-mesh-app-vm-crosvm"
+name = "init-ssh-mesh-app3-crosvm"
 command = "ssh-mesh"
 priority = 100
 oneshot = false
@@ -12,10 +12,10 @@ memory_max = "512M"
 cpu_weight = 100
 
 [environment]
-PATH = "/out/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
+PATH = "/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
 RUST_LOG = "info"
 SSH_PORT = "18522"
 HTTP_PORT = "18580"
-MUX_DIR = "/home/app-vm-crosvm/.run/ssh-mesh/mux"
-MESH_INIT_SOCK = "/home/app-vm-crosvm/.run/mesh-init/control.sock"
+MUX_DIR = "/home/app3/.run/ssh-mesh/mux"
+MESH_INIT_SOCK = "/home/app3/.run/mesh-init/control.sock"
 SSH_MESH_HOME_ROOT = "/home"

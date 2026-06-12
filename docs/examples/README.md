@@ -16,10 +16,10 @@ Required binaries:
 - `bwrap`
 - `qemu-system-x86_64`, `crosvm`, and `cloud-hypervisor` for VM examples
 
-Each script prepends the staged example bin directory, `/out/ssh-mesh/bin`,
-`/opt/ssh-mesh/bin`, and the selected Nix profile to `PATH`. By default
-`start_all.sh` stages mutable data under `target/examples` and uses
-`target/nix/profiles` when it exists.
+`scripts/build.sh` creates distributable artifacts under `target/dist`:
+`target/dist/opt` is the package tree used as `/opt`, and
+`target/dist/img/ssh-mesh.erofs` embeds that same `/opt` for VMs. By default
+`start_all.sh` uses `target/examples` only for mutable state.
 
 ## Model
 
@@ -46,7 +46,6 @@ its own `/home/appN` plus read-only package inputs:
 /home/app4                    app4-ch runtime home
 /nix                          read-only package store when available
 /opt/ssh-mesh                 read-only package install
-/out/ssh-mesh                 staged build output, when present
 ```
 
 Host and app configuration lives under the runtime home:
@@ -121,15 +120,20 @@ Runtime state is staged like this:
 ```text
 target/examples/
   host1/home/system/
-  host1/home/app1/
   host2/home/system/
   host3-vm/home/system/
+  app1-bwrap/home/app1/
   app2-qemu/home/app2/
   app3-crosvm/home/app3/
   app4-ch/home/app4/
   shared/
-  opt/
 ```
+
+App source directories under `docs/examples/*/home/app*` are home/config
+templates only. Host mesh-init starts app isolation through the shared launchers
+installed in `target/dist/opt`: host1, host2, and app1 use
+`/opt/ssh-mesh/bin/run_bwrap.sh`; host3-vm and VM apps use
+`/opt/ssh-mesh/bin/vrun start`.
 
 The local trusted sockets are created under:
 
@@ -137,10 +141,11 @@ The local trusted sockets are created under:
 $SSH_MESH_EXAMPLE_ROOT/shared
 ```
 
-For VMs, the host state root is exposed as `/src`. Host3-vm mounts its system
-home from `/src/host3-vm/home/system`, and VM apps mount their app home from
-`/src/appN-backend/home/appN`. When host `/nix` is available, launchers expose it
-read-only through the VM share so guests can mount `/nix`.
+For VMs, the host3-vm state root is exposed as `/src` through `vrun`. Host3-vm
+mounts its system home from `/src/host3-vm/home/system`. Nested VM apps do not
+receive the whole host3-vm `/src`; `vrun` creates a per-app VM share containing
+only the app home, shared socket directory, init script, and read-only `/nix`
+when available.
 
 Host3-vm also starts a one-shot diagnostic job on boot. It writes to the VM
 console and reports the kernel, command line, memory, interfaces, routes, virtio
@@ -154,6 +159,7 @@ The three networked hosts have checked-in example keys and certificates:
 docs/examples/host1/home/system/.ssh
 docs/examples/host2/home/system/.ssh
 docs/examples/host3-vm/home/system/.ssh
+docs/examples/root/home/root/.ssh
 ```
 
 Regenerate the example CA, node keys, and OpenSSH certificates with:
@@ -163,28 +169,43 @@ docs/examples/generate_keys.sh
 ```
 
 The script uses the built `meshkeys` binary. The checked-in private keys are for
-local examples only.
+local examples only. The root example key has the certificate principal
+`root@example.m`; ssh-mesh authz rules allow it to act as routed identities such
+as `root@host3-vm.example.m`.
+
+## Build From a Clean Target
+
+From the repository root:
+
+```bash
+scripts/build.sh profile
+scripts/build.sh
+docs/examples/start_all.sh
+```
+
+`profile` builds the repo-local Nix profile with the VM kernel/rootfs assets and
+hypervisors. It defaults to `target/nix/profile`, or reuses an existing
+`target/nix/profiles`. The default `scripts/build.sh` command builds the musl
+Rust binaries and creates `target/dist/opt` plus `target/dist/img`.
 
 ## Start All Nodes
 
 ```bash
 cd docs/examples
-export SSH_MESH_HOST3_VM_DIR=/path/to/result-default
 ./start_all.sh
 ```
 
 Press `Ctrl-C` to stop all nodes and their child services.
 
-Host3-vm needs VM artifacts from `SSH_MESH_HOST3_VM_DIR`, or explicit paths:
+After `scripts/build.sh profile`, `scripts/build.sh` copies the VM kernel into
+`target/dist/img` and builds `target/dist/img/ssh-mesh.erofs` from
+`target/dist/opt`. The example launchers use those dist artifacts directly:
 
-```bash
-export SSH_MESH_HOST3_VM_KERNEL=/path/to/vmlinux-or-bzImage
-export SSH_MESH_HOST3_VM_ROOTFS=/path/to/ssh-mesh.erofs
-./host3-vm/start.sh
+```text
+target/dist/opt
+target/dist/img/vmlinux-cloud
+target/dist/img/ssh-mesh.erofs
 ```
-
-`start_all.sh` also checks `result-default`, `docs/examples/share/host3-vm-vm`,
-`$NIX_PROFILE/opt/ssh-mesh/share/host3-vm-vm`, and `/opt/ssh-mesh`.
 
 After config-only edits, reload the relevant running daemon instead of
 restarting binaries. For example, inside a host/app environment:
@@ -227,6 +248,7 @@ cd docs/examples
 ssh -F ssh_config host1
 ssh -F ssh_config host2
 ssh -F ssh_config host3-vm
+ssh -F ssh_config host3-vm-root
 ssh -F ssh_config app1-bwrap
 ssh -F ssh_config app2-qemu
 ssh -F ssh_config app3-crosvm

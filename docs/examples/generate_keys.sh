@@ -23,6 +23,7 @@ find_meshkeys() {
 
 meshkeys="$(find_meshkeys)"
 nodes="host2 host1 host3-vm"
+users="root"
 
 user_principals="system,host1,host2,host3-vm"
 user_principals="${user_principals},system@host2.example.m,system@host3-vm.example.m"
@@ -58,6 +59,37 @@ for node in ${nodes}; do
     --domain "${domain}" \
     --host-principals "${node}.${domain},${node},127.0.0.1" \
     --user-principals "${principals}" \
+    sign
+
+  cp "${ca_dir}/id_ecdsa.pub" "${ssh_dir}/authorized_cas"
+  chmod 700 "${ssh_dir}"
+  chmod 600 "${ssh_dir}/id_ecdsa"
+  chmod 644 \
+    "${ssh_dir}/authorized_cas" \
+    "${ssh_dir}/id_ecdsa.pub" \
+    "${ssh_dir}/id_ecdsa.crt" \
+    "${ssh_dir}/id_ecdsa-host-cert.pub" \
+    "${ssh_dir}/id_ecdsa-user-cert.pub"
+done
+
+for user in ${users}; do
+  ssh_dir="${examples_dir}/${user}/home/${user}/.ssh"
+  rm -rf "${ssh_dir}"
+  mkdir -p "${ssh_dir}"
+
+  "${meshkeys}" \
+    --nodedir "${ssh_dir}" \
+    --name "${user}" \
+    --domain "${domain}" \
+    gen
+
+  "${meshkeys}" \
+    --cadir "${ca_dir}" \
+    --nodedir "${ssh_dir}" \
+    --name "${user}" \
+    --domain "${domain}" \
+    --host-principals "${user}.${domain},${user}" \
+    --user-principals "${user}@${domain}" \
     sign
 
   cp "${ca_dir}/id_ecdsa.pub" "${ssh_dir}/authorized_cas"

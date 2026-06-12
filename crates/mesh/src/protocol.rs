@@ -125,6 +125,31 @@ pub enum Request {
         env: HashMap<String, String>,
         #[serde(default)]
         context: Option<ActivationContext>,
+        /// Optional command string to execute. When absent, mesh-init starts
+        /// the user's interactive shell.
+        #[serde(default)]
+        command: Option<String>,
+    },
+
+    /// Resize an active terminal session that was returned by `start_terminal`.
+    #[serde(rename = "terminal_resize")]
+    TerminalResize {
+        terminal_id: String,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+    },
+
+    /// Send a control command to an active terminal session.
+    ///
+    /// Currently supported commands include `close`, `hup`, and `signal`.
+    #[serde(rename = "terminal_command")]
+    TerminalCommand {
+        terminal_id: String,
+        command: String,
+        #[serde(default)]
+        data: serde_json::Value,
     },
 
     /// Stop a running service.

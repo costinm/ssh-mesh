@@ -10,14 +10,14 @@ use axum::{
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use log::{debug, info};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use russh::server::Server;
 use rust_embed::RustEmbed;
+use std::io::{IoSlice, Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UnixStream};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
@@ -453,6 +453,89 @@ pub async fn handle_uds_proxy(
         .into_response()
 }
 
+async fn open_mesh_init_exec_stream(
+    cmd: String,
+    env: std::collections::HashMap<String, String>,
+) -> Result<UnixStream, anyhow::Error> {
+    let (child_end, parent_end) = std::os::unix::net::UnixStream::pair()?;
+    tokio::task::spawn_blocking(move || {
+        send_mesh_init_exec_fd_blocking(cmd, env, child_end.into())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("mesh-init exec task failed: {}", e))??;
+
+    parent_end.set_nonblocking(true)?;
+    Ok(UnixStream::from_std(parent_end)?)
+}
+
+fn send_mesh_init_exec_fd_blocking(
+    cmd: String,
+    env: std::collections::HashMap<String, String>,
+    fd: OwnedFd,
+) -> Result<(), anyhow::Error> {
+    let socket_path = mesh_init_socket_path();
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)?;
+    let user = std::env::var("USER").unwrap_or_else(|_| "system".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let request = mesh::protocol::Request::StartTerminal {
+        name: user,
+        home,
+        uid: unsafe { libc::getuid() },
+        gid: Some(unsafe { libc::getgid() }),
+        pty: false,
+        env,
+        context: None,
+        command: Some(cmd),
+    };
+    let line = serde_json::to_string(&request)?;
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let iov = [IoSlice::new(b"F")];
+    let fds = [fd.as_raw_fd()];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
+    sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)?;
+
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            break;
+        }
+        response.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    anyhow::ensure!(!response.is_empty(), "empty response from mesh-init");
+    let response = String::from_utf8(response)?;
+    let response: mesh::protocol::Response = serde_json::from_str(response.trim())?;
+    if response.success {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "mesh-init exec failed: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        ))
+    }
+}
+
+fn mesh_init_socket_path() -> String {
+    if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
+        return path;
+    }
+    if unsafe { libc::getuid() } == 0 {
+        "/run/mesh-init/control.sock".to_string()
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.run/mesh-init/control.sock", home)
+    }
+}
+
 /// Execute a shell command and stream stdin/stdout over the HTTP/2 body.
 ///
 /// Environment variables can be passed via `X-E-<NAME>` request headers.
@@ -497,29 +580,17 @@ pub async fn handle_exec(
         }
     }
 
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .envs(env_vars)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
+    let mesh_init_stream = match open_mesh_init_exec_stream(cmd.clone(), env_vars).await {
+        Ok(stream) => stream,
         Err(e) => {
-            tracing_error!("Failed to spawn command {}: {}", cmd, e);
+            tracing_error!("Failed to start mesh-init exec {}: {}", cmd, e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to spawn command: {}", e),
+                format!("Failed to start mesh-init exec: {}", e),
             )
                 .into_response();
         }
     };
-
-    let stdin = child.stdin.take().expect("Failed to open stdin");
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let mut stderr = child.stderr.take().expect("Failed to open stderr");
 
     // Create a bidirectional stream adapter for HTTP/2 body
     let (reader_tx, reader_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(100);
@@ -536,25 +607,12 @@ pub async fn handle_exec(
 
     // Forward data between the HTTP/2 stream and the child process
     tokio::spawn(async move {
-        // Task to log stderr
-        let cmd_clone = cmd.clone();
-        tokio::spawn(async move {
-            let mut buffer = [0; 8192];
-            loop {
-                match stderr.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let err_msg = String::from_utf8_lossy(&buffer[..n]);
-                        info!("Exec stderr [{}]: {}", cmd_clone, err_msg.trim());
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let child_io = tokio::io::join(stdout, stdin);
-        crate::utils::bridge(child_io, stream, &format!("Exec session for {}", cmd)).await;
-        let _ = child.wait().await;
+        crate::utils::bridge(
+            mesh_init_stream,
+            stream,
+            &format!("Exec session for {}", cmd),
+        )
+        .await;
         info!("Exec session completed for: {}", cmd);
     });
 
@@ -703,43 +761,15 @@ impl mesh::StreamHandler for ExecWsHandler {
         let parts: Vec<&str> = dest.splitn(5, '/').collect();
         let cmd = parts.get(4).unwrap_or(&"").to_string();
         info!("WS Executing command: {}", cmd);
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                tracing_error!("WS Exec spawn error for {}: {}", cmd, e);
-                return;
-            }
-        };
-
-        let stdin = child.stdin.take().expect("Failed to open stdin");
-        let stdout = child.stdout.take().expect("Failed to open stdout");
-        let mut stderr = child.stderr.take().expect("Failed to open stderr");
-
-        let cmd_clone = cmd.clone();
-        tokio::spawn(async move {
-            let mut buffer = [0; 8192];
-            loop {
-                match tokio::io::AsyncReadExt::read(&mut stderr, &mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let err_msg = String::from_utf8_lossy(&buffer[..n]);
-                        info!("WS Exec stderr [{}]: {}", cmd_clone, err_msg.trim());
-                    }
-                    Err(_) => break,
+        let mesh_init_stream =
+            match open_mesh_init_exec_stream(cmd.clone(), Default::default()).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing_error!("WS mesh-init exec error for {}: {}", cmd, e);
+                    return;
                 }
-            }
-        });
-
-        let child_io = tokio::io::join(stdout, stdin);
-        crate::utils::bridge(child_io, stream, &format!("WS Exec for {}", cmd)).await;
-        let _ = child.wait().await;
+            };
+        crate::utils::bridge(mesh_init_stream, stream, &format!("WS Exec for {}", cmd)).await;
         info!("WS Exec session completed for: {}", cmd);
     }
 }

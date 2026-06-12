@@ -1,6 +1,6 @@
 # ssh-mesh node configuration for app-bwrap.
 #
-# This file is installed by app-bwrap/start.sh at:
+# This file is copied by run_bwrap.sh into the app home at:
 #
 #   $HOME/.config/ssh-mesh/mesh.yaml
 #
@@ -13,9 +13,9 @@
 # Capabilities shown by this node:
 #
 #   Trusted stdio:    SSH_MESH_TRUSTED_STDIO=1 ssh-mesh
-#   HTTP UDS proxy:   POST /_m/_uds/home/app-bwrap/.run/pmond/control.sock
-#   Activator UDS:    /tmp/mesh/shared/app-bwrap/trusted.sock
+#   HTTP UDS proxy:   POST /_m/_uds/home/app1/.run/pmond/control.sock
+#   Activator UDS:    /tmp/mesh/shared/app1-bwrap/trusted.sock
 
 ssh_port: 18522
 http_port: 18580
-trusted_uds_path: /tmp/mesh/shared/app-bwrap/trusted.sock
+trusted_uds_path: /tmp/mesh/shared/app1-bwrap/trusted.sock

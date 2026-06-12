@@ -15,6 +15,6 @@ memory_max = "128M"
 cpu_weight = 50
 
 [environment]
-PATH = "/out/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
+PATH = "/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
 RUST_LOG = "info"
 
