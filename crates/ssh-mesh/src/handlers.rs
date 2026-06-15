@@ -486,6 +486,7 @@ fn send_mesh_init_exec_fd_blocking(
         env,
         context: None,
         command: Some(cmd),
+        fd_count: None,
     };
     let line = serde_json::to_string(&request)?;
     stream.write_all(line.as_bytes())?;

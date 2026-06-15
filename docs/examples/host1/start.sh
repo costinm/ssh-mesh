@@ -21,13 +21,21 @@ mkdir -p \
   "${root_dir}/shared/app1-bwrap" \
   "${root_dir}/shared/app2-qemu" \
   "${root_dir}/shared/app3-crosvm" \
-  "${root_dir}/shared/app4-ch"
+  "${root_dir}/shared/app4-ch" \
+  "${root_dir}/shared/app5-vm" \
+  "${root_dir}/vm-artifacts"
 
 rm -rf "${root_dir}/shared/app2" "${root_dir}/shared/app2-vsock"
 
+for artifact in vmlinux-cloud ssh-mesh.erofs modules-cloud.erofs; do
+  if [ -r "${target_dir}/dist/img/${artifact}" ]; then
+    cp -f "${target_dir}/dist/img/${artifact}" "${root_dir}/vm-artifacts/${artifact}"
+  fi
+done
+
 export NIX_PROFILE="${NIX_PROFILE:-${default_nix_profile}}"
 export SSH_MESH_OPT_DIR="${staged_opt}"
-export SSH_MESH_EXAMPLE_ROOT="${root_dir}"
+export SSH_MESH_STATE_ROOT="${root_dir}"
 export SSH_MESH_APP_NAME=host1
 export SSH_MESH_APP_HOME=system
 export SSH_MESH_APP_TEMPLATE_DIR="${example_dir}"
@@ -39,6 +47,5 @@ export SSH_MESH_BWRAP_BIND_STATE=1
 export SSH_MESH_BWRAP_ROOT=0
 export SSH_MESH_BWRAP_NET=share
 export SSH_MESH_BWRAP_DEVICES=1
-export SSH_MESH_HOST3_VM_HOST_SSH_PORT="${SSH_MESH_HOST3_VM_HOST_SSH_PORT:-18322}"
 
 exec "${staged_opt}/ssh-mesh/bin/run_bwrap.sh" "$@"

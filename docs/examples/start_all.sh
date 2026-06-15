@@ -7,7 +7,8 @@ set -euo pipefail
 #   host2:    remote host on SSH 18222 / HTTP 18280
 #   host3-vm: worker VM host on SSH 18322 / HTTP 18380
 #
-# The host1 node installs mesh-init activation sockets for app1-bwrap.
+# The host1 node installs mesh-init activation sockets for app1-bwrap and
+# app5-vm.
 # Host3-vm installs activation sockets for app2/app3/app4 VM apps.
 #
 # Host2 and host1 run through the shared bubblewrap launcher. Host3-vm is
@@ -17,7 +18,7 @@ set -euo pipefail
 # namespace. Host3-vm's TCP ports are forwarded from vrun's QEMU user
 # networking.
 #
-#   $SSH_MESH_EXAMPLE_ROOT/shared
+#   $SSH_MESH_STATE_ROOT/shared
 #
 # Build scripts create package artifacts under target/dist. The example base dir
 # is state only; bwrap hosts bind target/dist/opt as /opt, and VMs get that same
@@ -26,7 +27,7 @@ set -euo pipefail
 examples_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace_dir="$(cd "${examples_dir}/../.." 2>/dev/null && pwd)"
 target_dir="${SSH_MESH_TARGET_DIR:-${workspace_dir}/target}"
-root_dir="${1:-${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}}"
+root_dir="${1:-${SSH_MESH_STATE_ROOT:-${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}}}"
 artifact_dir="${target_dir}/dist"
 default_nix_profile="${target_dir}/nix/profile"
 if [ ! -e "${default_nix_profile}" ] && [ -e "${target_dir}/nix/profiles" ]; then
@@ -39,7 +40,7 @@ run_dir="${root_dir}/run"
 pid_file="${run_dir}/start_all.pids"
 
 export NIX_PROFILE="${nix_profile}"
-export SSH_MESH_EXAMPLE_ROOT="${root_dir}"
+export SSH_MESH_STATE_ROOT="${root_dir}"
 export PATH="${staged_opt}/ssh-mesh/bin:${staged_opt}/busybox/bin:${NIX_PROFILE}/bin:${PATH}"
 
 need() {
@@ -285,6 +286,7 @@ Fixed listeners:
 
 Trusted UDS sockets:
   ${root_dir}/shared/app1-bwrap/trusted.sock  (activated by host1 mesh-init)
+  ${root_dir}/shared/app5-vm/trusted.sock    (activated by host1 mesh-init, VM vsock)
   ${root_dir}/shared/host3-vm/trusted.sock
   ${root_dir}/shared/app2-qemu/trusted.sock (activated by host3-vm mesh-init, qemu vsock)
   ${root_dir}/shared/app3-crosvm/trusted.sock (activated by host3-vm mesh-init, crosvm vsock)
@@ -337,6 +339,7 @@ Example SSH shells:
   ssh -F ssh_config app2-qemu
   ssh -F ssh_config app3-crosvm
   ssh -F ssh_config app4-ch
+  ssh -F ssh_config app5-vm
 
 Direct SSH shells:
   ssh -F ssh_config host2-direct
@@ -368,6 +371,11 @@ Example pmond local forwards:
     -L 127.0.0.1:19286:/home/app2/.run/pmond/control.sock \\
     app2-qemu
   curl http://127.0.0.1:19286/_m/pmon/_ps
+
+  ssh -N -F ssh_config \\
+    -L 127.0.0.1:19287:/home/app5/.run/pmond/control.sock \\
+    app5-vm
+  curl http://127.0.0.1:19287/_m/pmon/_ps
 
 Press Ctrl-C to stop all example nodes.
 EOF

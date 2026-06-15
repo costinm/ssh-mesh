@@ -134,7 +134,10 @@ impl MeshListener {
 
                 let is_authorized = match &self.auth {
                     Some(a) => a.is_uid_authorized(peer_uid, self.current_uid),
-                    None => peer_uid == 0 || peer_uid == self.current_uid,
+                    None => crate::auth::AuthConfig::is_builtin_uid_authorized(
+                        peer_uid,
+                        self.current_uid,
+                    ),
                 };
 
                 if is_authorized {

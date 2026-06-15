@@ -6,10 +6,10 @@ usage() {
 usage: run_bwrap.sh [--daemon|--stdio]
 
 Environment:
-  SSH_MESH_APP_NAME          instance name, for example host1 or app1-bwrap
-  SSH_MESH_APP_HOME          home basename inside the sandbox, for example system
-  SSH_MESH_APP_TEMPLATE_DIR  source home template, or a host dir with home/*
-  SSH_MESH_EXAMPLE_ROOT      mutable state root mounted by the parent host
+  SSH_MESH_APP_NAME          instance name
+  SSH_MESH_APP_HOME          home basename inside the sandbox
+  SSH_MESH_APP_TEMPLATE_DIR  optional source home template, or a host dir with home/*
+  SSH_MESH_STATE_ROOT        mutable state root mounted by the parent host
   SSH_MESH_OPT_DIR           staged package tree mounted as /opt
 EOF
 }
@@ -31,13 +31,24 @@ if [ "$#" -gt 0 ]; then
   shift
 fi
 
-app="${SSH_MESH_APP_NAME:-${SSH_MESH_BWRAP_APP:-app1-bwrap}}"
-app_home="${SSH_MESH_APP_HOME:-app1}"
-root_dir="${SSH_MESH_EXAMPLE_ROOT:-/tmp/mesh/state}"
-template_dir="${SSH_MESH_APP_TEMPLATE_DIR:-${root_dir}/host1/home/${app}}"
+app="${SSH_MESH_APP_NAME:-${SSH_MESH_BWRAP_APP:-}}"
+if [ -z "${app}" ]; then
+  app="$(basename "$0")"
+  case "${app}" in
+    run_bwrap.sh|run_bwrap) app="" ;;
+  esac
+fi
+if [ -z "${app}" ]; then
+  echo "run_bwrap.sh requires SSH_MESH_APP_NAME" >&2
+  exit 2
+fi
+app_home="${SSH_MESH_APP_HOME:-${app}}"
+root_dir="${SSH_MESH_STATE_ROOT:-${PWD}/target/ssh-mesh-state}"
+template_dir="${SSH_MESH_APP_TEMPLATE_DIR:-}"
 state_dir="${SSH_MESH_APP_STATE_DIR:-${root_dir}/${app}}"
 home_dir="${SSH_MESH_APP_HOME_DIR:-${state_dir}/home/${app_home}}"
 shared_dir="${SSH_MESH_SHARED_DIR:-${root_dir}/shared}"
+state_mount="${SSH_MESH_STATE_MOUNT:-/tmp/mesh/state}"
 nix_profile="${NIX_PROFILE:-/nix-profile}"
 inner_nix_profile="${nix_profile}"
 opt_dir="${SSH_MESH_OPT_DIR:-}"
@@ -51,21 +62,15 @@ mkdir -p \
   "${shared_dir}" \
   "${state_dir}/run"
 
-if [ "${SSH_MESH_BWRAP_COPY_HOME_SET:-0}" != "0" ] && [ -d "${template_dir}/home" ]; then
+if [ -n "${template_dir}" ] && [ "${SSH_MESH_BWRAP_COPY_HOME_SET:-0}" != "0" ] && [ -d "${template_dir}/home" ]; then
   for template_home in "${template_dir}/home/"*; do
     [ -d "${template_home}" ] || continue
     name="$(basename "${template_home}")"
     mkdir -p "${state_dir}/home/${name}"
     cp -R "${template_home}/." "${state_dir}/home/${name}/"
   done
-elif [ -d "${template_dir}" ]; then
+elif [ -n "${template_dir}" ] && [ -d "${template_dir}" ]; then
   cp -R "${template_dir}/." "${home_dir}/"
-fi
-
-if [ -n "${SSH_MESH_HOST3_VM_HOST_SSH_PORT:-}" ] && [ -f "${home_dir}/.config/ssh-mesh/mesh.yaml" ]; then
-  sed -i \
-    "s/port: 18322/port: ${SSH_MESH_HOST3_VM_HOST_SSH_PORT}/g" \
-    "${home_dir}/.config/ssh-mesh/mesh.yaml"
 fi
 
 if [ -e "${nix_profile}" ]; then
@@ -93,11 +98,17 @@ if [ -e "${nix_profile}" ]; then
   package_args+=(--ro-bind "$(readlink -f "${nix_profile}")" "${inner_nix_profile}")
 fi
 
-state_args=(--dir /tmp/mesh/state)
+state_args=(--dir "${state_mount}")
 if [ "${SSH_MESH_BWRAP_BIND_STATE:-0}" != "0" ]; then
-  state_args=(--bind "${root_dir}" /tmp/mesh/state)
+  state_args=(--bind "${root_dir}" "${state_mount}")
 fi
 
+# TODO: simplify.
+# 1. trusted as current user - net shared, run as current UID.
+#    From mesh-init - user already set by mesh-init along with home.
+#
+# 2. untrusted net (default) - unshare net, run as uid 0/gid 0, start mesh-init/ssh-mesh sidecar.
+#    From mesh-init - user already set, run as the given user with mesh-init/ssh-mesh in user mode, not root.
 user_args=()
 if [ "${SSH_MESH_BWRAP_ROOT:-1}" != "0" ]; then
   user_args=(--unshare-user --uid 0 --gid 0)
@@ -166,7 +177,7 @@ exec bwrap \
   --setenv PATH "/opt/ssh-mesh/bin:/opt/busybox/bin:${inner_nix_profile}/bin" \
   --setenv RUST_LOG "${RUST_LOG:-info}" \
   --setenv NIX_PROFILE "${inner_nix_profile}" \
-  --setenv SSH_MESH_EXAMPLE_ROOT /tmp/mesh/state \
+  --setenv SSH_MESH_STATE_ROOT "${state_mount}" \
   --setenv MESH_INIT_SOCK "/home/${app_home}/.run/mesh-init/control.sock" \
   --setenv SSH_MESH_HOME_ROOT /home \
   "${mode_env[@]}" \

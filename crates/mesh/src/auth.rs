@@ -13,6 +13,12 @@
 //!   and email addresses `@example.com` or `@*.example.com`
 
 use serde::{Deserialize, Serialize};
+
+/// Hardcoded UID allowed to talk to local mesh control sockets.
+///
+/// Debian commonly assigns this UID to the `sshd` user. ssh-mesh may run as
+/// that service account while mesh-init runs as root or the app owner.
+pub const DEFAULT_TRUSTED_SSHD_UID: u32 = 103;
 use tracing::warn;
 
 // ============================================================================
@@ -93,12 +99,21 @@ pub struct DelegationEnvelope {
 // ============================================================================
 
 impl AuthConfig {
+    /// Check the built-in local UDS peer allowlist.
+    ///
+    /// Root (UID 0), the daemon's own UID (`current_uid`), and the hardcoded
+    /// sshd service UID are always authorized.
+    pub fn is_builtin_uid_authorized(uid: u32, current_uid: u32) -> bool {
+        uid == 0 || uid == current_uid || uid == DEFAULT_TRUSTED_SSHD_UID
+    }
+
     /// Check if a UID is authorized to connect directly.
     ///
-    /// Root (UID 0) and the daemon's own UID (`current_uid`) are always
-    /// authorized. Otherwise the UID must appear in a `[[peer]]` entry.
+    /// Root (UID 0), the daemon's own UID (`current_uid`), and the hardcoded
+    /// sshd service UID are always authorized. Otherwise the UID must appear in
+    /// a `[[peer]]` entry.
     pub fn is_uid_authorized(&self, uid: u32, current_uid: u32) -> bool {
-        if uid == 0 || uid == current_uid {
+        if Self::is_builtin_uid_authorized(uid, current_uid) {
             return true;
         }
         self.peers.iter().any(|p| p.uid == Some(uid))
@@ -357,6 +372,12 @@ mod tests {
     fn test_auth_self_always_authorized() {
         let config = AuthConfig::default();
         assert!(config.is_uid_authorized(5000, 5000));
+    }
+
+    #[test]
+    fn test_auth_default_sshd_uid_always_authorized() {
+        let config = AuthConfig::default();
+        assert!(config.is_uid_authorized(DEFAULT_TRUSTED_SSHD_UID, 5000));
     }
 
     #[test]

@@ -70,9 +70,12 @@ async fn test_mux_functionality() -> Result<()> {
     println!("Executing command via mux: {}", cmd);
 
     use std::os::unix::io::AsRawFd;
-    let stdin = std::io::stdin().as_raw_fd();
-    let stdout = std::io::stdout().as_raw_fd();
-    let stderr = std::io::stderr().as_raw_fd();
+    let null_in = std::fs::File::open("/dev/null")?;
+    let null_out = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+    let null_err = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+    let stdin = null_in.as_raw_fd();
+    let stdout = null_out.as_raw_fd();
+    let stderr = null_err.as_raw_fd();
 
     let (session_id, exit_code) = client
         .new_session(&cmd, false, stdin, stdout, stderr)

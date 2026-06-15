@@ -9,7 +9,7 @@ set -euo pipefail
 examples_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace_dir="$(cd "${examples_dir}/../.." 2>/dev/null && pwd)"
 target_dir="${SSH_MESH_TARGET_DIR:-${workspace_dir}/target}"
-root_dir="${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}"
+root_dir="${SSH_MESH_STATE_ROOT:-${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}}"
 log_dir="${root_dir}/logs/ssh-ls-dev"
 
 ssh_config="${SSH_MESH_SSH_CONFIG:-${examples_dir}/ssh_config}"
@@ -17,7 +17,7 @@ host1_port="${SSH_MESH_HOST1_SSH_PORT:-18422}"
 timeout_secs="${SSH_MESH_DEV_LS_TIMEOUT:-180}"
 runs="${SSH_MESH_DEV_LS_RUNS:-2}"
 
-targets="${SSH_MESH_DEV_LS_TARGETS:-host1 host2 app1-bwrap host3-vm app2-qemu app3-crosvm app4-ch}"
+targets="${SSH_MESH_DEV_LS_TARGETS:-host1 host2 app1-bwrap host3-vm app2-qemu app3-crosvm app4-ch app5-vm}"
 
 for f in "${ssh_config}" "${examples_dir}/host1/home/system/.ssh/id_ecdsa" "${examples_dir}/host1/home/system/.ssh/id_ecdsa-user-cert.pub"; do
   if [ ! -r "${f}" ]; then

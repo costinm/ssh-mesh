@@ -238,6 +238,7 @@ impl Daemon {
                 env,
                 context,
                 command,
+                ..
             } => self.handle_start_terminal(&name, &home, uid, gid, pty, env, context, command, fd),
             _ => Response::err("request does not accept a passed file descriptor"),
         }
@@ -1094,6 +1095,7 @@ priority = 300
             ]),
             context: None,
             command: None,
+            fd_count: None,
         };
 
         let response = daemon
@@ -1140,6 +1142,7 @@ priority = 300
             pty: false,
             context: None,
             command: None,
+            fd_count: None,
         };
 
         let response = daemon

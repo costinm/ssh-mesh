@@ -13,6 +13,9 @@ oneshot = true
 socket = "/tmp/mesh/shared/app2-qemu/trusted.sock"
 wait = false
 
+[[peer]]
+uid = 103
+
 [resources]
 memory_high = "384M"
 memory_max = "768M"

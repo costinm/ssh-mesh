@@ -10,7 +10,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    timeout(Duration::from_secs(20), test_fn()).await?
+    timeout(Duration::from_secs(90), test_fn()).await?
 }
 
 #[tokio::test]

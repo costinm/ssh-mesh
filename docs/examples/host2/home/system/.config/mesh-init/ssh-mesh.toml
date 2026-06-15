@@ -17,6 +17,9 @@ command = "ssh-mesh"
 priority = 100
 oneshot = false
 
+[[peer]]
+uid = 103
+
 [resources]
 # These are advisory in unprivileged bubblewrap examples. They are included so
 # the config exercises mesh-init's resource model when cgroup access is present.

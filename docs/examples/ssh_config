@@ -70,30 +70,37 @@ Host host3-vm-root
   IdentityFile root/home/root/.ssh/id_ecdsa
   CertificateFile root/home/root/.ssh/id_ecdsa-user-cert.pub
 
-Host app1-bwrap
+Host app1-bwrap app1
   HostName 127.0.0.1
   Port 18422
   User system@app1-bwrap.example.m
   IdentityFile host1/home/system/.ssh/id_ecdsa
   CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
 
-Host app2-qemu
+Host app2-qemu app2 qemu
   HostName 127.0.0.1
   Port 18422
   User system@app2-qemu.example.m
   IdentityFile host1/home/system/.ssh/id_ecdsa
   CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
 
-Host app3-crosvm
+Host app3-crosvm app3 crosvm
   HostName 127.0.0.1
   Port 18422
   User system@app3-crosvm.example.m
   IdentityFile host1/home/system/.ssh/id_ecdsa
   CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
 
-Host app4-ch
+Host app4-ch app4 ch
   HostName 127.0.0.1
   Port 18422
   User system@app4-ch.example.m
+  IdentityFile host1/home/system/.ssh/id_ecdsa
+  CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub
+
+Host app5-vm app5
+  HostName 127.0.0.1
+  Port 18422
+  User system@app5-vm.example.m
   IdentityFile host1/home/system/.ssh/id_ecdsa
   CertificateFile host1/home/system/.ssh/id_ecdsa-user-cert.pub

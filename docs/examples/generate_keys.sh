@@ -31,6 +31,7 @@ user_principals="${user_principals},system@app1-bwrap.example.m"
 user_principals="${user_principals},system@app2-qemu.example.m"
 user_principals="${user_principals},system@app3-crosvm.example.m"
 user_principals="${user_principals},system@app4-ch.example.m"
+user_principals="${user_principals},system@app5-vm.example.m"
 
 rm -rf "${ca_dir}"
 mkdir -p "${ca_dir}"

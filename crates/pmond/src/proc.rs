@@ -548,79 +548,69 @@ fn spawn_snapshot_checker(
     config: Arc<Mutex<ProcCfg>>,
     psi_watcher: Arc<PsiWatcher>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
-        run_snapshot_loop(running, snap1, snap2, config, psi_watcher);
+    tokio::spawn(async move {
+        while running.load(Ordering::SeqCst) {
+            let interval = get_refresh_interval(&config);
+            tokio::time::sleep(interval).await;
+
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let snap1_clone = snap1.clone();
+            let snap2_clone = snap2.clone();
+            let psi_watcher_clone = psi_watcher.clone();
+
+            let _ = tokio::task::spawn_blocking(move || {
+                // Take fresh snapshot
+                let new_processes = read_existing_processes_impl();
+
+                // --------------------------------------------------------------------
+                // PSI Watcher Logic
+                // --------------------------------------------------------------------
+
+                // 1. Extract the set of cgroups referenced from each process in the new list
+                let active_cgroups: HashSet<String> = new_processes
+                    .values()
+                    .filter_map(|p| p.cgroup_path.clone())
+                    .collect();
+
+                // 2. Pass it to the psi_watcher - it should iterate over the cgroups it is watching
+                // and remove any that is not present in the new list.
+                psi_watcher_clone.prune_cgroups(&active_cgroups);
+
+                // 3. Go over snap2 - and find the set of cgroups referenced that is still present
+                // in the set discovered at the first step.
+                let stable_cgroups: HashSet<String> = {
+                    let s2 = snap2_clone.lock();
+                    s2.values()
+                        .filter_map(|p| p.cgroup_path.clone())
+                        .filter(|path| active_cgroups.contains(path))
+                        .collect()
+                };
+
+                // 4. Pass it to psi watcher, and have it add any cgroup that is not already watched.
+                // This will ensure psi is watching 'old' cgroups for processes that are still running.
+                psi_watcher_clone.watch_cgroups(&stable_cgroups);
+
+                // --------------------------------------------------------------------
+                // Delta Calculation and Snapshot Rotation
+                // The intent is to know what changed in last 2 intervals.
+                // --------------------------------------------------------------------
+                {
+                    let mut s1 = snap1_clone.lock();
+                    let mut s2 = snap2_clone.lock();
+
+                    // 6. Finally set snap2 with snap1 and snap1 with new_processes
+                    // snap2 becomes the previous snap1 (T-1)
+                    *s2 = s1.clone();
+                    // snap1 becomes the new processes (T)
+                    *s1 = new_processes;
+                }
+            })
+            .await;
+        }
     })
-}
-
-/// Main loop for periodic snapshot checking.
-/// Main loop for periodic snapshot checking.
-fn run_snapshot_loop(
-    running: Arc<AtomicBool>,
-    snap1: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
-    snap2: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
-    config: Arc<Mutex<ProcCfg>>,
-    psi_watcher: Arc<PsiWatcher>,
-) {
-    while running.load(Ordering::SeqCst) {
-        let interval = get_refresh_interval(&config);
-        std::thread::sleep(interval);
-
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // Take fresh snapshot
-        let new_processes = read_existing_processes_impl();
-
-        // --------------------------------------------------------------------
-        // PSI Watcher Logic
-        // --------------------------------------------------------------------
-
-        // 1. Extract the set of cgroups referenced from each process in the new list
-        let active_cgroups: HashSet<String> = new_processes
-            .values()
-            .filter_map(|p| p.cgroup_path.clone())
-            .collect();
-
-        // 2. Pass it to the psi_watcher - it should iterate over the cgroups it is watching
-        // and remove any that is not present in the new list.
-        psi_watcher.prune_cgroups(&active_cgroups);
-
-        // 3. Go over snap2 - and find the set of cgroups referenced that is still present
-        // in the set discovered at the first step.
-        let stable_cgroups: HashSet<String> = {
-            let s2 = snap2.lock();
-            s2.values()
-                .filter_map(|p| p.cgroup_path.clone())
-                .filter(|path| active_cgroups.contains(path))
-                .collect()
-        };
-
-        // 4. Pass it to psi watcher, and have it add any cgroup that is not already watched.
-        // This will ensure psi is watching 'old' cgroups for processes that are still running.
-        psi_watcher.watch_cgroups(&stable_cgroups);
-
-        // --------------------------------------------------------------------
-        // Delta Calculation and Snapshot Rotation
-        // The intent is to know what changed in last 2 intervals.
-        // --------------------------------------------------------------------
-        {
-            let mut s1 = snap1.lock();
-            let mut s2 = snap2.lock();
-
-            // 6. Compute the delta between snap1 and new_processes, saving the delta in new_processes
-            // new_processes contains processes from T. snap1 contains processes from T-1.
-            // We update new_processes to hold the diffs (T) - (T-1).
-            // calculate_memory_deltas removed
-
-            // 7. Finally set snap2 with snap1 and snap1 with new_processes
-            // snap2 becomes the previous snap1 (T-1)
-            *s2 = s1.clone();
-            // snap1 becomes the new processes (T)
-            *s1 = new_processes;
-        }
-    }
 }
 
 /// Get refresh interval from config, defaulting to 20 seconds.

@@ -636,16 +636,15 @@ impl SshHandler {
         });
     }
 
-    async fn bridge_command_stream_to_channel<S>(
-        stream: S,
+    async fn bridge_command_streams_to_channel(
+        stdin_stream: tokio::net::UnixStream,
+        stdout_stream: tokio::net::UnixStream,
+        stderr_stream: tokio::net::UnixStream,
         channel_id: ChannelId,
         channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
         session_handle: server::Handle,
         label: String,
-    ) where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let (reader, writer) = tokio::io::split(stream);
+    ) {
         let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
         {
             let mut writers = channel_writers.lock().await;
@@ -653,24 +652,39 @@ impl SshHandler {
         }
 
         let channel_writers_clone = channel_writers.clone();
-        let label_to_ssh = format!("{} to SSH", label);
+        let label_from_ssh = format!("SSH to {} (stdin)", label);
         tokio::spawn(async move {
-            crate::utils::pipe_read_to_ssh_with_exit_status(
-                reader,
-                session_handle,
-                channel_id,
-                &label_to_ssh,
-                0,
-            )
-            .await;
+            crate::utils::pipe_rx_to_write(rx, stdin_stream, &label_from_ssh).await;
             let mut writers = channel_writers_clone.lock().await;
             writers.remove(&channel_id);
         });
 
         let channel_writers_clone = channel_writers.clone();
-        let label_from_ssh = format!("SSH to {}", label);
         tokio::spawn(async move {
-            crate::utils::pipe_rx_to_write(rx, writer, &label_from_ssh).await;
+            let label_stdout_to_ssh = format!("{} stdout to SSH", label);
+            let label_stderr_to_ssh = format!("{} stderr to SSH", label);
+
+            let stdout_fut = crate::utils::pipe_read_to_ssh_no_close(
+                stdout_stream,
+                session_handle.clone(),
+                channel_id,
+                &label_stdout_to_ssh,
+            );
+
+            let stderr_fut = crate::utils::pipe_read_to_ssh_extended(
+                stderr_stream,
+                session_handle.clone(),
+                channel_id,
+                1,
+                &label_stderr_to_ssh,
+            );
+
+            tokio::join!(stdout_fut, stderr_fut);
+
+            let _ = session_handle.exit_status_request(channel_id, 0).await;
+            let _ = session_handle.eof(channel_id).await;
+            let _ = session_handle.close(channel_id).await;
+
             let mut writers = channel_writers_clone.lock().await;
             writers.remove(&channel_id);
         });
@@ -884,13 +898,15 @@ impl SshHandler {
                     anyhow::anyhow!("{} requires mesh-init terminal delegation", label)
                 })?;
                 let env = channel_session.env.clone();
-                let (stream, control) =
+                let (stdin_stream, stdout_stream, stderr_stream, control) =
                     send_stdio_to_mesh_init(terminal, command.clone(), env).await?;
                 channel_session.mesh_init_terminal = Some(control);
                 drop(sessions_lock);
 
-                Self::bridge_command_stream_to_channel(
-                    stream,
+                Self::bridge_command_streams_to_channel(
+                    stdin_stream,
+                    stdout_stream,
+                    stderr_stream,
                     channel_id,
                     channel_writers.clone(),
                     session_handle.clone(),
@@ -1160,10 +1176,12 @@ async fn send_terminal_to_mesh_init_with_term(
     term: String,
     command: Option<String>,
 ) -> Result<MeshInitTerminalControl, anyhow::Error> {
+    use std::os::fd::AsRawFd;
+    let slave_fd = OwnedFd::from(slave);
     tokio::task::spawn_blocking(move || {
         send_start_terminal_to_mesh_init_blocking(
             terminal,
-            slave.into(),
+            &[slave_fd.as_raw_fd()],
             true,
             term,
             command,
@@ -1178,12 +1196,34 @@ async fn send_stdio_to_mesh_init(
     terminal: MeshInitTerminal,
     command: Option<String>,
     env: std::collections::HashMap<String, String>,
-) -> Result<(tokio::net::UnixStream, MeshInitTerminalControl), anyhow::Error> {
-    let (child_end, parent_end) = std::os::unix::net::UnixStream::pair()?;
+) -> Result<
+    (
+        tokio::net::UnixStream,
+        tokio::net::UnixStream,
+        tokio::net::UnixStream,
+        MeshInitTerminalControl,
+    ),
+    anyhow::Error,
+> {
+    let (stdin_child, stdin_parent) = std::os::unix::net::UnixStream::pair()?;
+    let (stdout_child, stdout_parent) = std::os::unix::net::UnixStream::pair()?;
+    let (stderr_child, stderr_parent) = std::os::unix::net::UnixStream::pair()?;
+
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let stdin_child_fd = OwnedFd::from(stdin_child);
+    let stdout_child_fd = OwnedFd::from(stdout_child);
+    let stderr_child_fd = OwnedFd::from(stderr_child);
+
+    let fds = [
+        stdin_child_fd.as_raw_fd(),
+        stdout_child_fd.as_raw_fd(),
+        stderr_child_fd.as_raw_fd(),
+    ];
+
     let control = tokio::task::spawn_blocking(move || {
         send_start_terminal_to_mesh_init_blocking(
             terminal,
-            child_end.into(),
+            &fds,
             false,
             "xterm-256color".to_string(),
             command,
@@ -1193,14 +1233,24 @@ async fn send_stdio_to_mesh_init(
     .await
     .map_err(|e| anyhow::anyhow!("mesh-init stdio task failed: {}", e))??;
 
-    parent_end.set_nonblocking(true)?;
-    let stream = tokio::net::UnixStream::from_std(parent_end)?;
-    Ok((stream, control))
+    drop(stdin_child_fd);
+    drop(stdout_child_fd);
+    drop(stderr_child_fd);
+
+    stdin_parent.set_nonblocking(true)?;
+    stdout_parent.set_nonblocking(true)?;
+    stderr_parent.set_nonblocking(true)?;
+
+    let stdin_stream = tokio::net::UnixStream::from_std(stdin_parent)?;
+    let stdout_stream = tokio::net::UnixStream::from_std(stdout_parent)?;
+    let stderr_stream = tokio::net::UnixStream::from_std(stderr_parent)?;
+
+    Ok((stdin_stream, stdout_stream, stderr_stream, control))
 }
 
 fn send_start_terminal_to_mesh_init_blocking(
     terminal: MeshInitTerminal,
-    fd: OwnedFd,
+    fds: &[std::os::unix::io::RawFd],
     pty: bool,
     term: String,
     command: Option<String>,
@@ -1225,6 +1275,7 @@ fn send_start_terminal_to_mesh_init_blocking(
         env,
         context: None,
         command,
+        fd_count: Some(fds.len() as u32),
     };
     let line = serde_json::to_string(&request)?;
     stream.write_all(line.as_bytes())?;
@@ -1232,8 +1283,7 @@ fn send_start_terminal_to_mesh_init_blocking(
     stream.flush()?;
 
     let iov = [IoSlice::new(b"F")];
-    let fds = [fd.as_raw_fd()];
-    let cmsg = [ControlMessage::ScmRights(&fds)];
+    let cmsg = [ControlMessage::ScmRights(fds)];
     sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)?;
 
     let response = read_mesh_init_response_blocking(&mut stream)?;

@@ -48,6 +48,17 @@ impl ControlServer {
         // Ensure parent directory exists
         if let Some(parent) = std::path::Path::new(&self.socket_path).parent() {
             let _ = std::fs::create_dir_all(parent);
+            if unsafe { libc::getuid() } == 0
+                && let Ok(path) = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())
+            {
+                let _ = unsafe {
+                    libc::chown(
+                        path.as_ptr(),
+                        u32::MAX,
+                        mesh::auth::DEFAULT_TRUSTED_SSHD_UID,
+                    )
+                };
+            }
             if let Ok(metadata) = std::fs::metadata(parent) {
                 let mut perms = metadata.permissions();
                 std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o770);
@@ -56,6 +67,17 @@ impl ControlServer {
         }
 
         let listener = UnixListener::bind(&self.socket_path)?;
+        if unsafe { libc::getuid() } == 0
+            && let Ok(path) = std::ffi::CString::new(self.socket_path.as_str())
+        {
+            let _ = unsafe {
+                libc::chown(
+                    path.as_ptr(),
+                    u32::MAX,
+                    mesh::auth::DEFAULT_TRUSTED_SSHD_UID,
+                )
+            };
+        }
 
         // Set permissions so root/owner/group can connect
         let mut perms = std::fs::metadata(&self.socket_path)?.permissions();
@@ -87,13 +109,17 @@ impl ControlServer {
                 let auth = configs.values().find_map(|c| c.auth.as_ref());
                 match auth {
                     Some(auth_config) => auth_config.is_uid_authorized(peer_uid, current_uid),
-                    None => peer_uid == 0 || peer_uid == current_uid,
+                    None => {
+                        mesh::auth::AuthConfig::is_builtin_uid_authorized(peer_uid, current_uid)
+                    }
                 }
             };
             if !is_authorized {
                 error!(
-                    "Rejected connection from UID {} (expected 0 or {})",
-                    peer_uid, current_uid
+                    "Rejected connection from UID {} (expected 0, {}, or {})",
+                    peer_uid,
+                    current_uid,
+                    mesh::auth::DEFAULT_TRUSTED_SSHD_UID
                 );
                 continue;
             }
@@ -123,11 +149,19 @@ enum ProtocolFormat {
 fn parse_incoming(trimmed: &str) -> (ProtocolFormat, Result<Request, String>) {
     if !trimmed.starts_with('{') {
         let parsed = parse_text_command(trimmed);
-        (ProtocolFormat::TextCommand, parsed.map_err(|e| e.to_string()))
+        (
+            ProtocolFormat::TextCommand,
+            parsed.map_err(|e| e.to_string()),
+        )
     } else {
         let val: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
-            Err(e) => return (ProtocolFormat::FlatJson { id: None }, Err(format!("Invalid JSON: {}", e))),
+            Err(e) => {
+                return (
+                    ProtocolFormat::FlatJson { id: None },
+                    Err(format!("Invalid JSON: {}", e)),
+                );
+            }
         };
 
         if let Some(obj) = val.as_object() {
@@ -136,7 +170,12 @@ fn parse_incoming(trimmed: &str) -> (ProtocolFormat, Result<Request, String>) {
                 let format = ProtocolFormat::JsonRpc { id };
                 let method = match obj.get("method").and_then(|m| m.as_str()) {
                     Some(m) => m,
-                    None => return (format, Err("Missing or invalid 'method' in JSON-RPC request".to_string())),
+                    None => {
+                        return (
+                            format,
+                            Err("Missing or invalid 'method' in JSON-RPC request".to_string()),
+                        );
+                    }
                 };
 
                 let mut flat = serde_json::Map::new();
@@ -148,7 +187,10 @@ fn parse_incoming(trimmed: &str) -> (ProtocolFormat, Result<Request, String>) {
                             flat.insert(k.clone(), v.clone());
                         }
                     } else if !params.is_null() {
-                        return (format, Err("JSON-RPC 'params' must be an object".to_string()));
+                        return (
+                            format,
+                            Err("JSON-RPC 'params' must be an object".to_string()),
+                        );
                     }
                 }
 
@@ -164,7 +206,10 @@ fn parse_incoming(trimmed: &str) -> (ProtocolFormat, Result<Request, String>) {
                 }
             }
         } else {
-            (ProtocolFormat::FlatJson { id: None }, Err("JSON payload is not an object".to_string()))
+            (
+                ProtocolFormat::FlatJson { id: None },
+                Err("JSON payload is not an object".to_string()),
+            )
         }
     }
 }
@@ -180,7 +225,9 @@ fn parse_text_command(line: &str) -> Result<Request> {
             name: tokens.get(1).map(|s| s.to_string()),
         }),
         "start" => {
-            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            let name = tokens
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
             Ok(Request::Start {
                 name: name.to_string(),
                 args: tokens[2..].iter().map(|s| s.to_string()).collect(),
@@ -189,7 +236,9 @@ fn parse_text_command(line: &str) -> Result<Request> {
             })
         }
         "stop" => {
-            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            let name = tokens
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
             let mut signal = None;
             let mut i = 2;
             while i < tokens.len() {
@@ -205,12 +254,20 @@ fn parse_text_command(line: &str) -> Result<Request> {
             })
         }
         "freeze" => {
-            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
-            Ok(Request::Freeze { name: name.to_string() })
+            let name = tokens
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            Ok(Request::Freeze {
+                name: name.to_string(),
+            })
         }
         "unfreeze" => {
-            let name = tokens.get(1).ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
-            Ok(Request::Unfreeze { name: name.to_string() })
+            let name = tokens
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
+            Ok(Request::Unfreeze {
+                name: name.to_string(),
+            })
         }
         "reload" => Ok(Request::Reload),
         "shutdown" => Ok(Request::Shutdown),
@@ -239,8 +296,14 @@ fn format_text_success(data: &Option<serde_json::Value>) -> String {
         let mut lines = Vec::new();
         for item in arr {
             if let Some(obj) = item.as_object() {
-                let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                let state = obj.get("state").and_then(|s| s.as_str()).unwrap_or("unknown");
+                let name = obj
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
+                let state = obj
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown");
                 if let Some(pid) = obj.get("pid").and_then(|p| p.as_u64()) {
                     lines.push(format!("{}: {} (PID {})", name, state, pid));
                 } else {
@@ -271,21 +334,38 @@ fn format_response(response: Response, format: &ProtocolFormat) -> Result<String
             let mut map = serde_json::Map::new();
             map.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
             if response.success {
-                map.insert("result".to_string(), response.data.clone().unwrap_or(serde_json::Value::Null));
+                map.insert(
+                    "result".to_string(),
+                    response.data.clone().unwrap_or(serde_json::Value::Null),
+                );
             } else {
                 let mut err_map = serde_json::Map::new();
                 err_map.insert("code".to_string(), serde_json::json!(-32603));
-                err_map.insert("message".to_string(), serde_json::json!(response.error.clone().unwrap_or_else(|| "Unknown error".to_string())));
+                err_map.insert(
+                    "message".to_string(),
+                    serde_json::json!(
+                        response
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Unknown error".to_string())
+                    ),
+                );
                 map.insert("error".to_string(), serde_json::Value::Object(err_map));
             }
-            map.insert("id".to_string(), id.clone().unwrap_or(serde_json::Value::Null));
+            map.insert(
+                "id".to_string(),
+                id.clone().unwrap_or(serde_json::Value::Null),
+            );
             Ok(serde_json::to_string(&serde_json::Value::Object(map))?)
         }
         ProtocolFormat::TextCommand => {
             if response.success {
                 Ok(format_text_success(&response.data))
             } else {
-                Ok(format!("Error: {}", response.error.as_deref().unwrap_or("Unknown error")))
+                Ok(format!(
+                    "Error: {}",
+                    response.error.as_deref().unwrap_or("Unknown error")
+                ))
             }
         }
     }
@@ -449,7 +529,9 @@ mod tests {
     fn test_parse_incoming_flat_json() {
         let trimmed = r#"{"method":"status","name":"x","id":"req-id"}"#;
         let (format, parsed) = parse_incoming(trimmed);
-        assert!(matches!(format, ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) } if s == "req-id"));
+        assert!(
+            matches!(format, ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) } if s == "req-id")
+        );
         let req = parsed.unwrap();
         match req {
             Request::Status { name } => assert_eq!(name, Some("x".to_string())),
@@ -461,7 +543,9 @@ mod tests {
     fn test_parse_incoming_jsonrpc() {
         let trimmed = r#"{"jsonrpc":"2.0","method":"status","params":{"name":"x"},"id":100}"#;
         let (format, parsed) = parse_incoming(trimmed);
-        assert!(matches!(format, ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) } if n.as_i64() == Some(100)));
+        assert!(
+            matches!(format, ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) } if n.as_i64() == Some(100))
+        );
         let req = parsed.unwrap();
         match req {
             Request::Status { name } => assert_eq!(name, Some("x".to_string())),
@@ -484,7 +568,9 @@ mod tests {
     #[test]
     fn test_format_response_jsonrpc() {
         let response = Response::ok_with_data(serde_json::json!({"pid": 42}));
-        let format = ProtocolFormat::JsonRpc { id: Some(serde_json::json!(100)) };
+        let format = ProtocolFormat::JsonRpc {
+            id: Some(serde_json::json!(100)),
+        };
         let formatted = format_response(response, &format).unwrap();
         let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
         assert_eq!(val["jsonrpc"], "2.0");

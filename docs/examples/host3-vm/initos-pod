@@ -46,6 +46,8 @@ setup_kvm_device() {
 home_src=/src/host3-vm/home/system
 home=/home/system
 root_home=/home/root
+sshd_uid=103
+sshd_gid=103
 
 mkdir -p \
   "${home}" \
@@ -122,6 +124,10 @@ chmod 700 "${home}/.ssh"
 chmod 700 "${root_home}" "${root_home}/.ssh"
 chown 0:0 "${root_home}" "${root_home}/.ssh" 2>/dev/null || true
 chmod 600 "${home}/.ssh/config" 2>/dev/null || true
+chown -R "${sshd_uid}:${sshd_gid}" \
+  "${home}/.ssh" \
+  "${home}/.config/ssh-mesh" \
+  "${home}/.run/ssh-mesh" 2>/dev/null || true
 
 ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || true

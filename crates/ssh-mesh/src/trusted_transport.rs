@@ -712,6 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn trusted_duplex_exec_uses_none_auth_and_none_crypto() {
+        let _guard = crate::test_utils::TEST_MUTEX.lock().await;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -756,18 +757,16 @@ mod tests {
 
     #[tokio::test]
     async fn configured_client_can_maintain_trusted_uds_connection() {
+        let _guard = crate::test_utils::TEST_MUTEX.lock().await;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base_dir = std::env::current_dir()
-            .unwrap()
-            .join("target/tmp")
-            .join(format!(
-                "ssh-mesh-trusted-uds-{}-{}",
-                std::process::id(),
-                unique
-            ));
+        let base_dir = std::env::temp_dir().join(format!(
+            "ssh-mesh-trusted-uds-{}-{}",
+            std::process::id(),
+            unique
+        ));
         std::fs::create_dir_all(&base_dir).unwrap();
         let socket_path = base_dir.join("trusted.sock");
 

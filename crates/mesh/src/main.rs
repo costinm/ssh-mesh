@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::IoSlice;
@@ -124,6 +124,7 @@ async fn main() -> Result<()> {
                 env: HashMap::new(),
                 context: None,
                 command,
+                fd_count: None,
             };
             send_terminal_request(&socket_path, &request, pty).await?;
             return Ok(());
@@ -228,7 +229,11 @@ async fn send_request(socket_path: &str, request: &Request) -> Result<Response> 
     Ok(response)
 }
 
-async fn send_terminal_request(socket_path: &str, request: &Request, pty: bool) -> Result<Response> {
+async fn send_terminal_request(
+    socket_path: &str,
+    request: &Request,
+    pty: bool,
+) -> Result<Response> {
     let (passed_fd, mut stream): (OwnedFd, Box<dyn AsyncDuplex>) = if pty {
         let (master, slave) = open_pty_pair()?;
         let master_file = std::fs::File::from(master);

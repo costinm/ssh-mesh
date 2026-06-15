@@ -114,6 +114,11 @@ async fn run_uds_listener(path: String, service_name: String, wait: bool, daemon
             return;
         }
     };
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        let mut perms = metadata.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o666);
+        let _ = std::fs::set_permissions(&path, perms);
+    }
     if let Err(e) = listener.set_nonblocking(true) {
         error!("Failed to set UDS listener non-blocking: {}", e);
         return;

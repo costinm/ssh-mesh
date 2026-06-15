@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use pmond::{ProcMon, proc_netlink, psi::PsiWatcher};
+use pmond::{proc_netlink, psi::PsiWatcher, ProcMon};
 
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 use tracing::{debug, error, info};
 use tracing_subscriber::layer::SubscriberExt;

@@ -20,7 +20,7 @@ mkdir -p "${root_dir}/shared/host2"
 
 export NIX_PROFILE="${NIX_PROFILE:-${default_nix_profile}}"
 export SSH_MESH_OPT_DIR="${staged_opt}"
-export SSH_MESH_EXAMPLE_ROOT="${root_dir}"
+export SSH_MESH_STATE_ROOT="${root_dir}"
 export SSH_MESH_APP_NAME=host2
 export SSH_MESH_APP_HOME=system
 export SSH_MESH_APP_TEMPLATE_DIR="${example_dir}/home/system"

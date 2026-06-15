@@ -44,6 +44,7 @@ its own `/home/appN` plus read-only package inputs:
 /home/app2                    app2-qemu runtime home
 /home/app3                    app3-crosvm runtime home
 /home/app4                    app4-ch runtime home
+/home/app5                    app5-vm runtime home
 /nix                          read-only package store when available
 /opt/ssh-mesh                 read-only package install
 ```
@@ -70,9 +71,16 @@ On Android the same model maps to `/data/data/APPNAME`.
 | app2-qemu | host3-vm isolated app, QEMU backend | trusted local activation over vsock |
 | app3-crosvm | host3-vm isolated app, crosvm backend | trusted local activation over vsock |
 | app4-ch | host3-vm isolated app, Cloud Hypervisor backend | trusted local activation over vsock |
+| app5-vm | host1 isolated app, VM backend selected by vrun | trusted local activation over vsock |
 
 Host1 is the gateway. Users connect to host1's SSH port and can reach host2,
 host3-vm, and all apps through ssh-mesh routes.
+
+Host1 intentionally runs in bubblewrap as the invoking user without a user
+namespace. It is the example for running ssh-mesh and mesh-init without root or
+extra privileges. App1-bwrap shows that user-mode mesh-init can start isolated
+containers. App5-vm shows the same user-mode mesh-init starting a no-network VM:
+`vrun` picks crosvm when `/dev/kvm` is usable and falls back to QEMU otherwise.
 
 Host2 is the remote-node example. It is reached by host1 over normal TCP SSH
 with certificates, not through trusted local transports.
@@ -89,6 +97,7 @@ docs/examples/
   host1/
     home/system/              host1 home and config
     home/app1-bwrap/          source for app1, runtime home is /home/app1
+    home/app5-vm/             source for app5, runtime home is /home/app5
   host2/
     home/system/              host2 home and config
   host3-vm/
@@ -112,7 +121,7 @@ target/examples
 Override it with:
 
 ```bash
-export SSH_MESH_EXAMPLE_ROOT=/path/to/state
+export SSH_MESH_STATE_ROOT=/path/to/state
 ```
 
 Runtime state is staged like this:
@@ -126,6 +135,7 @@ target/examples/
   app2-qemu/home/app2/
   app3-crosvm/home/app3/
   app4-ch/home/app4/
+  app5-vm/home/app5/
   shared/
 ```
 
@@ -138,7 +148,7 @@ installed in `target/dist/opt`: host1, host2, and app1 use
 The local trusted sockets are created under:
 
 ```bash
-$SSH_MESH_EXAMPLE_ROOT/shared
+$SSH_MESH_STATE_ROOT/shared
 ```
 
 For VMs, the host3-vm state root is exposed as `/src` through `vrun`. Host3-vm
@@ -217,7 +227,7 @@ mesh-init reload
 From the host, point `MESH_INIT_RUN` at the daemon run directory:
 
 ```bash
-MESH_INIT_RUN="$SSH_MESH_EXAMPLE_ROOT/host1/home/system/.run/mesh-init" mesh-init reload
+MESH_INIT_RUN="$SSH_MESH_STATE_ROOT/host1/home/system/.run/mesh-init" mesh-init reload
 ```
 
 ## Ports
@@ -253,6 +263,7 @@ ssh -F ssh_config app1-bwrap
 ssh -F ssh_config app2-qemu
 ssh -F ssh_config app3-crosvm
 ssh -F ssh_config app4-ch
+ssh -F ssh_config app5-vm
 ```
 
 Pmond through a local forward:

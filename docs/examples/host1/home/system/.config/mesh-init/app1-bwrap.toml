@@ -17,6 +17,9 @@ oneshot = true
 socket = "/tmp/mesh/shared/app1-bwrap/trusted.sock"
 wait = false
 
+[[peer]]
+uid = 103
+
 [resources]
 memory_high = "384M"
 memory_max = "768M"

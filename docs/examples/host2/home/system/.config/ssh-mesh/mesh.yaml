@@ -1,16 +1,8 @@
-# ssh-mesh node configuration for host2.
-#
-# This file is installed by host2/start.sh at:
-#
-#   $HOME/.config/ssh-mesh/mesh.yaml
-#
-# Other ssh-mesh state uses normal defaults:
-#
 #   $HOME/.ssh                 host key and authorized_keys
 #   $HOME/.config/ssh-mesh     per-host1 authorized_keys and this mesh.yaml
 #   $HOME/.run/ssh-mesh        mux sockets when MUX_DIR is set
 #
-# Capabilities shown by this node:
+# Capabilities shown by this node (assuming ssh key/cert configured):
 #
 #   TCP SSH:          ssh -p 18222 system@127.0.0.1
 #   HTTP/admin:       curl http://127.0.0.1:18280/_m/api/ssh/clients

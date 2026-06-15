@@ -773,17 +773,16 @@ impl SshClientManager {
                             Err(_) => break,
                         }
                     }
-                    Some(msg) = channel.wait() => {
+                    msg = channel.wait() => {
                         match msg {
-                            russh::ChannelMsg::Data { ref data } => {
+                            Some(russh::ChannelMsg::Data { ref data }) => {
                                 if let Err(_) = writer.write_all(data).await {
                                     break;
                                 }
                             }
-                            russh::ChannelMsg::Eof => {
+                            Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => {
                                 break;
                             }
-                            russh::ChannelMsg::Close => break,
                             _ => {}
                         }
                     }
@@ -833,14 +832,14 @@ impl SshClientManager {
                             Err(_) => break,
                         }
                     }
-                    Some(msg) = channel.wait() => {
+                    msg = channel.wait() => {
                         match msg {
-                            russh::ChannelMsg::Data { ref data } => {
+                            Some(russh::ChannelMsg::Data { ref data }) => {
                                 if writer.write_all(data).await.is_err() {
                                     break;
                                 }
                             }
-                            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                            Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => break,
                             _ => {}
                         }
                     }
@@ -909,14 +908,14 @@ impl SshClientManager {
                             Err(_) => break,
                         }
                     }
-                    Some(msg) = channel.wait() => {
+                    msg = channel.wait() => {
                         match msg {
-                            russh::ChannelMsg::Data { ref data } => {
+                            Some(russh::ChannelMsg::Data { ref data }) => {
                                 if writer.write_all(data).await.is_err() {
                                     break;
                                 }
                             }
-                            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                            Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => break,
                             _ => {}
                         }
                     }
@@ -1239,34 +1238,29 @@ pub async fn handle_local_forward(
             .await?
     };
 
-    let mut stream_closed = false;
     let mut buf = vec![0u8; 65536];
     loop {
         tokio::select! {
             // TCP → SSH
-            r = tcp_stream.read(&mut buf), if !stream_closed => {
+            r = tcp_stream.read(&mut buf) => {
                 match r {
                     Ok(0) => {
-                        stream_closed = true;
-                        channel.eof().await?;
+                        let _ = channel.close().await;
+                        break;
                     }
                     Ok(n) => channel.data(&buf[..n]).await?,
                     Err(e) => return Err(e.into()),
                 }
             }
             // SSH → TCP
-            Some(msg) = channel.wait() => {
+            msg = channel.wait() => {
                 match msg {
-                    ChannelMsg::Data { ref data } => {
+                    Some(ChannelMsg::Data { ref data }) => {
                         tcp_stream.write_all(data).await?;
                     }
-                    ChannelMsg::Eof => {
-                        if !stream_closed {
-                            channel.eof().await?;
-                        }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                         break;
                     }
-                    ChannelMsg::Close => break,
                     _ => {}
                 }
             }

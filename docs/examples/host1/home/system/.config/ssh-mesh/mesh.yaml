@@ -117,3 +117,17 @@ ssh_routes:
       hostname: 127.0.0.1
       port: 18322
       user: system@app4-ch.example.m
+
+  - name: app5-vm
+    user: system@app5-vm.example.m
+    jump_host: app5-vm.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    activation_service: activate-app5-vm
+    client:
+      transport: vsock
+      user: app5
+      vsock_cid: 55
+      vsock_port: 18522
+      uds_path: /tmp/mesh/shared/app5-vm/trusted.sock

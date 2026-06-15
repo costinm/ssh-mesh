@@ -23,6 +23,8 @@ log() {
 
 home_src=/src/${node}/home/${app_home}
 home=/home/${app_home}
+sshd_uid=103
+sshd_gid=103
 
 mkdir -p \
   "${home}" \
@@ -77,6 +79,10 @@ mkdir -p \
 
 chmod 700 "${home}/.ssh"
 chmod 600 "${home}/.ssh/config" 2>/dev/null || true
+chown -R "${sshd_uid}:${sshd_gid}" \
+  "${home}/.ssh" \
+  "${home}/.config/ssh-mesh" \
+  "${home}/.run/ssh-mesh" 2>/dev/null || true
 
 ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || true

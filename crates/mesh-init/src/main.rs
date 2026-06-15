@@ -172,7 +172,12 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
         // configured services or bind the daemon control socket; doing so can
         // steal the real daemon's socket when mesh-init is used as a shell.
         {
-            let dirs: Vec<&str> = daemon.config.config_dirs.iter().map(|s| s.as_str()).collect();
+            let dirs: Vec<&str> = daemon
+                .config
+                .config_dirs
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
             let loaded_configs = mesh_init::config::load_system_configs(&dirs);
             if let Some(default_cfg) = loaded_configs.into_iter().find(|cfg| cfg.name == "default")
             {

@@ -5,6 +5,11 @@ name = "init-ssh-mesh-app2-qemu"
 command = "ssh-mesh"
 priority = 100
 oneshot = false
+uid = 103
+gid = 103
+
+[[peer]]
+uid = 103
 
 [resources]
 memory_high = "256M"

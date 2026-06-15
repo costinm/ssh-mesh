@@ -129,6 +129,9 @@ pub enum Request {
         /// the user's interactive shell.
         #[serde(default)]
         command: Option<String>,
+        /// The number of file descriptors being passed (usually 1, or 3 for separate stdin/stdout/stderr).
+        #[serde(default)]
+        fd_count: Option<u32>,
     },
 
     /// Resize an active terminal session that was returned by `start_terminal`.

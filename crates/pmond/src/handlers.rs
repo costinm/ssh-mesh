@@ -73,9 +73,7 @@ pub struct ApiDoc;
     path = "/_m/pmon/_ps",
     tag = "pmond",
     responses(
-        (status = 200, 
-        description = "List processes and return detailed memory info", 
-        body = Vec<ProcessInfo>)
+        (status = 200, description = "List processes and return detailed memory info", body = Vec<ProcessInfo>)
     )
 )]
 pub async fn handle_ps_request(
