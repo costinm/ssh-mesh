@@ -9,10 +9,9 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
-    linux = { url = "path:./linux"; inputs.nixpkgs.follows = "nixpkgs"; };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, linux }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         muslTarget = "x86_64-unknown-linux-musl";
@@ -81,6 +80,14 @@
         ssh-mesh-full = mkPackage "ssh-mesh-full"
           "--workspace --bins --features ssh-mesh/pmon";
 
+        ssh-mesh  = mkPackage "ssh-mesh"  "--features pmon -p ssh-mesh";
+        pmond     = mkPackage "pmond"     "-p pmond";
+        mesh-init = mkPackage "mesh-init" "-p mesh-init";
+        h2t       = mkPackage "h2t"       "-p ssh-mesh --bin h2t";
+        meshkeys  = mkPackage "meshkeys"  "-p ssh-mesh --bin meshkeys";
+        sshmc     = mkPackage "sshmc"     "-p ssh-mesh --bin sshmc";
+        traceweb  = mkPackage "traceweb"  "-p traceweb";
+
         # ── Docker image ──────────────────────────────────────────
 
         sshm = pkgs.dockerTools.buildLayeredImage {
@@ -101,14 +108,81 @@
           bash ${./scripts/build.sh} erofs "$out" "${pkgs.pkgsStatic.busybox}/bin/busybox" "${./bin/initos-init-vm}" "${ssh-mesh-full}/bin"
         '';
 
+        # ── Linux Kernel & VM ─────────────────────────────────────
+
+        kernelConfigSrc = pkgs.lib.cleanSourceWith {
+          src = ./linux;
+          filter = path: type:
+            let
+              rel = pkgs.lib.removePrefix "${toString ./linux}/" (toString path);
+            in
+            rel == "6.18" || pkgs.lib.hasPrefix "6.18/" rel
+            || rel == "fragments" || pkgs.lib.hasPrefix "fragments/" rel;
+        };
+
+        kernel-cloud = import ./linux/kernel-cloud.nix {
+          inherit pkgs;
+          src = kernelConfigSrc;
+        };
+
+        initos-vm = pkgs.runCommand "initos-vm" { } ''
+          mkdir -p "$out"/{bin,boot,img}
+
+          ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
+
+          for m in ${kernel-cloud}/img/modules-*.erofs; do
+            if [ -f "$m" ]; then
+              ln -s "$m" "$out/img/modules-cloud.erofs"
+            fi
+          done
+
+          ln -s ${pkgs.cloud-hypervisor}/bin/cloud-hypervisor "$out/bin/cloud-hypervisor"
+          ln -s ${pkgs.cloud-hypervisor}/bin/ch-remote "$out/bin/ch-remote"
+          ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
+          ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
+          ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
+          ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
+          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
+          ln -s ${pkgs.tmux}/bin/tmux "$out/bin/tmux"
+          ln -s ${pkgs.curl}/bin/curl "$out/bin/curl"
+          ln -s ${pkgs.bubblewrap}/bin/bwrap "$out/bin/bwrap"
+          
+          cp ${./linux/bin/vrun} "$out/bin/vrun"
+          chmod +x "$out/bin/vrun"
+          ln -s vrun "$out/bin/initos-vrun"
+        '';
+
+        initos-vm-image = pkgs.dockerTools.buildLayeredImage {
+          name = "ghcr.io/costinm/initos-vm";
+          tag = "latest";
+          contents = [
+            initos-vm
+            pkgs.bash
+            pkgs.coreutils
+          ];
+          config = {
+            Cmd = [ "${initos-vm}/bin/vrun" ];
+            Env = [
+              "PATH=/bin:/usr/bin"
+            ];
+          };
+        };
+
       in
       {
         packages = {
-            inherit ssh-mesh-full sshm initos-erofs;
+            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc sshm initos-erofs kernel-cloud initos-vm initos-vm-image;
             default = pkgs.symlinkJoin {
               name = "ssh-mesh-default";
-              paths = [ ssh-mesh-full initos-erofs linux.packages.${system}.initos-vm ];
+              paths = [ ssh-mesh-full initos-erofs initos-vm ];
             };
+        };
+
+        apps = {
+          vm-cloud = {
+            type = "app";
+            program = "${initos-vm}/bin/vrun";
+          };
         };
 
         devShells.default = craneLib.devShell {
