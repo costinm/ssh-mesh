@@ -26,24 +26,3 @@ pub fn qid_from_attr(attr: &Metadata) -> Qid {
         path: attr.ino(),
     }
 }
-
-pub async fn get_dirent_from<P: AsRef<Path> + ?Sized>(
-    p: &P,
-    offset: u64,
-) -> crate::Result<DirEntry> {
-    Ok(DirEntry {
-        qid: get_qid(p).await?,
-        offset,
-        typ: 0,
-        name: p.as_ref().to_string_lossy().into_owned(),
-    })
-}
-
-pub async fn get_dirent(entry: &fs::DirEntry, offset: u64) -> crate::Result<DirEntry> {
-    Ok(DirEntry {
-        qid: qid_from_attr(&entry.metadata().await?),
-        offset,
-        typ: 0,
-        name: entry.file_name().to_string_lossy().into_owned(),
-    })
-}

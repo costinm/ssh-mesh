@@ -1,5 +1,6 @@
 use {
     crate::{
+        error::errno::*,
         srv::{Fid, Filesystem},
         *,
     },
@@ -7,9 +8,11 @@ use {
     filetime::FileTime,
     nix::libc::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY},
     std::{
+        collections::{BTreeMap, BTreeSet},
+        hash::{Hash, Hasher},
         io::SeekFrom,
         os::unix::{fs::PermissionsExt, io::FromRawFd},
-        path::PathBuf,
+        path::{Component, Path, PathBuf},
     },
     tokio::{
         fs,
@@ -37,15 +40,210 @@ use crate::unpfs::utils::*;
 // we are seeing with a file system benchmark.
 const UNIX_FLAGS: u32 = (O_WRONLY | O_RDONLY | O_RDWR | O_CREAT | O_TRUNC) as u32;
 
-#[derive(Default)]
 pub struct UnpfsFid {
-    realpath: RwLock<PathBuf>,
+    vpath: RwLock<PathBuf>,
     file: Mutex<Option<fs::File>>,
+}
+
+impl Default for UnpfsFid {
+    fn default() -> Self {
+        Self {
+            vpath: RwLock::new(PathBuf::from("/")),
+            file: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Export {
+    pub source: PathBuf,
+    pub mountpoint: PathBuf,
+    pub writable: bool,
 }
 
 #[derive(Clone)]
 pub struct Unpfs {
-    pub realroot: PathBuf,
+    pub exports: Vec<Export>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedPath {
+    Real { realpath: PathBuf, writable: bool },
+    VirtualDir { virtual_path: PathBuf },
+}
+
+impl Unpfs {
+    pub fn new(exports: Vec<Export>) -> Result<Self> {
+        if exports.is_empty() {
+            return Err(error::Error::No(EINVAL));
+        }
+
+        Ok(Self { exports })
+    }
+
+    fn resolve(&self, vpath: &Path) -> Result<ResolvedPath> {
+        let normalized = normalize_virtual_path(vpath)?;
+        let mut best: Option<(usize, &Export)> = None;
+
+        for export in &self.exports {
+            if has_path_prefix(&normalized, &export.mountpoint) {
+                let len = component_count(&export.mountpoint);
+                if best.map_or(true, |(best_len, _)| len > best_len) {
+                    best = Some((len, export));
+                }
+            }
+        }
+
+        if let Some((_, export)) = best {
+            let suffix = strip_path_prefix(&normalized, &export.mountpoint);
+            return Ok(ResolvedPath::Real {
+                realpath: export.source.join(suffix),
+                writable: export.writable,
+            });
+        }
+
+        if self
+            .exports
+            .iter()
+            .any(|export| has_path_prefix(&export.mountpoint, &normalized))
+        {
+            return Ok(ResolvedPath::VirtualDir {
+                virtual_path: normalized,
+            });
+        }
+
+        Err(error::Error::No(ENOENT))
+    }
+
+    fn child_path(&self, parent: &Path, name: &str) -> Result<PathBuf> {
+        if name.contains('/') {
+            return Err(error::Error::No(EINVAL));
+        }
+
+        let mut path = normalize_virtual_path(parent)?;
+        match name {
+            "" | "." => {}
+            ".." => {
+                path.pop();
+                if path.as_os_str().is_empty() {
+                    path = PathBuf::from("/");
+                }
+            }
+            _ => path.push(name),
+        }
+
+        normalize_virtual_path(&path)
+    }
+
+    fn direct_virtual_children(&self, parent: &Path) -> BTreeSet<String> {
+        let Ok(parent) = normalize_virtual_path(parent) else {
+            return BTreeSet::new();
+        };
+        let parent_len = component_count(&parent);
+        let mut children = BTreeSet::new();
+
+        for export in &self.exports {
+            if !has_path_prefix(&export.mountpoint, &parent) {
+                continue;
+            }
+            if component_count(&export.mountpoint) <= parent_len {
+                continue;
+            }
+            if let Some(name) = path_components(&export.mountpoint).get(parent_len) {
+                children.insert(name.clone());
+            }
+        }
+
+        children
+    }
+}
+
+fn normalize_virtual_path(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+                if normalized.as_os_str().is_empty() {
+                    normalized = PathBuf::from("/");
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+            _ => return Err(error::Error::No(EINVAL)),
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn component_count(path: &Path) -> usize {
+    path_components(path).len()
+}
+
+fn has_path_prefix(path: &Path, prefix: &Path) -> bool {
+    let path_parts = path_components(path);
+    let prefix_components = path_components(prefix);
+    path_parts.len() >= prefix_components.len()
+        && path_parts
+            .iter()
+            .zip(prefix_components.iter())
+            .all(|(path, prefix)| path == prefix)
+}
+
+fn strip_path_prefix(path: &Path, prefix: &Path) -> PathBuf {
+    path_components(path)
+        .into_iter()
+        .skip(component_count(prefix))
+        .collect()
+}
+
+fn virtual_qid(path: &Path) -> Qid {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    Qid {
+        typ: QidType::DIR,
+        version: 0,
+        path: hasher.finish(),
+    }
+}
+
+fn virtual_stat() -> Stat {
+    Stat {
+        mode: nix::libc::S_IFDIR as u32 | 0o555,
+        uid: 0,
+        gid: 0,
+        nlink: 2,
+        rdev: 0,
+        size: 0,
+        blksize: 4096,
+        blocks: 0,
+        atime: Time { sec: 0, nsec: 0 },
+        mtime: Time { sec: 0, nsec: 0 },
+        ctime: Time { sec: 0, nsec: 0 },
+    }
+}
+
+async fn node_qid(node: &ResolvedPath) -> Result<Qid> {
+    match node {
+        ResolvedPath::Real { realpath, .. } => get_qid(realpath).await,
+        ResolvedPath::VirtualDir { virtual_path } => Ok(virtual_qid(virtual_path)),
+    }
+}
+
+fn ensure_writable(node: &ResolvedPath) -> Result<()> {
+    match node {
+        ResolvedPath::Real { writable, .. } if *writable => Ok(()),
+        _ => Err(error::Error::No(EROFS)),
+    }
 }
 
 #[async_trait]
@@ -61,12 +259,12 @@ impl Filesystem for Unpfs {
         _n_uname: u32,
     ) -> Result<Fcall> {
         {
-            let mut realpath = fid.aux.realpath.write().await;
-            *realpath = PathBuf::from(&self.realroot);
+            let mut vpath = fid.aux.vpath.write().await;
+            *vpath = PathBuf::from("/");
         }
 
         Ok(Fcall::Rattach {
-            qid: get_qid(&self.realroot).await?,
+            qid: node_qid(&self.resolve(Path::new("/"))?).await?,
         })
     }
 
@@ -78,14 +276,18 @@ impl Filesystem for Unpfs {
     ) -> Result<Fcall> {
         let mut wqids = Vec::new();
         let mut path = {
-            let realpath = fid.aux.realpath.read().await;
-            realpath.clone()
+            let vpath = fid.aux.vpath.read().await;
+            vpath.clone()
         };
 
         for (i, name) in wnames.iter().enumerate() {
-            path.push(name);
+            let next_path = self.child_path(&path, name)?;
 
-            let qid = match get_qid(&path).await {
+            let qid = match self.resolve(&next_path) {
+                Ok(node) => node_qid(&node).await,
+                Err(e) => Err(e),
+            };
+            let qid = match qid {
                 Ok(qid) => qid,
                 Err(e) => {
                     if i == 0 {
@@ -96,12 +298,13 @@ impl Filesystem for Unpfs {
                 }
             };
 
+            path = next_path;
             wqids.push(qid);
         }
 
         {
-            let mut new_realpath = newfid.aux.realpath.write().await;
-            *new_realpath = path;
+            let mut new_vpath = newfid.aux.vpath.write().await;
+            *new_vpath = path;
         }
 
         Ok(Fcall::Rwalk { wqids })
@@ -109,8 +312,17 @@ impl Filesystem for Unpfs {
 
     async fn rgetattr(&self, fid: &Fid<Self::Fid>, req_mask: GetattrMask) -> Result<Fcall> {
         let attr = {
-            let realpath = fid.aux.realpath.read().await;
-            fs::symlink_metadata(&*realpath).await?
+            let vpath = fid.aux.vpath.read().await;
+            match self.resolve(&vpath)? {
+                ResolvedPath::Real { realpath, .. } => fs::symlink_metadata(realpath).await?,
+                ResolvedPath::VirtualDir { .. } => {
+                    return Ok(Fcall::Rgetattr {
+                        valid: req_mask,
+                        qid: virtual_qid(&vpath),
+                        stat: virtual_stat(),
+                    })
+                }
+            }
         };
 
         Ok(Fcall::Rgetattr {
@@ -127,8 +339,13 @@ impl Filesystem for Unpfs {
         stat: &SetAttr,
     ) -> Result<Fcall> {
         let filepath = {
-            let realpath = fid.aux.realpath.read().await;
-            realpath.clone()
+            let vpath = fid.aux.vpath.read().await;
+            let node = self.resolve(&vpath)?;
+            ensure_writable(&node)?;
+            match node {
+                ResolvedPath::Real { realpath, .. } => realpath,
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EROFS)),
+            }
         };
 
         if valid.contains(SetattrMask::MODE) {
@@ -184,8 +401,11 @@ impl Filesystem for Unpfs {
 
     async fn rreadlink(&self, fid: &Fid<Self::Fid>) -> Result<Fcall> {
         let link = {
-            let realpath = fid.aux.realpath.read().await;
-            fs::read_link(&*realpath).await?
+            let vpath = fid.aux.vpath.read().await;
+            match self.resolve(&vpath)? {
+                ResolvedPath::Real { realpath, .. } => fs::read_link(realpath).await?,
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EINVAL)),
+            }
         };
 
         Ok(Fcall::Rreadlink {
@@ -196,27 +416,61 @@ impl Filesystem for Unpfs {
     async fn rreaddir(&self, fid: &Fid<Self::Fid>, off: u64, count: u32) -> Result<Fcall> {
         let mut dirents = DirEntryData::new();
 
+        let vpath = {
+            let vpath = fid.aux.vpath.read().await;
+            vpath.clone()
+        };
+        let node = self.resolve(&vpath)?;
+
         let offset = if off == 0 {
-            dirents.push(get_dirent_from(".", 0).await?);
-            dirents.push(get_dirent_from("..", 1).await?);
+            dirents.push(DirEntry {
+                qid: node_qid(&node).await?,
+                offset: 0,
+                typ: 0,
+                name: ".".to_string(),
+            });
+            let parent = self.child_path(&vpath, "..")?;
+            dirents.push(DirEntry {
+                qid: node_qid(&self.resolve(&parent)?).await?,
+                offset: 1,
+                typ: 0,
+                name: "..".to_string(),
+            });
             off
         } else {
             off - 1
         } as usize;
 
-        let mut entries = {
-            let realpath = fid.aux.realpath.read().await;
-            ReadDirStream::new(fs::read_dir(&*realpath).await?).skip(offset)
-        };
+        let mut entries_by_name: BTreeMap<String, Qid> = BTreeMap::new();
 
-        let mut i = offset;
-        while let Some(entry) = entries.next().await {
-            let dirent = get_dirent(&entry?, 2 + i as u64).await?;
+        if let ResolvedPath::Real { realpath, .. } = &node {
+            let mut entries = ReadDirStream::new(fs::read_dir(realpath).await?);
+            while let Some(entry) = entries.next().await {
+                let entry = entry?;
+                entries_by_name.insert(
+                    entry.file_name().to_string_lossy().into_owned(),
+                    qid_from_attr(&entry.metadata().await?),
+                );
+            }
+        }
+
+        for name in self.direct_virtual_children(&vpath) {
+            let child = self.child_path(&vpath, &name)?;
+            let qid = node_qid(&self.resolve(&child)?).await?;
+            entries_by_name.insert(name, qid);
+        }
+
+        for (i, (name, qid)) in entries_by_name.into_iter().skip(offset).enumerate() {
+            let dirent = DirEntry {
+                qid,
+                offset: 2 + offset as u64 + i as u64,
+                typ: 0,
+                name,
+            };
             if dirents.size() + dirent.size() > count {
                 break;
             }
             dirents.push(dirent);
-            i += 1;
         }
 
         Ok(Fcall::Rreaddir { data: dirents })
@@ -224,8 +478,30 @@ impl Filesystem for Unpfs {
 
     async fn rlopen(&self, fid: &Fid<Self::Fid>, flags: u32) -> Result<Fcall> {
         let realpath = {
-            let realpath = fid.aux.realpath.read().await;
-            realpath.clone()
+            let vpath = fid.aux.vpath.read().await;
+            match self.resolve(&vpath)? {
+                ResolvedPath::Real {
+                    realpath, writable, ..
+                } => {
+                    let oflags = nix::fcntl::OFlag::from_bits_truncate((flags & UNIX_FLAGS) as i32);
+                    if !writable
+                        && oflags.intersects(
+                            nix::fcntl::OFlag::O_WRONLY
+                                | nix::fcntl::OFlag::O_RDWR
+                                | nix::fcntl::OFlag::O_TRUNC,
+                        )
+                    {
+                        return Err(error::Error::No(EROFS));
+                    }
+                    realpath
+                }
+                ResolvedPath::VirtualDir { virtual_path } => {
+                    return Ok(Fcall::Rlopen {
+                        qid: virtual_qid(&virtual_path),
+                        iounit: 0,
+                    })
+                }
+            }
         };
 
         let qid = get_qid(&realpath).await?;
@@ -254,8 +530,13 @@ impl Filesystem for Unpfs {
         _gid: u32,
     ) -> Result<Fcall> {
         let path = {
-            let realpath = fid.aux.realpath.read().await;
-            realpath.join(name)
+            let vpath = fid.aux.vpath.read().await;
+            let node = self.resolve(&vpath)?;
+            ensure_writable(&node)?;
+            match node {
+                ResolvedPath::Real { realpath, .. } => realpath.join(name),
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EROFS)),
+            }
         };
         let oflags = nix::fcntl::OFlag::from_bits_truncate((flags & UNIX_FLAGS) as i32);
         let omode = nix::sys::stat::Mode::from_bits_truncate(mode);
@@ -263,8 +544,12 @@ impl Filesystem for Unpfs {
 
         let qid = get_qid(&path).await?;
         {
-            let mut realpath = fid.aux.realpath.write().await;
-            *realpath = path;
+            let parent = {
+                let vpath = fid.aux.vpath.read().await;
+                vpath.clone()
+            };
+            let mut vpath = fid.aux.vpath.write().await;
+            *vpath = self.child_path(&parent, name)?;
         }
         {
             let mut file = fid.aux.file.lock().await;
@@ -310,8 +595,13 @@ impl Filesystem for Unpfs {
         _gid: u32,
     ) -> Result<Fcall> {
         let path = {
-            let realpath = dfid.aux.realpath.read().await;
-            realpath.join(name)
+            let vpath = dfid.aux.vpath.read().await;
+            let node = self.resolve(&vpath)?;
+            ensure_writable(&node)?;
+            match node {
+                ResolvedPath::Real { realpath, .. } => realpath.join(name),
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EROFS)),
+            }
         };
 
         fs::create_dir(&path).await?;
@@ -329,13 +619,23 @@ impl Filesystem for Unpfs {
         newname: &str,
     ) -> Result<Fcall> {
         let oldpath = {
-            let realpath = olddir.aux.realpath.read().await;
-            realpath.join(oldname)
+            let vpath = olddir.aux.vpath.read().await;
+            let node = self.resolve(&vpath)?;
+            ensure_writable(&node)?;
+            match node {
+                ResolvedPath::Real { realpath, .. } => realpath.join(oldname),
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EROFS)),
+            }
         };
 
         let newpath = {
-            let realpath = newdir.aux.realpath.read().await;
-            realpath.join(newname)
+            let vpath = newdir.aux.vpath.read().await;
+            let node = self.resolve(&vpath)?;
+            ensure_writable(&node)?;
+            match node {
+                ResolvedPath::Real { realpath, .. } => realpath.join(newname),
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EROFS)),
+            }
         };
 
         fs::rename(&oldpath, &newpath).await?;
@@ -345,8 +645,13 @@ impl Filesystem for Unpfs {
 
     async fn runlinkat(&self, dirfid: &Fid<Self::Fid>, name: &str, _flags: u32) -> Result<Fcall> {
         let path = {
-            let realpath = dirfid.aux.realpath.read().await;
-            realpath.join(name)
+            let vpath = dirfid.aux.vpath.read().await;
+            let node = self.resolve(&vpath)?;
+            ensure_writable(&node)?;
+            match node {
+                ResolvedPath::Real { realpath, .. } => realpath.join(name),
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EROFS)),
+            }
         };
 
         match fs::symlink_metadata(&path).await? {
@@ -375,8 +680,11 @@ impl Filesystem for Unpfs {
 
     async fn rstatfs(&self, fid: &Fid<Self::Fid>) -> Result<Fcall> {
         let path = {
-            let realpath = fid.aux.realpath.read().await;
-            realpath.clone()
+            let vpath = fid.aux.vpath.read().await;
+            match self.resolve(&vpath)? {
+                ResolvedPath::Real { realpath, .. } => realpath,
+                ResolvedPath::VirtualDir { .. } => return Err(error::Error::No(EINVAL)),
+            }
         };
 
         //let fs = nix::sys::statvfs::statvfs(&path)?;
@@ -387,5 +695,71 @@ impl Filesystem for Unpfs {
         Ok(Fcall::Rstatfs {
             statfs: From::from(fs),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_fs() -> Unpfs {
+        Unpfs::new(vec![
+            Export {
+                source: PathBuf::from("/real/nix"),
+                mountpoint: PathBuf::from("/nix"),
+                writable: false,
+            },
+            Export {
+                source: PathBuf::from("/real/app"),
+                mountpoint: PathBuf::from("/home/app"),
+                writable: true,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn resolves_exports_and_virtual_parent_directories() {
+        let fs = test_fs();
+
+        match fs.resolve(Path::new("/home")).unwrap() {
+            ResolvedPath::VirtualDir { virtual_path } => {
+                assert_eq!(virtual_path, PathBuf::from("/home"));
+            }
+            other => panic!("expected virtual /home, got {other:?}"),
+        }
+
+        match fs.resolve(Path::new("/home/app/.ssh")).unwrap() {
+            ResolvedPath::Real { realpath, writable } => {
+                assert_eq!(realpath, PathBuf::from("/real/app/.ssh"));
+                assert!(writable);
+            }
+            other => panic!("expected real app path, got {other:?}"),
+        }
+
+        match fs.resolve(Path::new("/nix/store")).unwrap() {
+            ResolvedPath::Real { realpath, writable } => {
+                assert_eq!(realpath, PathBuf::from("/real/nix/store"));
+                assert!(!writable);
+            }
+            other => panic!("expected real nix path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalizes_walk_components_without_escaping_root() {
+        let fs = test_fs();
+
+        assert_eq!(
+            fs.child_path(Path::new("/home/app"), "../app/file")
+                .err()
+                .unwrap()
+                .errno(),
+            EINVAL
+        );
+        assert_eq!(
+            fs.child_path(Path::new("/home"), "..").unwrap(),
+            PathBuf::from("/")
+        );
     }
 }

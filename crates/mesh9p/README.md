@@ -29,8 +29,13 @@ Per pod (container):
 
 
 ```bash
-unpfs --listen '/tmp/unpfs-socket' /exportdir
+mesh9p /nix /exportdir:/srv/export:rw --listen '/tmp/unpfs-socket'
+mesh9p /nix /exportdir:/srv/export:rw --tcp 127.0.0.1:15101
 ```
+
+Export arguments use `/source[:/mountpoint][:rw]`. If the mountpoint is omitted,
+the source is exported at the same path. Exports are read-only unless `:rw` is
+present.
 
 Mounting:
 

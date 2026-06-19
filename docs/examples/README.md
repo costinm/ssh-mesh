@@ -161,6 +161,79 @@ Host3-vm also starts a one-shot diagnostic job on boot. It writes to the VM
 console and reports the kernel, command line, memory, interfaces, routes, virtio
 devices, kvm/vsock devices, `/nix`, and `/home`.
 
+## 9P Filesystem Exports
+
+`mesh9p` can export more than one host directory through one server. Each
+argument has this form:
+
+```bash
+mesh9p '/source/dir[:/guest/path][:rw]' ...
+```
+
+When `/guest/path` is omitted, the directory is exported at the same absolute
+path. Exports are read-only by default, so `/nix` exports the host `/nix` as
+guest `/nix` read-only. Add `:rw` only for per-app writable state.
+
+Bubblewrap exporter on host1:
+
+```bash
+mesh9p \
+  /nix \
+  "${SSH_MESH_STATE_ROOT}/app1-bwrap/home/app1:/home/app1:rw" \
+  "${SSH_MESH_STATE_ROOT}/shared:/run/ssh-mesh/shared:rw" \
+  --listen "${SSH_MESH_STATE_ROOT}/shared/mesh9p-app1.sock"
+```
+
+No-network VM over stdio activation:
+
+```toml
+[service]
+name = "app5-mesh9p-stdio"
+command = "/opt/ssh-mesh/bin/mesh9p"
+args = [
+  "/nix",
+  "/src/home/app5:/home/app5:rw",
+  "/src/shared:/run/ssh-mesh/shared:rw",
+]
+
+[[activation]]
+socket = "/home/system/.run/mesh-init/app5-9p.sock"
+wait = false
+```
+
+No-network VM over vsock uses the same `mesh9p` arguments. In this mode vsock is
+the trusted carrier used by ssh-mesh or mesh-init to deliver a bidirectional
+stdio stream to `mesh9p`; the mount side should expose that stream through an
+fd, UDS, or virtio-9p front-end because Linux v9fs does not have a direct
+`trans=vsock` mount option:
+
+```bash
+# exporter side, normally launched by mesh-init or trusted-vsock exec
+mesh9p /nix /src/home/app5:/home/app5:rw /src/shared:/run/ssh-mesh/shared:rw
+
+# direct virtio-9p front-end in the guest
+mount -t 9p -o version=9p2000.L,trans=virtio,access=any mesh9p /mnt/host
+```
+
+Networked VM over TCP:
+
+```bash
+mesh9p \
+  /nix \
+  "${SSH_MESH_STATE_ROOT}/host3-vm/home/system:/home/system:rw" \
+  "${SSH_MESH_STATE_ROOT}/shared:/run/ssh-mesh/shared:rw" \
+  --tcp 127.0.0.1:15101
+```
+
+Inside a VM with network access to the exporter:
+
+```bash
+mkdir -p /mnt/host
+mount -t 9p -o version=9p2000.L,trans=tcp,port=15101,uname=root \
+  127.0.0.1 /mnt/host
+ls /mnt/host/nix /mnt/host/home/system
+```
+
 ## Keys
 
 The three networked hosts have checked-in example keys and certificates:
