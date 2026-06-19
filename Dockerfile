@@ -41,10 +41,6 @@ RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNK
 RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
     cargo build --target aarch64-unknown-linux-musl --release -p pmond
 
-# Build rvirtiofsd statically
-#RUN RUSTFLAGS="-C target-feature=+crt-static" \
-#    cargo build --target x86_64-unknown-linux-musl --release -p rvirtiofsd
-
 # -----------------------
 FROM rust:slim-bookworm AS build-android
 

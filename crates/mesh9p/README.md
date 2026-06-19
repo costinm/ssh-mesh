@@ -1,6 +1,6 @@
 # 9p server
 
-This is used as a replacement for sshfs:
+This is used as an alternative to sshfs:
 
 - has a native kernel driver
 - better for VM-to-host sharing - no encryption needed.
