@@ -16,6 +16,7 @@ pub struct TunStack {
     pub sockets: SocketSet<'static>,
     pub device: QueueDevice,
     pub active_tcp_sockets: HashSet<SocketHandle>,
+    pub vm_id: String,
 }
 
 fn parse_packet_and_add_socket(stack: &mut TunStack, p: &[u8]) {
@@ -67,6 +68,45 @@ fn parse_packet_and_add_socket(stack: &mut TunStack, p: &[u8]) {
             }
         }
     }
+}
+
+fn parse_udp_packet(p: &[u8]) -> Option<TunUdpPacket> {
+    if p.len() < 20 {
+        return None;
+    }
+
+    let version = p[0] >> 4;
+    if version == 4 {
+        let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(p).ok()?;
+        if ipv4.next_header() != smoltcp::wire::IpProtocol::Udp {
+            return None;
+        }
+        let udp = smoltcp::wire::UdpPacket::new_checked(ipv4.payload()).ok()?;
+        return Some(TunUdpPacket {
+            src_addr: IpAddr::from(ipv4.src_addr()),
+            src_port: udp.src_port(),
+            dst_addr: IpAddr::from(ipv4.dst_addr()),
+            dst_port: udp.dst_port(),
+            payload: udp.payload().to_vec(),
+        });
+    }
+
+    if version == 6 {
+        let ipv6 = smoltcp::wire::Ipv6Packet::new_checked(p).ok()?;
+        if ipv6.next_header() != smoltcp::wire::IpProtocol::Udp {
+            return None;
+        }
+        let udp = smoltcp::wire::UdpPacket::new_checked(ipv6.payload()).ok()?;
+        return Some(TunUdpPacket {
+            src_addr: IpAddr::from(ipv6.src_addr()),
+            src_port: udp.src_port(),
+            dst_addr: IpAddr::from(ipv6.dst_addr()),
+            dst_port: udp.dst_port(),
+            payload: udp.payload().to_vec(),
+        });
+    }
+
+    None
 }
 
 /// Async wrapper for a smoltcp TCP socket.
@@ -173,6 +213,7 @@ impl StackState {
         mtu: usize,
         tcp_sockets: usize,
         udp_sockets: usize,
+        vm_id: String,
         tx_sender: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Self {
         let mut device = QueueDevice::new(tx_sender, mtu);
@@ -225,6 +266,7 @@ impl StackState {
                 sockets,
                 device,
                 active_tcp_sockets: HashSet::new(),
+                vm_id,
             })),
             poll_waker: Arc::new(Notify::new()),
         }
@@ -240,9 +282,20 @@ impl StackState {
     ) {
         loop {
             let processed;
+            let mut spawn_udp_tasks = Vec::new();
+            let mut spawn_dns_tasks = Vec::new();
             // Process queue
             let mut has_new_packets = false;
             while let Ok(packet) = rx_queue.try_recv() {
+                if let Some(pkt) = parse_udp_packet(&packet) {
+                    if pkt.src_port == 53 || pkt.dst_port == 53 {
+                        spawn_dns_tasks.push(pkt);
+                    } else {
+                        spawn_udp_tasks.push(pkt);
+                    }
+                    has_new_packets = true;
+                    continue;
+                }
                 let mut stack = self.stack.lock().unwrap();
                 parse_packet_and_add_socket(&mut stack, &packet);
                 stack.device.rx_queue.push_back(packet);
@@ -251,8 +304,6 @@ impl StackState {
 
             let mut sockets_to_replace = Vec::new();
             let mut spawn_tcp_tasks = Vec::new();
-            let mut spawn_udp_tasks = Vec::new();
-            let mut spawn_dns_tasks = Vec::new();
 
             let delay;
             {
@@ -263,6 +314,7 @@ impl StackState {
                     sockets,
                     device,
                     active_tcp_sockets,
+                    vm_id: _,
                 } = &mut *stack;
                 processed = interface.poll(now, device, sockets);
 
@@ -389,6 +441,24 @@ impl StackState {
                         _ = poll_future => {}
                         packet = rx_queue.recv() => {
                             if let Some(p) = packet {
+                                if let Some(pkt) = parse_udp_packet(&p) {
+                                    let handler = if pkt.src_port == 53 || pkt.dst_port == 53 {
+                                        None
+                                    } else {
+                                        Some(udp_handler.clone())
+                                    };
+                                    if let Some(handler) = handler {
+                                        tokio::spawn(async move {
+                                            handler.handle_udp(pkt).await;
+                                        });
+                                    } else {
+                                        let handler = dns_handler.clone();
+                                        tokio::spawn(async move {
+                                            handler.handle_dns(pkt).await;
+                                        });
+                                    }
+                                    continue;
+                                }
                                 let mut stack = self.stack.lock().unwrap();
                                 parse_packet_and_add_socket(&mut stack, &p);
                                 stack.device.rx_queue.push_back(p);
@@ -402,6 +472,24 @@ impl StackState {
                         _ = poll_future => {}
                         packet = rx_queue.recv() => {
                             if let Some(p) = packet {
+                                if let Some(pkt) = parse_udp_packet(&p) {
+                                    let handler = if pkt.src_port == 53 || pkt.dst_port == 53 {
+                                        None
+                                    } else {
+                                        Some(udp_handler.clone())
+                                    };
+                                    if let Some(handler) = handler {
+                                        tokio::spawn(async move {
+                                            handler.handle_udp(pkt).await;
+                                        });
+                                    } else {
+                                        let handler = dns_handler.clone();
+                                        tokio::spawn(async move {
+                                            handler.handle_dns(pkt).await;
+                                        });
+                                    }
+                                    continue;
+                                }
                                 let mut stack = self.stack.lock().unwrap();
                                 parse_packet_and_add_socket(&mut stack, &p);
                                 stack.device.rx_queue.push_back(p);

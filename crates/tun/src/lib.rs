@@ -1,9 +1,15 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+pub mod control;
 pub mod device;
+pub mod flow;
 pub mod injector;
+pub mod policy;
 pub mod stack;
+pub mod telemetry;
+pub mod uds;
+pub mod vhost_user;
 
 /// Configuration for MeshTun
 #[derive(Debug, Clone)]
@@ -22,6 +28,8 @@ pub struct MeshTunConfig {
     pub tcp_sockets: usize,
     /// Pre-allocated UDP socket count.
     pub udp_sockets: usize,
+    /// Workload identity attached to flows from this capture instance.
+    pub vm_id: String,
 }
 
 impl Default for MeshTunConfig {
@@ -34,6 +42,7 @@ impl Default for MeshTunConfig {
             mtu: 1500,
             tcp_sockets: 64,
             udp_sockets: 64,
+            vm_id: "default".to_string(),
         }
     }
 }
@@ -72,6 +81,7 @@ impl MeshTun {
             self.config.mtu,
             self.config.tcp_sockets,
             self.config.udp_sockets,
+            self.config.vm_id,
             stack_tx,
         );
 
@@ -179,6 +189,7 @@ impl MeshTun {
             self.config.mtu,
             self.config.tcp_sockets,
             self.config.udp_sockets,
+            self.config.vm_id,
             stack_tx,
         );
 
