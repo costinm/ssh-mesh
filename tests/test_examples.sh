@@ -133,7 +133,7 @@ need mcp-pmond
 need h2t
 
 if [ "${SSH_MESH_TEST_SKIP_PORT_CHECK:-0}" != "1" ]; then
-  for port in 18222 18280 "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}" "${SSH_MESH_HOST3_VM_HOST_HTTP_PORT}" 18422 18480 19002 19005 19102 19105; do
+  for port in 15101 15102 18222 18280 "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}" "${SSH_MESH_HOST3_VM_HOST_HTTP_PORT}" 18422 18480 19002 19005 19102 19105; do
     if ! port_free "${port}"; then
       echo "required test port is already in use: ${port}" >&2
       exit 1
@@ -149,6 +149,8 @@ suite_pid=$!
 
 wait_for "host2 HTTP admin" 60 http_ok "http://127.0.0.1:18280/_m/api/ssh/clients"
 wait_for "host1 HTTP admin" 60 http_ok "http://127.0.0.1:18480/_m/api/ssh/clients"
+wait_for "host1 mesh9p activation port" 60 tcp_open 15101
+wait_for "host2 mesh9p activation port" 60 tcp_open 15102
 wait_for "host3-vm HTTP admin" 180 http_ok "http://127.0.0.1:${SSH_MESH_HOST3_VM_HOST_HTTP_PORT}/_m/api/ssh/clients"
 wait_for "host3-vm SSH port" 60 tcp_open "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}"
 wait_for "host3-vm /nix over SSH" 60 ssh_exec_ok \
@@ -168,6 +170,10 @@ wait_for "host3-vm direct root SSH exec" 60 ssh_exec_ok \
   host3-vm-root-direct \
   "test \"$(id -u)\" = 0 && echo host3-root-direct-ok" \
   -p "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}"
+wait_for "host3-vm sees host1 and host2 9p exports" 60 ssh_exec_ok \
+  host3-vm-root-direct \
+  'test "$(cat /tmp/mesh/9p/host1/host1/mesh9p-export/host1.txt)" = "host1-9p-export-ok" && test "$(cat /tmp/mesh/9p/host2/host2/mesh9p-export/host2.txt)" = "host2-9p-export-ok"' \
+  -p "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}"
 wait_for "host1 SSH shell" 30 ssh_shell_ok host1
 wait_for "host2 routed SSH shell" 60 ssh_shell_ok host2
 wait_for "host3-vm routed SSH shell" 60 ssh_shell_ok host3-vm
@@ -175,6 +181,11 @@ wait_for "app1-bwrap routed SSH exec" 60 ssh_exec_ok \
   app1-bwrap \
   "echo app1-routed-ok"
 wait_for "app1-bwrap routed SSH shell" 60 ssh_shell_ok app1-bwrap
+if [ "${SSH_MESH_TEST_SKIP_APP5_9P:-0}" != "1" ]; then
+  wait_for "app5-vm no-TCP 9p mount" 180 ssh_exec_ok \
+    app5-vm \
+    "test -d /tmp/mesh/9p/nix/store && echo app5-9p-ok"
+fi
 
 wait_for "host3-vm trusted UDS" 60 test -S "${state_root}/shared/host3-vm/trusted.sock"
 wait_for "host1 trusted UDS" 30 test -S "${state_root}/shared/host1/trusted.sock"

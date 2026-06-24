@@ -1,8 +1,9 @@
 [service]
-name = "mesh9p-opt"
+name = "mesh9p-host2"
 command = "mesh9p"
-args = ["/opt"]
+args = ["/home/system:/host2:rw", "/opt"]
 priority = 400
+oneshot = false
 
 [resources]
 memory_low = "64M"
@@ -10,7 +11,8 @@ memory_high = "128M"
 cpu_weight = 50
 
 [environment]
-RUST_LOG = "debug"
+RUST_LOG = "info"
 
 [[activation]]
-port = 15101
+port = 15102
+wait = false

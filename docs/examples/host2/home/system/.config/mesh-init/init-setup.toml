@@ -1,0 +1,6 @@
+[service]
+name = "init-setup"
+command = "/opt/busybox/bin/sh"
+args = ["-c", "mkdir -p /home/system/mesh9p-export; printf 'host2-9p-export-ok\n' >/home/system/mesh9p-export/host2.txt; echo 'init-setup complete'"]
+priority = 10
+oneshot = true

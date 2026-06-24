@@ -1,7 +1,7 @@
 [service]
-name = "mesh9p-host1"
+name = "mesh9p-host3-vm"
 command = "mesh9p"
-args = ["/home/system:/host1:rw", "/tmp/mesh/shared:/shared:rw", "/opt"]
+args = ["/home/system:/host3-vm:rw", "/tmp/mesh/9p:/imports:rw", "/opt"]
 priority = 400
 oneshot = false
 
@@ -14,5 +14,5 @@ cpu_weight = 50
 RUST_LOG = "info"
 
 [[activation]]
-port = 15101
+port = 15103
 wait = false

@@ -161,6 +161,18 @@ Host3-vm also starts a one-shot diagnostic job on boot. It writes to the VM
 console and reports the kernel, command line, memory, interfaces, routes, virtio
 devices, kvm/vsock devices, `/nix`, and `/home`.
 
+The mesh also exercises 9P in multiple transport shapes:
+
+- host1 exports `/home/system`, `/tmp/mesh/shared`, and `/opt` on TCP port
+  `15101` through `mesh-init` socket activation.
+- host2 exports `/home/system` and `/opt` on TCP port `15102`.
+- host3-vm imports host1 and host2 at `/tmp/mesh/9p/host1` and
+  `/tmp/mesh/9p/host2`, then exports `/home/system`, `/tmp/mesh/9p`, and `/opt`
+  on TCP port `15103` inside the guest.
+- app5-vm mounts the host `/nix` 9P device at `/tmp/mesh/9p/nix` without TCP;
+  this is the no-network VM path using QEMU virtio-9p alongside the trusted
+  vsock activation channel.
+
 ## 9P Filesystem Exports
 
 `mesh9p` can export more than one host directory through one server. Each
@@ -212,26 +224,28 @@ fd, UDS, or virtio-9p front-end because Linux v9fs does not have a direct
 mesh9p /nix /src/home/app5:/home/app5:rw /src/shared:/run/ssh-mesh/shared:rw
 
 # direct virtio-9p front-end in the guest
-mount -t 9p -o version=9p2000.L,trans=virtio,access=any mesh9p /mnt/host
+mount -t 9p -o version=9p2000.L,trans=virtio,access=any mesh9p /tmp/mesh/9p/host
 ```
 
-Networked VM over TCP:
+The checked-in host configs use these concrete exporter ports:
 
 ```bash
-mesh9p \
-  /nix \
-  "${SSH_MESH_STATE_ROOT}/host3-vm/home/system:/home/system:rw" \
-  "${SSH_MESH_STATE_ROOT}/shared:/run/ssh-mesh/shared:rw" \
-  --tcp 127.0.0.1:15101
+mesh9p /home/system:/host1:rw /tmp/mesh/shared:/shared:rw /opt
+mesh9p /home/system:/host2:rw /opt
+mesh9p /home/system:/host3-vm:rw /tmp/mesh/9p:/imports:rw /opt
 ```
 
-Inside a VM with network access to the exporter:
+Inside host3-vm, the host1 and host2 imports are mounted over TCP from the QEMU
+host gateway:
 
 ```bash
-mkdir -p /mnt/host
-mount -t 9p -o version=9p2000.L,trans=tcp,port=15101,uname=root \
-  127.0.0.1 /mnt/host
-ls /mnt/host/nix /mnt/host/home/system
+mkdir -p /tmp/mesh/9p/host1 /tmp/mesh/9p/host2
+mount -t 9p -o version=9p2000.L,trans=tcp,port=15101,uname=system,access=any \
+  10.0.2.2 /tmp/mesh/9p/host1
+mount -t 9p -o version=9p2000.L,trans=tcp,port=15102,uname=system,access=any \
+  10.0.2.2 /tmp/mesh/9p/host2
+cat /tmp/mesh/9p/host1/host1/mesh9p-export/host1.txt
+cat /tmp/mesh/9p/host2/host2/mesh9p-export/host2.txt
 ```
 
 ## Keys

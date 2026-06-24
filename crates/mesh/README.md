@@ -1,8 +1,9 @@
 # Client library for (SSH) Mesh
 
-This create provides an optional library for interacting with a Mesh, defined as a mechanism for running apps with configurable and (more) consistent security, telemetry, networking.
+This create provides an optional library for interacting with a Mesh, i.e. a mechanism for running apps with configurable and (more) consistent security, telemetry, networking.
 
-Any application using stdin/stdout/stderr or UDS or HTTP/1.1 or H2C can be used with no changes by SSH mesh - the library is optional, defining helpers and examples for the patterns used by ssh-mesh.
+Any application using stdin/stdout/stderr or UDS or HTTP/1.1 or H2C can be used with no changes by SSH mesh - the library allows few 
+extra features like a control socket, opinionated telemetry setup.
 
 
 

@@ -9,16 +9,6 @@ cd "${REPO_ROOT}"
 export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc 
 
-# Musl SDK must be installed - the script will download in setup() if missing.
-export MUSL_DIR=${MUSL_DIR:-/opt/musl}
-export PATH=$MUSL_DIR/bin:$PATH
-    
-# export PATH="$MUSL_DIR/x86_64-linux-musl-native/bin:$PATH"
-# export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
-# export CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++
-# export AR_x86_64_unknown_linux_musl=x86_64-linux-musl-ar
-# export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
-
 #RUST_FLAGS="-j 1"
 
 export DEST=${DEST:-/opt/ssh-mesh}
@@ -51,6 +41,7 @@ Fresh target/examples sequence:
 Common commands:
   help                 Show this help.
   rust                 Build x86_64 musl release Rust binaries.
+  deps [path]          Add missing build dependencies to the Nix profile.
   deploy_examples      Compatibility alias for dist.
   stage_examples       Compatibility alias for staging target/dist/opt.
   stage_example_tree   Refresh checked-in example files under target/examples.
@@ -131,6 +122,100 @@ default_nix_profile() {
         target_profile="$PWD/target/nix/profiles"
     fi
     printf '%s\n' "$target_profile"
+}
+
+prepend_nix_profile_path() {
+    local profile_path="${1:-$(default_nix_profile)}"
+
+    if [ -d "$profile_path/bin" ]; then
+        case ":${PATH:-}:" in
+            *":$profile_path/bin:"*) ;;
+            *) export PATH="$profile_path/bin:${PATH:-}" ;;
+        esac
+    fi
+}
+
+prepare_nix_profile_path() {
+    local target_profile="$1"
+
+    if [ -d "${target_profile}" ] && [ ! -L "${target_profile}" ]; then
+        echo "Removing non-symlink directory at ${target_profile} so Nix can manage the profile..."
+        rm -rf "${target_profile}"
+    fi
+}
+
+configure_musl_toolchain() {
+    local profile_path="${1:-$(default_nix_profile)}"
+    local linker
+    local ar
+
+    prepend_nix_profile_path "$profile_path"
+
+    linker="$(command -v x86_64-unknown-linux-musl-gcc || true)"
+    if [ -z "$linker" ]; then
+        echo "Missing x86_64-unknown-linux-musl-gcc in PATH; run scripts/build.sh profile" >&2
+        return 1
+    fi
+
+    export CC_x86_64_unknown_linux_musl="$linker"
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$linker"
+
+    ar="$(command -v x86_64-unknown-linux-musl-ar || true)"
+    if [ -n "$ar" ]; then
+        export AR_x86_64_unknown_linux_musl="$ar"
+    fi
+}
+
+configure_swagger_ui_assets() {
+    local profile_path="${1:-$(default_nix_profile)}"
+    local swagger_zip="$profile_path/share/ssh-mesh/swagger-ui/v5.17.14.zip"
+
+    if [ ! -e "$swagger_zip" ]; then
+        echo "Missing Swagger UI zip in Nix profile; run scripts/build.sh deps" >&2
+        return 1
+    fi
+
+    export SWAGGER_UI_DOWNLOAD_URL="file://$swagger_zip"
+}
+
+add_nix_profile_deps() {
+    local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
+    shift || true
+    local deps="${*:-musl-toolchain swagger-ui-assets}"
+    local dep
+
+    prepare_nix_profile_path "$target_profile"
+
+    echo "Adding missing Nix profile dependencies to: ${target_profile}"
+    for dep in $deps; do
+        if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "$dep"; then
+            echo "  ${dep}: already present"
+        else
+            echo "  ${dep}: nix profile add .#${dep}"
+            nix profile add ".#${dep}" --profile "${target_profile}" || return $?
+        fi
+    done
+
+    prepend_nix_profile_path "$target_profile"
+}
+
+deps() {
+    add_nix_profile_deps "$@"
+}
+
+ensure_musl_toolchain_profile() {
+    local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
+
+    prepend_nix_profile_path "$target_profile"
+    if ! command -v x86_64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+        add_nix_profile_deps "$target_profile" musl-toolchain
+    fi
+    if [ ! -e "$target_profile/share/ssh-mesh/swagger-ui/v5.17.14.zip" ]; then
+        add_nix_profile_deps "$target_profile" swagger-ui-assets
+    fi
+
+    configure_musl_toolchain "$target_profile"
+    configure_swagger_ui_assets "$target_profile"
 }
 
 install_busybox_tree() {
@@ -230,6 +315,7 @@ stage_example_tree() {
 }
 
 rust() {
+    ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
     echo "Building release binaries with musl..."
     cargo build --target x86_64-unknown-linux-musl --release --workspace --exclude dmesh
 }
@@ -249,16 +335,10 @@ default() {
 }
 
 setup() {
-    if [ ! -d "$MUSL_DIR" ]; then
-        mkdir -p $MUSL_DIR
-        cd $MUSL_DIR
-        # No -O - stdout
-        curl -L https://musl.cc/x86_64-linux-musl-native.tgz | \
-            tar xzf -
-    fi 
-
+    ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
 }
 debug() {
+    ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
     cargo build --target x86_64-unknown-linux-musl --workspace --exclude dmesh
 
     #_all x86_64-unknown-linux-musl 
@@ -280,6 +360,10 @@ arm() {
 _all() {
     local target=$1
     local mode=$2
+
+    if [ "$target" = "x86_64-unknown-linux-musl" ]; then
+        ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
+    fi
     
     for bin in $CRATES; do
         cargo build ${RUST_FLAGS} --target $target ${mode} -p $bin
@@ -291,6 +375,7 @@ _all() {
 
 # upstream unpfs
 unpfs() {
+    ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
     cargo install --target x86_64-unknown-linux-musl unpfs
 }
 
@@ -352,8 +437,7 @@ install() {
     
     mkdir -p "$dest/bin"
 
-    echo "Building release binaries with musl..."
-    cargo build --target x86_64-unknown-linux-musl --release --workspace --exclude dmesh
+    rust
 
     echo "Installing runtime binaries to $dest/bin..."
     copy_runtime_bins "$release_dir" "$dest/bin" $BIN_TARGETS
@@ -426,6 +510,8 @@ dmesh_java() {
     local release_dir="target/x86_64-unknown-linux-musl/release"
 
     mkdir -p "$dest/bin"
+
+    ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
 
     echo "Building dmesh release binary with musl..."
     cargo build -p dmesh --target x86_64-unknown-linux-musl --release
@@ -518,11 +604,7 @@ profile() {
     # Default NIX_PROFILE target path
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
 
-    # If target_profile is a real directory and not a symlink, delete it so Nix can manage it
-    if [ -d "${target_profile}" ] && [ ! -L "${target_profile}" ]; then
-        echo "Removing non-symlink directory at ${target_profile} so Nix can manage the profile..."
-        rm -rf "${target_profile}"
-    fi
+    prepare_nix_profile_path "$target_profile"
 
     echo "Updating Nix profile: ${target_profile}"
     if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "ssh-mesh"; then
@@ -556,8 +638,7 @@ build() {
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
     
     echo "=== 1. Building release binaries with musl ==="
-    cargo build --target x86_64-unknown-linux-musl --release --workspace --exclude dmesh
-
+    rust
 
     echo "=== 2. Assembling and upgrading local VM profile ==="
     profile "${target_profile}"
@@ -579,7 +660,7 @@ main() {
         -h|--help|help)
             help
             ;;
-        default|rust|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|jni|dmesh_java|arm_release|erofs|vm|profile|build)
+        default|rust|deps|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|jni|dmesh_java|arm_release|erofs|vm|profile|build)
             "$cmd" "$@"
             ;;
         *)

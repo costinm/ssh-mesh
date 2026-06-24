@@ -76,6 +76,21 @@
 
         # ── Packages ──────────────────────────────────────────────
 
+        musl-toolchain = pkgs.symlinkJoin {
+          name = "ssh-mesh-musl-toolchain";
+          paths = [ pkgs.pkgsCross.musl64.stdenv.cc ];
+        };
+
+        swagger-ui-assets = pkgs.runCommand "ssh-mesh-swagger-ui-assets" { } ''
+          mkdir -p "$out/share/ssh-mesh/swagger-ui"
+          ln -s ${swaggerUiZip} "$out/share/ssh-mesh/swagger-ui/v5.17.14.zip"
+        '';
+
+        build-deps = pkgs.symlinkJoin {
+          name = "ssh-mesh-build-deps";
+          paths = [ musl-toolchain swagger-ui-assets ];
+        };
+
         # Aggregate: all workspace binaries
         ssh-mesh-full = mkPackage "ssh-mesh-full"
           "--workspace --bins --features ssh-mesh/pmon";
@@ -171,10 +186,10 @@
       in
       {
         packages = {
-            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc sshm initos-erofs kernel-cloud initos-vm initos-vm-image;
+            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets build-deps;
             default = pkgs.symlinkJoin {
               name = "ssh-mesh-default";
-              paths = [ ssh-mesh-full initos-erofs initos-vm ];
+              paths = [ ssh-mesh-full initos-erofs initos-vm build-deps ];
             };
         };
 

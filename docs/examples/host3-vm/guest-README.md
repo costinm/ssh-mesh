@@ -67,6 +67,17 @@ When QEMU user networking is used, `vrun` forwards:
 127.0.0.1:18380 -> guest:18380
 ```
 
+Host3-vm imports the host1 and host2 `mesh9p` exports through the QEMU host
+gateway:
+
+```text
+10.0.2.2:15101 -> /tmp/mesh/9p/host1
+10.0.2.2:15102 -> /tmp/mesh/9p/host2
+```
+
+The guest also starts `mesh9p-host3-vm`, exporting `/home/system`,
+`/tmp/mesh/9p`, and `/opt` on guest TCP port `15103`.
+
 The host-side ports can be changed with `SSH_MESH_HOST3_VM_HOST_SSH_PORT` and
 `SSH_MESH_HOST3_VM_HOST_HTTP_PORT`; guest ports remain `18322` and `18380`. The
 example uses QEMU user networking only. The shared 9p filesystem is for config

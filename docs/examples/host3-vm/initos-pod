@@ -43,6 +43,31 @@ setup_kvm_device() {
   fi
 }
 
+mount_mesh9p_tcp() {
+  name="$1"
+  port="$2"
+  mountpoint="/tmp/mesh/9p/${name}"
+  gateway="${SSH_MESH_9P_HOST_GATEWAY:-10.0.2.2}"
+
+  modprobe 9pnet 2>/dev/null || true
+  modprobe 9pnet_tcp 2>/dev/null || true
+  modprobe 9p 2>/dev/null || true
+
+  mkdir -p "${mountpoint}"
+  n=0
+  while [ "${n}" -lt 60 ]; do
+    if mount -t 9p -o "trans=tcp,version=9p2000.L,port=${port},uname=system,access=any" "${gateway}" "${mountpoint}" 2>/dev/null; then
+      log "mounted ${name} 9p export from ${gateway}:${port} at ${mountpoint}"
+      return 0
+    fi
+    n=$((n + 1))
+    sleep 1
+  done
+
+  log "warning: failed to mount ${name} 9p export from ${gateway}:${port}"
+  return 1
+}
+
 home_src=/src/host3-vm/home/system
 home=/home/system
 root_home=/home/root
@@ -59,7 +84,8 @@ mkdir -p \
   "${home}/.run/ssh-mesh/mux" \
   "${home}/.ssh" \
   /tmp/mesh \
-  /tmp/mesh/shared
+  /tmp/mesh/shared \
+  /tmp/mesh/9p
 
 if [ -d /src/shared ]; then
   if mount -o bind /src/shared /tmp/mesh/shared 2>/dev/null; then
@@ -133,6 +159,9 @@ ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || true
 udhcpc -i eth0 -q -n -t 5 2>/dev/null || log "dhcp on eth0 failed"
 setup_kvm_device
+
+mount_mesh9p_tcp host1 15101 || true
+mount_mesh9p_tcp host2 15102 || true
 
 export HOME="${home}"
 export USER=system

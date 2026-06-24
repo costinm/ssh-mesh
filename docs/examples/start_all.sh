@@ -263,9 +263,9 @@ start_node() {
   printf '%s\n' "${pid}" >>"${pid_file}"
 }
 
+start_node host1
 start_node host2
 start_node host3-vm "${examples_dir}/host3-vm/run-host3-vm"
-start_node host1
 
 cat <<EOF
 
@@ -283,6 +283,9 @@ Fixed listeners:
   host2: ssh 127.0.0.1:18222, http 127.0.0.1:18280
   host3-vm: vrun/qemu hostfwd ssh 127.0.0.1:${vm_host_ssh_port}, http 127.0.0.1:${vm_host_http_port}
   host1: ssh 127.0.0.1:18422, http 127.0.0.1:18480
+  mesh9p host1 export: tcp 127.0.0.1:15101
+  mesh9p host2 export: tcp 127.0.0.1:15102
+  mesh9p host3-vm export: tcp 15103 inside the guest
 
 Trusted UDS sockets:
   ${root_dir}/shared/app1-bwrap/trusted.sock  (activated by host1 mesh-init)

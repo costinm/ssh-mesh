@@ -20,6 +20,28 @@ log() {
   echo "${node}-POD: $*"
 }
 
+mount_virtio_9p_nix() {
+  modprobe 9pnet 2>/dev/null || true
+  modprobe 9pnet_virtio 2>/dev/null || true
+  modprobe 9p 2>/dev/null || true
+
+  mkdir -p /tmp/mesh/9p/nix
+  nix_9p=0
+  for tag9p in /sys/bus/virtio/drivers/9pnet_virtio/virtio*/mount_tag; do
+    [ -f "${tag9p}" ] || continue
+    if [ "$(cat "${tag9p}" 2>/dev/null || true)" = "nix" ]; then
+      nix_9p=1
+      break
+    fi
+  done
+  if [ "${nix_9p}" = "1" ] && mount -t 9p -o trans=virtio,version=9p2000.L,ro nix /tmp/mesh/9p/nix 2>/dev/null; then
+    log "mounted 9p tag nix to /tmp/mesh/9p/nix read-only"
+    return 0
+  fi
+  log "nix 9p tag not mounted; no-TCP 9p check will be unavailable"
+  return 1
+}
+
 mkdir -p \
   "${home}" \
   "${home}/.config/mesh-init" \
@@ -28,7 +50,10 @@ mkdir -p \
   "${home}/.run/ssh-mesh/mux" \
   "${home}/.ssh" \
   /tmp/mesh \
-  /tmp/mesh/shared
+  /tmp/mesh/shared \
+  /tmp/mesh/9p
+
+mount_virtio_9p_nix || true
 
 if [ -d /src/shared ]; then
   if mount -o bind /src/shared /tmp/mesh/shared 2>/dev/null; then
