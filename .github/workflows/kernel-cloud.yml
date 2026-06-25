@@ -7,10 +7,14 @@ on:
       - master
     paths:
       - linux/**
+      - flake.nix
+      - flake.lock
       - .github/workflows/kernel-cloud.yml
   pull_request:
     paths:
       - linux/**
+      - flake.nix
+      - flake.lock
       - .github/workflows/kernel-cloud.yml
   workflow_dispatch:
 
@@ -31,7 +35,7 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build cloud kernel
-        run: nix build ./linux#kernel-cloud -o result-kernel-cloud --print-build-logs
+        run: nix build .#kernel-cloud -o result-kernel-cloud --print-build-logs
 
       - name: Check cloud kernel output
         run: |
@@ -50,7 +54,7 @@ jobs:
           path: ssh-mesh-kernel-cloud.tar.gz
 
       - name: Build initos VM image
-        run: nix build ./linux#initos-vm-image -o result-initos-vm-image --print-build-logs
+        run: nix build .#initos-vm-image -o result-initos-vm-image --print-build-logs
 
       - name: Load initos VM image
         run: docker load < result-initos-vm-image

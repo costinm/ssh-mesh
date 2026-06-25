@@ -16,10 +16,6 @@ vhost-user-net = [
 
 [dependencies]
 mesh = { path = "../mesh" }
-smoltcp = { version = "0.13", default-features = false, features = [
-    "std", "medium-ip", "proto-ipv4", "proto-ipv6",
-    "socket-tcp", "socket-udp", "socket-raw", "log", "async"
-] }
 tun-rs = { version = "2.8", features = ["async"] }
 tokio = { version = "1", features = ["net", "sync", "io-util", "rt", "macros", "time"] }
 tracing = "0.1"

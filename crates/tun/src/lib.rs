@@ -1,35 +1,39 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use mesh::tun::{TunDnsHandler, TunTcpHandler, TunUdpHandler};
+use tcp_rewrite::{TcpRewriteConfig, TcpRewriter};
+use tokio::sync::mpsc;
+
 pub mod control;
-pub mod device;
 pub mod flow;
 pub mod injector;
+pub mod packet;
 pub mod policy;
-pub mod stack;
+pub mod tcp_rewrite;
 pub mod telemetry;
 pub mod uds;
 pub mod vhost_user;
 
-/// Configuration for MeshTun
+/// Configuration for MeshTun.
 #[derive(Debug, Clone)]
 pub struct MeshTunConfig {
-    /// TUN interface name (e.g., "tun0"). Ignored if `fd` is set.
+    /// TUN interface name. Ignored if `fd` is set.
     pub name: Option<String>,
-    /// Pre-opened TUN file descriptor (Android VPN).
+    /// Pre-opened TUN file descriptor, used by Android VPN integration.
     pub fd: Option<i32>,
-    /// Local IP address for the smoltcp interface.
+    /// Local IP address reserved for this capture endpoint.
     pub address: IpAddr,
     /// Network prefix length.
     pub prefix_len: u8,
-    /// MTU for the interface.
+    /// MTU for packet buffers and created TUN devices.
     pub mtu: usize,
-    /// Pre-allocated TCP socket count (can grow since we use std Vec).
-    pub tcp_sockets: usize,
-    /// Pre-allocated UDP socket count.
-    pub udp_sockets: usize,
     /// Workload identity attached to flows from this capture instance.
     pub vm_id: String,
+    /// Enable passt-style TCP source tracking and packet rewrite.
+    pub tcp_rewrite: bool,
+    /// TCP rewrite settings.
+    pub tcp_rewrite_config: TcpRewriteConfig,
 }
 
 impl Default for MeshTunConfig {
@@ -40,9 +44,9 @@ impl Default for MeshTunConfig {
             address: "10.5.0.1".parse().unwrap(),
             prefix_len: 16,
             mtu: 1500,
-            tcp_sockets: 64,
-            udp_sockets: 64,
             vm_id: "default".to_string(),
+            tcp_rewrite: true,
+            tcp_rewrite_config: TcpRewriteConfig::default(),
         }
     }
 }
@@ -56,153 +60,181 @@ impl MeshTun {
         Ok(Self { config })
     }
 
-    /// Create from an Android VPN file descriptor.
+    /// Create a MeshTun from an Android VPN/TUN file descriptor.
+    ///
+    /// The caller remains responsible for passing a valid TUN fd. The fd is
+    /// handed to `tun-rs` when [`MeshTun::run`] is called.
     pub unsafe fn from_fd(fd: i32) -> Result<Self, anyhow::Error> {
         let mut config = MeshTunConfig::default();
         config.fd = Some(fd);
         Ok(Self { config })
     }
 
-    /// Access the config
-    /// Start the smoltcp event loop and return the injector.
+    /// Start packet routing over a real TUN device or pre-opened fd.
     pub async fn run(
         self,
-        tcp_handler: Arc<dyn mesh::tun::TunTcpHandler>,
-        udp_handler: Arc<dyn mesh::tun::TunUdpHandler>,
-        dns_handler: Arc<dyn mesh::tun::TunDnsHandler>,
+        tcp_handler: Arc<dyn TunTcpHandler>,
+        udp_handler: Arc<dyn TunUdpHandler>,
+        dns_handler: Arc<dyn TunDnsHandler>,
     ) -> Result<Arc<dyn mesh::tun::TunInjector>, anyhow::Error> {
-        let (tun_tx, tun_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stack_tx, mut stack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (tun_tx, tun_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (device_tx, mut device_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let injector = Arc::new(injector::MeshTunInjector::new(device_tx.clone()));
+        let tcp_rewriter = self.tcp_rewriter()?;
 
-        // Create the stack state
-        let stack_state = stack::StackState::new(
-            self.config.address,
-            self.config.prefix_len,
-            self.config.mtu,
-            self.config.tcp_sockets,
-            self.config.udp_sockets,
-            self.config.vm_id,
-            stack_tx,
-        );
-
-        let stack_arc = stack_state.stack.clone();
-        let waker = stack_state.poll_waker.clone();
-        let injector = Arc::new(injector::MeshTunInjector::new(stack_arc, waker));
-
-        if let Some(fd) = self.config.fd {
-            // Android VPN Mode (or pre-opened TUN fd)
-            let tun = unsafe { tun_rs::AsyncDevice::from_fd(fd) }
-                .map_err(|e| anyhow::anyhow!("TUN FD error: {}", e))?;
-            let tun_arc = Arc::new(tun);
-            let tun_read = tun_arc.clone();
-            let tun_write = tun_arc;
-
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65535];
-                loop {
-                    match tun_read.recv(&mut buf).await {
-                        Ok(n) => {
-                            let _ = tun_tx.send(buf[..n].to_vec());
-                        }
-                        Err(e) => {
-                            tracing::error!("TUN read error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            });
-
-            tokio::spawn(async move {
-                while let Some(pkt) = stack_rx.recv().await {
-                    let _ = tun_write.send(&pkt).await;
-                }
-            });
-        } else {
-            // Test Mode: We leave the queues open. Tests can push/pull to them if we exposed them,
-            // but for a pipe test, we can just use the config fd or we expose a method to inject.
-            // Wait, tun-rs also supports creating a real TUN by name.
-            let mut builder = tun_rs::DeviceBuilder::new();
-            if let Some(name) = &self.config.name {
-                builder = builder.name(name);
-            }
-            let tun = builder
-                .mtu(self.config.mtu as u16)
-                .build_async()
-                .map_err(|e| anyhow::anyhow!("TUN create error: {}", e))?;
-            let tun_arc = Arc::new(tun);
-            let tun_read = tun_arc.clone();
-            let tun_write = tun_arc;
-
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65535];
-                loop {
-                    match tun_read.recv(&mut buf).await {
-                        Ok(n) => {
-                            let _ = tun_tx.send(buf[..n].to_vec());
-                        }
-                        Err(e) => {
-                            tracing::error!("TUN read error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            });
-
-            tokio::spawn(async move {
-                while let Some(pkt) = stack_rx.recv().await {
-                    let _ = tun_write.send(&pkt).await;
-                }
-            });
-        }
+        let tun = self.open_tun_device()?;
+        let tun_arc = Arc::new(tun);
+        let tun_read = tun_arc.clone();
+        let tun_write = tun_arc;
+        let mtu = self.config.mtu.max(1500);
 
         tokio::spawn(async move {
-            stack_state
-                .run_loop(tcp_handler, udp_handler, dns_handler, tun_rx)
-                .await;
+            let mut buf = vec![0u8; mtu.max(65535)];
+            loop {
+                match tun_read.recv(&mut buf).await {
+                    Ok(n) => {
+                        let _ = tun_tx.send(buf[..n].to_vec());
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "TUN read stopped");
+                        break;
+                    }
+                }
+            }
         });
 
+        tokio::spawn(async move {
+            while let Some(packet) = device_rx.recv().await {
+                if let Err(error) = tun_write.send(&packet).await {
+                    tracing::error!(%error, "TUN write stopped");
+                    break;
+                }
+            }
+        });
+
+        spawn_packet_router(
+            tcp_handler,
+            udp_handler,
+            dns_handler,
+            tun_rx,
+            device_tx,
+            tcp_rewriter,
+        );
         Ok(injector)
     }
 
-    /// Internal method for test environments to inject a pair of channels instead of a real TUN device
+    /// Start packet routing over caller-provided channels.
+    ///
+    /// The returned sender accepts inbound IP packets. The returned receiver
+    /// yields outbound IP packets generated by the injector.
     pub async fn run_with_channels(
         self,
-        tcp_handler: Arc<dyn mesh::tun::TunTcpHandler>,
-        udp_handler: Arc<dyn mesh::tun::TunUdpHandler>,
-        dns_handler: Arc<dyn mesh::tun::TunDnsHandler>,
-        _tun_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-        _stack_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        tcp_handler: Arc<dyn TunTcpHandler>,
+        udp_handler: Arc<dyn TunUdpHandler>,
+        dns_handler: Arc<dyn TunDnsHandler>,
+        _tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+        _stack_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> Result<
         (
             Arc<dyn mesh::tun::TunInjector>,
-            tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-            tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+            mpsc::UnboundedSender<Vec<u8>>,
+            mpsc::UnboundedReceiver<Vec<u8>>,
         ),
         anyhow::Error,
     > {
-        let (inner_tun_tx, tun_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stack_tx, inner_stack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-        let stack_state = stack::StackState::new(
-            self.config.address,
-            self.config.prefix_len,
-            self.config.mtu,
-            self.config.tcp_sockets,
-            self.config.udp_sockets,
-            self.config.vm_id,
-            stack_tx,
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let injector = Arc::new(injector::MeshTunInjector::new(outgoing_tx.clone()));
+        let tcp_rewriter = self.tcp_rewriter()?;
+        spawn_packet_router(
+            tcp_handler,
+            udp_handler,
+            dns_handler,
+            incoming_rx,
+            outgoing_tx,
+            tcp_rewriter,
         );
-
-        let stack_arc = stack_state.stack.clone();
-        let waker = stack_state.poll_waker.clone();
-        let injector = Arc::new(injector::MeshTunInjector::new(stack_arc, waker));
-
-        tokio::spawn(async move {
-            stack_state
-                .run_loop(tcp_handler, udp_handler, dns_handler, tun_rx)
-                .await;
-        });
-
-        Ok((injector, inner_tun_tx, inner_stack_rx))
+        Ok((injector, incoming_tx, outgoing_rx))
     }
+
+    fn open_tun_device(&self) -> Result<tun_rs::AsyncDevice, anyhow::Error> {
+        if let Some(fd) = self.config.fd {
+            return unsafe { tun_rs::AsyncDevice::from_fd(fd) }
+                .map_err(|error| anyhow::anyhow!("TUN FD error: {error}"));
+        }
+
+        let mut builder = tun_rs::DeviceBuilder::new();
+        if let Some(name) = &self.config.name {
+            builder = builder.name(name);
+        }
+        builder
+            .mtu(self.config.mtu as u16)
+            .build_async()
+            .map_err(|error| anyhow::anyhow!("TUN create error: {error}"))
+    }
+
+    fn tcp_rewriter(&self) -> Result<Option<TcpRewriter>, anyhow::Error> {
+        self.config
+            .tcp_rewrite
+            .then(|| TcpRewriter::new(self.config.tcp_rewrite_config.clone()))
+            .transpose()
+    }
+}
+
+fn spawn_packet_router(
+    _tcp_handler: Arc<dyn TunTcpHandler>,
+    udp_handler: Arc<dyn TunUdpHandler>,
+    dns_handler: Arc<dyn TunDnsHandler>,
+    mut incoming_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    outgoing_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tcp_rewriter: Option<TcpRewriter>,
+) {
+    tokio::spawn(async move {
+        let mut tcp_rewriter = tcp_rewriter;
+        while let Some(packet) = incoming_rx.recv().await {
+            match packet::parse_ip_packet(&packet) {
+                packet::TunPacket::Udp(packet)
+                    if packet.src_port == 53 || packet.dst_port == 53 =>
+                {
+                    let handler = dns_handler.clone();
+                    tokio::spawn(async move {
+                        handler.handle_dns(packet).await;
+                    });
+                }
+                packet::TunPacket::Udp(packet) => {
+                    let handler = udp_handler.clone();
+                    tokio::spawn(async move {
+                        handler.handle_udp(packet).await;
+                    });
+                }
+                packet::TunPacket::Tcp(tcp) => {
+                    if let Some(rewriter) = tcp_rewriter.as_mut() {
+                        let result = if tcp.dst_addr == IpAddr::V4(rewriter.config().proxy_addr) {
+                            rewriter.translate_inbound(&packet)
+                        } else {
+                            rewriter.translate_outbound(&packet)
+                        };
+                        match result {
+                            Ok(Some(packet)) => {
+                                let _ = outgoing_tx.send(packet);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "TCP rewrite failed");
+                            }
+                        }
+                        continue;
+                    }
+                    tracing::debug!(
+                        src = %std::net::SocketAddr::new(tcp.src_addr, tcp.src_port),
+                        dst = %std::net::SocketAddr::new(tcp.dst_addr, tcp.dst_port),
+                        syn = tcp.syn,
+                        ack = tcp.ack,
+                        "TCP packet observed; passt-style TCP rewriting is not wired yet"
+                    );
+                }
+                packet::TunPacket::Other => {}
+            }
+        }
+    });
 }

@@ -96,7 +96,7 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
     let mut fields = request.split_whitespace();
     match fields.next() {
         Some("ping") => Ok(ControlRequest::Ping),
-        Some("capture-packet") => {
+        Some("capture-packet" | "capture-afpacket" | "capture-af_socket") => {
             let mut vm_id = None;
             let mut netns_path = None;
             let mut if_name = None;
@@ -243,5 +243,17 @@ mod tests {
         assert_eq!(spec.vm_id, "app1");
         assert_eq!(spec.netns_path, PathBuf::from("/proc/123/ns/net"));
         assert_eq!(spec.if_name.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn parses_afsocket_capture_alias() {
+        let ControlRequest::CapturePacket(spec) =
+            parse_control_request("capture-af_socket vm_id=app2 netns=/proc/456/ns/net").unwrap()
+        else {
+            panic!("expected capture-packet");
+        };
+        assert_eq!(spec.vm_id, "app2");
+        assert_eq!(spec.netns_path, PathBuf::from("/proc/456/ns/net"));
+        assert_eq!(spec.if_name, None);
     }
 }

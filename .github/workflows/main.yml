@@ -5,15 +5,26 @@ on:
     branches:
       - main
       - master
-  pull_request: {}
+    paths-ignore:
+      - linux/**
+      - crates/dmesh/**
+      - .github/workflows/kernel-cloud.yml
+      - .github/workflows/dmesh.yml
+  pull_request:
+    paths-ignore:
+      - linux/**
+      - crates/dmesh/**
+      - .github/workflows/kernel-cloud.yml
+      - .github/workflows/dmesh.yml
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   # ── Nix build: native x86_64 ───────────────────────────────────
-  nix-build:
-    name: Nix (x86_64-linux)
+  build:
+    name: Build
     runs-on: ubuntu-latest
 
     steps:
@@ -25,25 +36,16 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Build all packages
-        run: nix build .#ssh-mesh .#pmond .#h2t .#meshkeys .#sshmc .#ssh-mesh-full --print-build-logs
+      - name: Build main Nix target
+        run: nix build .#default -o result-default --print-build-logs
 
       - name: Build Nix Docker image
-        run: nix build .#sshm --print-build-logs
+        run: nix build .#sshm -o result-sshm --print-build-logs
 
-      - name: Create NAR archives
+      - name: Create NAR archive
         run: |
           mkdir -p artifacts
-
-          for pkg in ssh-mesh pmond h2t meshkeys sshmc; do
-            nix build .#${pkg} --print-build-logs
-            nix-store --dump ./result > artifacts/${pkg}-x86_64-linux.nar
-          done
-
-          # Directly create combined NAR archive from the ssh-mesh-full build
-          nix build .#ssh-mesh-full --print-build-logs
-          nix-store --dump ./result > artifacts/ssh-mesh-all-x86_64-linux.nar
-
+          nix-store --dump ./result-default > artifacts/ssh-mesh-main-x86_64-linux.nar
           ls -lh artifacts/
 
       - name: Upload NAR artifacts
@@ -53,40 +55,24 @@ jobs:
           path: artifacts/*.nar
           retention-days: 90
 
-  # ── Docker build (existing) ────────────────────────────────────
-  build-docker:
-    name: Build-in-docker
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to the Container registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: https://ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/costinm/sshm:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Push Docker image
+        if: github.event_name != 'pull_request'
+        run: |
+          docker load < result-sshm
+          docker push ghcr.io/costinm/sshm:latest
 
   # ── Release: attach NARs to GitHub releases ────────────────────
   release:
     name: Attach NARs to release
-    needs: [nix-build]
+    needs: [build]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

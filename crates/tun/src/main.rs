@@ -118,11 +118,18 @@ fn mesh_tun_config_from_env() -> Result<MeshTunConfig, anyhow::Error> {
     if let Ok(mtu) = env::var("MESH_TUN_MTU") {
         config.mtu = mtu.parse()?;
     }
-    if let Ok(tcp_sockets) = env::var("MESH_TUN_TCP_SOCKETS") {
-        config.tcp_sockets = tcp_sockets.parse()?;
+    if let Ok(enabled) = env::var("MESH_TUN_TCP_REWRITE") {
+        config.tcp_rewrite = env_value_truthy(&enabled);
     }
-    if let Ok(udp_sockets) = env::var("MESH_TUN_UDP_SOCKETS") {
-        config.udp_sockets = udp_sockets.parse()?;
+    if let Ok(proxy_addr) = env::var("MESH_TUN_TCP_REWRITE_PROXY_ADDR") {
+        config.tcp_rewrite_config.proxy_addr = proxy_addr.parse()?;
+    }
+    if let Ok(port_range) = env::var("MESH_TUN_TCP_REWRITE_PORTS") {
+        let Some((first, last)) = port_range.split_once('-') else {
+            anyhow::bail!("MESH_TUN_TCP_REWRITE_PORTS must be FIRST-LAST");
+        };
+        config.tcp_rewrite_config.first_port = first.parse()?;
+        config.tcp_rewrite_config.last_port = last.parse()?;
     }
     if let Ok(vm_id) = env::var("MESH_TUN_VM_ID") {
         if !vm_id.is_empty() {
@@ -133,8 +140,11 @@ fn mesh_tun_config_from_env() -> Result<MeshTunConfig, anyhow::Error> {
 }
 
 fn env_truthy(name: &str) -> bool {
-    matches!(
-        env::var(name).as_deref(),
-        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
-    )
+    env::var(name)
+        .map(|value| env_value_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn env_value_truthy(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes" | "on")
 }

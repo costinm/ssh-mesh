@@ -19,15 +19,16 @@ path = "src/bin/meshkeys.rs"
 [[bin]]
 name = "gen-openapi"
 path = "src/bin/gen-openapi.rs"
+required-features = ["openapi"]
 
 [[bin]]
 name = "sshmc"
 path = "src/bin/sshmc.rs"
 
 [features]
-default = ["test-utils", "sftp", "pmon"]
+default = ["test-utils", "sftp"]
 test-utils = ["tempfile", "once_cell"]
-pmon = ["dep:pmond"]
+openapi = ["dep:pmond"]
 sftp = ["dep:sftp-server", "dep:russh-sftp"]
 ws = ["dep:ws"]
 
@@ -88,4 +89,3 @@ config = "0.14"
 tokio = { version = "1", features = ["test-util", "macros"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-

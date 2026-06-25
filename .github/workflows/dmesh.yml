@@ -1,0 +1,55 @@
+name: DMesh
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - flake.nix
+      - flake.lock
+      - .github/workflows/dmesh.yml
+  pull_request:
+    paths:
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - flake.nix
+      - flake.lock
+      - .github/workflows/dmesh.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dmesh:
+    name: DMesh native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build dmesh
+        run: nix build .#dmesh -o result-dmesh --print-build-logs
+
+      - name: Create dmesh NAR archive
+        run: |
+          mkdir -p artifacts
+          nix-store --dump ./result-dmesh > artifacts/dmesh-x86_64-linux.nar
+          ls -lh artifacts/
+
+      - name: Upload dmesh artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmesh-x86_64-linux
+          path: artifacts/*.nar

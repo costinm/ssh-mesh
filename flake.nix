@@ -61,10 +61,28 @@
           '';
         };
 
-        # Build workspace deps once — shared by all packages
+        # Native glibc build args for dmesh. dmesh carries Python/JNI wrapper
+        # defaults and is intentionally kept out of the static MUSL aggregate.
+        nativeArgs = {
+          inherit src nativeBuildInputs;
+          version = "0.1.0";
+          strictDeps = true;
+          doCheck = false;
+
+          preBuild = ''
+            install -m644 ${swaggerUiZip} $PWD/v5.17.14.zip
+            export SWAGGER_UI_DOWNLOAD_URL="file://$PWD/v5.17.14.zip"
+          '';
+        };
+
+        mainCargoExtraArgs =
+          "--workspace --bins --exclude dmesh --features ssh-mesh/openapi,mesh-tun/bin-full";
+
+        # Build main workspace deps once — shared by all main binary outputs.
+        # Kernel, VM, and rootfs packages remain separate opt-in outputs.
         cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
           pname = "ssh-mesh";
-          cargoExtraArgs = "--workspace --bins --features ssh-mesh/pmon";
+          cargoExtraArgs = mainCargoExtraArgs;
         });
 
         # Helper to define a package with minimal boilerplate
@@ -91,17 +109,32 @@
           paths = [ musl-toolchain swagger-ui-assets ];
         };
 
-        # Aggregate: all workspace binaries
-        ssh-mesh-full = mkPackage "ssh-mesh-full"
-          "--workspace --bins --features ssh-mesh/pmon";
+        # Aggregate: main runtime binaries built in a single cargo invocation.
+        ssh-mesh-full = mkPackage "ssh-mesh-full" mainCargoExtraArgs;
 
-        ssh-mesh  = mkPackage "ssh-mesh"  "--features pmon -p ssh-mesh";
-        pmond     = mkPackage "pmond"     "-p pmond";
-        mesh-init = mkPackage "mesh-init" "-p mesh-init";
-        h2t       = mkPackage "h2t"       "-p ssh-mesh --bin h2t";
-        meshkeys  = mkPackage "meshkeys"  "-p ssh-mesh --bin meshkeys";
-        sshmc     = mkPackage "sshmc"     "-p ssh-mesh --bin sshmc";
-        traceweb  = mkPackage "traceweb"  "-p traceweb";
+        selectBins = pname: bins:
+          pkgs.runCommand pname { } ''
+            mkdir -p "$out/bin"
+            ${pkgs.lib.concatMapStringsSep "\n" (bin: ''
+              ln -s ${ssh-mesh-full}/bin/${bin} "$out/bin/${bin}"
+            '') bins}
+          '';
+
+        ssh-mesh  = selectBins "ssh-mesh"  [ "ssh-mesh" ];
+        pmond     = selectBins "pmond"     [ "pmond" ];
+        mesh-init = selectBins "mesh-init" [ "mesh-init" ];
+        h2t       = selectBins "h2t"       [ "h2t" ];
+        meshkeys  = selectBins "meshkeys"  [ "meshkeys" ];
+        sshmc     = selectBins "sshmc"     [ "sshmc" ];
+        gen-openapi = selectBins "gen-openapi" [ "gen-openapi" ];
+        traceweb  = selectBins "traceweb"  [ "traceweb" ];
+        sftp-server = selectBins "sftp-server" [ "sftp-server" ];
+        mesh-tun = selectBins "mesh-tun" [ "mesh-tun" ];
+
+        dmesh = craneLib.buildPackage (nativeArgs // {
+          pname = "dmesh";
+          cargoExtraArgs = "-p dmesh";
+        });
 
         # ── Docker image ──────────────────────────────────────────
 
@@ -186,11 +219,8 @@
       in
       {
         packages = {
-            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets build-deps;
-            default = pkgs.symlinkJoin {
-              name = "ssh-mesh-default";
-              paths = [ ssh-mesh-full initos-erofs initos-vm build-deps ];
-            };
+            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets build-deps;
+            default = ssh-mesh-full;
         };
 
         apps = {
