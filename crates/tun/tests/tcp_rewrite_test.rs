@@ -171,14 +171,11 @@ async fn mesh_tun_channel_router_rewrites_two_client_syns() {
         ..MeshTunConfig::default()
     };
     let tun = MeshTun::new(config).unwrap();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (_injector, incoming, mut outgoing) = tun
         .run_with_channels(
             Arc::new(NoopTcpHandler),
             Arc::new(NoopUdpHandler),
             Arc::new(NoopDnsHandler),
-            tx,
-            rx,
         )
         .await
         .unwrap();
@@ -233,4 +230,134 @@ async fn mesh_tun_channel_router_rewrites_two_client_syns() {
     );
     assert!(ipv4_tcp_checksum_valid(&first));
     assert!(ipv4_tcp_checksum_valid(&second));
+}
+
+#[test]
+fn test_invalid_port_range_zero() {
+    assert!(TcpRewriter::new(TcpRewriteConfig {
+        proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
+        first_port: 0,
+        last_port: 1000,
+    })
+    .is_err());
+}
+
+#[test]
+fn test_invalid_port_range_inverted() {
+    assert!(TcpRewriter::new(TcpRewriteConfig {
+        proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
+        first_port: 2000,
+        last_port: 1000,
+    })
+    .is_err());
+}
+
+#[test]
+fn test_port_range_single_port() {
+    let mut rewriter = TcpRewriter::new(TcpRewriteConfig {
+        proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
+        first_port: 4000,
+        last_port: 4000,
+    })
+    .unwrap();
+
+    let client = Ipv4Addr::new(10, 0, 0, 2);
+    let remote = Ipv4Addr::new(203, 0, 113, 9);
+    let syn1 = build_ipv4_tcp_packet(client, 50001, remote, 80, SYN, 1, 0, b"").unwrap();
+    let syn2 = build_ipv4_tcp_packet(client, 50002, remote, 80, SYN, 1, 0, b"").unwrap();
+
+    assert!(rewriter.translate_outbound(&syn1).unwrap().is_some());
+    assert!(rewriter.translate_outbound(&syn2).is_err());
+}
+
+#[test]
+fn test_port_wrap_around() {
+    let mut rewriter = TcpRewriter::new(TcpRewriteConfig {
+        proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
+        first_port: 4000,
+        last_port: 4001,
+    })
+    .unwrap();
+
+    let client = Ipv4Addr::new(10, 0, 0, 2);
+    let remote = Ipv4Addr::new(203, 0, 113, 9);
+    let syn1 = build_ipv4_tcp_packet(client, 50001, remote, 80, SYN, 1, 0, b"").unwrap();
+    let syn2 = build_ipv4_tcp_packet(client, 50002, remote, 80, SYN, 1, 0, b"").unwrap();
+
+    let out1 = rewriter.translate_outbound(&syn1).unwrap().unwrap();
+    let out2 = rewriter.translate_outbound(&syn2).unwrap().unwrap();
+    assert_eq!(tcp_tuple(&out1).1, 4000);
+    assert_eq!(tcp_tuple(&out2).1, 4001);
+
+    rewriter.prune_expired(Duration::from_secs(0));
+    let rst = build_ipv4_tcp_packet(client, 50001, remote, 80, 0x04, 2, 0, b"").unwrap();
+    rewriter.translate_outbound(&rst).unwrap();
+}
+
+#[test]
+fn test_translate_inbound_unknown_flow() {
+    let mut rewriter = TcpRewriter::new(TcpRewriteConfig::default()).unwrap();
+    let remote = Ipv4Addr::new(203, 0, 113, 9);
+    let client = Ipv4Addr::new(169, 254, 0, 1);
+    let syn_ack = build_ipv4_tcp_packet(remote, 80, client, 40000, SYN_ACK, 1, 2, b"").unwrap();
+    assert!(rewriter.translate_inbound(&syn_ack).unwrap().is_none());
+    assert_eq!(rewriter.stats().dropped_packets, 1);
+}
+
+#[test]
+fn test_retransmitted_syn_reuses_entry() {
+    let mut rewriter = TcpRewriter::new(TcpRewriteConfig::default()).unwrap();
+    let client = Ipv4Addr::new(10, 0, 0, 2);
+    let remote = Ipv4Addr::new(203, 0, 113, 9);
+    let syn = build_ipv4_tcp_packet(client, 50001, remote, 80, SYN, 1, 0, b"").unwrap();
+    let out1 = rewriter.translate_outbound(&syn).unwrap().unwrap();
+    let out2 = rewriter.translate_outbound(&syn).unwrap().unwrap();
+    assert_eq!(tcp_tuple(&out1), tcp_tuple(&out2));
+}
+
+#[test]
+fn test_ack_on_existing_flow() {
+    let mut rewriter = TcpRewriter::new(TcpRewriteConfig::default()).unwrap();
+    let client = Ipv4Addr::new(10, 0, 0, 2);
+    let remote = Ipv4Addr::new(203, 0, 113, 9);
+    let syn = build_ipv4_tcp_packet(client, 50001, remote, 80, SYN, 1, 0, b"").unwrap();
+    rewriter.translate_outbound(&syn).unwrap().unwrap();
+
+    let ack = build_ipv4_tcp_packet(client, 50001, remote, 80, ACK, 2, 1, b"").unwrap();
+    let out_ack = rewriter.translate_outbound(&ack).unwrap().unwrap();
+    assert_eq!(tcp_tuple(&out_ack).1, 40000);
+}
+
+#[test]
+fn test_flow_closure_on_both_fins() {
+    let mut rewriter = TcpRewriter::new(TcpRewriteConfig::default()).unwrap();
+    let client = Ipv4Addr::new(10, 0, 0, 2);
+    let remote = Ipv4Addr::new(203, 0, 113, 9);
+    let syn = build_ipv4_tcp_packet(client, 50001, remote, 80, SYN, 1, 0, b"").unwrap();
+    rewriter.translate_outbound(&syn).unwrap().unwrap();
+
+    let client_fin = build_ipv4_tcp_packet(client, 50001, remote, 80, 0x01, 2, 1, b"").unwrap();
+    rewriter.translate_outbound(&client_fin).unwrap().unwrap();
+
+    let server_fin = build_ipv4_tcp_packet(
+        remote,
+        80,
+        Ipv4Addr::new(169, 254, 0, 1),
+        40000,
+        0x01,
+        1,
+        3,
+        b"",
+    )
+    .unwrap();
+    rewriter.translate_inbound(&server_fin).unwrap().unwrap();
+
+    let flow_key = TcpFlowKey {
+        src: SocketAddr::new(IpAddr::V4(client), 50001),
+        dst: SocketAddr::new(IpAddr::V4(remote), 80),
+    };
+    let entry = rewriter.lookup_forward(&flow_key).unwrap();
+    assert!(entry.client_fin);
+    assert!(entry.server_fin);
+    assert!(entry.closed);
 }

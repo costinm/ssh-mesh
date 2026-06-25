@@ -202,9 +202,7 @@ async fn channel_stack_captures_udp_destination_metadata() {
     });
     let dns = Arc::new(MockDnsHandler);
     let tcp = Arc::new(MockTcpHandler);
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let (_injector, tun_tx, _stack_rx) =
-        tun.run_with_channels(tcp, udp, dns, tx, rx).await.unwrap();
+    let (_injector, tun_tx, _stack_rx) = tun.run_with_channels(tcp, udp, dns).await.unwrap();
 
     tun_tx
         .send(raw_ipv4_udp(
@@ -242,9 +240,7 @@ async fn injector_emits_raw_udp_packet() {
     let udp = Arc::new(MockUdpHandler);
     let dns = Arc::new(MockDnsHandler);
     let tcp = Arc::new(MockTcpHandler);
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let (injector, _tun_tx, mut stack_rx) =
-        tun.run_with_channels(tcp, udp, dns, tx, rx).await.unwrap();
+    let (injector, _tun_tx, mut stack_rx) = tun.run_with_channels(tcp, udp, dns).await.unwrap();
 
     injector
         .inject_udp(

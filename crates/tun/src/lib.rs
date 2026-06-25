@@ -10,6 +10,8 @@ pub mod flow;
 pub mod injector;
 pub mod packet;
 pub mod policy;
+pub mod stats;
+pub mod tcp_proxy;
 pub mod tcp_rewrite;
 pub mod telemetry;
 pub mod uds;
@@ -64,9 +66,15 @@ impl MeshTun {
     ///
     /// The caller remains responsible for passing a valid TUN fd. The fd is
     /// handed to `tun-rs` when [`MeshTun::run`] is called.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `fd` is a valid file descriptor for a TUN/VPN device.
     pub unsafe fn from_fd(fd: i32) -> Result<Self, anyhow::Error> {
-        let mut config = MeshTunConfig::default();
-        config.fd = Some(fd);
+        let config = MeshTunConfig {
+            fd: Some(fd),
+            ..MeshTunConfig::default()
+        };
         Ok(Self { config })
     }
 
@@ -132,8 +140,6 @@ impl MeshTun {
         tcp_handler: Arc<dyn TunTcpHandler>,
         udp_handler: Arc<dyn TunUdpHandler>,
         dns_handler: Arc<dyn TunDnsHandler>,
-        _tun_tx: mpsc::UnboundedSender<Vec<u8>>,
-        _stack_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> Result<
         (
             Arc<dyn mesh::tun::TunInjector>,
@@ -182,13 +188,14 @@ impl MeshTun {
 }
 
 fn spawn_packet_router(
-    _tcp_handler: Arc<dyn TunTcpHandler>,
+    tcp_handler: Arc<dyn TunTcpHandler>,
     udp_handler: Arc<dyn TunUdpHandler>,
     dns_handler: Arc<dyn TunDnsHandler>,
     mut incoming_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     outgoing_tx: mpsc::UnboundedSender<Vec<u8>>,
     tcp_rewriter: Option<TcpRewriter>,
 ) {
+    let tcp_proxy = tcp_proxy::TcpProxyManager::new(outgoing_tx.clone(), tcp_handler);
     tokio::spawn(async move {
         let mut tcp_rewriter = tcp_rewriter;
         while let Some(packet) = incoming_rx.recv().await {
@@ -230,8 +237,9 @@ fn spawn_packet_router(
                         dst = %std::net::SocketAddr::new(tcp.dst_addr, tcp.dst_port),
                         syn = tcp.syn,
                         ack = tcp.ack,
-                        "TCP packet observed; passt-style TCP rewriting is not wired yet"
+                        "TCP packet observed; routing to TcpProxyManager"
                     );
+                    tcp_proxy.handle_packet(tcp).await;
                 }
                 packet::TunPacket::Other => {}
             }

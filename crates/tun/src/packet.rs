@@ -15,6 +15,11 @@ pub struct TunTcpPacket {
     pub dst_port: u16,
     pub syn: bool,
     pub ack: bool,
+    pub fin: bool,
+    pub rst: bool,
+    pub seq: u32,
+    pub ack_num: u32,
+    pub payload: Vec<u8>,
 }
 
 pub fn parse_ip_packet(packet: &[u8]) -> TunPacket {
@@ -166,6 +171,7 @@ pub fn ipv4_tcp_checksum_valid(packet: &[u8]) -> bool {
     matches!(ipv4_tcp_checksum(src, dst, &packet[ihl..total_len]), Ok(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_ipv4_tcp_packet(
     src_addr: Ipv4Addr,
     src_port: u16,
@@ -257,6 +263,10 @@ fn parse_tcp_payload(src_addr: IpAddr, dst_addr: IpAddr, payload: &[u8]) -> TunP
     if payload.len() < 20 {
         return TunPacket::Other;
     }
+    let data_offset = usize::from(payload[12] >> 4) * 4;
+    if payload.len() < data_offset {
+        return TunPacket::Other;
+    }
 
     TunPacket::Tcp(TunTcpPacket {
         src_addr,
@@ -265,6 +275,11 @@ fn parse_tcp_payload(src_addr: IpAddr, dst_addr: IpAddr, payload: &[u8]) -> TunP
         dst_port: u16::from_be_bytes([payload[2], payload[3]]),
         syn: payload[13] & 0x02 != 0,
         ack: payload[13] & 0x10 != 0,
+        fin: payload[13] & 0x01 != 0,
+        rst: payload[13] & 0x04 != 0,
+        seq: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+        ack_num: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
+        payload: payload[data_offset..].to_vec(),
     })
 }
 
@@ -304,4 +319,331 @@ pub fn internet_checksum(bytes: &[u8]) -> u16 {
     }
 
     !(sum as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_parse_empty_packet() {
+        assert!(matches!(parse_ip_packet(&[]), TunPacket::Other));
+    }
+
+    #[test]
+    fn test_parse_truncated_ipv4() {
+        assert!(matches!(parse_ip_packet(&[0x45; 19]), TunPacket::Other));
+    }
+
+    #[test]
+    fn test_parse_ipv4_udp_standard() {
+        let pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1234,
+            Ipv4Addr::new(10, 0, 0, 2),
+            5678,
+            b"hello",
+        )
+        .unwrap();
+        match parse_ip_packet(&pkt) {
+            TunPacket::Udp(udp) => {
+                assert_eq!(udp.src_addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+                assert_eq!(udp.src_port, 1234);
+                assert_eq!(udp.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+                assert_eq!(udp.dst_port, 5678);
+                assert_eq!(udp.payload, b"hello");
+            }
+            _ => panic!("Expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv4_tcp_syn() {
+        let pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1234,
+            Ipv4Addr::new(10, 0, 0, 2),
+            5678,
+            0x02, // SYN
+            100,
+            0,
+            &[],
+        )
+        .unwrap();
+        match parse_ip_packet(&pkt) {
+            TunPacket::Tcp(tcp) => {
+                assert_eq!(tcp.src_addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+                assert_eq!(tcp.src_port, 1234);
+                assert_eq!(tcp.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+                assert_eq!(tcp.dst_port, 5678);
+                assert!(tcp.syn);
+                assert!(!tcp.ack);
+                assert!(!tcp.fin);
+                assert!(!tcp.rst);
+            }
+            _ => panic!("Expected TCP"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv4_tcp_fin_ack() {
+        let pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1234,
+            Ipv4Addr::new(10, 0, 0, 2),
+            5678,
+            0x11, // FIN | ACK
+            100,
+            200,
+            &[],
+        )
+        .unwrap();
+        match parse_ip_packet(&pkt) {
+            TunPacket::Tcp(tcp) => {
+                assert!(tcp.fin);
+                assert!(tcp.ack);
+                assert!(!tcp.syn);
+                assert!(!tcp.rst);
+            }
+            _ => panic!("Expected TCP"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv4_with_options() {
+        let mut pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1234,
+            Ipv4Addr::new(10, 0, 0, 2),
+            5678,
+            b"hello",
+        )
+        .unwrap();
+        pkt[0] = 0x46; // IHL = 6
+        pkt.insert(20, 0);
+        pkt.insert(21, 0);
+        pkt.insert(22, 0);
+        pkt.insert(23, 0);
+        let new_len = (pkt.len() as u16).to_be_bytes();
+        pkt[2..4].copy_from_slice(&new_len);
+        let new_udp_len = ((pkt.len() - 24) as u16).to_be_bytes();
+        pkt[28..30].copy_from_slice(&new_udp_len);
+        pkt[10..12].copy_from_slice(&[0, 0]);
+        let cs = internet_checksum(&pkt[..24]);
+        pkt[10..12].copy_from_slice(&cs.to_be_bytes());
+
+        match parse_ip_packet(&pkt) {
+            TunPacket::Udp(udp) => {
+                assert_eq!(udp.payload, b"hello");
+            }
+            _ => panic!("Expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv6_udp() {
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[6] = 17;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).octets());
+        pkt[24..40].copy_from_slice(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2).octets());
+        pkt[40..42].copy_from_slice(&1234u16.to_be_bytes());
+        pkt[42..44].copy_from_slice(&5678u16.to_be_bytes());
+        pkt[44..46].copy_from_slice(&8u16.to_be_bytes());
+        match parse_ip_packet(&pkt) {
+            TunPacket::Udp(udp) => {
+                assert_eq!(
+                    udp.src_addr,
+                    IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))
+                );
+                assert_eq!(udp.src_port, 1234);
+                assert_eq!(
+                    udp.dst_addr,
+                    IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2))
+                );
+                assert_eq!(udp.dst_port, 5678);
+            }
+            _ => panic!("Expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv6_tcp() {
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x60;
+        pkt[6] = 6;
+        pkt[4..6].copy_from_slice(&20u16.to_be_bytes());
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).octets());
+        pkt[24..40].copy_from_slice(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2).octets());
+        pkt[40..42].copy_from_slice(&1234u16.to_be_bytes());
+        pkt[42..44].copy_from_slice(&5678u16.to_be_bytes());
+        pkt[53] = 0x12;
+        match parse_ip_packet(&pkt) {
+            TunPacket::Tcp(tcp) => {
+                assert_eq!(
+                    tcp.src_addr,
+                    IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))
+                );
+                assert_eq!(tcp.src_port, 1234);
+                assert_eq!(
+                    tcp.dst_addr,
+                    IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2))
+                );
+                assert_eq!(tcp.dst_port, 5678);
+                assert!(tcp.syn);
+                assert!(tcp.ack);
+            }
+            _ => panic!("Expected TCP"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv6_truncated() {
+        let mut pkt = vec![0u8; 39];
+        pkt[0] = 0x60;
+        assert!(matches!(parse_ip_packet(&pkt), TunPacket::Other));
+    }
+
+    #[test]
+    fn test_parse_non_ip_version() {
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x50;
+        assert!(matches!(parse_ip_packet(&pkt), TunPacket::Other));
+    }
+
+    #[test]
+    fn test_build_ipv4_udp_roundtrip() {
+        let pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 1),
+            8888,
+            Ipv4Addr::new(192, 168, 1, 2),
+            9999,
+            b"roundtrip",
+        )
+        .unwrap();
+        match parse_ip_packet(&pkt) {
+            TunPacket::Udp(udp) => {
+                assert_eq!(udp.src_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+                assert_eq!(udp.src_port, 8888);
+                assert_eq!(udp.dst_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)));
+                assert_eq!(udp.dst_port, 9999);
+                assert_eq!(udp.payload, b"roundtrip");
+            }
+            _ => panic!("Expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_build_ipv4_udp_max_payload() {
+        let max_payload = vec![0u8; 65507];
+        let pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(1, 1, 1, 1),
+            123,
+            Ipv4Addr::new(2, 2, 2, 2),
+            456,
+            &max_payload,
+        );
+        assert!(pkt.is_ok());
+    }
+
+    #[test]
+    fn test_build_ipv4_udp_overflow() {
+        let max_payload = vec![0u8; 65508];
+        let pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(1, 1, 1, 1),
+            123,
+            Ipv4Addr::new(2, 2, 2, 2),
+            456,
+            &max_payload,
+        );
+        assert!(pkt.is_err());
+    }
+
+    #[test]
+    fn test_build_ipv4_tcp_with_data() {
+        let pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(1, 1, 1, 1),
+            123,
+            Ipv4Addr::new(2, 2, 2, 2),
+            456,
+            0x10,
+            1,
+            2,
+            b"tcp data",
+        )
+        .unwrap();
+        assert!(ipv4_checksum_valid(&pkt));
+        assert!(ipv4_tcp_checksum_valid(&pkt));
+    }
+
+    #[test]
+    fn test_ipv4_checksum_valid_known_vector() {
+        let header = vec![
+            0x45, 0x00, 0x00, 0x28, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x0a, 0x84, 0x0a, 0x00,
+            0x00, 0x03, 0x0a, 0x00, 0x00, 0x04,
+        ];
+        assert!(ipv4_checksum_valid(&header));
+    }
+
+    #[test]
+    fn test_rewrite_ipv4_tcp_preserves_payload() {
+        let pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1234,
+            Ipv4Addr::new(10, 0, 0, 2),
+            5678,
+            0x10,
+            1,
+            1,
+            b"secret payload",
+        )
+        .unwrap();
+        let rewritten = rewrite_ipv4_tcp(
+            &pkt,
+            Ipv4Addr::new(192, 168, 1, 100),
+            8888,
+            Ipv4Addr::new(192, 168, 1, 200),
+            9999,
+        )
+        .unwrap();
+        match parse_ip_packet(&rewritten) {
+            TunPacket::Tcp(tcp) => {
+                assert_eq!(tcp.src_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)));
+                assert_eq!(tcp.src_port, 8888);
+                assert_eq!(tcp.dst_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)));
+                assert_eq!(tcp.dst_port, 9999);
+            }
+            _ => panic!("Expected TCP"),
+        }
+        assert_eq!(&rewritten[rewritten.len() - 14..], b"secret payload");
+    }
+
+    #[test]
+    fn test_rewrite_non_tcp_fails() {
+        let pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(1, 1, 1, 1),
+            123,
+            Ipv4Addr::new(2, 2, 2, 2),
+            456,
+            b"udp data",
+        )
+        .unwrap();
+        assert!(rewrite_ipv4_tcp(
+            &pkt,
+            Ipv4Addr::new(3, 3, 3, 3),
+            777,
+            Ipv4Addr::new(4, 4, 4, 4),
+            888,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_internet_checksum_odd_length() {
+        let data = b"abc";
+        let cs = internet_checksum(data);
+        assert_ne!(cs, 0);
+    }
 }

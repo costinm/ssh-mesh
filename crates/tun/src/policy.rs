@@ -67,3 +67,87 @@ impl MeshTunPolicy for DenyPortPolicy {
         PolicyDecision::Allow
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_allow_all_policy() {
+        let policy = AllowAllPolicy;
+        let ctx = FlowContext {
+            vm_id: "test-vm".to_string(),
+            protocol: FlowProtocol::Tcp,
+            src: "10.0.0.1:12345".parse().unwrap(),
+            dst: "1.1.1.1:80".parse().unwrap(),
+        };
+        assert!(policy.check(&ctx).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_deny_port_policy_match() {
+        let policy = DenyPortPolicy {
+            dst_addr: None,
+            dst_port: 80,
+            reason: "no web".to_string(),
+        };
+        let ctx = FlowContext {
+            vm_id: "test-vm".to_string(),
+            protocol: FlowProtocol::Tcp,
+            src: "10.0.0.1:12345".parse().unwrap(),
+            dst: "1.1.1.1:80".parse().unwrap(),
+        };
+        match policy.check(&ctx).await {
+            PolicyDecision::Deny { reason } => assert_eq!(reason, "no web"),
+            PolicyDecision::Allow => panic!("Expected deny"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deny_port_policy_different_port() {
+        let policy = DenyPortPolicy {
+            dst_addr: None,
+            dst_port: 80,
+            reason: "no web".to_string(),
+        };
+        let ctx = FlowContext {
+            vm_id: "test-vm".to_string(),
+            protocol: FlowProtocol::Tcp,
+            src: "10.0.0.1:12345".parse().unwrap(),
+            dst: "1.1.1.1:443".parse().unwrap(),
+        };
+        assert!(policy.check(&ctx).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_deny_port_policy_with_addr_match() {
+        let policy = DenyPortPolicy {
+            dst_addr: Some("1.1.1.1".parse().unwrap()),
+            dst_port: 80,
+            reason: "no cf".to_string(),
+        };
+        let ctx = FlowContext {
+            vm_id: "test-vm".to_string(),
+            protocol: FlowProtocol::Tcp,
+            src: "10.0.0.1:12345".parse().unwrap(),
+            dst: "1.1.1.1:80".parse().unwrap(),
+        };
+        assert!(!policy.check(&ctx).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_deny_port_policy_with_addr_mismatch() {
+        let policy = DenyPortPolicy {
+            dst_addr: Some("1.1.1.1".parse().unwrap()),
+            dst_port: 80,
+            reason: "no cf".to_string(),
+        };
+        let ctx = FlowContext {
+            vm_id: "test-vm".to_string(),
+            protocol: FlowProtocol::Tcp,
+            src: "10.0.0.1:12345".parse().unwrap(),
+            dst: "8.8.8.8:80".parse().unwrap(),
+        };
+        assert!(policy.check(&ctx).await.is_allowed());
+    }
+}

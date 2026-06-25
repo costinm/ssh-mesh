@@ -25,7 +25,7 @@ impl VhostUserNetConfig {
 #[cfg(feature = "vhost-user-net")]
 mod backend {
     use super::VhostUserNetConfig;
-    use std::io::{Error, ErrorKind, Result};
+    use std::io::{Error, Result};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -158,16 +158,15 @@ mod backend {
     pub fn run_vhost_user_net_blocking(config: VhostUserNetConfig) -> Result<()> {
         bind_parent(&config.socket_path)?;
         let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x1000)]).map_err(|error| {
-                Error::new(ErrorKind::Other, format!("initial guest memory: {error}"))
-            })?,
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x1000)])
+                .map_err(|error| Error::other(format!("initial guest memory: {error}")))?,
         );
         let backend = Arc::new(Mutex::new(VhostUserNetBackend::new(config.clone())));
         let mut daemon = VhostUserDaemon::new("mesh-tun-vhost-net".to_string(), backend, mem)
-            .map_err(|error| Error::new(ErrorKind::Other, error.to_string()))?;
+            .map_err(|error| Error::other(error.to_string()))?;
         daemon
             .serve(&config.socket_path)
-            .map_err(|error| Error::new(ErrorKind::Other, error.to_string()))
+            .map_err(|error| Error::other(error.to_string()))
     }
 
     fn bind_parent(path: &std::path::Path) -> Result<()> {
@@ -183,16 +182,17 @@ mod backend {
     pub async fn run_vhost_user_net(config: VhostUserNetConfig) -> Result<()> {
         tokio::task::spawn_blocking(move || run_vhost_user_net_blocking(config))
             .await
-            .map_err(|error| Error::new(ErrorKind::Other, error.to_string()))?
+            .map_err(|error| Error::other(error.to_string()))?
     }
 
     pub fn spawn_vhost_user_net(
         config: VhostUserNetConfig,
     ) -> Result<thread::JoinHandle<Result<()>>> {
         bind_parent(&config.socket_path)?;
-        Ok(thread::Builder::new()
+        thread::Builder::new()
             .name(format!("mesh-tun-vhost-{}", config.vm_id))
-            .spawn(move || run_vhost_user_net_blocking(config))?)
+            .spawn(move || run_vhost_user_net_blocking(config))
+            .map_err(|error| Error::other(error.to_string()))
     }
 
     #[cfg(test)]

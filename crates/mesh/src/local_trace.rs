@@ -496,6 +496,14 @@ pub async fn start_uds_listener(
     let listener = UnixListener::bind(socket_path)?;
     tracing::info!("UDS trace listener started at: {:?}", socket_path);
 
+    start_uds_listener_from_listener(listener, buffer).await
+}
+
+/// Start streaming traces from an already-bound UnixListener
+pub async fn start_uds_listener_from_listener(
+    listener: UnixListener,
+    buffer: LogBuffer,
+) -> std::io::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {

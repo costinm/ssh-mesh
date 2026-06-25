@@ -38,6 +38,7 @@ impl UdsServerConfig {
 }
 
 pub async fn run_uds_server(
+    listener: UnixListener,
     config: UdsServerConfig,
     tun_tx: mpsc::UnboundedSender<Vec<u8>>,
     stack_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -48,19 +49,8 @@ pub async fn run_uds_server(
         );
     }
 
-    if let Some(parent) = config.socket_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    if tokio::fs::try_exists(&config.socket_path)
-        .await
-        .unwrap_or(false)
-    {
-        tokio::fs::remove_file(&config.socket_path).await?;
-    }
-
-    let listener = UnixListener::bind(&config.socket_path)?;
     tracing::info!(
-        socket = %config.socket_path.display(),
+        socket = ?listener.local_addr(),
         style = ?config.style,
         "mesh-tun UDS listener started"
     );
@@ -164,7 +154,35 @@ fn ethernet_to_ip(frame: &[u8]) -> Option<(Vec<u8>, [u8; 6])> {
     src_mac.copy_from_slice(&frame[6..12]);
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
     match ethertype {
-        0x0800 | 0x86dd => Some((frame[14..].to_vec(), src_mac)),
+        0x0800 => {
+            let payload = &frame[14..];
+            if payload.len() < 20 {
+                return None;
+            }
+            let ihl = usize::from(payload[0] & 0x0f) * 4;
+            if ihl < 20 || payload.len() < ihl {
+                return None;
+            }
+            let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+            if total_len >= ihl && payload.len() >= total_len {
+                Some((payload[..total_len].to_vec(), src_mac))
+            } else {
+                Some((payload.to_vec(), src_mac))
+            }
+        }
+        0x86dd => {
+            let payload = &frame[14..];
+            if payload.len() < 40 {
+                return None;
+            }
+            let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
+            let total_len = 40usize.saturating_add(payload_len);
+            if payload.len() >= total_len {
+                Some((payload[..total_len].to_vec(), src_mac))
+            } else {
+                Some((payload.to_vec(), src_mac))
+            }
+        }
         _ => None,
     }
 }

@@ -2614,6 +2614,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tun-rs",
  "vhost",
  "vhost-user-backend",
