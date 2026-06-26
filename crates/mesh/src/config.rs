@@ -4,6 +4,12 @@ use std::collections::HashMap;
 
 use crate::auth::{AuthConfig, ImpersonationRule, PeerConfig};
 
+/// Default IP MTU used by mesh-tun managed TAP namespaces.
+///
+/// 65520 leaves room for IPv4 and TCP headers under the IPv4 65535-byte
+/// packet limit while still allowing Linux to send near-maximum TCP segments.
+pub const DEFAULT_MESH_TUN_MTU: u32 = 65_520;
+
 // ============================================================================
 // Service / Job Unified Config
 // ============================================================================
@@ -18,6 +24,8 @@ pub struct AppConfigFile {
     pub environment: HashMap<String, String>,
     #[serde(default)]
     pub activation: Vec<ActivationConfig>,
+    #[serde(default)]
+    pub network: NetworkConfig,
     #[serde(default)]
     pub schedule: Option<ScheduleConfig>,
     #[serde(default)]
@@ -90,6 +98,40 @@ pub struct ActivationConfig {
     /// or `::` to listen on all interfaces — only do this with auth configured.
     #[serde(default)]
     pub bind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkBackend {
+    #[default]
+    None,
+    Pasta,
+    MeshTun,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub backend: NetworkBackend,
+    /// Backend command for sidecars like pasta.
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Control socket for a shared mesh-tun daemon.
+    pub control_socket: Option<String>,
+    /// Interface name created in the service network namespace.
+    pub if_name: Option<String>,
+    /// Address assigned to the service side of the TAP, for example `10.5.0.2/24`.
+    pub address: Option<String>,
+    /// Gateway used for the service default route.
+    pub gateway: Option<String>,
+    /// MTU for the service-side TAP interface.
+    pub mtu: Option<u32>,
+    /// Install a default route through the TAP gateway.
+    #[serde(default)]
+    pub default_route: bool,
 }
 
 // ============================================================================
@@ -191,6 +233,7 @@ pub struct AppConfig {
     pub oom_score_adjust: Option<i32>,
     pub resources: ResolvedResourceLimits,
     pub activation: Vec<ActivationConfig>,
+    pub network: NetworkConfig,
     pub source_path: Option<String>,
     /// Resolved authorization config from `[[peer]]` entries.
     pub auth: Option<AuthConfig>,
@@ -340,6 +383,7 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
         oom_score_adjust: file.service.oom_score_adjust,
         resources: resolved,
         activation: file.activation,
+        network: file.network,
         source_path: None,
         auth: if file.peers.is_empty() && file.impersonation.is_empty() {
             None

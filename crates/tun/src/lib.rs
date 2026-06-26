@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
+use mesh::config::DEFAULT_MESH_TUN_MTU;
 use mesh::tun::{TunDnsHandler, TunUdpHandler};
 use policy::MeshTunPolicy;
 use tcp_proxy::TcpProxyConfig;
@@ -56,7 +57,7 @@ impl Default for MeshTunConfig {
             fd: None,
             address: IpAddr::V4(Ipv4Addr::new(10, 5, 0, 1)),
             prefix_len: 16,
-            mtu: 1500,
+            mtu: DEFAULT_MESH_TUN_MTU as usize,
             packet_queue_capacity: 4096,
             vm_id: "default".to_string(),
             tcp_rewrite: false,
@@ -229,23 +230,9 @@ fn spawn_packet_router_with_policy(
     tokio::spawn(async move {
         let mut tcp_rewriter = tcp_rewriter;
         while let Some(packet) = incoming_rx.recv().await {
-            match packet::parse_ip_packet(&packet) {
-                packet::TunPacket::Udp(packet)
-                    if packet.src_port == 53 || packet.dst_port == 53 =>
-                {
-                    let handler = dns_handler.clone();
-                    tokio::spawn(async move {
-                        handler.handle_dns(packet).await;
-                    });
-                }
-                packet::TunPacket::Udp(packet) => {
-                    let handler = udp_handler.clone();
-                    tokio::spawn(async move {
-                        handler.handle_udp(packet).await;
-                    });
-                }
-                packet::TunPacket::Tcp(tcp) => {
-                    if let Some(rewriter) = tcp_rewriter.as_mut() {
+            if let Some(rewriter) = tcp_rewriter.as_mut() {
+                match packet::parse_ip_packet(&packet) {
+                    packet::TunPacket::Tcp(tcp) => {
                         let result = if tcp.dst_addr == IpAddr::V4(rewriter.config().proxy_addr) {
                             rewriter.translate_inbound(&packet)
                         } else {
@@ -264,8 +251,42 @@ fn spawn_packet_router_with_policy(
                                 tracing::warn!(%error, "TCP rewrite failed");
                             }
                         }
-                        continue;
                     }
+                    packet::TunPacket::Udp(packet)
+                        if packet.src_port == 53 || packet.dst_port == 53 =>
+                    {
+                        let handler = dns_handler.clone();
+                        tokio::spawn(async move {
+                            handler.handle_dns(packet).await;
+                        });
+                    }
+                    packet::TunPacket::Udp(packet) => {
+                        let handler = udp_handler.clone();
+                        tokio::spawn(async move {
+                            handler.handle_udp(packet).await;
+                        });
+                    }
+                    packet::TunPacket::Other => {}
+                }
+                continue;
+            }
+
+            match packet::parse_ip_packet_owned(packet) {
+                packet::TunPacket::Udp(packet)
+                    if packet.src_port == 53 || packet.dst_port == 53 =>
+                {
+                    let handler = dns_handler.clone();
+                    tokio::spawn(async move {
+                        handler.handle_dns(packet).await;
+                    });
+                }
+                packet::TunPacket::Udp(packet) => {
+                    let handler = udp_handler.clone();
+                    tokio::spawn(async move {
+                        handler.handle_udp(packet).await;
+                    });
+                }
+                packet::TunPacket::Tcp(tcp) => {
                     tracing::debug!(
                         src = %std::net::SocketAddr::new(tcp.src_addr, tcp.src_port),
                         dst = %std::net::SocketAddr::new(tcp.dst_addr, tcp.dst_port),

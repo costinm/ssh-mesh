@@ -62,6 +62,7 @@ impl JobConfig {
             },
             environment: self.env.clone(),
             activation: self.activation.clone(),
+            network: self.network.clone(),
             schedule: self.schedule.clone(),
             constraints: self.constraints.clone(),
             backoff: self.backoff.clone(),

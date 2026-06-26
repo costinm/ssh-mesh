@@ -18,7 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{self, AppConfig};
 use crate::process::{self, ManagedProcess};
-use crate::protocol::{ActivationContext, Request, Response, ServiceState, ServiceStatus};
+use crate::protocol::{
+    ActivationContext, NamespaceKind, Request, Response, ServiceState, ServiceStatus,
+};
 use crate::resource::ResourceManager;
 
 // ============================================================================
@@ -266,6 +268,9 @@ impl Daemon {
             Request::StartTerminal { .. } => {
                 Response::err("start_terminal requires a passed file descriptor")
             }
+            Request::RegisterNamespace { .. } => {
+                Response::err("register_namespace requires a passed file descriptor")
+            }
             Request::TerminalResize {
                 terminal_id,
                 col_width,
@@ -323,6 +328,11 @@ impl Daemon {
             } => self.handle_start_terminal(
                 &name, &home, uid, gid, pty, env, context, command, fd, peer_uid,
             ),
+            Request::RegisterNamespace {
+                name,
+                kind,
+                target_pid,
+            } => self.handle_register_namespace(&name, kind, target_pid, fd, peer_uid),
             _ => Response::err("request does not accept a passed file descriptor"),
         }
     }
@@ -330,6 +340,98 @@ impl Daemon {
     // ========================================================================
     // Request Handlers
     // ========================================================================
+
+    fn handle_register_namespace(
+        &self,
+        name: &str,
+        kind: NamespaceKind,
+        target_pid: Option<u32>,
+        fd: OwnedFd,
+        peer_uid: u32,
+    ) -> Response {
+        if let Err(reason) = crate::config::validate_cgroup_name(name) {
+            return Response::err(format!("invalid service name: {reason}"));
+        }
+
+        let attach = {
+            let mut services = self.services.lock();
+            let Some(proc) = services.get_mut(name) else {
+                return Response::err(format!("service '{}' not found", name));
+            };
+            if proc.pid.is_none() {
+                return Response::err(format!("service '{}' is not running", name));
+            }
+            if let Err(resp) = check_impersonation(
+                peer_uid,
+                proc.config.uid.unwrap_or(peer_uid),
+                proc.config.gid,
+                name,
+            ) {
+                return resp;
+            }
+
+            let fd_num = fd.as_raw_fd();
+            match kind {
+                NamespaceKind::Net => {
+                    proc.netns_fd = Some(fd);
+                    proc.namespace_pid = target_pid.or(proc.namespace_pid);
+                    proc.mesh_tun_attached = false;
+                    info!(
+                        "Registered netns fd {} for service '{}' from peer UID {}",
+                        fd_num, name, peer_uid
+                    );
+                }
+                NamespaceKind::User => {
+                    proc.userns_fd = Some(fd);
+                    proc.namespace_pid = target_pid.or(proc.namespace_pid);
+                    proc.mesh_tun_attached = false;
+                    info!(
+                        "Registered userns fd {} for service '{}' from peer UID {}",
+                        fd_num, name, peer_uid
+                    );
+                }
+            }
+
+            if proc.config.network.backend == mesh::config::NetworkBackend::MeshTun
+                && proc.netns_fd.is_some()
+                && !proc.mesh_tun_attached
+            {
+                let service_pid = proc.namespace_pid.or(proc.pid).expect("checked running");
+                let userns_path = proc
+                    .userns_fd
+                    .as_ref()
+                    .map(|_| format!("/proc/{service_pid}/ns/user"));
+                Some((
+                    proc.config.name.clone(),
+                    proc.config.network.clone(),
+                    format!("/proc/{service_pid}/ns/net"),
+                    userns_path,
+                ))
+            } else {
+                None
+            }
+        };
+
+        if let Some((service_name, network, netns_path, userns_path)) = attach {
+            if let Err(error) = crate::network::attach_mesh_tun(
+                &service_name,
+                &network,
+                &netns_path,
+                userns_path.as_deref(),
+            ) {
+                return Response::err(error.to_string());
+            }
+            if let Some(proc) = self.services.lock().get_mut(name) {
+                proc.mesh_tun_attached = true;
+            }
+        }
+
+        Response::ok_with_data(serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "registered": true
+        }))
+    }
 
     fn handle_start(
         &self,
@@ -717,7 +819,7 @@ impl Daemon {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
         }
-        let pid = {
+        let (pid, network_pid) = {
             let mut services = self.services.lock();
             match services.get_mut(name) {
                 Some(proc)
@@ -733,13 +835,20 @@ impl Daemon {
                     }
                     proc.state = ServiceState::Stopping;
                     proc.target_state = ServiceState::Stopped;
-                    proc.pid
+                    proc.netns_fd = None;
+                    proc.userns_fd = None;
+                    proc.namespace_pid = None;
+                    proc.mesh_tun_attached = false;
+                    (proc.pid, proc.network_pid)
                 }
                 Some(_) => return Response::err(format!("service '{}' is not running", name)),
                 None => return Response::err(format!("service '{}' not found", name)),
             }
         };
 
+        if let Some(network_pid) = network_pid {
+            let _ = process::send_signal(network_pid, libc::SIGTERM);
+        }
         if let Some(pid) = pid
             && let Err(e) = process::stop_process(pid, signal).await
         {
@@ -753,6 +862,11 @@ impl Daemon {
             if let Some(proc) = services.get_mut(name) {
                 proc.state = ServiceState::Stopped;
                 proc.pid = None;
+                proc.network_pid = None;
+                proc.netns_fd = None;
+                proc.userns_fd = None;
+                proc.namespace_pid = None;
+                proc.mesh_tun_attached = false;
             }
         }
 
@@ -922,6 +1036,15 @@ impl Daemon {
 
         let mut services = self.services.lock();
         for (name, proc) in services.iter_mut() {
+            if proc.network_pid == Some(pid) {
+                info!(
+                    "Network sidecar for service '{}' (PID {}) exited with code {}",
+                    name, pid, exit_code
+                );
+                proc.network_pid = None;
+                return;
+            }
+
             if proc.pid == Some(pid) {
                 let intentionally_stopped = proc.target_state == ServiceState::Stopped;
                 info!(
@@ -931,6 +1054,13 @@ impl Daemon {
 
                 proc.state = ServiceState::Stopped;
                 proc.pid = None;
+                proc.netns_fd = None;
+                proc.userns_fd = None;
+                proc.namespace_pid = None;
+                proc.mesh_tun_attached = false;
+                if let Some(network_pid) = proc.network_pid.take() {
+                    let _ = process::send_signal(network_pid, libc::SIGTERM);
+                }
 
                 if proc.config.oneshot {
                     proc.target_state = ServiceState::Stopped;
@@ -1126,6 +1256,11 @@ impl Daemon {
                 proc.state = ServiceState::Starting;
                 proc.target_state = ServiceState::Running;
                 proc.pid = None;
+                proc.network_pid = None;
+                proc.netns_fd = None;
+                proc.userns_fd = None;
+                proc.namespace_pid = None;
+                proc.mesh_tun_attached = false;
             } else {
                 let mut proc = ManagedProcess::new(config.clone());
                 proc.state = ServiceState::Starting;
@@ -1148,17 +1283,39 @@ impl Daemon {
             }
         };
 
+        let network_sidecar = match crate::network::start_network_sidecar(&config, pid, cg) {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                let _ = process::send_signal(pid, libc::SIGTERM);
+                let mut services = self.services.lock();
+                if let Some(proc) = services.get_mut(&name) {
+                    proc.state = ServiceState::Stopped;
+                    proc.pid = None;
+                    proc.network_pid = None;
+                    proc.netns_fd = None;
+                    proc.userns_fd = None;
+                    proc.namespace_pid = None;
+                    proc.mesh_tun_attached = false;
+                }
+                return Err(error);
+            }
+        };
+
         // Register the spawned PID with the reaper (when not in catch-all mode)
         // and update the service state to Running.
         {
             if let Some(ref tracked) = *self.tracked_child_pids.lock() {
                 tracked.lock().insert(pid);
+                if let Some(sidecar) = &network_sidecar {
+                    tracked.lock().insert(sidecar.pid);
+                }
             }
             let mut services = self.services.lock();
             if let Some(proc) = services.get_mut(&name) {
                 proc.state = ServiceState::Running;
                 proc.target_state = ServiceState::Running;
                 proc.pid = Some(pid);
+                proc.network_pid = network_sidecar.as_ref().map(|sidecar| sidecar.pid);
                 proc.started_at = Some(std::time::Instant::now());
                 proc.cgroup_path = cgroup_path;
                 proc.config = config;
@@ -1194,6 +1351,15 @@ impl Daemon {
             if let Some(pid) = pid {
                 debug!("Stopping service '{}' (PID {})", name, pid);
                 let _ = process::stop_process(pid, None).await;
+            }
+
+            let network_pid = {
+                let services = self.services.lock();
+                services.get(&name).and_then(|p| p.network_pid)
+            };
+            if let Some(pid) = network_pid {
+                debug!("Stopping network sidecar for '{}' (PID {})", name, pid);
+                let _ = process::send_signal(pid, libc::SIGTERM);
             }
 
             // Clean up cgroup
@@ -1374,6 +1540,82 @@ priority = 300
                 .as_deref()
                 .is_some_and(|e| e.contains("permission denied")),
             "expected permission-denied error, got: {:?}",
+            response.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_namespace_stores_netns_fd() {
+        let cfg = DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test.sock".to_string(),
+        };
+        let daemon = Daemon::new(cfg);
+        let current_uid = unsafe { libc::getuid() };
+        let mut proc = ManagedProcess::new(AppConfig {
+            name: "net-svc".to_string(),
+            command: "/bin/sleep".to_string(),
+            args: vec!["60".to_string()],
+            uid: Some(current_uid),
+            ..Default::default()
+        });
+        proc.state = ServiceState::Running;
+        proc.target_state = ServiceState::Running;
+        proc.pid = Some(1234);
+        daemon.services.lock().insert("net-svc".to_string(), proc);
+
+        let (child_end, _parent_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let response = daemon
+            .handle_request_with_fd(
+                Request::RegisterNamespace {
+                    name: "net-svc".to_string(),
+                    kind: NamespaceKind::Net,
+                    target_pid: None,
+                },
+                OwnedFd::from(child_end),
+                current_uid,
+            )
+            .await;
+
+        assert!(response.success, "{:?}", response.error);
+        let status = daemon
+            .services
+            .lock()
+            .get("net-svc")
+            .expect("service")
+            .status();
+        assert!(status.netns_registered);
+    }
+
+    #[tokio::test]
+    async fn test_register_namespace_rejects_unknown_service() {
+        let cfg = DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test.sock".to_string(),
+        };
+        let daemon = Daemon::new(cfg);
+        let current_uid = unsafe { libc::getuid() };
+        let (child_end, _parent_end) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let response = daemon
+            .handle_request_with_fd(
+                Request::RegisterNamespace {
+                    name: "missing".to_string(),
+                    kind: NamespaceKind::Net,
+                    target_pid: None,
+                },
+                OwnedFd::from(child_end),
+                current_uid,
+            )
+            .await;
+
+        assert!(!response.success);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not found")),
+            "expected not-found error, got: {:?}",
             response.error
         );
     }

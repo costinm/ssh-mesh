@@ -401,7 +401,8 @@ async fn handle_connection(
             Ok(request) => {
                 debug!("Received request: {:?}", request);
                 match request {
-                    request @ Request::StartTerminal { .. } => {
+                    request @ (Request::StartTerminal { .. }
+                    | Request::RegisterNamespace { .. }) => {
                         let mut std_stream = stream.into_std()?;
                         std_stream.set_nonblocking(false)?;
                         let fd = recv_one_fd(&std_stream)?;

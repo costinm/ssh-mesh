@@ -1,5 +1,6 @@
 use crate::packet::{ethernet_payload_to_ip, ip_to_ethernet_frame};
 
+use std::io::IoSlice;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -193,9 +194,24 @@ where
     if frame.len() > u32::MAX as usize {
         anyhow::bail!("frame too large: {}", frame.len());
     }
-    writer.write_u32(frame.len() as u32).await?;
-    writer.write_all(frame).await?;
-    writer.flush().await?;
+    let header = (frame.len() as u32).to_be_bytes();
+    let mut written = 0usize;
+    let total = header.len() + frame.len();
+    while written < total {
+        let n = if written < header.len() {
+            let header_slice = &header[written..];
+            let frame_slice = frame;
+            writer
+                .write_vectored(&[IoSlice::new(header_slice), IoSlice::new(frame_slice)])
+                .await?
+        } else {
+            writer.write(&frame[written - header.len()..]).await?
+        };
+        if n == 0 {
+            anyhow::bail!("short write while writing qemu frame");
+        }
+        written += n;
+    }
     Ok(())
 }
 

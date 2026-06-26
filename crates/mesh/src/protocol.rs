@@ -7,6 +7,17 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Linux namespace descriptor kind passed over the control socket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NamespaceKind {
+    /// Network namespace, opened from a path such as `/proc/<pid>/ns/net`.
+    #[default]
+    Net,
+    /// User namespace, opened from a path such as `/proc/<pid>/ns/user`.
+    User,
+}
+
 /// Extra metadata describing why a service is being activated.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActivationContext {
@@ -132,6 +143,21 @@ pub enum Request {
         /// The number of file descriptors being passed (usually 1, or 3 for separate stdin/stdout/stderr).
         #[serde(default)]
         fd_count: Option<u32>,
+    },
+
+    /// Register a namespace descriptor for a running service.
+    ///
+    /// This lets an unprivileged in-container mesh-init expose its namespace to
+    /// the host mesh-init via SCM_RIGHTS. The host daemon can then hand that fd
+    /// to a privileged backend such as mesh-tun without requiring NET_ADMIN in
+    /// the container.
+    #[serde(rename = "register_namespace")]
+    RegisterNamespace {
+        name: String,
+        #[serde(default)]
+        kind: NamespaceKind,
+        #[serde(default)]
+        target_pid: Option<u32>,
     },
 
     /// Resize an active terminal session that was returned by `start_terminal`.
@@ -293,6 +319,14 @@ pub struct ServiceStatus {
     pub name: String,
     pub state: ServiceState,
     pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub netns_registered: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub userns_registered: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh_tun_attached: bool,
     pub uptime_secs: Option<u64>,
     pub restarts: u32,
     pub consecutive_failures: u32,

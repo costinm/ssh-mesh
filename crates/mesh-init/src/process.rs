@@ -48,6 +48,20 @@ pub struct ManagedProcess {
     pub target_state: ServiceState,
     /// PID of the running process (None if stopped).
     pub pid: Option<u32>,
+    /// PID of the network sidecar process, if one is attached.
+    pub network_pid: Option<u32>,
+    /// Host-held network namespace descriptor registered by a child mesh-init.
+    ///
+    /// Keeping the fd open pins the namespace and gives the host daemon a
+    /// stable handle it can pass to mesh-tun later, while pasta can still be
+    /// used today as a PID-based validation backend.
+    pub netns_fd: Option<std::os::fd::OwnedFd>,
+    /// Optional user namespace descriptor for targets created in a userns.
+    pub userns_fd: Option<std::os::fd::OwnedFd>,
+    /// PID in the service namespace that registered the namespace descriptors.
+    pub namespace_pid: Option<u32>,
+    /// True after the shared mesh-tun daemon accepted this service namespace.
+    pub mesh_tun_attached: bool,
     /// When the process was last started.
     pub started_at: Option<Instant>,
     /// Number of times this service has been restarted.
@@ -68,6 +82,11 @@ impl ManagedProcess {
             state: ServiceState::Stopped,
             target_state: ServiceState::Stopped,
             pid: None,
+            network_pid: None,
+            netns_fd: None,
+            userns_fd: None,
+            namespace_pid: None,
+            mesh_tun_attached: false,
             started_at: None,
             restarts: 0,
             consecutive_failures: 0,
@@ -87,6 +106,10 @@ impl ManagedProcess {
             name: self.config.name.clone(),
             state: self.state,
             pid: self.pid,
+            network_pid: self.network_pid,
+            netns_registered: self.netns_fd.is_some(),
+            userns_registered: self.userns_fd.is_some(),
+            mesh_tun_attached: self.mesh_tun_attached,
             uptime_secs: self.uptime_secs(),
             restarts: self.restarts,
             consecutive_failures: self.consecutive_failures,

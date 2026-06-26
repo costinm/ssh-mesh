@@ -56,6 +56,7 @@ fn create_base_job(name: &str) -> JobConfig {
         oom_score_adjust: None,
         resources: Default::default(),
         activation: vec![],
+        network: Default::default(),
         source_path: None,
         auth: None,
         schedule: Some(ScheduleConfig::default()),

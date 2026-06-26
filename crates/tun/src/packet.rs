@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use mesh::tun::TunUdpPacket;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -19,7 +20,7 @@ pub struct TunTcpPacket {
     pub rst: bool,
     pub seq: u32,
     pub ack_num: u32,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 pub fn parse_ip_packet(packet: &[u8]) -> TunPacket {
@@ -31,6 +32,17 @@ pub fn parse_ip_packet(packet: &[u8]) -> TunPacket {
         4 => parse_ipv4_packet(packet),
         6 => parse_ipv6_packet(packet),
         _ => TunPacket::Other,
+    }
+}
+
+pub fn parse_ip_packet_owned(packet: Vec<u8>) -> TunPacket {
+    if packet.is_empty() {
+        return TunPacket::Other;
+    }
+
+    match packet[0] >> 4 {
+        4 => parse_ipv4_packet_owned(packet),
+        _ => parse_ip_packet(&packet),
     }
 }
 
@@ -94,6 +106,64 @@ fn parse_ipv4_packet(packet: &[u8]) -> TunPacket {
         6 => parse_tcp_payload(src_addr, dst_addr, payload),
         17 => parse_udp_payload(src_addr, dst_addr, payload),
         _ => TunPacket::Other,
+    }
+}
+
+fn parse_ipv4_packet_owned(mut packet: Vec<u8>) -> TunPacket {
+    if packet.len() < 20 {
+        return TunPacket::Other;
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return TunPacket::Other;
+    }
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if total_len < ihl || packet.len() < total_len {
+        return TunPacket::Other;
+    }
+
+    let src_addr = IpAddr::V4(Ipv4Addr::new(
+        packet[12], packet[13], packet[14], packet[15],
+    ));
+    let dst_addr = IpAddr::V4(Ipv4Addr::new(
+        packet[16], packet[17], packet[18], packet[19],
+    ));
+    match packet[9] {
+        6 => {
+            if total_len < ihl + 20 {
+                return TunPacket::Other;
+            }
+            let tcp = &packet[ihl..total_len];
+            let data_offset = usize::from(tcp[12] >> 4) * 4;
+            if data_offset < 20 || total_len < ihl + data_offset {
+                return TunPacket::Other;
+            }
+            let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+            let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+            let syn = tcp[13] & 0x02 != 0;
+            let ack = tcp[13] & 0x10 != 0;
+            let fin = tcp[13] & 0x01 != 0;
+            let rst = tcp[13] & 0x04 != 0;
+            let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+            let ack_num = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+            packet.truncate(total_len);
+            let payload_start = ihl + data_offset;
+            let bytes = Bytes::from(packet);
+            TunPacket::Tcp(TunTcpPacket {
+                src_addr,
+                src_port,
+                dst_addr,
+                dst_port,
+                syn,
+                ack,
+                fin,
+                rst,
+                seq,
+                ack_num,
+                payload: bytes.slice(payload_start..total_len),
+            })
+        }
+        _ => parse_ipv4_packet(&packet),
     }
 }
 
@@ -294,7 +364,41 @@ pub fn build_ipv4_tcp_packet(
     ack: u32,
     payload: &[u8],
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let tcp_len = 20usize
+    build_ipv4_tcp_packet_with_options(
+        src_addr,
+        src_port,
+        dst_addr,
+        dst_port,
+        flags,
+        seq,
+        ack,
+        &[],
+        payload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_ipv4_tcp_packet_with_options(
+    src_addr: Ipv4Addr,
+    src_port: u16,
+    dst_addr: Ipv4Addr,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+    options: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>, anyhow::Error> {
+    if options.len() % 4 != 0 {
+        anyhow::bail!("TCP options length must be 32-bit aligned");
+    }
+    let tcp_header_len = 20usize
+        .checked_add(options.len())
+        .ok_or_else(|| anyhow::anyhow!("TCP options too large"))?;
+    if tcp_header_len > 60 {
+        anyhow::bail!("TCP header too large: {tcp_header_len}");
+    }
+    let tcp_len = tcp_header_len
         .checked_add(payload.len())
         .ok_or_else(|| anyhow::anyhow!("TCP payload too large"))?;
     let total_len = 20usize
@@ -319,10 +423,11 @@ pub fn build_ipv4_tcp_packet(
     tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     tcp[4..8].copy_from_slice(&seq.to_be_bytes());
     tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-    tcp[12] = 5 << 4;
+    tcp[12] = ((tcp_header_len / 4) as u8) << 4;
     tcp[13] = flags;
     tcp[14..16].copy_from_slice(&64240u16.to_be_bytes());
-    tcp[20..].copy_from_slice(payload);
+    tcp[20..20 + options.len()].copy_from_slice(options);
+    tcp[tcp_header_len..].copy_from_slice(payload);
     let tcp_checksum = ipv4_tcp_checksum(src_addr, dst_addr, tcp)?;
     tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
 
@@ -391,7 +496,7 @@ fn parse_tcp_payload(src_addr: IpAddr, dst_addr: IpAddr, payload: &[u8]) -> TunP
         rst: payload[13] & 0x04 != 0,
         seq: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
         ack_num: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
-        payload: payload[data_offset..].to_vec(),
+        payload: Bytes::copy_from_slice(&payload[data_offset..]),
     })
 }
 

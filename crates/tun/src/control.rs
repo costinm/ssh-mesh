@@ -31,6 +31,7 @@ struct BwrapInfoServerState {
 pub struct TapCaptureSpec {
     pub vm_id: String,
     pub netns_path: PathBuf,
+    pub userns_path: Option<PathBuf>,
     pub if_name: Option<String>,
     pub setup: Option<NetnsSetup>,
 }
@@ -39,6 +40,7 @@ pub struct TapCaptureSpec {
 pub struct NetnsSetup {
     pub address: Option<String>,
     pub gateway: Option<String>,
+    pub mtu: Option<u32>,
     pub default_route: bool,
 }
 
@@ -160,10 +162,12 @@ async fn handle_bwrap_info_client(
         let spec = TapCaptureSpec {
             vm_id: config.vm_id.clone(),
             netns_path: PathBuf::from(format!("/proc/{child_pid}/ns/net")),
+            userns_path: Some(PathBuf::from(format!("/proc/{child_pid}/ns/user"))),
             if_name: Some(config.if_name.clone()),
             setup: Some(NetnsSetup {
                 address: Some(format!("{guest_ip}/{}", config.prefix_len)),
                 gateway: Some(config.gateway.clone()),
+                mtu: None,
                 default_route: true,
             }),
         };
@@ -243,10 +247,12 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
         Some("capture-tap") => {
             let mut vm_id = None;
             let mut netns_path = None;
+            let mut userns_path = None;
             let mut if_name = None;
             let mut setup = None;
             let mut address = None;
             let mut gateway = None;
+            let mut mtu = None;
             let mut default_route = false;
             for field in fields {
                 let Some((key, value)) = field.split_once('=') else {
@@ -255,8 +261,10 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
                 match key {
                     "vm_id" => vm_id = Some(value.to_string()),
                     "netns" => netns_path = Some(PathBuf::from(value)),
+                    "userns" => userns_path = Some(PathBuf::from(value)),
                     "if" => if_name = Some(value.to_string()),
                     "gw" => gateway = Some(value.to_string()),
+                    "mtu" => mtu = Some(value.parse()?),
                     "setup" => match value {
                         "tap" => setup = Some(()),
                         other => anyhow::bail!("unsupported setup={other}"),
@@ -275,12 +283,14 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
             let setup = setup.map(|()| NetnsSetup {
                 address,
                 gateway,
+                mtu,
                 default_route,
             });
             Ok(ControlRequest::CaptureTap(TapCaptureSpec {
                 vm_id: vm_id.unwrap_or_else(|| "netns".to_string()),
                 netns_path: netns_path
                     .ok_or_else(|| anyhow::anyhow!("capture-tap requires netns=/path"))?,
+                userns_path,
                 if_name,
                 setup,
             }))
@@ -389,6 +399,9 @@ fn inject_ip_packet(
     };
 
     let frame = ip_to_ethernet_frame(ip_packet, src_mac, dst_mac, 60)?;
+    crate::stats::stats()
+        .tap_inject_bytes
+        .fetch_add(frame.len() as u64, Ordering::Relaxed);
 
     record_inject_frame(&frame);
     // SAFETY: frame points to valid memory for frame.len() bytes and socket is
@@ -513,6 +526,9 @@ fn packet_capture_thread_loop(
         crate::stats::stats()
             .tap_frame_rx
             .fetch_add(1, Ordering::Relaxed);
+        crate::stats::stats()
+            .tap_frame_rx_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
         if n < 14 {
             continue;
         }
@@ -543,6 +559,9 @@ fn packet_capture_thread_loop(
             crate::stats::stats()
                 .tap_ip_rx
                 .fetch_add(1, Ordering::Relaxed);
+            crate::stats::stats()
+                .tap_ip_rx_bytes
+                .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
             if let Some(src_ip) = ip_packet_source(&ip_packet) {
                 if registered_ips.insert(src_ip) {
                     register_destination(src_ip, inject_tx.clone());
@@ -577,7 +596,12 @@ fn drain_inject_queue(
 ) -> Result<(), anyhow::Error> {
     loop {
         match inject_rx.try_recv() {
-            Ok(packet) => inject_ip_packet(socket, guest_mac.clone(), &packet)?,
+            Ok(packet) => {
+                crate::stats::stats()
+                    .tap_inject_queue_rx
+                    .fetch_add(1, Ordering::Relaxed);
+                inject_ip_packet(socket, guest_mac.clone(), &packet)?;
+            }
             Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
         }
@@ -607,18 +631,13 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
     // SAFETY: see parent_sock above.
     let child_sock = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-    // Find the user namespace path by looking up the sibling user namespace
-    // For netns "/proc/<pid>/ns/net", the corresponding user namespace is "/proc/<pid>/ns/user"
-    let userns_path = if let Some(parent_dir) = spec.netns_path.parent() {
-        parent_dir.join("user")
-    } else {
-        PathBuf::from("/invalid/path")
-    };
-
     let self_userns = std::fs::metadata("/proc/self/ns/user");
-    let target_userns = std::fs::metadata(&userns_path);
+    let target_userns = spec
+        .userns_path
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok());
     let should_enter_userns = match (self_userns, target_userns) {
-        (Ok(s), Ok(t)) => {
+        (Ok(s), Some(t)) => {
             use std::os::unix::fs::MetadataExt;
             s.ino() != t.ino()
         }
@@ -649,7 +668,7 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
             // First, enter the user namespace of the target process if it is different
             // This is crucial because it gives us capabilities (like CAP_NET_ADMIN/CAP_SYS_ADMIN) inside that namespace
-            if should_enter_userns && userns_path.exists() {
+            if should_enter_userns && let Some(userns_path) = &spec.userns_path {
                 let userns_file = std::fs::File::open(&userns_path)?;
                 // SAFETY: userns_file is an open namespace fd and setns only
                 // mutates the child process namespace membership.
@@ -730,6 +749,13 @@ fn configure_netns_interface(if_name: &str, setup: &NetnsSetup) -> Result<(), st
 
     if let Some(address) = &setup.address {
         run_ip(&["addr", "add", address, "dev", if_name], true)?;
+    }
+
+    if let Some(mtu) = setup.mtu {
+        run_ip(
+            &["link", "set", "dev", if_name, "mtu", &mtu.to_string()],
+            true,
+        )?;
     }
 
     run_ip(&["link", "set", "dev", if_name, "up"], false)?;
@@ -951,7 +977,7 @@ mod tests {
     #[test]
     fn parses_tap_capture_command() {
         let ControlRequest::CaptureTap(spec) = parse_control_request(
-            "capture-tap vm_id=app5 netns=/proc/791/ns/net if=tap0 setup=tap addr=10.5.0.2/24 gw=10.5.0.1 route=default",
+            "capture-tap vm_id=app5 netns=/proc/791/ns/net userns=/proc/791/ns/user if=tap0 setup=tap addr=10.5.0.2/24 gw=10.5.0.1 route=default",
         )
         .unwrap()
         else {
@@ -959,12 +985,14 @@ mod tests {
         };
         assert_eq!(spec.vm_id, "app5");
         assert_eq!(spec.netns_path, PathBuf::from("/proc/791/ns/net"));
+        assert_eq!(spec.userns_path, Some(PathBuf::from("/proc/791/ns/user")));
         assert_eq!(spec.if_name.as_deref(), Some("tap0"));
         assert_eq!(
             spec.setup,
             Some(NetnsSetup {
                 address: Some("10.5.0.2/24".to_string()),
                 gateway: Some("10.5.0.1".to_string()),
+                mtu: None,
                 default_route: true,
             })
         );

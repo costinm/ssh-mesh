@@ -1,5 +1,6 @@
-use crate::packet::{TunTcpPacket, build_ipv4_tcp_packet};
+use crate::packet::{TunTcpPacket, build_ipv4_tcp_packet, build_ipv4_tcp_packet_with_options};
 use crate::policy::{FlowContext, FlowProtocol, MeshTunPolicy, TcpRouteDecision};
+use mesh::config::DEFAULT_MESH_TUN_MTU;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -8,6 +9,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 
 const TCP_REORDER_BUFFER_MAX_BYTES: usize = 256 * 1024;
+const TCP_SYNTHETIC_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
+const IPV4_TCP_HEADER_BYTES: u32 = 40;
+const TCP_WINDOW_SCALE_SHIFT: u8 = 7;
+
+fn default_tcp_mss() -> u16 {
+    DEFAULT_MESH_TUN_MTU
+        .saturating_sub(IPV4_TCP_HEADER_BYTES)
+        .min(u16::MAX as u32) as u16
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TcpProxyConfig {
@@ -71,6 +81,11 @@ impl TcpProxyManager {
         crate::stats::stats()
             .tcp_packet
             .fetch_add(1, Ordering::Relaxed);
+        if !pkt.payload.is_empty() {
+            crate::stats::stats()
+                .tcp_packet_payload_bytes
+                .fetch_add(pkt.payload.len() as u64, Ordering::Relaxed);
+        }
         let key = TcpFlowKey {
             src: SocketAddr::new(pkt.src_addr, pkt.src_port),
             dst: SocketAddr::new(pkt.dst_addr, pkt.dst_port),
@@ -220,7 +235,8 @@ async fn handle_tcp_flow(
     let client_acked_shared = Arc::new(AtomicU32::new(initial_server_seq));
 
     // Send SYN-ACK
-    let syn_ack = match build_ipv4_tcp_packet(
+    let syn_ack_options = tcp_syn_ack_options();
+    let syn_ack = match build_ipv4_tcp_packet_with_options(
         dst_ip_v4,
         dst.port(),
         src_ip_v4,
@@ -228,6 +244,7 @@ async fn handle_tcp_flow(
         0x12, // SYN | ACK
         initial_server_seq,
         syn_pkt.seq.wrapping_add(1),
+        &syn_ack_options,
         &[],
     ) {
         Ok(pkt) => pkt,
@@ -344,7 +361,7 @@ async fn handle_tcp_flow(
     let mut rx_task = tokio::spawn(async move {
         let mut client_seq = client_seq_a.load(Ordering::Acquire);
         // B3: Reorder buffer for out-of-order segments, keyed by seq.
-        let mut ooo_buf: std::collections::BTreeMap<u32, Vec<u8>> =
+        let mut ooo_buf: std::collections::BTreeMap<u32, bytes::Bytes> =
             std::collections::BTreeMap::new();
         let mut ooo_bytes = 0usize;
 
@@ -378,6 +395,9 @@ async fn handle_tcp_flow(
                         crate::stats::stats()
                             .tcp_payload_guest_to_host
                             .fetch_add(new_data.len() as u64, Ordering::Relaxed);
+                        crate::stats::stats()
+                            .tcp_guest_write_calls
+                            .fetch_add(1, Ordering::Relaxed);
                         client_seq = client_seq.wrapping_add(new_data.len() as u32);
                         client_seq_a.store(client_seq, Ordering::Release);
 
@@ -393,6 +413,9 @@ async fn handle_tcp_flow(
                             crate::stats::stats()
                                 .tcp_payload_guest_to_host
                                 .fetch_add(seg.len() as u64, Ordering::Relaxed);
+                            crate::stats::stats()
+                                .tcp_guest_write_calls
+                                .fetch_add(1, Ordering::Relaxed);
                             client_seq = client_seq.wrapping_add(seg.len() as u32);
                             client_seq_a.store(client_seq, Ordering::Release);
                         }
@@ -480,9 +503,9 @@ async fn handle_tcp_flow(
 
     // Task B: Host to Guest (Read reader -> Send outgoing_tx)
     let mut tx_task = tokio::spawn(async move {
-        // B3: Cap read size to a conservative MSS (minus IP/TCP headers) to
-        // respect common MTU limits. 1400 is safe for typical 1500-byte MTU.
-        let mut buf = vec![0u8; 1400];
+        // Match the advertised default MSS so host-to-guest traffic also uses
+        // near-MTU packets on the default mesh-tun TAP path.
+        let mut buf = vec![0u8; usize::from(default_tcp_mss())];
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => {
@@ -512,11 +535,14 @@ async fn handle_tcp_flow(
                     crate::stats::stats()
                         .tcp_payload_host_to_guest
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    crate::stats::stats()
+                        .tcp_host_read_calls
+                        .fetch_add(1, Ordering::Relaxed);
                     let s_seq = server_seq_shared.load(Ordering::Relaxed);
                     // B2: Wait for send window to open, woken by the rx_task's
                     // notify on ACK. Use a 60s overall timeout to avoid an
                     // unbounded hang if the client never ACKs.
-                    let window = 65535u32;
+                    let window = TCP_SYNTHETIC_WINDOW_BYTES;
                     let deadline =
                         tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
                     loop {
@@ -589,6 +615,16 @@ async fn handle_tcp_flow(
             res
         }
     };
+}
+
+fn tcp_syn_ack_options() -> [u8; 8] {
+    // Kind=2, Len=4, MSS=default MTU minus IPv4/TCP headers. Kind=3, Len=3,
+    // Shift=7 advertises an
+    // ~8 MiB receive window instead of the unscaled ~64 KiB TCP header field.
+    // Without MSS, Linux falls back to ~536-byte segments; without window
+    // scaling, large-MSS uploads keep only one segment in flight.
+    let mss = default_tcp_mss().to_be_bytes();
+    [2, 4, mss[0], mss[1], 1, 3, 3, TCP_WINDOW_SCALE_SHIFT]
 }
 
 fn tcp_flags(pkt: &TunTcpPacket) -> u8 {

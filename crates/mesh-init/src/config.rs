@@ -198,6 +198,55 @@ to = "*"
     }
 
     #[test]
+    fn test_parse_toml_with_pasta_network() {
+        let toml = r#"
+[service]
+name = "net-svc"
+command = "/bin/sleep"
+args = ["60"]
+
+[network]
+backend = "pasta"
+command = "pasta"
+args = ["--config-net", "{pid}"]
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.network.backend, NetworkBackend::Pasta);
+        assert_eq!(config.network.command.as_deref(), Some("pasta"));
+        assert_eq!(config.network.args, vec!["--config-net", "{pid}"]);
+    }
+
+    #[test]
+    fn test_parse_toml_with_mesh_tun_network() {
+        let toml = r#"
+[service]
+name = "mesh-tun-svc"
+command = "/bin/sleep"
+args = ["60"]
+
+[network]
+backend = "mesh-tun"
+control_socket = "/tmp/mesh/control.sock"
+if_name = "tap0"
+address = "10.5.0.2/24"
+gateway = "10.5.0.1"
+mtu = 65520
+default_route = true
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.network.backend, NetworkBackend::MeshTun);
+        assert_eq!(
+            config.network.control_socket.as_deref(),
+            Some("/tmp/mesh/control.sock")
+        );
+        assert_eq!(config.network.if_name.as_deref(), Some("tap0"));
+        assert_eq!(config.network.address.as_deref(), Some("10.5.0.2/24"));
+        assert_eq!(config.network.gateway.as_deref(), Some("10.5.0.1"));
+        assert_eq!(config.network.mtu, Some(65520));
+        assert!(config.network.default_route);
+    }
+
+    #[test]
     fn test_parse_memory_size() {
         assert_eq!(parse_memory_size("4096").unwrap(), 4096);
         assert_eq!(parse_memory_size("256K").unwrap(), 256 * 1024);
