@@ -14,8 +14,8 @@
 use jni::objects::{GlobalRef, JByteArray, JClass, JString};
 use jni::sys::{jint, jlong};
 use jni::{JNIEnv, JavaVM};
-use ssh_mesh::sshc::SshClientListener;
 use ssh_mesh::MeshListener;
+use ssh_mesh::sshc::SshClientListener;
 use std::sync::Arc;
 use tokio::io::DuplexStream;
 

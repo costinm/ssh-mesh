@@ -1,7 +1,8 @@
-use mesh::tun::{TunDnsHandler, TunTcpHandler, TunTcpMeta, TunUdpHandler, TunUdpPacket};
+use mesh::tun::{TunDnsHandler, TunUdpHandler, TunUdpPacket};
 use mesh_tun::packet::{
-    build_ipv4_tcp_packet, ipv4_checksum_valid, ipv4_tcp_checksum_valid, parse_ip_packet, TunPacket,
+    TunPacket, build_ipv4_tcp_packet, ipv4_checksum_valid, ipv4_tcp_checksum_valid, parse_ip_packet,
 };
+use mesh_tun::policy::AllowAllPolicy;
 use mesh_tun::tcp_rewrite::{TcpFlowKey, TcpRewriteConfig, TcpRewriter};
 use mesh_tun::{MeshTun, MeshTunConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -23,13 +24,6 @@ fn tcp_tuple(packet: &[u8]) -> (Ipv4Addr, u16, Ipv4Addr, u16) {
         panic!("expected IPv4 destination");
     };
     (src, tcp.src_port, dst, tcp.dst_port)
-}
-
-struct NoopTcpHandler;
-
-#[async_trait::async_trait]
-impl TunTcpHandler for NoopTcpHandler {
-    async fn handle_tcp(&self, _meta: TunTcpMeta, _stream: tokio::io::DuplexStream) {}
 }
 
 struct NoopUdpHandler;
@@ -163,6 +157,9 @@ fn non_syn_without_state_is_dropped() {
 #[tokio::test]
 async fn mesh_tun_channel_router_rewrites_two_client_syns() {
     let config = MeshTunConfig {
+        // B1: tcp_rewrite now defaults to false; this test exercises the
+        // rewrite path, so opt in explicitly.
+        tcp_rewrite: true,
         tcp_rewrite_config: TcpRewriteConfig {
             proxy_addr: Ipv4Addr::new(169, 254, 0, 10),
             first_port: 43000,
@@ -172,8 +169,8 @@ async fn mesh_tun_channel_router_rewrites_two_client_syns() {
     };
     let tun = MeshTun::new(config).unwrap();
     let (_injector, incoming, mut outgoing) = tun
-        .run_with_channels(
-            Arc::new(NoopTcpHandler),
+        .run_with_channels_and_policy(
+            Arc::new(AllowAllPolicy),
             Arc::new(NoopUdpHandler),
             Arc::new(NoopDnsHandler),
         )
@@ -195,6 +192,7 @@ async fn mesh_tun_channel_router_rewrites_two_client_syns() {
             )
             .unwrap(),
         )
+        .await
         .unwrap();
     incoming
         .send(
@@ -210,6 +208,7 @@ async fn mesh_tun_channel_router_rewrites_two_client_syns() {
             )
             .unwrap(),
         )
+        .await
         .unwrap();
 
     let first = tokio::time::timeout(Duration::from_secs(1), outgoing.recv())
@@ -232,24 +231,98 @@ async fn mesh_tun_channel_router_rewrites_two_client_syns() {
     assert!(ipv4_tcp_checksum_valid(&second));
 }
 
+#[tokio::test]
+async fn mesh_tun_channel_router_counts_full_output_queue() {
+    mesh_tun::stats::stats().reset();
+    let config = MeshTunConfig {
+        tcp_rewrite: true,
+        packet_queue_capacity: 1,
+        tcp_rewrite_config: TcpRewriteConfig {
+            proxy_addr: Ipv4Addr::new(169, 254, 0, 11),
+            first_port: 44000,
+            last_port: 44010,
+        },
+        ..MeshTunConfig::default()
+    };
+    let tun = MeshTun::new(config).unwrap();
+    let (_injector, incoming, _outgoing) = tun
+        .run_with_channels_and_policy(
+            Arc::new(AllowAllPolicy),
+            Arc::new(NoopUdpHandler),
+            Arc::new(NoopDnsHandler),
+        )
+        .await
+        .unwrap();
+
+    let remote = Ipv4Addr::new(203, 0, 113, 10);
+    incoming
+        .send(
+            build_ipv4_tcp_packet(
+                Ipv4Addr::new(10, 30, 0, 2),
+                50000,
+                remote,
+                7,
+                SYN,
+                1,
+                0,
+                b"",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    incoming
+        .send(
+            build_ipv4_tcp_packet(
+                Ipv4Addr::new(10, 40, 0, 2),
+                50000,
+                remote,
+                7,
+                SYN,
+                2,
+                0,
+                b"",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        if mesh_tun::stats::stats()
+            .tun_output_queue_full
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected tun_output_queue_full to increase");
+}
+
 #[test]
 fn test_invalid_port_range_zero() {
-    assert!(TcpRewriter::new(TcpRewriteConfig {
-        proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
-        first_port: 0,
-        last_port: 1000,
-    })
-    .is_err());
+    assert!(
+        TcpRewriter::new(TcpRewriteConfig {
+            proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
+            first_port: 0,
+            last_port: 1000,
+        })
+        .is_err()
+    );
 }
 
 #[test]
 fn test_invalid_port_range_inverted() {
-    assert!(TcpRewriter::new(TcpRewriteConfig {
-        proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
-        first_port: 2000,
-        last_port: 1000,
-    })
-    .is_err());
+    assert!(
+        TcpRewriter::new(TcpRewriteConfig {
+            proxy_addr: Ipv4Addr::new(169, 254, 0, 1),
+            first_port: 2000,
+            last_port: 1000,
+        })
+        .is_err()
+    );
 }
 
 #[test]

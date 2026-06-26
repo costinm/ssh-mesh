@@ -70,10 +70,17 @@ mod backend {
         }
 
         fn config_space(&self) -> [u8; 12] {
+            // Virtio-net config space layout per the specification:
+            //   offset 0..6   : mac[6]
+            //   offset 6..8   : status (u16, VIRTIO_NET_S_LINK_UP etc.)
+            //   offset 8..10  : max_virtqueue_pairs (u16)
+            //   offset 10..12 : mtu (u16, only valid if VIRTIO_NET_F_MTU set)
             let mut config = [0u8; 12];
             config[..6].copy_from_slice(&self.config.mac);
             config[6..8].copy_from_slice(&VIRTIO_NET_S_LINK_UP.to_le_bytes());
-            config[8..10].copy_from_slice(&(self.config.mtu as u16).to_le_bytes());
+            // We expose 2 queues (1 RX + 1 TX) = 1 virtqueue pair.
+            config[8..10].copy_from_slice(&1u16.to_le_bytes());
+            config[10..12].copy_from_slice(&(self.config.mtu as u16).to_le_bytes());
             config
         }
     }
@@ -277,7 +284,11 @@ mod backend {
                 .get_config(0, 12, VhostUserConfigFlags::empty(), &buf)
                 .unwrap();
             assert_eq!(&config_bytes[..6], &frontend_config.mac);
-            assert_eq!(u16::from_le_bytes([config_bytes[8], config_bytes[9]]), 1500);
+            assert_eq!(
+                u16::from_le_bytes([config_bytes[10], config_bytes[11]]),
+                1500
+            );
+            assert_eq!(u16::from_le_bytes([config_bytes[8], config_bytes[9]]), 1);
             frontend.reset_owner().unwrap();
             drop(frontend);
             drop(server_thread);
@@ -291,8 +302,8 @@ mod backend {
 
 #[cfg(feature = "vhost-user-net")]
 pub use backend::{
-    run_vhost_user_net, run_vhost_user_net_blocking, spawn_vhost_user_net, VhostUserNetBackend,
-    VhostUserNetStats,
+    VhostUserNetBackend, VhostUserNetStats, run_vhost_user_net, run_vhost_user_net_blocking,
+    spawn_vhost_user_net,
 };
 
 #[cfg(not(feature = "vhost-user-net"))]

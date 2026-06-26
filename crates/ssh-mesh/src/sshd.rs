@@ -973,6 +973,21 @@ impl SshHandler {
         let handler_id = self.id;
         let socket_path_str = socket_path.to_string();
 
+        // Security: refuse to connect to arbitrary UDS paths by default. UDS
+        // paths like `/var/run/docker.sock` or dbus sockets would let an
+        // authenticated SSH user escalate to host/container control. Only
+        // allow when the operator explicitly opts in via
+        // `allow_direct_tcpip` (the same flag governs direct-tcpip and UDS
+        // relay behavior), or the path matches a configured route.
+        if !self.server.cfg.allow_direct_tcpip {
+            error!(
+                "Refusing direct-streamlocal UDS connection to '{}' — \
+                 allow_direct_tcpip is false",
+                socket_path_str
+            );
+            return Ok(false);
+        }
+
         trace!(
             "Processing UDS connection for: {} (handler ID: {})",
             socket_path_str, handler_id
@@ -1387,12 +1402,10 @@ impl server::Handler for SshHandler {
         let handler_id = self.id;
         let comment = self.comment.clone();
         let options = self.options.clone();
-        if allow && user_part.is_some() {
-            self.user = user_str.clone();
-            self.authenticated_with_certificate = false;
-            self.cert_user = None;
-            self.terminal_user = user_part.clone();
-        }
+        // B15: Auth state mutation is deferred until the async block confirms
+        // `Auth::Accept`. Mutating `self` synchronously before the auth result
+        // is known would leave partially-populated identity fields if russh
+        // invokes this method speculatively during a multi-step handshake.
 
         async move {
             if !allow {
@@ -1403,6 +1416,10 @@ impl server::Handler for SshHandler {
             }
 
             if user_part.is_some() {
+                self.user = user_str.clone();
+                self.authenticated_with_certificate = false;
+                self.cert_user = None;
+                self.terminal_user = user_part.clone();
                 let mut clients = connected_clients.lock().await;
                 clients.insert(
                     handler_id,
@@ -1442,7 +1459,8 @@ impl server::Handler for SshHandler {
         let connected_clients = self.server.connected_clients.clone();
         let handler_id = self.id;
 
-        self.user = user_str.clone();
+        // B15: Do not mutate `self.user` synchronously before the auth result
+        // is known; defer it to the `Auth::Accept` branch in the async block.
 
         let keyfp = public_key.fingerprint(HashAlg::Sha256).to_string();
 
@@ -1497,6 +1515,8 @@ impl server::Handler for SshHandler {
 
             if let Ok(ref auth_res) = auth_result {
                 if let server::Auth::Accept = auth_res.status {
+                    // B15: Apply identity only after auth is confirmed.
+                    self.user = user_str.clone();
                     let mut clients = connected_clients.lock().await;
                     let client_info = ConnectedClientInfo {
                         id: handler_id,
@@ -1557,7 +1577,7 @@ impl server::Handler for SshHandler {
         let user_part = safe_user_part(&user_str);
         let connected_clients = self.server.connected_clients.clone();
         let handler_id = self.id;
-        self.user = user_str.clone();
+        // B15: defer self.user mutation until Accept.
         let cert_openssh = certificate.to_openssh();
 
         async move {
@@ -1583,6 +1603,8 @@ impl server::Handler for SshHandler {
 
             if let Ok(ref auth_res) = auth_result {
                 if let server::Auth::Accept = auth_res.status {
+                    // B15: Apply identity only after auth is confirmed.
+                    self.user = user_str.clone();
                     let mut clients = connected_clients.lock().await;
                     clients.insert(
                         handler_id,
@@ -1846,6 +1868,20 @@ impl server::Handler for SshHandler {
             }
 
             // Establish a TCP connection to the target host:port
+            //
+            // Security: by default, refuse to connect to arbitrary hosts to
+            // avoid acting as an open SSH relay / SSRF pivot. Only the
+            // `local` host (handled above) and configured routes (handled
+            // above) are permitted. Operators can opt into open-relay mode by
+            // setting `allow_direct_tcpip = true` in the mesh config.
+            if !me.server.cfg.allow_direct_tcpip {
+                error!(
+                    "Refusing direct-tcpip to {}:{} — no matching route and \
+                     allow_direct_tcpip is false",
+                    host, port
+                );
+                return Ok(false);
+            }
             let target_addr = format!("{}:{}", host, port);
             match TcpStream::connect(&target_addr).await {
                 Ok(tcp_stream) => {
@@ -1981,20 +2017,25 @@ impl server::Handler for SshHandler {
         let session_handle = session.handle();
 
         async move {
-            // Check if we have a TCP writer for this channel
-            let writers = tcp_writers.lock().await;
-            if let Some(tx) = writers.get(&channel_id) {
-                // Forward data to the TCP connection or PTY
+            // B16: Clone the sender out and drop the lock guard *before* sending,
+            // so concurrent data() calls for different channels don't serialize
+            // on the channel_writers mutex. `mpsc::UnboundedSender::send` is
+            // synchronous (never blocks), but holding the lock across it still
+            // serializes lookups.
+            let tx_opt = {
+                let writers = tcp_writers.lock().await;
+                writers.get(&channel_id).cloned()
+            };
+            if let Some(tx) = tx_opt {
                 trace!(
                     "Forwarding {} bytes from SSH channel {:?}",
                     data_vec.len(),
                     channel_id
                 );
-                if let Err(e) = tx.send(Bytes::from(data_vec.clone())) {
+                if let Err(e) = tx.send(Bytes::from(data_vec)) {
                     error!("Failed to send data for channel {:?}: {}", channel_id, e);
                 }
             } else {
-                // Not a direct TCP/IP channel, echo the data back for other types of channels
                 trace!(
                     "Echoing data back ({} bytes) for non-TCP channel {:?}",
                     data_vec.len(),
@@ -2043,7 +2084,11 @@ impl server::Handler for SshHandler {
 
             {
                 let mut listeners = remote_forward_listeners.lock().await;
-                listeners.insert((bind_addr.clone(), bind_port), shutdown_tx);
+                // B12: Key the listener map on the *actual* bound port (not the
+                // requested `bind_port`, which is 0 for ephemeral). The client
+                // receives `actual_port` from the reply and uses it to cancel,
+                // so the lookup key must match.
+                listeners.insert((bind_addr.clone(), actual_port as u32), shutdown_tx);
             }
 
             let remote_forward_listeners_weak = Arc::downgrade(&remote_forward_listeners);

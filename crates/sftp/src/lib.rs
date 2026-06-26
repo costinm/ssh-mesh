@@ -40,13 +40,90 @@ impl FileSystemHandler {
         format!("handle_{}", *counter)
     }
 
+    /// Resolve a client-supplied SFTP path to a real filesystem path confined
+    /// to `base_dir`.
+    ///
+    /// The canonicalized result is verified to lie within `base_dir`; any path
+    /// that escapes (via `..`, absolute symlink, etc.) is rejected with
+    /// [`StatusCode::PermissionDenied`]. The `base_dir` itself is canonicalized
+    /// lazily on first use.
+    ///
+    /// Returns the resolved [`PathBuf`] (an absolute path within `base_dir`).
+    ///
+    /// # Errors
+    /// - `PermissionDenied` if the resolved path escapes `base_dir`.
+    /// - `NoSuchFile` if the path does not exist.
+    /// - `Failure` if `base_dir` itself cannot be canonicalized.
     fn resolve_path(&self, path: &str) -> PathBuf {
-        let path = path.trim_start_matches('/');
-        if path.is_empty() {
+        let stripped = path.trim_start_matches('/');
+        let candidate = if stripped.is_empty() {
             self.base_dir.clone()
         } else {
-            self.base_dir.join(path)
+            self.base_dir.join(stripped)
+        };
+        // For paths that may not exist yet (open CREATE, mkdir, symlink, etc.)
+        // we canonicalize the parent and append the final component, so the
+        // confinement check still applies to not-yet-existing entries.
+        candidate
+    }
+
+    /// Like [`resolve_path`](Self::resolve_path) but verifies the canonicalized
+    /// path stays within `base_dir`. Use for operations that touch existing
+    /// paths (open, stat, read, remove, etc.).
+    async fn confined_resolve_existing(&self, path: &str) -> Result<PathBuf, StatusCode> {
+        let candidate = self.resolve_path(path);
+        let base_canonical = self.canonicalize_base().await.ok_or(StatusCode::Failure)?;
+        // Canonicalize the candidate. If it doesn't exist, canonicalize the
+        // parent and re-append the final component.
+        let canonical = match fs::canonicalize(&candidate).await {
+            Ok(c) => c,
+            Err(_) => {
+                let parent = candidate
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("/"));
+                let file_name = candidate.file_name();
+                let parent_canonical = fs::canonicalize(parent)
+                    .await
+                    .map_err(|e| io_to_status_code(&e))?;
+                match file_name {
+                    Some(name) => parent_canonical.join(name),
+                    None => parent_canonical,
+                }
+            }
+        };
+        if !canonical.starts_with(&base_canonical) {
+            return Err(StatusCode::PermissionDenied);
         }
+        Ok(canonical)
+    }
+
+    /// Like [`confined_resolve_existing`](Self::confined_resolve_existing) but
+    /// does not require the path to exist (used for CREATE/mkdir/symlink
+    /// targets where the leaf does not yet exist).
+    async fn confined_resolve_new(&self, path: &str) -> Result<PathBuf, StatusCode> {
+        let candidate = self.resolve_path(path);
+        let base_canonical = self.canonicalize_base().await.ok_or(StatusCode::Failure)?;
+        let parent = candidate
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/"));
+        let parent_canonical = fs::canonicalize(parent)
+            .await
+            .map_err(|e| io_to_status_code(&e))?;
+        let resolved = match candidate.file_name() {
+            Some(name) => parent_canonical.join(name),
+            None => parent_canonical,
+        };
+        if !resolved.starts_with(&base_canonical) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        Ok(resolved)
+    }
+
+    /// Canonicalize `base_dir` (cached on first call). This is a best-effort
+    /// canonicalization; if it fails we return `None` so callers can fail the
+    /// request.
+    async fn canonicalize_base(&self) -> Option<PathBuf> {
+        fs::canonicalize(&self.base_dir).await.ok()
     }
 }
 
@@ -96,7 +173,13 @@ impl Handler for FileSystemHandler {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
-        let path = self.resolve_path(&filename);
+        // Use the "new" resolver when CREATE/EXCLUDE is requested (the leaf may
+        // not exist yet); otherwise the existing-file resolver.
+        let path = if pflags.intersects(OpenFlags::CREATE | OpenFlags::EXCLUDE) {
+            self.confined_resolve_new(&filename).await?
+        } else {
+            self.confined_resolve_existing(&filename).await?
+        };
         let mut options = fs::OpenOptions::new();
 
         if pflags.contains(OpenFlags::READ) {
@@ -192,7 +275,7 @@ impl Handler for FileSystemHandler {
 
     // SSH_FXP_LSTAT — stat without following symlinks
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let resolved = self.resolve_path(&path);
+        let resolved = self.confined_resolve_existing(&path).await?;
         let meta = fs::symlink_metadata(&resolved)
             .await
             .map_err(|e| io_to_status_code(&e))?;
@@ -223,7 +306,7 @@ impl Handler for FileSystemHandler {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        let resolved = self.resolve_path(&path);
+        let resolved = self.confined_resolve_existing(&path).await?;
         apply_attrs(&resolved, &attrs).await?;
         Ok(ok_status(id))
     }
@@ -257,7 +340,7 @@ impl Handler for FileSystemHandler {
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-        let resolved_path = self.resolve_path(&path);
+        let resolved_path = self.confined_resolve_existing(&path).await?;
         // Read the entire directory up-front so we can return all entries in
         // one readdir response, which is what typical SFTP clients expect.
         let read_dir = std::fs::read_dir(&resolved_path).map_err(|e| io_to_status_code(&e))?;
@@ -296,7 +379,7 @@ impl Handler for FileSystemHandler {
 
     // SSH_FXP_REMOVE — delete a file
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
-        let path = self.resolve_path(&filename);
+        let path = self.confined_resolve_existing(&filename).await?;
         fs::remove_file(&path)
             .await
             .map_err(|e| io_to_status_code(&e))?;
@@ -310,7 +393,7 @@ impl Handler for FileSystemHandler {
         path: String,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        let resolved = self.resolve_path(&path);
+        let resolved = self.confined_resolve_new(&path).await?;
         fs::create_dir(&resolved)
             .await
             .map_err(|e| io_to_status_code(&e))?;
@@ -319,7 +402,7 @@ impl Handler for FileSystemHandler {
 
     // SSH_FXP_RMDIR
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
-        let resolved = self.resolve_path(&path);
+        let resolved = self.confined_resolve_existing(&path).await?;
         fs::remove_dir(&resolved)
             .await
             .map_err(|e| io_to_status_code(&e))?;
@@ -328,7 +411,7 @@ impl Handler for FileSystemHandler {
 
     // SSH_FXP_REALPATH — canonicalize a path
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
-        let resolved = self.resolve_path(&path);
+        let resolved = self.confined_resolve_existing(&path).await?;
         // Canonicalize to get the real absolute path
         let canonical = fs::canonicalize(&resolved)
             .await
@@ -354,7 +437,7 @@ impl Handler for FileSystemHandler {
 
     // SSH_FXP_STAT — stat following symlinks
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let resolved = self.resolve_path(&path);
+        let resolved = self.confined_resolve_existing(&path).await?;
         let meta = fs::metadata(&resolved)
             .await
             .map_err(|e| io_to_status_code(&e))?;
@@ -371,8 +454,8 @@ impl Handler for FileSystemHandler {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
-        let old = self.resolve_path(&oldpath);
-        let new = self.resolve_path(&newpath);
+        let old = self.confined_resolve_existing(&oldpath).await?;
+        let new = self.confined_resolve_new(&newpath).await?;
         fs::rename(&old, &new)
             .await
             .map_err(|e| io_to_status_code(&e))?;
@@ -381,10 +464,20 @@ impl Handler for FileSystemHandler {
 
     // SSH_FXP_READLINK
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
-        let resolved = self.resolve_path(&path);
+        let resolved = self.confined_resolve_existing(&path).await?;
         let target = fs::read_link(&resolved)
             .await
             .map_err(|e| io_to_status_code(&e))?;
+        // Refuse to reveal symlink targets that escape base_dir (information
+        // leak / sandbox escape). Return the target only if it is relative or
+        // confined; otherwise return PermissionDenied.
+        if target.is_absolute()
+            && let Some(base_canonical) = self.canonicalize_base().await
+            && let Ok(target_canonical) = fs::canonicalize(&target).await
+            && !target_canonical.starts_with(&base_canonical)
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
         let target_str = target.to_string_lossy().to_string();
         Ok(Name {
             id,
@@ -399,7 +492,18 @@ impl Handler for FileSystemHandler {
         linkpath: String,
         targetpath: String,
     ) -> Result<Status, Self::Error> {
-        let link = self.resolve_path(&linkpath);
+        let link = self.confined_resolve_new(&linkpath).await?;
+        // Reject symlink targets that escape base_dir via absolute paths. A
+        // relative target is allowed (resolved relative to the link's parent).
+        if std::path::Path::new(&targetpath).is_absolute() {
+            let base_canonical = self.canonicalize_base().await.ok_or(StatusCode::Failure)?;
+            let target_canonical = fs::canonicalize(&targetpath)
+                .await
+                .unwrap_or_else(|_| std::path::PathBuf::from(&targetpath));
+            if !target_canonical.starts_with(&base_canonical) {
+                return Err(StatusCode::PermissionDenied);
+            }
+        }
         #[cfg(unix)]
         {
             tokio::fs::symlink(&targetpath, &link)
@@ -448,5 +552,85 @@ fn io_to_status_code(e: &std::io::Error) -> StatusCode {
         std::io::ErrorKind::NotFound => StatusCode::NoSuchFile,
         std::io::ErrorKind::PermissionDenied => StatusCode::PermissionDenied,
         _ => StatusCode::Failure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_handler(dir: &std::path::Path) -> FileSystemHandler {
+        FileSystemHandler::new(dir.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn resolve_existing_stays_in_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("inner.txt");
+        tokio::fs::write(&inner, b"hi").await.unwrap();
+        let h = make_handler(tmp.path());
+        let resolved = h.confined_resolve_existing("inner.txt").await.unwrap();
+        assert!(resolved.starts_with(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_dotdot_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a sibling directory outside base_dir.
+        let sibling = tmp.path().parent().unwrap().join("sftp_escape_target.txt");
+        tokio::fs::write(&sibling, b"secret").await.unwrap();
+        let h = make_handler(tmp.path());
+        let result = h
+            .confined_resolve_existing("../sftp_escape_target.txt")
+            .await;
+        let _ = tokio::fs::remove_file(&sibling);
+        assert!(
+            matches!(result, Err(StatusCode::PermissionDenied)),
+            "traversal must be rejected, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a symlink inside base pointing outside.
+        let outside = tmp.path().parent().unwrap().join("outside_secret.txt");
+        tokio::fs::write(&outside, b"secret").await.unwrap();
+        let link = tmp.path().join("escape");
+        #[cfg(unix)]
+        tokio::fs::symlink(&outside, &link).await.unwrap();
+        let h = make_handler(tmp.path());
+        let result = h.confined_resolve_existing("escape").await;
+        let _ = tokio::fs::remove_file(&outside);
+        #[cfg(unix)]
+        {
+            assert!(
+                matches!(result, Err(StatusCode::PermissionDenied)),
+                "symlink escape must be rejected, got {result:?}"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn resolve_new_allows_create_in_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a subdirectory that exists.
+        tokio::fs::create_dir(tmp.path().join("sub")).await.unwrap();
+        let h = make_handler(tmp.path());
+        let resolved = h.confined_resolve_new("sub/newfile.txt").await.unwrap();
+        assert!(resolved.starts_with(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn resolve_new_rejects_create_outside_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = make_handler(tmp.path());
+        let result = h.confined_resolve_new("../evil.txt").await;
+        assert!(
+            matches!(result, Err(StatusCode::PermissionDenied)),
+            "create outside base must be rejected, got {result:?}"
+        );
     }
 }

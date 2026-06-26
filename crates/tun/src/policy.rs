@@ -1,4 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+
+use crate::transport::{NativeTcpConnector, TcpConnector};
 
 pub type VmId = String;
 
@@ -29,9 +32,24 @@ impl PolicyDecision {
     }
 }
 
+#[derive(Clone)]
+pub enum TcpRouteDecision {
+    Connect { connector: Arc<dyn TcpConnector> },
+    Deny { reason: String },
+}
+
 #[async_trait::async_trait]
 pub trait MeshTunPolicy: Send + Sync + 'static {
     async fn check(&self, ctx: &FlowContext) -> PolicyDecision;
+
+    async fn route_tcp(&self, ctx: &FlowContext) -> TcpRouteDecision {
+        match self.check(ctx).await {
+            PolicyDecision::Allow => TcpRouteDecision::Connect {
+                connector: Arc::new(NativeTcpConnector),
+            },
+            PolicyDecision::Deny { reason } => TcpRouteDecision::Deny { reason },
+        }
+    }
 }
 
 #[derive(Debug, Default)]

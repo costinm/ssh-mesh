@@ -1,6 +1,6 @@
 [build]
 #target-dir = "out/rust1"
-#target = "x86_64-unknown-linux-musl"
+target = "x86_64-unknown-linux-musl"
 
 [env]
 BORING_BSSL_FIPS_PATH = { value = "vendor/boringssl-fips/linux_x86_64", force = true, relative = true }

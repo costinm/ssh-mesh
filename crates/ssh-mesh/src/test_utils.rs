@@ -108,6 +108,10 @@ pub async fn setup_test_environment(
         base_dir: Some(base_dir.clone()),
         ssh_port: Some(ssh_port),
         http_port,
+        // Tests exercise direct-tcpip port forwarding (e.g. mux_test's local
+        // forward), which requires the open-relay path. Production defaults
+        // to false for safety.
+        allow_direct_tcpip: true,
         ..Default::default()
     };
     let mesh_node = std::sync::Arc::new(crate::MeshNode::new(Some(base_dir.clone()), Some(cfg)));

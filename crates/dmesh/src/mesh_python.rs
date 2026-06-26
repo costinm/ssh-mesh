@@ -13,7 +13,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use ssh_mesh::{sshc::SshClientListener, MeshListener};
+use ssh_mesh::{MeshListener, sshc::SshClientListener};
 use std::sync::Arc;
 use tokio::io::DuplexStream;
 use tokio::runtime::Handle;

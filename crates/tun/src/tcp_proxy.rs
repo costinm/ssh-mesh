@@ -1,17 +1,38 @@
-use crate::packet::{build_ipv4_tcp_packet, TunTcpPacket};
-use mesh::tun::{TunTcpHandler, TunTcpMeta};
+use crate::packet::{TunTcpPacket, build_ipv4_tcp_packet};
+use crate::policy::{FlowContext, FlowProtocol, MeshTunPolicy, TcpRouteDecision};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TcpProxyConfig {
+    pub max_flows: usize,
+    pub per_flow_queue_capacity: usize,
+    pub handshake_timeout: std::time::Duration,
+    pub connect_timeout: std::time::Duration,
+}
+
+impl Default for TcpProxyConfig {
+    fn default() -> Self {
+        Self {
+            max_flows: 4096,
+            per_flow_queue_capacity: 256,
+            handshake_timeout: std::time::Duration::from_secs(10),
+            connect_timeout: std::time::Duration::from_secs(10),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TcpProxyManager {
-    flows: Arc<Mutex<HashMap<TcpFlowKey, mpsc::UnboundedSender<TunTcpPacket>>>>,
-    outgoing_tx: mpsc::UnboundedSender<Vec<u8>>,
-    tcp_handler: Arc<dyn TunTcpHandler>,
+    config: TcpProxyConfig,
+    flows: Arc<Mutex<HashMap<TcpFlowKey, mpsc::Sender<TunTcpPacket>>>>,
+    outgoing_tx: mpsc::Sender<Vec<u8>>,
+    policy: Arc<dyn MeshTunPolicy>,
+    vm_id: String,
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
@@ -22,13 +43,17 @@ pub struct TcpFlowKey {
 
 impl TcpProxyManager {
     pub fn new(
-        outgoing_tx: mpsc::UnboundedSender<Vec<u8>>,
-        tcp_handler: Arc<dyn TunTcpHandler>,
+        vm_id: String,
+        outgoing_tx: mpsc::Sender<Vec<u8>>,
+        policy: Arc<dyn MeshTunPolicy>,
+        config: TcpProxyConfig,
     ) -> Self {
         Self {
+            config,
             flows: Arc::new(Mutex::new(HashMap::new())),
             outgoing_tx,
-            tcp_handler,
+            policy,
+            vm_id,
         }
     }
 
@@ -46,21 +71,37 @@ impl TcpProxyManager {
             crate::stats::stats()
                 .tcp_flow_packet
                 .fetch_add(1, Ordering::Relaxed);
-            let _ = tx.send(pkt);
+            if tx.try_send(pkt).is_err() {
+                crate::stats::stats()
+                    .tcp_flow_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         } else if pkt.syn && !pkt.ack {
+            if flows_guard.len() >= self.config.max_flows {
+                crate::stats::stats()
+                    .tcp_flow_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             crate::stats::stats()
                 .tcp_syn
                 .fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(self.config.per_flow_queue_capacity);
             flows_guard.insert(key.clone(), tx.clone());
 
             let flows_clone = self.flows.clone();
             let outgoing_tx = self.outgoing_tx.clone();
-            let tcp_handler = self.tcp_handler.clone();
+            let policy = self.policy.clone();
+            let config = self.config.clone();
+            let vm_id = self.vm_id.clone();
 
             tokio::spawn(async move {
-                let _ = tx.send(pkt);
-                handle_tcp_flow(key.src, key.dst, rx, outgoing_tx, tcp_handler).await;
+                if tx.try_send(pkt).is_err() {
+                    crate::stats::stats()
+                        .tcp_flow_queue_full
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                handle_tcp_flow(key.src, key.dst, rx, outgoing_tx, policy, config, vm_id).await;
                 flows_clone.lock().await.remove(&key);
             });
         }
@@ -70,9 +111,11 @@ impl TcpProxyManager {
 async fn handle_tcp_flow(
     src: SocketAddr,
     dst: SocketAddr,
-    mut rx: mpsc::UnboundedReceiver<TunTcpPacket>,
-    outgoing_tx: mpsc::UnboundedSender<Vec<u8>>,
-    tcp_handler: Arc<dyn TunTcpHandler>,
+    mut rx: mpsc::Receiver<TunTcpPacket>,
+    outgoing_tx: mpsc::Sender<Vec<u8>>,
+    policy: Arc<dyn MeshTunPolicy>,
+    config: TcpProxyConfig,
+    vm_id: String,
 ) {
     let syn_pkt = match rx.recv().await {
         Some(pkt) if pkt.syn && !pkt.ack => pkt,
@@ -91,20 +134,72 @@ async fn handle_tcp_flow(
         _ => return,
     };
 
-    let (guest_stream, host_stream) = tokio::io::duplex(65536);
-
-    let handler = tcp_handler.clone();
-    let meta = TunTcpMeta {
-        src_addr: src.ip(),
-        src_port: src.port(),
-        dst_addr: dst.ip(),
-        dst_port: dst.port(),
+    let context = FlowContext {
+        vm_id,
+        protocol: FlowProtocol::Tcp,
+        src,
+        dst,
     };
-    tokio::spawn(async move {
-        handler.handle_tcp(meta, host_stream).await;
-    });
 
-    let (mut reader, mut writer) = tokio::io::split(guest_stream);
+    let connect_result = match policy.route_tcp(&context).await {
+        TcpRouteDecision::Connect { connector } => {
+            tokio::time::timeout(config.connect_timeout, connector.connect(&context)).await
+        }
+        TcpRouteDecision::Deny { reason } => {
+            tracing::debug!(?src, ?dst, %reason, "TCP flow denied before SYN-ACK");
+            crate::stats::stats()
+                .tcp_flow_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            send_tcp_reset(
+                src_ip_v4,
+                src.port(),
+                dst_ip_v4,
+                dst.port(),
+                &syn_pkt,
+                &outgoing_tx,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let backend_stream = match connect_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            tracing::debug!(?src, ?dst, %error, "TCP backend connect failed before SYN-ACK");
+            crate::stats::stats()
+                .tcp_flow_error
+                .fetch_add(1, Ordering::Relaxed);
+            send_tcp_reset(
+                src_ip_v4,
+                src.port(),
+                dst_ip_v4,
+                dst.port(),
+                &syn_pkt,
+                &outgoing_tx,
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(?src, ?dst, "TCP backend connect timed out before SYN-ACK");
+            crate::stats::stats()
+                .tcp_flow_error
+                .fetch_add(1, Ordering::Relaxed);
+            send_tcp_reset(
+                src_ip_v4,
+                src.port(),
+                dst_ip_v4,
+                dst.port(),
+                &syn_pkt,
+                &outgoing_tx,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let (mut reader, mut writer) = tokio::io::split(backend_stream);
 
     let initial_server_seq = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -131,7 +226,7 @@ async fn handle_tcp_flow(
             return;
         }
     };
-    if outgoing_tx.send(syn_ack.clone()).is_err() {
+    if outgoing_tx.send(syn_ack.clone()).await.is_err() {
         crate::stats::stats()
             .tcp_flow_error
             .fetch_add(1, Ordering::Relaxed);
@@ -143,7 +238,19 @@ async fn handle_tcp_flow(
 
     let expected_ack = initial_server_seq.wrapping_add(1);
     let ack_pkt = loop {
-        let Some(pkt) = rx.recv().await else {
+        let recv = tokio::time::timeout(config.handshake_timeout, rx.recv()).await;
+        let Some(pkt) = (match recv {
+            Ok(pkt) => pkt,
+            Err(_) => {
+                crate::stats::stats()
+                    .tcp_handshake_timeout
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::stats::stats()
+                    .tcp_flow_error
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }) else {
             crate::stats::stats()
                 .tcp_flow_error
                 .fetch_add(1, Ordering::Relaxed);
@@ -166,7 +273,7 @@ async fn handle_tcp_flow(
             return;
         }
         if pkt.syn && !pkt.ack {
-            if outgoing_tx.send(syn_ack.clone()).is_err() {
+            if outgoing_tx.send(syn_ack.clone()).await.is_err() {
                 crate::stats::stats()
                     .tcp_flow_error
                     .fetch_add(1, Ordering::Relaxed);
@@ -217,32 +324,77 @@ async fn handle_tcp_flow(
     let client_acked_a = client_acked_shared.clone();
     let outgoing_tx_a = outgoing_tx.clone();
 
+    // B2: Notify the tx_task (host→guest) when an ACK advances the window,
+    // instead of the old 5ms busy-poll that burned CPU and could deadlock.
+    let ack_notify = Arc::new(tokio::sync::Notify::new());
+    let ack_notify_rx = ack_notify.clone();
+    let ack_notify_tx = ack_notify.clone();
+
     // Task A: Guest to Host (Read rx -> Write writer)
-    let rx_task = tokio::spawn(async move {
-        let mut client_seq = client_seq_a.load(Ordering::Relaxed);
+    let mut rx_task = tokio::spawn(async move {
+        let mut client_seq = client_seq_a.load(Ordering::Acquire);
+        // B3: Reorder buffer for out-of-order segments, keyed by seq.
+        let mut ooo_buf: std::collections::BTreeMap<u32, Vec<u8>> =
+            std::collections::BTreeMap::new();
+
         while let Some(pkt) = rx.recv().await {
             if pkt.rst {
                 break;
             }
 
             if pkt.ack {
-                client_acked_a.store(pkt.ack_num, Ordering::Relaxed);
+                client_acked_a.store(pkt.ack_num, Ordering::Release);
+                // B2: Wake the tx_task so it can re-check the window.
+                ack_notify_tx.notify_one();
             }
 
             if !pkt.payload.is_empty() {
-                if pkt.seq == client_seq {
-                    if writer.write_all(&pkt.payload).await.is_err() {
+                // B3: Handle in-order, out-of-order, and retransmitted data.
+                if pkt.seq.wrapping_add(pkt.payload.len() as u32) > client_seq
+                    && pkt.seq <= client_seq
+                {
+                    // In-order or overlapping: extract the new portion.
+                    let offset = client_seq.wrapping_sub(pkt.seq) as usize;
+                    let new_data = &pkt.payload[offset..];
+                    if !new_data.is_empty() {
+                        if writer.write_all(new_data).await.is_err() {
+                            crate::stats::stats()
+                                .tcp_flow_error
+                                .fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
                         crate::stats::stats()
-                            .tcp_flow_error
-                            .fetch_add(1, Ordering::Relaxed);
-                        break;
+                            .tcp_payload_guest_to_host
+                            .fetch_add(new_data.len() as u64, Ordering::Relaxed);
+                        client_seq = client_seq.wrapping_add(new_data.len() as u32);
+                        client_seq_a.store(client_seq, Ordering::Release);
+
+                        // Drain the reorder buffer for any now-in-order segments.
+                        while let Some(seg) = ooo_buf.remove(&client_seq) {
+                            if writer.write_all(&seg).await.is_err() {
+                                crate::stats::stats()
+                                    .tcp_flow_error
+                                    .fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            crate::stats::stats()
+                                .tcp_payload_guest_to_host
+                                .fetch_add(seg.len() as u64, Ordering::Relaxed);
+                            client_seq = client_seq.wrapping_add(seg.len() as u32);
+                            client_seq_a.store(client_seq, Ordering::Release);
+                        }
                     }
-                    crate::stats::stats()
-                        .tcp_payload_guest_to_host
-                        .fetch_add(pkt.payload.len() as u64, Ordering::Relaxed);
-                    client_seq = client_seq.wrapping_add(pkt.payload.len() as u32);
-                    client_seq_a.store(client_seq, Ordering::Relaxed);
+                } else if pkt.seq > client_seq {
+                    // B3: Out-of-order — buffer for later delivery.
+                    ooo_buf.insert(pkt.seq, pkt.payload.clone());
+                    // Cap the reorder buffer to 256 KiB to avoid unbounded memory.
+                    let total: usize = ooo_buf.values().map(|v| v.len()).sum();
+                    if total > 256 * 1024 {
+                        ooo_buf.clear();
+                    }
                 }
+                // If pkt.seq + len <= client_seq, it's a pure retransmit of
+                // already-received data — ack but don't re-deliver.
 
                 let s_seq = server_seq_a.load(Ordering::Relaxed);
                 if let Ok(ack_pkt) = build_ipv4_tcp_packet(
@@ -255,7 +407,12 @@ async fn handle_tcp_flow(
                     client_seq,
                     &[],
                 ) {
-                    let _ = outgoing_tx_a.send(ack_pkt);
+                    if outgoing_tx_a.send(ack_pkt).await.is_err() {
+                        crate::stats::stats()
+                            .tun_output_queue_full
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                     crate::stats::stats()
                         .tcp_ack_sent
                         .fetch_add(1, Ordering::Relaxed);
@@ -265,20 +422,22 @@ async fn handle_tcp_flow(
             if pkt.fin {
                 let s_seq = server_seq_a.load(Ordering::Relaxed);
                 let final_client_seq = client_seq.wrapping_add(1);
-                client_seq_a.store(final_client_seq, Ordering::Relaxed);
+                client_seq_a.store(final_client_seq, Ordering::Release);
+                // B3: Reply with FIN|ACK (0x11) instead of bare ACK (0x10) for
+                // a cleaner close per RFC 793.
                 if let Ok(fin_ack) = build_ipv4_tcp_packet(
                     dst_ip_v4,
                     dst.port(),
                     src_ip_v4,
                     src.port(),
-                    0x10, // ACK
+                    0x11, // FIN | ACK
                     s_seq,
                     final_client_seq,
                     &[],
                 ) {
-                    let _ = outgoing_tx_a.send(fin_ack);
+                    let _ = outgoing_tx_a.send(fin_ack).await;
                     crate::stats::stats()
-                        .tcp_ack_sent
+                        .tcp_fin_sent
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 let _ = writer.shutdown().await;
@@ -288,7 +447,9 @@ async fn handle_tcp_flow(
     });
 
     // Task B: Host to Guest (Read reader -> Send outgoing_tx)
-    let tx_task = tokio::spawn(async move {
+    let mut tx_task = tokio::spawn(async move {
+        // B3: Cap read size to a conservative MSS (minus IP/TCP headers) to
+        // respect common MTU limits. 1400 is safe for typical 1500-byte MTU.
         let mut buf = vec![0u8; 1400];
         loop {
             match reader.read(&mut buf).await {
@@ -305,7 +466,7 @@ async fn handle_tcp_flow(
                         c_seq,
                         &[],
                     ) {
-                        let _ = outgoing_tx.send(fin_pkt);
+                        let _ = outgoing_tx.send(fin_pkt).await;
                         crate::stats::stats()
                             .tcp_fin_sent
                             .fetch_add(1, Ordering::Relaxed);
@@ -320,15 +481,37 @@ async fn handle_tcp_flow(
                         .tcp_payload_host_to_guest
                         .fetch_add(n as u64, Ordering::Relaxed);
                     let s_seq = server_seq_shared.load(Ordering::Relaxed);
-                    while s_seq
-                        .wrapping_add(n as u32)
-                        .wrapping_sub(client_acked_shared.load(Ordering::Relaxed))
-                        > 65535
-                    {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                    // B2: Wait for send window to open, woken by the rx_task's
+                    // notify on ACK. Use a 60s overall timeout to avoid an
+                    // unbounded hang if the client never ACKs.
+                    let window = 65535u32;
+                    let deadline =
+                        tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+                    loop {
+                        let acked = client_acked_shared.load(Ordering::Acquire);
+                        let in_flight = s_seq.wrapping_add(n as u32).wrapping_sub(acked);
+                        if in_flight <= window {
+                            break;
+                        }
+                        // Window full: wait for an ACK notification.
+                        let timeout = tokio::time::sleep_until(deadline);
+                        tokio::pin!(timeout);
+                        tokio::select! {
+                            _ = ack_notify_rx.notified() => {}
+                                            _ = &mut timeout => {
+                                tracing::warn!(
+                                    "TCP flow {:?}->{:?} timed out waiting for ACK window",
+                                    src, dst
+                                );
+                                crate::stats::stats()
+                                    .tcp_flow_error
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
                     }
 
-                    server_seq_shared.fetch_add(n as u32, Ordering::Relaxed);
+                    server_seq_shared.fetch_add(n as u32, Ordering::Release);
                     let c_seq = client_seq_shared.load(Ordering::Relaxed);
                     if let Ok(data_pkt) = build_ipv4_tcp_packet(
                         dst_ip_v4,
@@ -340,7 +523,12 @@ async fn handle_tcp_flow(
                         c_seq,
                         &buf[..n],
                     ) {
-                        let _ = outgoing_tx.send(data_pkt);
+                        if outgoing_tx.send(data_pkt).await.is_err() {
+                            crate::stats::stats()
+                                .tun_output_queue_full
+                                .fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
                         crate::stats::stats()
                             .tcp_data_sent
                             .fetch_add(1, Ordering::Relaxed);
@@ -356,9 +544,18 @@ async fn handle_tcp_flow(
         }
     });
 
+    // B2: Abort the loser task to prevent task/FD leaks. Previously the select!
+    // returned the winner's result and leaked the loser (which could keep
+    // touching outgoing_tx and atomics).
     let _ = tokio::select! {
-        res = rx_task => res,
-        res = tx_task => res,
+        res = &mut rx_task => {
+            tx_task.abort();
+            res
+        }
+        res = &mut tx_task => {
+            rx_task.abort();
+            res
+        }
     };
 }
 
@@ -367,4 +564,226 @@ fn tcp_flags(pkt: &TunTcpPacket) -> u8 {
         | (if pkt.syn { 0x02 } else { 0 })
         | (if pkt.rst { 0x04 } else { 0 })
         | (if pkt.ack { 0x10 } else { 0 })
+}
+
+async fn send_tcp_reset(
+    src_ip_v4: std::net::Ipv4Addr,
+    src_port: u16,
+    dst_ip_v4: std::net::Ipv4Addr,
+    dst_port: u16,
+    syn_pkt: &TunTcpPacket,
+    outgoing_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    if let Ok(rst) = build_ipv4_tcp_packet(
+        dst_ip_v4,
+        dst_port,
+        src_ip_v4,
+        src_port,
+        0x14, // RST | ACK
+        0,
+        syn_pkt.seq.wrapping_add(1),
+        &[],
+    ) {
+        let _ = outgoing_tx.send(rst).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{TunPacket, build_ipv4_tcp_packet, parse_ip_packet};
+    use crate::policy::{PolicyDecision, TcpRouteDecision};
+    use crate::transport::{BoxTunByteStream, TcpConnector};
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    struct DuplexConnector;
+
+    #[async_trait::async_trait]
+    impl TcpConnector for DuplexConnector {
+        async fn connect(&self, _ctx: &FlowContext) -> Result<BoxTunByteStream, anyhow::Error> {
+            let (stream, _peer) = tokio::io::duplex(1024);
+            Ok(Box::new(stream))
+        }
+    }
+
+    struct DuplexPolicy;
+
+    #[async_trait::async_trait]
+    impl MeshTunPolicy for DuplexPolicy {
+        async fn check(&self, _ctx: &FlowContext) -> PolicyDecision {
+            PolicyDecision::Allow
+        }
+
+        async fn route_tcp(&self, _ctx: &FlowContext) -> TcpRouteDecision {
+            TcpRouteDecision::Connect {
+                connector: Arc::new(DuplexConnector),
+            }
+        }
+    }
+
+    struct DenyTcpPolicy;
+
+    #[async_trait::async_trait]
+    impl MeshTunPolicy for DenyTcpPolicy {
+        async fn check(&self, _ctx: &FlowContext) -> PolicyDecision {
+            PolicyDecision::Deny {
+                reason: "blocked".to_string(),
+            }
+        }
+    }
+
+    struct FailingConnector;
+
+    #[async_trait::async_trait]
+    impl TcpConnector for FailingConnector {
+        async fn connect(&self, _ctx: &FlowContext) -> Result<BoxTunByteStream, anyhow::Error> {
+            anyhow::bail!("backend unavailable")
+        }
+    }
+
+    struct FailingTcpPolicy;
+
+    #[async_trait::async_trait]
+    impl MeshTunPolicy for FailingTcpPolicy {
+        async fn check(&self, _ctx: &FlowContext) -> PolicyDecision {
+            PolicyDecision::Allow
+        }
+
+        async fn route_tcp(&self, _ctx: &FlowContext) -> TcpRouteDecision {
+            TcpRouteDecision::Connect {
+                connector: Arc::new(FailingConnector),
+            }
+        }
+    }
+
+    fn tcp_packet(src_port: u16) -> TunTcpPacket {
+        let packet = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 5, 0, 2),
+            src_port,
+            Ipv4Addr::new(198, 51, 100, 10),
+            80,
+            0x02,
+            1,
+            0,
+            &[],
+        )
+        .unwrap();
+        let TunPacket::Tcp(tcp) = parse_ip_packet(&packet) else {
+            panic!("expected TCP packet");
+        };
+        tcp
+    }
+
+    #[tokio::test]
+    async fn rejects_new_flows_after_limit() {
+        crate::stats::stats().reset();
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(16);
+        let manager = TcpProxyManager::new(
+            "vm-a".to_string(),
+            outgoing_tx,
+            Arc::new(DuplexPolicy),
+            TcpProxyConfig {
+                max_flows: 1,
+                per_flow_queue_capacity: 4,
+                handshake_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(30),
+            },
+        );
+
+        manager.handle_packet(tcp_packet(40000)).await;
+        manager.handle_packet(tcp_packet(40001)).await;
+
+        assert!(
+            crate::stats::stats()
+                .tcp_flow_rejected
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_removes_half_open_flow() {
+        crate::stats::stats().reset();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let manager = TcpProxyManager::new(
+            "vm-a".to_string(),
+            outgoing_tx,
+            Arc::new(DuplexPolicy),
+            TcpProxyConfig {
+                max_flows: 16,
+                per_flow_queue_capacity: 4,
+                handshake_timeout: Duration::from_millis(20),
+                connect_timeout: Duration::from_secs(30),
+            },
+        );
+
+        manager.handle_packet(tcp_packet(40000)).await;
+        let _ = outgoing_rx.recv().await.expect("SYN-ACK");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(
+            crate::stats::stats()
+                .tcp_handshake_timeout
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(manager.flows.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn denied_syn_returns_reset_without_syn_ack() {
+        crate::stats::stats().reset();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let manager = TcpProxyManager::new(
+            "vm-a".to_string(),
+            outgoing_tx,
+            Arc::new(DenyTcpPolicy),
+            TcpProxyConfig {
+                max_flows: 16,
+                per_flow_queue_capacity: 4,
+                handshake_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(30),
+            },
+        );
+
+        manager.handle_packet(tcp_packet(40000)).await;
+        let packet = outgoing_rx.recv().await.expect("RST");
+        let TunPacket::Tcp(tcp) = parse_ip_packet(&packet) else {
+            panic!("expected TCP packet");
+        };
+        assert!(tcp.rst);
+        assert!(tcp.ack);
+        assert!(!tcp.syn);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(manager.flows.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn backend_connect_failure_returns_reset_without_syn_ack() {
+        crate::stats::stats().reset();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let manager = TcpProxyManager::new(
+            "vm-a".to_string(),
+            outgoing_tx,
+            Arc::new(FailingTcpPolicy),
+            TcpProxyConfig {
+                max_flows: 16,
+                per_flow_queue_capacity: 4,
+                handshake_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(30),
+            },
+        );
+
+        manager.handle_packet(tcp_packet(40000)).await;
+        let packet = outgoing_rx.recv().await.expect("RST");
+        let TunPacket::Tcp(tcp) = parse_ip_packet(&packet) else {
+            panic!("expected TCP packet");
+        };
+        assert!(tcp.rst);
+        assert!(tcp.ack);
+        assert!(!tcp.syn);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(manager.flows.lock().await.len(), 0);
+    }
 }

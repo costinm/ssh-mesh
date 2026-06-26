@@ -8,10 +8,10 @@
 use crate::handler::PmonMcpHandler;
 
 use pmond::ProcMon;
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-};
 use rmcp::ServiceExt;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 
 use std::sync::Arc;
 use tracing::{error, info};

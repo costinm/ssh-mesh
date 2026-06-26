@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::IoSlice;

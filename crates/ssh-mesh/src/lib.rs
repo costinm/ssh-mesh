@@ -296,6 +296,16 @@ pub struct MeshNodeConfig {
     /// Incoming SSH exec/shell routing rules.
     #[serde(default)]
     pub ssh_routes: Vec<SshRouteConfig>,
+
+    /// Allow `direct-tcpip` channels to connect to arbitrary host:port targets
+    /// that do not match any configured route.
+    ///
+    /// Defaults to `false` (deny). When `false`, only the special `local`
+    /// host and hosts matching an `ssh_routes` entry are permitted. When
+    /// `true`, the server acts as an open SSH proxy/relay — only enable this on
+    /// trusted, isolated networks.
+    #[serde(default)]
+    pub allow_direct_tcpip: bool,
 }
 
 pub trait MeshListener: Send + Sync {

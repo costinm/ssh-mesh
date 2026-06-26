@@ -5,11 +5,39 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
-/// Adapter to bridge MPSC channels with AsyncRead + AsyncWrite
+/// Adapter to bridge MPSC channels with AsyncRead + AsyncWrite.
+///
+/// The write side uses a bounded `mpsc::Sender`. `poll_write` reserves
+/// capacity asynchronously (without busy-looping) by polling
+/// `reserve_owned`, storing an `OwnedPermit` between polls until capacity is
+/// available, then sending the bytes.
 pub struct ChannelStream {
     pub reader: mpsc::Receiver<Result<Bytes, std::io::Error>>,
     pub writer: mpsc::Sender<Bytes>,
     pub read_buf: BytesMut,
+    /// A pending reservation on the bounded channel, kept across `poll_write`
+    /// calls while we wait for capacity. Replaces the old `wake_by_ref()`
+    /// busy-loop that burned CPU when the channel was full.
+    reserve: Option<
+        futures_util::future::BoxFuture<
+            'static,
+            Result<mpsc::OwnedPermit<Bytes>, mpsc::error::SendError<()>>,
+        >,
+    >,
+}
+
+impl ChannelStream {
+    pub fn new(
+        reader: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+        writer: mpsc::Sender<Bytes>,
+    ) -> Self {
+        Self {
+            reader,
+            writer,
+            read_buf: BytesMut::new(),
+            reserve: None,
+        }
+    }
 }
 
 impl AsyncRead for ChannelStream {
@@ -47,12 +75,45 @@ impl AsyncWrite for ChannelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        // B17: Previously this used `try_send` + `wake_by_ref()` on Full, which
+        // busy-looped (the waker fired immediately, re-polling with no
+        // progress notification when capacity became available). Now we poll
+        // `reserve_owned` to asynchronously await capacity, storing the
+        // future in `self.reserve` across polls, then send through the
+        // `OwnedPermit` (which guarantees capacity and never blocks).
+        let this = unsafe { self.get_unchecked_mut() };
+
+        // If we have a pending reservation, poll it to completion.
+        if let Some(fut) = this.reserve.as_mut() {
+            match std::pin::Pin::new(fut).poll(cx) {
+                Poll::Ready(Ok(permit)) => {
+                    this.reserve = None;
+                    let data = Bytes::copy_from_slice(buf);
+                    let _ = permit.send(data);
+                    return Poll::Ready(Ok(buf.len()));
+                }
+                Poll::Ready(Err(_)) => {
+                    this.reserve = None;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "Channel closed",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Fast path: try to send immediately without reserving.
         let data = Bytes::copy_from_slice(buf);
-        match self.writer.try_send(data) {
+        match this.writer.try_send(data) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                // Channel full: start an async reservation to await capacity.
+                let writer = this.writer.clone();
+                this.reserve = Some(Box::pin(async move { writer.reserve_owned().await }));
+                // Recurse one step to poll the freshly-created future.
+                // Safety: we hold the pinned borrow for one extra poll.
+                std::pin::Pin::new(&mut *this).poll_write(cx, buf)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,

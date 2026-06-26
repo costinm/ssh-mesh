@@ -4,14 +4,14 @@
 //! and serves a rich trace viewer UI.
 
 use axum::{
+    Router,
     extract::{Query, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Json,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Router,
 };
 use futures_util::stream::{self, Stream};
 use mesh::local_trace::{LogEntry, TraceConfig};
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 /// Embedded web assets for the otel trace viewer
 #[derive(RustEmbed)]

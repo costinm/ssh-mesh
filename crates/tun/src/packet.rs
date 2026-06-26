@@ -630,14 +630,16 @@ mod tests {
             b"udp data",
         )
         .unwrap();
-        assert!(rewrite_ipv4_tcp(
-            &pkt,
-            Ipv4Addr::new(3, 3, 3, 3),
-            777,
-            Ipv4Addr::new(4, 4, 4, 4),
-            888,
-        )
-        .is_err());
+        assert!(
+            rewrite_ipv4_tcp(
+                &pkt,
+                Ipv4Addr::new(3, 3, 3, 3),
+                777,
+                Ipv4Addr::new(4, 4, 4, 4),
+                888,
+            )
+            .is_err()
+        );
     }
 
     #[test]

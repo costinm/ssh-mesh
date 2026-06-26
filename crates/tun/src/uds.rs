@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -40,8 +41,8 @@ impl UdsServerConfig {
 pub async fn run_uds_server(
     listener: UnixListener,
     config: UdsServerConfig,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
-    stack_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    mut stack_rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     if config.style == UdsStyle::VirtioUser {
         anyhow::bail!(
@@ -55,14 +56,48 @@ pub async fn run_uds_server(
         "mesh-tun UDS listener started"
     );
 
-    let stack_rx = Arc::new(tokio::sync::Mutex::new(stack_rx));
+    // B14: Previously `stack_rx` was wrapped in a `tokio::sync::Mutex` shared
+    // across all connected UDS clients, with each per-client writer holding the
+    // lock across `recv().await`. This serialized every client on one mutex:
+    // if client A's write stalled (slow socket, half-dead peer), client B's
+    // writer could not call `recv()` and was fully blocked — head-of-line
+    // blocking across guests, no eviction of stuck clients.
+    //
+    // Now we drain `stack_rx` in a single dedicated reader task and `broadcast`
+    // each packet to all subscribers. Each per-client writer holds its own
+    // `broadcast::Receiver` and so never contends with other clients. A stuck
+    // client falls behind and gets a `Lagged` error (frames dropped for it),
+    // leaving other clients unaffected.
+    let (tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+    let tx = Arc::new(tx);
+
+    let tx_clone = tx.clone();
+    let _drain = tokio::spawn(async move {
+        while let Some(packet) = stack_rx.recv().await {
+            match tx_clone.send(packet) {
+                Ok(_) => {
+                    crate::stats::stats()
+                        .uds_broadcast_sent
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    crate::stats::stats()
+                        .uds_broadcast_no_subscribers
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // When stack_rx ends, `tx` is dropped via `tx_clone`, closing the
+        // broadcast and propagating EOF to all subscribers.
+    });
+
     loop {
         let (stream, _) = listener.accept().await?;
         let tun_tx = tun_tx.clone();
-        let stack_rx = stack_rx.clone();
+        let rx = tx.subscribe();
         let host_mac = config.host_mac;
         tokio::spawn(async move {
-            if let Err(error) = serve_qemu_stream(stream, host_mac, tun_tx, stack_rx).await {
+            if let Err(error) = serve_qemu_stream(stream, host_mac, tun_tx, rx).await {
                 tracing::warn!(%error, "mesh-tun UDS client disconnected");
             }
         });
@@ -72,8 +107,8 @@ pub async fn run_uds_server(
 async fn serve_qemu_stream(
     stream: UnixStream,
     host_mac: [u8; 6],
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
-    stack_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    stack_rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let (mut reader, mut writer) = stream.into_split();
     let guest_mac = Arc::new(Mutex::new(None::<[u8; 6]>));
@@ -86,6 +121,7 @@ async fn serve_qemu_stream(
                 *read_guest_mac.lock().unwrap() = Some(src_mac);
                 tun_tx
                     .send(packet)
+                    .await
                     .map_err(|_| anyhow::anyhow!("TUN input queue closed"))?;
             }
         }
@@ -94,20 +130,33 @@ async fn serve_qemu_stream(
     });
 
     let write_guest_mac = guest_mac;
+    let mut stack_rx = stack_rx;
     let write_task = tokio::spawn(async move {
         loop {
-            let packet = {
-                let mut rx = stack_rx.lock().await;
-                rx.recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("TUN output queue closed"))?
+            let packet = match stack_rx.recv().await {
+                Ok(pkt) => pkt,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(anyhow::anyhow!("TUN output queue closed"));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    crate::stats::stats()
+                        .uds_client_lagged_frames
+                        .fetch_add(n, Ordering::Relaxed);
+                    tracing::warn!(n, "mesh-tun UDS client lagged behind; dropped frames");
+                    continue;
+                }
             };
             let dst_mac = write_guest_mac
                 .lock()
                 .unwrap()
                 .unwrap_or([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
             let frame = ip_to_ethernet(&packet, host_mac, dst_mac)?;
-            write_qemu_frame(&mut writer, &frame).await?;
+            if let Err(error) = write_qemu_frame(&mut writer, &frame).await {
+                crate::stats::stats()
+                    .uds_client_write_error
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())

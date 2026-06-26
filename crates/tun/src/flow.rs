@@ -1,13 +1,10 @@
 use crate::policy::{AllowAllPolicy, FlowContext, FlowProtocol, MeshTunPolicy, PolicyDecision};
 use crate::telemetry::{MeshTunEvent, MeshTunTelemetry, NoopTelemetry};
-use mesh::tun::{
-    TunDnsHandler, TunInjector, TunTcpHandler, TunTcpMeta, TunUdpHandler, TunUdpPacket,
-};
+use mesh::tun::{TunDnsHandler, TunInjector, TunUdpHandler, TunUdpPacket};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::DuplexStream;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 #[derive(Clone)]
 pub struct MeshPassthrough {
@@ -55,15 +52,6 @@ impl MeshPassthrough {
     pub fn with_udp_response_timeout(mut self, timeout: Duration) -> Self {
         self.udp_response_timeout = timeout;
         self
-    }
-
-    fn tcp_context(&self, meta: &TunTcpMeta) -> FlowContext {
-        FlowContext {
-            vm_id: self.vm_id.clone(),
-            protocol: FlowProtocol::Tcp,
-            src: SocketAddr::new(meta.src_addr, meta.src_port),
-            dst: SocketAddr::new(meta.dst_addr, meta.dst_port),
-        }
     }
 
     fn udp_context(&self, packet: &TunUdpPacket, protocol: FlowProtocol) -> FlowContext {
@@ -156,51 +144,6 @@ impl MeshPassthrough {
         }
 
         Ok(n as u64)
-    }
-}
-
-#[async_trait::async_trait]
-impl TunTcpHandler for MeshPassthrough {
-    async fn handle_tcp(&self, meta: TunTcpMeta, mut stream: DuplexStream) {
-        let context = self.tcp_context(&meta);
-        if !self.check_policy(&context).await {
-            return;
-        }
-
-        self.telemetry
-            .record(MeshTunEvent::FlowOpen(context.clone()))
-            .await;
-
-        let result = async {
-            let mut upstream = TcpStream::connect(context.dst).await?;
-            let (guest_to_remote, remote_to_guest) =
-                tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
-            Ok::<_, anyhow::Error>((guest_to_remote, remote_to_guest))
-        }
-        .await;
-
-        match result {
-            Ok((guest_to_remote, remote_to_guest)) => {
-                self.telemetry
-                    .record(MeshTunEvent::FlowBytes {
-                        context: context.clone(),
-                        guest_to_remote,
-                        remote_to_guest,
-                    })
-                    .await;
-                self.telemetry
-                    .record(MeshTunEvent::FlowClose(context))
-                    .await;
-            }
-            Err(error) => {
-                self.telemetry
-                    .record(MeshTunEvent::FlowError {
-                        context,
-                        error: error.to_string(),
-                    })
-                    .await;
-            }
-        }
     }
 }
 

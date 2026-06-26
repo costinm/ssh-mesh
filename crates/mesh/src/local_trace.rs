@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 use tracing_subscriber::layer::{Context, Layer};
-use tracing_subscriber::{reload, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
 /// Global handle for dynamically reloading the tracing filter, required to integrate.
 ///

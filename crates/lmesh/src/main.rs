@@ -1,5 +1,5 @@
 use anyhow::Result;
-use axum::{routing::post, Extension, Json, Router};
+use axum::{Extension, Json, Router, routing::post};
 use clap::Parser;
 use lmesh::LocalDiscovery;
 use mesh::server::run_axum_server;
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{error, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

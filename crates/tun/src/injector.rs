@@ -1,14 +1,15 @@
 use crate::packet::build_ipv4_udp_packet;
 use mesh::tun::TunInjector;
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 pub struct MeshTunInjector {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl MeshTunInjector {
-    pub fn new(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self { tx }
     }
 }
@@ -43,9 +44,12 @@ impl TunInjector for MeshTunInjector {
             _ => anyhow::bail!("source and destination IP versions differ"),
         };
 
-        self.tx
-            .send(packet)
-            .map_err(|_| anyhow::anyhow!("TUN output queue closed"))?;
+        self.tx.send(packet).await.map_err(|_| {
+            crate::stats::stats()
+                .tun_output_queue_full
+                .fetch_add(1, Ordering::Relaxed);
+            anyhow::anyhow!("TUN output queue closed")
+        })?;
         Ok(())
     }
 }

@@ -1,18 +1,18 @@
 use axum::{
+    Json,
     body::Body,
     extract::{Path, Request, State},
     response::Response,
-    Json,
 };
 use bytes::Bytes;
-use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket};
+use fastwebsockets::{Frame, OpCode, Payload, WebSocket, upgrade};
 use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use utoipa::ToSchema;
 
 /// WSServer holds the state of the WebSocket server.

@@ -1,4 +1,4 @@
-use crate::packet::{parse_ip_packet, rewrite_ipv4_tcp, TunPacket};
+use crate::packet::{TunPacket, parse_ip_packet, rewrite_ipv4_tcp};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;

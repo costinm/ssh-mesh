@@ -15,7 +15,6 @@ use russh::server::Server;
 use rust_embed::RustEmbed;
 use std::io::{IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::Path;
 use std::sync::Arc;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
@@ -51,8 +50,15 @@ use crate::AppState;
 pub struct ApiDoc;
 
 /// Serve a JSON file from the `web/` directory by path.
+///
+/// The path is confined to the `web/` directory: any `..` components or
+/// absolute paths are rejected to prevent traversal.
 async fn serve_json(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
-    let file_path = format!("web/{}", path);
+    let confined = confine_to_web_dir(&path);
+    let file_path = match confined {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, "invalid path").into_response(),
+    };
     match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => (
             StatusCode::OK,
@@ -61,6 +67,31 @@ async fn serve_json(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
         )
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, format!("{} not found", path)).into_response(),
+    }
+}
+
+/// Resolve a request path to a filesystem path confined within the `web/`
+/// directory. Returns `None` if the path escapes `web/` (via `..`, absolute
+/// paths, or symlink resolution outside the root).
+fn confine_to_web_dir(request_path: &str) -> Option<std::path::PathBuf> {
+    let web_root = std::path::Path::new("web");
+    let web_root_canonical = std::fs::canonicalize(web_root).ok()?;
+    let joined = web_root.join(request_path.trim_start_matches('/'));
+    // Canonicalize if the file exists; otherwise canonicalize the parent and
+    // re-append the leaf so not-yet-existing files are still checked.
+    let canonical = match std::fs::canonicalize(&joined) {
+        Ok(c) => c,
+        Err(_) => {
+            let parent = joined.parent()?;
+            let leaf = joined.file_name()?;
+            let parent_canonical = std::fs::canonicalize(parent).ok()?;
+            parent_canonical.join(leaf)
+        }
+    };
+    if canonical.starts_with(&web_root_canonical) {
+        Some(canonical)
+    } else {
+        None
     }
 }
 
@@ -135,10 +166,9 @@ pub async fn handle_web_request(
     AxumPath(path): AxumPath<String>,
 ) -> impl axum::response::IntoResponse {
     let path = path.trim_start_matches('/');
-    // Check local filesystem first (for dev)
-    let local_path = Path::new("web").join(path);
-
-    if local_path.is_file()
+    // Check local filesystem first (for dev), confined to web/.
+    if let Some(local_path) = confine_to_web_dir(path)
+        && local_path.is_file()
         && let Ok(content) = std::fs::read(&local_path)
     {
         let mime = mime_for_path(&local_path.to_string_lossy());
@@ -220,11 +250,7 @@ pub async fn handle_ssh_request(
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
     // Create the bidirectional stream adapter
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     let handler_id = handler.id;
     let connected_clients = ssh_server.connected_clients.clone();
@@ -346,11 +372,7 @@ pub async fn handle_tcp_proxy(
     // Spawn task to read from HTTP request body and feed to adapter
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     // Forward data between the HTTP/2 stream and the TCP connection
     tokio::spawn(async move {
@@ -426,11 +448,7 @@ pub async fn handle_uds_proxy(
     // Spawn task to read from HTTP request body and feed to adapter
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     // Forward data between the HTTP/2 stream and the UDS connection
     tokio::spawn(async move {
@@ -600,11 +618,7 @@ pub async fn handle_exec(
     // Spawn task to read from HTTP request body and feed to adapter
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     // Forward data between the HTTP/2 stream and the child process
     tokio::spawn(async move {

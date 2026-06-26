@@ -9,7 +9,7 @@
 //! feature set. Keep them in sync when adding new capabilities.
 
 use ssh_mesh::sshc::SshClientManager;
-use ssh_mesh::{run_ssh_server, MeshNode, MeshNodeConfig};
+use ssh_mesh::{MeshNode, MeshNodeConfig, run_ssh_server};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};

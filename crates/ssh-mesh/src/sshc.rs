@@ -141,10 +141,24 @@ impl client::Handler for ClientHandler {
             Ok(false)
         } else {
             // TOFU: save the key for future connections
-            info!(
-                "TOFU: Trusting server key on first use, saving to {:?}",
-                self.key_file
-            );
+            let actual_str = server_public_key
+                .to_openssh()
+                .context("Failed to serialize server key for TOFU persistence")?;
+            match std::fs::write(&self.key_file, actual_str) {
+                Ok(()) => {
+                    info!(
+                        "TOFU: Trusting server key on first use, saved to {:?}",
+                        self.key_file
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "TOFU: failed to persist server key to {:?}: {}. Rejecting connection to avoid silent trust-on-every-use.",
+                        self.key_file, e
+                    );
+                    return Ok(false);
+                }
+            }
             Ok(true)
         }
     }

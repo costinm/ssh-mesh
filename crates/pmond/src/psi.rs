@@ -9,8 +9,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};

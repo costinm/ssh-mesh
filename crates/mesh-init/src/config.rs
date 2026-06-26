@@ -12,6 +12,34 @@ use tracing::{debug, info, warn};
 
 pub use mesh::config::*;
 
+/// Validate a cgroup scope name.
+///
+/// Cgroup scope names are used directly in filesystem paths under
+/// `/sys/fs/cgroup/mesh.slice/`, so they must not contain path separators or
+/// `..` components. This is a stricter check than the general service-name
+/// check because cgroup names are also used in kernel paths.
+pub fn validate_cgroup_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("cgroup name must not be empty".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("cgroup name must not contain path separators".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("cgroup name must not be '.' or '..'".to_string());
+    }
+    if std::path::Path::new(name)
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err("cgroup name must not contain '..' components".to_string());
+    }
+    if name.contains('\0') {
+        return Err("cgroup name must not contain NUL bytes".to_string());
+    }
+    Ok(())
+}
+
 /// Load a single config file from disk.
 pub fn load_app_config(path: &Path) -> Result<AppConfig, ConfigError> {
     info!("Loading config from {}", path.display());

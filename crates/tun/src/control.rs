@@ -2,8 +2,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
@@ -44,7 +44,7 @@ pub struct NetnsSetup {
 
 pub async fn run_control_server(
     listener: UnixListener,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     tracing::info!(addr = ?listener.local_addr(), "mesh-tun control socket started");
 
@@ -62,7 +62,7 @@ pub async fn run_control_server(
 pub async fn run_bwrap_info_server(
     listener: UnixListener,
     config: BwrapInfoServerConfig,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     tracing::info!(addr = ?listener.local_addr(), "mesh-tun bwrap info socket started");
     let state = Arc::new(BwrapInfoServerState {
@@ -84,7 +84,7 @@ pub async fn run_bwrap_info_server(
 
 async fn handle_control_client(
     stream: tokio::net::UnixStream,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let std_stream = stream.into_std()?;
     std_stream.set_nonblocking(false)?;
@@ -147,7 +147,7 @@ async fn handle_control_client(
 async fn handle_bwrap_info_client(
     stream: tokio::net::UnixStream,
     state: Arc<BwrapInfoServerState>,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let mut stream = stream.into_std()?;
     stream.set_nonblocking(false)?;
@@ -291,10 +291,10 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
 }
 
 static GUEST_ROUTER: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, mpsc::UnboundedSender<Vec<u8>>>>,
+    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, mpsc::Sender<Vec<u8>>>>,
 > = std::sync::OnceLock::new();
 
-pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::UnboundedSender<Vec<u8>>) {
+pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::Sender<Vec<u8>>) {
     GUEST_ROUTER
         .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
         .write()
@@ -315,11 +315,21 @@ pub fn route_outgoing_packet(packet: &[u8]) -> bool {
     };
     if let Some(registry) = GUEST_ROUTER.get() {
         if let Some(sender) = registry.read().unwrap().get(&dst_ip) {
-            let _ = sender.send(packet.to_vec());
-            crate::stats::stats()
-                .route_hit
-                .fetch_add(1, Ordering::Relaxed);
-            return true;
+            match sender.try_send(packet.to_vec()) {
+                Ok(()) => {
+                    crate::stats::stats()
+                        .route_hit
+                        .fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    crate::stats::stats()
+                        .route_send_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
     }
     crate::stats::stats()
@@ -380,10 +390,10 @@ fn get_destination_ip(packet: &[u8]) -> Option<std::net::IpAddr> {
 
 fn start_tap_capture(
     spec: TapCaptureSpec,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let spec = Arc::new(spec);
-    let (inject_tx, inject_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (inject_tx, inject_rx) = mpsc::channel::<Vec<u8>>(1024);
     let guest_mac = Arc::new(std::sync::Mutex::new(None));
 
     let socket = fork_and_create_tap(&spec)?;
@@ -565,10 +575,10 @@ fn checksum_finish(mut sum: u32) -> u16 {
 fn packet_capture_thread_loop(
     _spec: &TapCaptureSpec,
     socket_arc: Arc<OwnedFd>,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
     guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
-    inject_tx: mpsc::UnboundedSender<Vec<u8>>,
-    mut inject_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    inject_tx: mpsc::Sender<Vec<u8>>,
+    mut inject_rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let mut buf = vec![0u8; 65535];
     let mut registered_ips = std::collections::HashSet::new();
@@ -636,9 +646,17 @@ fn packet_capture_thread_loop(
                 }
             }
 
-            tun_tx
-                .send(ip_packet)
-                .map_err(|_| anyhow::anyhow!("TUN input queue closed"))?;
+            match tun_tx.try_send(ip_packet) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    crate::stats::stats()
+                        .tun_input_queue_full
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(anyhow::anyhow!("TUN input queue closed"));
+                }
+            }
         }
     }
 
@@ -652,7 +670,7 @@ fn packet_capture_thread_loop(
 fn drain_inject_queue(
     socket: &OwnedFd,
     guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
-    inject_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    inject_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     loop {
         match inject_rx.try_recv() {
@@ -1041,5 +1059,42 @@ mod tests {
                 default_route: true,
             })
         );
+    }
+
+    #[test]
+    fn route_outgoing_packet_counts_full_destination_queue() {
+        crate::stats::stats().reset();
+        let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 250, 0, 2));
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        register_destination(dst, tx);
+
+        let first = crate::packet::build_ipv4_udp_packet(
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+            1234,
+            std::net::Ipv4Addr::new(10, 250, 0, 2),
+            5678,
+            b"first",
+        )
+        .unwrap();
+        let second = crate::packet::build_ipv4_udp_packet(
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+            1234,
+            std::net::Ipv4Addr::new(10, 250, 0, 2),
+            5678,
+            b"second",
+        )
+        .unwrap();
+
+        assert!(route_outgoing_packet(&first));
+        assert!(route_outgoing_packet(&second));
+        assert_eq!(
+            crate::stats::stats()
+                .route_send_full
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        unregister_destination(&dst);
+        let _ = rx.try_recv();
     }
 }

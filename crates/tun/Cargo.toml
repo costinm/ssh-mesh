@@ -1,10 +1,10 @@
 [package]
 name = "mesh-tun"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [features]
-default = []
+default = ["bin-full"]
 bin-full = ["vhost-user-net"]
 vhost-user-net = [
     "dep:vhost",
@@ -36,4 +36,3 @@ tempfile = "3"
 [[bin]]
 name = "mesh-tun"
 path = "src/main.rs"
-required-features = ["bin-full"]
