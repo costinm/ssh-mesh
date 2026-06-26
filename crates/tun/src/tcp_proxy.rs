@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 
+const TCP_REORDER_BUFFER_MAX_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TcpProxyConfig {
     pub max_flows: usize,
@@ -39,6 +41,14 @@ pub struct TcpProxyManager {
 pub struct TcpFlowKey {
     pub src: SocketAddr,
     pub dst: SocketAddr,
+}
+
+fn tcp_seq_after(seq: u32, other: u32) -> bool {
+    (seq.wrapping_sub(other) as i32) > 0
+}
+
+fn tcp_seq_before_or_equal(seq: u32, other: u32) -> bool {
+    (seq.wrapping_sub(other) as i32) <= 0
 }
 
 impl TcpProxyManager {
@@ -336,6 +346,7 @@ async fn handle_tcp_flow(
         // B3: Reorder buffer for out-of-order segments, keyed by seq.
         let mut ooo_buf: std::collections::BTreeMap<u32, Vec<u8>> =
             std::collections::BTreeMap::new();
+        let mut ooo_bytes = 0usize;
 
         while let Some(pkt) = rx.recv().await {
             if pkt.rst {
@@ -350,8 +361,9 @@ async fn handle_tcp_flow(
 
             if !pkt.payload.is_empty() {
                 // B3: Handle in-order, out-of-order, and retransmitted data.
-                if pkt.seq.wrapping_add(pkt.payload.len() as u32) > client_seq
-                    && pkt.seq <= client_seq
+                let segment_end = pkt.seq.wrapping_add(pkt.payload.len() as u32);
+                if tcp_seq_after(segment_end, client_seq)
+                    && tcp_seq_before_or_equal(pkt.seq, client_seq)
                 {
                     // In-order or overlapping: extract the new portion.
                     let offset = client_seq.wrapping_sub(pkt.seq) as usize;
@@ -371,6 +383,7 @@ async fn handle_tcp_flow(
 
                         // Drain the reorder buffer for any now-in-order segments.
                         while let Some(seg) = ooo_buf.remove(&client_seq) {
+                            ooo_bytes = ooo_bytes.saturating_sub(seg.len());
                             if writer.write_all(&seg).await.is_err() {
                                 crate::stats::stats()
                                     .tcp_flow_error
@@ -384,13 +397,32 @@ async fn handle_tcp_flow(
                             client_seq_a.store(client_seq, Ordering::Release);
                         }
                     }
-                } else if pkt.seq > client_seq {
+                } else if tcp_seq_after(pkt.seq, client_seq) {
                     // B3: Out-of-order — buffer for later delivery.
-                    ooo_buf.insert(pkt.seq, pkt.payload.clone());
-                    // Cap the reorder buffer to 256 KiB to avoid unbounded memory.
-                    let total: usize = ooo_buf.values().map(|v| v.len()).sum();
-                    if total > 256 * 1024 {
-                        ooo_buf.clear();
+                    if let Some(previous) = ooo_buf.insert(pkt.seq, pkt.payload.clone()) {
+                        ooo_bytes = ooo_bytes.saturating_sub(previous.len());
+                    }
+                    ooo_bytes = ooo_bytes.saturating_add(pkt.payload.len());
+                    // Avoid delivering gaps if the out-of-order queue grows beyond
+                    // its bounded budget. Close the flow and reset the guest side.
+                    if ooo_bytes > TCP_REORDER_BUFFER_MAX_BYTES {
+                        crate::stats::stats()
+                            .tcp_flow_error
+                            .fetch_add(1, Ordering::Relaxed);
+                        let s_seq = server_seq_a.load(Ordering::Relaxed);
+                        if let Ok(rst) = build_ipv4_tcp_packet(
+                            dst_ip_v4,
+                            dst.port(),
+                            src_ip_v4,
+                            src.port(),
+                            0x14, // RST | ACK
+                            s_seq,
+                            client_seq,
+                            &[],
+                        ) {
+                            let _ = outgoing_tx_a.send(rst).await;
+                        }
+                        break;
                     }
                 }
                 // If pkt.seq + len <= client_seq, it's a pure retransmit of
@@ -673,6 +705,16 @@ mod tests {
             panic!("expected TCP packet");
         };
         tcp
+    }
+
+    #[test]
+    fn tcp_sequence_order_handles_wraparound() {
+        assert!(tcp_seq_after(1, u32::MAX));
+        assert!(tcp_seq_after(0, u32::MAX - 1));
+        assert!(!tcp_seq_after(u32::MAX, 1));
+        assert!(tcp_seq_before_or_equal(u32::MAX, 1));
+        assert!(tcp_seq_before_or_equal(7, 7));
+        assert!(!tcp_seq_before_or_equal(9, 7));
     }
 
     #[tokio::test]

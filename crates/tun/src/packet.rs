@@ -125,7 +125,7 @@ pub fn rewrite_ipv4_tcp(
     if !is_ipv4_tcp(packet) {
         anyhow::bail!("packet is not IPv4 TCP");
     }
-    let ihl = ipv4_header_len(packet).unwrap();
+    let ihl = ipv4_header_len(packet).ok_or_else(|| anyhow::anyhow!("invalid IPv4 header"))?;
     let total_len = ipv4_total_len(packet).ok_or_else(|| anyhow::anyhow!("invalid IPv4 length"))?;
     if total_len < ihl + 20 {
         anyhow::bail!("TCP header is truncated");
@@ -169,6 +169,118 @@ pub fn ipv4_tcp_checksum_valid(packet: &[u8]) -> bool {
     let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
     let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
     matches!(ipv4_tcp_checksum(src, dst, &packet[ihl..total_len]), Ok(0))
+}
+
+pub fn ip_packet_source(packet: &[u8]) -> Option<IpAddr> {
+    if packet.is_empty() {
+        return None;
+    }
+    match packet[0] >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            Some(IpAddr::V4(Ipv4Addr::new(
+                packet[12], packet[13], packet[14], packet[15],
+            )))
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&packet[8..24]);
+            Some(IpAddr::V6(Ipv6Addr::from(addr)))
+        }
+        _ => None,
+    }
+}
+
+pub fn ip_packet_destination(packet: &[u8]) -> Option<IpAddr> {
+    if packet.is_empty() {
+        return None;
+    }
+    match packet[0] >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            Some(IpAddr::V4(Ipv4Addr::new(
+                packet[16], packet[17], packet[18], packet[19],
+            )))
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&packet[24..40]);
+            Some(IpAddr::V6(Ipv6Addr::from(addr)))
+        }
+        _ => None,
+    }
+}
+
+pub fn ethernet_payload_to_ip(frame: &[u8]) -> Option<(Vec<u8>, [u8; 6])> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let mut src_mac = [0u8; 6];
+    src_mac.copy_from_slice(&frame[6..12]);
+    match u16::from_be_bytes([frame[12], frame[13]]) {
+        0x0800 => {
+            let payload = &frame[14..];
+            let ihl = ipv4_header_len(payload)?;
+            let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+            let packet = if total_len >= ihl && payload.len() >= total_len {
+                payload[..total_len].to_vec()
+            } else {
+                payload.to_vec()
+            };
+            Some((packet, src_mac))
+        }
+        0x86dd => {
+            let payload = &frame[14..];
+            if payload.len() < 40 {
+                return None;
+            }
+            let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
+            let total_len = 40usize.saturating_add(payload_len);
+            let packet = if payload.len() >= total_len {
+                payload[..total_len].to_vec()
+            } else {
+                payload.to_vec()
+            };
+            Some((packet, src_mac))
+        }
+        _ => None,
+    }
+}
+
+pub fn ip_to_ethernet_frame(
+    packet: &[u8],
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    min_len: usize,
+) -> Result<Vec<u8>, anyhow::Error> {
+    if packet.is_empty() {
+        anyhow::bail!("empty IP packet");
+    }
+    let ethertype = match packet[0] >> 4 {
+        4 => 0x0800u16,
+        6 => 0x86ddu16,
+        version => anyhow::bail!("unsupported IP version in TUN packet: {version}"),
+    };
+
+    let mut frame = Vec::with_capacity(14 + packet.len());
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&ethertype.to_be_bytes());
+    frame.extend_from_slice(packet);
+    if frame.len() < min_len {
+        frame.resize(min_len, 0);
+    }
+    Ok(frame)
 }
 
 #[allow(clippy::too_many_arguments)]

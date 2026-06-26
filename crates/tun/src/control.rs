@@ -1,3 +1,8 @@
+use crate::packet::{
+    ethernet_payload_to_ip, ip_packet_destination, ip_packet_source, ip_to_ethernet_frame,
+    ipv4_checksum_valid, ipv4_tcp_checksum_valid,
+};
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -6,11 +11,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
-
-#[derive(Debug, Clone)]
-pub struct ControlServerConfig {
-    pub socket_path: PathBuf,
-}
 
 #[derive(Debug, Clone)]
 pub struct BwrapInfoServerConfig {
@@ -295,26 +295,31 @@ static GUEST_ROUTER: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::Sender<Vec<u8>>) {
-    GUEST_ROUTER
-        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+    let registry =
+        GUEST_ROUTER.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    let mut destinations = registry
         .write()
-        .unwrap()
-        .insert(ip, sender);
+        .unwrap_or_else(|poison| poison.into_inner());
+    destinations.insert(ip, sender);
 }
 
 pub fn unregister_destination(ip: &std::net::IpAddr) {
     if let Some(registry) = GUEST_ROUTER.get() {
-        registry.write().unwrap().remove(ip);
+        registry
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(ip);
     }
 }
 
 pub fn route_outgoing_packet(packet: &[u8]) -> bool {
-    let dst_ip = match get_destination_ip(packet) {
+    let dst_ip = match ip_packet_destination(packet) {
         Some(ip) => ip,
         None => return false,
     };
     if let Some(registry) = GUEST_ROUTER.get() {
-        if let Some(sender) = registry.read().unwrap().get(&dst_ip) {
+        let destinations = registry.read().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(sender) = destinations.get(&dst_ip) {
             match sender.try_send(packet.to_vec()) {
                 Ok(()) => {
                     crate::stats::stats()
@@ -336,56 +341,6 @@ pub fn route_outgoing_packet(packet: &[u8]) -> bool {
         .route_miss
         .fetch_add(1, Ordering::Relaxed);
     false
-}
-
-fn get_source_ip(packet: &[u8]) -> Option<std::net::IpAddr> {
-    if packet.is_empty() {
-        return None;
-    }
-    match packet[0] >> 4 {
-        4 => {
-            if packet.len() < 20 {
-                return None;
-            }
-            let mut addr = [0u8; 4];
-            addr.copy_from_slice(&packet[12..16]);
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(addr)))
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            let mut addr = [0u8; 16];
-            addr.copy_from_slice(&packet[8..24]);
-            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr)))
-        }
-        _ => None,
-    }
-}
-
-fn get_destination_ip(packet: &[u8]) -> Option<std::net::IpAddr> {
-    if packet.is_empty() {
-        return None;
-    }
-    match packet[0] >> 4 {
-        4 => {
-            if packet.len() < 20 {
-                return None;
-            }
-            let mut addr = [0u8; 4];
-            addr.copy_from_slice(&packet[16..20]);
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(addr)))
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            let mut addr = [0u8; 16];
-            addr.copy_from_slice(&packet[24..40]);
-            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr)))
-        }
-        _ => None,
-    }
 }
 
 fn start_tap_capture(
@@ -422,32 +377,22 @@ fn inject_ip_packet(
     crate::stats::stats()
         .tap_inject_packet
         .fetch_add(1, Ordering::Relaxed);
-    let dst_mac = {
-        let guard = guest_mac.lock().unwrap();
-        guard.unwrap_or([0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
-    };
+    let dst_mac = *guest_mac
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .unwrap_or(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     let src_mac = if dst_mac == [0, 0, 0, 0, 0, 0] {
         dst_mac
     } else {
         gateway_mac
     };
 
-    let ethertype = match ip_packet[0] >> 4 {
-        4 => 0x0800u16,
-        6 => 0x86ddu16,
-        _ => return Ok(()),
-    };
-
-    let mut frame = Vec::with_capacity(14 + ip_packet.len());
-    frame.extend_from_slice(&dst_mac);
-    frame.extend_from_slice(&src_mac);
-    frame.extend_from_slice(&ethertype.to_be_bytes());
-    frame.extend_from_slice(ip_packet);
-    if frame.len() < 60 {
-        frame.resize(60, 0);
-    }
+    let frame = ip_to_ethernet_frame(ip_packet, src_mac, dst_mac, 60)?;
 
     record_inject_frame(&frame);
+    // SAFETY: frame points to valid memory for frame.len() bytes and socket is
+    // an owned TAP file descriptor kept alive for the duration of this call.
     let rc = unsafe { libc::write(socket.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
     crate::stats::stats()
         .tap_last_inject_write_rc
@@ -495,7 +440,7 @@ fn record_inject_frame(frame: &[u8]) {
         let ihl = usize::from(ip[0] & 0x0f) * 4;
         stats
             .tap_last_inject_ip_checksum_ok
-            .store(u64::from(ipv4_header_checksum_valid(ip)), Ordering::Relaxed);
+            .store(u64::from(ipv4_checksum_valid(ip)), Ordering::Relaxed);
         if ihl >= 20 && ip.len() >= ihl + 20 && ip[9] == 6 {
             stats.tap_last_inject_ipv4_src.store(
                 u64::from(u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]])),
@@ -508,10 +453,9 @@ fn record_inject_frame(frame: &[u8]) {
             stats
                 .tap_last_inject_tcp_flags
                 .store(u64::from(ip[ihl + 13]), Ordering::Relaxed);
-            stats.tap_last_inject_tcp_checksum_ok.store(
-                u64::from(ipv4_tcp_checksum_valid(ip, ihl)),
-                Ordering::Relaxed,
-            );
+            stats
+                .tap_last_inject_tcp_checksum_ok
+                .store(u64::from(ipv4_tcp_checksum_valid(ip)), Ordering::Relaxed);
         }
     }
 }
@@ -522,54 +466,6 @@ fn mac_hi(mac: &[u8]) -> u64 {
 
 fn mac_lo(mac: &[u8]) -> u64 {
     (u64::from(mac[3]) << 16) | (u64::from(mac[4]) << 8) | u64::from(mac[5])
-}
-
-fn ipv4_header_checksum_valid(packet: &[u8]) -> bool {
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return false;
-    }
-    let ihl = usize::from(packet[0] & 0x0f) * 4;
-    ihl >= 20 && packet.len() >= ihl && internet_checksum(&packet[..ihl]) == 0
-}
-
-fn ipv4_tcp_checksum_valid(packet: &[u8], ihl: usize) -> bool {
-    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-    if packet.len() < total_len || total_len < ihl + 20 || packet[9] != 6 {
-        return false;
-    }
-
-    let tcp = &packet[ihl..total_len];
-    let tcp_len = tcp.len() as u32;
-    let mut sum = 0u32;
-    sum = checksum_add(sum, &packet[12..16]);
-    sum = checksum_add(sum, &packet[16..20]);
-    sum += 6;
-    sum += tcp_len;
-    sum = checksum_add(sum, tcp);
-    checksum_finish(sum) == 0
-}
-
-fn internet_checksum(buf: &[u8]) -> u16 {
-    checksum_finish(checksum_add(0, buf))
-}
-
-fn checksum_add(mut sum: u32, buf: &[u8]) -> u32 {
-    for chunk in buf.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-    }
-    sum
-}
-
-fn checksum_finish(mut sum: u32) -> u16 {
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
 }
 
 fn packet_capture_thread_loop(
@@ -591,6 +487,7 @@ fn packet_capture_thread_loop(
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: poll_fd points to one valid pollfd and the timeout is finite.
         let ready = unsafe { libc::poll(&mut poll_fd, 1, 10) };
         if ready < 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -602,6 +499,8 @@ fn packet_capture_thread_loop(
             continue;
         }
 
+        // SAFETY: buf is writable for buf.len() bytes and socket_arc is a live
+        // TAP fd owned by this capture thread.
         let n = unsafe { libc::read(socket_arc.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -620,12 +519,16 @@ fn packet_capture_thread_loop(
 
         let mut src_mac = [0u8; 6];
         src_mac.copy_from_slice(&buf[6..12]);
-        *guest_mac.lock().unwrap() = Some(src_mac);
+        *guest_mac
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(src_mac);
 
         if let Some(reply) = arp_reply(&buf[..n]) {
             crate::stats::stats()
                 .arp_request_rx
                 .fetch_add(1, Ordering::Relaxed);
+            // SAFETY: reply points to valid memory for reply.len() bytes and
+            // socket_arc is the live TAP fd for this capture thread.
             let rc =
                 unsafe { libc::write(socket_arc.as_raw_fd(), reply.as_ptr().cast(), reply.len()) };
             if rc >= 0 {
@@ -636,11 +539,11 @@ fn packet_capture_thread_loop(
             continue;
         }
 
-        if let Some(ip_packet) = ethernet_payload_to_ip(&buf[..n]) {
+        if let Some((ip_packet, _src_mac)) = ethernet_payload_to_ip(&buf[..n]) {
             crate::stats::stats()
                 .tap_ip_rx
                 .fetch_add(1, Ordering::Relaxed);
-            if let Some(src_ip) = get_source_ip(&ip_packet) {
+            if let Some(src_ip) = ip_packet_source(&ip_packet) {
                 if registered_ips.insert(src_ip) {
                     register_destination(src_ip, inject_tx.clone());
                 }
@@ -686,6 +589,7 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
     // Create a socketpair for passing the file descriptor
     let mut fds = [0i32; 2];
+    // SAFETY: fds points to two writable i32 slots for socketpair to fill.
     let rc = unsafe {
         libc::socketpair(
             libc::AF_UNIX,
@@ -697,7 +601,10 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
     if rc != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    // SAFETY: socketpair succeeded and initialized both fds. Each fd is moved
+    // into exactly one OwnedFd here.
     let parent_sock = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: see parent_sock above.
     let child_sock = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
     // Find the user namespace path by looking up the sibling user namespace
@@ -718,6 +625,9 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
         _ => false,
     };
 
+    // SAFETY: fork is called to enter the target namespaces and create a TAP fd
+    // in the child, then the child exits via _exit. The child avoids returning
+    // into Rust async runtime state.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -730,6 +640,8 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
         let run_child = || -> Result<(), std::io::Error> {
             // Unshare filesystem state to avoid sharing context with parent threads
+            // SAFETY: unshare is called in the forked child before starting any
+            // child threads; CLONE_FS has no Rust aliasing implications.
             let rc = unsafe { libc::unshare(libc::CLONE_FS) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -739,6 +651,8 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
             // This is crucial because it gives us capabilities (like CAP_NET_ADMIN/CAP_SYS_ADMIN) inside that namespace
             if should_enter_userns && userns_path.exists() {
                 let userns_file = std::fs::File::open(&userns_path)?;
+                // SAFETY: userns_file is an open namespace fd and setns only
+                // mutates the child process namespace membership.
                 let rc = unsafe { libc::setns(userns_file.as_raw_fd(), libc::CLONE_NEWUSER) };
                 if rc != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -747,6 +661,8 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
             // Enter the network namespace
             let netns_file = std::fs::File::open(&spec.netns_path)?;
+            // SAFETY: netns_file is an open namespace fd and setns only mutates
+            // the child process namespace membership.
             let rc = unsafe { libc::setns(netns_file.as_raw_fd(), libc::CLONE_NEWNET) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -772,9 +688,12 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
         };
 
         match run_child() {
+            // SAFETY: this is the forked child; _exit terminates without running
+            // parent-runtime destructors.
             Ok(()) => unsafe { libc::_exit(0) },
             Err(e) => {
                 let code = e.raw_os_error().unwrap_or(255);
+                // SAFETY: see successful _exit path above.
                 unsafe { libc::_exit(code) }
             }
         }
@@ -785,6 +704,8 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
     // Wait for the child to exit
     let mut status = 0i32;
+    // SAFETY: pid is the child returned by fork and status points to writable
+    // storage for waitpid to fill.
     let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -839,13 +760,19 @@ fn open_tap_device(if_name: &str) -> Result<OwnedFd, std::io::Error> {
         ));
     }
 
+    // SAFETY: the path is a static NUL-terminated C string and flags/mode are valid.
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: open succeeded and returned an owned fd, moved into OwnedFd once.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
+    // SAFETY: ifreq is a plain C struct that is fully initialized below before
+    // it is passed to ioctl.
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    // SAFETY: ifr_name has at least IFNAMSIZ bytes, checked above, and ifru_flags
+    // is the active union field expected by TUNSETIFF.
     unsafe {
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -855,6 +782,7 @@ fn open_tap_device(if_name: &str) -> Result<OwnedFd, std::io::Error> {
         req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
     }
 
+    // SAFETY: fd is a live /dev/net/tun fd and req points to an initialized ifreq.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut req) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
@@ -884,6 +812,8 @@ fn run_ip(args: &[&str], allow_existing: bool) -> Result<(), std::io::Error> {
 }
 
 fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
+    // SAFETY: msghdr is a plain C struct; all relevant fields are initialized
+    // before sendmsg is called.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
 
     // We must send at least one dummy byte of data for sendmsg to succeed on many platforms
@@ -896,15 +826,19 @@ fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
     msg.msg_iovlen = 1;
 
     // Allocate control message buffer for the file descriptor
+    // SAFETY: CMSG_SPACE only computes the buffer size for one RawFd.
     let mut control_buf =
         [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize }];
     msg.msg_control = control_buf.as_mut_ptr().cast();
     msg.msg_controllen = control_buf.len() as _;
 
+    // SAFETY: msg points to an initialized msghdr with a control buffer.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
         return Err(std::io::Error::other("CMSG_FIRSTHDR failed"));
     }
+    // SAFETY: cmsg points into control_buf and has enough space for one RawFd
+    // because control_buf was sized with CMSG_SPACE.
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -913,6 +847,8 @@ fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
         std::ptr::write(data_ptr.cast::<RawFd>(), fd);
     }
 
+    // SAFETY: msg references stack buffers that remain alive for the duration
+    // of sendmsg; sock is expected to be a connected Unix socket fd.
     let rc = unsafe { libc::sendmsg(sock, &msg, 0) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
@@ -921,6 +857,8 @@ fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
 }
 
 fn recv_fd(sock: RawFd) -> Result<OwnedFd, std::io::Error> {
+    // SAFETY: msghdr is a plain C struct; all relevant fields are initialized
+    // before recvmsg is called.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
 
     let mut dummy: u8 = 0;
@@ -931,34 +869,43 @@ fn recv_fd(sock: RawFd) -> Result<OwnedFd, std::io::Error> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
 
+    // SAFETY: CMSG_SPACE only computes the buffer size for one RawFd.
     let mut control_buf =
         [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize }];
     msg.msg_control = control_buf.as_mut_ptr().cast();
     msg.msg_controllen = control_buf.len() as _;
 
+    // SAFETY: msg references stack buffers that remain alive for the duration
+    // of recvmsg; sock is expected to be a connected Unix socket fd.
     let rc = unsafe { libc::recvmsg(sock, &mut msg, 0) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
+    // SAFETY: msg was filled by recvmsg and still owns the control buffer.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
         return Err(std::io::Error::other("no control message received"));
     }
 
+    // SAFETY: cmsg was checked non-null and points into the received control
+    // buffer. read_unaligned avoids layout-alignment assumptions.
     let cmsg_level = unsafe { std::ptr::addr_of!((*cmsg).cmsg_level).read_unaligned() };
+    // SAFETY: see cmsg_level above.
     let cmsg_type = unsafe { std::ptr::addr_of!((*cmsg).cmsg_type).read_unaligned() };
     let is_scm_rights = cmsg_level == libc::SOL_SOCKET && cmsg_type == libc::SCM_RIGHTS;
     if !is_scm_rights {
         return Err(std::io::Error::other("expected SCM_RIGHTS"));
     }
 
+    // SAFETY: the SCM_RIGHTS control message contains at least one RawFd.
     let fd = unsafe { libc::CMSG_DATA(cmsg).cast::<RawFd>().read_unaligned() };
     if fd < 0 {
         return Err(std::io::Error::other("invalid file descriptor received"));
     }
 
     use std::os::fd::FromRawFd;
+    // SAFETY: fd was received via SCM_RIGHTS and is now owned by this process.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -995,44 +942,6 @@ fn arp_reply(frame: &[u8]) -> Option<Vec<u8>> {
     reply[32..38].copy_from_slice(sender_mac);
     reply[38..42].copy_from_slice(sender_ip);
     Some(reply)
-}
-
-fn ethernet_payload_to_ip(frame: &[u8]) -> Option<Vec<u8>> {
-    if frame.len() < 14 {
-        return None;
-    }
-    match u16::from_be_bytes([frame[12], frame[13]]) {
-        0x0800 => {
-            let payload = &frame[14..];
-            if payload.len() < 20 {
-                return None;
-            }
-            let ihl = usize::from(payload[0] & 0x0f) * 4;
-            if ihl < 20 || payload.len() < ihl {
-                return None;
-            }
-            let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
-            if total_len >= ihl && payload.len() >= total_len {
-                Some(payload[..total_len].to_vec())
-            } else {
-                Some(payload.to_vec())
-            }
-        }
-        0x86dd => {
-            let payload = &frame[14..];
-            if payload.len() < 40 {
-                return None;
-            }
-            let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-            let total_len = 40usize.saturating_add(payload_len);
-            if payload.len() >= total_len {
-                Some(payload[..total_len].to_vec())
-            } else {
-                Some(payload.to_vec())
-            }
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

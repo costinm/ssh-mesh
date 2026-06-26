@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll},
     time::SystemTime,
 };
@@ -467,13 +467,16 @@ impl MeshNode {
             None
         };
 
-        let route_client_manager = Arc::new(sshc::SshClientManager::new_with_certificate(
-            keys.clone(),
-            ca_keys_vec.clone(),
-            None,
-            None,
-            user_certificate.clone(),
-        ));
+        let route_client_manager = Arc::new(
+            sshc::SshClientManager::new_with_certificate(
+                keys.clone(),
+                ca_keys_vec.clone(),
+                None,
+                None,
+                user_certificate.clone(),
+            )
+            .with_discovery_dir(Some(base_dir.clone())),
+        );
 
         MeshNode {
             cfg,
@@ -583,14 +586,14 @@ impl server::Server for MeshNode {
 
 impl MeshNode {
     fn new_client_for_transport(&mut self, trusted_transport: bool) -> SshHandler {
-        let mut id = self.id_counter.lock().unwrap();
+        let mut id = lock_or_recover(&self.id_counter);
         *id += 1;
         let mut handler = SshHandler::new(*id, self.clone());
         handler.set_trusted_transport(trusted_transport);
 
         // Store the handler in active_handlers
         let handler_arc = Arc::new(tokio::sync::Mutex::new(handler.clone()));
-        let mut active_handlers = self.active_handlers.lock().unwrap();
+        let mut active_handlers = lock_or_recover(&self.active_handlers);
         active_handlers.insert(*id, handler_arc);
 
         // Notify listeners about the new connection
@@ -650,7 +653,7 @@ where
     }
 
     {
-        let mut active_handlers = server.active_handlers.lock().unwrap();
+        let mut active_handlers = lock_or_recover(&server.active_handlers);
         active_handlers.remove(&handler_id);
     }
 
@@ -660,6 +663,10 @@ where
     }
 
     Ok(())
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 // Function to start the SSH server

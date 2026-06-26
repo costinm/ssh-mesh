@@ -6,8 +6,10 @@ pub mod protocol;
 pub mod server;
 pub mod tun;
 
+use anyhow::Context;
 use axum::serve;
 use serde::{Deserialize, Serialize};
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -64,8 +66,7 @@ impl MeshApp {
             let listener = if let Ok(fd_str) = std::env::var("LISTEN_FD") {
                 if let Ok(fd) = fd_str.parse::<i32>() {
                     info!("MeshApp: Using activated listener FD {}", fd);
-                    use std::os::fd::FromRawFd;
-                    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+                    let std_listener = activated_tcp_listener(fd)?;
                     std_listener.set_nonblocking(true)?;
                     TcpListener::from_std(std_listener)?
                 } else {
@@ -84,12 +85,12 @@ impl MeshApp {
 
     /// Bind the default TCP port.
     async fn bind_default_tcp(&self) -> Result<TcpListener, anyhow::Error> {
+        // SAFETY: getuid has no preconditions and does not access Rust-managed memory.
         let uid = unsafe { libc::getuid() };
-        let port = self.config.http_port.unwrap_or(if uid == 0 {
-            8081
-        } else {
-            8082 + (uid as u16 - 1000)
-        });
+        let port = self
+            .config
+            .http_port
+            .unwrap_or_else(|| default_http_port_for_uid(uid));
 
         let addr = format!("127.0.0.1:{}", port);
         let listener = TcpListener::bind(&addr).await?;
@@ -153,6 +154,84 @@ impl MeshApp {
             }
         }
         Ok(())
+    }
+}
+
+fn default_http_port_for_uid(uid: libc::uid_t) -> u16 {
+    if uid == 0 {
+        return 8081;
+    }
+
+    let offset = uid.saturating_sub(1000).min(u16::MAX as libc::uid_t - 8082);
+    8082 + offset as u16
+}
+
+fn activated_tcp_listener(fd: i32) -> Result<std::net::TcpListener, anyhow::Error> {
+    validate_tcp_listener_fd(fd)?;
+    // SAFETY: validate_tcp_listener_fd verifies that fd is an open TCP listener
+    // socket. from_raw_fd takes ownership exactly once in this activation path.
+    Ok(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+}
+
+fn validate_tcp_listener_fd(fd: i32) -> Result<(), anyhow::Error> {
+    let mut socket_type: libc::c_int = 0;
+    let mut socket_type_len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    // SAFETY: socket_type points to writable memory of socket_type_len bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut socket_type as *mut libc::c_int).cast(),
+            &mut socket_type_len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("LISTEN_FD is not a socket");
+    }
+    if socket_type != libc::SOCK_STREAM {
+        anyhow::bail!("LISTEN_FD is not a stream socket");
+    }
+
+    // SAFETY: sockaddr_storage is a plain old data buffer initialized by getsockname.
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addr_len = std::mem::size_of_val(&addr) as libc::socklen_t;
+    // SAFETY: addr points to writable storage large enough for addr_len bytes.
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut addr as *mut libc::sockaddr_storage).cast(),
+            &mut addr_len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("LISTEN_FD has no socket address");
+    }
+    if addr.ss_family as libc::c_int != libc::AF_INET
+        && addr.ss_family as libc::c_int != libc::AF_INET6
+    {
+        anyhow::bail!("LISTEN_FD is not an IPv4 or IPv6 socket");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_http_port_for_uid;
+
+    #[test]
+    fn default_http_port_handles_root_and_small_uids() {
+        assert_eq!(default_http_port_for_uid(0), 8081);
+        assert_eq!(default_http_port_for_uid(1), 8082);
+        assert_eq!(default_http_port_for_uid(999), 8082);
+        assert_eq!(default_http_port_for_uid(1000), 8082);
+    }
+
+    #[test]
+    fn default_http_port_caps_large_uids() {
+        assert_eq!(default_http_port_for_uid(1001), 8083);
+        assert_eq!(default_http_port_for_uid(u32::MAX), u16::MAX);
     }
 }
 

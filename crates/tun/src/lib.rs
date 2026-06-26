@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use mesh::tun::{TunDnsHandler, TunUdpHandler};
@@ -54,7 +54,7 @@ impl Default for MeshTunConfig {
         Self {
             name: None,
             fd: None,
-            address: "10.5.0.1".parse().unwrap(),
+            address: IpAddr::V4(Ipv4Addr::new(10, 5, 0, 1)),
             prefix_len: 16,
             mtu: 1500,
             packet_queue_capacity: 4096,

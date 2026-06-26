@@ -61,6 +61,8 @@ pub struct SshHandler {
 }
 
 const DEBUG_PTY: bool = false;
+/// Sentinel direct-tcpip port used to request Unix-domain socket forwarding.
+pub const UDS_FORWARD_PORT: u32 = 0xFFFF_FFFE;
 
 #[derive(Debug, Clone)]
 struct PtyInfo {
@@ -832,7 +834,9 @@ impl SshHandler {
                 };
 
                 // Set up PTY I/O forwarding
-                let master = channel_session.pty_master.as_ref().unwrap();
+                let master = channel_session.pty_master.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("{label} requested PTY but no PTY master exists")
+                })?;
                 let master_fd = master.as_raw_fd();
                 trace!("PTY created with master fd {}", master_fd);
 
@@ -1685,7 +1689,7 @@ impl server::Handler for SshHandler {
 
     /// Connection forward from client.
     ///
-    /// If port is -2 (any large value will do, e.g. 0xFFFFFFFE), treat host as a UDS path.
+    /// If port is [`UDS_FORWARD_PORT`], treat host as a UDS path.
     #[instrument(skip(self, session), fields(channel_id = ?channel.id(), host_to_connect = %host_to_connect, port_to_connect = %port_to_connect, originator_ip = %originator_ip_address, originator_port = %originator_port))]
     fn channel_open_direct_tcpip(
         &mut self,
@@ -1723,8 +1727,8 @@ impl server::Handler for SshHandler {
         let channel = channel;
 
         async move {
-            // UDS support: check for port -2 (0xFFFFFFFE)
-            if port == 0xFFFFFFFE {
+            // UDS support: the host field carries the socket path.
+            if port == UDS_FORWARD_PORT {
                 return me.connect_uds(channel, &host, session_handle).await;
             }
 
@@ -2076,7 +2080,16 @@ impl server::Handler for SshHandler {
 
             // TODO:
 
-            let actual_port = listener.local_addr().unwrap().port();
+            let actual_port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(error) => {
+                    error!(
+                        "Failed to read local address for {}: {}",
+                        listen_addr, error
+                    );
+                    return (Err(anyhow::Error::new(error)), 0);
+                }
+            };
             info!("Started listening on {}:{}", bind_addr, actual_port);
 
             // Channel to signal shutdown
@@ -2950,9 +2963,18 @@ impl server::Handler for SshHandler {
                         .stderr(Stdio::piped());
 
                     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!(e))?;
-                    let stdin = child.stdin.take().unwrap();
-                    let stdout = child.stdout.take().unwrap();
-                    let stderr = child.stderr.take().unwrap();
+                    let stdin = child
+                        .stdin
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("SFTP child stdin was not piped"))?;
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("SFTP child stdout was not piped"))?;
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("SFTP child stderr was not piped"))?;
 
                     // Forward SFTP stdout -> SSH data
                     let session_handle_clone = session_handle.clone();

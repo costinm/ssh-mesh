@@ -1,3 +1,5 @@
+use crate::packet::{ethernet_payload_to_ip, ip_to_ethernet_frame};
+
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -117,8 +119,10 @@ async fn serve_qemu_stream(
     let read_task = tokio::spawn(async move {
         loop {
             let frame = read_qemu_frame(&mut reader).await?;
-            if let Some((packet, src_mac)) = ethernet_to_ip(&frame) {
-                *read_guest_mac.lock().unwrap() = Some(src_mac);
+            if let Some((packet, src_mac)) = ethernet_payload_to_ip(&frame) {
+                *read_guest_mac
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(src_mac);
                 tun_tx
                     .send(packet)
                     .await
@@ -148,9 +152,9 @@ async fn serve_qemu_stream(
             };
             let dst_mac = write_guest_mac
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poison| poison.into_inner())
                 .unwrap_or([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-            let frame = ip_to_ethernet(&packet, host_mac, dst_mac)?;
+            let frame = ip_to_ethernet_frame(&packet, host_mac, dst_mac, 0)?;
             if let Err(error) = write_qemu_frame(&mut writer, &frame).await {
                 crate::stats::stats()
                     .uds_client_write_error
@@ -195,68 +199,6 @@ where
     Ok(())
 }
 
-fn ethernet_to_ip(frame: &[u8]) -> Option<(Vec<u8>, [u8; 6])> {
-    if frame.len() < 14 {
-        return None;
-    }
-    let mut src_mac = [0u8; 6];
-    src_mac.copy_from_slice(&frame[6..12]);
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    match ethertype {
-        0x0800 => {
-            let payload = &frame[14..];
-            if payload.len() < 20 {
-                return None;
-            }
-            let ihl = usize::from(payload[0] & 0x0f) * 4;
-            if ihl < 20 || payload.len() < ihl {
-                return None;
-            }
-            let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
-            if total_len >= ihl && payload.len() >= total_len {
-                Some((payload[..total_len].to_vec(), src_mac))
-            } else {
-                Some((payload.to_vec(), src_mac))
-            }
-        }
-        0x86dd => {
-            let payload = &frame[14..];
-            if payload.len() < 40 {
-                return None;
-            }
-            let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-            let total_len = 40usize.saturating_add(payload_len);
-            if payload.len() >= total_len {
-                Some((payload[..total_len].to_vec(), src_mac))
-            } else {
-                Some((payload.to_vec(), src_mac))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn ip_to_ethernet(
-    packet: &[u8],
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-) -> Result<Vec<u8>, anyhow::Error> {
-    if packet.is_empty() {
-        anyhow::bail!("empty IP packet");
-    }
-    let ethertype = match packet[0] >> 4 {
-        4 => 0x0800u16,
-        6 => 0x86ddu16,
-        version => anyhow::bail!("unsupported IP version in TUN packet: {version}"),
-    };
-    let mut frame = Vec::with_capacity(14 + packet.len());
-    frame.extend_from_slice(&dst_mac);
-    frame.extend_from_slice(&src_mac);
-    frame.extend_from_slice(&ethertype.to_be_bytes());
-    frame.extend_from_slice(packet);
-    Ok(frame)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,8 +210,8 @@ mod tests {
         ];
         let src = [0x02, 0, 0, 0, 0, 1];
         let dst = [0x02, 0, 0, 0, 0, 2];
-        let frame = ip_to_ethernet(&packet, src, dst).unwrap();
-        let (decoded, observed_src) = ethernet_to_ip(&frame).unwrap();
+        let frame = ip_to_ethernet_frame(&packet, src, dst, 0).unwrap();
+        let (decoded, observed_src) = ethernet_payload_to_ip(&frame).unwrap();
         assert_eq!(decoded, packet);
         assert_eq!(observed_src, src);
     }

@@ -26,7 +26,7 @@ impl VhostUserNetConfig {
 mod backend {
     use super::VhostUserNetConfig;
     use std::io::{Error, Result};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread;
 
     use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -55,6 +55,10 @@ mod backend {
     pub struct VhostUserNetBackend {
         config: VhostUserNetConfig,
         stats: Arc<Mutex<VhostUserNetStats>>,
+    }
+
+    fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
     impl VhostUserNetBackend {
@@ -106,7 +110,7 @@ mod backend {
         }
 
         fn acked_features(&mut self, features: u64) {
-            self.stats.lock().unwrap().acked_features = features;
+            lock_or_recover(&self.stats).acked_features = features;
         }
 
         fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -116,14 +120,14 @@ mod backend {
         }
 
         fn reset_device(&mut self) {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = lock_or_recover(&self.stats);
             stats.reset_count += 1;
             stats.acked_features = 0;
             stats.event_idx = false;
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
-            self.stats.lock().unwrap().event_idx = enabled;
+            lock_or_recover(&self.stats).event_idx = enabled;
         }
 
         fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -142,7 +146,7 @@ mod backend {
 
         fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) -> Result<()> {
             let mem = atomic_mem.memory();
-            self.stats.lock().unwrap().memory_regions = mem.iter().count();
+            lock_or_recover(&self.stats).memory_regions = mem.iter().count();
             Ok(())
         }
 
@@ -157,7 +161,7 @@ mod backend {
             _vrings: &[VringRwLock],
             _thread_id: usize,
         ) -> Result<()> {
-            self.stats.lock().unwrap().handle_event_calls += 1;
+            lock_or_recover(&self.stats).handle_event_calls += 1;
             Ok(())
         }
     }

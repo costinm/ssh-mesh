@@ -2,7 +2,7 @@ use crate::policy::{AllowAllPolicy, FlowContext, FlowProtocol, MeshTunPolicy, Po
 use crate::telemetry::{MeshTunEvent, MeshTunTelemetry, NoopTelemetry};
 use mesh::tun::{TunDnsHandler, TunInjector, TunUdpHandler, TunUdpPacket};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -41,12 +41,12 @@ impl MeshPassthrough {
     }
 
     pub fn with_injector(self, injector: Arc<dyn TunInjector>) -> Self {
-        *self.injector.lock().unwrap() = Some(injector);
+        *lock_or_recover(&self.injector) = Some(injector);
         self
     }
 
     pub fn set_injector(&self, injector: Arc<dyn TunInjector>) {
-        *self.injector.lock().unwrap() = Some(injector);
+        *lock_or_recover(&self.injector) = Some(injector);
     }
 
     pub fn with_udp_response_timeout(mut self, timeout: Duration) -> Self {
@@ -130,7 +130,7 @@ impl MeshPassthrough {
             return Ok(0);
         };
 
-        let injector = self.injector.lock().unwrap().clone();
+        let injector = lock_or_recover(&self.injector).clone();
         if let Some(injector) = injector {
             injector
                 .inject_udp(
@@ -145,6 +145,10 @@ impl MeshPassthrough {
 
         Ok(n as u64)
     }
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 #[async_trait::async_trait]

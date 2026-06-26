@@ -249,7 +249,8 @@ async fn main() -> Result<(), anyhow::Error> {
             },
             env::var("SSH_MUX").ok().map(PathBuf::from),
             user_certificate,
-        )),
+        )
+        .with_discovery_dir(Some(base_dir.clone()))),
     };
 
     // Start configured SSH client connections from config
@@ -280,33 +281,14 @@ async fn main() -> Result<(), anyhow::Error> {
     });
 
     if socks_port > 0 {
-        // Default bind address is 127.0.0.1 (loopback) to avoid exposing an
-        // unauthenticated open proxy. Set SSH_MESH_SOCKS_BIND to override
-        // (e.g. to 0.0.0.0) — only do this if credentials are configured.
-        let socks_bind =
-            std::env::var("SSH_MESH_SOCKS_BIND").unwrap_or_else(|_| "127.0.0.1".into());
-        let socks_creds = match (
-            std::env::var("SSH_MESH_SOCKS_USER").ok(),
-            std::env::var("SSH_MESH_SOCKS_PASS").ok(),
-        ) {
-            (Some(u), Some(p)) if !u.is_empty() => Some(ssh_mesh::socks5::Socks5Credentials {
-                username: u,
-                password: p,
-            }),
-            _ => None,
-        };
-        if socks_creds.is_none() && socks_bind != "127.0.0.1" {
-            log::warn!(
-                "SOCKS5 bound to {} without credentials configured — open proxy risk",
-                socks_bind
-            );
-        }
-        let socks_cfg = ssh_mesh::socks5::Socks5Config {
-            credentials: socks_creds,
-        };
-        let socks_addr = format!("{}:{}", socks_bind, socks_port);
+        let socks_addr = format!("127.0.0.1:{}", socks_port);
         tokio::spawn(async move {
-            match ssh_mesh::socks5::Socks5Server::bind_with_config(&socks_addr, socks_cfg).await {
+            match ssh_mesh::socks5::Socks5Server::bind_with_config(
+                &socks_addr,
+                ssh_mesh::socks5::Socks5Config::default(),
+            )
+            .await
+            {
                 Ok(server) => {
                     info!("SOCKS5 server listening on {}", socks_addr);
                     server.run().await;

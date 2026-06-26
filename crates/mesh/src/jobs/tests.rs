@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::Mutex;
 
 use crate::jobs::config::{
-    BackoffConfig, BackoffPolicy, ConstraintConfig, JobConfig, NetworkType, ScheduleConfig,
+    BackoffConfig, ConstraintConfig, JobConfig, NetworkType, ScheduleConfig,
 };
 use crate::jobs::event::SystemEvent;
 use crate::jobs::executor::JobExecutor;

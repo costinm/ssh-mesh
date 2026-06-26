@@ -3,7 +3,8 @@
 //! Manages service lifecycle: loads configs, starts system services,
 //! handles control requests, manages signal handling and zombie reaping.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{
     Arc,
@@ -967,13 +968,16 @@ impl Daemon {
                         backoff_secs = backoff_secs.min(24 * 3600);
                     }
 
+                    let restart_delay_secs = restart_delay_with_jitter(name, backoff_secs);
+
                     info!(
                         "Service '{}' crashed. Scheduling restart #{} in {}s",
-                        name, proc.consecutive_failures, backoff_secs
+                        name, proc.consecutive_failures, restart_delay_secs
                     );
 
                     proc.next_restart_at = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(restart_delay_secs),
                     );
                 }
 
@@ -1038,9 +1042,11 @@ impl Daemon {
                         // Increase failure count
                         proc.consecutive_failures += 1;
                         let backoff_secs = (1 << (proc.consecutive_failures - 1)).min(60);
+                        let restart_delay_secs =
+                            restart_delay_with_jitter(&config.name, backoff_secs);
                         proc.next_restart_at = Some(
                             std::time::Instant::now()
-                                + std::time::Duration::from_secs(backoff_secs as u64),
+                                + std::time::Duration::from_secs(restart_delay_secs),
                         );
                     }
                 }
@@ -1103,7 +1109,9 @@ impl Daemon {
                 if proc.state == ServiceState::Running && proc.pid.is_some() {
                     // Already running; let the caller decide via handle_start's
                     // restart logic. Return the existing pid.
-                    return Ok(proc.pid.unwrap());
+                    if let Some(pid) = proc.pid {
+                        return Ok(pid);
+                    }
                 }
             }
         }
@@ -1202,6 +1210,17 @@ impl Daemon {
         let _ = std::fs::remove_file(&self.config.socket_path);
         info!("Daemon shutdown complete");
     }
+}
+
+fn restart_delay_with_jitter(service_name: &str, base_secs: u64) -> u64 {
+    if base_secs <= 1 {
+        return base_secs;
+    }
+
+    let jitter_window = (base_secs / 10).clamp(1, 30);
+    let mut hasher = DefaultHasher::new();
+    service_name.hash(&mut hasher);
+    base_secs.saturating_add(hasher.finish() % (jitter_window + 1))
 }
 
 // ============================================================================
@@ -1392,5 +1411,18 @@ priority = 300
         assert!(check_impersonation(5000, 5000, None, "svc").is_ok());
         assert!(check_impersonation(5000, 0, None, "svc").is_err());
         assert!(check_impersonation(5000, 5000, Some(6000), "svc").is_err());
+    }
+
+    #[test]
+    fn restart_delay_jitter_keeps_one_second_delay_exact() {
+        assert_eq!(restart_delay_with_jitter("svc-a", 1), 1);
+    }
+
+    #[test]
+    fn restart_delay_jitter_is_bounded_and_deterministic() {
+        let first = restart_delay_with_jitter("svc-a", 100);
+        let second = restart_delay_with_jitter("svc-a", 100);
+        assert_eq!(first, second);
+        assert!((100..=110).contains(&first));
     }
 }

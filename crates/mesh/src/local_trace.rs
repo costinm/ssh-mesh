@@ -12,11 +12,11 @@
 //! - In-memory circular buffer for recent events
 //! - event distribution using UDS.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::RwLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
@@ -94,7 +94,7 @@ impl LogBuffer {
 
     /// Add a log entry to the buffer
     pub fn push(&self, entry: LogEntry) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         // Add to circular buffer
         if inner.buffer.len() >= inner.max_size {
@@ -108,19 +108,19 @@ impl LogBuffer {
 
     /// Get all current log entries
     pub fn get_all(&self) -> Vec<LogEntry> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.buffer.iter().cloned().collect()
     }
 
     /// Subscribe to new log entries
     pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.tx.subscribe()
     }
 
     /// Get the current buffer size
     pub fn len(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.buffer.len()
     }
 

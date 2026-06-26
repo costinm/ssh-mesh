@@ -197,9 +197,15 @@ pub async fn handle_web_request(
 /// Serve the main SSH web UI (ssh.html) as the index page.
 async fn serve_index() -> impl IntoResponse {
     match Assets::get("ssh.html") {
-        Some(content) => Html(std::str::from_utf8(&content.data).unwrap().to_string()),
+        Some(content) => Html(String::from_utf8_lossy(&content.data).into_owned()),
         None => Html("<h1>Error: ssh.html not found</h1>".to_string()),
     }
+}
+
+fn response_with_status(status: StatusCode, body: Body) -> Response {
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
 }
 
 #[utoipa::path(
@@ -279,17 +285,14 @@ pub async fn handle_ssh_request(
             let response_stream =
                 tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-            Response::builder()
-                .status(200)
-                .body(Body::from_stream(response_stream))
-                .unwrap()
+            response_with_status(StatusCode::OK, Body::from_stream(response_stream))
         }
         Err(e) => {
             tracing_error!("Failed to start SSH session: {:?}", e);
-            Response::builder()
-                .status(500)
-                .body(Body::from(format!("SSH session failed: {:?}", e)))
-                .unwrap()
+            response_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Body::from(format!("SSH session failed: {:?}", e)),
+            )
         }
     }
 }
@@ -388,11 +391,7 @@ pub async fn handle_tcp_proxy(
     let response_stream =
         tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-    Response::builder()
-        .status(200)
-        .body(Body::from_stream(response_stream))
-        .unwrap()
-        .into_response()
+    response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
 /// Unix domain socket proxy handler.
@@ -464,11 +463,7 @@ pub async fn handle_uds_proxy(
     let response_stream =
         tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-    Response::builder()
-        .status(200)
-        .body(Body::from_stream(response_stream))
-        .unwrap()
-        .into_response()
+    response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
 async fn open_mesh_init_exec_stream(
@@ -635,11 +630,7 @@ pub async fn handle_exec(
     let response_stream =
         tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-    Response::builder()
-        .status(200)
-        .body(Body::from_stream(response_stream))
-        .unwrap()
-        .into_response()
+    response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
 /// WebSocket handler for SSH-over-WS at `/_m/_ws/_ssh`.
@@ -825,12 +816,29 @@ pub async fn handle_proxy_request(
     };
 
     let (mut parts, body) = req.into_parts();
-    parts.uri = uri_str.parse().unwrap();
+    parts.uri = match uri_str.parse() {
+        Ok(uri) => uri,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("invalid proxy target URI {uri_str}: {error}"),
+            )
+                .into_response();
+        }
+    };
 
     // Update Host header
-    parts
-        .headers
-        .insert(hyper::header::HOST, target_addr.parse().unwrap());
+    let host = match target_addr.parse() {
+        Ok(host) => host,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("invalid proxy host header {target_addr}: {error}"),
+            )
+                .into_response();
+        }
+    };
+    parts.headers.insert(hyper::header::HOST, host);
 
     let proxy_req = hyper::Request::from_parts(parts, body);
 
