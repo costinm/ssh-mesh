@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::config::{JobConfig, NetworkType, WorkItem, WorkResult};
 use super::event::{SystemEvent, SystemState};
@@ -73,6 +73,8 @@ impl JobScheduler {
 
     pub async fn schedule(&self, config: JobConfig) -> Result<()> {
         let name = config.name.clone();
+        crate::config::validate_service_name(&name)
+            .map_err(|e| anyhow::anyhow!("invalid job name: {e}"))?;
         if config.persisted {
             tokio::fs::create_dir_all(&self.jobs_dir).await?;
             config.save(&self.jobs_dir).await?;
@@ -90,6 +92,8 @@ impl JobScheduler {
     }
 
     pub async fn enqueue(&self, job_name: &str, mut work: WorkItem) -> Result<()> {
+        crate::config::validate_service_name(job_name)
+            .map_err(|e| anyhow::anyhow!("invalid job name: {e}"))?;
         let mut jobs = self.jobs.lock().await;
         if let Some(entry) = jobs.get_mut(job_name) {
             work.enqueued_at = chrono::Utc::now().to_rfc3339();
@@ -107,6 +111,8 @@ impl JobScheduler {
     }
 
     pub async fn cancel(&self, job_name: &str) -> Result<()> {
+        crate::config::validate_service_name(job_name)
+            .map_err(|e| anyhow::anyhow!("invalid job name: {e}"))?;
         let mut jobs = self.jobs.lock().await;
         if jobs.remove(job_name).is_some() {
             // Remove from disk
@@ -117,9 +123,18 @@ impl JobScheduler {
     }
 
     pub async fn cancel_all(&self) -> Result<()> {
+        // Refuse to recursively delete a path that is root or suspiciously
+        // short, as a guard against misconfiguration.
+        let dir = &self.jobs_dir;
+        let canonical = tokio::fs::canonicalize(dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot canonicalize jobs_dir: {e}"))?;
+        if canonical.parent().is_none() {
+            anyhow::bail!("refusing to remove_dir_all on filesystem root");
+        }
         let mut jobs = self.jobs.lock().await;
         jobs.clear();
-        let _ = tokio::fs::remove_dir_all(&self.jobs_dir).await;
+        let _ = tokio::fs::remove_dir_all(&canonical).await;
         Ok(())
     }
 
@@ -243,15 +258,51 @@ impl JobScheduler {
 
             if reschedule {
                 entry.failure_count += 1;
-                // apply backoff
+                // B19: Honor `max_retries`. When the failure count exceeds the
+                // configured limit, give up on rescheduling and mark the job
+                // completed/failed so the periodic scheduler doesn't hammer it
+                // forever with an unbounded backoff.
+                let exceeded_max = entry
+                    .config
+                    .backoff
+                    .max_retries
+                    .is_some_and(|max| entry.failure_count > max);
+                if exceeded_max {
+                    warn!(
+                        "Job '{}' hit max_retries ({}), stopping",
+                        name,
+                        entry.config.backoff.max_retries.unwrap()
+                    );
+                    entry.state = JobState::Completed;
+                    entry.failure_count = 0;
+                    if entry.config.save_result && entry.config.persisted {
+                        let job_dir = self.jobs_dir.join(name);
+                        for item in &entry.work_items {
+                            let _ = item.complete(&job_dir, result.clone()).await;
+                        }
+                    }
+                    entry.work_items.clear();
+                    return Ok(());
+                }
+
+                // B19: Cap the exponent for exponential backoff to avoid u64
+                // overflow in `2.pow()` (panics in debug for shift >= 64, wraps
+                // in release producing wild values). Cap to 30 shifts and
+                // apply a hard `max_secs` ceiling.
+                let initial = entry.config.backoff.initial_secs;
                 let backoff_secs = match entry.config.backoff.policy {
                     super::config::BackoffPolicy::Linear => {
-                        entry.config.backoff.initial_secs * (entry.failure_count as u64)
+                        initial.saturating_mul(entry.failure_count as u64)
                     }
                     super::config::BackoffPolicy::Exponential => {
-                        entry.config.backoff.initial_secs * (2_u64.pow(entry.failure_count - 1))
+                        let shifts = (entry.failure_count - 1).min(30);
+                        let multiplier = 1u64 << shifts;
+                        initial.saturating_mul(multiplier)
                     }
                 };
+                let initial = entry.config.backoff.initial_secs;
+                let _ = initial;
+                let backoff_secs = backoff_secs.min(entry.config.backoff.max_secs);
                 entry.next_eligible = Some(now + backoff_secs);
             } else {
                 entry.failure_count = 0;

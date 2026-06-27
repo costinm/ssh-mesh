@@ -1,7 +1,7 @@
 [package]
 name = "dmesh"
 version = "0.0.1"
-edition = "2021" 
+edition = "2024" 
 
 [features]
 default = ["python"]
@@ -9,7 +9,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 ssh-mesh = { path = "../ssh-mesh" }
-mesh-tun = { path = "../tun" }
+mesh-tun = { path = "../tun", default-features = false }
 pmond = { path = "../pmond" }
 lmesh = { path = "../lmesh" }
 mesh = { path = "../mesh" }

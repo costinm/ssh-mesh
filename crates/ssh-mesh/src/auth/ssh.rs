@@ -145,13 +145,30 @@ pub async fn validate_certificate_with_authz(
         .as_secs();
 
     let valid_principals: Vec<String> = cert.valid_principals().iter().cloned().collect();
+
+    // Reject certificates with no principals before consulting authz. OpenSSH
+    // never issues user certs without principals, and an empty list would let a
+    // wildcard impersonation rule (`to = "*"`) match unintended identities.
+    if valid_principals.is_empty() {
+        warn!("Certificate has no valid principals; rejecting");
+        return Ok(SshAuthResult {
+            status: server::Auth::Reject {
+                proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
+                partial_success: false,
+            },
+            comment: cert.key_id().to_string(),
+            options: None,
+            user: String::new(),
+        });
+    }
+
     let authorized_principal = if valid_principals.iter().any(|principal| principal == user) {
         Some(user)
     } else {
         authz.and_then(|authz| authz.authorized_impersonator(&valid_principals, user))
     };
 
-    if authorized_principal.is_none() || valid_principals.is_empty() {
+    if authorized_principal.is_none() {
         warn!(
             "Certificate principals {:?} not authorized for user: {}",
             valid_principals, user
@@ -227,47 +244,109 @@ pub fn parse_authorized_keys_content(content: &str) -> Result<Vec<AuthorizedKeyE
             continue;
         }
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        if is_known_key_type(parts[0]) {
-            if let Ok(key) = ssh_key::PublicKey::from_openssh(line) {
+        // Split the line into an options field (optional) and the key body.
+        // The options field, when present, may contain quoted strings with
+        // embedded spaces and commas (e.g. `command="echo hi",no-pty`), so a
+        // naive split_whitespace would mis-split. We scan token-by-token,
+        // respecting double-quote pairs, until we find a token that begins
+        // with a known key type.
+        match split_options_and_key(line) {
+            ParsedLine::KeyOnly(key_body) => {
+                if let Ok(key) = ssh_key::PublicKey::from_openssh(key_body) {
+                    entries.push(AuthorizedKeyEntry {
+                        comment: Some(key.comment().to_string()),
+                        key: Some(key),
+                        fingerprint: None,
+                        options: None,
+                    });
+                }
+            }
+            ParsedLine::WithOptions(options, key_body) => {
+                if let Ok(key) = ssh_key::PublicKey::from_openssh(key_body) {
+                    entries.push(AuthorizedKeyEntry {
+                        comment: Some(key.comment().to_string()),
+                        key: Some(key),
+                        fingerprint: None,
+                        options: Some(options),
+                    });
+                }
+            }
+            ParsedLine::FingerprintOnly(fingerprint, comment) => {
                 entries.push(AuthorizedKeyEntry {
-                    comment: Some(key.comment().to_string()),
-                    key: Some(key),
-                    fingerprint: None,
+                    key: None,
+                    fingerprint: Some(fingerprint),
                     options: None,
+                    comment,
                 });
             }
-        } else if parts.len() >= 2 && is_known_key_type(parts[1]) {
-            let options = parts[0].to_string();
-            let rest = parts[1..].join(" ");
-            if let Ok(key) = ssh_key::PublicKey::from_openssh(&rest) {
-                entries.push(AuthorizedKeyEntry {
-                    comment: Some(key.comment().to_string()),
-                    key: Some(key),
-                    fingerprint: None,
-                    options: Some(options),
-                });
+            ParsedLine::Unparsable => {
+                warn!("Skipping unparsable authorized_keys line");
             }
-        } else if parts[0].starts_with("SHA256:") || parts[0].starts_with("MD5:") {
-            let fingerprint = parts[0].to_string();
-            let comment = if parts.len() >= 2 {
-                Some(parts[1..].join(" "))
-            } else {
-                None
-            };
-            entries.push(AuthorizedKeyEntry {
-                key: None,
-                fingerprint: Some(fingerprint),
-                options: None,
-                comment,
-            });
         }
     }
     Ok(entries)
+}
+
+/// Result of splitting an authorized_keys line.
+enum ParsedLine<'a> {
+    /// Line is just a key (no options).
+    KeyOnly(&'a str),
+    /// Line has options followed by a key.
+    WithOptions(String, &'a str),
+    /// Line is a bare fingerprint (`SHA256:...` / `MD5:...`) with optional comment.
+    FingerprintOnly(String, Option<String>),
+    /// Line could not be parsed.
+    Unparsable,
+}
+
+/// Split an authorized_keys line into an optional options field and the key
+/// body (everything after the options, including comment). Handles quoted
+/// option values that may contain spaces.
+fn split_options_and_key(line: &str) -> ParsedLine<'_> {
+    // Fast path: the first whitespace-delimited token is a known key type.
+    let first_token = line.split_whitespace().next().unwrap_or("");
+    if is_known_key_type(first_token) {
+        return ParsedLine::KeyOnly(line);
+    }
+
+    // Fingerprint-only line.
+    if first_token.starts_with("SHA256:") || first_token.starts_with("MD5:") {
+        let fingerprint = first_token.to_string();
+        let comment = line[first_token.len()..].trim();
+        let comment = if comment.is_empty() {
+            None
+        } else {
+            Some(comment.to_string())
+        };
+        return ParsedLine::FingerprintOnly(fingerprint, comment);
+    }
+
+    // Otherwise the first field is an options string. Scan respecting quotes
+    // to find where the options end and the key begins.
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_quotes = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' {
+            in_quotes = !in_quotes;
+        } else if c == b' ' && !in_quotes {
+            // End of options token.
+            let options = line[..i].to_string();
+            let rest = line[i..].trim_start();
+            // The next token should be the key type; verify.
+            let key_type = rest.split_whitespace().next().unwrap_or("");
+            if is_known_key_type(key_type) {
+                return ParsedLine::WithOptions(options, rest);
+            }
+            // Options present but no recognizable key follows.
+            return ParsedLine::Unparsable;
+        }
+        i += 1;
+    }
+
+    // No space found outside quotes — line is just an options blob with no key.
+    ParsedLine::Unparsable
 }
 
 fn is_known_key_type(s: &str) -> bool {
@@ -488,6 +567,28 @@ mod tests {
         assert!(entries[1].key.is_some());
         assert_eq!(entries[1].options, Some("opt1,opt2".to_string()));
         assert!(entries[2].key.is_none());
+    }
+
+    #[test]
+    fn test_parse_authorized_keys_quoted_options_with_spaces() {
+        let key = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBICtPKa3mXZss+k6LqtiNOQ3TbJFqLvjsvZGubtILlkV2Kz3HjO9+fghwCT/bb1R2SrvqHWWEj+QH6G4+ogPns=";
+        // Options field containing a quoted value with spaces and a comma.
+        let content = format!(
+            "command=\"echo hello world\",no-pty {}\nfrom=\"10.0.0.0/8\",permitlisten=\"127.0.0.1:0\" {}",
+            key, key
+        );
+        let entries = parse_authorized_keys_content(&content).unwrap();
+        assert_eq!(entries.len(), 2, "both quoted-option entries should parse");
+        assert_eq!(
+            entries[0].options.as_deref(),
+            Some("command=\"echo hello world\",no-pty")
+        );
+        assert!(entries[0].key.is_some());
+        assert_eq!(
+            entries[1].options.as_deref(),
+            Some("from=\"10.0.0.0/8\",permitlisten=\"127.0.0.1:0\"")
+        );
+        assert!(entries[1].key.is_some());
     }
 
     #[tokio::test]

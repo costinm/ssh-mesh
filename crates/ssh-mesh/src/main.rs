@@ -249,7 +249,8 @@ async fn main() -> Result<(), anyhow::Error> {
             },
             env::var("SSH_MUX").ok().map(PathBuf::from),
             user_certificate,
-        )),
+        )
+        .with_discovery_dir(Some(base_dir.clone()))),
     };
 
     // Start configured SSH client connections from config
@@ -280,9 +281,14 @@ async fn main() -> Result<(), anyhow::Error> {
     });
 
     if socks_port > 0 {
-        let socks_addr = format!("0.0.0.0:{}", socks_port);
+        let socks_addr = format!("127.0.0.1:{}", socks_port);
         tokio::spawn(async move {
-            match ssh_mesh::socks5::Socks5Server::bind(&socks_addr).await {
+            match ssh_mesh::socks5::Socks5Server::bind_with_config(
+                &socks_addr,
+                ssh_mesh::socks5::Socks5Config::default(),
+            )
+            .await
+            {
                 Ok(server) => {
                     info!("SOCKS5 server listening on {}", socks_addr);
                     server.run().await;
@@ -336,15 +342,43 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // app = app.nest("/", pmond::handlers::app(proc_mon.clone()));
 
-    // HTTPS server - WIP, authz and authn not implemented.
-    // SSH is tunneled over H2 - doing its own auth.
+    // HTTPS admin server with mTLS client-certificate authentication.
+    //
+    // When a CA certificate is available (base_dir/id_ecdsa.crt for the
+    // server, and a CA bundle for clients), the HTTPS server requires a valid
+    // client certificate. This is the recommended mode for exposing the admin
+    // (`/_m/...`) endpoints. Without mTLS, anyone who can reach the port has
+    // full admin access (RCE via `_exec`, open relay via `_tcp`/`_uds`).
     if https_port > 0 {
         let cert_path = base_dir.join("id_ecdsa.crt");
         let key_path = base_dir.join("id_ecdsa");
         if cert_path.exists() && key_path.exists() {
             let app = app.clone();
-            let https_addr = format!("0.0.0.0:{}", https_port);
-            match ssh_mesh::auth::TlsServer::new(&cert_path, &key_path, None, &https_addr) {
+            let https_bind =
+                std::env::var("SSH_MESH_HTTPS_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+            let https_addr = format!("{}:{}", https_bind, https_port);
+            // Look for a CA bundle to enable client-cert verification.
+            // Defaults to base_dir/authorized_cas (the same file used for SSH
+            // CA validation). Can be overridden with SSH_MESH_HTTPS_CA.
+            let ca_path = std::env::var("SSH_MESH_HTTPS_CA")
+                .map(PathBuf::from)
+                .ok()
+                .unwrap_or_else(|| base_dir.join("authorized_cas"));
+            let ca_arg = if ca_path.exists() {
+                info!(
+                    "HTTPS admin server will require mTLS client certs validated against {}",
+                    ca_path.display()
+                );
+                Some(ca_path.as_path())
+            } else {
+                log::warn!(
+                    "HTTPS admin server starting WITHOUT client-cert authentication. \
+                     The admin endpoints (_exec, _tcp, _uds) will be unauthenticated. \
+                     Provide an authorized_cas file or SSH_MESH_HTTPS_CA to enable mTLS."
+                );
+                None
+            };
+            match ssh_mesh::auth::TlsServer::new(&cert_path, &key_path, ca_arg, &https_addr) {
                 Ok(tls_server) => {
                     info!("Starting HTTPS server on https://{}", https_addr);
                     tokio::spawn(async move {
@@ -380,9 +414,23 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // HTTP server - forwards to the app's port, with handlers for
     // ssh tunneling and an admin interface.
-    // TODO: separate admin interface to different port.
+    //
+    // Security: the admin (`/_m/...`) endpoints are served on this port. By
+    // default bind to 127.0.0.1 (loopback) so that the admin surface is not
+    // reachable from the network without an explicit opt-in. Set
+    // `SSH_MESH_HTTP_BIND=0.0.0.0` to listen on all interfaces — only do this
+    // behind a reverse proxy or with mTLS on the HTTPS port.
     if http_port > 0 {
-        let http_addr = format!("0.0.0.0:{}", http_port);
+        let http_bind =
+            std::env::var("SSH_MESH_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        if http_bind == "0.0.0.0" || http_bind == "::" {
+            log::warn!(
+                "HTTP admin server binds {} with unauthenticated admin endpoints (_exec, _tcp, _uds). \
+                 Restrict to localhost or use the HTTPS port with mTLS.",
+                http_bind
+            );
+        }
+        let http_addr = format!("{}:{}", http_bind, http_port);
         let listener = TcpListener::bind(&http_addr).await?;
         // Run HTTP server in background
         tokio::spawn(async move {

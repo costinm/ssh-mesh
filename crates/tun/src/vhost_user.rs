@@ -26,7 +26,7 @@ impl VhostUserNetConfig {
 mod backend {
     use super::VhostUserNetConfig;
     use std::io::{Error, Result};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread;
 
     use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -57,6 +57,10 @@ mod backend {
         stats: Arc<Mutex<VhostUserNetStats>>,
     }
 
+    fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
     impl VhostUserNetBackend {
         pub fn new(config: VhostUserNetConfig) -> Self {
             Self {
@@ -70,10 +74,17 @@ mod backend {
         }
 
         fn config_space(&self) -> [u8; 12] {
+            // Virtio-net config space layout per the specification:
+            //   offset 0..6   : mac[6]
+            //   offset 6..8   : status (u16, VIRTIO_NET_S_LINK_UP etc.)
+            //   offset 8..10  : max_virtqueue_pairs (u16)
+            //   offset 10..12 : mtu (u16, only valid if VIRTIO_NET_F_MTU set)
             let mut config = [0u8; 12];
             config[..6].copy_from_slice(&self.config.mac);
             config[6..8].copy_from_slice(&VIRTIO_NET_S_LINK_UP.to_le_bytes());
-            config[8..10].copy_from_slice(&(self.config.mtu as u16).to_le_bytes());
+            // We expose 2 queues (1 RX + 1 TX) = 1 virtqueue pair.
+            config[8..10].copy_from_slice(&1u16.to_le_bytes());
+            config[10..12].copy_from_slice(&(self.config.mtu as u16).to_le_bytes());
             config
         }
     }
@@ -99,7 +110,7 @@ mod backend {
         }
 
         fn acked_features(&mut self, features: u64) {
-            self.stats.lock().unwrap().acked_features = features;
+            lock_or_recover(&self.stats).acked_features = features;
         }
 
         fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -109,14 +120,14 @@ mod backend {
         }
 
         fn reset_device(&mut self) {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = lock_or_recover(&self.stats);
             stats.reset_count += 1;
             stats.acked_features = 0;
             stats.event_idx = false;
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
-            self.stats.lock().unwrap().event_idx = enabled;
+            lock_or_recover(&self.stats).event_idx = enabled;
         }
 
         fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -135,7 +146,7 @@ mod backend {
 
         fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) -> Result<()> {
             let mem = atomic_mem.memory();
-            self.stats.lock().unwrap().memory_regions = mem.iter().count();
+            lock_or_recover(&self.stats).memory_regions = mem.iter().count();
             Ok(())
         }
 
@@ -150,7 +161,7 @@ mod backend {
             _vrings: &[VringRwLock],
             _thread_id: usize,
         ) -> Result<()> {
-            self.stats.lock().unwrap().handle_event_calls += 1;
+            lock_or_recover(&self.stats).handle_event_calls += 1;
             Ok(())
         }
     }
@@ -277,7 +288,11 @@ mod backend {
                 .get_config(0, 12, VhostUserConfigFlags::empty(), &buf)
                 .unwrap();
             assert_eq!(&config_bytes[..6], &frontend_config.mac);
-            assert_eq!(u16::from_le_bytes([config_bytes[8], config_bytes[9]]), 1500);
+            assert_eq!(
+                u16::from_le_bytes([config_bytes[10], config_bytes[11]]),
+                1500
+            );
+            assert_eq!(u16::from_le_bytes([config_bytes[8], config_bytes[9]]), 1);
             frontend.reset_owner().unwrap();
             drop(frontend);
             drop(server_thread);
@@ -291,8 +306,8 @@ mod backend {
 
 #[cfg(feature = "vhost-user-net")]
 pub use backend::{
-    run_vhost_user_net, run_vhost_user_net_blocking, spawn_vhost_user_net, VhostUserNetBackend,
-    VhostUserNetStats,
+    VhostUserNetBackend, VhostUserNetStats, run_vhost_user_net, run_vhost_user_net_blocking,
+    spawn_vhost_user_net,
 };
 
 #[cfg(not(feature = "vhost-user-net"))]

@@ -39,9 +39,14 @@ fn init_telemetry() {
     }
 
     if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        let out_layer = tracing_subscriber::fmt::layer()
-            .compact()
-            .with_writer(move || file.try_clone().expect("clone mesh-init log file"));
+        let out_layer = tracing_subscriber::fmt::layer().compact().with_writer(
+            move || -> Box<dyn std::io::Write + Send> {
+                match file.try_clone() {
+                    Ok(file) => Box::new(file),
+                    Err(_) => Box::new(std::io::sink()),
+                }
+            },
+        );
         Registry::default().with(filter).with(out_layer).init();
     } else {
         Registry::default().with(filter).init();

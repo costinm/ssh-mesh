@@ -48,6 +48,20 @@ pub struct ManagedProcess {
     pub target_state: ServiceState,
     /// PID of the running process (None if stopped).
     pub pid: Option<u32>,
+    /// PID of the network sidecar process, if one is attached.
+    pub network_pid: Option<u32>,
+    /// Host-held network namespace descriptor registered by a child mesh-init.
+    ///
+    /// Keeping the fd open pins the namespace and gives the host daemon a
+    /// stable handle it can pass to mesh-tun later, while pasta can still be
+    /// used today as a PID-based validation backend.
+    pub netns_fd: Option<std::os::fd::OwnedFd>,
+    /// Optional user namespace descriptor for targets created in a userns.
+    pub userns_fd: Option<std::os::fd::OwnedFd>,
+    /// PID in the service namespace that registered the namespace descriptors.
+    pub namespace_pid: Option<u32>,
+    /// True after the shared mesh-tun daemon accepted this service namespace.
+    pub mesh_tun_attached: bool,
     /// When the process was last started.
     pub started_at: Option<Instant>,
     /// Number of times this service has been restarted.
@@ -68,6 +82,11 @@ impl ManagedProcess {
             state: ServiceState::Stopped,
             target_state: ServiceState::Stopped,
             pid: None,
+            network_pid: None,
+            netns_fd: None,
+            userns_fd: None,
+            namespace_pid: None,
+            mesh_tun_attached: false,
             started_at: None,
             restarts: 0,
             consecutive_failures: 0,
@@ -87,6 +106,10 @@ impl ManagedProcess {
             name: self.config.name.clone(),
             state: self.state,
             pid: self.pid,
+            network_pid: self.network_pid,
+            netns_registered: self.netns_fd.is_some(),
+            userns_registered: self.userns_fd.is_some(),
+            mesh_tun_attached: self.mesh_tun_attached,
             uptime_secs: self.uptime_secs(),
             restarts: self.restarts,
             consecutive_failures: self.consecutive_failures,
@@ -215,8 +238,13 @@ pub fn spawn_process(
                     });
                 }
             }
-            // Keep the OwnedFd alive so it isn't closed before exec
-            std::mem::forget(fd);
+            // Keep the OwnedFd alive so it isn't closed before exec. Hold it
+            // until after `cmd.spawn()` returns; the child inherits the FD
+            // (CLOEXEC was cleared in pre_exec), and the parent's copy is
+            // then closed when `_passed_fd_keepalive` drops at end of scope.
+            // Previously this used `mem::forget`, which leaked the parent's
+            // copy permanently (one FD per wait=true activation).
+            _passed_fd_keepalive = Some(fd);
         }
         None => {}
     }
@@ -268,6 +296,13 @@ pub fn send_signal(pid: u32, signal: i32) -> Result<(), ProcessError> {
 
 /// Stop a process. Sends the given signal (default SIGTERM), waits briefly,
 /// then sends SIGKILL if still alive.
+///
+/// Liveness is checked with `waitpid(pid, WNOHANG)` rather than `kill(pid, 0)`
+/// to avoid the PID-recycle hazard: if the child already exited and its PID was
+/// recycled by the kernel, `kill(pid, 0)` would succeed (alive) and we would
+/// SIGKILL an unrelated process. `waitpid(pid)` returns `ECHILD` for a PID
+/// that is not our child (already reaped or recycled), so we never signal a
+/// stranger.
 pub async fn stop_process(pid: u32, signal: Option<i32>) -> Result<(), ProcessError> {
     let sig = signal.unwrap_or(libc::SIGTERM);
     info!("Stopping PID {} with signal {}", pid, sig);
@@ -277,22 +312,29 @@ pub async fn stop_process(pid: u32, signal: Option<i32>) -> Result<(), ProcessEr
     // Give it a moment to exit
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Check if still alive
-    match send_signal(pid, 0) {
-        Ok(()) => {
-            // Still alive — escalate to SIGKILL
-            warn!(
-                "PID {} still alive after signal {}, sending SIGKILL",
-                pid, sig
-            );
-            let _ = send_signal(pid, libc::SIGKILL);
-        }
-        Err(ProcessError::NotFound(_)) => {
-            debug!("PID {} exited after signal {}", pid, sig);
-        }
-        Err(e) => {
-            debug!("Error checking PID {} status: {}", pid, e);
-        }
+    // Check if the child has exited using waitpid on the specific PID.
+    // Returns:
+    //   0   — child still running
+    //   pid — child exited, status reaped
+    //  -1   — ECHILD: not our child (already reaped by the global reaper, or
+    //         PID was recycled). Either way, do NOT escalate to SIGKILL.
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if ret == 0 {
+        warn!(
+            "PID {} still alive after signal {}, sending SIGKILL",
+            pid, sig
+        );
+        let _ = send_signal(pid, libc::SIGKILL);
+        // Reap the killed child if we can (best-effort; the global reaper may
+        // race us, which is harmless).
+        let mut s: libc::c_int = 0;
+        let _ = unsafe { libc::waitpid(pid as libc::pid_t, &mut s, libc::WNOHANG) };
+    } else {
+        debug!(
+            "PID {} exited after signal {} (waitpid ret={})",
+            pid, sig, ret
+        );
     }
 
     Ok(())
@@ -325,7 +367,24 @@ pub fn unfreeze_process(pid: u32, cgroup_path: Option<&str>) -> Result<(), Proce
 
 /// Start the background task to listen for child process exits.
 /// When a child exits, its PID and exit code are sent through the channel.
-pub fn start_child_reaper(tx: tokio::sync::mpsc::Sender<(u32, i32)>) {
+///
+/// When running as PID 1 (or with `MESH_INIT_REAP_ALL=1`), uses
+/// `waitpid(-1, WNOHANG)` to reap any child. When not PID 1, this is dangerous
+/// because `waitpid(-1)` reaps *every* child of the process, stealing exit
+/// notifications from any other `Child::wait()` caller in the same process
+/// (e.g. libraries that spawn helper processes). In that case we instead reap
+/// only PIDs that the caller registers via the returned `tracked_pids` set.
+pub fn start_child_reaper(
+    tx: tokio::sync::mpsc::Sender<(u32, i32)>,
+) -> std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<u32>>> {
+    let tracked_pids =
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+    let reap_all = is_pid1()
+        || std::env::var("MESH_INIT_REAP_ALL")
+            .map(|v| v.trim().eq_ignore_ascii_case("1") || v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let tracked = tracked_pids.clone();
+
     tokio::spawn(async move {
         let mut sigchld = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
         {
@@ -339,26 +398,58 @@ pub fn start_child_reaper(tx: tokio::sync::mpsc::Sender<(u32, i32)>) {
         loop {
             sigchld.recv().await;
 
-            loop {
-                let mut status = 0;
-                let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-                if pid <= 0 {
-                    break;
+            if reap_all {
+                // PID 1: reap all children.
+                loop {
+                    let mut status = 0;
+                    let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                    if pid <= 0 {
+                        break;
+                    }
+                    let exit_code = exit_code_from_status(status);
+                    debug!("Reaped child PID {} with exit code {}", pid, exit_code);
+                    let _ = tx.send((pid as u32, exit_code)).await;
                 }
-
-                let exit_code = if libc::WIFEXITED(status) {
-                    libc::WEXITSTATUS(status)
-                } else if libc::WIFSIGNALED(status) {
-                    -libc::WTERMSIG(status)
-                } else {
-                    -1
-                };
-
-                debug!("Reaped child PID {} with exit code {}", pid, exit_code);
-                let _ = tx.send((pid as u32, exit_code)).await;
+            } else {
+                // Not PID 1: reap only tracked PIDs to avoid stealing reaps
+                // from other Child::wait() callers in this process.
+                let pids: Vec<u32> = tracked.lock().iter().copied().collect();
+                for pid in pids {
+                    let mut status = 0;
+                    let ret =
+                        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                    if ret == pid as libc::pid_t {
+                        let exit_code = exit_code_from_status(status);
+                        debug!(
+                            "Reaped tracked child PID {} with exit code {}",
+                            pid, exit_code
+                        );
+                        tracked.lock().remove(&pid);
+                        let _ = tx.send((pid, exit_code)).await;
+                    } else if ret > 0 {
+                        // reaped but pid mismatch (shouldn't happen for specific pid)
+                        tracked.lock().remove(&pid);
+                    }
+                    // ret == 0: still running; ret < 0: already reaped or not ours
+                    if ret < 0 {
+                        tracked.lock().remove(&pid);
+                    }
+                }
             }
         }
     });
+
+    tracked_pids
+}
+
+fn exit_code_from_status(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        -libc::WTERMSIG(status)
+    } else {
+        -1
+    }
 }
 
 /// Check if the current process is PID 1.

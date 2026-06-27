@@ -9,6 +9,7 @@ use pmond::{
     ProcessDetailedInfo,
 };
 use rmcp::{
+    RoleServer,
     handler::server::ServerHandler,
     model::{
         Annotated, CallToolResult, ErrorCode, ErrorData, Implementation, InitializeRequestParam,
@@ -18,10 +19,9 @@ use rmcp::{
         Tool, ToolsCapability,
     },
     service::RequestContext,
-    RoleServer,
 };
 use schemars::schema_for;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// MCP handler for the Process Memory monitor.

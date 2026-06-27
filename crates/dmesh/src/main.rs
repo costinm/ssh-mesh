@@ -115,8 +115,10 @@ fn dirs_or_default(var: &str) -> String {
 
 fn ctrlc_or_wait(tx: std::sync::mpsc::Sender<()>) {
     // Wait for Ctrl-C or indefinitely
-    std::thread::spawn(move || loop {
-        std::thread::park();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::park();
+        }
     });
     // Try to install Ctrl-C handler; if that fails, just block forever
     let _ = std::thread::Builder::new()

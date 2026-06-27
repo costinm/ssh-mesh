@@ -15,7 +15,6 @@ use russh::server::Server;
 use rust_embed::RustEmbed;
 use std::io::{IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::Path;
 use std::sync::Arc;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
@@ -51,8 +50,15 @@ use crate::AppState;
 pub struct ApiDoc;
 
 /// Serve a JSON file from the `web/` directory by path.
+///
+/// The path is confined to the `web/` directory: any `..` components or
+/// absolute paths are rejected to prevent traversal.
 async fn serve_json(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
-    let file_path = format!("web/{}", path);
+    let confined = confine_to_web_dir(&path);
+    let file_path = match confined {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, "invalid path").into_response(),
+    };
     match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => (
             StatusCode::OK,
@@ -61,6 +67,31 @@ async fn serve_json(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
         )
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, format!("{} not found", path)).into_response(),
+    }
+}
+
+/// Resolve a request path to a filesystem path confined within the `web/`
+/// directory. Returns `None` if the path escapes `web/` (via `..`, absolute
+/// paths, or symlink resolution outside the root).
+fn confine_to_web_dir(request_path: &str) -> Option<std::path::PathBuf> {
+    let web_root = std::path::Path::new("web");
+    let web_root_canonical = std::fs::canonicalize(web_root).ok()?;
+    let joined = web_root.join(request_path.trim_start_matches('/'));
+    // Canonicalize if the file exists; otherwise canonicalize the parent and
+    // re-append the leaf so not-yet-existing files are still checked.
+    let canonical = match std::fs::canonicalize(&joined) {
+        Ok(c) => c,
+        Err(_) => {
+            let parent = joined.parent()?;
+            let leaf = joined.file_name()?;
+            let parent_canonical = std::fs::canonicalize(parent).ok()?;
+            parent_canonical.join(leaf)
+        }
+    };
+    if canonical.starts_with(&web_root_canonical) {
+        Some(canonical)
+    } else {
+        None
     }
 }
 
@@ -135,10 +166,9 @@ pub async fn handle_web_request(
     AxumPath(path): AxumPath<String>,
 ) -> impl axum::response::IntoResponse {
     let path = path.trim_start_matches('/');
-    // Check local filesystem first (for dev)
-    let local_path = Path::new("web").join(path);
-
-    if local_path.is_file()
+    // Check local filesystem first (for dev), confined to web/.
+    if let Some(local_path) = confine_to_web_dir(path)
+        && local_path.is_file()
         && let Ok(content) = std::fs::read(&local_path)
     {
         let mime = mime_for_path(&local_path.to_string_lossy());
@@ -167,9 +197,15 @@ pub async fn handle_web_request(
 /// Serve the main SSH web UI (ssh.html) as the index page.
 async fn serve_index() -> impl IntoResponse {
     match Assets::get("ssh.html") {
-        Some(content) => Html(std::str::from_utf8(&content.data).unwrap().to_string()),
+        Some(content) => Html(String::from_utf8_lossy(&content.data).into_owned()),
         None => Html("<h1>Error: ssh.html not found</h1>".to_string()),
     }
+}
+
+fn response_with_status(status: StatusCode, body: Body) -> Response {
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
 }
 
 #[utoipa::path(
@@ -220,11 +256,7 @@ pub async fn handle_ssh_request(
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
     // Create the bidirectional stream adapter
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     let handler_id = handler.id;
     let connected_clients = ssh_server.connected_clients.clone();
@@ -253,17 +285,14 @@ pub async fn handle_ssh_request(
             let response_stream =
                 tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-            Response::builder()
-                .status(200)
-                .body(Body::from_stream(response_stream))
-                .unwrap()
+            response_with_status(StatusCode::OK, Body::from_stream(response_stream))
         }
         Err(e) => {
             tracing_error!("Failed to start SSH session: {:?}", e);
-            Response::builder()
-                .status(500)
-                .body(Body::from(format!("SSH session failed: {:?}", e)))
-                .unwrap()
+            response_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Body::from(format!("SSH session failed: {:?}", e)),
+            )
         }
     }
 }
@@ -346,11 +375,7 @@ pub async fn handle_tcp_proxy(
     // Spawn task to read from HTTP request body and feed to adapter
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     // Forward data between the HTTP/2 stream and the TCP connection
     tokio::spawn(async move {
@@ -366,11 +391,7 @@ pub async fn handle_tcp_proxy(
     let response_stream =
         tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-    Response::builder()
-        .status(200)
-        .body(Body::from_stream(response_stream))
-        .unwrap()
-        .into_response()
+    response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
 /// Unix domain socket proxy handler.
@@ -426,11 +447,7 @@ pub async fn handle_uds_proxy(
     // Spawn task to read from HTTP request body and feed to adapter
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     // Forward data between the HTTP/2 stream and the UDS connection
     tokio::spawn(async move {
@@ -446,11 +463,7 @@ pub async fn handle_uds_proxy(
     let response_stream =
         tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-    Response::builder()
-        .status(200)
-        .body(Body::from_stream(response_stream))
-        .unwrap()
-        .into_response()
+    response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
 async fn open_mesh_init_exec_stream(
@@ -600,11 +613,7 @@ pub async fn handle_exec(
     // Spawn task to read from HTTP request body and feed to adapter
     tokio::spawn(pipe_body_to_tx(req.into_body(), reader_tx));
 
-    let stream = crate::utils::ChannelStream {
-        reader: reader_rx,
-        writer: writer_tx,
-        read_buf: bytes::BytesMut::new(),
-    };
+    let stream = crate::utils::ChannelStream::new(reader_rx, writer_tx);
 
     // Forward data between the HTTP/2 stream and the child process
     tokio::spawn(async move {
@@ -621,11 +630,7 @@ pub async fn handle_exec(
     let response_stream =
         tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
 
-    Response::builder()
-        .status(200)
-        .body(Body::from_stream(response_stream))
-        .unwrap()
-        .into_response()
+    response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
 /// WebSocket handler for SSH-over-WS at `/_m/_ws/_ssh`.
@@ -811,12 +816,29 @@ pub async fn handle_proxy_request(
     };
 
     let (mut parts, body) = req.into_parts();
-    parts.uri = uri_str.parse().unwrap();
+    parts.uri = match uri_str.parse() {
+        Ok(uri) => uri,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("invalid proxy target URI {uri_str}: {error}"),
+            )
+                .into_response();
+        }
+    };
 
     // Update Host header
-    parts
-        .headers
-        .insert(hyper::header::HOST, target_addr.parse().unwrap());
+    let host = match target_addr.parse() {
+        Ok(host) => host,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("invalid proxy host header {target_addr}: {error}"),
+            )
+                .into_response();
+        }
+    };
+    parts.headers.insert(hyper::header::HOST, host);
 
     let proxy_req = hyper::Request::from_parts(parts, body);
 

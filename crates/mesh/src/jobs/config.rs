@@ -55,15 +55,14 @@ impl JobConfig {
                 oom_score_adjust: self.oom_score_adjust,
             },
             resources: crate::config::ResourceLimits {
-                // These are resolved in runtime, saving doesn't reconstruct human strings currently
-                // Usually we don't save back these configs dynamically anyway.
-                memory_low: None,
-                memory_high: None,
-                memory_max: None,
+                memory_low: memory_limit_to_toml(self.resources.memory_low),
+                memory_high: memory_limit_to_toml(self.resources.memory_high),
+                memory_max: memory_limit_to_toml(self.resources.memory_max),
                 cpu_weight: self.resources.cpu_weight,
             },
             environment: self.env.clone(),
             activation: self.activation.clone(),
+            network: self.network.clone(),
             schedule: self.schedule.clone(),
             constraints: self.constraints.clone(),
             backoff: self.backoff.clone(),
@@ -93,6 +92,25 @@ impl JobConfig {
         fs::write(&path, content)
             .await
             .context("Failed to write JobConfig")
+    }
+}
+
+fn memory_limit_to_toml(limit: Option<u64>) -> Option<String> {
+    limit.map(|bytes| bytes.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::memory_limit_to_toml;
+
+    #[test]
+    fn memory_limit_to_toml_preserves_byte_values() {
+        assert_eq!(memory_limit_to_toml(None), None);
+        assert_eq!(memory_limit_to_toml(Some(0)), Some("0".to_string()));
+        assert_eq!(
+            memory_limit_to_toml(Some(512 * 1024 * 1024)),
+            Some("536870912".to_string())
+        );
     }
 }
 

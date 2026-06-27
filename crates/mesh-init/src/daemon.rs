@@ -3,7 +3,8 @@
 //! Manages service lifecycle: loads configs, starts system services,
 //! handles control requests, manages signal handling and zombie reaping.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{
     Arc,
@@ -17,12 +18,83 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{self, AppConfig};
 use crate::process::{self, ManagedProcess};
-use crate::protocol::{ActivationContext, Request, Response, ServiceState, ServiceStatus};
+use crate::protocol::{
+    ActivationContext, NamespaceKind, Request, Response, ServiceState, ServiceStatus,
+};
 use crate::resource::ResourceManager;
 
 // ============================================================================
 // Daemon
 // ============================================================================
+
+/// Default non-root UIDs permitted to act as a different user (i.e. spawn or
+/// control a process whose UID differs from the peer's).
+///
+/// - `1000` — the `system` service account
+///
+/// In addition, the configurable sshd UID (resolved via
+/// `mesh::auth::trusted_sshd_uid`, env var `MESH_TRUSTED_SSHD_UID`, default
+/// 103) is included, since sshd must spawn shells as other users.
+///
+/// Root (UID 0) is always privileged. The full list can be overridden with the
+/// `MESH_INIT_PRIVILEGED_UIDS` env var (comma-separated).
+const DEFAULT_SYSTEM_UID: u32 = 1000;
+
+/// Resolve the set of UIDs permitted to act as a different user (i.e. spawn
+/// or control a process whose UID differs from the peer's).
+///
+/// If `MESH_INIT_PRIVILEGED_UIDS` is set, it fully overrides the default list.
+/// Otherwise the list is `[0, 1000]` plus the sshd UID from
+/// [`mesh::auth::trusted_sshd_uid`] (if `Some`).
+fn privileged_uids() -> Vec<u32> {
+    if let Ok(v) = std::env::var("MESH_INIT_PRIVILEGED_UIDS") {
+        let parsed: Vec<u32> = v
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    let mut uids = vec![0, DEFAULT_SYSTEM_UID];
+    if let Some(sshd) = mesh::auth::trusted_sshd_uid() {
+        if !uids.contains(&sshd) {
+            uids.push(sshd);
+        }
+    }
+    uids
+}
+
+/// Check whether `peer_uid` is permitted to act as `target_uid`/`target_gid`.
+///
+/// Privileged UIDs (see [`privileged_uids`]) may target any UID. A non-
+/// privileged peer may only target its own UID. Returns `Ok(())` if allowed,
+/// or `Err(Response)` with a permission-denied response.
+fn check_impersonation(
+    peer_uid: u32,
+    target_uid: u32,
+    target_gid: Option<u32>,
+    name: &str,
+) -> Result<(), Response> {
+    if privileged_uids().contains(&peer_uid) {
+        return Ok(());
+    }
+    if target_uid != peer_uid {
+        return Err(Response::err(format!(
+            "permission denied: peer UID {} may not operate on service '{}' (UID {})",
+            peer_uid, name, target_uid
+        )));
+    }
+    if let Some(g) = target_gid
+        && g != peer_uid
+    {
+        return Err(Response::err(format!(
+            "permission denied: peer UID {} may not operate on service '{}' (GID {})",
+            peer_uid, name, g
+        )));
+    }
+    Ok(())
+}
 
 fn preferred_shell() -> &'static str {
     if std::path::Path::new("/opt/busybox/bin/sh").is_file() {
@@ -54,6 +126,8 @@ pub struct Daemon {
     terminal_sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
     next_terminal_id: AtomicU64,
     resource_manager: Option<ResourceManager>,
+    /// Set of tracked child PIDs for the reaper (only used when not PID 1).
+    tracked_child_pids: Mutex<Option<Arc<parking_lot::Mutex<std::collections::HashSet<u32>>>>>,
 }
 
 struct TerminalSession {
@@ -82,6 +156,7 @@ impl Daemon {
             terminal_sessions: Arc::new(Mutex::new(HashMap::new())),
             next_terminal_id: AtomicU64::new(1),
             resource_manager,
+            tracked_child_pids: Mutex::new(None),
         })
     }
 
@@ -157,7 +232,10 @@ impl Daemon {
     /// Spawn the child process manager (zombie reaper + restart loop).
     pub fn start_child_manager(self: &Arc<Self>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        process::start_child_reaper(tx);
+        let tracked = process::start_child_reaper(tx);
+        // Store the tracked PIDs set so spawn sites can register children when
+        // the reaper is not in catch-all (PID 1) mode.
+        *self.tracked_child_pids.lock() = Some(tracked);
 
         let daemon_clone = self.clone();
         tokio::spawn(async move {
@@ -176,19 +254,22 @@ impl Daemon {
     }
 
     /// Handle a control protocol request.
-    pub async fn handle_request(&self, request: Request) -> Response {
+    pub async fn handle_request(&self, request: Request, peer_uid: u32) -> Response {
         match request {
             Request::Start {
                 name,
                 args,
                 env,
                 context,
-            } => self.handle_start(&name, args, env, context),
+            } => self.handle_start(&name, args, env, context, peer_uid),
             Request::PrepareActivation { name, context } => {
                 self.prepare_activation_context(name, context)
             }
             Request::StartTerminal { .. } => {
                 Response::err("start_terminal requires a passed file descriptor")
+            }
+            Request::RegisterNamespace { .. } => {
+                Response::err("register_namespace requires a passed file descriptor")
             }
             Request::TerminalResize {
                 terminal_id,
@@ -208,9 +289,9 @@ impl Daemon {
                 command,
                 data,
             } => self.handle_terminal_command(&terminal_id, &command, data),
-            Request::Stop { name, signal } => self.handle_stop(&name, signal).await,
-            Request::Freeze { name } => self.handle_freeze(&name),
-            Request::Unfreeze { name } => self.handle_unfreeze(&name),
+            Request::Stop { name, signal } => self.handle_stop(&name, signal, peer_uid).await,
+            Request::Freeze { name } => self.handle_freeze(&name, peer_uid),
+            Request::Unfreeze { name } => self.handle_unfreeze(&name, peer_uid),
             Request::Status { name } => self.handle_status(name.as_deref()),
             Request::Shutdown => self.handle_shutdown().await,
             Request::Reload => self.handle_reload(),
@@ -227,7 +308,12 @@ impl Daemon {
     }
 
     /// Handle a control request that carries one Unix file descriptor.
-    pub async fn handle_request_with_fd(&self, request: Request, fd: OwnedFd) -> Response {
+    pub async fn handle_request_with_fd(
+        &self,
+        request: Request,
+        fd: OwnedFd,
+        peer_uid: u32,
+    ) -> Response {
         match request {
             Request::StartTerminal {
                 name,
@@ -239,7 +325,14 @@ impl Daemon {
                 context,
                 command,
                 ..
-            } => self.handle_start_terminal(&name, &home, uid, gid, pty, env, context, command, fd),
+            } => self.handle_start_terminal(
+                &name, &home, uid, gid, pty, env, context, command, fd, peer_uid,
+            ),
+            Request::RegisterNamespace {
+                name,
+                kind,
+                target_pid,
+            } => self.handle_register_namespace(&name, kind, target_pid, fd, peer_uid),
             _ => Response::err("request does not accept a passed file descriptor"),
         }
     }
@@ -248,13 +341,122 @@ impl Daemon {
     // Request Handlers
     // ========================================================================
 
+    fn handle_register_namespace(
+        &self,
+        name: &str,
+        kind: NamespaceKind,
+        target_pid: Option<u32>,
+        fd: OwnedFd,
+        peer_uid: u32,
+    ) -> Response {
+        if let Err(reason) = crate::config::validate_cgroup_name(name) {
+            return Response::err(format!("invalid service name: {reason}"));
+        }
+
+        let attach = {
+            let mut services = self.services.lock();
+            let Some(proc) = services.get_mut(name) else {
+                return Response::err(format!("service '{}' not found", name));
+            };
+            if proc.pid.is_none() {
+                return Response::err(format!("service '{}' is not running", name));
+            }
+            if let Err(resp) = check_impersonation(
+                peer_uid,
+                proc.config.uid.unwrap_or(peer_uid),
+                proc.config.gid,
+                name,
+            ) {
+                return resp;
+            }
+
+            let fd_num = fd.as_raw_fd();
+            match kind {
+                NamespaceKind::Net => {
+                    proc.netns_fd = Some(fd);
+                    proc.namespace_pid = target_pid.or(proc.namespace_pid);
+                    proc.mesh_tun_attached = false;
+                    info!(
+                        "Registered netns fd {} for service '{}' from peer UID {}",
+                        fd_num, name, peer_uid
+                    );
+                }
+                NamespaceKind::User => {
+                    proc.userns_fd = Some(fd);
+                    proc.namespace_pid = target_pid.or(proc.namespace_pid);
+                    proc.mesh_tun_attached = false;
+                    info!(
+                        "Registered userns fd {} for service '{}' from peer UID {}",
+                        fd_num, name, peer_uid
+                    );
+                }
+            }
+
+            if proc.config.network.backend == mesh::config::NetworkBackend::MeshTun
+                && proc.netns_fd.is_some()
+                && !proc.mesh_tun_attached
+            {
+                let service_pid = proc.namespace_pid.or(proc.pid).expect("checked running");
+                let userns_path = proc
+                    .userns_fd
+                    .as_ref()
+                    .map(|_| format!("/proc/{service_pid}/ns/user"));
+                Some((
+                    proc.config.name.clone(),
+                    proc.config.network.clone(),
+                    format!("/proc/{service_pid}/ns/net"),
+                    userns_path,
+                ))
+            } else {
+                None
+            }
+        };
+
+        if let Some((service_name, network, netns_path, userns_path)) = attach {
+            if let Err(error) = crate::network::attach_mesh_tun(
+                &service_name,
+                &network,
+                &netns_path,
+                userns_path.as_deref(),
+            ) {
+                return Response::err(error.to_string());
+            }
+            if let Some(proc) = self.services.lock().get_mut(name) {
+                proc.mesh_tun_attached = true;
+            }
+        }
+
+        Response::ok_with_data(serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "registered": true
+        }))
+    }
+
     fn handle_start(
         &self,
         name: &str,
         extra_args: Vec<String>,
         extra_env: HashMap<String, String>,
         context: Option<ActivationContext>,
+        peer_uid: u32,
     ) -> Response {
+        // Reject names that could escape the config/cgroup directories.
+        if let Err(reason) = crate::config::validate_cgroup_name(name) {
+            return Response::err(format!("invalid service name: {reason}"));
+        }
+        // Authorization: a non-privileged peer may only start services whose
+        // config uid matches its own. Privileged UIDs may start any service.
+        {
+            let configs = self.configs.lock();
+            if let Some(cfg) = configs.get(name) {
+                if let Err(resp) =
+                    check_impersonation(peer_uid, cfg.uid.unwrap_or(peer_uid), cfg.gid, name)
+                {
+                    return resp;
+                }
+            }
+        }
         // Attempt to reload the config from disk before checking state
         let mut config = {
             let mut configs = self.configs.lock();
@@ -379,7 +581,18 @@ impl Daemon {
         context: Option<ActivationContext>,
         command: Option<String>,
         fd: OwnedFd,
+        peer_uid: u32,
     ) -> Response {
+        if let Err(reason) = crate::config::validate_cgroup_name(name) {
+            return Response::err(format!("invalid service name: {reason}"));
+        }
+        // Authorization: a non-privileged peer may only spawn processes as
+        // itself. Privileged UIDs (root, system, sshd — see `privileged_uids`)
+        // may target any UID. This prevents privilege escalation where an
+        // authorized non-privileged peer requests uid=0.
+        if let Err(resp) = check_impersonation(peer_uid, uid, gid, name) {
+            return resp;
+        }
         let home_path = std::path::Path::new(home);
         if !home_path.is_dir() {
             return Response::err(format!("home directory '{}' does not exist", home));
@@ -454,6 +667,15 @@ impl Daemon {
             config.command = preferred_shell().to_string();
             config.args = vec!["-c".to_string(), command];
             config.oneshot = true;
+        }
+
+        // Final authorization guard on the resolved config. The config file
+        // may have specified a uid different from the request; a non-privileged
+        // peer must not benefit from that.
+        if let Err(resp) =
+            check_impersonation(peer_uid, config.uid.unwrap_or(peer_uid), config.gid, name)
+        {
+            return resp;
         }
 
         let cg =
@@ -593,23 +815,40 @@ impl Daemon {
         context
     }
 
-    async fn handle_stop(&self, name: &str, signal: Option<i32>) -> Response {
-        let pid = {
+    async fn handle_stop(&self, name: &str, signal: Option<i32>, peer_uid: u32) -> Response {
+        if let Err(reason) = crate::config::validate_cgroup_name(name) {
+            return Response::err(format!("invalid service name: {reason}"));
+        }
+        let (pid, network_pid) = {
             let mut services = self.services.lock();
             match services.get_mut(name) {
                 Some(proc)
                     if proc.state == ServiceState::Running
                         || proc.state == ServiceState::Frozen =>
                 {
+                    // Authorization: a non-privileged peer may only stop
+                    // services running as its own UID.
+                    let svc_uid = proc.config.uid.unwrap_or(peer_uid);
+                    let svc_gid = proc.config.gid;
+                    if let Err(resp) = check_impersonation(peer_uid, svc_uid, svc_gid, name) {
+                        return resp;
+                    }
                     proc.state = ServiceState::Stopping;
                     proc.target_state = ServiceState::Stopped;
-                    proc.pid
+                    proc.netns_fd = None;
+                    proc.userns_fd = None;
+                    proc.namespace_pid = None;
+                    proc.mesh_tun_attached = false;
+                    (proc.pid, proc.network_pid)
                 }
                 Some(_) => return Response::err(format!("service '{}' is not running", name)),
                 None => return Response::err(format!("service '{}' not found", name)),
             }
         };
 
+        if let Some(network_pid) = network_pid {
+            let _ = process::send_signal(network_pid, libc::SIGTERM);
+        }
         if let Some(pid) = pid
             && let Err(e) = process::stop_process(pid, signal).await
         {
@@ -623,6 +862,11 @@ impl Daemon {
             if let Some(proc) = services.get_mut(name) {
                 proc.state = ServiceState::Stopped;
                 proc.pid = None;
+                proc.network_pid = None;
+                proc.netns_fd = None;
+                proc.userns_fd = None;
+                proc.namespace_pid = None;
+                proc.mesh_tun_attached = false;
             }
         }
 
@@ -630,13 +874,23 @@ impl Daemon {
         Response::ok()
     }
 
-    fn handle_freeze(&self, name: &str) -> Response {
+    fn handle_freeze(&self, name: &str, peer_uid: u32) -> Response {
+        if let Err(reason) = crate::config::validate_cgroup_name(name) {
+            return Response::err(format!("invalid service name: {reason}"));
+        }
         let mut services = self.services.lock();
         let proc = match services.get_mut(name) {
             Some(p) if p.state == ServiceState::Running => p,
             Some(_) => return Response::err(format!("service '{}' is not running", name)),
             None => return Response::err(format!("service '{}' not found", name)),
         };
+        // Authorization: a non-privileged peer may only freeze services
+        // running as its own UID.
+        let svc_uid = proc.config.uid.unwrap_or(peer_uid);
+        let svc_gid = proc.config.gid;
+        if let Err(resp) = check_impersonation(peer_uid, svc_uid, svc_gid, name) {
+            return resp;
+        }
 
         if let Some(pid) = proc.pid {
             if let Err(e) = process::freeze_process(pid, proc.cgroup_path.as_deref()) {
@@ -649,13 +903,23 @@ impl Daemon {
         Response::ok()
     }
 
-    fn handle_unfreeze(&self, name: &str) -> Response {
+    fn handle_unfreeze(&self, name: &str, peer_uid: u32) -> Response {
+        if let Err(reason) = crate::config::validate_cgroup_name(name) {
+            return Response::err(format!("invalid service name: {reason}"));
+        }
         let mut services = self.services.lock();
         let proc = match services.get_mut(name) {
             Some(p) if p.state == ServiceState::Frozen => p,
             Some(_) => return Response::err(format!("service '{}' is not frozen", name)),
             None => return Response::err(format!("service '{}' not found", name)),
         };
+        // Authorization: a non-privileged peer may only unfreeze services
+        // running as its own UID.
+        let svc_uid = proc.config.uid.unwrap_or(peer_uid);
+        let svc_gid = proc.config.gid;
+        if let Err(resp) = check_impersonation(peer_uid, svc_uid, svc_gid, name) {
+            return resp;
+        }
 
         if let Some(pid) = proc.pid {
             if let Err(e) = process::unfreeze_process(pid, proc.cgroup_path.as_deref()) {
@@ -772,6 +1036,15 @@ impl Daemon {
 
         let mut services = self.services.lock();
         for (name, proc) in services.iter_mut() {
+            if proc.network_pid == Some(pid) {
+                info!(
+                    "Network sidecar for service '{}' (PID {}) exited with code {}",
+                    name, pid, exit_code
+                );
+                proc.network_pid = None;
+                return;
+            }
+
             if proc.pid == Some(pid) {
                 let intentionally_stopped = proc.target_state == ServiceState::Stopped;
                 info!(
@@ -781,6 +1054,13 @@ impl Daemon {
 
                 proc.state = ServiceState::Stopped;
                 proc.pid = None;
+                proc.netns_fd = None;
+                proc.userns_fd = None;
+                proc.namespace_pid = None;
+                proc.mesh_tun_attached = false;
+                if let Some(network_pid) = proc.network_pid.take() {
+                    let _ = process::send_signal(network_pid, libc::SIGTERM);
+                }
 
                 if proc.config.oneshot {
                     proc.target_state = ServiceState::Stopped;
@@ -818,13 +1098,16 @@ impl Daemon {
                         backoff_secs = backoff_secs.min(24 * 3600);
                     }
 
+                    let restart_delay_secs = restart_delay_with_jitter(name, backoff_secs);
+
                     info!(
                         "Service '{}' crashed. Scheduling restart #{} in {}s",
-                        name, proc.consecutive_failures, backoff_secs
+                        name, proc.consecutive_failures, restart_delay_secs
                     );
 
                     proc.next_restart_at = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(restart_delay_secs),
                     );
                 }
 
@@ -889,9 +1172,11 @@ impl Daemon {
                         // Increase failure count
                         proc.consecutive_failures += 1;
                         let backoff_secs = (1 << (proc.consecutive_failures - 1)).min(60);
+                        let restart_delay_secs =
+                            restart_delay_with_jitter(&config.name, backoff_secs);
                         proc.next_restart_at = Some(
                             std::time::Instant::now()
-                                + std::time::Duration::from_secs(backoff_secs as u64),
+                                + std::time::Duration::from_secs(restart_delay_secs),
                         );
                     }
                 }
@@ -939,26 +1224,102 @@ impl Daemon {
 
         let cg = cgroup_path.as_deref().unwrap_or("/sys/fs/cgroup");
 
-        // Spawn process
-        let pid = process::spawn_process(&config, cg, passed_fd)?;
+        // B9: Guard against double-spawn. If another caller (e.g. check_restarts)
+        // already transitioned this service to `Starting`, refuse to spawn again
+        // to avoid two processes for the same service.
+        {
+            let services = self.services.lock();
+            if let Some(proc) = services.get(&name) {
+                if proc.state == ServiceState::Starting && proc.pid.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "service '{}' is already starting (double-spawn prevented)",
+                        name
+                    ));
+                }
+                if proc.state == ServiceState::Running && proc.pid.is_some() {
+                    // Already running; let the caller decide via handle_start's
+                    // restart logic. Return the existing pid.
+                    if let Some(pid) = proc.pid {
+                        return Ok(pid);
+                    }
+                }
+            }
+        }
 
-        // Register managed process. If it exists, update it, otherwise create new.
-        let mut services = self.services.lock();
-        if let Some(proc) = services.get_mut(&name) {
-            proc.state = ServiceState::Running;
-            proc.target_state = ServiceState::Running;
-            proc.pid = Some(pid);
-            proc.started_at = Some(std::time::Instant::now());
-            proc.cgroup_path = cgroup_path;
-            proc.config = config; // update config just in case
-        } else {
-            let mut proc = ManagedProcess::new(config);
-            proc.state = ServiceState::Running;
-            proc.target_state = ServiceState::Running;
-            proc.pid = Some(pid);
-            proc.started_at = Some(std::time::Instant::now());
-            proc.cgroup_path = cgroup_path;
-            services.insert(name.clone(), proc);
+        // B5: Register the service in `Starting` state BEFORE spawning, so
+        // that the SIGCHLD reaper can match a fast-exiting child's PID. If the
+        // child exits before we insert, the exit event is lost and the daemon
+        // believes a dead service is Running.
+        {
+            let mut services = self.services.lock();
+            if let Some(proc) = services.get_mut(&name) {
+                proc.state = ServiceState::Starting;
+                proc.target_state = ServiceState::Running;
+                proc.pid = None;
+                proc.network_pid = None;
+                proc.netns_fd = None;
+                proc.userns_fd = None;
+                proc.namespace_pid = None;
+                proc.mesh_tun_attached = false;
+            } else {
+                let mut proc = ManagedProcess::new(config.clone());
+                proc.state = ServiceState::Starting;
+                proc.target_state = ServiceState::Running;
+                services.insert(name.clone(), proc);
+            }
+        }
+
+        // Spawn process
+        let pid = match process::spawn_process(&config, cg, passed_fd) {
+            Ok(p) => p,
+            Err(e) => {
+                // Spawn failed: mark the service Stopped so it can be restarted.
+                let mut services = self.services.lock();
+                if let Some(proc) = services.get_mut(&name) {
+                    proc.state = ServiceState::Stopped;
+                    proc.pid = None;
+                }
+                return Err(e.into());
+            }
+        };
+
+        let network_sidecar = match crate::network::start_network_sidecar(&config, pid, cg) {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                let _ = process::send_signal(pid, libc::SIGTERM);
+                let mut services = self.services.lock();
+                if let Some(proc) = services.get_mut(&name) {
+                    proc.state = ServiceState::Stopped;
+                    proc.pid = None;
+                    proc.network_pid = None;
+                    proc.netns_fd = None;
+                    proc.userns_fd = None;
+                    proc.namespace_pid = None;
+                    proc.mesh_tun_attached = false;
+                }
+                return Err(error);
+            }
+        };
+
+        // Register the spawned PID with the reaper (when not in catch-all mode)
+        // and update the service state to Running.
+        {
+            if let Some(ref tracked) = *self.tracked_child_pids.lock() {
+                tracked.lock().insert(pid);
+                if let Some(sidecar) = &network_sidecar {
+                    tracked.lock().insert(sidecar.pid);
+                }
+            }
+            let mut services = self.services.lock();
+            if let Some(proc) = services.get_mut(&name) {
+                proc.state = ServiceState::Running;
+                proc.target_state = ServiceState::Running;
+                proc.pid = Some(pid);
+                proc.network_pid = network_sidecar.as_ref().map(|sidecar| sidecar.pid);
+                proc.started_at = Some(std::time::Instant::now());
+                proc.cgroup_path = cgroup_path;
+                proc.config = config;
+            }
         }
         info!("Service '{}' started with PID {}", name, pid);
 
@@ -992,6 +1353,15 @@ impl Daemon {
                 let _ = process::stop_process(pid, None).await;
             }
 
+            let network_pid = {
+                let services = self.services.lock();
+                services.get(&name).and_then(|p| p.network_pid)
+            };
+            if let Some(pid) = network_pid {
+                debug!("Stopping network sidecar for '{}' (PID {})", name, pid);
+                let _ = process::send_signal(pid, libc::SIGTERM);
+            }
+
             // Clean up cgroup
             let cgroup_path = {
                 let services = self.services.lock();
@@ -1006,6 +1376,17 @@ impl Daemon {
         let _ = std::fs::remove_file(&self.config.socket_path);
         info!("Daemon shutdown complete");
     }
+}
+
+fn restart_delay_with_jitter(service_name: &str, base_secs: u64) -> u64 {
+    if base_secs <= 1 {
+        return base_secs;
+    }
+
+    let jitter_window = (base_secs / 10).clamp(1, 30);
+    let mut hasher = DefaultHasher::new();
+    service_name.hash(&mut hasher);
+    base_secs.saturating_add(hasher.finish() % (jitter_window + 1))
 }
 
 // ============================================================================
@@ -1099,7 +1480,7 @@ priority = 300
         };
 
         let response = daemon
-            .handle_request_with_fd(request, OwnedFd::from(child_end))
+            .handle_request_with_fd(request, OwnedFd::from(child_end), current_uid)
             .await;
         assert!(response.success, "{:?}", response.error);
 
@@ -1114,7 +1495,7 @@ priority = 300
     }
 
     #[tokio::test]
-    async fn test_start_terminal_dynamic_config_uses_current_uid_for_user_daemon() {
+    async fn test_start_terminal_rejects_uid_mismatch_for_non_root_peer() {
         let cfg = DaemonConfig {
             config_dirs: vec![],
             socket_path: "/tmp/mesh-init-test.sock".to_string(),
@@ -1125,19 +1506,18 @@ priority = 300
         let home = tempfile::tempdir().unwrap();
 
         let (child_end, _parent_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Request a uid different from the peer's (current_uid).
+        let requested_uid = if current_uid == 0 {
+            // root peer is allowed to spawn as any uid; nothing to test here.
+            return;
+        } else {
+            current_uid.saturating_add(1)
+        };
         let request = Request::StartTerminal {
             name: "dynamic-user".to_string(),
             home: home.path().to_string_lossy().into_owned(),
-            uid: if current_uid == 0 {
-                current_uid
-            } else {
-                current_uid.saturating_add(1)
-            },
-            gid: Some(if current_uid == 0 {
-                current_gid
-            } else {
-                current_gid.saturating_add(1)
-            }),
+            uid: requested_uid,
+            gid: Some(current_gid.saturating_add(1)),
             env: HashMap::new(),
             pty: false,
             context: None,
@@ -1145,22 +1525,146 @@ priority = 300
             fd_count: None,
         };
 
+        // Pass peer_uid = current_uid (the actual non-root user).
         let response = daemon
-            .handle_request_with_fd(request, OwnedFd::from(child_end))
+            .handle_request_with_fd(request, OwnedFd::from(child_end), current_uid)
             .await;
-        assert!(response.success, "{:?}", response.error);
-
-        let pid = response
-            .data
-            .as_ref()
-            .and_then(|data| data.get("pid"))
-            .and_then(|pid| pid.as_u64())
-            .expect("pid in response") as u32;
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         assert!(
-            status.contains(&format!("Uid:\t{}", current_uid)),
-            "{status}"
+            !response.success,
+            "non-root peer must not be able to spawn as a different uid; got success: {:?}",
+            response.data
         );
-        let _ = process::send_signal(pid, libc::SIGTERM);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("permission denied")),
+            "expected permission-denied error, got: {:?}",
+            response.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_namespace_stores_netns_fd() {
+        let cfg = DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test.sock".to_string(),
+        };
+        let daemon = Daemon::new(cfg);
+        let current_uid = unsafe { libc::getuid() };
+        let mut proc = ManagedProcess::new(AppConfig {
+            name: "net-svc".to_string(),
+            command: "/bin/sleep".to_string(),
+            args: vec!["60".to_string()],
+            uid: Some(current_uid),
+            ..Default::default()
+        });
+        proc.state = ServiceState::Running;
+        proc.target_state = ServiceState::Running;
+        proc.pid = Some(1234);
+        daemon.services.lock().insert("net-svc".to_string(), proc);
+
+        let (child_end, _parent_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let response = daemon
+            .handle_request_with_fd(
+                Request::RegisterNamespace {
+                    name: "net-svc".to_string(),
+                    kind: NamespaceKind::Net,
+                    target_pid: None,
+                },
+                OwnedFd::from(child_end),
+                current_uid,
+            )
+            .await;
+
+        assert!(response.success, "{:?}", response.error);
+        let status = daemon
+            .services
+            .lock()
+            .get("net-svc")
+            .expect("service")
+            .status();
+        assert!(status.netns_registered);
+    }
+
+    #[tokio::test]
+    async fn test_register_namespace_rejects_unknown_service() {
+        let cfg = DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test.sock".to_string(),
+        };
+        let daemon = Daemon::new(cfg);
+        let current_uid = unsafe { libc::getuid() };
+        let (child_end, _parent_end) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let response = daemon
+            .handle_request_with_fd(
+                Request::RegisterNamespace {
+                    name: "missing".to_string(),
+                    kind: NamespaceKind::Net,
+                    target_pid: None,
+                },
+                OwnedFd::from(child_end),
+                current_uid,
+            )
+            .await;
+
+        assert!(!response.success);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not found")),
+            "expected not-found error, got: {:?}",
+            response.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_privileged_uids_default_includes_root_system_and_sshd() {
+        let uids = privileged_uids();
+        assert!(uids.contains(&0), "root must be privileged");
+        assert!(uids.contains(&1000), "system (1000) must be privileged");
+        assert!(
+            uids.contains(&103),
+            "default sshd uid (103) must be privileged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_privileged_uids_env_override() {
+        // SAFETY: this test runs single-threaded under the TEST_MUTEX.
+        unsafe { std::env::set_var("MESH_INIT_PRIVILEGED_UIDS", "0,42") };
+        let uids = privileged_uids();
+        unsafe { std::env::remove_var("MESH_INIT_PRIVILEGED_UIDS") };
+        assert_eq!(uids, vec![0, 42]);
+    }
+
+    #[tokio::test]
+    async fn test_check_impersonation_allows_privileged_for_any_target() {
+        // A privileged UID (1000) may target any UID.
+        assert!(check_impersonation(1000, 0, None, "svc").is_ok());
+        assert!(check_impersonation(1000, 9999, Some(9999), "svc").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_impersonation_rejects_unprivileged_mismatch() {
+        // A non-privileged UID may only target itself.
+        assert!(check_impersonation(5000, 5000, None, "svc").is_ok());
+        assert!(check_impersonation(5000, 0, None, "svc").is_err());
+        assert!(check_impersonation(5000, 5000, Some(6000), "svc").is_err());
+    }
+
+    #[test]
+    fn restart_delay_jitter_keeps_one_second_delay_exact() {
+        assert_eq!(restart_delay_with_jitter("svc-a", 1), 1);
+    }
+
+    #[test]
+    fn restart_delay_jitter_is_bounded_and_deterministic() {
+        let first = restart_delay_with_jitter("svc-a", 100);
+        let second = restart_delay_with_jitter("svc-a", 100);
+        assert_eq!(first, second);
+        assert!((100..=110).contains(&first));
     }
 }

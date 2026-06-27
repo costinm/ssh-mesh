@@ -119,13 +119,29 @@ find_busybox() {
 default_nix_profile() {
     local target_profile="$PWD/target/nix/profile"
     if [ ! -e "$target_profile" ] && [ -e "$PWD/target/nix/profiles" ]; then
-        target_profile="$PWD/target/nix/profiles"
+        if [ -e "$PWD/target/nix/profiles/profile" ]; then
+            target_profile="$PWD/target/nix/profiles/profile"
+        else
+            target_profile="$PWD/target/nix/profiles"
+        fi
     fi
     printf '%s\n' "$target_profile"
 }
 
-prepend_nix_profile_path() {
+resolve_nix_profile() {
     local profile_path="${1:-$(default_nix_profile)}"
+
+    if [ -d "$profile_path" ] && [ ! -d "$profile_path/bin" ] && [ -e "$profile_path/profile" ]; then
+        profile_path="$profile_path/profile"
+    fi
+
+    printf '%s\n' "$profile_path"
+}
+
+prepend_nix_profile_path() {
+    local profile_path
+
+    profile_path="$(resolve_nix_profile "${1:-$(default_nix_profile)}")"
 
     if [ -d "$profile_path/bin" ]; then
         case ":${PATH:-}:" in
@@ -145,15 +161,19 @@ prepare_nix_profile_path() {
 }
 
 configure_musl_toolchain() {
-    local profile_path="${1:-$(default_nix_profile)}"
+    local profile_path
     local linker
     local ar
 
+    profile_path="$(resolve_nix_profile "${1:-$(default_nix_profile)}")"
     prepend_nix_profile_path "$profile_path"
 
     linker="$(command -v x86_64-unknown-linux-musl-gcc || true)"
     if [ -z "$linker" ]; then
-        echo "Missing x86_64-unknown-linux-musl-gcc in PATH; run scripts/build.sh profile" >&2
+        linker="$(command -v x86_64-linux-musl-gcc || true)"
+    fi
+    if [ -z "$linker" ]; then
+        echo "Missing x86_64 musl gcc in PATH; run scripts/build.sh deps" >&2
         return 1
     fi
 
@@ -167,8 +187,11 @@ configure_musl_toolchain() {
 }
 
 configure_swagger_ui_assets() {
-    local profile_path="${1:-$(default_nix_profile)}"
-    local swagger_zip="$profile_path/share/ssh-mesh/swagger-ui/v5.17.14.zip"
+    local profile_path
+    local swagger_zip
+
+    profile_path="$(resolve_nix_profile "${1:-$(default_nix_profile)}")"
+    swagger_zip="$profile_path/share/ssh-mesh/swagger-ui/v5.17.14.zip"
 
     if [ ! -e "$swagger_zip" ]; then
         echo "Missing Swagger UI zip in Nix profile; run scripts/build.sh deps" >&2
@@ -184,6 +207,7 @@ add_nix_profile_deps() {
     local deps="${*:-musl-toolchain swagger-ui-assets}"
     local dep
 
+    target_profile="$(resolve_nix_profile "$target_profile")"
     prepare_nix_profile_path "$target_profile"
 
     echo "Adding missing Nix profile dependencies to: ${target_profile}"
@@ -206,8 +230,10 @@ deps() {
 ensure_musl_toolchain_profile() {
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
 
+    target_profile="$(resolve_nix_profile "$target_profile")"
     prepend_nix_profile_path "$target_profile"
-    if ! command -v x86_64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+    if ! command -v x86_64-unknown-linux-musl-gcc >/dev/null 2>&1 ||
+       ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
         add_nix_profile_deps "$target_profile" musl-toolchain
     fi
     if [ ! -e "$target_profile/share/ssh-mesh/swagger-ui/v5.17.14.zip" ]; then

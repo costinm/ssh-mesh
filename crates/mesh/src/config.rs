@@ -4,6 +4,12 @@ use std::collections::HashMap;
 
 use crate::auth::{AuthConfig, ImpersonationRule, PeerConfig};
 
+/// Default IP MTU used by mesh-tun managed TAP namespaces.
+///
+/// 65520 leaves room for IPv4 and TCP headers under the IPv4 65535-byte
+/// packet limit while still allowing Linux to send near-maximum TCP segments.
+pub const DEFAULT_MESH_TUN_MTU: u32 = 65_520;
+
 // ============================================================================
 // Service / Job Unified Config
 // ============================================================================
@@ -18,6 +24,8 @@ pub struct AppConfigFile {
     pub environment: HashMap<String, String>,
     #[serde(default)]
     pub activation: Vec<ActivationConfig>,
+    #[serde(default)]
+    pub network: NetworkConfig,
     #[serde(default)]
     pub schedule: Option<ScheduleConfig>,
     #[serde(default)]
@@ -85,6 +93,45 @@ pub struct ActivationConfig {
     pub socket: Option<String>,
     #[serde(default)]
     pub wait: bool,
+    /// Bind address for TCP activation. Defaults to `127.0.0.1` (loopback) to
+    /// avoid exposing unauthenticated activation services. Set to `0.0.0.0`
+    /// or `::` to listen on all interfaces — only do this with auth configured.
+    #[serde(default)]
+    pub bind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkBackend {
+    #[default]
+    None,
+    Pasta,
+    MeshTun,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub backend: NetworkBackend,
+    /// Backend command for sidecars like pasta.
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Control socket for a shared mesh-tun daemon.
+    pub control_socket: Option<String>,
+    /// Interface name created in the service network namespace.
+    pub if_name: Option<String>,
+    /// Address assigned to the service side of the TAP, for example `10.5.0.2/24`.
+    pub address: Option<String>,
+    /// Gateway used for the service default route.
+    pub gateway: Option<String>,
+    /// MTU for the service-side TAP interface.
+    pub mtu: Option<u32>,
+    /// Install a default route through the TAP gateway.
+    #[serde(default)]
+    pub default_route: bool,
 }
 
 // ============================================================================
@@ -115,7 +162,17 @@ pub struct BackoffConfig {
     pub initial_secs: u64,
     #[serde(default)]
     pub policy: BackoffPolicy,
+    #[serde(default)]
     pub max_retries: Option<u32>,
+    /// Hard cap on the computed backoff delay in seconds. Defaults to 24h to
+    /// prevent an exponential backoff from scheduling effectively-never after
+    /// many failures. Set to override.
+    #[serde(default = "default_max_backoff_secs")]
+    pub max_secs: u64,
+}
+
+fn default_max_backoff_secs() -> u64 {
+    24 * 60 * 60
 }
 
 impl Default for BackoffConfig {
@@ -124,6 +181,7 @@ impl Default for BackoffConfig {
             initial_secs: 1,
             policy: BackoffPolicy::Exponential,
             max_retries: None,
+            max_secs: default_max_backoff_secs(),
         }
     }
 }
@@ -175,6 +233,7 @@ pub struct AppConfig {
     pub oom_score_adjust: Option<i32>,
     pub resources: ResolvedResourceLimits,
     pub activation: Vec<ActivationConfig>,
+    pub network: NetworkConfig,
     pub source_path: Option<String>,
     /// Resolved authorization config from `[[peer]]` entries.
     pub auth: Option<AuthConfig>,
@@ -293,6 +352,14 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
         ));
     }
 
+    // Reject names that could escape the jobs/cgroup directory or be used in
+    // filesystem paths unsafely.
+    if let Err(reason) = validate_service_name(&file.service.name) {
+        return Err(ConfigError::Invalid(format!(
+            "invalid service name: {reason}"
+        )));
+    }
+
     if let Some(oom) = file.service.oom_score_adjust {
         if !(-1000..=1000).contains(&oom) {
             return Err(ConfigError::Invalid(format!(
@@ -316,6 +383,7 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
         oom_score_adjust: file.service.oom_score_adjust,
         resources: resolved,
         activation: file.activation,
+        network: file.network,
         source_path: None,
         auth: if file.peers.is_empty() && file.impersonation.is_empty() {
             None
@@ -339,4 +407,87 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
         estimated_upload_bytes: file.estimated_upload_bytes,
         minimum_network_chunk_bytes: file.minimum_network_chunk_bytes,
     })
+}
+
+/// Validate a service/job name for safe use in filesystem paths (cgroup
+/// scopes, jobs directory, user config directory).
+///
+/// A valid name:
+/// - is non-empty
+/// - is at most 251 characters (leaving room for the `.scope`/`.toml`
+///   suffixes under NAME_MAX=255)
+/// - contains no path separators (`/`, `\`)
+/// - is not `.` or `..` and contains no `..` component
+/// - contains no NUL bytes
+/// - does not start with `-` (could be mistaken for a flag in some contexts)
+///
+/// Returns `Ok(())` if valid, or `Err(String)` with a reason.
+pub fn validate_service_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name must not be empty".to_string());
+    }
+    if name.len() > 251 {
+        return Err(format!(
+            "name must be at most 251 characters, got {}",
+            name.len()
+        ));
+    }
+    if name.contains('\0') {
+        return Err("name must not contain NUL bytes".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("name must not contain path separators".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("name must not be '.' or '..'".to_string());
+    }
+    // Reject any path component equal to ParentDir, which would let `..`
+    // sneak in as part of a joined path.
+    if std::path::Path::new(name)
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err("name must not contain '..' components".to_string());
+    }
+    if name.starts_with('-') {
+        return Err("name must not start with '-'".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod name_validation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_dotdot() {
+        assert!(validate_service_name("../etc").is_err());
+        assert!(validate_service_name("..").is_err());
+        assert!(validate_service_name("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn rejects_separators() {
+        assert!(validate_service_name("a/b").is_err());
+        assert!(validate_service_name("a\\b").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_long() {
+        assert!(validate_service_name("").is_err());
+        let long = "a".repeat(252);
+        assert!(validate_service_name(&long).is_err());
+    }
+
+    #[test]
+    fn rejects_leading_dash() {
+        assert!(validate_service_name("-foo").is_err());
+    }
+
+    #[test]
+    fn accepts_valid() {
+        assert!(validate_service_name("app1").is_ok());
+        assert!(validate_service_name("worker-1.mesh").is_ok());
+        assert!(validate_service_name("_underscore").is_ok());
+    }
 }

@@ -128,7 +128,7 @@ impl ControlServer {
 
             let daemon = self.daemon.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, daemon).await {
+                if let Err(e) = handle_connection(stream, daemon, peer_uid).await {
                     error!("Control connection error: {}", e);
                 }
             });
@@ -375,7 +375,11 @@ fn format_response(response: Response, format: &ProtocolFormat) -> Result<String
 ///
 /// Reads JSON or text command lines from the stream, dispatches each to the daemon,
 /// and writes back formatted responses.
-async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) -> Result<()> {
+async fn handle_connection(
+    stream: tokio::net::UnixStream,
+    daemon: Arc<Daemon>,
+    peer_uid: u32,
+) -> Result<()> {
     let mut stream = stream;
     let mut line = String::new();
 
@@ -397,11 +401,12 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
             Ok(request) => {
                 debug!("Received request: {:?}", request);
                 match request {
-                    request @ Request::StartTerminal { .. } => {
+                    request @ (Request::StartTerminal { .. }
+                    | Request::RegisterNamespace { .. }) => {
                         let mut std_stream = stream.into_std()?;
                         std_stream.set_nonblocking(false)?;
                         let fd = recv_one_fd(&std_stream)?;
-                        let response = daemon.handle_request_with_fd(request, fd).await;
+                        let response = daemon.handle_request_with_fd(request, fd, peer_uid).await;
                         let response_str = format_response(response, &format)?;
                         std_stream.write_all(response_str.as_bytes())?;
                         std_stream.write_all(b"\n")?;
@@ -410,7 +415,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
                         stream = tokio::net::UnixStream::from_std(std_stream)?;
                         continue;
                     }
-                    request => daemon.handle_request(request).await,
+                    request => daemon.handle_request(request, peer_uid).await,
                 }
             }
             Err(e) => {
@@ -430,19 +435,35 @@ async fn handle_connection(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) 
 }
 
 async fn read_json_line(stream: &mut tokio::net::UnixStream, line: &mut String) -> Result<usize> {
-    let mut bytes_read = 0;
+    // Read raw bytes into a Vec, then convert to a String. Reading one byte
+    // at a time and casting u8→char corrupts multibyte UTF-8 sequences (each
+    // byte becomes a separate Unicode scalar, doubling/tripling their size).
+    // Also cap the line at 1 MiB to prevent unbounded reads from OOM-ing.
+    const MAX_LINE_LEN: usize = 1024 * 1024;
+    let mut buf = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     loop {
         let n = stream.read(&mut byte).await?;
         if n == 0 {
-            return Ok(bytes_read);
+            return Ok(buf.len());
         }
-        bytes_read += n;
-        line.push(byte[0] as char);
-        if byte[0] == b'\n' {
-            return Ok(bytes_read);
+        let b = byte[0];
+        buf.push(b);
+        if b == b'\n' {
+            break;
+        }
+        if buf.len() > MAX_LINE_LEN {
+            anyhow::bail!("control line exceeds {} bytes", MAX_LINE_LEN);
         }
     }
+    let len = buf.len();
+    // Strip a trailing newline for the String conversion.
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    *line = String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("control line is not valid UTF-8: {}", e))?;
+    Ok(len)
 }
 
 fn recv_one_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd> {
@@ -461,11 +482,29 @@ fn recv_one_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd> {
             && let Some(fd) = fds.first()
         {
             // SAFETY: recvmsg transferred ownership of this descriptor.
-            return Ok(unsafe { OwnedFd::from_raw_fd(*fd) });
+            let owned = unsafe { OwnedFd::from_raw_fd(*fd) };
+            // FDs received via SCM_RIGHTS do not inherit the sender's
+            // FD_CLOEXEC flag. Set it explicitly so the PTY/stdio FD does not
+            // leak into any child process the daemon might spawn later.
+            set_fd_cloexec(owned.as_raw_fd());
+            return Ok(owned);
         }
     }
 
     anyhow::bail!("missing passed file descriptor")
+}
+
+/// Set `FD_CLOEXEC` on a file descriptor. Best-effort.
+fn set_fd_cloexec(fd: i32) {
+    // SAFETY: fd is a valid open file descriptor; F_GETFD/F_SETFD are safe.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return;
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        // SAFETY: as above.
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    }
 }
 
 // ============================================================================

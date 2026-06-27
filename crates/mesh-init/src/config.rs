@@ -12,6 +12,34 @@ use tracing::{debug, info, warn};
 
 pub use mesh::config::*;
 
+/// Validate a cgroup scope name.
+///
+/// Cgroup scope names are used directly in filesystem paths under
+/// `/sys/fs/cgroup/mesh.slice/`, so they must not contain path separators or
+/// `..` components. This is a stricter check than the general service-name
+/// check because cgroup names are also used in kernel paths.
+pub fn validate_cgroup_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("cgroup name must not be empty".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("cgroup name must not contain path separators".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("cgroup name must not be '.' or '..'".to_string());
+    }
+    if std::path::Path::new(name)
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err("cgroup name must not contain '..' components".to_string());
+    }
+    if name.contains('\0') {
+        return Err("cgroup name must not contain NUL bytes".to_string());
+    }
+    Ok(())
+}
+
 /// Load a single config file from disk.
 pub fn load_app_config(path: &Path) -> Result<AppConfig, ConfigError> {
     info!("Loading config from {}", path.display());
@@ -167,6 +195,55 @@ to = "*"
         assert_eq!(auth.peers[1].delegate.as_deref(), Some("*.mesh.local"));
         assert_eq!(auth.impersonation.len(), 1);
         assert!(auth.can_impersonate("root@example.m", "root@host3-vm.example.m"));
+    }
+
+    #[test]
+    fn test_parse_toml_with_pasta_network() {
+        let toml = r#"
+[service]
+name = "net-svc"
+command = "/bin/sleep"
+args = ["60"]
+
+[network]
+backend = "pasta"
+command = "pasta"
+args = ["--config-net", "{pid}"]
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.network.backend, NetworkBackend::Pasta);
+        assert_eq!(config.network.command.as_deref(), Some("pasta"));
+        assert_eq!(config.network.args, vec!["--config-net", "{pid}"]);
+    }
+
+    #[test]
+    fn test_parse_toml_with_mesh_tun_network() {
+        let toml = r#"
+[service]
+name = "mesh-tun-svc"
+command = "/bin/sleep"
+args = ["60"]
+
+[network]
+backend = "mesh-tun"
+control_socket = "/tmp/mesh/control.sock"
+if_name = "tap0"
+address = "10.5.0.2/24"
+gateway = "10.5.0.1"
+mtu = 65520
+default_route = true
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.network.backend, NetworkBackend::MeshTun);
+        assert_eq!(
+            config.network.control_socket.as_deref(),
+            Some("/tmp/mesh/control.sock")
+        );
+        assert_eq!(config.network.if_name.as_deref(), Some("tap0"));
+        assert_eq!(config.network.address.as_deref(), Some("10.5.0.2/24"));
+        assert_eq!(config.network.gateway.as_deref(), Some("10.5.0.1"));
+        assert_eq!(config.network.mtu, Some(65520));
+        assert!(config.network.default_route);
     }
 
     #[test]

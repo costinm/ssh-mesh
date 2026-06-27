@@ -8,12 +8,35 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use crate::daemon::Daemon;
 use crate::process::ActivationFd;
 use crate::protocol::ServiceState;
+
+/// Default maximum number of concurrent inetd-style (wait=false) activation
+/// children. Prevents a connection flood from exhausting PIDs/memory/FDs.
+/// Override via the `MESH_INIT_MAX_ACTIVATION_CHILDREN` env var.
+const DEFAULT_MAX_ACTIVATION_CHILDREN: usize = 64;
+
+fn max_activation_children() -> usize {
+    std::env::var("MESH_INIT_MAX_ACTIVATION_CHILDREN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_MAX_ACTIVATION_CHILDREN)
+}
+
+/// Global semaphore capping concurrent inetd-style activation spawns.
+static ACTIVATION_SEMAPHORE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+
+fn activation_semaphore() -> Arc<Semaphore> {
+    ACTIVATION_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(max_activation_children())))
+        .clone()
+}
 
 /// Get peer UID from a raw file descriptor using SO_PEERCRED.
 fn get_peer_uid(fd: i32) -> Option<u32> {
@@ -60,11 +83,50 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
 }
 
 async fn run_tcp_listener(port: u16, service_name: String, wait: bool, daemon: Arc<Daemon>) {
-    let addr = format!("0.0.0.0:{}", port);
+    // Default bind address is 127.0.0.1 (loopback) to avoid exposing
+    // unauthenticated activation services on all interfaces. Operators can
+    // opt into a public bind by setting the `bind` field on the activation
+    // config, but this is a conscious choice.
+    let bind_addr = daemon
+        .configs
+        .lock()
+        .get(&service_name)
+        .and_then(|c| {
+            c.activation
+                .iter()
+                .find_map(|a| a.bind.clone().filter(|b| !b.is_empty()))
+        })
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let addr = format!("{}:{}", bind_addr, port);
+    if bind_addr == "0.0.0.0" || bind_addr == "::" {
+        warn!(
+            "TCP activation for '{}' binds {} — ensure auth or firewalling is in place",
+            service_name, addr
+        );
+    }
     info!(
-        "Starting TCP activation listener for '{}' on {}",
-        service_name, addr
+        "Starting TCP activation listener for '{}' on {} (wait={})",
+        service_name, addr, wait
     );
+
+    // wait=true cannot enforce peer auth (the child calls accept), so reject
+    // the combination explicitly to prevent silent unauthenticated exposure.
+    if wait {
+        let has_auth = daemon
+            .configs
+            .lock()
+            .get(&service_name)
+            .is_some_and(|c| c.auth.is_some());
+        if has_auth {
+            error!(
+                "Service '{}' has auth configured but uses wait=true activation, \
+                 which cannot enforce peer authentication. Refusing to start the \
+                 listener. Remove the auth config or set wait=false.",
+                service_name
+            );
+            return;
+        }
+    }
 
     let listener = match std::net::TcpListener::bind(&addr) {
         Ok(l) => l,
@@ -116,7 +178,11 @@ async fn run_uds_listener(path: String, service_name: String, wait: bool, daemon
     };
     if let Ok(metadata) = std::fs::metadata(&path) {
         let mut perms = metadata.permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o666);
+        // 0o660: owner and group can connect, others cannot. World-connectable
+        // (0o666) UDS activation sockets let any local user trigger service
+        // spawns, which is a privilege boundary violation when the service
+        // runs with elevated privileges.
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o660);
         let _ = std::fs::set_permissions(&path, perms);
     }
     if let Err(e) = listener.set_nonblocking(true) {
@@ -154,10 +220,27 @@ async fn handle_listener(
         debug!("Activation connection ready for {}", service_name);
 
         if wait {
-            // wait=true mode (xinetd style)
-            // Pass the listening socket directly. Service calls accept().
-            // Do not clear readiness here because we want the child to accept it.
-            // But we must wait for the child to exit before polling again.
+            // wait=true mode (xinetd style).
+            //
+            // The listening FD is passed to the child, which calls accept() on
+            // it directly. B6: Previously the parent blocked in a sleep loop
+            // until the child exited, which deadlocked for long-running servers
+            // (the parent could never handle another activation event). Now we
+            // spawn the child (if not already running) and return to the
+            // listener loop immediately. Because the child holds the listening
+            // socket, the kernel will not signal readable on the parent's fd
+            // until the child exits (releasing the listener); at that point the
+            // parent re-enters the loop and re-spawns the service.
+            let already_running = {
+                let services = daemon.services.lock();
+                services.get(&service_name).is_some_and(|p| {
+                    p.state == ServiceState::Running || p.state == ServiceState::Starting
+                })
+            };
+            if already_running {
+                guard.clear_ready();
+                continue;
+            }
 
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
             if let Some(mut config) = config_opt {
@@ -179,23 +262,12 @@ async fn handle_listener(
                     .map(ActivationFd::Listen);
                 if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
                     error!("Failed to activate service {}: {}", service_name, e);
-                } else {
-                    // Wait until service exits
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        let services = daemon.services.lock();
-                        if let Some(proc) = services.get(&service_name) {
-                            if proc.state == ServiceState::Stopped && proc.pid.is_none() {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
                 }
+                // Do NOT block waiting for the child to exit; return to the
+                // listener loop. The child holds the listener FD, so no further
+                // readable events arrive until it exits.
             }
 
-            // Re-arm readiness (since child accepted the connection hopefully)
             guard.clear_ready();
         } else {
             // wait=false mode (inetd style)
@@ -272,6 +344,19 @@ async fn handle_listener(
                 let cg = crate::cgroup::create_cgroup(&service_name)
                     .unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
 
+                // Acquire a permit before spawning to cap concurrent inetd-style
+                // children and prevent fork-bomb / resource exhaustion under a
+                // connection flood. The permit is held for the lifetime of the
+                // spawned task (released on drop).
+                let permit = match activation_semaphore().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Activation semaphore closed for '{}': {}", service_name, e);
+                        drop(client_owned);
+                        continue;
+                    }
+                };
+
                 // Spawn the process directly, passing the client socket.
                 // We do NOT use start_service_with_config because there could be multiple instances.
                 match crate::process::spawn_process(
@@ -281,12 +366,26 @@ async fn handle_listener(
                 ) {
                     Ok(pid) => {
                         debug!("Spawned activated instance (wait=false) PID {}", pid);
+                        // Hold the permit until the child exits. We poll
+                        // periodically; a more robust solution would integrate
+                        // with the SIGCHLD reaper, but this caps the flood.
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                // If the child is gone, release the permit.
+                                if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                                    break;
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         error!(
                             "Failed to spawn activated instance for {}: {}",
                             service_name, e
                         );
+                        drop(permit);
                     }
                 }
             }

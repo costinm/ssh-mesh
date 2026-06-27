@@ -4,14 +4,14 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::IoSlice;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use mesh::protocol::{Request, Response};
+use mesh::protocol::{NamespaceKind, Request, Response};
 
 #[derive(Parser, Debug)]
 #[clap(name = "mesh", version = "0.1.0")]
@@ -63,6 +63,20 @@ enum Command {
         pty: bool,
         #[clap(long)]
         command: Option<String>,
+    },
+    /// Register this process's namespace with mesh-init by passing a namespace fd.
+    RegisterNamespace {
+        name: String,
+        /// Namespace kind. Currently only `net` is accepted.
+        #[clap(long, default_value = "net")]
+        kind: String,
+        /// Namespace path to open and pass. Defaults to this process's netns.
+        #[clap(long, default_value = "/proc/self/ns/net")]
+        path: String,
+        /// Stable process PID in the namespace, used by mesh-tun while the fd
+        /// attach path is being kept behind mesh-init.
+        #[clap(long)]
+        target_pid: Option<u32>,
     },
     /// Resize an active terminal session.
     TerminalResize {
@@ -129,6 +143,25 @@ async fn main() -> Result<()> {
             send_terminal_request(&socket_path, &request, pty).await?;
             return Ok(());
         }
+        Command::RegisterNamespace {
+            name,
+            kind,
+            path,
+            target_pid,
+        } => {
+            let kind = parse_namespace_kind(&kind)?;
+            let fd = std::fs::File::open(&path)
+                .with_context(|| format!("failed to open namespace path {}", path))?
+                .into();
+            let request = Request::RegisterNamespace {
+                name,
+                kind,
+                target_pid,
+            };
+            let response = send_request_with_fd(&socket_path, &request, &fd)?;
+            print_response(&response)?;
+            return Ok(());
+        }
         Command::TerminalResize {
             terminal_id,
             cols,
@@ -170,6 +203,14 @@ async fn main() -> Result<()> {
     print_response(&response)?;
 
     Ok(())
+}
+
+fn parse_namespace_kind(kind: &str) -> Result<NamespaceKind> {
+    match kind {
+        "net" => Ok(NamespaceKind::Net),
+        "user" => Ok(NamespaceKind::User),
+        other => anyhow::bail!("unsupported namespace kind: {}", other),
+    }
 }
 
 fn print_response(response: &Response) -> Result<()> {

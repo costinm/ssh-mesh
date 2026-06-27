@@ -41,7 +41,15 @@ const MESH_SLICE_PATH: &str = "/sys/fs/cgroup/mesh.slice";
 /// Build the cgroup path for a service name.
 ///
 /// Returns `/sys/fs/cgroup/mesh.slice/{name}.scope`.
+///
+/// `name` is validated to reject path separators and `..` components, which
+/// would otherwise allow escaping `mesh.slice`.
 pub fn cgroup_path_for(name: &str) -> String {
+    if let Err(reason) = crate::config::validate_cgroup_name(name) {
+        error!("rejecting invalid cgroup name {:?}: {}", name, reason);
+        // Return a path that will fail to create rather than a traversal target.
+        return format!("{}/invalid.scope", MESH_SLICE_PATH);
+    }
     format!("{}/{}.scope", MESH_SLICE_PATH, name)
 }
 

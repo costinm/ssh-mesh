@@ -1,4 +1,8 @@
+use crate::packet::{ethernet_payload_to_ip, ip_to_ethernet_frame};
+
+use std::io::IoSlice;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -40,8 +44,8 @@ impl UdsServerConfig {
 pub async fn run_uds_server(
     listener: UnixListener,
     config: UdsServerConfig,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
-    stack_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    mut stack_rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     if config.style == UdsStyle::VirtioUser {
         anyhow::bail!(
@@ -55,14 +59,48 @@ pub async fn run_uds_server(
         "mesh-tun UDS listener started"
     );
 
-    let stack_rx = Arc::new(tokio::sync::Mutex::new(stack_rx));
+    // B14: Previously `stack_rx` was wrapped in a `tokio::sync::Mutex` shared
+    // across all connected UDS clients, with each per-client writer holding the
+    // lock across `recv().await`. This serialized every client on one mutex:
+    // if client A's write stalled (slow socket, half-dead peer), client B's
+    // writer could not call `recv()` and was fully blocked — head-of-line
+    // blocking across guests, no eviction of stuck clients.
+    //
+    // Now we drain `stack_rx` in a single dedicated reader task and `broadcast`
+    // each packet to all subscribers. Each per-client writer holds its own
+    // `broadcast::Receiver` and so never contends with other clients. A stuck
+    // client falls behind and gets a `Lagged` error (frames dropped for it),
+    // leaving other clients unaffected.
+    let (tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+    let tx = Arc::new(tx);
+
+    let tx_clone = tx.clone();
+    let _drain = tokio::spawn(async move {
+        while let Some(packet) = stack_rx.recv().await {
+            match tx_clone.send(packet) {
+                Ok(_) => {
+                    crate::stats::stats()
+                        .uds_broadcast_sent
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    crate::stats::stats()
+                        .uds_broadcast_no_subscribers
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // When stack_rx ends, `tx` is dropped via `tx_clone`, closing the
+        // broadcast and propagating EOF to all subscribers.
+    });
+
     loop {
         let (stream, _) = listener.accept().await?;
         let tun_tx = tun_tx.clone();
-        let stack_rx = stack_rx.clone();
+        let rx = tx.subscribe();
         let host_mac = config.host_mac;
         tokio::spawn(async move {
-            if let Err(error) = serve_qemu_stream(stream, host_mac, tun_tx, stack_rx).await {
+            if let Err(error) = serve_qemu_stream(stream, host_mac, tun_tx, rx).await {
                 tracing::warn!(%error, "mesh-tun UDS client disconnected");
             }
         });
@@ -72,8 +110,8 @@ pub async fn run_uds_server(
 async fn serve_qemu_stream(
     stream: UnixStream,
     host_mac: [u8; 6],
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
-    stack_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    stack_rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let (mut reader, mut writer) = stream.into_split();
     let guest_mac = Arc::new(Mutex::new(None::<[u8; 6]>));
@@ -82,10 +120,13 @@ async fn serve_qemu_stream(
     let read_task = tokio::spawn(async move {
         loop {
             let frame = read_qemu_frame(&mut reader).await?;
-            if let Some((packet, src_mac)) = ethernet_to_ip(&frame) {
-                *read_guest_mac.lock().unwrap() = Some(src_mac);
+            if let Some((packet, src_mac)) = ethernet_payload_to_ip(&frame) {
+                *read_guest_mac
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(src_mac);
                 tun_tx
                     .send(packet)
+                    .await
                     .map_err(|_| anyhow::anyhow!("TUN input queue closed"))?;
             }
         }
@@ -94,20 +135,33 @@ async fn serve_qemu_stream(
     });
 
     let write_guest_mac = guest_mac;
+    let mut stack_rx = stack_rx;
     let write_task = tokio::spawn(async move {
         loop {
-            let packet = {
-                let mut rx = stack_rx.lock().await;
-                rx.recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("TUN output queue closed"))?
+            let packet = match stack_rx.recv().await {
+                Ok(pkt) => pkt,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(anyhow::anyhow!("TUN output queue closed"));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    crate::stats::stats()
+                        .uds_client_lagged_frames
+                        .fetch_add(n, Ordering::Relaxed);
+                    tracing::warn!(n, "mesh-tun UDS client lagged behind; dropped frames");
+                    continue;
+                }
             };
             let dst_mac = write_guest_mac
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poison| poison.into_inner())
                 .unwrap_or([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-            let frame = ip_to_ethernet(&packet, host_mac, dst_mac)?;
-            write_qemu_frame(&mut writer, &frame).await?;
+            let frame = ip_to_ethernet_frame(&packet, host_mac, dst_mac, 0)?;
+            if let Err(error) = write_qemu_frame(&mut writer, &frame).await {
+                crate::stats::stats()
+                    .uds_client_write_error
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -140,72 +194,25 @@ where
     if frame.len() > u32::MAX as usize {
         anyhow::bail!("frame too large: {}", frame.len());
     }
-    writer.write_u32(frame.len() as u32).await?;
-    writer.write_all(frame).await?;
-    writer.flush().await?;
+    let header = (frame.len() as u32).to_be_bytes();
+    let mut written = 0usize;
+    let total = header.len() + frame.len();
+    while written < total {
+        let n = if written < header.len() {
+            let header_slice = &header[written..];
+            let frame_slice = frame;
+            writer
+                .write_vectored(&[IoSlice::new(header_slice), IoSlice::new(frame_slice)])
+                .await?
+        } else {
+            writer.write(&frame[written - header.len()..]).await?
+        };
+        if n == 0 {
+            anyhow::bail!("short write while writing qemu frame");
+        }
+        written += n;
+    }
     Ok(())
-}
-
-fn ethernet_to_ip(frame: &[u8]) -> Option<(Vec<u8>, [u8; 6])> {
-    if frame.len() < 14 {
-        return None;
-    }
-    let mut src_mac = [0u8; 6];
-    src_mac.copy_from_slice(&frame[6..12]);
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    match ethertype {
-        0x0800 => {
-            let payload = &frame[14..];
-            if payload.len() < 20 {
-                return None;
-            }
-            let ihl = usize::from(payload[0] & 0x0f) * 4;
-            if ihl < 20 || payload.len() < ihl {
-                return None;
-            }
-            let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
-            if total_len >= ihl && payload.len() >= total_len {
-                Some((payload[..total_len].to_vec(), src_mac))
-            } else {
-                Some((payload.to_vec(), src_mac))
-            }
-        }
-        0x86dd => {
-            let payload = &frame[14..];
-            if payload.len() < 40 {
-                return None;
-            }
-            let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-            let total_len = 40usize.saturating_add(payload_len);
-            if payload.len() >= total_len {
-                Some((payload[..total_len].to_vec(), src_mac))
-            } else {
-                Some((payload.to_vec(), src_mac))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn ip_to_ethernet(
-    packet: &[u8],
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-) -> Result<Vec<u8>, anyhow::Error> {
-    if packet.is_empty() {
-        anyhow::bail!("empty IP packet");
-    }
-    let ethertype = match packet[0] >> 4 {
-        4 => 0x0800u16,
-        6 => 0x86ddu16,
-        version => anyhow::bail!("unsupported IP version in TUN packet: {version}"),
-    };
-    let mut frame = Vec::with_capacity(14 + packet.len());
-    frame.extend_from_slice(&dst_mac);
-    frame.extend_from_slice(&src_mac);
-    frame.extend_from_slice(&ethertype.to_be_bytes());
-    frame.extend_from_slice(packet);
-    Ok(frame)
 }
 
 #[cfg(test)]
@@ -219,8 +226,8 @@ mod tests {
         ];
         let src = [0x02, 0, 0, 0, 0, 1];
         let dst = [0x02, 0, 0, 0, 0, 2];
-        let frame = ip_to_ethernet(&packet, src, dst).unwrap();
-        let (decoded, observed_src) = ethernet_to_ip(&frame).unwrap();
+        let frame = ip_to_ethernet_frame(&packet, src, dst, 0).unwrap();
+        let (decoded, observed_src) = ethernet_payload_to_ip(&frame).unwrap();
         assert_eq!(decoded, packet);
         assert_eq!(observed_src, src);
     }

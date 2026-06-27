@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::Mutex;
 
 use crate::jobs::config::{
-    BackoffConfig, BackoffPolicy, ConstraintConfig, JobConfig, NetworkType, ScheduleConfig,
+    BackoffConfig, ConstraintConfig, JobConfig, NetworkType, ScheduleConfig,
 };
 use crate::jobs::event::SystemEvent;
 use crate::jobs::executor::JobExecutor;
@@ -56,6 +56,7 @@ fn create_base_job(name: &str) -> JobConfig {
         oom_score_adjust: None,
         resources: Default::default(),
         activation: vec![],
+        network: Default::default(),
         source_path: None,
         auth: None,
         schedule: Some(ScheduleConfig::default()),

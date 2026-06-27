@@ -1,24 +1,9 @@
-use mesh::tun::{TunDnsHandler, TunTcpHandler, TunTcpMeta, TunUdpHandler, TunUdpPacket};
-use mesh_tun::flow::MeshPassthrough;
-use mesh_tun::policy::{DenyPortPolicy, FlowProtocol};
-use mesh_tun::telemetry::{MeshTunEvent, MeshTunTelemetry};
+use mesh::tun::{TunDnsHandler, TunUdpHandler, TunUdpPacket};
+use mesh_tun::policy::AllowAllPolicy;
 use mesh_tun::{MeshTun, MeshTunConfig};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
-struct MockTcpHandler;
-#[async_trait::async_trait]
-impl TunTcpHandler for MockTcpHandler {
-    async fn handle_tcp(&self, _meta: TunTcpMeta, mut stream: tokio::io::DuplexStream) {
-        let mut buf = [0u8; 1024];
-        if let Ok(n) = stream.read(&mut buf).await {
-            let _ = stream.write_all(&buf[..n]).await;
-        }
-    }
-}
 
 struct MockUdpHandler;
 #[async_trait::async_trait]
@@ -40,18 +25,6 @@ struct RecordingUdpHandler {
 impl TunUdpHandler for RecordingUdpHandler {
     async fn handle_udp(&self, packet: TunUdpPacket) {
         self.packets.lock().unwrap().push(packet);
-    }
-}
-
-#[derive(Default)]
-struct RecordingTelemetry {
-    events: Mutex<Vec<MeshTunEvent>>,
-}
-
-#[async_trait::async_trait]
-impl MeshTunTelemetry for RecordingTelemetry {
-    async fn record(&self, event: MeshTunEvent) {
-        self.events.lock().unwrap().push(event);
     }
 }
 
@@ -98,101 +71,6 @@ fn raw_ipv4_udp(
 }
 
 #[tokio::test]
-async fn passthrough_proxies_tcp_and_records_telemetry() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 32];
-        let n = socket.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ping");
-        socket.write_all(b"pong").await.unwrap();
-    });
-
-    let telemetry = Arc::new(RecordingTelemetry::default());
-    let passthrough = MeshPassthrough::new("vm-a")
-        .with_telemetry(telemetry.clone())
-        .with_udp_response_timeout(Duration::from_millis(10));
-    let (mut guest, handler_side) = tokio::io::duplex(1024);
-    let meta = TunTcpMeta {
-        src_addr: "10.5.0.2".parse().unwrap(),
-        src_port: 40000,
-        dst_addr: target.ip(),
-        dst_port: target.port(),
-    };
-
-    let handler = passthrough.clone();
-    tokio::spawn(async move {
-        handler.handle_tcp(meta, handler_side).await;
-    });
-
-    guest.write_all(b"ping").await.unwrap();
-    let mut buf = [0u8; 16];
-    let n = guest.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"pong");
-    guest.shutdown().await.unwrap();
-
-    for _ in 0..50 {
-        if telemetry.events.lock().unwrap().iter().any(|event| {
-            matches!(
-                event,
-                MeshTunEvent::FlowBytes {
-                    guest_to_remote: 4,
-                    remote_to_guest: 4,
-                    ..
-                }
-            )
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let events = telemetry.events.lock().unwrap();
-    assert!(events.iter().any(|event| matches!(
-        event,
-        MeshTunEvent::FlowOpen(ctx)
-            if ctx.vm_id == "vm-a" && ctx.protocol == FlowProtocol::Tcp && ctx.dst == target
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        MeshTunEvent::FlowBytes {
-            guest_to_remote: 4,
-            remote_to_guest: 4,
-            ..
-        }
-    )));
-}
-
-#[tokio::test]
-async fn passthrough_denies_tcp_by_policy() {
-    let telemetry = Arc::new(RecordingTelemetry::default());
-    let policy = Arc::new(DenyPortPolicy {
-        dst_addr: None,
-        dst_port: 443,
-        reason: "blocked".to_string(),
-    });
-    let passthrough = MeshPassthrough::new("vm-b")
-        .with_policy(policy)
-        .with_telemetry(telemetry.clone());
-    let (_guest, handler_side) = tokio::io::duplex(1024);
-    let meta = TunTcpMeta {
-        src_addr: "10.5.0.2".parse().unwrap(),
-        src_port: 40000,
-        dst_addr: "203.0.113.10".parse().unwrap(),
-        dst_port: 443,
-    };
-
-    passthrough.handle_tcp(meta, handler_side).await;
-
-    let events = telemetry.events.lock().unwrap();
-    assert!(events.iter().any(|event| matches!(
-        event,
-        MeshTunEvent::FlowDeny { context, reason }
-            if context.vm_id == "vm-b" && context.dst.port() == 443 && reason == "blocked"
-    )));
-}
-
-#[tokio::test]
 async fn channel_stack_captures_udp_destination_metadata() {
     let config = MeshTunConfig::default();
     let tun = MeshTun::new(config).unwrap();
@@ -201,8 +79,10 @@ async fn channel_stack_captures_udp_destination_metadata() {
         packets: udp_packets.clone(),
     });
     let dns = Arc::new(MockDnsHandler);
-    let tcp = Arc::new(MockTcpHandler);
-    let (_injector, tun_tx, _stack_rx) = tun.run_with_channels(tcp, udp, dns).await.unwrap();
+    let (_injector, tun_tx, _stack_rx) = tun
+        .run_with_channels_and_policy(Arc::new(AllowAllPolicy), udp, dns)
+        .await
+        .unwrap();
 
     tun_tx
         .send(raw_ipv4_udp(
@@ -212,6 +92,7 @@ async fn channel_stack_captures_udp_destination_metadata() {
             8080,
             b"payload",
         ))
+        .await
         .unwrap();
 
     for _ in 0..50 {
@@ -239,8 +120,10 @@ async fn injector_emits_raw_udp_packet() {
     let tun = MeshTun::new(config).unwrap();
     let udp = Arc::new(MockUdpHandler);
     let dns = Arc::new(MockDnsHandler);
-    let tcp = Arc::new(MockTcpHandler);
-    let (injector, _tun_tx, mut stack_rx) = tun.run_with_channels(tcp, udp, dns).await.unwrap();
+    let (injector, _tun_tx, mut stack_rx) = tun
+        .run_with_channels_and_policy(Arc::new(AllowAllPolicy), udp, dns)
+        .await
+        .unwrap();
 
     injector
         .inject_udp(

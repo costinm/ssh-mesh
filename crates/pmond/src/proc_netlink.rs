@@ -1,11 +1,11 @@
 use log::{error, info, trace};
-use nix::sys::socket::{bind, recv, send, NetlinkAddr};
+use nix::sys::socket::{NetlinkAddr, bind, recv, send};
 use nix::unistd::getpid;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
 

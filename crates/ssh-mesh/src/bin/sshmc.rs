@@ -43,6 +43,7 @@ use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use log::debug;
 use serde_json::json;
+use ssh_mesh::sshd::UDS_FORWARD_PORT;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -294,7 +295,12 @@ async fn main() -> Result<()> {
                 connect_path,
             } => {
                 client
-                    .open_local_forward(&listen_path, 0xFFFF_FFFE, &connect_path, 0xFFFF_FFFE)
+                    .open_local_forward(
+                        &listen_path,
+                        UDS_FORWARD_PORT,
+                        &connect_path,
+                        UDS_FORWARD_PORT,
+                    )
                     .await?;
                 println!(
                     "Local Unix forward established: {} -> {}",
@@ -332,7 +338,12 @@ async fn main() -> Result<()> {
                 connect_path,
             } => {
                 client
-                    .open_remote_forward(&listen_path, 0xFFFF_FFFE, &connect_path, 0xFFFF_FFFE)
+                    .open_remote_forward(
+                        &listen_path,
+                        UDS_FORWARD_PORT,
+                        &connect_path,
+                        UDS_FORWARD_PORT,
+                    )
                     .await?;
                 println!(
                     "Remote Unix forward established: {} -> {}",

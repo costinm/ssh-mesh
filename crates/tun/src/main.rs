@@ -1,7 +1,8 @@
-use mesh_tun::control::{run_bwrap_info_server, run_control_server, BwrapInfoServerConfig};
+use mesh_tun::control::{BwrapInfoServerConfig, run_bwrap_info_server, run_control_server};
 use mesh_tun::flow::MeshPassthrough;
-use mesh_tun::uds::{run_uds_server, UdsServerConfig, UdsStyle};
-use mesh_tun::vhost_user::{spawn_vhost_user_net, VhostUserNetConfig};
+use mesh_tun::policy::AllowAllPolicy;
+use mesh_tun::uds::{UdsServerConfig, UdsStyle, run_uds_server};
+use mesh_tun::vhost_user::{VhostUserNetConfig, spawn_vhost_user_net};
 use mesh_tun::{MeshTun, MeshTunConfig};
 use std::env;
 use std::net::Ipv4Addr;
@@ -14,9 +15,9 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{reload, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), anyhow::Error> {
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 && args[1] == "bwrap" {
@@ -109,8 +110,14 @@ fn run_bwrap_command(args: &[String]) -> Result<(), anyhow::Error> {
     anyhow::bail!("bwrap terminated without an exit code")
 }
 
+/// Duplicate a file descriptor for passing to `bwrap`.
+///
+/// The returned fd must be inheritable by the immediate `bwrap` process because
+/// it is passed as `--info-fd` or `--block-fd`. `bwrap` owns closing or
+/// forwarding those descriptors according to its own sandbox setup.
 fn dup_fd(fd: i32) -> Result<i32, anyhow::Error> {
-    let duplicated = unsafe { libc::dup(fd) };
+    // SAFETY: `fd` is a valid open file descriptor owned by the caller.
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
     if duplicated < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -118,8 +125,30 @@ fn dup_fd(fd: i32) -> Result<i32, anyhow::Error> {
 }
 
 fn close_fd(fd: i32) {
+    // SAFETY: fd is a valid open file descriptor owned by the caller.
     unsafe {
         libc::close(fd);
+    }
+}
+
+/// Set `FD_CLOEXEC` on an existing file descriptor.
+///
+/// Best-effort: logs a warning on failure. This prevents the FD from being
+/// inherited by child processes spawned via `execve()` (e.g. bwrap workloads).
+fn set_fd_cloexec(fd: i32) {
+    // SAFETY: fd is a valid open file descriptor. F_GETFD/F_SETFD do not
+    // have undefined behavior on valid fds.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        tracing::warn!("fcntl(F_GETFD) failed on fd {}", fd);
+        return;
+    }
+    if flags & libc::FD_CLOEXEC != 0 {
+        return; // already set
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if rc < 0 {
+        tracing::warn!("fcntl(F_SETFD FD_CLOEXEC) failed on fd {}", fd);
     }
 }
 
@@ -129,8 +158,8 @@ async fn run_real_tun(
 ) -> Result<(), anyhow::Error> {
     let tun = MeshTun::new(config)?;
     let injector = tun
-        .run(
-            passthrough.clone(),
+        .run_with_policy(
+            Arc::new(AllowAllPolicy),
             passthrough.clone(),
             passthrough.clone(),
         )
@@ -180,21 +209,26 @@ async fn run_capture_sockets(
         .ok()
         .map(PathBuf::from)
         .or_else(|| env_truthy("MESH_TUN_ENABLE_VHOST").then(|| run_dir.join("vhost.sock")));
+    let packet_queue_capacity = config.packet_queue_capacity;
     let tun = MeshTun::new(config)?;
     let (injector, tun_tx, mut stack_rx) = tun
-        .run_with_channels(
-            passthrough.clone(),
+        .run_with_channels_and_policy(
+            Arc::new(AllowAllPolicy),
             passthrough.clone(),
             passthrough.clone(),
         )
         .await?;
     passthrough.set_injector(injector);
 
-    let (fallback_tx, fallback_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (fallback_tx, fallback_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(packet_queue_capacity);
     tokio::spawn(async move {
         while let Some(packet) = stack_rx.recv().await {
             if !mesh_tun::control::route_outgoing_packet(&packet) {
-                let _ = fallback_tx.send(packet);
+                if fallback_tx.try_send(packet).is_err() {
+                    mesh_tun::stats::stats()
+                        .fallback_queue_full
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     });
@@ -261,18 +295,22 @@ fn mesh_tun_config_from_env() -> Result<MeshTunConfig, anyhow::Error> {
     if let Ok(mtu) = env::var("MESH_TUN_MTU") {
         config.mtu = mtu.parse()?;
     }
-    if let Ok(enabled) = env::var("MESH_TUN_TCP_REWRITE") {
-        config.tcp_rewrite = env_value_truthy(&enabled);
+    if let Ok(capacity) = env::var("MESH_TUN_PACKET_QUEUE") {
+        config.packet_queue_capacity = capacity.parse()?;
     }
-    if let Ok(proxy_addr) = env::var("MESH_TUN_TCP_REWRITE_PROXY_ADDR") {
-        config.tcp_rewrite_config.proxy_addr = proxy_addr.parse()?;
+    if let Ok(max_flows) = env::var("MESH_TUN_TCP_MAX_FLOWS") {
+        config.tcp_proxy_config.max_flows = max_flows.parse()?;
     }
-    if let Ok(port_range) = env::var("MESH_TUN_TCP_REWRITE_PORTS") {
-        let Some((first, last)) = port_range.split_once('-') else {
-            anyhow::bail!("MESH_TUN_TCP_REWRITE_PORTS must be FIRST-LAST");
-        };
-        config.tcp_rewrite_config.first_port = first.parse()?;
-        config.tcp_rewrite_config.last_port = last.parse()?;
+    if let Ok(capacity) = env::var("MESH_TUN_TCP_PER_FLOW_QUEUE") {
+        config.tcp_proxy_config.per_flow_queue_capacity = capacity.parse()?;
+    }
+    if let Ok(timeout_ms) = env::var("MESH_TUN_TCP_HANDSHAKE_TIMEOUT_MS") {
+        config.tcp_proxy_config.handshake_timeout =
+            std::time::Duration::from_millis(timeout_ms.parse()?);
+    }
+    if let Ok(timeout_ms) = env::var("MESH_TUN_TCP_CONNECT_TIMEOUT_MS") {
+        config.tcp_proxy_config.connect_timeout =
+            std::time::Duration::from_millis(timeout_ms.parse()?);
     }
     if let Ok(vm_id) = env::var("MESH_TUN_VM_ID") {
         if !vm_id.is_empty() {
@@ -340,8 +378,14 @@ fn resolve_and_bind_uds(
     if let Some(fd_str) = fd_str {
         if let Ok(fd) = fd_str.parse::<i32>() {
             tracing::info!("Using activated listener FD {} for {}", fd, path_str);
+            // SAFETY: the FD was passed by the parent (systemd-style
+            // activation) and is a valid, owned UnixListener fd.
             let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
             std_listener.set_nonblocking(true)?;
+            // Ensure the listener is closed on exec so it does not leak into
+            // spawned bwrap workloads or other child processes.
+            use std::os::fd::AsRawFd;
+            set_fd_cloexec(std_listener.as_raw_fd());
             let listener = UnixListener::from_std(std_listener)?;
             return Ok(listener);
         }
@@ -376,4 +420,29 @@ fn resolve_and_bind_uds(
     }
 
     Ok(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[test]
+    fn duplicated_bwrap_fd_is_inheritable() {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+        let dup = dup_fd(read_fd.as_raw_fd()).expect("duplicate fd");
+        assert!(dup >= 3);
+        let flags = unsafe { libc::fcntl(dup, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::FD_CLOEXEC, 0);
+
+        close_fd(dup);
+        drop(read_fd);
+        drop(write_fd);
+    }
 }

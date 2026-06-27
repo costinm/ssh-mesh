@@ -1,9 +1,9 @@
 use crate::ProcMon;
 use axum::{
+    Router,
     extract::{Path as AxumPath, State},
     response::{Html, IntoResponse, Json},
     routing::{get, post},
-    Router,
 };
 use hyper::StatusCode;
 use log::debug;
@@ -109,7 +109,7 @@ pub async fn handle_get_process_request(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Invalid PID: {}", pid)})),
-            )
+            );
         }
     };
 

@@ -43,6 +43,30 @@ pub struct ForwardInfo {
     pub forward_type: String, // "local" or "remote"
 }
 
+/// A peer discovery entry, persisted as JSON under `discovery_dir`.
+///
+/// Created by TOFU on first connection or populated externally by DNS /
+/// control-plane components. The format is intentionally extensible —
+/// unknown fields are preserved on round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryEntry {
+    /// Logical hostname / peer name.
+    pub host: String,
+    /// Resolved IP address or network address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+    /// Port number.
+    pub port: u16,
+    /// Server public key (OpenSSH one-line format).
+    pub public_key: String,
+    /// How this entry was discovered (e.g. `"tofu"`, `"dns"`, `"control-plane"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// ISO-8601 timestamp of first discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovered_at: Option<String>,
+}
+
 /// Metadata about one SSH client connection.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConnectionInfo {
@@ -55,8 +79,8 @@ pub struct ConnectionInfo {
 
 /// russh client::Handler connects to a single client.
 pub struct ClientHandler {
-    /// Path on disk for storing the known server key.
-    key_file: PathBuf,
+    /// Path to the JSON discovery file for this peer.
+    discovery_file: Option<PathBuf>,
     /// Expected server keys (if provided or previously saved). Empty ⇒ TOFU.
     expected_keys: Vec<RusshPublicKey>,
     /// CA keys for validating server certificates.
@@ -65,6 +89,8 @@ pub struct ClientHandler {
     forwards: Arc<Mutex<Vec<ForwardInfo>>>,
     /// Hostname we are connecting to (used for certificate validation).
     host: String,
+    /// Port we are connecting to (recorded in discovery entries).
+    port: u16,
     /// Connection ID for identifying this connection in callbacks.
     conn_id: u64,
     /// Listeners to notify about incoming channels.
@@ -141,10 +167,40 @@ impl client::Handler for ClientHandler {
             Ok(false)
         } else {
             // TOFU: save the key for future connections
-            info!(
-                "TOFU: Trusting server key on first use, saving to {:?}",
-                self.key_file
-            );
+            let actual_str = server_public_key
+                .to_openssh()
+                .context("Failed to serialize server key for TOFU persistence")?;
+            if let Some(ref path) = self.discovery_file {
+                let entry = DiscoveryEntry {
+                    host: self.host.clone(),
+                    addr: Some(self.host.clone()),
+                    port: self.port,
+                    public_key: actual_str,
+                    source: Some("tofu".to_string()),
+                    discovered_at: Some(
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    ),
+                };
+                let json = serde_json::to_string_pretty(&entry)
+                    .context("Failed to serialize discovery entry")?;
+                match std::fs::write(path, json) {
+                    Ok(()) => {
+                        info!("TOFU: Trusting server key on first use, saved to {:?}", path);
+                    }
+                    Err(e) => {
+                        error!(
+                            "TOFU: failed to persist discovery entry to {:?}: {}. \
+                             Rejecting connection to avoid silent trust-on-every-use.",
+                            path, e
+                        );
+                        return Ok(false);
+                    }
+                }
+            } else {
+                info!(
+                    "TOFU: Trusting server key on first use (no discovery_dir configured, not persisted)"
+                );
+            }
             Ok(true)
         }
     }
@@ -323,6 +379,11 @@ pub struct SshClientManager {
     ssh_config_path: Option<PathBuf>,
     /// Optional directory for mux sockets.
     mux_dir: Option<PathBuf>,
+    /// Directory for peer discovery entries (TOFU keys, DNS, control-plane).
+    ///
+    /// When set, TOFU server keys are persisted as JSON files here and
+    /// external components may populate it with richer peer metadata.
+    discovery_dir: Option<PathBuf>,
     pub(crate) listeners: Arc<Mutex<Vec<Arc<dyn SshClientListener>>>>,
 }
 
@@ -351,8 +412,47 @@ impl SshClientManager {
             ca_keys: Arc::new(ca_keys),
             ssh_config_path,
             mux_dir,
+            discovery_dir: None,
             listeners: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Set the directory used for peer discovery entries.
+    pub fn with_discovery_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.discovery_dir = dir;
+        self
+    }
+
+    /// Load server public keys from a discovery entry file.
+    ///
+    /// Reads JSON `DiscoveryEntry` format first. If the file does not exist
+    /// or cannot be parsed, falls back to a legacy `.pub` file (bare OpenSSH
+    /// key) at the same stem for backward compatibility.
+    fn load_discovery_keys(path: &std::path::Path) -> Vec<RusshPublicKey> {
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(path) {
+                // Try JSON discovery format
+                if let Ok(entry) = serde_json::from_str::<DiscoveryEntry>(&data) {
+                    if let Ok(k) = RusshPublicKey::from_openssh(&entry.public_key) {
+                        return vec![k];
+                    }
+                }
+                // Fall back: maybe it's a bare OpenSSH key (legacy format)
+                if let Ok(k) = RusshPublicKey::from_openssh(data.trim()) {
+                    return vec![k];
+                }
+            }
+        }
+        // Also try legacy .pub file at the same stem
+        let legacy = path.with_extension("pub");
+        if legacy.exists() {
+            if let Ok(data) = std::fs::read_to_string(&legacy) {
+                if let Ok(k) = RusshPublicKey::from_openssh(data.trim()) {
+                    return vec![k];
+                }
+            }
+        }
+        vec![]
     }
 
     pub fn add_listener(&self, listener: Arc<dyn SshClientListener>) {
@@ -433,7 +533,8 @@ impl SshClientManager {
     /// * `host` / `port` – target SSH server
     /// * `user` – username
     /// * `server_key` – optional known server public key (OpenSSH format).
-    ///   If empty, TOFU: accept and save to `<host>_<port>.pub`.
+    ///   If empty and `discovery_dir` is set, TOFU: accept and save a
+    ///   JSON [`DiscoveryEntry`] to `<discovery_dir>/<host>_<port>.json`.
     pub async fn connect(
         &self,
         host: &str,
@@ -458,7 +559,10 @@ impl SshClientManager {
                 (host.to_string(), port, user.to_string())
             };
 
-        let key_file = PathBuf::from(format!("{}_{}.pub", connect_host, connect_port));
+        let discovery_file = self
+            .discovery_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}_{}.json", connect_host, connect_port)));
 
         // Determine expected server key(s)
         let expected_keys = if !server_key.is_empty() {
@@ -466,14 +570,9 @@ impl SshClientManager {
                 RusshPublicKey::from_openssh(server_key)
                     .context("Failed to parse supplied server key")?,
             ]
-        } else if key_file.exists() {
-            // Try loading a previously TOFU-saved key
-            let data =
-                std::fs::read_to_string(&key_file).context("Failed to read saved server key")?;
-            vec![
-                RusshPublicKey::from_openssh(data.trim())
-                    .context("Failed to parse saved server key")?,
-            ]
+        } else if let Some(ref path) = discovery_file {
+            // Try loading a previously saved discovery entry (JSON)
+            Self::load_discovery_keys(path)
         } else {
             vec![]
         };
@@ -486,11 +585,12 @@ impl SshClientManager {
         drop(next_id_lock);
 
         let handler = ClientHandler {
-            key_file,
+            discovery_file,
             expected_keys,
             ca_keys: self.ca_keys.clone(),
             forwards: forwards.clone(),
             host: connect_host.clone(),
+            port: connect_port,
             conn_id: id,
             listeners: self.listeners.clone(),
             trust_server_key: false,
@@ -947,7 +1047,10 @@ impl SshClientManager {
             cfg.user.clone()
         };
 
-        let key_file = PathBuf::from(format!("{}_{}.pub", connect_host, connect_port));
+        let discovery_file = self
+            .discovery_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}_{}.json", connect_host, connect_port)));
 
         // Parse expected host keys from config
         let mut expected_keys = Vec::new();
@@ -963,13 +1066,11 @@ impl SshClientManager {
             }
         }
 
-        // If no keys configured, try TOFU file
-        if expected_keys.is_empty()
-            && key_file.exists()
-            && let Ok(data) = std::fs::read_to_string(&key_file)
-            && let Ok(k) = RusshPublicKey::from_openssh(data.trim())
-        {
-            expected_keys.push(k);
+        // If no keys configured, try discovery file
+        if expected_keys.is_empty() {
+            if let Some(ref path) = discovery_file {
+                expected_keys = Self::load_discovery_keys(path);
+            }
         }
 
         let forwards = Arc::new(Mutex::new(Vec::new()));
@@ -980,11 +1081,12 @@ impl SshClientManager {
         drop(next_id_lock);
 
         let mut handler = ClientHandler {
-            key_file,
+            discovery_file,
             expected_keys,
             ca_keys: self.ca_keys.clone(),
             forwards: forwards.clone(),
             host: connect_host.clone(),
+            port: connect_port,
             conn_id: id,
             listeners: self.listeners.clone(),
             trust_server_key: false,

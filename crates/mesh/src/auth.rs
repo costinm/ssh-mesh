@@ -14,12 +14,52 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Hardcoded UID allowed to talk to local mesh control sockets.
+/// Hardcoded UID commonly assigned to the `sshd` service account (Debian).
 ///
-/// Debian commonly assigns this UID to the `sshd` user. ssh-mesh may run as
-/// that service account while mesh-init runs as root or the app owner.
+/// This is only a fallback default. Operators should override it via the
+/// `MESH_TRUSTED_SSHD_UID` environment variable (see [`trusted_sshd_uid`]) to
+/// match their distribution's sshd UID, or set it to `none`/`off` to disable
+/// the builtin sshd-UID allowlist entirely. Relying on this hardcoded default
+/// is insecure on systems where UID 103 belongs to an unrelated account.
 pub const DEFAULT_TRUSTED_SSHD_UID: u32 = 103;
 use tracing::warn;
+
+/// Resolve the trusted sshd UID.
+///
+/// Reads the `MESH_TRUSTED_SSHD_UID` environment variable:
+/// - unset → falls back to [`DEFAULT_TRUSTED_SSHD_UID`] (backward compat)
+/// - a number → that UID
+/// - `none` or `off` → `None` (disables the builtin sshd-UID allowlist)
+/// - invalid value → falls back to the default with a warning
+///
+/// Returning `None` means no UID other than root (0) and the daemon's own UID
+/// is trusted by the builtin allowlist; all other UIDs must be listed in
+/// `[[peer]]` entries.
+pub fn trusted_sshd_uid() -> Option<u32> {
+    match std::env::var("MESH_TRUSTED_SSHD_UID") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("none")
+                || trimmed.eq_ignore_ascii_case("off")
+                || trimmed.is_empty()
+            {
+                None
+            } else {
+                match trimmed.parse::<u32>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        warn!(
+                            "Invalid MESH_TRUSTED_SSHD_UID='{}'; falling back to default {}",
+                            v, DEFAULT_TRUSTED_SSHD_UID
+                        );
+                        Some(DEFAULT_TRUSTED_SSHD_UID)
+                    }
+                }
+            }
+        }
+        Err(_) => Some(DEFAULT_TRUSTED_SSHD_UID),
+    }
+}
 
 // ============================================================================
 // Config Types (TOML)
@@ -101,10 +141,12 @@ pub struct DelegationEnvelope {
 impl AuthConfig {
     /// Check the built-in local UDS peer allowlist.
     ///
-    /// Root (UID 0), the daemon's own UID (`current_uid`), and the hardcoded
-    /// sshd service UID are always authorized.
+    /// Root (UID 0) and the daemon's own UID (`current_uid`) are always
+    /// authorized. The sshd service UID is authorized only if
+    /// [`trusted_sshd_uid`] returns `Some` (configurable via
+    /// `MESH_TRUSTED_SSHD_UID`; set to `none` to disable).
     pub fn is_builtin_uid_authorized(uid: u32, current_uid: u32) -> bool {
-        uid == 0 || uid == current_uid || uid == DEFAULT_TRUSTED_SSHD_UID
+        uid == 0 || uid == current_uid || trusted_sshd_uid().is_some_and(|sshd| uid == sshd)
     }
 
     /// Check if a UID is authorized to connect directly.
@@ -152,12 +194,12 @@ impl AuthConfig {
         }
 
         self.peers.iter().any(|p| {
-            if let (Some(ref peer_id), Some(ref rule_id)) = (&identity.id, &p.id) {
+            if let (Some(peer_id), Some(rule_id)) = (&identity.id, &p.id) {
                 if peer_id == rule_id {
                     return true;
                 }
             }
-            if let (Some(ref peer_email), Some(ref rule_email)) = (&identity.email, &p.email) {
+            if let (Some(peer_email), Some(rule_email)) = (&identity.email, &p.email) {
                 if peer_email == rule_email {
                     return true;
                 }

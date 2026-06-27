@@ -1,11 +1,12 @@
 //! Standalone SOCKS5 server implementation.
 //!
 //! This module implements a minimal SOCKS5 proxy server that supports:
-//! - Unauthenticated connections only
+//! - No-auth (`0x00`) method
 //! - CONNECT command with IPv4, IPv6, and domain name addresses
 //! - Direct TCP forwarding to the target destination
 //!
-//! Future enhancements will add forwarding over HTTP/2 or SSH tunnels.
+//! To avoid becoming an open proxy, the server only binds to localhost/loopback
+//! addresses.
 
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, error, info, warn};
@@ -13,17 +14,42 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// Configuration for the SOCKS5 server.
+#[derive(Clone, Default)]
+pub struct Socks5Config {}
+
 /// SOCKS5 server that listens on a TCP port and forwards connections.
 pub struct Socks5Server {
     listener: TcpListener,
+    config: Socks5Config,
 }
 
 impl Socks5Server {
     /// Create a new SOCKS5 server bound to the given address.
     pub async fn bind(addr: &str) -> Result<Self, std::io::Error> {
+        Self::bind_with_config(addr, Socks5Config::default()).await
+    }
+
+    /// Create a new SOCKS5 server bound to the given address with config.
+    pub async fn bind_with_config(
+        addr: &str,
+        config: Socks5Config,
+    ) -> Result<Self, std::io::Error> {
+        // Enforce that the address is localhost/loopback only
+        for resolved_addr in tokio::net::lookup_host(addr).await? {
+            if !resolved_addr.ip().is_loopback() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("SOCKS5 server is restricted to localhost/loopback addresses, but requested: {}", addr),
+                ));
+            }
+        }
         let listener = TcpListener::bind(addr).await?;
-        info!("SOCKS5 server listening on {}", listener.local_addr()?);
-        Ok(Self { listener })
+        info!(
+            "SOCKS5 server listening on {} (auth: none)",
+            listener.local_addr()?
+        );
+        Ok(Self { listener, config })
     }
 
     /// Get the local address the server is bound to.
@@ -33,12 +59,14 @@ impl Socks5Server {
 
     /// Run the SOCKS5 server, accepting and handling connections.
     pub async fn run(self) {
+        let config = self.config.clone();
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     debug!("SOCKS5: New connection from {}", peer_addr);
+                    let cfg = config.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream).await {
+                        if let Err(e) = handle_connection(stream, &cfg).await {
                             warn!("SOCKS5: Connection from {} failed: {}", peer_addr, e);
                         }
                     });
@@ -52,9 +80,12 @@ impl Socks5Server {
 }
 
 /// Handle a single SOCKS5 connection.
-async fn handle_connection(mut stream: TcpStream) -> Result<(), Socks5Error> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    _config: &Socks5Config,
+) -> Result<(), Socks5Error> {
     // Perform SOCKS5 handshake and get target address
-    let target_addr = negotiate_socks5(&mut stream).await?;
+    let target_addr = negotiate_socks5(&mut stream, _config).await?;
 
     // Connect to the target
     debug!("SOCKS5: Connecting to target {}", target_addr);
@@ -93,7 +124,10 @@ async fn handle_connection(mut stream: TcpStream) -> Result<(), Socks5Error> {
 }
 
 /// Negotiate a SOCKS5 connection and return the target address.
-async fn negotiate_socks5(stream: &mut TcpStream) -> Result<SocketAddr, Socks5Error> {
+async fn negotiate_socks5(
+    stream: &mut TcpStream,
+    _config: &Socks5Config,
+) -> Result<SocketAddr, Socks5Error> {
     // Read version and number of auth methods
     let mut version = [0u8; 2];
     stream.read_exact(&mut version).await?;
@@ -114,17 +148,17 @@ async fn negotiate_socks5(stream: &mut TcpStream) -> Result<SocketAddr, Socks5Er
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
-    // Check for "no authentication" method (0x00)
-    if !methods.contains(&0x00) {
-        // Reply with "no acceptable methods"
+    let offered_no_auth = methods.contains(&0x00);
+
+    // Select authentication method (only no-auth supported).
+    if offered_no_auth {
+        stream.write_all(&[0x05, 0x00]).await?;
+    } else {
         stream.write_all(&[0x05, 0xFF]).await?;
         return Err(Socks5Error::Protocol(
             "only unauthenticated connections are supported".into(),
         ));
     }
-
-    // Reply: accept "no authentication"
-    stream.write_all(&[0x05, 0x00]).await?;
 
     // Read connection request
     let mut request = [0u8; 4];
@@ -201,6 +235,8 @@ async fn negotiate_socks5(stream: &mut TcpStream) -> Result<SocketAddr, Socks5Er
 
     Ok(SocketAddr::new(ip, port))
 }
+
+
 
 /// SOCKS5 reply codes
 #[allow(dead_code)]
@@ -300,5 +336,13 @@ mod tests {
         };
         let addr = server.local_addr().unwrap();
         assert!(addr.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_socks5_server_rejects_non_loopback() {
+        let result = Socks5Server::bind("0.0.0.0:0").await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

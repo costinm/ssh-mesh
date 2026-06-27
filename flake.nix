@@ -94,10 +94,26 @@
 
         # ── Packages ──────────────────────────────────────────────
 
-        musl-toolchain = pkgs.symlinkJoin {
-          name = "ssh-mesh-musl-toolchain";
-          paths = [ pkgs.pkgsCross.musl64.stdenv.cc ];
-        };
+        musl-toolchain = pkgs.runCommand "ssh-mesh-musl-toolchain" { } ''
+          mkdir -p "$out"
+          for path in ${pkgs.pkgsCross.musl64.stdenv.cc}/*; do
+            name="$(basename "$path")"
+            if [ "$name" != bin ]; then
+              ln -s "$path" "$out/$name"
+            fi
+          done
+
+          mkdir -p "$out/bin"
+          for path in ${pkgs.pkgsCross.musl64.stdenv.cc}/bin/*; do
+            ln -s "$path" "$out/bin/$(basename "$path")"
+          done
+          for tool in gcc g++ cc c++ cpp ar as ld ld.bfd ld.gold nm objcopy objdump ranlib readelf size strings strip; do
+            if [ -e "$out/bin/x86_64-unknown-linux-musl-$tool" ] &&
+               [ ! -e "$out/bin/x86_64-linux-musl-$tool" ]; then
+              ln -s "x86_64-unknown-linux-musl-$tool" "$out/bin/x86_64-linux-musl-$tool"
+            fi
+          done
+        '';
 
         swagger-ui-assets = pkgs.runCommand "ssh-mesh-swagger-ui-assets" { } ''
           mkdir -p "$out/share/ssh-mesh/swagger-ui"

@@ -1,11 +1,11 @@
 use crate::psi::PsiWatcher;
-use crate::{read_process_info_from_proc, ProcMemInfo, ProcessInfo};
+use crate::{ProcMemInfo, ProcessInfo, read_process_info_from_proc};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, trace};

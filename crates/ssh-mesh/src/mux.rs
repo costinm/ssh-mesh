@@ -576,7 +576,9 @@ async fn handle_open_fwd(
             // Ask SSH server to listen on remote side
             let handle = session.lock().await;
 
-            if listen_port == 0xFFFF_FFFE || connect_port == 0xFFFF_FFFE {
+            if listen_port == super::sshd::UDS_FORWARD_PORT
+                || connect_port == super::sshd::UDS_FORWARD_PORT
+            {
                 // Streamlocal forwarding (UDS)
                 info!("Requesting remote streamlocal forward for {}", listen_host);
 
@@ -641,7 +643,9 @@ async fn handle_open_fwd(
                                             let session = session.clone();
                                             let ch = connect_host.clone();
                                             let cp = connect_port as u16;
-                                            if listen_port == 0xFFFF_FFFE || connect_port == 0xFFFF_FFFE {
+                                            if listen_port == super::sshd::UDS_FORWARD_PORT
+                                                || connect_port == super::sshd::UDS_FORWARD_PORT
+                                            {
                                                 warn!("Local UDS forwarding not implemented in mux server yet");
                                                 return;
                                             }

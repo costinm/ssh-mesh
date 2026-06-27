@@ -19,7 +19,7 @@ use {
         io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
         sync::{Mutex, RwLock},
     },
-    tokio_stream::{wrappers::ReadDirStream, StreamExt},
+    tokio_stream::{StreamExt, wrappers::ReadDirStream},
 };
 
 mod utils;
@@ -320,7 +320,7 @@ impl Filesystem for Unpfs {
                         valid: req_mask,
                         qid: virtual_qid(&vpath),
                         stat: virtual_stat(),
-                    })
+                    });
                 }
             }
         };
@@ -499,7 +499,7 @@ impl Filesystem for Unpfs {
                     return Ok(Fcall::Rlopen {
                         qid: virtual_qid(&virtual_path),
                         iounit: 0,
-                    })
+                    });
                 }
             }
         };

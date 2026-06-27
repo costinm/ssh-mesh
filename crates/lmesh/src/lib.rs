@@ -6,9 +6,9 @@
 ///
 use anyhow::{Context, Result};
 
+use p256::SecretKey;
 use p256::elliptic_curve::Generate;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
-use p256::SecretKey;
 
 use serde::{Deserialize, Serialize};
 

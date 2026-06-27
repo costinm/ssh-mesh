@@ -4,6 +4,7 @@ members = [
 ]
 exclude = [
     "crates/python",
+    "crates/dmesh",
 ]
 resolver = "2"
 

@@ -66,6 +66,8 @@ async fn test_sftp_integration() -> Result<()> {
     let mut file = sftp.create(filename).await?;
     file.write_all(content).await?;
     file.shutdown().await?; // Flush and close
+    drop(file);
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Verify file exists on server disk
     let server_file_path = setup.base_dir.join(filename);

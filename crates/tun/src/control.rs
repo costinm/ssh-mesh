@@ -1,16 +1,16 @@
+use crate::packet::{
+    build_ipv4_tcp_packet_with_options, ethernet_payload_to_ip, ip_packet_destination,
+    ip_packet_source, ip_to_ethernet_frame, ipv4_checksum_valid, ipv4_tcp_checksum_valid,
+};
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
-
-#[derive(Debug, Clone)]
-pub struct ControlServerConfig {
-    pub socket_path: PathBuf,
-}
 
 #[derive(Debug, Clone)]
 pub struct BwrapInfoServerConfig {
@@ -31,6 +31,7 @@ struct BwrapInfoServerState {
 pub struct TapCaptureSpec {
     pub vm_id: String,
     pub netns_path: PathBuf,
+    pub userns_path: Option<PathBuf>,
     pub if_name: Option<String>,
     pub setup: Option<NetnsSetup>,
 }
@@ -39,12 +40,13 @@ pub struct TapCaptureSpec {
 pub struct NetnsSetup {
     pub address: Option<String>,
     pub gateway: Option<String>,
+    pub mtu: Option<u32>,
     pub default_route: bool,
 }
 
 pub async fn run_control_server(
     listener: UnixListener,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     tracing::info!(addr = ?listener.local_addr(), "mesh-tun control socket started");
 
@@ -62,7 +64,7 @@ pub async fn run_control_server(
 pub async fn run_bwrap_info_server(
     listener: UnixListener,
     config: BwrapInfoServerConfig,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     tracing::info!(addr = ?listener.local_addr(), "mesh-tun bwrap info socket started");
     let state = Arc::new(BwrapInfoServerState {
@@ -84,7 +86,7 @@ pub async fn run_bwrap_info_server(
 
 async fn handle_control_client(
     stream: tokio::net::UnixStream,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let std_stream = stream.into_std()?;
     std_stream.set_nonblocking(false)?;
@@ -147,7 +149,7 @@ async fn handle_control_client(
 async fn handle_bwrap_info_client(
     stream: tokio::net::UnixStream,
     state: Arc<BwrapInfoServerState>,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let mut stream = stream.into_std()?;
     stream.set_nonblocking(false)?;
@@ -160,10 +162,12 @@ async fn handle_bwrap_info_client(
         let spec = TapCaptureSpec {
             vm_id: config.vm_id.clone(),
             netns_path: PathBuf::from(format!("/proc/{child_pid}/ns/net")),
+            userns_path: Some(PathBuf::from(format!("/proc/{child_pid}/ns/user"))),
             if_name: Some(config.if_name.clone()),
             setup: Some(NetnsSetup {
                 address: Some(format!("{guest_ip}/{}", config.prefix_len)),
                 gateway: Some(config.gateway.clone()),
+                mtu: None,
                 default_route: true,
             }),
         };
@@ -243,10 +247,12 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
         Some("capture-tap") => {
             let mut vm_id = None;
             let mut netns_path = None;
+            let mut userns_path = None;
             let mut if_name = None;
             let mut setup = None;
             let mut address = None;
             let mut gateway = None;
+            let mut mtu = None;
             let mut default_route = false;
             for field in fields {
                 let Some((key, value)) = field.split_once('=') else {
@@ -255,8 +261,10 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
                 match key {
                     "vm_id" => vm_id = Some(value.to_string()),
                     "netns" => netns_path = Some(PathBuf::from(value)),
+                    "userns" => userns_path = Some(PathBuf::from(value)),
                     "if" => if_name = Some(value.to_string()),
                     "gw" => gateway = Some(value.to_string()),
+                    "mtu" => mtu = Some(value.parse()?),
                     "setup" => match value {
                         "tap" => setup = Some(()),
                         other => anyhow::bail!("unsupported setup={other}"),
@@ -275,12 +283,14 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
             let setup = setup.map(|()| NetnsSetup {
                 address,
                 gateway,
+                mtu,
                 default_route,
             });
             Ok(ControlRequest::CaptureTap(TapCaptureSpec {
                 vm_id: vm_id.unwrap_or_else(|| "netns".to_string()),
                 netns_path: netns_path
                     .ok_or_else(|| anyhow::anyhow!("capture-tap requires netns=/path"))?,
+                userns_path,
                 if_name,
                 setup,
             }))
@@ -291,35 +301,74 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
 }
 
 static GUEST_ROUTER: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, mpsc::UnboundedSender<Vec<u8>>>>,
+    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, mpsc::Sender<TapInject>>>,
 > = std::sync::OnceLock::new();
 
-pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::UnboundedSender<Vec<u8>>) {
-    GUEST_ROUTER
-        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+const TAP_INJECT_DRAIN_BUDGET: usize = 64;
+
+#[derive(Debug)]
+pub enum TapInject {
+    Ip(Vec<u8>),
+    Tcp4 {
+        src_addr: Ipv4Addr,
+        src_port: u16,
+        dst_addr: Ipv4Addr,
+        dst_port: u16,
+        flags: u8,
+        seq: u32,
+        ack: u32,
+        options: Vec<u8>,
+        payload: Vec<u8>,
+    },
+}
+
+pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::Sender<TapInject>) {
+    let registry =
+        GUEST_ROUTER.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    let mut destinations = registry
         .write()
-        .unwrap()
-        .insert(ip, sender);
+        .unwrap_or_else(|poison| poison.into_inner());
+    destinations.insert(ip, sender);
 }
 
 pub fn unregister_destination(ip: &std::net::IpAddr) {
     if let Some(registry) = GUEST_ROUTER.get() {
-        registry.write().unwrap().remove(ip);
+        registry
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(ip);
     }
 }
 
+pub fn destination_sender(ip: &std::net::IpAddr) -> Option<mpsc::Sender<TapInject>> {
+    let registry = GUEST_ROUTER.get()?;
+    let destinations = registry.read().unwrap_or_else(|poison| poison.into_inner());
+    destinations.get(ip).cloned()
+}
+
 pub fn route_outgoing_packet(packet: &[u8]) -> bool {
-    let dst_ip = match get_destination_ip(packet) {
+    let dst_ip = match ip_packet_destination(packet) {
         Some(ip) => ip,
         None => return false,
     };
     if let Some(registry) = GUEST_ROUTER.get() {
-        if let Some(sender) = registry.read().unwrap().get(&dst_ip) {
-            let _ = sender.send(packet.to_vec());
-            crate::stats::stats()
-                .route_hit
-                .fetch_add(1, Ordering::Relaxed);
-            return true;
+        let destinations = registry.read().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(sender) = destinations.get(&dst_ip) {
+            match sender.try_send(TapInject::Ip(packet.to_vec())) {
+                Ok(()) => {
+                    crate::stats::stats()
+                        .route_hit
+                        .fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    crate::stats::stats()
+                        .route_send_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
     }
     crate::stats::stats()
@@ -328,62 +377,12 @@ pub fn route_outgoing_packet(packet: &[u8]) -> bool {
     false
 }
 
-fn get_source_ip(packet: &[u8]) -> Option<std::net::IpAddr> {
-    if packet.is_empty() {
-        return None;
-    }
-    match packet[0] >> 4 {
-        4 => {
-            if packet.len() < 20 {
-                return None;
-            }
-            let mut addr = [0u8; 4];
-            addr.copy_from_slice(&packet[12..16]);
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(addr)))
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            let mut addr = [0u8; 16];
-            addr.copy_from_slice(&packet[8..24]);
-            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr)))
-        }
-        _ => None,
-    }
-}
-
-fn get_destination_ip(packet: &[u8]) -> Option<std::net::IpAddr> {
-    if packet.is_empty() {
-        return None;
-    }
-    match packet[0] >> 4 {
-        4 => {
-            if packet.len() < 20 {
-                return None;
-            }
-            let mut addr = [0u8; 4];
-            addr.copy_from_slice(&packet[16..20]);
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(addr)))
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            let mut addr = [0u8; 16];
-            addr.copy_from_slice(&packet[24..40]);
-            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr)))
-        }
-        _ => None,
-    }
-}
-
 fn start_tap_capture(
     spec: TapCaptureSpec,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let spec = Arc::new(spec);
-    let (inject_tx, inject_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (inject_tx, inject_rx) = mpsc::channel::<TapInject>(1024);
     let guest_mac = Arc::new(std::sync::Mutex::new(None));
 
     let socket = fork_and_create_tap(&spec)?;
@@ -412,32 +411,25 @@ fn inject_ip_packet(
     crate::stats::stats()
         .tap_inject_packet
         .fetch_add(1, Ordering::Relaxed);
-    let dst_mac = {
-        let guard = guest_mac.lock().unwrap();
-        guard.unwrap_or([0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
-    };
+    let dst_mac = *guest_mac
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .unwrap_or(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     let src_mac = if dst_mac == [0, 0, 0, 0, 0, 0] {
         dst_mac
     } else {
         gateway_mac
     };
 
-    let ethertype = match ip_packet[0] >> 4 {
-        4 => 0x0800u16,
-        6 => 0x86ddu16,
-        _ => return Ok(()),
-    };
-
-    let mut frame = Vec::with_capacity(14 + ip_packet.len());
-    frame.extend_from_slice(&dst_mac);
-    frame.extend_from_slice(&src_mac);
-    frame.extend_from_slice(&ethertype.to_be_bytes());
-    frame.extend_from_slice(ip_packet);
-    if frame.len() < 60 {
-        frame.resize(60, 0);
-    }
+    let frame = ip_to_ethernet_frame(ip_packet, src_mac, dst_mac, 60)?;
+    crate::stats::stats()
+        .tap_inject_bytes
+        .fetch_add(frame.len() as u64, Ordering::Relaxed);
 
     record_inject_frame(&frame);
+    // SAFETY: frame points to valid memory for frame.len() bytes and socket is
+    // an owned TAP file descriptor kept alive for the duration of this call.
     let rc = unsafe { libc::write(socket.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
     crate::stats::stats()
         .tap_last_inject_write_rc
@@ -453,6 +445,32 @@ fn inject_ip_packet(
         return Err(err.into());
     }
     Ok(())
+}
+
+fn inject_tap_packet(
+    socket: &OwnedFd,
+    guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
+    packet: TapInject,
+) -> Result<(), anyhow::Error> {
+    match packet {
+        TapInject::Ip(packet) => inject_ip_packet(socket, guest_mac, &packet),
+        TapInject::Tcp4 {
+            src_addr,
+            src_port,
+            dst_addr,
+            dst_port,
+            flags,
+            seq,
+            ack,
+            options,
+            payload,
+        } => {
+            let packet = build_ipv4_tcp_packet_with_options(
+                src_addr, src_port, dst_addr, dst_port, flags, seq, ack, &options, &payload,
+            )?;
+            inject_ip_packet(socket, guest_mac, &packet)
+        }
+    }
 }
 
 fn record_inject_frame(frame: &[u8]) {
@@ -485,7 +503,7 @@ fn record_inject_frame(frame: &[u8]) {
         let ihl = usize::from(ip[0] & 0x0f) * 4;
         stats
             .tap_last_inject_ip_checksum_ok
-            .store(u64::from(ipv4_header_checksum_valid(ip)), Ordering::Relaxed);
+            .store(u64::from(ipv4_checksum_valid(ip)), Ordering::Relaxed);
         if ihl >= 20 && ip.len() >= ihl + 20 && ip[9] == 6 {
             stats.tap_last_inject_ipv4_src.store(
                 u64::from(u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]])),
@@ -498,10 +516,9 @@ fn record_inject_frame(frame: &[u8]) {
             stats
                 .tap_last_inject_tcp_flags
                 .store(u64::from(ip[ihl + 13]), Ordering::Relaxed);
-            stats.tap_last_inject_tcp_checksum_ok.store(
-                u64::from(ipv4_tcp_checksum_valid(ip, ihl)),
-                Ordering::Relaxed,
-            );
+            stats
+                .tap_last_inject_tcp_checksum_ok
+                .store(u64::from(ipv4_tcp_checksum_valid(ip)), Ordering::Relaxed);
         }
     }
 }
@@ -514,74 +531,33 @@ fn mac_lo(mac: &[u8]) -> u64 {
     (u64::from(mac[3]) << 16) | (u64::from(mac[4]) << 8) | u64::from(mac[5])
 }
 
-fn ipv4_header_checksum_valid(packet: &[u8]) -> bool {
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return false;
-    }
-    let ihl = usize::from(packet[0] & 0x0f) * 4;
-    ihl >= 20 && packet.len() >= ihl && internet_checksum(&packet[..ihl]) == 0
-}
-
-fn ipv4_tcp_checksum_valid(packet: &[u8], ihl: usize) -> bool {
-    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-    if packet.len() < total_len || total_len < ihl + 20 || packet[9] != 6 {
-        return false;
-    }
-
-    let tcp = &packet[ihl..total_len];
-    let tcp_len = tcp.len() as u32;
-    let mut sum = 0u32;
-    sum = checksum_add(sum, &packet[12..16]);
-    sum = checksum_add(sum, &packet[16..20]);
-    sum += 6;
-    sum += tcp_len;
-    sum = checksum_add(sum, tcp);
-    checksum_finish(sum) == 0
-}
-
-fn internet_checksum(buf: &[u8]) -> u16 {
-    checksum_finish(checksum_add(0, buf))
-}
-
-fn checksum_add(mut sum: u32, buf: &[u8]) -> u32 {
-    for chunk in buf.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-    }
-    sum
-}
-
-fn checksum_finish(mut sum: u32) -> u16 {
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 fn packet_capture_thread_loop(
     _spec: &TapCaptureSpec,
     socket_arc: Arc<OwnedFd>,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
     guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
-    inject_tx: mpsc::UnboundedSender<Vec<u8>>,
-    mut inject_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    inject_tx: mpsc::Sender<TapInject>,
+    mut inject_rx: mpsc::Receiver<TapInject>,
 ) -> Result<(), anyhow::Error> {
     let mut buf = vec![0u8; 65535];
     let mut registered_ips = std::collections::HashSet::new();
 
     loop {
-        drain_inject_queue(&socket_arc, guest_mac.clone(), &mut inject_rx)?;
+        let drained = drain_inject_queue(
+            &socket_arc,
+            guest_mac.clone(),
+            &mut inject_rx,
+            TAP_INJECT_DRAIN_BUDGET,
+        )?;
 
         let mut poll_fd = libc::pollfd {
             fd: socket_arc.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, 10) };
+        // SAFETY: poll_fd points to one valid pollfd and the timeout is finite.
+        let timeout_ms = if drained == 0 { 10 } else { 0 };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
         if ready < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -592,6 +568,8 @@ fn packet_capture_thread_loop(
             continue;
         }
 
+        // SAFETY: buf is writable for buf.len() bytes and socket_arc is a live
+        // TAP fd owned by this capture thread.
         let n = unsafe { libc::read(socket_arc.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -604,18 +582,25 @@ fn packet_capture_thread_loop(
         crate::stats::stats()
             .tap_frame_rx
             .fetch_add(1, Ordering::Relaxed);
+        crate::stats::stats()
+            .tap_frame_rx_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
         if n < 14 {
             continue;
         }
 
         let mut src_mac = [0u8; 6];
         src_mac.copy_from_slice(&buf[6..12]);
-        *guest_mac.lock().unwrap() = Some(src_mac);
+        *guest_mac
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(src_mac);
 
         if let Some(reply) = arp_reply(&buf[..n]) {
             crate::stats::stats()
                 .arp_request_rx
                 .fetch_add(1, Ordering::Relaxed);
+            // SAFETY: reply points to valid memory for reply.len() bytes and
+            // socket_arc is the live TAP fd for this capture thread.
             let rc =
                 unsafe { libc::write(socket_arc.as_raw_fd(), reply.as_ptr().cast(), reply.len()) };
             if rc >= 0 {
@@ -626,19 +611,30 @@ fn packet_capture_thread_loop(
             continue;
         }
 
-        if let Some(ip_packet) = ethernet_payload_to_ip(&buf[..n]) {
+        if let Some((ip_packet, _src_mac)) = ethernet_payload_to_ip(&buf[..n]) {
             crate::stats::stats()
                 .tap_ip_rx
                 .fetch_add(1, Ordering::Relaxed);
-            if let Some(src_ip) = get_source_ip(&ip_packet) {
+            crate::stats::stats()
+                .tap_ip_rx_bytes
+                .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
+            if let Some(src_ip) = ip_packet_source(&ip_packet) {
                 if registered_ips.insert(src_ip) {
                     register_destination(src_ip, inject_tx.clone());
                 }
             }
 
-            tun_tx
-                .send(ip_packet)
-                .map_err(|_| anyhow::anyhow!("TUN input queue closed"))?;
+            match tun_tx.try_send(ip_packet) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    crate::stats::stats()
+                        .tun_input_queue_full
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(anyhow::anyhow!("TUN input queue closed"));
+                }
+            }
         }
     }
 
@@ -652,15 +648,24 @@ fn packet_capture_thread_loop(
 fn drain_inject_queue(
     socket: &OwnedFd,
     guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
-    inject_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-) -> Result<(), anyhow::Error> {
-    loop {
+    inject_rx: &mut mpsc::Receiver<TapInject>,
+    budget: usize,
+) -> Result<usize, anyhow::Error> {
+    let mut drained = 0usize;
+    while drained < budget {
         match inject_rx.try_recv() {
-            Ok(packet) => inject_ip_packet(socket, guest_mac.clone(), &packet)?,
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+            Ok(packet) => {
+                crate::stats::stats()
+                    .tap_inject_queue_rx
+                    .fetch_add(1, Ordering::Relaxed);
+                inject_tap_packet(socket, guest_mac.clone(), packet)?;
+                drained += 1;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(drained),
+            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(drained),
         }
     }
+    Ok(drained)
 }
 
 fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> {
@@ -668,6 +673,7 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
     // Create a socketpair for passing the file descriptor
     let mut fds = [0i32; 2];
+    // SAFETY: fds points to two writable i32 slots for socketpair to fill.
     let rc = unsafe {
         libc::socketpair(
             libc::AF_UNIX,
@@ -679,27 +685,28 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
     if rc != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    // SAFETY: socketpair succeeded and initialized both fds. Each fd is moved
+    // into exactly one OwnedFd here.
     let parent_sock = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: see parent_sock above.
     let child_sock = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-    // Find the user namespace path by looking up the sibling user namespace
-    // For netns "/proc/<pid>/ns/net", the corresponding user namespace is "/proc/<pid>/ns/user"
-    let userns_path = if let Some(parent_dir) = spec.netns_path.parent() {
-        parent_dir.join("user")
-    } else {
-        PathBuf::from("/invalid/path")
-    };
-
     let self_userns = std::fs::metadata("/proc/self/ns/user");
-    let target_userns = std::fs::metadata(&userns_path);
+    let target_userns = spec
+        .userns_path
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok());
     let should_enter_userns = match (self_userns, target_userns) {
-        (Ok(s), Ok(t)) => {
+        (Ok(s), Some(t)) => {
             use std::os::unix::fs::MetadataExt;
             s.ino() != t.ino()
         }
         _ => false,
     };
 
+    // SAFETY: fork is called to enter the target namespaces and create a TAP fd
+    // in the child, then the child exits via _exit. The child avoids returning
+    // into Rust async runtime state.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -712,6 +719,8 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
         let run_child = || -> Result<(), std::io::Error> {
             // Unshare filesystem state to avoid sharing context with parent threads
+            // SAFETY: unshare is called in the forked child before starting any
+            // child threads; CLONE_FS has no Rust aliasing implications.
             let rc = unsafe { libc::unshare(libc::CLONE_FS) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -719,8 +728,10 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
             // First, enter the user namespace of the target process if it is different
             // This is crucial because it gives us capabilities (like CAP_NET_ADMIN/CAP_SYS_ADMIN) inside that namespace
-            if should_enter_userns && userns_path.exists() {
+            if should_enter_userns && let Some(userns_path) = &spec.userns_path {
                 let userns_file = std::fs::File::open(&userns_path)?;
+                // SAFETY: userns_file is an open namespace fd and setns only
+                // mutates the child process namespace membership.
                 let rc = unsafe { libc::setns(userns_file.as_raw_fd(), libc::CLONE_NEWUSER) };
                 if rc != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -729,6 +740,8 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
             // Enter the network namespace
             let netns_file = std::fs::File::open(&spec.netns_path)?;
+            // SAFETY: netns_file is an open namespace fd and setns only mutates
+            // the child process namespace membership.
             let rc = unsafe { libc::setns(netns_file.as_raw_fd(), libc::CLONE_NEWNET) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -754,9 +767,12 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
         };
 
         match run_child() {
+            // SAFETY: this is the forked child; _exit terminates without running
+            // parent-runtime destructors.
             Ok(()) => unsafe { libc::_exit(0) },
             Err(e) => {
                 let code = e.raw_os_error().unwrap_or(255);
+                // SAFETY: see successful _exit path above.
                 unsafe { libc::_exit(code) }
             }
         }
@@ -767,6 +783,8 @@ fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> 
 
     // Wait for the child to exit
     let mut status = 0i32;
+    // SAFETY: pid is the child returned by fork and status points to writable
+    // storage for waitpid to fill.
     let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -791,6 +809,13 @@ fn configure_netns_interface(if_name: &str, setup: &NetnsSetup) -> Result<(), st
 
     if let Some(address) = &setup.address {
         run_ip(&["addr", "add", address, "dev", if_name], true)?;
+    }
+
+    if let Some(mtu) = setup.mtu {
+        run_ip(
+            &["link", "set", "dev", if_name, "mtu", &mtu.to_string()],
+            true,
+        )?;
     }
 
     run_ip(&["link", "set", "dev", if_name, "up"], false)?;
@@ -821,13 +846,19 @@ fn open_tap_device(if_name: &str) -> Result<OwnedFd, std::io::Error> {
         ));
     }
 
+    // SAFETY: the path is a static NUL-terminated C string and flags/mode are valid.
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: open succeeded and returned an owned fd, moved into OwnedFd once.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
+    // SAFETY: ifreq is a plain C struct that is fully initialized below before
+    // it is passed to ioctl.
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    // SAFETY: ifr_name has at least IFNAMSIZ bytes, checked above, and ifru_flags
+    // is the active union field expected by TUNSETIFF.
     unsafe {
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -837,6 +868,7 @@ fn open_tap_device(if_name: &str) -> Result<OwnedFd, std::io::Error> {
         req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
     }
 
+    // SAFETY: fd is a live /dev/net/tun fd and req points to an initialized ifreq.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut req) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
@@ -866,6 +898,8 @@ fn run_ip(args: &[&str], allow_existing: bool) -> Result<(), std::io::Error> {
 }
 
 fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
+    // SAFETY: msghdr is a plain C struct; all relevant fields are initialized
+    // before sendmsg is called.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
 
     // We must send at least one dummy byte of data for sendmsg to succeed on many platforms
@@ -878,15 +912,19 @@ fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
     msg.msg_iovlen = 1;
 
     // Allocate control message buffer for the file descriptor
+    // SAFETY: CMSG_SPACE only computes the buffer size for one RawFd.
     let mut control_buf =
         [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize }];
     msg.msg_control = control_buf.as_mut_ptr().cast();
     msg.msg_controllen = control_buf.len() as _;
 
+    // SAFETY: msg points to an initialized msghdr with a control buffer.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
         return Err(std::io::Error::other("CMSG_FIRSTHDR failed"));
     }
+    // SAFETY: cmsg points into control_buf and has enough space for one RawFd
+    // because control_buf was sized with CMSG_SPACE.
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -895,6 +933,8 @@ fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
         std::ptr::write(data_ptr.cast::<RawFd>(), fd);
     }
 
+    // SAFETY: msg references stack buffers that remain alive for the duration
+    // of sendmsg; sock is expected to be a connected Unix socket fd.
     let rc = unsafe { libc::sendmsg(sock, &msg, 0) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
@@ -903,6 +943,8 @@ fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), std::io::Error> {
 }
 
 fn recv_fd(sock: RawFd) -> Result<OwnedFd, std::io::Error> {
+    // SAFETY: msghdr is a plain C struct; all relevant fields are initialized
+    // before recvmsg is called.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
 
     let mut dummy: u8 = 0;
@@ -913,34 +955,43 @@ fn recv_fd(sock: RawFd) -> Result<OwnedFd, std::io::Error> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
 
+    // SAFETY: CMSG_SPACE only computes the buffer size for one RawFd.
     let mut control_buf =
         [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize }];
     msg.msg_control = control_buf.as_mut_ptr().cast();
     msg.msg_controllen = control_buf.len() as _;
 
+    // SAFETY: msg references stack buffers that remain alive for the duration
+    // of recvmsg; sock is expected to be a connected Unix socket fd.
     let rc = unsafe { libc::recvmsg(sock, &mut msg, 0) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
+    // SAFETY: msg was filled by recvmsg and still owns the control buffer.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
         return Err(std::io::Error::other("no control message received"));
     }
 
+    // SAFETY: cmsg was checked non-null and points into the received control
+    // buffer. read_unaligned avoids layout-alignment assumptions.
     let cmsg_level = unsafe { std::ptr::addr_of!((*cmsg).cmsg_level).read_unaligned() };
+    // SAFETY: see cmsg_level above.
     let cmsg_type = unsafe { std::ptr::addr_of!((*cmsg).cmsg_type).read_unaligned() };
     let is_scm_rights = cmsg_level == libc::SOL_SOCKET && cmsg_type == libc::SCM_RIGHTS;
     if !is_scm_rights {
         return Err(std::io::Error::other("expected SCM_RIGHTS"));
     }
 
+    // SAFETY: the SCM_RIGHTS control message contains at least one RawFd.
     let fd = unsafe { libc::CMSG_DATA(cmsg).cast::<RawFd>().read_unaligned() };
     if fd < 0 {
         return Err(std::io::Error::other("invalid file descriptor received"));
     }
 
     use std::os::fd::FromRawFd;
+    // SAFETY: fd was received via SCM_RIGHTS and is now owned by this process.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -979,44 +1030,6 @@ fn arp_reply(frame: &[u8]) -> Option<Vec<u8>> {
     Some(reply)
 }
 
-fn ethernet_payload_to_ip(frame: &[u8]) -> Option<Vec<u8>> {
-    if frame.len() < 14 {
-        return None;
-    }
-    match u16::from_be_bytes([frame[12], frame[13]]) {
-        0x0800 => {
-            let payload = &frame[14..];
-            if payload.len() < 20 {
-                return None;
-            }
-            let ihl = usize::from(payload[0] & 0x0f) * 4;
-            if ihl < 20 || payload.len() < ihl {
-                return None;
-            }
-            let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
-            if total_len >= ihl && payload.len() >= total_len {
-                Some(payload[..total_len].to_vec())
-            } else {
-                Some(payload.to_vec())
-            }
-        }
-        0x86dd => {
-            let payload = &frame[14..];
-            if payload.len() < 40 {
-                return None;
-            }
-            let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-            let total_len = 40usize.saturating_add(payload_len);
-            if payload.len() >= total_len {
-                Some(payload[..total_len].to_vec())
-            } else {
-                Some(payload.to_vec())
-            }
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,7 +1037,7 @@ mod tests {
     #[test]
     fn parses_tap_capture_command() {
         let ControlRequest::CaptureTap(spec) = parse_control_request(
-            "capture-tap vm_id=app5 netns=/proc/791/ns/net if=tap0 setup=tap addr=10.5.0.2/24 gw=10.5.0.1 route=default",
+            "capture-tap vm_id=app5 netns=/proc/791/ns/net userns=/proc/791/ns/user if=tap0 setup=tap addr=10.5.0.2/24 gw=10.5.0.1 route=default",
         )
         .unwrap()
         else {
@@ -1032,14 +1045,53 @@ mod tests {
         };
         assert_eq!(spec.vm_id, "app5");
         assert_eq!(spec.netns_path, PathBuf::from("/proc/791/ns/net"));
+        assert_eq!(spec.userns_path, Some(PathBuf::from("/proc/791/ns/user")));
         assert_eq!(spec.if_name.as_deref(), Some("tap0"));
         assert_eq!(
             spec.setup,
             Some(NetnsSetup {
                 address: Some("10.5.0.2/24".to_string()),
                 gateway: Some("10.5.0.1".to_string()),
+                mtu: None,
                 default_route: true,
             })
         );
+    }
+
+    #[test]
+    fn route_outgoing_packet_counts_full_destination_queue() {
+        crate::stats::stats().reset();
+        let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 250, 0, 2));
+        let (tx, mut rx) = mpsc::channel::<TapInject>(1);
+        register_destination(dst, tx);
+
+        let first = crate::packet::build_ipv4_udp_packet(
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+            1234,
+            std::net::Ipv4Addr::new(10, 250, 0, 2),
+            5678,
+            b"first",
+        )
+        .unwrap();
+        let second = crate::packet::build_ipv4_udp_packet(
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+            1234,
+            std::net::Ipv4Addr::new(10, 250, 0, 2),
+            5678,
+            b"second",
+        )
+        .unwrap();
+
+        assert!(route_outgoing_packet(&first));
+        assert!(route_outgoing_packet(&second));
+        assert_eq!(
+            crate::stats::stats()
+                .route_send_full
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        unregister_destination(&dst);
+        let _ = rx.try_recv();
     }
 }

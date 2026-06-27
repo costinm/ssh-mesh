@@ -108,10 +108,15 @@ pub async fn setup_test_environment(
         base_dir: Some(base_dir.clone()),
         ssh_port: Some(ssh_port),
         http_port,
+        // Tests exercise direct-tcpip port forwarding (e.g. mux_test's local
+        // forward), which requires the open-relay path. Production defaults
+        // to false for safety.
+        allow_direct_tcpip: true,
         ..Default::default()
     };
     let mesh_node = std::sync::Arc::new(crate::MeshNode::new(Some(base_dir.clone()), Some(cfg)));
 
+    let base_dir_for_server = base_dir.clone();
     let mesh_node_clone = mesh_node.clone();
     let server_handle = tokio::spawn(async move {
         println!(
@@ -123,12 +128,15 @@ pub async fn setup_test_environment(
             let app_state = crate::AppState {
                 ssh_server: mesh_node_clone.clone(),
                 target_http_address: std::env::var("HTTP_PORT").ok(),
-                ssh_client_manager: std::sync::Arc::new(crate::sshc::SshClientManager::new(
-                    mesh_node_clone.private_key().clone(),
-                    Vec::new(),
-                    None,
-                    None,
-                )),
+                ssh_client_manager: std::sync::Arc::new(
+                    crate::sshc::SshClientManager::new(
+                        mesh_node_clone.private_key().clone(),
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .with_discovery_dir(Some(base_dir_for_server.clone())),
+                ),
             };
 
             let mesh_node_for_ssh = mesh_node_clone.clone();

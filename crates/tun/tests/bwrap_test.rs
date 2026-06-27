@@ -1,4 +1,6 @@
-use mesh::tun::{TunDnsHandler, TunTcpHandler, TunTcpMeta, TunUdpHandler, TunUdpPacket};
+use mesh::tun::{TunDnsHandler, TunUdpHandler, TunUdpPacket};
+use mesh_tun::policy::FlowContext;
+use mesh_tun::transport::{BoxTunByteStream, FixedTcpConnectorPolicy, TcpConnector};
 use mesh_tun::{MeshTun, MeshTunConfig};
 use std::fs::{self, File, OpenOptions};
 use std::net::SocketAddr;
@@ -8,23 +10,20 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-struct RedirectTcpHandler {
+struct RedirectTcpConnector {
     target: SocketAddr,
 }
 
 #[async_trait::async_trait]
-impl TunTcpHandler for RedirectTcpHandler {
-    async fn handle_tcp(&self, _meta: TunTcpMeta, mut stream: DuplexStream) {
-        let mut upstream = match tokio::net::TcpStream::connect(self.target).await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+impl TcpConnector for RedirectTcpConnector {
+    async fn connect(&self, _ctx: &FlowContext) -> Result<BoxTunByteStream, anyhow::Error> {
+        let stream = tokio::net::TcpStream::connect(self.target).await?;
+        Ok(Box::new(stream))
     }
 }
 
@@ -47,29 +46,29 @@ struct TunTestHarness {
 }
 
 impl TunTestHarness {
-    async fn new(tcp_handler: Arc<dyn TunTcpHandler>) -> Self {
+    async fn new(target: SocketAddr) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
         let control_socket = temp_dir.path().join("control.sock");
 
-        let config = MeshTunConfig {
-            tcp_rewrite: false, // Disables NAT
-            ..MeshTunConfig::default()
-        };
+        let config = MeshTunConfig::default();
         let tun = MeshTun::new(config).unwrap();
         let dummy_udp = Arc::new(DummyUdpHandler);
         let dummy_dns = Arc::new(DummyDnsHandler);
+        let tcp_policy = Arc::new(FixedTcpConnectorPolicy::new(Arc::new(
+            RedirectTcpConnector { target },
+        )));
 
         let (_injector, tun_tx, mut stack_rx) = tun
-            .run_with_channels(tcp_handler, dummy_udp, dummy_dns)
+            .run_with_channels_and_policy(tcp_policy, dummy_udp, dummy_dns)
             .await
             .unwrap();
 
         // Spawn route outgoing packet loop
-        let (fallback_tx, _fallback_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (fallback_tx, _fallback_rx) = mpsc::channel::<Vec<u8>>(1024);
         tokio::spawn(async move {
             while let Some(packet) = stack_rx.recv().await {
                 if !mesh_tun::control::route_outgoing_packet(&packet) {
-                    let _ = fallback_tx.send(packet);
+                    let _ = fallback_tx.try_send(packet);
                 }
             }
         });
@@ -109,9 +108,8 @@ async fn test_bwrap_curl_e2e() {
         }
     });
 
-    let redirect_handler = Arc::new(RedirectTcpHandler { target: mock_addr });
     println!("starting in-process mesh-tun control server");
-    let harness = TunTestHarness::new(redirect_handler).await;
+    let harness = TunTestHarness::new(mock_addr).await;
 
     println!("creating bwrap coordination fds");
     let temp_dir = tempfile::tempdir().unwrap();
