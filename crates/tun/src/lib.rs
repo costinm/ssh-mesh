@@ -5,7 +5,6 @@ use mesh::config::DEFAULT_MESH_TUN_MTU;
 use mesh::tun::{TunDnsHandler, TunUdpHandler};
 use policy::MeshTunPolicy;
 use tcp_proxy::TcpProxyConfig;
-use tcp_rewrite::{TcpRewriteConfig, TcpRewriter};
 use tokio::sync::mpsc;
 
 pub mod control;
@@ -15,7 +14,6 @@ pub mod packet;
 pub mod policy;
 pub mod stats;
 pub mod tcp_proxy;
-pub mod tcp_rewrite;
 pub mod telemetry;
 pub mod transport;
 pub mod uds;
@@ -38,14 +36,6 @@ pub struct MeshTunConfig {
     pub packet_queue_capacity: usize,
     /// Workload identity attached to flows from this capture instance.
     pub vm_id: String,
-    /// Enable passt-style TCP source tracking and packet rewrite.
-    ///
-    /// When enabled, TCP packets bypass the policy-selected connector path
-    /// and are NAT-translated directly to the outgoing interface. Defaults to
-    /// `false` so that TCP flows are routed through the passt-like TCP proxy.
-    pub tcp_rewrite: bool,
-    /// TCP rewrite settings.
-    pub tcp_rewrite_config: TcpRewriteConfig,
     /// TCP proxy flow-control settings for the mesh/policy path.
     pub tcp_proxy_config: TcpProxyConfig,
 }
@@ -60,8 +50,6 @@ impl Default for MeshTunConfig {
             mtu: DEFAULT_MESH_TUN_MTU as usize,
             packet_queue_capacity: 4096,
             vm_id: "default".to_string(),
-            tcp_rewrite: false,
-            tcp_rewrite_config: TcpRewriteConfig::default(),
             tcp_proxy_config: TcpProxyConfig::default(),
         }
     }
@@ -105,8 +93,16 @@ impl MeshTun {
         let queue_capacity = self.config.packet_queue_capacity;
         let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(queue_capacity);
         let (device_tx, mut device_rx) = mpsc::channel::<Vec<u8>>(queue_capacity);
-        let injector = Arc::new(injector::MeshTunInjector::new(device_tx.clone()));
-        let tcp_rewriter = self.tcp_rewriter()?;
+        let tcp_proxy = tcp_proxy::TcpProxyManager::new(
+            self.config.vm_id.clone(),
+            device_tx.clone(),
+            tcp_policy,
+            self.config.tcp_proxy_config.clone(),
+        );
+        let injector = Arc::new(injector::MeshTunInjector::with_tcp_proxy(
+            device_tx.clone(),
+            tcp_proxy.clone(),
+        ));
 
         let tun = self.open_tun_device()?;
         let tun_arc = Arc::new(tun);
@@ -140,16 +136,7 @@ impl MeshTun {
             }
         });
 
-        spawn_packet_router_with_policy(
-            tcp_policy,
-            udp_handler,
-            dns_handler,
-            tun_rx,
-            device_tx,
-            tcp_rewriter,
-            self.config.tcp_proxy_config,
-            self.config.vm_id,
-        );
+        spawn_packet_router_with_policy(tcp_proxy, udp_handler, dns_handler, tun_rx);
         Ok(injector)
     }
 
@@ -176,18 +163,17 @@ impl MeshTun {
             mpsc::channel::<Vec<u8>>(self.config.packet_queue_capacity);
         let (outgoing_tx, outgoing_rx) =
             mpsc::channel::<Vec<u8>>(self.config.packet_queue_capacity);
-        let injector = Arc::new(injector::MeshTunInjector::new(outgoing_tx.clone()));
-        let tcp_rewriter = self.tcp_rewriter()?;
-        spawn_packet_router_with_policy(
+        let tcp_proxy = tcp_proxy::TcpProxyManager::new(
+            self.config.vm_id.clone(),
+            outgoing_tx.clone(),
             tcp_policy,
-            udp_handler,
-            dns_handler,
-            incoming_rx,
-            outgoing_tx,
-            tcp_rewriter,
-            self.config.tcp_proxy_config,
-            self.config.vm_id,
+            self.config.tcp_proxy_config.clone(),
         );
+        let injector = Arc::new(injector::MeshTunInjector::with_tcp_proxy(
+            outgoing_tx.clone(),
+            tcp_proxy.clone(),
+        ));
+        spawn_packet_router_with_policy(tcp_proxy, udp_handler, dns_handler, incoming_rx);
         Ok((injector, incoming_tx, outgoing_rx))
     }
 
@@ -206,71 +192,16 @@ impl MeshTun {
             .build_async()
             .map_err(|error| anyhow::anyhow!("TUN create error: {error}"))
     }
-
-    fn tcp_rewriter(&self) -> Result<Option<TcpRewriter>, anyhow::Error> {
-        self.config
-            .tcp_rewrite
-            .then(|| TcpRewriter::new(self.config.tcp_rewrite_config.clone()))
-            .transpose()
-    }
 }
 
 fn spawn_packet_router_with_policy(
-    tcp_policy: Arc<dyn MeshTunPolicy>,
+    tcp_proxy: tcp_proxy::TcpProxyManager,
     udp_handler: Arc<dyn TunUdpHandler>,
     dns_handler: Arc<dyn TunDnsHandler>,
     mut incoming_rx: mpsc::Receiver<Vec<u8>>,
-    outgoing_tx: mpsc::Sender<Vec<u8>>,
-    tcp_rewriter: Option<TcpRewriter>,
-    tcp_proxy_config: TcpProxyConfig,
-    vm_id: String,
 ) {
-    let tcp_proxy =
-        tcp_proxy::TcpProxyManager::new(vm_id, outgoing_tx.clone(), tcp_policy, tcp_proxy_config);
     tokio::spawn(async move {
-        let mut tcp_rewriter = tcp_rewriter;
         while let Some(packet) = incoming_rx.recv().await {
-            if let Some(rewriter) = tcp_rewriter.as_mut() {
-                match packet::parse_ip_packet(&packet) {
-                    packet::TunPacket::Tcp(tcp) => {
-                        let result = if tcp.dst_addr == IpAddr::V4(rewriter.config().proxy_addr) {
-                            rewriter.translate_inbound(&packet)
-                        } else {
-                            rewriter.translate_outbound(&packet)
-                        };
-                        match result {
-                            Ok(Some(packet)) => {
-                                if outgoing_tx.try_send(packet).is_err() {
-                                    crate::stats::stats()
-                                        .tun_output_queue_full
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::warn!(%error, "TCP rewrite failed");
-                            }
-                        }
-                    }
-                    packet::TunPacket::Udp(packet)
-                        if packet.src_port == 53 || packet.dst_port == 53 =>
-                    {
-                        let handler = dns_handler.clone();
-                        tokio::spawn(async move {
-                            handler.handle_dns(packet).await;
-                        });
-                    }
-                    packet::TunPacket::Udp(packet) => {
-                        let handler = udp_handler.clone();
-                        tokio::spawn(async move {
-                            handler.handle_udp(packet).await;
-                        });
-                    }
-                    packet::TunPacket::Other => {}
-                }
-                continue;
-            }
-
             match packet::parse_ip_packet_owned(packet) {
                 packet::TunPacket::Udp(packet)
                     if packet.src_port == 53 || packet.dst_port == 53 =>

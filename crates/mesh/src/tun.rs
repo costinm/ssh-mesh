@@ -46,8 +46,9 @@ pub trait TunDnsHandler: Send + Sync + 'static {
 /// the `tun` crate.
 #[async_trait]
 pub trait TunInjector: Send + Sync + 'static {
-    /// Create an outbound TCP connection that appears on the TUN with
-    /// the given source IP. Returns a bidirectional stream.
+    /// Create a TCP connection into the guest that appears to originate from
+    /// the given source tuple. The caller may back this with a local TCP
+    /// accept, SSH channel, HBONE stream, or another byte-stream transport.
     async fn connect_tcp(
         &self,
         src_addr: std::net::IpAddr,

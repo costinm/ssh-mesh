@@ -1,6 +1,6 @@
 use crate::packet::{
-    ethernet_payload_to_ip, ip_packet_destination, ip_packet_source, ip_to_ethernet_frame,
-    ipv4_checksum_valid, ipv4_tcp_checksum_valid,
+    build_ipv4_tcp_packet_with_options, ethernet_payload_to_ip, ip_packet_destination,
+    ip_packet_source, ip_to_ethernet_frame, ipv4_checksum_valid, ipv4_tcp_checksum_valid,
 };
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -301,10 +301,28 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
 }
 
 static GUEST_ROUTER: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, mpsc::Sender<Vec<u8>>>>,
+    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, mpsc::Sender<TapInject>>>,
 > = std::sync::OnceLock::new();
 
-pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::Sender<Vec<u8>>) {
+const TAP_INJECT_DRAIN_BUDGET: usize = 64;
+
+#[derive(Debug)]
+pub enum TapInject {
+    Ip(Vec<u8>),
+    Tcp4 {
+        src_addr: Ipv4Addr,
+        src_port: u16,
+        dst_addr: Ipv4Addr,
+        dst_port: u16,
+        flags: u8,
+        seq: u32,
+        ack: u32,
+        options: Vec<u8>,
+        payload: Vec<u8>,
+    },
+}
+
+pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::Sender<TapInject>) {
     let registry =
         GUEST_ROUTER.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
     let mut destinations = registry
@@ -322,6 +340,12 @@ pub fn unregister_destination(ip: &std::net::IpAddr) {
     }
 }
 
+pub fn destination_sender(ip: &std::net::IpAddr) -> Option<mpsc::Sender<TapInject>> {
+    let registry = GUEST_ROUTER.get()?;
+    let destinations = registry.read().unwrap_or_else(|poison| poison.into_inner());
+    destinations.get(ip).cloned()
+}
+
 pub fn route_outgoing_packet(packet: &[u8]) -> bool {
     let dst_ip = match ip_packet_destination(packet) {
         Some(ip) => ip,
@@ -330,7 +354,7 @@ pub fn route_outgoing_packet(packet: &[u8]) -> bool {
     if let Some(registry) = GUEST_ROUTER.get() {
         let destinations = registry.read().unwrap_or_else(|poison| poison.into_inner());
         if let Some(sender) = destinations.get(&dst_ip) {
-            match sender.try_send(packet.to_vec()) {
+            match sender.try_send(TapInject::Ip(packet.to_vec())) {
                 Ok(()) => {
                     crate::stats::stats()
                         .route_hit
@@ -358,7 +382,7 @@ fn start_tap_capture(
     tun_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let spec = Arc::new(spec);
-    let (inject_tx, inject_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let (inject_tx, inject_rx) = mpsc::channel::<TapInject>(1024);
     let guest_mac = Arc::new(std::sync::Mutex::new(None));
 
     let socket = fork_and_create_tap(&spec)?;
@@ -421,6 +445,32 @@ fn inject_ip_packet(
         return Err(err.into());
     }
     Ok(())
+}
+
+fn inject_tap_packet(
+    socket: &OwnedFd,
+    guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
+    packet: TapInject,
+) -> Result<(), anyhow::Error> {
+    match packet {
+        TapInject::Ip(packet) => inject_ip_packet(socket, guest_mac, &packet),
+        TapInject::Tcp4 {
+            src_addr,
+            src_port,
+            dst_addr,
+            dst_port,
+            flags,
+            seq,
+            ack,
+            options,
+            payload,
+        } => {
+            let packet = build_ipv4_tcp_packet_with_options(
+                src_addr, src_port, dst_addr, dst_port, flags, seq, ack, &options, &payload,
+            )?;
+            inject_ip_packet(socket, guest_mac, &packet)
+        }
+    }
 }
 
 fn record_inject_frame(frame: &[u8]) {
@@ -486,14 +536,19 @@ fn packet_capture_thread_loop(
     socket_arc: Arc<OwnedFd>,
     tun_tx: mpsc::Sender<Vec<u8>>,
     guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
-    inject_tx: mpsc::Sender<Vec<u8>>,
-    mut inject_rx: mpsc::Receiver<Vec<u8>>,
+    inject_tx: mpsc::Sender<TapInject>,
+    mut inject_rx: mpsc::Receiver<TapInject>,
 ) -> Result<(), anyhow::Error> {
     let mut buf = vec![0u8; 65535];
     let mut registered_ips = std::collections::HashSet::new();
 
     loop {
-        drain_inject_queue(&socket_arc, guest_mac.clone(), &mut inject_rx)?;
+        let drained = drain_inject_queue(
+            &socket_arc,
+            guest_mac.clone(),
+            &mut inject_rx,
+            TAP_INJECT_DRAIN_BUDGET,
+        )?;
 
         let mut poll_fd = libc::pollfd {
             fd: socket_arc.as_raw_fd(),
@@ -501,7 +556,8 @@ fn packet_capture_thread_loop(
             revents: 0,
         };
         // SAFETY: poll_fd points to one valid pollfd and the timeout is finite.
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, 10) };
+        let timeout_ms = if drained == 0 { 10 } else { 0 };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
         if ready < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -592,20 +648,24 @@ fn packet_capture_thread_loop(
 fn drain_inject_queue(
     socket: &OwnedFd,
     guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
-    inject_rx: &mut mpsc::Receiver<Vec<u8>>,
-) -> Result<(), anyhow::Error> {
-    loop {
+    inject_rx: &mut mpsc::Receiver<TapInject>,
+    budget: usize,
+) -> Result<usize, anyhow::Error> {
+    let mut drained = 0usize;
+    while drained < budget {
         match inject_rx.try_recv() {
             Ok(packet) => {
                 crate::stats::stats()
                     .tap_inject_queue_rx
                     .fetch_add(1, Ordering::Relaxed);
-                inject_ip_packet(socket, guest_mac.clone(), &packet)?;
+                inject_tap_packet(socket, guest_mac.clone(), packet)?;
+                drained += 1;
             }
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(drained),
+            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(drained),
         }
     }
+    Ok(drained)
 }
 
 fn fork_and_create_tap(spec: &TapCaptureSpec) -> Result<OwnedFd, anyhow::Error> {
@@ -1002,7 +1062,7 @@ mod tests {
     fn route_outgoing_packet_counts_full_destination_queue() {
         crate::stats::stats().reset();
         let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 250, 0, 2));
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        let (tx, mut rx) = mpsc::channel::<TapInject>(1);
         register_destination(dst, tx);
 
         let first = crate::packet::build_ipv4_udp_packet(

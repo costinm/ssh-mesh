@@ -17,7 +17,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry, reload};
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), anyhow::Error> {
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 && args[1] == "bwrap" {
@@ -297,19 +297,6 @@ fn mesh_tun_config_from_env() -> Result<MeshTunConfig, anyhow::Error> {
     }
     if let Ok(capacity) = env::var("MESH_TUN_PACKET_QUEUE") {
         config.packet_queue_capacity = capacity.parse()?;
-    }
-    if let Ok(enabled) = env::var("MESH_TUN_TCP_REWRITE") {
-        config.tcp_rewrite = env_value_truthy(&enabled);
-    }
-    if let Ok(proxy_addr) = env::var("MESH_TUN_TCP_REWRITE_PROXY_ADDR") {
-        config.tcp_rewrite_config.proxy_addr = proxy_addr.parse()?;
-    }
-    if let Ok(port_range) = env::var("MESH_TUN_TCP_REWRITE_PORTS") {
-        let Some((first, last)) = port_range.split_once('-') else {
-            anyhow::bail!("MESH_TUN_TCP_REWRITE_PORTS must be FIRST-LAST");
-        };
-        config.tcp_rewrite_config.first_port = first.parse()?;
-        config.tcp_rewrite_config.last_port = last.parse()?;
     }
     if let Ok(max_flows) = env::var("MESH_TUN_TCP_MAX_FLOWS") {
         config.tcp_proxy_config.max_flows = max_flows.parse()?;

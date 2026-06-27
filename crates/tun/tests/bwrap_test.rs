@@ -50,10 +50,7 @@ impl TunTestHarness {
         let temp_dir = tempfile::tempdir().unwrap();
         let control_socket = temp_dir.path().join("control.sock");
 
-        let config = MeshTunConfig {
-            tcp_rewrite: false, // Disables NAT
-            ..MeshTunConfig::default()
-        };
+        let config = MeshTunConfig::default();
         let tun = MeshTun::new(config).unwrap();
         let dummy_udp = Arc::new(DummyUdpHandler);
         let dummy_dns = Arc::new(DummyDnsHandler);

@@ -24,7 +24,6 @@ env_init() {
 env_tun() {
   MESH_TUN_RUN="${tun_run}" \
   MESH_TUN_MODE=uds \
-  MESH_TUN_TCP_REWRITE=false \
   MESH_TUN_CONTROL_SOCKET="${tun_run}/control.sock" \
   MESH_TUN_BWRAP_SOCKET="${tun_run}/bwrap.sock" \
   MESH_TUN_SOCKET="${tun_run}/qemu.sock" \

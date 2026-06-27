@@ -185,37 +185,6 @@ pub fn is_ipv4_tcp(packet: &[u8]) -> bool {
     ipv4_header_len(packet).is_some() && packet.get(9) == Some(&6)
 }
 
-pub fn rewrite_ipv4_tcp(
-    packet: &[u8],
-    new_src: Ipv4Addr,
-    new_src_port: u16,
-    new_dst: Ipv4Addr,
-    new_dst_port: u16,
-) -> Result<Vec<u8>, anyhow::Error> {
-    if !is_ipv4_tcp(packet) {
-        anyhow::bail!("packet is not IPv4 TCP");
-    }
-    let ihl = ipv4_header_len(packet).ok_or_else(|| anyhow::anyhow!("invalid IPv4 header"))?;
-    let total_len = ipv4_total_len(packet).ok_or_else(|| anyhow::anyhow!("invalid IPv4 length"))?;
-    if total_len < ihl + 20 {
-        anyhow::bail!("TCP header is truncated");
-    }
-
-    let mut out = packet[..total_len].to_vec();
-    out[12..16].copy_from_slice(&new_src.octets());
-    out[16..20].copy_from_slice(&new_dst.octets());
-    out[10..12].copy_from_slice(&[0, 0]);
-    let ip_checksum = internet_checksum(&out[..ihl]);
-    out[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-    out[ihl..ihl + 2].copy_from_slice(&new_src_port.to_be_bytes());
-    out[ihl + 2..ihl + 4].copy_from_slice(&new_dst_port.to_be_bytes());
-    out[ihl + 16..ihl + 18].copy_from_slice(&[0, 0]);
-    let tcp_checksum = ipv4_tcp_checksum(new_src, new_dst, &out[ihl..total_len])?;
-    out[ihl + 16..ihl + 18].copy_from_slice(&tcp_checksum.to_be_bytes());
-    Ok(out)
-}
-
 pub fn ipv4_checksum_valid(packet: &[u8]) -> bool {
     let Some(ihl) = ipv4_header_len(packet) else {
         return false;
@@ -802,61 +771,6 @@ mod tests {
             0x00, 0x03, 0x0a, 0x00, 0x00, 0x04,
         ];
         assert!(ipv4_checksum_valid(&header));
-    }
-
-    #[test]
-    fn test_rewrite_ipv4_tcp_preserves_payload() {
-        let pkt = build_ipv4_tcp_packet(
-            Ipv4Addr::new(10, 0, 0, 1),
-            1234,
-            Ipv4Addr::new(10, 0, 0, 2),
-            5678,
-            0x10,
-            1,
-            1,
-            b"secret payload",
-        )
-        .unwrap();
-        let rewritten = rewrite_ipv4_tcp(
-            &pkt,
-            Ipv4Addr::new(192, 168, 1, 100),
-            8888,
-            Ipv4Addr::new(192, 168, 1, 200),
-            9999,
-        )
-        .unwrap();
-        match parse_ip_packet(&rewritten) {
-            TunPacket::Tcp(tcp) => {
-                assert_eq!(tcp.src_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)));
-                assert_eq!(tcp.src_port, 8888);
-                assert_eq!(tcp.dst_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)));
-                assert_eq!(tcp.dst_port, 9999);
-            }
-            _ => panic!("Expected TCP"),
-        }
-        assert_eq!(&rewritten[rewritten.len() - 14..], b"secret payload");
-    }
-
-    #[test]
-    fn test_rewrite_non_tcp_fails() {
-        let pkt = build_ipv4_udp_packet(
-            Ipv4Addr::new(1, 1, 1, 1),
-            123,
-            Ipv4Addr::new(2, 2, 2, 2),
-            456,
-            b"udp data",
-        )
-        .unwrap();
-        assert!(
-            rewrite_ipv4_tcp(
-                &pkt,
-                Ipv4Addr::new(3, 3, 3, 3),
-                777,
-                Ipv4Addr::new(4, 4, 4, 4),
-                888,
-            )
-            .is_err()
-        );
     }
 
     #[test]

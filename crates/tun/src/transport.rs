@@ -1,8 +1,9 @@
 use crate::policy::FlowContext;
+use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 use tokio::net::TcpStream;
 
 pub trait TunByteStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
@@ -10,6 +11,26 @@ pub trait TunByteStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T> TunByteStream for T where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 pub type BoxTunByteStream = Box<dyn TunByteStream>;
+
+/// Bridge an already-accepted byte stream into a guest TCP listener.
+///
+/// The source tuple is the original peer address that should be visible to the
+/// guest. The stream may be a native TCP accept, SSH channel, HBONE stream, or
+/// any other bidirectional transport.
+pub async fn bridge_accepted_tcp_to_guest<S>(
+    injector: Arc<dyn mesh::tun::TunInjector>,
+    src: SocketAddr,
+    dst: SocketAddr,
+    mut stream: S,
+) -> Result<(u64, u64), anyhow::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut guest = injector
+        .connect_tcp(src.ip(), src.port(), dst.ip(), dst.port())
+        .await?;
+    Ok(copy_bidirectional(&mut stream, &mut guest).await?)
+}
 
 #[async_trait::async_trait]
 pub trait TcpConnector: Send + Sync + 'static {

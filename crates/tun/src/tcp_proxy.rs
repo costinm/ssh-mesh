@@ -1,11 +1,12 @@
-use crate::packet::{TunTcpPacket, build_ipv4_tcp_packet, build_ipv4_tcp_packet_with_options};
+use crate::control::TapInject;
+use crate::packet::{TunTcpPacket, build_ipv4_tcp_packet_with_options};
 use crate::policy::{FlowContext, FlowProtocol, MeshTunPolicy, TcpRouteDecision};
 use mesh::config::DEFAULT_MESH_TUN_MTU;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{Mutex, mpsc};
 
 const TCP_REORDER_BUFFER_MAX_BYTES: usize = 256 * 1024;
@@ -131,6 +132,395 @@ impl TcpProxyManager {
             });
         }
     }
+
+    pub async fn connect_inbound(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> Result<DuplexStream, anyhow::Error> {
+        // Inbound streams may originate from a local listener, SSH, HBONE, or
+        // another mesh transport. The original source/destination tuple is
+        // preserved here and used both for policy and for the guest-visible
+        // synthetic TCP handshake.
+        let context = FlowContext {
+            vm_id: self.vm_id.clone(),
+            protocol: FlowProtocol::Tcp,
+            src,
+            dst,
+        };
+        if let crate::policy::PolicyDecision::Deny { reason } = self.policy.check(&context).await {
+            crate::stats::stats()
+                .tcp_inbound_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("inbound TCP flow denied: {reason}");
+        }
+
+        let key = TcpFlowKey { src: dst, dst: src };
+        let mut flows_guard = self.flows.lock().await;
+        if flows_guard.len() >= self.config.max_flows {
+            crate::stats::stats()
+                .tcp_inbound_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("too many TCP flows");
+        }
+        if flows_guard.contains_key(&key) {
+            crate::stats::stats()
+                .tcp_flow_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("inbound TCP flow already exists");
+        }
+
+        let (tx, rx) = mpsc::channel(self.config.per_flow_queue_capacity);
+        flows_guard.insert(key.clone(), tx);
+        drop(flows_guard);
+
+        let (caller_stream, mesh_stream) = tokio::io::duplex(usize::from(default_tcp_mss()) * 4);
+        let outgoing_tx = self.outgoing_tx.clone();
+        let flows = self.flows.clone();
+        let config = self.config.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            if let Err(error) =
+                handle_inbound_tcp_flow(src, dst, rx, outgoing_tx, mesh_stream, config, ready_tx)
+                    .await
+            {
+                tracing::debug!(?src, ?dst, %error, "inbound TCP flow stopped");
+                crate::stats::stats()
+                    .tcp_flow_error
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            flows.lock().await.remove(&key);
+        });
+
+        match ready_rx.await {
+            Ok(Ok(())) => Ok(caller_stream),
+            Ok(Err(error)) => anyhow::bail!(error),
+            Err(_) => anyhow::bail!("inbound TCP flow task stopped before handshake"),
+        }
+    }
+}
+
+async fn handle_inbound_tcp_flow(
+    src: SocketAddr,
+    dst: SocketAddr,
+    mut rx: mpsc::Receiver<TunTcpPacket>,
+    outgoing_tx: mpsc::Sender<Vec<u8>>,
+    mesh_stream: DuplexStream,
+    config: TcpProxyConfig,
+    ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+) -> Result<(), anyhow::Error> {
+    let src_ip_v4 = match src.ip() {
+        IpAddr::V4(ip) => ip,
+        _ => anyhow::bail!("IPv6 inbound TCP is not implemented yet"),
+    };
+    let dst_ip_v4 = match dst.ip() {
+        IpAddr::V4(ip) => ip,
+        _ => anyhow::bail!("IPv6 inbound TCP is not implemented yet"),
+    };
+    let direct_guest_tx = crate::control::destination_sender(&dst.ip());
+    let initial_remote_seq = initial_tcp_sequence();
+    let remote_seq_shared = Arc::new(AtomicU32::new(initial_remote_seq.wrapping_add(1)));
+    let guest_seq_shared = Arc::new(AtomicU32::new(0));
+    let remote_acked_shared = Arc::new(AtomicU32::new(initial_remote_seq));
+
+    if !send_tcp4_output(
+        Tcp4Output {
+            src_addr: src_ip_v4,
+            src_port: src.port(),
+            dst_addr: dst_ip_v4,
+            dst_port: dst.port(),
+            flags: 0x02,
+            seq: initial_remote_seq,
+            ack: 0,
+            options: tcp_syn_options().to_vec(),
+            payload: Vec::new(),
+        },
+        &outgoing_tx,
+        direct_guest_tx.as_ref(),
+    )
+    .await
+    {
+        crate::stats::stats()
+            .tcp_flow_error
+            .fetch_add(1, Ordering::Relaxed);
+        let message = "failed to send inbound TCP SYN".to_string();
+        let _ = ready_tx.send(Err(message.clone()));
+        anyhow::bail!(message);
+    }
+    crate::stats::stats()
+        .tcp_inbound_syn_sent
+        .fetch_add(1, Ordering::Relaxed);
+
+    let expected_ack = initial_remote_seq.wrapping_add(1);
+    let syn_ack = loop {
+        let recv = tokio::time::timeout(config.handshake_timeout, rx.recv()).await;
+        let Some(pkt) = (match recv {
+            Ok(pkt) => pkt,
+            Err(_) => {
+                crate::stats::stats()
+                    .tcp_handshake_timeout
+                    .fetch_add(1, Ordering::Relaxed);
+                let message = "inbound TCP handshake timed out".to_string();
+                let _ = ready_tx.send(Err(message.clone()));
+                anyhow::bail!(message);
+            }
+        }) else {
+            let message = "inbound TCP flow closed during handshake".to_string();
+            let _ = ready_tx.send(Err(message.clone()));
+            anyhow::bail!(message);
+        };
+
+        if pkt.syn && pkt.ack && pkt.ack_num == expected_ack {
+            break pkt;
+        }
+        if pkt.rst || pkt.fin {
+            let message = "inbound TCP flow rejected by guest".to_string();
+            let _ = ready_tx.send(Err(message.clone()));
+            anyhow::bail!(message);
+        }
+        crate::stats::stats()
+            .tcp_handshake_skip
+            .fetch_add(1, Ordering::Relaxed);
+    };
+
+    let guest_seq = syn_ack.seq.wrapping_add(1);
+    guest_seq_shared.store(guest_seq, Ordering::Release);
+    remote_acked_shared.store(syn_ack.ack_num, Ordering::Release);
+
+    if !send_tcp4_output(
+        Tcp4Output {
+            src_addr: src_ip_v4,
+            src_port: src.port(),
+            dst_addr: dst_ip_v4,
+            dst_port: dst.port(),
+            flags: 0x10,
+            seq: expected_ack,
+            ack: guest_seq,
+            options: Vec::new(),
+            payload: Vec::new(),
+        },
+        &outgoing_tx,
+        direct_guest_tx.as_ref(),
+    )
+    .await
+    {
+        crate::stats::stats()
+            .tcp_flow_error
+            .fetch_add(1, Ordering::Relaxed);
+        let message = "failed to send inbound TCP handshake ACK".to_string();
+        let _ = ready_tx.send(Err(message.clone()));
+        anyhow::bail!(message);
+    }
+    crate::stats::stats()
+        .tcp_inbound_ack_sent
+        .fetch_add(1, Ordering::Relaxed);
+    crate::stats::stats()
+        .tcp_inbound_open
+        .fetch_add(1, Ordering::Relaxed);
+    let _ = ready_tx.send(Ok(()));
+
+    let (mut reader, mut writer) = tokio::io::split(mesh_stream);
+    let remote_seq_a = remote_seq_shared.clone();
+    let guest_seq_a = guest_seq_shared.clone();
+    let remote_acked_a = remote_acked_shared.clone();
+    let outgoing_tx_a = outgoing_tx.clone();
+    let direct_guest_tx_a = direct_guest_tx.clone();
+    let ack_notify = Arc::new(tokio::sync::Notify::new());
+    let ack_notify_rx = ack_notify.clone();
+    let ack_notify_tx = ack_notify.clone();
+
+    let mut rx_task = tokio::spawn(async move {
+        let mut guest_seq = guest_seq_a.load(Ordering::Acquire);
+        while let Some(pkt) = rx.recv().await {
+            if pkt.rst {
+                break;
+            }
+            if pkt.ack {
+                remote_acked_a.store(pkt.ack_num, Ordering::Release);
+                ack_notify_tx.notify_one();
+            }
+            if !pkt.payload.is_empty() {
+                let segment_end = pkt.seq.wrapping_add(pkt.payload.len() as u32);
+                if tcp_seq_after(segment_end, guest_seq)
+                    && tcp_seq_before_or_equal(pkt.seq, guest_seq)
+                {
+                    let offset = guest_seq.wrapping_sub(pkt.seq) as usize;
+                    let new_data = &pkt.payload[offset..];
+                    if !new_data.is_empty() {
+                        if writer.write_all(new_data).await.is_err() {
+                            crate::stats::stats()
+                                .tcp_flow_error
+                                .fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        crate::stats::stats()
+                            .tcp_payload_guest_to_host
+                            .fetch_add(new_data.len() as u64, Ordering::Relaxed);
+                        crate::stats::stats()
+                            .tcp_guest_write_calls
+                            .fetch_add(1, Ordering::Relaxed);
+                        guest_seq = guest_seq.wrapping_add(new_data.len() as u32);
+                        guest_seq_a.store(guest_seq, Ordering::Release);
+                    }
+                }
+                let r_seq = remote_seq_a.load(Ordering::Relaxed);
+                let _ = send_tcp4_output(
+                    Tcp4Output {
+                        src_addr: src_ip_v4,
+                        src_port: src.port(),
+                        dst_addr: dst_ip_v4,
+                        dst_port: dst.port(),
+                        flags: 0x10,
+                        seq: r_seq,
+                        ack: guest_seq,
+                        options: Vec::new(),
+                        payload: Vec::new(),
+                    },
+                    &outgoing_tx_a,
+                    direct_guest_tx_a.as_ref(),
+                )
+                .await;
+                crate::stats::stats()
+                    .tcp_ack_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if pkt.fin {
+                let r_seq = remote_seq_a.load(Ordering::Relaxed);
+                let final_guest_seq = guest_seq.wrapping_add(1);
+                guest_seq_a.store(final_guest_seq, Ordering::Release);
+                let _ = send_tcp4_output(
+                    Tcp4Output {
+                        src_addr: src_ip_v4,
+                        src_port: src.port(),
+                        dst_addr: dst_ip_v4,
+                        dst_port: dst.port(),
+                        flags: 0x11,
+                        seq: r_seq,
+                        ack: final_guest_seq,
+                        options: Vec::new(),
+                        payload: Vec::new(),
+                    },
+                    &outgoing_tx_a,
+                    direct_guest_tx_a.as_ref(),
+                )
+                .await;
+                let _ = writer.shutdown().await;
+                break;
+            }
+        }
+    });
+
+    let mut tx_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; usize::from(default_tcp_mss())];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => {
+                    let r_seq = remote_seq_shared.fetch_add(1, Ordering::Relaxed);
+                    let g_seq = guest_seq_shared.load(Ordering::Relaxed);
+                    let _ = send_tcp4_output(
+                        Tcp4Output {
+                            src_addr: src_ip_v4,
+                            src_port: src.port(),
+                            dst_addr: dst_ip_v4,
+                            dst_port: dst.port(),
+                            flags: 0x11,
+                            seq: r_seq,
+                            ack: g_seq,
+                            options: Vec::new(),
+                            payload: Vec::new(),
+                        },
+                        &outgoing_tx,
+                        direct_guest_tx.as_ref(),
+                    )
+                    .await;
+                    crate::stats::stats()
+                        .tcp_fin_sent
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                Ok(n) => {
+                    crate::stats::stats()
+                        .tcp_payload_host_to_guest
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                    crate::stats::stats()
+                        .tcp_host_read_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                    let r_seq = remote_seq_shared.load(Ordering::Relaxed);
+                    let window = TCP_SYNTHETIC_WINDOW_BYTES;
+                    let deadline =
+                        tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+                    loop {
+                        let acked = remote_acked_shared.load(Ordering::Acquire);
+                        let in_flight = r_seq.wrapping_add(n as u32).wrapping_sub(acked);
+                        if in_flight <= window {
+                            break;
+                        }
+                        let timeout = tokio::time::sleep_until(deadline);
+                        tokio::pin!(timeout);
+                        tokio::select! {
+                            _ = ack_notify_rx.notified() => {}
+                            _ = &mut timeout => {
+                                crate::stats::stats()
+                                    .tcp_flow_error
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+
+                    remote_seq_shared.fetch_add(n as u32, Ordering::Release);
+                    let g_seq = guest_seq_shared.load(Ordering::Relaxed);
+                    if !send_tcp4_output(
+                        Tcp4Output {
+                            src_addr: src_ip_v4,
+                            src_port: src.port(),
+                            dst_addr: dst_ip_v4,
+                            dst_port: dst.port(),
+                            flags: 0x10,
+                            seq: r_seq,
+                            ack: g_seq,
+                            options: Vec::new(),
+                            payload: buf[..n].to_vec(),
+                        },
+                        &outgoing_tx,
+                        direct_guest_tx.as_ref(),
+                    )
+                    .await
+                    {
+                        crate::stats::stats()
+                            .tun_output_queue_full
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    crate::stats::stats()
+                        .tcp_data_sent
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    crate::stats::stats()
+                        .tcp_flow_error
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    });
+
+    let _ = tokio::select! {
+        res = &mut rx_task => {
+            tx_task.abort();
+            res
+        }
+        res = &mut tx_task => {
+            rx_task.abort();
+            res
+        }
+    };
+    crate::stats::stats()
+        .tcp_flow_close
+        .fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 async fn handle_tcp_flow(
@@ -154,6 +544,7 @@ async fn handle_tcp_flow(
         IpAddr::V4(ip) => ip,
         _ => return,
     };
+    let direct_guest_tx = crate::control::destination_sender(&src.ip());
     let dst_ip_v4 = match dst.ip() {
         IpAddr::V4(ip) => ip,
         _ => return,
@@ -182,6 +573,7 @@ async fn handle_tcp_flow(
                 dst.port(),
                 &syn_pkt,
                 &outgoing_tx,
+                direct_guest_tx.as_ref(),
             )
             .await;
             return;
@@ -202,6 +594,7 @@ async fn handle_tcp_flow(
                 dst.port(),
                 &syn_pkt,
                 &outgoing_tx,
+                direct_guest_tx.as_ref(),
             )
             .await;
             return;
@@ -218,6 +611,7 @@ async fn handle_tcp_flow(
                 dst.port(),
                 &syn_pkt,
                 &outgoing_tx,
+                direct_guest_tx.as_ref(),
             )
             .await;
             return;
@@ -226,34 +620,30 @@ async fn handle_tcp_flow(
 
     let (mut reader, mut writer) = tokio::io::split(backend_stream);
 
-    let initial_server_seq = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u32)
-        .unwrap_or(0);
+    let initial_server_seq = initial_tcp_sequence();
     let server_seq_shared = Arc::new(AtomicU32::new(initial_server_seq.wrapping_add(1)));
     let client_seq_shared = Arc::new(AtomicU32::new(syn_pkt.seq.wrapping_add(1)));
     let client_acked_shared = Arc::new(AtomicU32::new(initial_server_seq));
 
     // Send SYN-ACK
-    let syn_ack_options = tcp_syn_ack_options();
-    let syn_ack = match build_ipv4_tcp_packet_with_options(
-        dst_ip_v4,
-        dst.port(),
-        src_ip_v4,
-        src.port(),
-        0x12, // SYN | ACK
-        initial_server_seq,
-        syn_pkt.seq.wrapping_add(1),
-        &syn_ack_options,
-        &[],
-    ) {
-        Ok(pkt) => pkt,
-        Err(e) => {
-            tracing::error!("Failed to build SYN-ACK: {}", e);
-            return;
-        }
-    };
-    if outgoing_tx.send(syn_ack.clone()).await.is_err() {
+    let syn_ack_options = tcp_syn_ack_options().to_vec();
+    if !send_tcp4_output(
+        Tcp4Output {
+            src_addr: dst_ip_v4,
+            src_port: dst.port(),
+            dst_addr: src_ip_v4,
+            dst_port: src.port(),
+            flags: 0x12,
+            seq: initial_server_seq,
+            ack: syn_pkt.seq.wrapping_add(1),
+            options: syn_ack_options.clone(),
+            payload: Vec::new(),
+        },
+        &outgoing_tx,
+        direct_guest_tx.as_ref(),
+    )
+    .await
+    {
         crate::stats::stats()
             .tcp_flow_error
             .fetch_add(1, Ordering::Relaxed);
@@ -300,7 +690,23 @@ async fn handle_tcp_flow(
             return;
         }
         if pkt.syn && !pkt.ack {
-            if outgoing_tx.send(syn_ack.clone()).await.is_err() {
+            if !send_tcp4_output(
+                Tcp4Output {
+                    src_addr: dst_ip_v4,
+                    src_port: dst.port(),
+                    dst_addr: src_ip_v4,
+                    dst_port: src.port(),
+                    flags: 0x12,
+                    seq: initial_server_seq,
+                    ack: syn_pkt.seq.wrapping_add(1),
+                    options: syn_ack_options.clone(),
+                    payload: Vec::new(),
+                },
+                &outgoing_tx,
+                direct_guest_tx.as_ref(),
+            )
+            .await
+            {
                 crate::stats::stats()
                     .tcp_flow_error
                     .fetch_add(1, Ordering::Relaxed);
@@ -350,6 +756,7 @@ async fn handle_tcp_flow(
     let client_seq_a = client_seq_shared.clone();
     let client_acked_a = client_acked_shared.clone();
     let outgoing_tx_a = outgoing_tx.clone();
+    let direct_guest_tx_a = direct_guest_tx.clone();
 
     // B2: Notify the tx_task (host→guest) when an ACK advances the window,
     // instead of the old 5ms busy-poll that burned CPU and could deadlock.
@@ -433,18 +840,22 @@ async fn handle_tcp_flow(
                             .tcp_flow_error
                             .fetch_add(1, Ordering::Relaxed);
                         let s_seq = server_seq_a.load(Ordering::Relaxed);
-                        if let Ok(rst) = build_ipv4_tcp_packet(
-                            dst_ip_v4,
-                            dst.port(),
-                            src_ip_v4,
-                            src.port(),
-                            0x14, // RST | ACK
-                            s_seq,
-                            client_seq,
-                            &[],
-                        ) {
-                            let _ = outgoing_tx_a.send(rst).await;
-                        }
+                        let _ = send_tcp4_output(
+                            Tcp4Output {
+                                src_addr: dst_ip_v4,
+                                src_port: dst.port(),
+                                dst_addr: src_ip_v4,
+                                dst_port: src.port(),
+                                flags: 0x14,
+                                seq: s_seq,
+                                ack: client_seq,
+                                options: Vec::new(),
+                                payload: Vec::new(),
+                            },
+                            &outgoing_tx_a,
+                            direct_guest_tx_a.as_ref(),
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -452,26 +863,31 @@ async fn handle_tcp_flow(
                 // already-received data — ack but don't re-deliver.
 
                 let s_seq = server_seq_a.load(Ordering::Relaxed);
-                if let Ok(ack_pkt) = build_ipv4_tcp_packet(
-                    dst_ip_v4,
-                    dst.port(),
-                    src_ip_v4,
-                    src.port(),
-                    0x10, // ACK
-                    s_seq,
-                    client_seq,
-                    &[],
-                ) {
-                    if outgoing_tx_a.send(ack_pkt).await.is_err() {
-                        crate::stats::stats()
-                            .tun_output_queue_full
-                            .fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
+                if !send_tcp4_output(
+                    Tcp4Output {
+                        src_addr: dst_ip_v4,
+                        src_port: dst.port(),
+                        dst_addr: src_ip_v4,
+                        dst_port: src.port(),
+                        flags: 0x10,
+                        seq: s_seq,
+                        ack: client_seq,
+                        options: Vec::new(),
+                        payload: Vec::new(),
+                    },
+                    &outgoing_tx_a,
+                    direct_guest_tx_a.as_ref(),
+                )
+                .await
+                {
                     crate::stats::stats()
-                        .tcp_ack_sent
+                        .tun_output_queue_full
                         .fetch_add(1, Ordering::Relaxed);
+                    break;
                 }
+                crate::stats::stats()
+                    .tcp_ack_sent
+                    .fetch_add(1, Ordering::Relaxed);
             }
 
             if pkt.fin {
@@ -480,21 +896,25 @@ async fn handle_tcp_flow(
                 client_seq_a.store(final_client_seq, Ordering::Release);
                 // B3: Reply with FIN|ACK (0x11) instead of bare ACK (0x10) for
                 // a cleaner close per RFC 793.
-                if let Ok(fin_ack) = build_ipv4_tcp_packet(
-                    dst_ip_v4,
-                    dst.port(),
-                    src_ip_v4,
-                    src.port(),
-                    0x11, // FIN | ACK
-                    s_seq,
-                    final_client_seq,
-                    &[],
-                ) {
-                    let _ = outgoing_tx_a.send(fin_ack).await;
-                    crate::stats::stats()
-                        .tcp_fin_sent
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                let _ = send_tcp4_output(
+                    Tcp4Output {
+                        src_addr: dst_ip_v4,
+                        src_port: dst.port(),
+                        dst_addr: src_ip_v4,
+                        dst_port: src.port(),
+                        flags: 0x11,
+                        seq: s_seq,
+                        ack: final_client_seq,
+                        options: Vec::new(),
+                        payload: Vec::new(),
+                    },
+                    &outgoing_tx_a,
+                    direct_guest_tx_a.as_ref(),
+                )
+                .await;
+                crate::stats::stats()
+                    .tcp_fin_sent
+                    .fetch_add(1, Ordering::Relaxed);
                 let _ = writer.shutdown().await;
                 break;
             }
@@ -511,21 +931,25 @@ async fn handle_tcp_flow(
                 Ok(0) => {
                     let s_seq = server_seq_shared.fetch_add(1, Ordering::Relaxed);
                     let c_seq = client_seq_shared.load(Ordering::Relaxed);
-                    if let Ok(fin_pkt) = build_ipv4_tcp_packet(
-                        dst_ip_v4,
-                        dst.port(),
-                        src_ip_v4,
-                        src.port(),
-                        0x11, // FIN | ACK
-                        s_seq,
-                        c_seq,
-                        &[],
-                    ) {
-                        let _ = outgoing_tx.send(fin_pkt).await;
-                        crate::stats::stats()
-                            .tcp_fin_sent
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = send_tcp4_output(
+                        Tcp4Output {
+                            src_addr: dst_ip_v4,
+                            src_port: dst.port(),
+                            dst_addr: src_ip_v4,
+                            dst_port: src.port(),
+                            flags: 0x11,
+                            seq: s_seq,
+                            ack: c_seq,
+                            options: Vec::new(),
+                            payload: Vec::new(),
+                        },
+                        &outgoing_tx,
+                        direct_guest_tx.as_ref(),
+                    )
+                    .await;
+                    crate::stats::stats()
+                        .tcp_fin_sent
+                        .fetch_add(1, Ordering::Relaxed);
                     crate::stats::stats()
                         .tcp_flow_close
                         .fetch_add(1, Ordering::Relaxed);
@@ -571,26 +995,31 @@ async fn handle_tcp_flow(
 
                     server_seq_shared.fetch_add(n as u32, Ordering::Release);
                     let c_seq = client_seq_shared.load(Ordering::Relaxed);
-                    if let Ok(data_pkt) = build_ipv4_tcp_packet(
-                        dst_ip_v4,
-                        dst.port(),
-                        src_ip_v4,
-                        src.port(),
-                        0x10, // ACK
-                        s_seq,
-                        c_seq,
-                        &buf[..n],
-                    ) {
-                        if outgoing_tx.send(data_pkt).await.is_err() {
-                            crate::stats::stats()
-                                .tun_output_queue_full
-                                .fetch_add(1, Ordering::Relaxed);
-                            break;
-                        }
+                    if !send_tcp4_output(
+                        Tcp4Output {
+                            src_addr: dst_ip_v4,
+                            src_port: dst.port(),
+                            dst_addr: src_ip_v4,
+                            dst_port: src.port(),
+                            flags: 0x10,
+                            seq: s_seq,
+                            ack: c_seq,
+                            options: Vec::new(),
+                            payload: buf[..n].to_vec(),
+                        },
+                        &outgoing_tx,
+                        direct_guest_tx.as_ref(),
+                    )
+                    .await
+                    {
                         crate::stats::stats()
-                            .tcp_data_sent
+                            .tun_output_queue_full
                             .fetch_add(1, Ordering::Relaxed);
+                        break;
                     }
+                    crate::stats::stats()
+                        .tcp_data_sent
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
                     crate::stats::stats()
@@ -627,11 +1056,116 @@ fn tcp_syn_ack_options() -> [u8; 8] {
     [2, 4, mss[0], mss[1], 1, 3, 3, TCP_WINDOW_SCALE_SHIFT]
 }
 
+fn tcp_syn_options() -> [u8; 8] {
+    tcp_syn_ack_options()
+}
+
+fn initial_tcp_sequence() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u32)
+        .unwrap_or(0)
+}
+
 fn tcp_flags(pkt: &TunTcpPacket) -> u8 {
     (if pkt.fin { 0x01 } else { 0 })
         | (if pkt.syn { 0x02 } else { 0 })
         | (if pkt.rst { 0x04 } else { 0 })
         | (if pkt.ack { 0x10 } else { 0 })
+}
+
+struct Tcp4Output {
+    src_addr: std::net::Ipv4Addr,
+    src_port: u16,
+    dst_addr: std::net::Ipv4Addr,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+    options: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+async fn send_tcp4_output(
+    output: Tcp4Output,
+    outgoing_tx: &mpsc::Sender<Vec<u8>>,
+    direct_guest_tx: Option<&mpsc::Sender<TapInject>>,
+) -> bool {
+    if let Some(tx) = direct_guest_tx {
+        let direct = TapInject::Tcp4 {
+            src_addr: output.src_addr,
+            src_port: output.src_port,
+            dst_addr: output.dst_addr,
+            dst_port: output.dst_port,
+            flags: output.flags,
+            seq: output.seq,
+            ack: output.ack,
+            options: output.options,
+            payload: output.payload,
+        };
+        match tx.send(direct).await {
+            Ok(()) => {
+                crate::stats::stats()
+                    .route_hit
+                    .fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            Err(error) => {
+                let TapInject::Tcp4 {
+                    src_addr,
+                    src_port,
+                    dst_addr,
+                    dst_port,
+                    flags,
+                    seq,
+                    ack,
+                    options,
+                    payload,
+                } = error.0
+                else {
+                    unreachable!("direct TCP output returned unexpected inject variant")
+                };
+                return build_and_send_tcp4(
+                    Tcp4Output {
+                        src_addr,
+                        src_port,
+                        dst_addr,
+                        dst_port,
+                        flags,
+                        seq,
+                        ack,
+                        options,
+                        payload,
+                    },
+                    outgoing_tx,
+                )
+                .await;
+            }
+        }
+    }
+
+    build_and_send_tcp4(output, outgoing_tx).await
+}
+
+async fn build_and_send_tcp4(output: Tcp4Output, outgoing_tx: &mpsc::Sender<Vec<u8>>) -> bool {
+    let packet = build_ipv4_tcp_packet_with_options(
+        output.src_addr,
+        output.src_port,
+        output.dst_addr,
+        output.dst_port,
+        output.flags,
+        output.seq,
+        output.ack,
+        &output.options,
+        &output.payload,
+    );
+    match packet {
+        Ok(packet) => outgoing_tx.send(packet).await.is_ok(),
+        Err(error) => {
+            tracing::error!(%error, "failed to build TCP output packet");
+            false
+        }
+    }
 }
 
 async fn send_tcp_reset(
@@ -641,19 +1175,24 @@ async fn send_tcp_reset(
     dst_port: u16,
     syn_pkt: &TunTcpPacket,
     outgoing_tx: &mpsc::Sender<Vec<u8>>,
+    direct_guest_tx: Option<&mpsc::Sender<TapInject>>,
 ) {
-    if let Ok(rst) = build_ipv4_tcp_packet(
-        dst_ip_v4,
-        dst_port,
-        src_ip_v4,
-        src_port,
-        0x14, // RST | ACK
-        0,
-        syn_pkt.seq.wrapping_add(1),
-        &[],
-    ) {
-        let _ = outgoing_tx.send(rst).await;
-    }
+    let _ = send_tcp4_output(
+        Tcp4Output {
+            src_addr: dst_ip_v4,
+            src_port: dst_port,
+            dst_addr: src_ip_v4,
+            dst_port: src_port,
+            flags: 0x14,
+            seq: 0,
+            ack: syn_pkt.seq.wrapping_add(1),
+            options: Vec::new(),
+            payload: Vec::new(),
+        },
+        outgoing_tx,
+        direct_guest_tx,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -863,5 +1402,130 @@ mod tests {
         assert!(!tcp.syn);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(manager.flows.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn inbound_connect_tcp_preserves_tuple_and_streams_bytes() {
+        crate::stats::stats().reset();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let manager = TcpProxyManager::new(
+            "vm-a".to_string(),
+            outgoing_tx,
+            Arc::new(DuplexPolicy),
+            TcpProxyConfig {
+                max_flows: 16,
+                per_flow_queue_capacity: 4,
+                handshake_timeout: Duration::from_secs(1),
+                connect_timeout: Duration::from_secs(30),
+            },
+        );
+        let src: SocketAddr = "203.0.113.10:50000".parse().unwrap();
+        let dst: SocketAddr = "10.5.0.2:5201".parse().unwrap();
+
+        let connect_manager = manager.clone();
+        let connect_task =
+            tokio::spawn(async move { connect_manager.connect_inbound(src, dst).await });
+
+        let syn = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let syn_tcp = match parse_ip_packet(&syn) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected inbound SYN"),
+        };
+        assert_eq!(syn_tcp.src_addr, src.ip());
+        assert_eq!(syn_tcp.src_port, src.port());
+        assert_eq!(syn_tcp.dst_addr, dst.ip());
+        assert_eq!(syn_tcp.dst_port, dst.port());
+        assert!(syn_tcp.syn);
+        assert!(!syn_tcp.ack);
+
+        let syn_ack = build_ipv4_tcp_packet(
+            match dst.ip() {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => unreachable!(),
+            },
+            dst.port(),
+            match src.ip() {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => unreachable!(),
+            },
+            src.port(),
+            0x12,
+            1000,
+            syn_tcp.seq.wrapping_add(1),
+            &[],
+        )
+        .unwrap();
+        match parse_ip_packet(&syn_ack) {
+            TunPacket::Tcp(tcp) => manager.handle_packet(tcp).await,
+            _ => panic!("expected TCP SYN-ACK"),
+        }
+
+        let mut stream = tokio::time::timeout(Duration::from_secs(1), connect_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ack_tcp = match parse_ip_packet(&ack) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected inbound ACK"),
+        };
+        assert_eq!(ack_tcp.src_addr, src.ip());
+        assert_eq!(ack_tcp.src_port, src.port());
+        assert_eq!(ack_tcp.dst_addr, dst.ip());
+        assert_eq!(ack_tcp.dst_port, dst.port());
+        assert!(ack_tcp.ack);
+        assert!(!ack_tcp.syn);
+        assert_eq!(ack_tcp.ack_num, 1001);
+
+        stream.write_all(b"ping").await.unwrap();
+        let data = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let data_tcp = match parse_ip_packet(&data) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected inbound data"),
+        };
+        assert_eq!(data_tcp.src_addr, src.ip());
+        assert_eq!(data_tcp.src_port, src.port());
+        assert_eq!(data_tcp.dst_addr, dst.ip());
+        assert_eq!(data_tcp.dst_port, dst.port());
+        assert_eq!(&data_tcp.payload[..], b"ping");
+
+        let guest_payload = build_ipv4_tcp_packet(
+            match dst.ip() {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => unreachable!(),
+            },
+            dst.port(),
+            match src.ip() {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => unreachable!(),
+            },
+            src.port(),
+            0x10,
+            1001,
+            data_tcp.seq.wrapping_add(data_tcp.payload.len() as u32),
+            b"pong",
+        )
+        .unwrap();
+        match parse_ip_packet(&guest_payload) {
+            TunPacket::Tcp(tcp) => manager.handle_packet(tcp).await,
+            _ => panic!("expected guest payload"),
+        }
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"pong");
     }
 }
