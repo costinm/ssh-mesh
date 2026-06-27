@@ -6,9 +6,7 @@
 //! Usage:
 //!   dmesh --base-dir /path/to/data --ssh-port 15022 --http-port 8080
 //!
-//! Equivalent launchers exist in other languages — keep them in sync:
-//! - Python: `python/dmesh/__main__.py`
-//! - Java: `java/rust/src/main/java/.../Main.java`
+//! Python bindings live in `mesh_python.rs`.
 
 use std::env;
 
@@ -70,12 +68,7 @@ fn main() {
                 );
                 eprintln!();
                 eprintln!("See also:");
-                eprintln!(
-                    "  Python: python -m dmesh --base-dir ... --ssh-port ... --http-port ..."
-                );
-                eprintln!(
-                    "  Java:   java -cp ... com.github.costinm.dmeshnative.Main --base-dir ..."
-                );
+                eprintln!("  Python: python -m dmesh --base-dir ... --ssh-port ... --http-port ...");
                 std::process::exit(0);
             }
             _ => {

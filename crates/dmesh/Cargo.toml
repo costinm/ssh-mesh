@@ -4,9 +4,8 @@ version = "0.0.1"
 edition = "2021" 
 
 [features]
-default = ["python", "jni-wrapper"]
+default = ["python"]
 python = ["dep:pyo3"]
-jni-wrapper = ["dep:jni"]
 
 [dependencies]
 ssh-mesh = { path = "../ssh-mesh" }
@@ -23,9 +22,8 @@ log = "0.4"
 libc = "0.2"
 hyper-util = { version = "0.1", features = ["full"] }
 
-# Optional: language-specific wrappers
+# Optional Python wrapper
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
-jni = { version = "0.21.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.3"

@@ -1,12 +1,10 @@
-//! Common mesh node handle and operations shared by JNI and Python wrappers.
+//! Common mesh node handle and operations shared by the Python wrapper.
 //!
-//! Both the JNI wrapper (`mesh_jni.rs`) and the Python wrapper (`mesh_python.rs`)
-//! delegate to these functions for the actual mesh logic. Language-specific code
-//! (JNI marshalling, PyO3 conversions) stays in the respective wrapper modules.
+//! The Python wrapper (`mesh_python.rs`) delegates to these functions for the
+//! actual mesh logic. PyO3-specific conversions stay in the wrapper module.
 //!
-//! The Rust binary (`main.rs`), Python launcher (`python/dmesh/__main__.py`), and
-//! Java launcher (`java/.../Main.java`) all start a single node using the same
-//! feature set. Keep them in sync when adding new capabilities.
+//! The Rust binary (`main.rs`) and Python launcher start a single node using
+//! the same feature set. Keep them in sync when adding new capabilities.
 
 use ssh_mesh::sshc::SshClientManager;
 use ssh_mesh::{run_ssh_server, MeshNode, MeshNodeConfig};

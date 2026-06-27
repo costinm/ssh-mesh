@@ -7,9 +7,7 @@
 //!
 //! See also:
 //! - Rust binary: `src/main.rs`
-//! - JNI wrapper: `mesh_jni.rs`
 //! - Python launcher: `python/dmesh/__main__.py`
-//! - Java launcher: `java/rust/src/main/java/.../Main.java`
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;

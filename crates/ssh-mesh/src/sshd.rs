@@ -1798,18 +1798,19 @@ impl server::Handler for SshHandler {
                 }
             }
 
-            // Handle "local" host - trigger callback
-            if host == "local" {
+            // Handle internal stream hosts - trigger callback.
+            if host == "local" || host == "dmesh-msg" {
                 let (s1, s2) = tokio::io::duplex(64 * 1024);
 
                 // Notify listeners
                 let listeners = me.server.listeners.clone();
                 let client_id = handler_id;
                 let port_val = port as u16;
+                let stream_host = host.clone();
                 tokio::spawn(async move {
                     let listeners = listeners.lock().await;
                     if let Some(l) = listeners.first() {
-                        l.on_stream(client_id, "local", port_val, s1);
+                        l.on_stream(client_id, &stream_host, port_val, s1);
                     }
                 });
 

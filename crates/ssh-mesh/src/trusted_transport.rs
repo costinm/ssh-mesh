@@ -441,6 +441,10 @@ impl VsockListener {
     pub fn bind(_cid: u32, _port: u32) -> Result<Self> {
         anyhow::bail!("virtio-vsock is only supported on Linux")
     }
+
+    pub async fn accept(&self) -> Result<VsockStream> {
+        anyhow::bail!("virtio-vsock is only supported on Linux")
+    }
 }
 
 pub struct VsockStream {

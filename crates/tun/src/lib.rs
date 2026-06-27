@@ -169,14 +169,22 @@ impl MeshTun {
                 .map_err(|error| anyhow::anyhow!("TUN FD error: {error}"));
         }
 
-        let mut builder = tun_rs::DeviceBuilder::new();
-        if let Some(name) = &self.config.name {
-            builder = builder.name(name);
+        #[cfg(target_os = "android")]
+        {
+            anyhow::bail!("Android TUN devices must be provided by VpnService fd")
         }
-        builder
-            .mtu(self.config.mtu as u16)
-            .build_async()
-            .map_err(|error| anyhow::anyhow!("TUN create error: {error}"))
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let mut builder = tun_rs::DeviceBuilder::new();
+            if let Some(name) = &self.config.name {
+                builder = builder.name(name);
+            }
+            builder
+                .mtu(self.config.mtu as u16)
+                .build_async()
+                .map_err(|error| anyhow::anyhow!("TUN create error: {error}"))
+        }
     }
 
     fn tcp_rewriter(&self) -> Result<Option<TcpRewriter>, anyhow::Error> {

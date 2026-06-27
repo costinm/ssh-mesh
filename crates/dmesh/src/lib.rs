@@ -3,10 +3,9 @@
 //! The `dmesh` crate provides a unified interface to the ssh-mesh ecosystem.
 //! Language-specific wrappers are feature-gated:
 //!
-//! - `jni-wrapper` — JNI bindings for Java/Android (`mesh_jni` module)
 //! - `python` — PyO3 bindings for Python (`mesh_python` module)
 //!
-//! Both wrappers share common logic in `mesh_common`.
+//! Java/Android JNI bindings live in the Android dmesh checkout.
 
 // Re-export workspace crates
 pub use lmesh;
@@ -15,9 +14,6 @@ pub use pmond;
 pub use ssh_mesh;
 
 pub mod mesh_common;
-
-#[cfg(feature = "jni-wrapper")]
-pub mod mesh_jni;
 
 #[cfg(feature = "python")]
 pub mod mesh_python;
