@@ -1,6 +1,8 @@
 use mesh::tun::{TunDnsHandler, TunUdpHandler, TunUdpPacket};
 use mesh_tun::policy::FlowContext;
-use mesh_tun::transport::{BoxTunByteStream, FixedTcpConnectorPolicy, TcpConnector};
+use mesh_tun::transport::{
+    BoxTunByteStream, ConnectedTcpStream, FixedTcpConnectorPolicy, TcpConnector,
+};
 use mesh_tun::{MeshTun, MeshTunConfig};
 use std::fs::{self, File, OpenOptions};
 use std::net::SocketAddr;
@@ -21,9 +23,10 @@ struct RedirectTcpConnector {
 
 #[async_trait::async_trait]
 impl TcpConnector for RedirectTcpConnector {
-    async fn connect(&self, _ctx: &FlowContext) -> Result<BoxTunByteStream, anyhow::Error> {
+    async fn connect(&self, _ctx: &FlowContext) -> Result<ConnectedTcpStream, anyhow::Error> {
         let stream = tokio::net::TcpStream::connect(self.target).await?;
-        Ok(Box::new(stream))
+        let stream: BoxTunByteStream = Box::new(stream);
+        Ok(ConnectedTcpStream::generic(stream))
     }
 }
 

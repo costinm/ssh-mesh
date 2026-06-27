@@ -302,6 +302,18 @@ pub fn ip_to_ethernet_frame(
     dst_mac: [u8; 6],
     min_len: usize,
 ) -> Result<Vec<u8>, anyhow::Error> {
+    let mut frame = Vec::new();
+    ip_to_ethernet_frame_into(&mut frame, packet, src_mac, dst_mac, min_len)?;
+    Ok(frame)
+}
+
+pub fn ip_to_ethernet_frame_into(
+    frame: &mut Vec<u8>,
+    packet: &[u8],
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    min_len: usize,
+) -> Result<(), anyhow::Error> {
     if packet.is_empty() {
         anyhow::bail!("empty IP packet");
     }
@@ -311,7 +323,8 @@ pub fn ip_to_ethernet_frame(
         version => anyhow::bail!("unsupported IP version in TUN packet: {version}"),
     };
 
-    let mut frame = Vec::with_capacity(14 + packet.len());
+    frame.clear();
+    frame.reserve(14 + packet.len());
     frame.extend_from_slice(&dst_mac);
     frame.extend_from_slice(&src_mac);
     frame.extend_from_slice(&ethertype.to_be_bytes());
@@ -319,7 +332,7 @@ pub fn ip_to_ethernet_frame(
     if frame.len() < min_len {
         frame.resize(min_len, 0);
     }
-    Ok(frame)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -417,6 +430,30 @@ pub fn build_ethernet_ipv4_tcp_frame_with_options(
     options: &[u8],
     payload: &[u8],
 ) -> Result<Vec<u8>, anyhow::Error> {
+    let mut frame = Vec::new();
+    build_ethernet_ipv4_tcp_frame_with_options_into(
+        &mut frame, src_mac, dst_mac, min_len, src_addr, src_port, dst_addr, dst_port, flags, seq,
+        ack, options, payload,
+    )?;
+    Ok(frame)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_ethernet_ipv4_tcp_frame_with_options_into(
+    frame: &mut Vec<u8>,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    min_len: usize,
+    src_addr: Ipv4Addr,
+    src_port: u16,
+    dst_addr: Ipv4Addr,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+    options: &[u8],
+    payload: &[u8],
+) -> Result<(), anyhow::Error> {
     if options.len() % 4 != 0 {
         anyhow::bail!("TCP options length must be 32-bit aligned");
     }
@@ -437,10 +474,11 @@ pub fn build_ethernet_ipv4_tcp_frame_with_options(
     }
 
     // Direct TAP injection already knows the Ethernet destination, so build
-    // Ethernet+IP+TCP in one allocation instead of serializing IP and then
-    // wrapping it in a second Ethernet frame allocation/copy.
+    // Ethernet+IP+TCP directly into the caller's scratch buffer. The TAP
+    // inject thread reuses this allocation for every packet.
     let frame_len = min_len.max(14 + ip_total_len);
-    let mut frame = vec![0u8; frame_len];
+    frame.clear();
+    frame.resize(frame_len, 0);
     frame[0..6].copy_from_slice(&dst_mac);
     frame[6..12].copy_from_slice(&src_mac);
     frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
@@ -468,7 +506,7 @@ pub fn build_ethernet_ipv4_tcp_frame_with_options(
     let tcp_checksum = ipv4_tcp_checksum(src_addr, dst_addr, tcp)?;
     tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
 
-    Ok(frame)
+    Ok(())
 }
 
 fn parse_ipv6_packet(packet: &[u8]) -> TunPacket {

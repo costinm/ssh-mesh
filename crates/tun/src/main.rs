@@ -13,9 +13,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry, reload};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), anyhow::Error> {
@@ -24,33 +21,33 @@ async fn main() -> Result<(), anyhow::Error> {
         return run_bwrap_command(&args[2..]);
     }
 
-    let log_buffer = init_telemetry();
+    let (log_buffer, _trace_guard) = mesh::local_trace::init("mesh-tun");
 
-    // Resolve and bind trace listener UDS socket. Default to the shared
-    // traceweb discovery dir so traceweb finds this producer with no config.
-    let trace_socket_str = env::var("MESH_TUN_TRACE_SOCKET").unwrap_or_else(|_| {
-        mesh::local_trace::default_trace_socket_path("mesh-tun")
-            .to_string_lossy()
-            .to_string()
-    });
-
-    let log_buffer_clone = log_buffer.clone();
-    match resolve_and_bind_uds("mesh-tun", &trace_socket_str, "MESH_TUN_TRACE_FD", None) {
-        Ok(trace_listener) => {
-            tokio::spawn(async move {
-                if let Err(error) = mesh::local_trace::start_uds_listener_from_listener(
-                    trace_listener,
-                    log_buffer_clone,
-                )
-                .await
-                {
-                    tracing::error!(%error, "UDS trace listener stopped");
-                }
-            });
+    // Bind the UDS trace socket (with optional FD activation via
+    // MESH_TUN_TRACE_FD). The path comes from `default_trace_socket_path`,
+    // which is governed by TRACE_SOCKET_DIR / HOME — if neither is set, the
+    // trace surface is off and we skip the bind entirely.
+    if let Some(trace_socket) = mesh::local_trace::default_trace_socket_path("mesh-tun") {
+        let trace_socket_str = trace_socket.to_string_lossy().to_string();
+        match resolve_and_bind_uds("mesh-tun", &trace_socket_str, "MESH_TUN_TRACE_FD", None) {
+            Ok(trace_listener) => {
+                tokio::spawn(async move {
+                    if let Err(error) = mesh::local_trace::start_uds_listener_from_listener(
+                        trace_listener,
+                        log_buffer,
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, "UDS trace listener stopped");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::error!(%error, "Failed to bind UDS trace listener");
+            }
         }
-        Err(error) => {
-            tracing::error!(%error, "Failed to bind UDS trace listener");
-        }
+    } else {
+        tracing::debug!("TRACE_SOCKET_DIR/HOME not set; not binding UDS trace listener");
     }
 
     let mode = env::var("MESH_TUN_MODE").unwrap_or_else(|_| {
@@ -343,21 +340,6 @@ fn env_truthy(name: &str) -> bool {
 
 fn env_value_truthy(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes" | "on")
-}
-
-fn init_telemetry() -> mesh::local_trace::LogBuffer {
-    let filter = EnvFilter::from_default_env();
-    let (filter, reload_handle) = reload::Layer::new(filter);
-
-    let buffer_layer = mesh::local_trace::LogBufferLayer::new();
-    let log_buffer = buffer_layer.buffer();
-
-    Registry::default().with(filter).with(buffer_layer).init();
-
-    // Store the reload handle globally
-    let _ = mesh::local_trace::TRACING_RELOAD_HANDLE.set(reload_handle);
-
-    log_buffer
 }
 
 fn get_run_dir() -> PathBuf {

@@ -1,7 +1,7 @@
 use crate::policy::FlowContext;
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 use tokio::net::TcpStream;
@@ -11,6 +11,43 @@ pub trait TunByteStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T> TunByteStream for T where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 pub type BoxTunByteStream = Box<dyn TunByteStream>;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TcpFlowControlSnapshot {
+    pub send_capacity_bytes: u64,
+    pub unacked_packets: u32,
+    pub notsent_bytes: u32,
+    pub send_cwnd_packets: u32,
+    pub send_mss: u32,
+}
+
+pub trait TcpFlowControl: Send + Sync + 'static {
+    fn snapshot(&self) -> Option<TcpFlowControlSnapshot>;
+}
+
+pub struct ConnectedTcpStream {
+    pub stream: BoxTunByteStream,
+    pub flow_control: Option<Arc<dyn TcpFlowControl>>,
+}
+
+impl ConnectedTcpStream {
+    pub fn generic(stream: BoxTunByteStream) -> Self {
+        Self {
+            stream,
+            flow_control: None,
+        }
+    }
+
+    pub fn with_flow_control(
+        stream: BoxTunByteStream,
+        flow_control: Arc<dyn TcpFlowControl>,
+    ) -> Self {
+        Self {
+            stream,
+            flow_control: Some(flow_control),
+        }
+    }
+}
 
 /// Bridge an already-accepted byte stream into a guest TCP listener.
 ///
@@ -34,7 +71,7 @@ where
 
 #[async_trait::async_trait]
 pub trait TcpConnector: Send + Sync + 'static {
-    async fn connect(&self, ctx: &FlowContext) -> Result<BoxTunByteStream, anyhow::Error>;
+    async fn connect(&self, ctx: &FlowContext) -> Result<ConnectedTcpStream, anyhow::Error>;
 }
 
 #[derive(Debug, Default)]
@@ -42,12 +79,73 @@ pub struct NativeTcpConnector;
 
 #[async_trait::async_trait]
 impl TcpConnector for NativeTcpConnector {
-    async fn connect(&self, ctx: &FlowContext) -> Result<BoxTunByteStream, anyhow::Error> {
+    async fn connect(&self, ctx: &FlowContext) -> Result<ConnectedTcpStream, anyhow::Error> {
         let stream = TcpStream::connect(ctx.dst).await?;
         stream.set_nodelay(true)?;
         tune_backend_socket(&stream);
-        Ok(Box::new(stream))
+        #[cfg(target_os = "linux")]
+        let flow_control =
+            native_tcp_flow_control(&stream).map(|flow| Arc::new(flow) as Arc<dyn TcpFlowControl>);
+        #[cfg(not(target_os = "linux"))]
+        let flow_control: Option<Arc<dyn TcpFlowControl>> = None;
+        let stream: BoxTunByteStream = Box::new(stream);
+        match flow_control {
+            Some(flow_control) => Ok(ConnectedTcpStream::with_flow_control(stream, flow_control)),
+            None => Ok(ConnectedTcpStream::generic(stream)),
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct NativeTcpFlowControl {
+    fd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl TcpFlowControl for NativeTcpFlowControl {
+    fn snapshot(&self) -> Option<TcpFlowControlSnapshot> {
+        let mut info = std::mem::MaybeUninit::<libc::tcp_info>::zeroed();
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                info.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        let cwnd_bytes = u64::from(info.tcpi_snd_cwnd) * u64::from(info.tcpi_snd_mss);
+        let unacked_bytes = u64::from(info.tcpi_unacked) * u64::from(info.tcpi_snd_mss);
+        let queued_bytes = unacked_bytes.saturating_add(u64::from(info.tcpi_notsent_bytes));
+        Some(TcpFlowControlSnapshot {
+            send_capacity_bytes: cwnd_bytes.saturating_sub(queued_bytes),
+            unacked_packets: info.tcpi_unacked,
+            notsent_bytes: info.tcpi_notsent_bytes,
+            send_cwnd_packets: info.tcpi_snd_cwnd,
+            send_mss: info.tcpi_snd_mss,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn native_tcp_flow_control(stream: &TcpStream) -> Option<NativeTcpFlowControl> {
+    let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+    if fd < 0 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            "failed to duplicate native TCP socket for flow-control metadata"
+        );
+        return None;
+    }
+    Some(NativeTcpFlowControl {
+        fd: unsafe { OwnedFd::from_raw_fd(fd) },
+    })
 }
 
 #[cfg(target_os = "linux")]
