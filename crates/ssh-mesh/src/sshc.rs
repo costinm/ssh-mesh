@@ -185,7 +185,10 @@ impl client::Handler for ClientHandler {
                     .context("Failed to serialize discovery entry")?;
                 match std::fs::write(path, json) {
                     Ok(()) => {
-                        info!("TOFU: Trusting server key on first use, saved to {:?}", path);
+                        info!(
+                            "TOFU: Trusting server key on first use, saved to {:?}",
+                            path
+                        );
                     }
                     Err(e) => {
                         error!(

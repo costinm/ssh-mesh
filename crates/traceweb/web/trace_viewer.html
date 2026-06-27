@@ -509,23 +509,6 @@
         </div>
 
         <div class="sidebar-section">
-            <h3>OTEL Export</h3>
-            <div class="panel">
-                <div class="panel-header">
-                    <span class="panel-title">OTLP Push</span>
-                    <span class="panel-status inactive" id="otel-status">Inactive</span>
-                </div>
-                <div class="panel-body">
-                    <input type="text" class="panel-input" id="otel-endpoint" placeholder="OTEL_EXPORTER_OTLP_ENDPOINT"
-                        readonly>
-                    <button class="btn" id="otel-toggle-btn" style="margin-top: 8px; width: 100%">
-                        Start Push
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <div class="sidebar-section">
             <h3>Trace Level</h3>
             <div class="panel">
                 <div class="panel-body">
@@ -798,51 +781,9 @@
             statusEl.className = fail ? 'panel-status inactive' : 'panel-status active';
         });
 
-        // ── OTEL panel ────────────────────────────────────────
-
-        async function refreshOtelStatus() {
-            try {
-                const res = await fetch('/api/otel');
-                const status = await res.json();
-                const statusEl = document.getElementById('otel-status');
-                const endpointEl = document.getElementById('otel-endpoint');
-                const toggleBtn = document.getElementById('otel-toggle-btn');
-
-                if (status.endpoint) {
-                    endpointEl.value = status.endpoint;
-                } else {
-                    endpointEl.value = 'Not configured';
-                }
-
-                if (status.active) {
-                    statusEl.textContent = 'Active';
-                    statusEl.className = 'panel-status active';
-                    toggleBtn.textContent = 'Stop Push';
-                    toggleBtn.classList.add('btn-primary');
-                } else {
-                    statusEl.textContent = 'Inactive';
-                    statusEl.className = 'panel-status inactive';
-                    toggleBtn.textContent = 'Start Push';
-                    toggleBtn.classList.remove('btn-primary');
-                }
-            } catch (e) {
-                console.error('Failed to get OTEL status:', e);
-            }
-        }
-
-        document.getElementById('otel-toggle-btn').addEventListener('click', async () => {
-            try {
-                await fetch('/api/otel/toggle', { method: 'POST' });
-                await refreshOtelStatus();
-            } catch (e) {
-                console.error('Failed to toggle OTEL push:', e);
-            }
-        });
-
         // ── Init ──────────────────────────────────────────────
 
         refreshSources();
-        refreshOtelStatus();
         connectStream();
 
         // Periodic refresh

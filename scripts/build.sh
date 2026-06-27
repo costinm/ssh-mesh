@@ -371,10 +371,6 @@ debug() {
 }
 
 release() {
-    # (cd crates/otel && docker run --rm -v /ws/rust/ssh-mesh:/home/rust/src \
-    #   -w /home/rust/src/crates/otel \
-    #   messense/rust-musl-cross:x86_64-musl \
-    #   cargo build --release --bin otel)
 
     _all x86_64-unknown-linux-musl --release
 }

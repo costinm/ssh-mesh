@@ -5,37 +5,6 @@ use tokio::net::TcpListener;
 #[cfg(feature = "ws")]
 use ws::WSServer;
 
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry, reload};
-
-/// Initialize telemetry with dynamic reload support and in-memory log buffering.
-///
-/// Configuration is controlled via the `RUST_LOG` environment variable.
-/// Examples:
-/// - `RUST_LOG=info` -> Log info and above
-/// - `RUST_LOG=debug` -> Log debug and above
-/// - `RUST_LOG=ssh_mesh=debug,info` -> Log debug for ssh_mesh crate, info for others
-///
-/// The tracing level can be dynamically changed at runtime over the UDS trace
-/// socket (see `mesh::local_trace::start_uds_listener`); no HTTP stack is
-/// required for telemetry. All log events are captured in the returned buffer.
-fn init_telemetry() -> mesh::local_trace::LogBuffer {
-    let filter = EnvFilter::from_default_env();
-    let (filter, reload_handle) = reload::Layer::new(filter);
-
-    let buffer_layer = mesh::local_trace::LogBufferLayer::new();
-    let log_buffer = buffer_layer.buffer();
-
-    Registry::default().with(filter).with(buffer_layer).init();
-
-    // Store the reload handle globally so UDS collectors can raise the level.
-    let _ = mesh::local_trace::TRACING_RELOAD_HANDLE.set(reload_handle);
-
-    tracing::trace!(hello = "world", foo = 2, "Test {}", 1);
-    log_buffer
-}
-
 fn get_local_ip() -> Option<String> {
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -53,24 +22,8 @@ fn get_port_from_env(var_name: &str, default: u16) -> u16 {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // The buffer is always needed: the UDS trace socket (below) streams from
-    // it regardless of the `ws` feature.
-    let log_buffer = init_telemetry();
-
-    // Bind the UDS trace socket so collectors (traceweb, nc) can pull recent
-    // logs and stream new ones, and raise the trace level, without an HTTP
-    // stack. Default: $TRACE_SOCKET_DIR/ssh-mesh.sock (~/.run/traceweb/).
-    let trace_socket = env::var("SSH_MESH_TRACE_SOCKET").map(PathBuf::from).unwrap_or_else(|_| {
-        mesh::local_trace::default_trace_socket_path("ssh-mesh")
-    });
-    {
-        let buffer = log_buffer.clone();
-        tokio::spawn(async move {
-            if let Err(e) = mesh::local_trace::start_uds_listener(&trace_socket, buffer).await {
-                log::error!("UDS trace listener failed: {}", e);
-            }
-        });
-    }
+    let (log_buffer, _trace_guard) = mesh::local_trace::init("ssh-mesh");
+    mesh::local_trace::serve("ssh-mesh", log_buffer);
 
     // Import required items
     use log::{error, info};
@@ -247,25 +200,27 @@ async fn main() -> Result<(), anyhow::Error> {
     let app_state = AppState {
         ssh_server: ssh_server.clone(),
         target_http_address: std::env::var("APP_HTTP_PORT").ok(),
-        ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new_with_certificate(
-            ssh_server.private_key().clone(),
-            (*ssh_server.ca_keys).clone(),
-            {
-                // Default: base_dir/config (i.e. ~/.ssh/config).
-                // Override with SSH_CONFIG env var.
-                let config_path = env::var("SSH_CONFIG")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| base_dir.join("config"));
-                if config_path.exists() {
-                    Some(config_path)
-                } else {
-                    None
-                }
-            },
-            env::var("SSH_MUX").ok().map(PathBuf::from),
-            user_certificate,
-        )
-        .with_discovery_dir(Some(base_dir.clone()))),
+        ssh_client_manager: Arc::new(
+            ssh_mesh::sshc::SshClientManager::new_with_certificate(
+                ssh_server.private_key().clone(),
+                (*ssh_server.ca_keys).clone(),
+                {
+                    // Default: base_dir/config (i.e. ~/.ssh/config).
+                    // Override with SSH_CONFIG env var.
+                    let config_path = env::var("SSH_CONFIG")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| base_dir.join("config"));
+                    if config_path.exists() {
+                        Some(config_path)
+                    } else {
+                        None
+                    }
+                },
+                env::var("SSH_MUX").ok().map(PathBuf::from),
+                user_certificate,
+            )
+            .with_discovery_dir(Some(base_dir.clone())),
+        ),
     };
 
     // Start configured SSH client connections from config

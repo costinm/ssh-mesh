@@ -40,7 +40,10 @@ impl Socks5Server {
             if !resolved_addr.ip().is_loopback() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    format!("SOCKS5 server is restricted to localhost/loopback addresses, but requested: {}", addr),
+                    format!(
+                        "SOCKS5 server is restricted to localhost/loopback addresses, but requested: {}",
+                        addr
+                    ),
                 ));
             }
         }
@@ -235,8 +238,6 @@ async fn negotiate_socks5(
 
     Ok(SocketAddr::new(ip, port))
 }
-
-
 
 /// SOCKS5 reply codes
 #[allow(dead_code)]

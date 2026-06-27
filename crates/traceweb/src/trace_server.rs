@@ -29,10 +29,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast};
 
-/// Embedded web assets for the otel trace viewer
+/// Embedded web assets for the trace viewer
 #[derive(RustEmbed)]
 #[folder = "web/"]
-pub struct OtelAssets;
+pub struct TraceAssets;
 
 /// State for the trace server
 #[derive(Clone)]
@@ -46,9 +46,6 @@ pub struct TraceServerState {
 
     /// Track which sources are currently connected
     pub connected_sources: Arc<Mutex<HashMap<String, SourceInfo>>>,
-
-    /// Whether OTEL push is currently active
-    pub otel_push_active: Arc<Mutex<bool>>,
 }
 
 /// A log entry tagged with its source
@@ -85,13 +82,6 @@ pub struct DiscoveredSocket {
     pub connected: bool,
 }
 
-/// OTEL push status
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OtelPushStatus {
-    pub active: bool,
-    pub endpoint: Option<String>,
-}
-
 impl TraceServerState {
     pub fn new(base_dir: PathBuf) -> Self {
         let (aggregated_tx, _) = broadcast::channel(1000);
@@ -99,7 +89,6 @@ impl TraceServerState {
             base_dir,
             aggregated_tx,
             connected_sources: Arc::new(Mutex::new(HashMap::new())),
-            otel_push_active: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -115,15 +104,13 @@ pub fn trace_router(state: TraceServerState) -> Router {
         .route("/api/stream", get(stream_aggregated_sse))
         .route("/api/stream/ws", get(stream_aggregated_ws))
         .route("/api/discover", get(discover_sockets))
-        .route("/api/otel", get(get_otel_status))
-        .route("/api/otel/toggle", post(otel_toggle_handler))
         .route("/assets/*path", get(serve_asset))
         .with_state(state)
 }
 
 /// Serve the trace viewer HTML
 async fn serve_trace_viewer() -> impl IntoResponse {
-    match OtelAssets::get("trace_viewer.html") {
+    match TraceAssets::get("trace_viewer.html") {
         Some(content) => Html(std::str::from_utf8(&content.data).unwrap().to_string()),
         None => Html("<h1>Error: trace_viewer.html not found</h1>".to_string()),
     }
@@ -131,7 +118,7 @@ async fn serve_trace_viewer() -> impl IntoResponse {
 
 /// Serve embedded static assets
 async fn serve_asset(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
-    match OtelAssets::get(&path) {
+    match TraceAssets::get(&path) {
         Some(content) => {
             let mime = mime_guess::from_path(&path)
                 .first_or_octet_stream()
@@ -415,30 +402,6 @@ async fn set_source_level(
             (StatusCode::OK, Json(value)).into_response()
         }
     }
-}
-
-/// Get OTEL push status
-async fn get_otel_status(State(state): State<TraceServerState>) -> impl IntoResponse {
-    let active = *state.otel_push_active.lock().await;
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-    (StatusCode::OK, Json(OtelPushStatus { active, endpoint }))
-}
-
-/// Handler for POST /api/otel/toggle
-///
-/// Toggles the OTEL push active flag.
-async fn otel_toggle_handler(State(state): State<TraceServerState>) -> impl IntoResponse {
-    let mut active = state.otel_push_active.lock().await;
-    *active = !*active;
-    let new_state = *active;
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-    (
-        StatusCode::OK,
-        Json(OtelPushStatus {
-            active: new_state,
-            endpoint,
-        }),
-    )
 }
 
 /// Read log entries from a UDS source and broadcast them

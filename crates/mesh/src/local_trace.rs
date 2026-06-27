@@ -16,19 +16,19 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
-use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry, reload};
 
 /// Global handle for dynamically reloading the tracing filter, required to integrate.
 ///
 /// Any binary using this module should set this handle after initializing
 /// the tracing subscriber with a reload layer.
-pub static TRACING_RELOAD_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, Registry>> =
-    std::sync::OnceLock::new();
+pub static TRACING_RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
 /// Maximum number of log entries to keep in the circular buffer (default)
 const DEFAULT_BUFFER_SIZE: usize = 1000;
@@ -619,17 +619,191 @@ pub fn create_log_buffer_with_size(size: usize) -> LogBuffer {
 /// `$HOME/.run/traceweb`. Both producers (binding `<dir>/<app>.sock`) and
 /// the traceweb collector (scanning `<dir>`) use this so discovery needs no
 /// extra configuration.
-pub fn default_trace_socket_dir() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("TRACE_SOCKET_DIR")
+///
+/// Returns `None` when `TRACE_SOCKET_DIR` is unset *and* `HOME` is unset —
+/// i.e. the producer has not opted in to a shared trace directory. Callers
+/// should treat `None` as "no trace socket; skip the bind".
+pub fn default_trace_socket_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("TRACE_SOCKET_DIR")
         && !dir.is_empty()
     {
-        return std::path::PathBuf::from(dir);
+        return Some(std::path::PathBuf::from(dir));
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(format!("{}/.run/traceweb", home))
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".run/traceweb"))
 }
 
-/// Resolve the default trace socket path for an app: `<dir>/<app>.sock`.
-pub fn default_trace_socket_path(app_name: &str) -> std::path::PathBuf {
-    default_trace_socket_dir().join(format!("{}.sock", app_name))
+/// Resolve the default trace socket path for an app: `<dir>/<app>.sock`,
+/// where `<dir>` comes from [`default_trace_socket_dir`].
+///
+/// Returns `None` when no shared directory is configured; callers should
+/// treat that as "no trace socket; skip the bind".
+pub fn default_trace_socket_path(app_name: &str) -> Option<std::path::PathBuf> {
+    Some(default_trace_socket_dir()?.join(format!("{}.sock", app_name)))
+}
+
+/// Initialize tracing with a reloadable `EnvFilter` and an in-memory
+/// `LogBuffer`. Replaces the per-app `init_telemetry` boilerplate; apps call
+/// this and then (optionally) [`serve`] to expose the buffer over UDS.
+///
+/// `app` is the producer's short name (e.g. `"ssh-mesh"`, `"mesh-tun"`).
+/// It is used as the `TRACE_DIR` log file's basename (`<TRACE_DIR>/<app>.log`).
+///
+/// The initial filter is taken from `RUST_LOG` (via `EnvFilter::from_default_env`).
+/// A global reload handle is installed so UDS collectors can raise the level
+/// at runtime (see `handle_uds_connection`).
+///
+/// If `TRACE_DIR` is set, a non-blocking JSON `fmt` layer is also installed
+/// that writes every event (subject to the same `EnvFilter`) to
+/// `<TRACE_DIR>/<app>.log`. The directory is created if missing. The
+/// returned `WorkerGuard` must be kept alive for the lifetime of the
+/// process (dropping it stops the background writer thread and flushes
+/// pending events); bind it to a named variable in `main` to be safe. If
+/// `TRACE_DIR` is unset, no file is written and the second tuple element
+/// is `None`.
+///
+/// This calls `tracing_subscriber`'s global `.init()`, so it can only be
+/// called once per process.
+pub fn init(
+    app: &str,
+) -> (
+    LogBuffer,
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+) {
+    let filter = EnvFilter::from_default_env();
+    let (filter, reload_handle) = reload::Layer::new(filter);
+    let buffer_layer = LogBufferLayer::new();
+    let log_buffer = buffer_layer.buffer();
+
+    let guard = match build_file_writer(app) {
+        Some((non_blocking, guard)) => {
+            Registry::default()
+                .with(filter)
+                .with(buffer_layer)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_current_span(false)
+                        .with_span_list(false)
+                        .with_writer(non_blocking),
+                )
+                .init();
+            Some(guard)
+        }
+        None => {
+            Registry::default().with(filter).with(buffer_layer).init();
+            None
+        }
+    };
+
+    let _ = TRACING_RELOAD_HANDLE.set(reload_handle);
+    (log_buffer, guard)
+}
+
+/// Build the optional non-blocking JSON file writer for `TRACE_DIR/<app>.log`.
+///
+/// Returns `Some((writer, guard))` when `TRACE_DIR` is set and usable, or
+/// `None` when it's unset (producer is in-memory / UDS only) or the
+/// directory cannot be created (logged as a warning; the buffer still
+/// works).
+fn build_file_writer(
+    app: &str,
+) -> Option<(
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    let dir = std::env::var_os("TRACE_DIR").filter(|s| !s.is_empty())?;
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            path = ?dir,
+            error = %e,
+            "TRACE_DIR is set but could not be created; file logging disabled"
+        );
+        return None;
+    }
+
+    let file_name = format!("{}.log", app);
+    let appender = tracing_appender::rolling::never(&dir, &file_name);
+    Some(tracing_appender::non_blocking(appender))
+}
+
+/// Bind the app's UDS trace socket and serve it in a background task.
+///
+/// The socket path comes from `default_trace_socket_path`, which is governed
+/// solely by `TRACE_SOCKET_DIR` (the shared directory) and `HOME`. If
+/// `TRACE_SOCKET_DIR` is unset, no socket is bound and the function is a
+/// no-op — the producer keeps its in-memory buffer for in-process use but
+/// does not advertise itself to collectors. This makes the trace surface
+/// opt-in: set `TRACE_SOCKET_DIR` to enable it.
+///
+/// Apps typically invoke this with:
+///
+/// ```ignore
+/// mesh::local_trace::serve("ssh-mesh", mesh::local_trace::init());
+/// ```
+pub fn serve(app_name: &str, buffer: LogBuffer) {
+    let Some(socket) = default_trace_socket_path(app_name) else {
+        tracing::debug!(
+            app = %app_name,
+            "TRACE_SOCKET_DIR not set; not binding UDS trace listener"
+        );
+        return;
+    };
+
+    let app_name = app_name.to_string();
+    tracing::info!(app = %app_name, path = ?socket, "Binding UDS trace listener");
+
+    tokio::spawn(async move {
+        if let Err(e) = start_uds_listener(&socket, buffer).await {
+            tracing::error!(app = %app_name, error = %e, "UDS trace listener stopped");
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `init` installs a global subscriber; only one test in this module can
+    /// call it. Verifies that `TRACE_DIR=<dir> init("smoke-test")` writes a
+    /// JSON line per emitted event to `<dir>/smoke-test.log`. Dropping the
+    /// returned `WorkerGuard` flushes and shuts down the background writer.
+    #[test]
+    fn trace_dir_writes_json_log_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: this test owns `TRACE_DIR` and `RUST_LOG` for its
+        // duration; the global subscriber is one-shot so concurrent
+        // `init` calls would panic regardless.
+        unsafe {
+            std::env::set_var("TRACE_DIR", dir.path());
+            std::env::set_var("RUST_LOG", "info");
+        }
+
+        let (buffer, guard) = init("smoke-test");
+        tracing::info!(answer = 42, "smoke-test event");
+        assert_eq!(buffer.get_all().len(), 1, "buffer should capture the event");
+
+        // Drop the guard to flush and shut down the background writer.
+        drop(guard);
+
+        let log_path = dir.path().join("smoke-test.log");
+        let contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| panic!("read {:?}: {}", log_path, e));
+        assert!(!contents.is_empty(), "log file is empty: {:?}", contents);
+        assert!(
+            contents.contains("smoke-test event"),
+            "log file: {}",
+            contents
+        );
+        assert!(
+            contents.contains("\"answer\":42") || contents.contains("\"answer\": 42"),
+            "log file missing structured field: {}",
+            contents
+        );
+        assert!(
+            contents.contains("\"level\":\"INFO\""),
+            "log file missing level: {}",
+            contents
+        );
+    }
 }

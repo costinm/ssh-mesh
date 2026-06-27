@@ -31,9 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.command {
         Some(Commands::Serve { base_dir, port }) => {
-            let base_dir = base_dir
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(mesh::local_trace::default_trace_socket_dir);
+            let base_dir = match base_dir {
+                Some(p) => std::path::PathBuf::from(p),
+                None => mesh::local_trace::default_trace_socket_dir().ok_or_else(|| {
+                    "cannot determine trace socket directory: set TRACE_BASE_DIR, TRACE_SOCKET_DIR, or HOME"
+                })?,
+            };
 
             info!("Starting trace hub at http://127.0.0.1:{}", port);
             info!("Base directory: {:?}", base_dir);
