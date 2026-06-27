@@ -134,7 +134,6 @@ pub async fn handle_websocket(
 pub struct WsAppState {
     pub ws_server: Arc<WSServer>,
     pub stream_handlers: Vec<(String, Arc<dyn mesh::StreamHandler>)>,
-    pub push_handler: Option<Arc<dyn mesh::PushHandler>>,
 }
 
 pub async fn handle_websocket_upgrade(State(state): State<WsAppState>, req: Request) -> Response {
@@ -467,56 +466,6 @@ where
     let _ = ws.write_frame(Frame::close(1000, b"EOF")).await;
 }
 
-#[async_trait::async_trait]
-impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + core::marker::Unpin + Send + 'static>
-    mesh::PushSender for GenericWs<S>
-{
-    async fn send_text(
-        &mut self,
-        text: String,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_text(text).await
-    }
-    async fn recv(&mut self) -> Option<mesh::PushClientMsg> {
-        self.recv().await
-    }
-}
-
-pub struct GenericWs<S> {
-    inner: fastwebsockets::WebSocket<S>,
-}
-
-impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + core::marker::Unpin> GenericWs<S> {
-    pub fn new(inner: fastwebsockets::WebSocket<S>) -> Self {
-        Self { inner }
-    }
-
-    pub async fn send_text(
-        &mut self,
-        text: String,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner
-            .write_frame(fastwebsockets::Frame::text(fastwebsockets::Payload::Owned(
-                text.into_bytes(),
-            )))
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    }
-
-    pub async fn recv(&mut self) -> Option<mesh::PushClientMsg> {
-        match self.inner.read_frame().await {
-            Ok(frame) => match frame.opcode {
-                fastwebsockets::OpCode::Close => Some(mesh::PushClientMsg::Close),
-                fastwebsockets::OpCode::Ping | fastwebsockets::OpCode::Pong => {
-                    Some(mesh::PushClientMsg::Ping)
-                }
-                _ => Some(mesh::PushClientMsg::Other),
-            },
-            Err(_) => None,
-        }
-    }
-}
-
 pub fn app_ws(ws_state: WsAppState) -> axum::Router {
     let mut router = axum::Router::new()
         .route("/_m/ws", axum::routing::get(handle_websocket_upgrade))
@@ -530,21 +479,6 @@ pub fn app_ws(ws_state: WsAppState) -> axum::Router {
             axum::routing::post(handle_send_message),
         )
         .route("/_m/api/broadcast", axum::routing::post(handle_broadcast));
-
-    if let Some(push_handler) = ws_state.push_handler.clone() {
-        router = router.route(
-            "/_m/trace/view",
-            axum::routing::get(move |req: Request| {
-                let ph = push_handler.clone();
-                async move {
-                    handle_upgrade_with_handler(req, move |ws| async move {
-                        ph.handle_push(Box::new(GenericWs::new(ws))).await;
-                    })
-                    .await
-                }
-            }),
-        );
-    }
 
     for (route, handler) in ws_state.stream_handlers.clone() {
         let h = handler.clone();

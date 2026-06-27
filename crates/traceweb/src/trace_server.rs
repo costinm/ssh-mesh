@@ -5,7 +5,10 @@
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::{
         Html, IntoResponse, Json,
@@ -13,10 +16,11 @@ use axum::{
     },
     routing::{get, post},
 };
-use futures_util::stream::{self, Stream};
-use mesh::local_trace::{LogEntry, TraceConfig};
+use futures_util::stream::{Stream, StreamExt};
+use mesh::local_trace::{LogEntry, TraceConfig, TraceLevelRequest};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -107,7 +111,9 @@ pub fn trace_router(state: TraceServerState) -> Router {
         .route("/api/sources", get(list_sources))
         .route("/api/sources/connect", get(connect_source))
         .route("/api/sources/disconnect", get(disconnect_source))
+        .route("/api/sources/:name/level", post(set_source_level))
         .route("/api/stream", get(stream_aggregated_sse))
+        .route("/api/stream/ws", get(stream_aggregated_ws))
         .route("/api/discover", get(discover_sockets))
         .route("/api/otel", get(get_otel_status))
         .route("/api/otel/toggle", post(otel_toggle_handler))
@@ -262,37 +268,153 @@ async fn disconnect_source(
     }
 }
 
+/// Build the shared aggregated stream: subscribe to the broadcast, optionally
+/// filter by source name, and yield `SourcedLogEntry` values. Used by both
+/// the SSE endpoint and the WebSocket endpoint so transport differences are
+/// the only per-handler concern. Returns a `Unpin` stream so both
+/// `Stream::map` (SSE) and `Stream::next().await` (WS) work directly.
+fn aggregated_stream(
+    rx: broadcast::Receiver<SourcedLogEntry>,
+    source_filter: Option<Vec<String>>,
+) -> impl Stream<Item = SourcedLogEntry> + Send + 'static {
+    use tokio_stream::wrappers::BroadcastStream;
+    BroadcastStream::new(rx)
+        .filter_map(|r| async move { r.ok() })
+        .filter(move |entry| {
+            let keep = match &source_filter {
+                Some(s) => s.contains(&entry.source),
+                None => true,
+            };
+            std::future::ready(keep)
+        })
+}
+
+fn parse_source_filter(raw: Option<String>) -> Option<Vec<String>> {
+    raw.map(|s| {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    })
+    .filter(|v: &Vec<String>| !v.is_empty())
+}
+
 /// SSE endpoint that streams aggregated log entries from all connected sources
 async fn stream_aggregated_sse(
     State(state): State<TraceServerState>,
     Query(query): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.aggregated_tx.subscribe();
-    let source_filter: Option<Vec<String>> = query
-        .sources
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
+    let source_filter = parse_source_filter(query.sources);
 
-    let stream = stream::unfold((rx, source_filter), |(mut rx, filter)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(entry) => {
-                    // Apply source filter if provided
-                    if let Some(ref sources) = filter {
-                        if !sources.contains(&entry.source) {
-                            continue;
-                        }
-                    }
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        return Some((Ok(Event::default().data(json)), (rx, filter)));
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    });
+    let stream = aggregated_stream(rx, source_filter)
+        .map(|entry| Ok(Event::default().data(serde_json::to_string(&entry).unwrap_or_default())));
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// WebSocket endpoint mirroring `/api/stream` (SSE). Sends each
+/// `SourcedLogEntry` as a text frame. Useful for clients that prefer
+/// WebSocket over EventSource.
+async fn stream_aggregated_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<TraceServerState>,
+    Query(query): Query<StreamQuery>,
+) -> impl IntoResponse {
+    let rx = state.aggregated_tx.subscribe();
+    let source_filter = parse_source_filter(query.sources);
+    ws.on_upgrade(move |socket| ws_stream_loop(socket, rx, source_filter))
+}
+
+async fn ws_stream_loop(
+    mut socket: WebSocket,
+    rx: broadcast::Receiver<SourcedLogEntry>,
+    source_filter: Option<Vec<String>>,
+) {
+    // The aggregated stream is not Unpin, so pin it on the heap to drive it
+    // with `Stream::next().await` from a select/cancellation-safe loop.
+    let mut stream = Box::pin(aggregated_stream(rx, source_filter));
+    while let Some(entry) = stream.next().await {
+        let text = serde_json::to_string(&entry).unwrap_or_default();
+        if socket.send(Message::Text(text)).await.is_err() {
+            break;
+        }
+    }
+    let _ = socket.close().await;
+}
+
+/// Set the trace level on a connected source.
+///
+/// Opens a one-shot UDS connection to `<base_dir>/<name>.sock`, sends a
+/// `TraceConfig` with `control: true` and the requested level, reads the
+/// producer's ack, and returns it. This is the supported way to change a
+/// producer's `RUST_LOG` at runtime; apps expose only a UDS trace socket
+/// (no HTTP).
+async fn set_source_level(
+    State(state): State<TraceServerState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(req): Json<TraceLevelRequest>,
+) -> impl IntoResponse {
+    let socket_path = state.base_dir.join(format!("{}.sock", name));
+
+    let config = TraceConfig {
+        global_level: req.level.clone(),
+        modules: HashMap::new(),
+        targets: Vec::new(),
+        min_level: None,
+        max_level: None,
+        fields: HashMap::new(),
+        control: Some(true),
+    };
+    let config_line = match serde_json::to_string(&config) {
+        Ok(s) => format!("{}\n", s),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let stream = match UnixStream::connect(&socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": format!("connect {}: {}", socket_path.display(), e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let (reader, mut writer) = stream.into_split();
+    if writer.write_all(config_line.as_bytes()).await.is_err() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "failed to send config to source" })),
+        )
+            .into_response();
+    }
+    let _ = writer.shutdown().await;
+
+    // Read the single ack line from the producer.
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    match reader.read_line(&mut line).await {
+        Ok(0) | Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "source closed before ack" })),
+        )
+            .into_response(),
+        Ok(_) => {
+            let value: serde_json::Value = serde_json::from_str(line.trim())
+                .unwrap_or_else(|_| json!({ "ok": true, "raw": line.trim() }));
+            (StatusCode::OK, Json(value)).into_response()
+        }
+    }
 }
 
 /// Get OTEL push status
@@ -328,7 +450,10 @@ async fn read_uds_source(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
-    // Send a default config to the producer (request all logs)
+    // Send a default config to the producer. `global_level: "trace"` raises
+    // the producer to trace so the buffer/stream actually carries every
+    // event. This is the #3 mechanism: collectors can request a level and
+    // the producer applies it via the global reload handle.
     let config = TraceConfig {
         global_level: "trace".to_string(),
         modules: HashMap::new(),
@@ -336,6 +461,7 @@ async fn read_uds_source(
         min_level: None,
         max_level: None,
         fields: HashMap::new(),
+        control: None,
     };
 
     if let Ok(config_json) = serde_json::to_string(&config) {

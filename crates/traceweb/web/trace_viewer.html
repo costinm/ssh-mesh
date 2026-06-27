@@ -493,6 +493,7 @@
         <div class="header-actions">
             <button class="btn" id="refresh-btn">⟳ Refresh Sources</button>
             <button class="btn" id="clear-btn">Clear</button>
+            <label><input type="checkbox" id="use-ws"> WebSocket</label>
             <label><input type="checkbox" id="auto-scroll" checked> Auto-scroll</label>
         </div>
     </div>
@@ -503,26 +504,6 @@
             <div id="sources-list">
                 <div class="source-item" style="color: var(--text-muted); font-style: italic;">
                     No sources discovered
-                </div>
-            </div>
-        </div>
-
-        <div class="sidebar-section">
-            <h3>Perfetto Tracer</h3>
-            <div class="panel">
-                <div class="panel-header">
-                    <span class="panel-title">Consumer</span>
-                    <span class="panel-status inactive" id="perfetto-status">Idle</span>
-                </div>
-                <div class="panel-body">
-                    <input type="text" class="panel-input" id="perfetto-socket" value="/tmp/perfetto-consumer"
-                        placeholder="Consumer socket path">
-                    <div style="margin-top: 8px; display: flex; gap: 6px;">
-                        <button class="btn btn-primary" id="perfetto-pull-btn" style="flex:1">Pull Trace</button>
-                        <input type="number" class="panel-input" id="perfetto-duration" value="10" min="1" max="300"
-                            style="width: 60px; margin-top: 0;">
-                        <span style="font-size: 11px; color: var(--text-muted); align-self: center;">sec</span>
-                    </div>
                 </div>
             </div>
         </div>
@@ -540,6 +521,22 @@
                     <button class="btn" id="otel-toggle-btn" style="margin-top: 8px; width: 100%">
                         Start Push
                     </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <h3>Trace Level</h3>
+            <div class="panel">
+                <div class="panel-body">
+                    <input type="text" class="panel-input" id="global-level"
+                        placeholder="e.g. debug, ssh_mesh=trace,info"
+                        value="">
+                    <button class="btn" id="apply-level-btn" style="margin-top: 8px; width: 100%">
+                        Apply to all connected sources
+                    </button>
+                    <div class="panel-status inactive" id="level-status"
+                        style="margin-top: 8px; display: block; text-align: center;">Idle</div>
                 </div>
             </div>
         </div>
@@ -633,24 +630,37 @@
 
         function connectStream() {
             if (connection) connection.close();
-            connection = new EventSource('/api/stream');
-
-            connection.onmessage = (event) => {
-                const log = JSON.parse(event.data);
-                addLogEntry(log);
-            };
-
-            connection.onerror = () => {
-                if (connection.readyState === EventSource.CLOSED) {
+            if (document.getElementById('use-ws').checked) {
+                const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                connection = new WebSocket(`${proto}//${location.host}/api/stream/ws`);
+                connection.onmessage = (event) => {
+                    try { addLogEntry(JSON.parse(event.data)); } catch (e) {}
+                };
+                connection.onclose = () => {
+                    connection = null;
                     setTimeout(connectStream, 2000);
-                }
-            };
+                };
+                connection.onerror = () => { try { connection.close(); } catch (e) {} };
+            } else {
+                connection = new EventSource('/api/stream');
+                connection.onmessage = (event) => {
+                    try { addLogEntry(JSON.parse(event.data)); } catch (e) {}
+                };
+                connection.onerror = () => {
+                    if (connection.readyState === EventSource.CLOSED) {
+                        setTimeout(connectStream, 2000);
+                    }
+                };
+            }
         }
 
         function reconnectStream() {
             if (connection) connection.close();
             connectStream();
         }
+
+        // Switching transport should reconnect immediately.
+        document.getElementById('use-ws').addEventListener('change', reconnectStream);
 
         // ── Log entries ───────────────────────────────────────
 
@@ -754,33 +764,38 @@
 
         document.getElementById('refresh-btn').addEventListener('click', refreshSources);
 
-        // ── Perfetto panel ────────────────────────────────────
+        // ── Trace level ───────────────────────────────────────
 
-        document.getElementById('perfetto-pull-btn').addEventListener('click', async () => {
-            const socket = document.getElementById('perfetto-socket').value;
-            const duration = document.getElementById('perfetto-duration').value;
-            const statusEl = document.getElementById('perfetto-status');
-
-            statusEl.textContent = 'Pulling…';
-            statusEl.className = 'panel-status active';
-
-            try {
-                const res = await fetch(`/api/perfetto/pull?socket=${encodeURIComponent(socket)}&duration=${duration}`, { method: 'POST' });
-                if (res.ok) {
-                    statusEl.textContent = 'Done';
-                } else {
-                    statusEl.textContent = 'Failed';
-                    statusEl.className = 'panel-status inactive';
-                }
-            } catch (e) {
-                statusEl.textContent = 'Error';
+        document.getElementById('apply-level-btn').addEventListener('click', async () => {
+            const level = document.getElementById('global-level').value.trim();
+            const statusEl = document.getElementById('level-status');
+            if (!level) {
+                statusEl.textContent = 'Enter a level first';
                 statusEl.className = 'panel-status inactive';
+                return;
             }
-
-            setTimeout(() => {
-                statusEl.textContent = 'Idle';
+            const sources = Array.from(connectedSources);
+            if (sources.length === 0) {
+                statusEl.textContent = 'No connected sources';
                 statusEl.className = 'panel-status inactive';
-            }, 3000);
+                return;
+            }
+            statusEl.textContent = 'Applying…';
+            statusEl.className = 'panel-status active';
+            let ok = 0, fail = 0;
+            for (const name of sources) {
+                try {
+                    const res = await fetch(
+                        `/api/sources/${encodeURIComponent(name)}/level`,
+                        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ level }) });
+                    if (res.ok) ok++; else fail++;
+                } catch (e) { fail++; }
+            }
+            statusEl.textContent = fail
+                ? `Done: ${ok} ok, ${fail} failed`
+                : `Applied to ${ok} source${ok === 1 ? '' : 's'}`;
+            statusEl.className = fail ? 'panel-status inactive' : 'panel-status active';
         });
 
         // ── OTEL panel ────────────────────────────────────────

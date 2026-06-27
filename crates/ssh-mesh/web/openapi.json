@@ -364,65 +364,6 @@
           }
         }
       }
-    },
-    "/_m/trace/level": {
-      "get": {
-        "tags": [
-          "tracing"
-        ],
-        "summary": "Get the current tracing level",
-        "operationId": "get_trace_level",
-        "responses": {
-          "200": {
-            "description": "Current trace level",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TraceLevelResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Failed to get trace level"
-          }
-        }
-      },
-      "put": {
-        "tags": [
-          "tracing"
-        ],
-        "summary": "Set a new tracing level dynamically",
-        "operationId": "set_trace_level",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TraceLevelRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Trace level updated successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TraceLevelResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid trace level format"
-          },
-          "500": {
-            "description": "Failed to update trace level"
-          }
-        }
-      }
     }
   },
   "components": {
@@ -1284,39 +1225,6 @@
         "properties": {
           "message": {
             "type": "string"
-          }
-        }
-      },
-      "TraceLevelRequest": {
-        "type": "object",
-        "description": "Request body for setting trace level",
-        "required": [
-          "level"
-        ],
-        "properties": {
-          "level": {
-            "type": "string",
-            "description": "The new trace level filter directive (e.g., \"info\", \"debug\", \"trace\", \"ssh_mesh=debug,info\")"
-          }
-        }
-      },
-      "TraceLevelResponse": {
-        "type": "object",
-        "description": "Response for getting/setting trace level",
-        "required": [
-          "level"
-        ],
-        "properties": {
-          "level": {
-            "type": "string",
-            "description": "The current trace level filter directive"
-          },
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional message indicating the result of the operation"
           }
         }
       }

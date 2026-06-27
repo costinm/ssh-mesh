@@ -19,16 +19,12 @@ use std::{
 };
 use tracing::{debug, instrument};
 
-/// Re-export the global tracing reload handle from mesh crate.
-pub use mesh::local_trace::TRACING_RELOAD_HANDLE;
-
 use utoipa::ToSchema;
 
 // File paths for SSH authentication
 pub mod auth;
 pub mod config_provider;
 pub mod handlers;
-pub mod local_trace;
 pub mod mux;
 pub mod socks5;
 pub mod sshc;

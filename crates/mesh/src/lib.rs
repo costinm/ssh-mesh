@@ -254,27 +254,6 @@ pub trait Routable {
     fn route(&self) -> &str;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PushClientMsg {
-    Close,
-    Ping,
-    Other,
-}
-
-#[async_trait::async_trait]
-pub trait PushSender: Send + 'static {
-    async fn send_text(
-        &mut self,
-        text: String,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn recv(&mut self) -> Option<PushClientMsg>;
-}
-
-#[async_trait::async_trait]
-pub trait PushHandler: Send + Sync + 'static {
-    async fn handle_push(&self, sender: Box<dyn PushSender>);
-}
-
 /// Generic config provider trait. Implementations load config
 /// objects by kind (category/subdirectory) and name (identifier/filename).
 #[async_trait::async_trait]

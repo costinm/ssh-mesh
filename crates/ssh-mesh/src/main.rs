@@ -17,19 +17,20 @@ use tracing_subscriber::{EnvFilter, Registry, reload};
 /// - `RUST_LOG=debug` -> Log debug and above
 /// - `RUST_LOG=ssh_mesh=debug,info` -> Log debug for ssh_mesh crate, info for others
 ///
-/// The tracing level can be dynamically changed at runtime using the reload handle.
-/// All log events are also captured in the provided log buffer for viewing via WebSocket.
-fn init_telemetry() -> ssh_mesh::local_trace::LogBuffer {
+/// The tracing level can be dynamically changed at runtime over the UDS trace
+/// socket (see `mesh::local_trace::start_uds_listener`); no HTTP stack is
+/// required for telemetry. All log events are captured in the returned buffer.
+fn init_telemetry() -> mesh::local_trace::LogBuffer {
     let filter = EnvFilter::from_default_env();
     let (filter, reload_handle) = reload::Layer::new(filter);
 
-    let buffer_layer = ssh_mesh::local_trace::LogBufferLayer::new();
+    let buffer_layer = mesh::local_trace::LogBufferLayer::new();
     let log_buffer = buffer_layer.buffer();
 
     Registry::default().with(filter).with(buffer_layer).init();
 
-    // Store the reload handle globally
-    let _ = ssh_mesh::TRACING_RELOAD_HANDLE.set(reload_handle);
+    // Store the reload handle globally so UDS collectors can raise the level.
+    let _ = mesh::local_trace::TRACING_RELOAD_HANDLE.set(reload_handle);
 
     tracing::trace!(hello = "world", foo = 2, "Test {}", 1);
     log_buffer
@@ -52,10 +53,24 @@ fn get_port_from_env(var_name: &str, default: u16) -> u16 {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    #[cfg(feature = "ws")]
+    // The buffer is always needed: the UDS trace socket (below) streams from
+    // it regardless of the `ws` feature.
     let log_buffer = init_telemetry();
-    #[cfg(not(feature = "ws"))]
-    let _log_buffer = init_telemetry();
+
+    // Bind the UDS trace socket so collectors (traceweb, nc) can pull recent
+    // logs and stream new ones, and raise the trace level, without an HTTP
+    // stack. Default: $TRACE_SOCKET_DIR/ssh-mesh.sock (~/.run/traceweb/).
+    let trace_socket = env::var("SSH_MESH_TRACE_SOCKET").map(PathBuf::from).unwrap_or_else(|_| {
+        mesh::local_trace::default_trace_socket_path("ssh-mesh")
+    });
+    {
+        let buffer = log_buffer.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mesh::local_trace::start_uds_listener(&trace_socket, buffer).await {
+                log::error!("UDS trace listener failed: {}", e);
+            }
+        });
+    }
 
     // Import required items
     use log::{error, info};
@@ -332,9 +347,6 @@ async fn main() -> Result<(), anyhow::Error> {
         let ws_state = ws::WsAppState {
             ws_server: ws_server.clone(),
             stream_handlers: ws_handlers,
-            push_handler: Some(Arc::new(ssh_mesh::local_trace::TracePushHandler {
-                log_buffer: log_buffer.clone(),
-            })),
         };
 
         app = app.merge(ws::app_ws(ws_state));

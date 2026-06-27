@@ -288,65 +288,6 @@ pub fn set_trace_level(req: &TraceLevelRequest) -> Result<TraceLevelResponse, Tr
     }
 }
 
-pub struct TracePushHandler {
-    pub log_buffer: LogBuffer,
-}
-
-#[async_trait::async_trait]
-impl crate::PushHandler for TracePushHandler {
-    async fn handle_push(&self, mut sender: Box<dyn crate::PushSender>) {
-        stream_messages(sender.as_mut(), self.log_buffer.clone()).await;
-    }
-}
-
-/// Stream messages to a connected client
-pub async fn stream_messages(sender: &mut dyn crate::PushSender, buffer: LogBuffer) {
-    tracing::info!("New stream connection");
-
-    // Send all existing log entries
-    let existing_logs = buffer.get_all();
-    tracing::info!("Sending {} existing log entries", existing_logs.len());
-
-    for entry in existing_logs {
-        if let Ok(json) = serde_json::to_string(&entry) {
-            if sender.send_text(json).await.is_err() {
-                tracing::warn!("Failed to send existing log entry");
-                return;
-            }
-        }
-    }
-
-    // Subscribe to new log entries
-    let mut rx = buffer.subscribe();
-
-    // Stream new log entries
-    loop {
-        tokio::select! {
-            // Receive new log entries from broadcast channel
-            Ok(entry) = rx.recv() => {
-                if let Ok(json) = serde_json::to_string(&entry) {
-                    if sender.send_text(json).await.is_err() {
-                        tracing::info!("Stream client disconnected");
-                        break;
-                    }
-                }
-            }
-            // Handle incoming client messages
-            msg = sender.recv() => {
-                match msg {
-                    Some(crate::PushClientMsg::Close) | None => {
-                        tracing::info!("Stream client closed connection");
-                        break;
-                    }
-                    Some(crate::PushClientMsg::Ping) | Some(crate::PushClientMsg::Other) => {
-                        // Handled by transport layer
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// JSON-based tracing configuration
 ///
 /// This provides a structured alternative to RUST_LOG environment variable.
@@ -388,6 +329,13 @@ pub struct TraceConfig {
     /// Field filters - only include events with these fields
     #[serde(default)]
     pub fields: HashMap<String, String>,
+
+    /// Control-only mode: when true, the producer applies `global_level`/
+    /// `modules` (raising its trace level) and replies with a single JSON ack
+    /// line, then closes the connection without streaming. Used by collectors
+    /// (e.g. traceweb) to change a producer's level out-of-band.
+    #[serde(default)]
+    pub control: Option<bool>,
 }
 
 fn default_global_level() -> String {
@@ -471,16 +419,20 @@ fn level_lte(level: &str, threshold: &str) -> bool {
     level_idx <= threshold_idx
 }
 
-/// Start listening on a Unix Domain Socket for trace connections
+/// Start listening on a Unix Domain Socket for trace connections.
 ///
 /// Each connection:
-/// 1. Expects a JSON config on the first line
-/// 2. Sends all buffered entries that match the config
-/// 3. Streams new entries that match the config
+/// 1. Optionally raises the producer's trace level if the config carries
+///    `global_level`/`modules` (see [`set_trace_level`]).
+/// 2. Sends all buffered entries that match the config.
+/// 3. Streams new entries that match the config.
+///
+/// The parent directory is created if missing and the socket is given mode
+/// `0o660` so that a same-group collector (e.g. traceweb) can connect.
 ///
 /// Example usage:
 /// ```bash
-/// echo '{"global_level":"debug","modules":{"ssh_mesh":"trace"}}' | nc -U /tmp/trace.sock
+/// echo '{"global_level":"debug","modules":{"ssh_mesh":"trace"}}' | nc -U ~/.run/traceweb/ssh-mesh.sock
 /// ```
 pub async fn start_uds_listener(
     socket_path: impl AsRef<Path>,
@@ -488,12 +440,31 @@ pub async fn start_uds_listener(
 ) -> std::io::Result<()> {
     let socket_path = socket_path.as_ref();
 
+    // Ensure the parent directory exists (e.g. ~/.run/traceweb).
+    if let Some(parent) = socket_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     // Remove existing socket if it exists
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
 
     let listener = UnixListener::bind(socket_path)?;
+
+    // Restrict to same-user/same-group, matching mesh-tun's trace socket.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(socket_path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o660);
+            let _ = std::fs::set_permissions(socket_path, perms);
+        }
+    }
+
     tracing::info!("UDS trace listener started at: {:?}", socket_path);
 
     start_uds_listener_from_listener(listener, buffer).await
@@ -544,6 +515,44 @@ async fn handle_uds_connection(
             return Ok(());
         }
     };
+
+    // If the collector requests a level, apply it to this process so the
+    // buffer/subscription actually receives those events. The level persists
+    // via the global reload handle after the connection closes. The
+    // `config.matches()` filter below still governs *what is sent* on this
+    // connection, independent of the producer's level.
+    let mut applied_level: Option<String> = None;
+    let filter_str = config.to_filter_string();
+    if !filter_str.is_empty() && !config.global_level.is_empty() {
+        let req = TraceLevelRequest {
+            level: filter_str.clone(),
+        };
+        match set_trace_level(&req) {
+            Ok(resp) => {
+                tracing::info!("UDS collector raised trace level: {}", resp.level);
+                applied_level = Some(resp.level);
+            }
+            Err(resp) => {
+                tracing::warn!(
+                    "UDS collector requested level '{}' but it was rejected: {:?}",
+                    filter_str,
+                    resp.message
+                );
+            }
+        }
+    }
+
+    // Control-only mode: ack and close without streaming. Used by collectors
+    // that only want to change the level (or probe liveness).
+    if config.control.unwrap_or(false) {
+        let ack = serde_json::json!({
+            "ok": true,
+            "level": applied_level,
+        })
+        .to_string();
+        let _ = writer.write_all(format!("{}\n", ack).as_bytes()).await;
+        return Ok(());
+    }
 
     // Send all existing buffered entries that match the config
     let existing_logs = buffer.get_all();
@@ -602,4 +611,25 @@ pub fn create_log_buffer() -> LogBuffer {
 /// Create a log buffer with custom size
 pub fn create_log_buffer_with_size(size: usize) -> LogBuffer {
     LogBuffer::new(size)
+}
+
+/// Resolve the shared directory where trace sockets live.
+///
+/// Honors the `TRACE_SOCKET_DIR` env var; otherwise defaults to
+/// `$HOME/.run/traceweb`. Both producers (binding `<dir>/<app>.sock`) and
+/// the traceweb collector (scanning `<dir>`) use this so discovery needs no
+/// extra configuration.
+pub fn default_trace_socket_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("TRACE_SOCKET_DIR")
+        && !dir.is_empty()
+    {
+        return std::path::PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(format!("{}/.run/traceweb", home))
+}
+
+/// Resolve the default trace socket path for an app: `<dir>/<app>.sock`.
+pub fn default_trace_socket_path(app_name: &str) -> std::path::PathBuf {
+    default_trace_socket_dir().join(format!("{}.sock", app_name))
 }
