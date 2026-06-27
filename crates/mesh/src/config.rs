@@ -132,6 +132,14 @@ pub struct NetworkConfig {
     /// Install a default route through the TAP gateway.
     #[serde(default)]
     pub default_route: bool,
+    /// Redirect service TCP egress to this in-namespace listener port.
+    ///
+    /// mesh-tun uses this for an Istio-style fast path: nftables captures TCP
+    /// connections at connect time, while TAP remains available for UDP and
+    /// any future TCP traffic intentionally excluded from the redirect policy.
+    pub egress_redirect_port: Option<u16>,
+    /// Optional uid excluded from egress redirect rules.
+    pub egress_redirect_uid: Option<u32>,
 }
 
 // ============================================================================

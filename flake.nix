@@ -122,7 +122,18 @@
 
         build-deps = pkgs.symlinkJoin {
           name = "ssh-mesh-build-deps";
-          paths = [ musl-toolchain swagger-ui-assets ];
+          paths = [ musl-toolchain swagger-ui-assets mesh-net-tools ];
+        };
+
+        mesh-net-tools = pkgs.symlinkJoin {
+          name = "ssh-mesh-net-tools";
+          paths = with pkgs; [
+            bubblewrap
+            iperf3
+            iproute2
+            nftables
+            util-linux
+          ];
         };
 
         # Aggregate: main runtime binaries built in a single cargo invocation.
@@ -235,7 +246,7 @@
       in
       {
         packages = {
-            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets build-deps;
+            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets mesh-net-tools build-deps;
             default = ssh-mesh-full;
         };
 
@@ -252,6 +263,9 @@
             pkg-config
             cargo-watch
             cargo-edit
+            iperf3
+            iproute2
+            nftables
           ];
         };
 

@@ -6,8 +6,8 @@ use crate::packet::{
 use bytes::Bytes;
 use mesh::config::DEFAULT_MESH_TUN_MTU;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -22,6 +22,7 @@ pub struct BwrapInfoServerConfig {
     pub first_host: u32,
     pub gateway: String,
     pub vm_id: String,
+    pub egress_redirect: Option<EgressRedirectConfig>,
 }
 
 struct BwrapInfoServerState {
@@ -44,6 +45,13 @@ pub struct NetnsSetup {
     pub gateway: Option<String>,
     pub mtu: Option<u32>,
     pub default_route: bool,
+    pub egress_redirect: Option<EgressRedirectConfig>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EgressRedirectConfig {
+    pub listen_port: u16,
+    pub proxy_uid: Option<u32>,
 }
 
 pub async fn run_control_server(
@@ -108,7 +116,21 @@ async fn handle_control_client(
             }
             match parse_control_request(request) {
                 Ok(ControlRequest::CaptureTap(spec)) => {
-                    let result = start_tap_capture(spec, tun_tx.clone());
+                    let egress_redirect = spec
+                        .setup
+                        .as_ref()
+                        .and_then(|setup| setup.egress_redirect.clone());
+                    let netns_path = spec.netns_path.clone();
+                    let userns_path = spec.userns_path.clone();
+                    let result = start_tap_capture(spec, tun_tx.clone()).and_then(|()| {
+                        if let Some(egress) = egress_redirect {
+                            // The listener has to be bound after nft is installed and from
+                            // inside the service netns, so redirected TCP connects land in
+                            // mesh-tun without requiring NET_ADMIN in the container.
+                            start_egress_listener(netns_path, userns_path, egress)?;
+                        }
+                        Ok(())
+                    });
                     match result {
                         Ok(()) => {
                             crate::stats::stats()
@@ -175,10 +197,18 @@ async fn handle_bwrap_info_client(
                 // and can look like random iperf stalls.
                 mtu: Some(DEFAULT_MESH_TUN_MTU),
                 default_route: true,
+                egress_redirect: config.egress_redirect.clone(),
             }),
         };
 
         start_tap_capture(spec, tun_tx)?;
+        if let Some(egress) = &config.egress_redirect {
+            start_egress_listener(
+                PathBuf::from(format!("/proc/{child_pid}/ns/net")),
+                Some(PathBuf::from(format!("/proc/{child_pid}/ns/user"))),
+                egress.clone(),
+            )?;
+        }
         crate::stats::stats()
             .control_capture_ok
             .fetch_add(1, Ordering::Relaxed);
@@ -260,6 +290,8 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
             let mut gateway = None;
             let mut mtu = None;
             let mut default_route = false;
+            let mut egress_redirect_port = None;
+            let mut egress_redirect_uid = None;
             for field in fields {
                 let Some((key, value)) = field.split_once('=') else {
                     anyhow::bail!("expected key=value field, got {field}");
@@ -271,6 +303,8 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
                     "if" => if_name = Some(value.to_string()),
                     "gw" => gateway = Some(value.to_string()),
                     "mtu" => mtu = Some(value.parse()?),
+                    "egress_port" => egress_redirect_port = Some(value.parse()?),
+                    "egress_uid" => egress_redirect_uid = Some(value.parse()?),
                     "setup" => match value {
                         "tap" => setup = Some(()),
                         other => anyhow::bail!("unsupported setup={other}"),
@@ -291,6 +325,10 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
                 gateway,
                 mtu,
                 default_route,
+                egress_redirect: egress_redirect_port.map(|listen_port| EgressRedirectConfig {
+                    listen_port,
+                    proxy_uid: egress_redirect_uid,
+                }),
             });
             Ok(ControlRequest::CaptureTap(TapCaptureSpec {
                 vm_id: vm_id.unwrap_or_else(|| "netns".to_string()),
@@ -960,7 +998,244 @@ fn configure_netns_interface(if_name: &str, setup: &NetnsSetup) -> Result<(), st
         }
     }
 
+    if let Some(egress) = &setup.egress_redirect {
+        configure_egress_redirect(egress)?;
+    }
+
     Ok(())
+}
+
+fn configure_egress_redirect(config: &EgressRedirectConfig) -> Result<(), std::io::Error> {
+    let exclude_uid = config
+        .proxy_uid
+        .map(|uid| format!("meta skuid {uid} return\n"))
+        .unwrap_or_default();
+    let rules = format!(
+        "table ip mesh_tun {{\n  chain output {{\n    type nat hook output priority dstnat; policy accept;\n    oifname \"lo\" tcp dport {port} return\n    {exclude_uid}    ip protocol tcp redirect to :{port}\n  }}\n}}\n",
+        port = config.listen_port,
+        exclude_uid = exclude_uid
+    );
+    run_nft(&["delete", "table", "ip", "mesh_tun"], true)?;
+    run_nft_stdin(&rules)
+}
+
+fn start_egress_listener(
+    netns_path: PathBuf,
+    userns_path: Option<PathBuf>,
+    config: EgressRedirectConfig,
+) -> Result<(), anyhow::Error> {
+    let listener_fd =
+        bind_tcp_listener_in_netns(&netns_path, userns_path.as_ref(), config.listen_port)?;
+    let listener = TcpListener::from(listener_fd);
+    listener.set_nonblocking(false)?;
+    crate::stats::stats()
+        .egress_listener_start
+        .fetch_add(1, Ordering::Relaxed);
+    std::thread::Builder::new()
+        .name(format!("mesh-tun-egress-{}", config.listen_port))
+        .spawn(move || {
+            if let Err(error) = egress_accept_loop(listener) {
+                tracing::error!(%error, "mesh-tun egress listener stopped");
+            }
+        })?;
+    Ok(())
+}
+
+fn egress_accept_loop(listener: TcpListener) -> Result<(), anyhow::Error> {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                crate::stats::stats()
+                    .egress_accept_error
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error.into());
+            }
+        };
+        crate::stats::stats()
+            .egress_accept
+            .fetch_add(1, Ordering::Relaxed);
+        std::thread::Builder::new()
+            .name("mesh-tun-egress-flow".to_string())
+            .spawn(move || {
+                if let Err(error) = handle_egress_stream(stream) {
+                    tracing::debug!(%peer, %error, "egress stream closed");
+                }
+            })?;
+    }
+}
+
+fn handle_egress_stream(mut inbound: TcpStream) -> Result<(), anyhow::Error> {
+    let original_dst = match original_dst(&inbound) {
+        Ok(original_dst) => original_dst,
+        Err(error) => {
+            crate::stats::stats()
+                .egress_original_dst_error
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+    };
+    let mut upstream = match TcpStream::connect(original_dst) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            crate::stats::stats()
+                .egress_connect_error
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error.into());
+        }
+    };
+    inbound.set_nodelay(true)?;
+    upstream.set_nodelay(true)?;
+
+    let mut inbound_read = inbound.try_clone()?;
+    let mut upstream_write = upstream.try_clone()?;
+    let upstream_shutdown = upstream.try_clone()?;
+    let inbound_shutdown = inbound.try_clone()?;
+    let tx = std::thread::spawn(move || {
+        let copied = copy_egress_counted(
+            &mut inbound_read,
+            &mut upstream_write,
+            &crate::stats::stats().egress_bytes_to_upstream,
+        );
+        let _ = upstream_shutdown.shutdown(Shutdown::Write);
+        copied
+    });
+    let rx = copy_egress_counted(
+        &mut upstream,
+        &mut inbound,
+        &crate::stats::stats().egress_bytes_to_guest,
+    )?;
+    let _ = inbound_shutdown.shutdown(Shutdown::Write);
+    let tx = tx
+        .join()
+        .map_err(|_| anyhow::anyhow!("egress copy thread panicked"))??;
+    tracing::trace!(to_upstream = tx, to_inbound = rx, dst = %original_dst, "egress stream proxied");
+    Ok(())
+}
+
+fn copy_egress_counted(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    counter: &AtomicU64,
+) -> Result<u64, std::io::Error> {
+    let mut total = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n])?;
+        let n = n as u64;
+        total += n;
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+fn original_dst(stream: &TcpStream) -> Result<SocketAddr, anyhow::Error> {
+    const SO_ORIGINAL_DST: libc::c_int = 80;
+    let mut addr = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_IP,
+            SO_ORIGINAL_DST,
+            addr.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let addr = unsafe { addr.assume_init() };
+    let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+    let port = u16::from_be(addr.sin_port);
+    Ok(SocketAddr::from((ip, port)))
+}
+
+fn bind_tcp_listener_in_netns(
+    netns_path: &PathBuf,
+    userns_path: Option<&PathBuf>,
+    port: u16,
+) -> Result<OwnedFd, anyhow::Error> {
+    let mut fds = [0i32; 2];
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let parent_sock = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let child_sock = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if pid == 0 {
+        drop(parent_sock);
+        let result = bind_tcp_listener_in_netns_child(&child_sock, netns_path, userns_path, port);
+        match result {
+            Ok(()) => unsafe { libc::_exit(0) },
+            Err(error) => {
+                let code = error.raw_os_error().unwrap_or(255);
+                unsafe { libc::_exit(code) }
+            }
+        }
+    }
+    drop(child_sock);
+
+    let mut status = 0i32;
+    let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if libc::WIFEXITED(status) {
+        let exit_code = libc::WEXITSTATUS(status);
+        if exit_code != 0 {
+            return Err(std::io::Error::from_raw_os_error(exit_code).into());
+        }
+    } else {
+        anyhow::bail!("egress listener child terminated abnormally");
+    }
+    Ok(recv_fd(parent_sock.as_raw_fd())?)
+}
+
+fn bind_tcp_listener_in_netns_child(
+    child_sock: &OwnedFd,
+    netns_path: &PathBuf,
+    userns_path: Option<&PathBuf>,
+    port: u16,
+) -> Result<(), std::io::Error> {
+    let rc = unsafe { libc::unshare(libc::CLONE_FS) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if let Some(userns_path) = userns_path {
+        let userns_file = std::fs::File::open(userns_path)?;
+        let rc = unsafe { libc::setns(userns_file.as_raw_fd(), libc::CLONE_NEWUSER) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let netns_file = std::fs::File::open(netns_path)?;
+    let rc = unsafe { libc::setns(netns_file.as_raw_fd(), libc::CLONE_NEWNET) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    listener.set_nonblocking(false)?;
+    let fd = listener.into_raw_fd();
+    let send_result = send_fd(child_sock.as_raw_fd(), fd);
+    unsafe {
+        libc::close(fd);
+    }
+    send_result
 }
 
 fn open_tap_device(if_name: &str) -> Result<OwnedFd, std::io::Error> {
@@ -1023,6 +1298,47 @@ fn run_ip(args: &[&str], allow_existing: bool) -> Result<(), std::io::Error> {
         "ip {} failed: {}",
         args.join(" "),
         stderr.trim()
+    )))
+}
+
+fn run_nft(args: &[&str], allow_missing: bool) -> Result<(), std::io::Error> {
+    let output = std::process::Command::new("nft").args(args).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if allow_missing
+        && (stderr.contains("No such file or directory")
+            || stderr.contains("No such table")
+            || stderr.contains("Could not process rule"))
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "nft {} failed: {}",
+        args.join(" "),
+        stderr.trim()
+    )))
+}
+
+fn run_nft_stdin(rules: &str) -> Result<(), std::io::Error> {
+    let mut child = std::process::Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("nft stdin unavailable"))?
+        .write_all(rules.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "nft -f - failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
     )))
 }
 
@@ -1183,6 +1499,7 @@ mod tests {
                 gateway: Some("10.5.0.1".to_string()),
                 mtu: None,
                 default_route: true,
+                egress_redirect: None,
             })
         );
     }

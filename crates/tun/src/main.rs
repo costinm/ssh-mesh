@@ -1,4 +1,6 @@
-use mesh_tun::control::{BwrapInfoServerConfig, run_bwrap_info_server, run_control_server};
+use mesh_tun::control::{
+    BwrapInfoServerConfig, EgressRedirectConfig, run_bwrap_info_server, run_control_server,
+};
 use mesh_tun::flow::MeshPassthrough;
 use mesh_tun::policy::AllowAllPolicy;
 use mesh_tun::uds::{UdsServerConfig, UdsStyle, run_uds_server};
@@ -255,6 +257,7 @@ async fn run_capture_sockets(
             .unwrap_or(2),
         gateway: env::var("MESH_TUN_BWRAP_GW").unwrap_or_else(|_| "10.5.0.1".to_string()),
         vm_id: env::var("MESH_TUN_BWRAP_VM_ID").unwrap_or_else(|_| "bwrap".to_string()),
+        egress_redirect: egress_redirect_config_from_env()?,
     };
     tokio::spawn(async move {
         if let Err(error) = run_bwrap_info_server(bwrap_listener, bwrap_config, bwrap_tx).await {
@@ -278,6 +281,24 @@ async fn run_capture_sockets(
         fallback_rx,
     )
     .await
+}
+
+fn egress_redirect_config_from_env() -> Result<Option<EgressRedirectConfig>, anyhow::Error> {
+    let Some(port) = env::var("MESH_TUN_EGRESS_REDIRECT_PORT").ok() else {
+        return Ok(None);
+    };
+    if port.is_empty() {
+        return Ok(None);
+    }
+    let proxy_uid = env::var("MESH_TUN_EGRESS_PROXY_UID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse())
+        .transpose()?;
+    Ok(Some(EgressRedirectConfig {
+        listen_port: port.parse()?,
+        proxy_uid,
+    }))
 }
 
 fn mesh_tun_config_from_env() -> Result<MeshTunConfig, anyhow::Error> {

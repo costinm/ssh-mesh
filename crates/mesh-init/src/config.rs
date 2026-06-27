@@ -232,6 +232,8 @@ address = "10.5.0.2/24"
 gateway = "10.5.0.1"
 mtu = 65520
 default_route = true
+egress_redirect_port = 15001
+egress_redirect_uid = 1234
 "#;
         let config = parse_toml(toml).unwrap();
         assert_eq!(config.network.backend, NetworkBackend::MeshTun);
@@ -244,6 +246,8 @@ default_route = true
         assert_eq!(config.network.gateway.as_deref(), Some("10.5.0.1"));
         assert_eq!(config.network.mtu, Some(65520));
         assert!(config.network.default_route);
+        assert_eq!(config.network.egress_redirect_port, Some(15001));
+        assert_eq!(config.network.egress_redirect_uid, Some(1234));
     }
 
     #[test]

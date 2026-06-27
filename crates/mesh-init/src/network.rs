@@ -55,6 +55,14 @@ pub fn attach_mesh_tun(
     );
     request.push_str(" mtu=");
     request.push_str(&config.mtu.unwrap_or(DEFAULT_MESH_TUN_MTU).to_string());
+    if let Some(port) = config.egress_redirect_port {
+        request.push_str(" egress_port=");
+        request.push_str(&port.to_string());
+    }
+    if let Some(uid) = config.egress_redirect_uid {
+        request.push_str(" egress_uid=");
+        request.push_str(&uid.to_string());
+    }
     if let Some(userns_path) = userns_path {
         request.push_str(" userns=");
         request.push_str(&shell_field(userns_path));

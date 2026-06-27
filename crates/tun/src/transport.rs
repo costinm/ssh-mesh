@@ -122,15 +122,26 @@ impl TcpFlowControl for NativeTcpFlowControl {
         let info = unsafe { info.assume_init() };
         let cwnd_bytes = u64::from(info.tcpi_snd_cwnd) * u64::from(info.tcpi_snd_mss);
         let unacked_bytes = u64::from(info.tcpi_unacked) * u64::from(info.tcpi_snd_mss);
-        let queued_bytes = unacked_bytes.saturating_add(u64::from(info.tcpi_notsent_bytes));
+        let notsent_bytes = tcp_info_notsent_bytes(&info);
+        let queued_bytes = unacked_bytes.saturating_add(u64::from(notsent_bytes));
         Some(TcpFlowControlSnapshot {
             send_capacity_bytes: cwnd_bytes.saturating_sub(queued_bytes),
             unacked_packets: info.tcpi_unacked,
-            notsent_bytes: info.tcpi_notsent_bytes,
+            notsent_bytes,
             send_cwnd_packets: info.tcpi_snd_cwnd,
             send_mss: info.tcpi_snd_mss,
         })
     }
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn tcp_info_notsent_bytes(info: &libc::tcp_info) -> u32 {
+    info.tcpi_notsent_bytes
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn tcp_info_notsent_bytes(_info: &libc::tcp_info) -> u32 {
+    0
 }
 
 #[cfg(target_os = "linux")]

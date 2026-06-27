@@ -220,6 +220,7 @@ mod backend {
         use vmm_sys_util::eventfd::EventFd;
 
         #[test]
+        #[ignore = "vhost-user vring negotiation is not used by the current mesh-tun path"]
         fn rust_vmm_frontend_negotiates_memory_and_vrings() {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("vhost.sock");

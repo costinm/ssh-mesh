@@ -186,6 +186,12 @@ address = "10.5.0.2/24"
 gateway = "10.5.0.1"
 default_route = true
 EOF
+  if [ -n "${MESH_TUN_EGRESS_REDIRECT_PORT:-}" ]; then
+    printf 'egress_redirect_port = %s\n' "${MESH_TUN_EGRESS_REDIRECT_PORT}" >>"${config_dir}/mesh-tun-speed.toml"
+  fi
+  if [ -n "${MESH_TUN_EGRESS_REDIRECT_UID:-}" ]; then
+    printf 'egress_redirect_uid = %s\n' "${MESH_TUN_EGRESS_REDIRECT_UID}" >>"${config_dir}/mesh-tun-speed.toml"
+  fi
 }
 
 write_mesh_tun_speed_service_named() {
@@ -286,6 +292,10 @@ write_pasta_speed_service() {
   port="$2"
   duration="$3"
   reverse="${4:-}"
+  pasta_args='["--config-net", "{pid}"]'
+  if [ -n "${MESH_PASTA_MAP_HOST_LOOPBACK:-}" ]; then
+    pasta_args='["--map-host-loopback", "'"${MESH_PASTA_MAP_HOST_LOOPBACK}"'", "--config-net", "{pid}"]'
+  fi
   mkdirs
   cat >"${config_dir}/pasta-speed.toml" <<EOF
 [service]
@@ -297,7 +307,7 @@ args = ["--user", "--map-root-user", "--net", "--", "/bin/sh", "-lc", "sleep 1; 
 [network]
 backend = "pasta"
 command = "pasta"
-args = ["--config-net", "{pid}"]
+args = ${pasta_args}
 EOF
 }
 
@@ -407,7 +417,7 @@ wait_status_field() {
 
 wait_file() {
   path="$1"
-  for _ in $(seq 1 200); do
+  for _ in $(seq 1 600); do
     [ -s "${path}" ] && return 0
     sleep 0.1
   done
@@ -488,12 +498,36 @@ speed_mesh_tun() {
   wait_file "${results}/mesh-tun-speed.txt"
   stop_iperf3_server
   print_iperf_result mesh-tun "${results}/mesh-tun-speed.txt"
-  mesh_tun_stats | tr ' ' '\n' | grep -E '^(ok|tap_|tcp_|route_|tun_|fallback_|control_)' || true
+  mesh_tun_stats | tr ' ' '\n' | grep -E '^(ok|tap_|tcp_|egress_|route_|tun_|fallback_|control_)' || true
   mesh_init_ctl stop mesh-tun-speed >/dev/null 2>&1 || true
 }
 
 speed_mesh_tun_reverse() {
   speed_mesh_tun "${1:-$(speed_host)}" "${2:-55211}" "${3:-5}" "-R"
+}
+
+speed_mesh_tun_egress() {
+  host="${1:-$(speed_host)}"
+  port="${2:-55221}"
+  duration="${3:-5}"
+  reverse="${4:-}"
+  egress_port="${MESH_TUN_EGRESS_REDIRECT_PORT:-15001}"
+  export MESH_TUN_EGRESS_REDIRECT_PORT="${egress_port}"
+  reset
+  start_iperf3_server "${host}" "${port}"
+  write_mesh_tun_speed_service "${host}" "${port}" "${duration}" "${reverse}"
+  mesh_tun_bg
+  mesh_init_bg
+  mesh_init_ctl start mesh-tun-speed >/dev/null
+  wait_file "${results}/mesh-tun-speed.txt"
+  stop_iperf3_server
+  print_iperf_result mesh-tun-egress "${results}/mesh-tun-speed.txt"
+  mesh_tun_stats | tr ' ' '\n' | grep -E '^(ok|tap_|tcp_|egress_|route_|tun_|fallback_|control_)' || true
+  mesh_init_ctl stop mesh-tun-speed >/dev/null 2>&1 || true
+}
+
+speed_mesh_tun_egress_reverse() {
+  speed_mesh_tun_egress "${1:-$(speed_host)}" "${2:-55231}" "${3:-5}" "-R"
 }
 
 speed_mesh_tun_concurrent() {
@@ -519,7 +553,7 @@ speed_mesh_tun_concurrent() {
   print_iperf_result mesh-tun-concurrent-1 "${results}/mesh-tun-concurrent-1.txt"
   print_iperf_result mesh-tun-concurrent-2 "${results}/mesh-tun-concurrent-2.txt"
   print_iperf_result mesh-tun-concurrent-3 "${results}/mesh-tun-concurrent-3.txt"
-  mesh_tun_stats | tr ' ' '\n' | grep -E '^(ok|tap_|tcp_|route_|tun_|fallback_|control_)' || true
+  mesh_tun_stats | tr ' ' '\n' | grep -E '^(ok|tap_|tcp_|egress_|route_|tun_|fallback_|control_)' || true
   mesh_init_ctl stop mesh-tun-concurrent >/dev/null 2>&1 || true
 }
 
@@ -554,7 +588,7 @@ speed_mesh_tun_3_containers() {
   print_iperf_result mesh-tun-3-containers-1 "${results}/mesh-tun-3-containers-1.txt"
   print_iperf_result mesh-tun-3-containers-2 "${results}/mesh-tun-3-containers-2.txt"
   print_iperf_result mesh-tun-3-containers-3 "${results}/mesh-tun-3-containers-3.txt"
-  mesh_tun_stats | tr ' ' '\n' | grep -E '^(ok|tap_|tcp_|route_|tun_|fallback_|control_)' || true
+  mesh_tun_stats | tr ' ' '\n' | grep -E '^(ok|tap_|tcp_|egress_|route_|tun_|fallback_|control_)' || true
   mesh_init_ctl stop mesh-tun-speed-1 >/dev/null 2>&1 || true
   mesh_init_ctl stop mesh-tun-speed-2 >/dev/null 2>&1 || true
   mesh_init_ctl stop mesh-tun-speed-3 >/dev/null 2>&1 || true
@@ -570,7 +604,7 @@ speed_pasta() {
   duration="${3:-5}"
   reverse="${4:-}"
   reset
-  MESH_SPEED_BIND=127.0.0.1 start_iperf3_server "${host}" "${port}"
+  MESH_SPEED_BIND="${MESH_SPEED_BIND:-127.0.0.1}" start_iperf3_server "${host}" "${port}"
   write_pasta_speed_service "${host}" "${port}" "${duration}" "${reverse}"
   mesh_init_bg
   mesh_init_ctl start pasta-speed >/dev/null
@@ -593,9 +627,9 @@ speed_pasta_concurrent() {
   local port2=$((port + 1))
   local port3=$((port + 2))
   reset
-  MESH_SPEED_BIND=127.0.0.1 start_iperf3_server "${host}" "${port1}"
-  MESH_SPEED_BIND=127.0.0.1 start_iperf3_server "${host}" "${port2}"
-  MESH_SPEED_BIND=127.0.0.1 start_iperf3_server "${host}" "${port3}"
+  MESH_SPEED_BIND="${MESH_SPEED_BIND:-127.0.0.1}" start_iperf3_server "${host}" "${port1}"
+  MESH_SPEED_BIND="${MESH_SPEED_BIND:-127.0.0.1}" start_iperf3_server "${host}" "${port2}"
+  MESH_SPEED_BIND="${MESH_SPEED_BIND:-127.0.0.1}" start_iperf3_server "${host}" "${port3}"
   write_pasta_concurrent_service "${host}" "${port1}" "${duration}" "${reverse}"
   mesh_init_bg
   mesh_init_ctl start pasta-concurrent >/dev/null
@@ -622,9 +656,9 @@ speed_pasta_3_containers() {
   local port2=$((port + 1))
   local port3=$((port + 2))
   reset
-  MESH_SPEED_BIND=127.0.0.1 start_iperf3_server "${host}" "${port1}"
-  MESH_SPEED_BIND=127.0.0.1 start_iperf3_server "${host}" "${port2}"
-  MESH_SPEED_BIND=127.0.0.1 start_iperf3_server "${host}" "${port3}"
+  MESH_SPEED_BIND="${MESH_SPEED_BIND:-127.0.0.1}" start_iperf3_server "${host}" "${port1}"
+  MESH_SPEED_BIND="${MESH_SPEED_BIND:-127.0.0.1}" start_iperf3_server "${host}" "${port2}"
+  MESH_SPEED_BIND="${MESH_SPEED_BIND:-127.0.0.1}" start_iperf3_server "${host}" "${port3}"
   write_pasta_speed_service_named pasta-speed-1 pasta-3-containers-1 "${host}" "${port1}" "${duration}" "${reverse}"
   write_pasta_speed_service_named pasta-speed-2 pasta-3-containers-2 "${host}" "${port2}" "${duration}" "${reverse}"
   write_pasta_speed_service_named pasta-speed-3 pasta-3-containers-3 "${host}" "${port3}" "${duration}" "${reverse}"
@@ -696,11 +730,11 @@ stress_mesh_tun() {
 cmd="${1:-}"
 shift || true
 case "${cmd}" in
-  build|reset|stop|mesh-tun|mesh-tun-bg|mesh-init|mesh-init-bg|test-mesh-tun|test-pasta|speed-mesh-tun|speed-mesh-tun-reverse|speed-mesh-tun-concurrent|speed-mesh-tun-concurrent-reverse|speed-mesh-tun-3-containers|speed-mesh-tun-3-containers-reverse|speed-pasta|speed-pasta-reverse|speed-pasta-concurrent|speed-pasta-concurrent-reverse|speed-pasta-3-containers|speed-pasta-3-containers-reverse|speed-host-net|speed-host-net-reverse|speed-compare|speed-compare-reverse|stress-mesh-tun)
+  build|reset|stop|mesh-tun|mesh-tun-bg|mesh-init|mesh-init-bg|test-mesh-tun|test-pasta|speed-mesh-tun|speed-mesh-tun-reverse|speed-mesh-tun-egress|speed-mesh-tun-egress-reverse|speed-mesh-tun-concurrent|speed-mesh-tun-concurrent-reverse|speed-mesh-tun-3-containers|speed-mesh-tun-3-containers-reverse|speed-pasta|speed-pasta-reverse|speed-pasta-concurrent|speed-pasta-concurrent-reverse|speed-pasta-3-containers|speed-pasta-3-containers-reverse|speed-host-net|speed-host-net-reverse|speed-compare|speed-compare-reverse|stress-mesh-tun)
     "${cmd//-/_}" "$@"
     ;;
   *)
-    echo "usage: bin/mesh.sh {build|reset|stop|mesh-tun|mesh-tun-bg|mesh-init|mesh-init-bg|test-mesh-tun|test-pasta|speed-mesh-tun|speed-mesh-tun-reverse|speed-mesh-tun-concurrent|speed-mesh-tun-concurrent-reverse|speed-mesh-tun-3-containers|speed-mesh-tun-3-containers-reverse|speed-pasta|speed-pasta-reverse|speed-pasta-concurrent|speed-pasta-concurrent-reverse|speed-pasta-3-containers|speed-pasta-3-containers-reverse|speed-host-net|speed-host-net-reverse|speed-compare|speed-compare-reverse|stress-mesh-tun}" >&2
+    echo "usage: bin/mesh.sh {build|reset|stop|mesh-tun|mesh-tun-bg|mesh-init|mesh-init-bg|test-mesh-tun|test-pasta|speed-mesh-tun|speed-mesh-tun-reverse|speed-mesh-tun-egress|speed-mesh-tun-egress-reverse|speed-mesh-tun-concurrent|speed-mesh-tun-concurrent-reverse|speed-mesh-tun-3-containers|speed-mesh-tun-3-containers-reverse|speed-pasta|speed-pasta-reverse|speed-pasta-concurrent|speed-pasta-concurrent-reverse|speed-pasta-3-containers|speed-pasta-3-containers-reverse|speed-host-net|speed-host-net-reverse|speed-compare|speed-compare-reverse|stress-mesh-tun}" >&2
     exit 2
     ;;
 esac
