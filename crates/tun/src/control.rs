@@ -1,14 +1,16 @@
 use crate::packet::{
-    build_ipv4_tcp_packet_with_options, ethernet_payload_to_ip, ip_packet_destination,
+    build_ethernet_ipv4_tcp_frame_with_options, ethernet_payload_to_ip, ip_packet_destination,
     ip_packet_source, ip_to_ethernet_frame, ipv4_checksum_valid, ipv4_tcp_checksum_valid,
 };
 
+use bytes::Bytes;
+use mesh::config::DEFAULT_MESH_TUN_MTU;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
@@ -167,7 +169,11 @@ async fn handle_bwrap_info_client(
             setup: Some(NetnsSetup {
                 address: Some(format!("{guest_ip}/{}", config.prefix_len)),
                 gateway: Some(config.gateway.clone()),
-                mtu: None,
+                // Keep the guest TAP MTU aligned with the MSS advertised by
+                // the synthetic TCP stack. A 1500-byte guest MTU paired with a
+                // ~64 KiB advertised MSS causes oversized guest-bound frames
+                // and can look like random iperf stalls.
+                mtu: Some(DEFAULT_MESH_TUN_MTU),
                 default_route: true,
             }),
         };
@@ -301,10 +307,12 @@ fn parse_control_request(request: &str) -> Result<ControlRequest, anyhow::Error>
 }
 
 static GUEST_ROUTER: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, mpsc::Sender<TapInject>>>,
+    std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, TapInjectSender>>,
 > = std::sync::OnceLock::new();
 
 const TAP_INJECT_DRAIN_BUDGET: usize = 64;
+const INJECT_DIAGNOSTIC_SAMPLE_MASK: u64 = 1023;
+const MAC_VALID_FLAG: u64 = 1 << 63;
 
 #[derive(Debug)]
 pub enum TapInject {
@@ -318,11 +326,50 @@ pub enum TapInject {
         seq: u32,
         ack: u32,
         options: Vec<u8>,
-        payload: Vec<u8>,
+        payload: Bytes,
     },
 }
 
-pub fn register_destination(ip: std::net::IpAddr, sender: mpsc::Sender<TapInject>) {
+#[derive(Clone)]
+pub struct TapInjectSender {
+    tx: mpsc::Sender<TapInject>,
+    wake_fd: Arc<OwnedFd>,
+}
+
+impl TapInjectSender {
+    fn new(tx: mpsc::Sender<TapInject>, wake_fd: Arc<OwnedFd>) -> Self {
+        Self { tx, wake_fd }
+    }
+
+    pub async fn send(&self, packet: TapInject) -> Result<(), mpsc::error::SendError<TapInject>> {
+        self.tx.send(packet).await?;
+        self.wake();
+        Ok(())
+    }
+
+    fn try_send(&self, packet: TapInject) -> Result<(), mpsc::error::TrySendError<TapInject>> {
+        self.tx.try_send(packet)?;
+        self.wake();
+        Ok(())
+    }
+
+    fn wake(&self) {
+        let value = 1u64.to_ne_bytes();
+        // The TAP worker polls this eventfd along with the TAP fd. Waking it
+        // removes the previous 10ms worst-case latency for guest-bound ACK/data
+        // frames emitted by flow tasks.
+        let rc =
+            unsafe { libc::write(self.wake_fd.as_raw_fd(), value.as_ptr().cast(), value.len()) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EAGAIN) {
+                tracing::debug!(%err, "failed to wake TAP inject thread");
+            }
+        }
+    }
+}
+
+pub fn register_destination(ip: std::net::IpAddr, sender: TapInjectSender) {
     let registry =
         GUEST_ROUTER.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
     let mut destinations = registry
@@ -340,7 +387,7 @@ pub fn unregister_destination(ip: &std::net::IpAddr) {
     }
 }
 
-pub fn destination_sender(ip: &std::net::IpAddr) -> Option<mpsc::Sender<TapInject>> {
+pub fn destination_sender(ip: &std::net::IpAddr) -> Option<TapInjectSender> {
     let registry = GUEST_ROUTER.get()?;
     let destinations = registry.read().unwrap_or_else(|poison| poison.into_inner());
     destinations.get(ip).cloned()
@@ -383,7 +430,8 @@ fn start_tap_capture(
 ) -> Result<(), anyhow::Error> {
     let spec = Arc::new(spec);
     let (inject_tx, inject_rx) = mpsc::channel::<TapInject>(1024);
-    let guest_mac = Arc::new(std::sync::Mutex::new(None));
+    let inject_wake_fd = create_eventfd()?;
+    let guest_mac = Arc::new(AtomicU64::new(0));
 
     let socket = fork_and_create_tap(&spec)?;
     let socket_arc = Arc::new(socket);
@@ -392,7 +440,13 @@ fn start_tap_capture(
         .name(format!("mesh-tun-tap-{}", spec.vm_id))
         .spawn(move || {
             if let Err(error) = packet_capture_thread_loop(
-                &spec, socket_arc, tun_tx, guest_mac, inject_tx, inject_rx,
+                &spec,
+                socket_arc,
+                tun_tx,
+                guest_mac,
+                inject_tx,
+                inject_rx,
+                inject_wake_fd,
             ) {
                 tracing::warn!(vm_id = %spec.vm_id, %error, "TAP capture loop stopped");
             }
@@ -401,33 +455,47 @@ fn start_tap_capture(
     Ok(())
 }
 
+fn create_eventfd() -> Result<Arc<OwnedFd>, anyhow::Error> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
 fn inject_ip_packet(
     socket: &OwnedFd,
-    guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
+    guest_mac: Arc<AtomicU64>,
     ip_packet: &[u8],
 ) -> Result<(), anyhow::Error> {
-    let gateway_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let (src_mac, dst_mac) = tap_frame_macs(&guest_mac);
+    let frame = ip_to_ethernet_frame(ip_packet, src_mac, dst_mac, 60)?;
+    write_tap_frame(socket, &frame)
+}
 
-    crate::stats::stats()
-        .tap_inject_packet
-        .fetch_add(1, Ordering::Relaxed);
-    let dst_mac = *guest_mac
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .as_ref()
-        .unwrap_or(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+fn tap_frame_macs(guest_mac: &AtomicU64) -> ([u8; 6], [u8; 6]) {
+    let gateway_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    // The TAP worker learns the guest MAC from inbound frames. Keep it in an
+    // atomic so every injected packet avoids a mutex lock on the hot path.
+    let dst_mac = decode_cached_mac(guest_mac.load(Ordering::Relaxed))
+        .unwrap_or([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     let src_mac = if dst_mac == [0, 0, 0, 0, 0, 0] {
         dst_mac
     } else {
         gateway_mac
     };
+    (src_mac, dst_mac)
+}
 
-    let frame = ip_to_ethernet_frame(ip_packet, src_mac, dst_mac, 60)?;
-    crate::stats::stats()
-        .tap_inject_bytes
-        .fetch_add(frame.len() as u64, Ordering::Relaxed);
+fn write_tap_frame(socket: &OwnedFd, frame: &[u8]) -> Result<(), anyhow::Error> {
+    let inject_count = crate::stats::record_tap_inject(frame.len());
 
-    record_inject_frame(&frame);
+    // Full frame diagnostics re-parse and re-checksum the packet we just
+    // built. Packet/byte counters are batched in thread-local storage; sample
+    // this debug path so iperf-style runs avoid checksum validation per frame.
+    if inject_count & INJECT_DIAGNOSTIC_SAMPLE_MASK == 0 {
+        record_inject_frame(&frame);
+    }
     // SAFETY: frame points to valid memory for frame.len() bytes and socket is
     // an owned TAP file descriptor kept alive for the duration of this call.
     let rc = unsafe { libc::write(socket.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
@@ -449,7 +517,7 @@ fn inject_ip_packet(
 
 fn inject_tap_packet(
     socket: &OwnedFd,
-    guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
+    guest_mac: Arc<AtomicU64>,
     packet: TapInject,
 ) -> Result<(), anyhow::Error> {
     match packet {
@@ -465,10 +533,12 @@ fn inject_tap_packet(
             options,
             payload,
         } => {
-            let packet = build_ipv4_tcp_packet_with_options(
-                src_addr, src_port, dst_addr, dst_port, flags, seq, ack, &options, &payload,
+            let (src_mac, dst_mac) = tap_frame_macs(&guest_mac);
+            let frame = build_ethernet_ipv4_tcp_frame_with_options(
+                src_mac, dst_mac, 60, src_addr, src_port, dst_addr, dst_port, flags, seq, ack,
+                &options, &payload,
             )?;
-            inject_ip_packet(socket, guest_mac, &packet)
+            write_tap_frame(socket, &frame)
         }
     }
 }
@@ -531,13 +601,38 @@ fn mac_lo(mac: &[u8]) -> u64 {
     (u64::from(mac[3]) << 16) | (u64::from(mac[4]) << 8) | u64::from(mac[5])
 }
 
+fn encode_cached_mac(mac: [u8; 6]) -> u64 {
+    MAC_VALID_FLAG
+        | (u64::from(mac[0]) << 40)
+        | (u64::from(mac[1]) << 32)
+        | (u64::from(mac[2]) << 24)
+        | (u64::from(mac[3]) << 16)
+        | (u64::from(mac[4]) << 8)
+        | u64::from(mac[5])
+}
+
+fn decode_cached_mac(encoded: u64) -> Option<[u8; 6]> {
+    if encoded & MAC_VALID_FLAG == 0 {
+        return None;
+    }
+    Some([
+        ((encoded >> 40) & 0xff) as u8,
+        ((encoded >> 32) & 0xff) as u8,
+        ((encoded >> 24) & 0xff) as u8,
+        ((encoded >> 16) & 0xff) as u8,
+        ((encoded >> 8) & 0xff) as u8,
+        (encoded & 0xff) as u8,
+    ])
+}
+
 fn packet_capture_thread_loop(
     _spec: &TapCaptureSpec,
     socket_arc: Arc<OwnedFd>,
     tun_tx: mpsc::Sender<Vec<u8>>,
-    guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
+    guest_mac: Arc<AtomicU64>,
     inject_tx: mpsc::Sender<TapInject>,
     mut inject_rx: mpsc::Receiver<TapInject>,
+    inject_wake_fd: Arc<OwnedFd>,
 ) -> Result<(), anyhow::Error> {
     let mut buf = vec![0u8; 65535];
     let mut registered_ips = std::collections::HashSet::new();
@@ -550,21 +645,37 @@ fn packet_capture_thread_loop(
             TAP_INJECT_DRAIN_BUDGET,
         )?;
 
-        let mut poll_fd = libc::pollfd {
-            fd: socket_arc.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll_fd points to one valid pollfd and the timeout is finite.
-        let timeout_ms = if drained == 0 { 10 } else { 0 };
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: socket_arc.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: inject_wake_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // If the inject queue is empty, block on both TAP input and eventfd
+        // producer wakeups. This removes the old 10ms poll timeout that delayed
+        // guest-bound ACK/data frames under reverse iperf.
+        let timeout_ms = if drained == 0 { -1 } else { 0 };
+        let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, timeout_ms) };
         if ready < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err.into());
         }
         if ready == 0 {
             continue;
         }
-        if poll_fd.revents & libc::POLLIN == 0 {
+        if poll_fds[1].revents & libc::POLLIN != 0 {
+            drain_eventfd(&inject_wake_fd)?;
+        }
+        if poll_fds[0].revents & libc::POLLIN == 0 {
             continue;
         }
 
@@ -579,21 +690,14 @@ fn packet_capture_thread_loop(
             return Err(err.into());
         }
         let n = n as usize;
-        crate::stats::stats()
-            .tap_frame_rx
-            .fetch_add(1, Ordering::Relaxed);
-        crate::stats::stats()
-            .tap_frame_rx_bytes
-            .fetch_add(n as u64, Ordering::Relaxed);
+        crate::stats::record_tap_frame_rx(n);
         if n < 14 {
             continue;
         }
 
         let mut src_mac = [0u8; 6];
         src_mac.copy_from_slice(&buf[6..12]);
-        *guest_mac
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(src_mac);
+        guest_mac.store(encode_cached_mac(src_mac), Ordering::Relaxed);
 
         if let Some(reply) = arp_reply(&buf[..n]) {
             crate::stats::stats()
@@ -612,15 +716,13 @@ fn packet_capture_thread_loop(
         }
 
         if let Some((ip_packet, _src_mac)) = ethernet_payload_to_ip(&buf[..n]) {
-            crate::stats::stats()
-                .tap_ip_rx
-                .fetch_add(1, Ordering::Relaxed);
-            crate::stats::stats()
-                .tap_ip_rx_bytes
-                .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
+            crate::stats::record_tap_ip_rx(ip_packet.len());
             if let Some(src_ip) = ip_packet_source(&ip_packet) {
                 if registered_ips.insert(src_ip) {
-                    register_destination(src_ip, inject_tx.clone());
+                    register_destination(
+                        src_ip,
+                        TapInjectSender::new(inject_tx.clone(), inject_wake_fd.clone()),
+                    );
                 }
             }
 
@@ -641,13 +743,32 @@ fn packet_capture_thread_loop(
     for ip in registered_ips {
         unregister_destination(&ip);
     }
+    crate::stats::flush_hot_counters();
 
     Ok(())
 }
 
+fn drain_eventfd(fd: &OwnedFd) -> Result<(), std::io::Error> {
+    let mut value = [0u8; 8];
+    loop {
+        let rc = unsafe { libc::read(fd.as_raw_fd(), value.as_mut_ptr().cast(), value.len()) };
+        if rc == 8 {
+            continue;
+        }
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        return Ok(());
+    }
+}
+
 fn drain_inject_queue(
     socket: &OwnedFd,
-    guest_mac: Arc<std::sync::Mutex<Option<[u8; 6]>>>,
+    guest_mac: Arc<AtomicU64>,
     inject_rx: &mut mpsc::Receiver<TapInject>,
     budget: usize,
 ) -> Result<usize, anyhow::Error> {
@@ -1063,7 +1184,8 @@ mod tests {
         crate::stats::stats().reset();
         let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 250, 0, 2));
         let (tx, mut rx) = mpsc::channel::<TapInject>(1);
-        register_destination(dst, tx);
+        let wake_fd = create_eventfd().unwrap();
+        register_destination(dst, TapInjectSender::new(tx, wake_fd));
 
         let first = crate::packet::build_ipv4_udp_packet(
             std::net::Ipv4Addr::new(192, 0, 2, 10),

@@ -403,6 +403,74 @@ pub fn build_ipv4_tcp_packet_with_options(
     Ok(packet)
 }
 
+pub fn build_ethernet_ipv4_tcp_frame_with_options(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    min_len: usize,
+    src_addr: Ipv4Addr,
+    src_port: u16,
+    dst_addr: Ipv4Addr,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+    options: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>, anyhow::Error> {
+    if options.len() % 4 != 0 {
+        anyhow::bail!("TCP options length must be 32-bit aligned");
+    }
+    let tcp_header_len = 20usize
+        .checked_add(options.len())
+        .ok_or_else(|| anyhow::anyhow!("TCP options too large"))?;
+    if tcp_header_len > 60 {
+        anyhow::bail!("TCP header too large: {tcp_header_len}");
+    }
+    let tcp_len = tcp_header_len
+        .checked_add(payload.len())
+        .ok_or_else(|| anyhow::anyhow!("TCP payload too large"))?;
+    let ip_total_len = 20usize
+        .checked_add(tcp_len)
+        .ok_or_else(|| anyhow::anyhow!("IPv4 packet too large"))?;
+    if ip_total_len > u16::MAX as usize {
+        anyhow::bail!("IPv4 packet too large: {ip_total_len}");
+    }
+
+    // Direct TAP injection already knows the Ethernet destination, so build
+    // Ethernet+IP+TCP in one allocation instead of serializing IP and then
+    // wrapping it in a second Ethernet frame allocation/copy.
+    let frame_len = min_len.max(14 + ip_total_len);
+    let mut frame = vec![0u8; frame_len];
+    frame[0..6].copy_from_slice(&dst_mac);
+    frame[6..12].copy_from_slice(&src_mac);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+    let packet = &mut frame[14..14 + ip_total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(ip_total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 6;
+    packet[12..16].copy_from_slice(&src_addr.octets());
+    packet[16..20].copy_from_slice(&dst_addr.octets());
+    let ip_checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    let tcp = &mut packet[20..20 + tcp_len];
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = ((tcp_header_len / 4) as u8) << 4;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&64240u16.to_be_bytes());
+    tcp[20..20 + options.len()].copy_from_slice(options);
+    tcp[tcp_header_len..].copy_from_slice(payload);
+    let tcp_checksum = ipv4_tcp_checksum(src_addr, dst_addr, tcp)?;
+    tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+    Ok(frame)
+}
+
 fn parse_ipv6_packet(packet: &[u8]) -> TunPacket {
     if packet.len() < 40 {
         return TunPacket::Other;
@@ -477,29 +545,35 @@ fn ipv4_tcp_checksum(
     if tcp_segment.len() > u16::MAX as usize {
         anyhow::bail!("TCP segment too large: {}", tcp_segment.len());
     }
-    let mut pseudo = Vec::with_capacity(12 + tcp_segment.len() + 1);
-    pseudo.extend_from_slice(&src_addr.octets());
-    pseudo.extend_from_slice(&dst_addr.octets());
-    pseudo.push(0);
-    pseudo.push(6);
-    pseudo.extend_from_slice(&(tcp_segment.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(tcp_segment);
-    if pseudo.len() % 2 != 0 {
-        pseudo.push(0);
-    }
-    Ok(internet_checksum(&pseudo))
+    // Avoid allocating a pseudo-header buffer on every TCP packet. TCP's
+    // checksum is the one's-complement sum of the pseudo-header plus the TCP
+    // segment, so we can fold those slices directly in the hot path.
+    let mut sum = 0u32;
+    add_checksum_bytes(&mut sum, &src_addr.octets());
+    add_checksum_bytes(&mut sum, &dst_addr.octets());
+    sum += 6;
+    sum += tcp_segment.len() as u32;
+    add_checksum_bytes(&mut sum, tcp_segment);
+    Ok(finish_checksum(sum))
 }
 
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
+    add_checksum_bytes(&mut sum, bytes);
+    finish_checksum(sum)
+}
+
+fn add_checksum_bytes(sum: &mut u32, bytes: &[u8]) {
     let mut chunks = bytes.chunks_exact(2);
     for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        *sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
     if let Some(&byte) = chunks.remainder().first() {
-        sum += u16::from_be_bytes([byte, 0]) as u32;
+        *sum += u16::from_be_bytes([byte, 0]) as u32;
     }
+}
 
+fn finish_checksum(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -762,6 +836,31 @@ mod tests {
         .unwrap();
         assert!(ipv4_checksum_valid(&pkt));
         assert!(ipv4_tcp_checksum_valid(&pkt));
+    }
+
+    #[test]
+    fn test_build_ethernet_ipv4_tcp_frame_with_data() {
+        let frame = build_ethernet_ipv4_tcp_frame_with_options(
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            60,
+            Ipv4Addr::new(1, 1, 1, 1),
+            123,
+            Ipv4Addr::new(2, 2, 2, 2),
+            456,
+            0x10,
+            1,
+            2,
+            &[],
+            b"tcp data",
+        )
+        .unwrap();
+        assert_eq!(&frame[0..6], &[0x02, 0, 0, 0, 0, 2]);
+        assert_eq!(&frame[6..12], &[0x02, 0, 0, 0, 0, 1]);
+        assert_eq!(&frame[12..14], &0x0800u16.to_be_bytes());
+        let ip = &frame[14..];
+        assert!(ipv4_checksum_valid(ip));
+        assert!(ipv4_tcp_checksum_valid(ip));
     }
 
     #[test]

@@ -26,9 +26,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let log_buffer = init_telemetry();
 
-    // Resolve and bind trace listener UDS socket
-    let trace_socket_str =
-        env::var("MESH_TUN_TRACE_SOCKET").unwrap_or_else(|_| "trace.sock".to_string());
+    // Resolve and bind trace listener UDS socket. Default to the shared
+    // traceweb discovery dir so traceweb finds this producer with no config.
+    let trace_socket_str = env::var("MESH_TUN_TRACE_SOCKET").unwrap_or_else(|_| {
+        mesh::local_trace::default_trace_socket_path("mesh-tun")
+            .to_string_lossy()
+            .to_string()
+    });
 
     let log_buffer_clone = log_buffer.clone();
     match resolve_and_bind_uds("mesh-tun", &trace_socket_str, "MESH_TUN_TRACE_FD", None) {

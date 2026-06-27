@@ -1,4 +1,7 @@
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const HOT_COUNTER_FLUSH_PACKETS: u64 = 64;
 
 #[derive(Default)]
 pub struct MeshTunStats {
@@ -135,18 +138,169 @@ static STATS: MeshTunStats = MeshTunStats {
     uds_client_write_error: AtomicU64::new(0),
 };
 
+#[derive(Default)]
+struct HotCounters {
+    tap_frame_rx: u64,
+    tap_frame_rx_bytes: u64,
+    tap_ip_rx: u64,
+    tap_ip_rx_bytes: u64,
+    tap_inject_packet: u64,
+    tap_inject_bytes: u64,
+    tap_inject_seen: u64,
+    tcp_packet: u64,
+    tcp_packet_payload_bytes: u64,
+    tcp_flow_packet: u64,
+    tcp_payload_guest_to_host: u64,
+    tcp_payload_host_to_guest: u64,
+    tcp_ack_sent: u64,
+    tcp_data_sent: u64,
+    pending_events: u64,
+}
+
+impl HotCounters {
+    fn add_event(&mut self) {
+        self.pending_events += 1;
+        if self.pending_events >= HOT_COUNTER_FLUSH_PACKETS {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        let stats = stats();
+        flush_one(&stats.tap_frame_rx, &mut self.tap_frame_rx);
+        flush_one(&stats.tap_frame_rx_bytes, &mut self.tap_frame_rx_bytes);
+        flush_one(&stats.tap_ip_rx, &mut self.tap_ip_rx);
+        flush_one(&stats.tap_ip_rx_bytes, &mut self.tap_ip_rx_bytes);
+        flush_one(&stats.tap_inject_packet, &mut self.tap_inject_packet);
+        flush_one(&stats.tap_inject_bytes, &mut self.tap_inject_bytes);
+        flush_one(&stats.tcp_packet, &mut self.tcp_packet);
+        flush_one(
+            &stats.tcp_packet_payload_bytes,
+            &mut self.tcp_packet_payload_bytes,
+        );
+        flush_one(&stats.tcp_flow_packet, &mut self.tcp_flow_packet);
+        flush_one(
+            &stats.tcp_payload_guest_to_host,
+            &mut self.tcp_payload_guest_to_host,
+        );
+        flush_one(
+            &stats.tcp_payload_host_to_guest,
+            &mut self.tcp_payload_host_to_guest,
+        );
+        flush_one(&stats.tcp_ack_sent, &mut self.tcp_ack_sent);
+        flush_one(&stats.tcp_data_sent, &mut self.tcp_data_sent);
+        self.pending_events = 0;
+    }
+}
+
+thread_local! {
+    static HOT_COUNTERS: RefCell<HotCounters> = RefCell::new(HotCounters::default());
+}
+
+fn flush_one(counter: &AtomicU64, pending: &mut u64) {
+    if *pending != 0 {
+        counter.fetch_add(*pending, Ordering::Relaxed);
+        *pending = 0;
+    }
+}
+
 pub fn stats() -> &'static MeshTunStats {
     &STATS
 }
 
+pub fn flush_hot_counters() {
+    HOT_COUNTERS.with(|counters| counters.borrow_mut().flush());
+}
+
+pub fn record_tap_frame_rx(bytes: usize) {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tap_frame_rx += 1;
+        counters.tap_frame_rx_bytes += bytes as u64;
+        counters.add_event();
+    });
+}
+
+pub fn record_tap_ip_rx(bytes: usize) {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tap_ip_rx += 1;
+        counters.tap_ip_rx_bytes += bytes as u64;
+        counters.add_event();
+    });
+}
+
+pub fn record_tap_inject(bytes: usize) -> u64 {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tap_inject_packet += 1;
+        counters.tap_inject_bytes += bytes as u64;
+        counters.tap_inject_seen += 1;
+        let packet_count = counters.tap_inject_seen;
+        counters.add_event();
+        packet_count
+    })
+}
+
+pub fn record_tcp_packet(payload_bytes: usize) {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tcp_packet += 1;
+        counters.tcp_packet_payload_bytes += payload_bytes as u64;
+        counters.add_event();
+    });
+}
+
+pub fn record_tcp_flow_packet() {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tcp_flow_packet += 1;
+        counters.add_event();
+    });
+}
+
+pub fn record_tcp_guest_to_host(bytes: usize) {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tcp_payload_guest_to_host += bytes as u64;
+        counters.add_event();
+    });
+}
+
+pub fn record_tcp_host_to_guest(bytes: usize) {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tcp_payload_host_to_guest += bytes as u64;
+        counters.add_event();
+    });
+}
+
+pub fn record_tcp_ack_sent() {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tcp_ack_sent += 1;
+        counters.add_event();
+    });
+}
+
+pub fn record_tcp_data_sent() {
+    HOT_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.tcp_data_sent += 1;
+        counters.add_event();
+    });
+}
+
 impl MeshTunStats {
     pub fn reset(&self) {
+        HOT_COUNTERS.with(|counters| *counters.borrow_mut() = HotCounters::default());
         for counter in self.counters() {
             counter.1.store(0, Ordering::Relaxed);
         }
     }
 
     pub fn snapshot_lines(&self) -> Vec<String> {
+        flush_hot_counters();
         self.counters()
             .into_iter()
             .map(|(name, counter)| format!("{name}={}", counter.load(Ordering::Relaxed)))

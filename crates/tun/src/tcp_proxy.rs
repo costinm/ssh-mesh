@@ -1,18 +1,23 @@
-use crate::control::TapInject;
+use crate::control::{TapInject, TapInjectSender};
 use crate::packet::{TunTcpPacket, build_ipv4_tcp_packet_with_options};
 use crate::policy::{FlowContext, FlowProtocol, MeshTunPolicy, TcpRouteDecision};
+use bytes::Bytes;
 use mesh::config::DEFAULT_MESH_TUN_MTU;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 const TCP_REORDER_BUFFER_MAX_BYTES: usize = 256 * 1024;
 const TCP_SYNTHETIC_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
 const IPV4_TCP_HEADER_BYTES: u32 = 40;
 const TCP_WINDOW_SCALE_SHIFT: u8 = 7;
+const FLOW_TABLE_SHARDS: usize = 64;
+const DELAYED_ACK_EVERY_SEGMENTS: u8 = 2;
+const DELAYED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 
 fn default_tcp_mss() -> u16 {
     DEFAULT_MESH_TUN_MTU
@@ -42,7 +47,7 @@ impl Default for TcpProxyConfig {
 #[derive(Clone)]
 pub struct TcpProxyManager {
     config: TcpProxyConfig,
-    flows: Arc<Mutex<HashMap<TcpFlowKey, mpsc::Sender<TunTcpPacket>>>>,
+    flows: Arc<FlowTable>,
     outgoing_tx: mpsc::Sender<Vec<u8>>,
     policy: Arc<dyn MeshTunPolicy>,
     vm_id: String,
@@ -52,6 +57,52 @@ pub struct TcpProxyManager {
 pub struct TcpFlowKey {
     pub src: SocketAddr,
     pub dst: SocketAddr,
+}
+
+struct FlowTable {
+    shards: Vec<StdMutex<HashMap<TcpFlowKey, mpsc::Sender<TunTcpPacket>>>>,
+}
+
+impl FlowTable {
+    fn new() -> Self {
+        let mut shards = Vec::with_capacity(FLOW_TABLE_SHARDS);
+        for _ in 0..FLOW_TABLE_SHARDS {
+            shards.push(StdMutex::new(HashMap::new()));
+        }
+        Self { shards }
+    }
+
+    fn shard_index(key: &TcpFlowKey) -> usize {
+        // Ports are well distributed for the common iperf and container case,
+        // and using them avoids hashing the whole 4-tuple on every packet.
+        ((usize::from(key.src.port())) ^ (usize::from(key.dst.port()) << 1))
+            & (FLOW_TABLE_SHARDS - 1)
+    }
+
+    fn shard(
+        &self,
+        key: &TcpFlowKey,
+    ) -> StdMutexGuard<'_, HashMap<TcpFlowKey, mpsc::Sender<TunTcpPacket>>> {
+        self.shards[Self::shard_index(key)]
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .len()
+            })
+            .sum()
+    }
+
+    fn remove(&self, key: &TcpFlowKey) {
+        self.shard(key).remove(key);
+    }
 }
 
 fn tcp_seq_after(seq: u32, other: u32) -> bool {
@@ -71,7 +122,7 @@ impl TcpProxyManager {
     ) -> Self {
         Self {
             config,
-            flows: Arc::new(Mutex::new(HashMap::new())),
+            flows: Arc::new(FlowTable::new()),
             outgoing_tx,
             policy,
             vm_id,
@@ -79,31 +130,26 @@ impl TcpProxyManager {
     }
 
     pub async fn handle_packet(&self, pkt: TunTcpPacket) {
-        crate::stats::stats()
-            .tcp_packet
-            .fetch_add(1, Ordering::Relaxed);
-        if !pkt.payload.is_empty() {
-            crate::stats::stats()
-                .tcp_packet_payload_bytes
-                .fetch_add(pkt.payload.len() as u64, Ordering::Relaxed);
-        }
+        crate::stats::record_tcp_packet(pkt.payload.len());
         let key = TcpFlowKey {
             src: SocketAddr::new(pkt.src_addr, pkt.src_port),
             dst: SocketAddr::new(pkt.dst_addr, pkt.dst_port),
         };
 
-        let mut flows_guard = self.flows.lock().await;
+        // Existing-flow dispatch is the packet hot path. Use a small sharded
+        // synchronous table to avoid yielding on a tokio mutex for every ACK or
+        // data segment.
+        let flows_guard = self.flows.shard(&key);
         if let Some(tx) = flows_guard.get(&key) {
-            crate::stats::stats()
-                .tcp_flow_packet
-                .fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_tcp_flow_packet();
             if tx.try_send(pkt).is_err() {
                 crate::stats::stats()
                     .tcp_flow_queue_full
                     .fetch_add(1, Ordering::Relaxed);
             }
         } else if pkt.syn && !pkt.ack {
-            if flows_guard.len() >= self.config.max_flows {
+            drop(flows_guard);
+            if self.flows.len() >= self.config.max_flows {
                 crate::stats::stats()
                     .tcp_flow_rejected
                     .fetch_add(1, Ordering::Relaxed);
@@ -113,7 +159,12 @@ impl TcpProxyManager {
                 .tcp_syn
                 .fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = mpsc::channel(self.config.per_flow_queue_capacity);
+            let mut flows_guard = self.flows.shard(&key);
+            if flows_guard.contains_key(&key) {
+                return;
+            }
             flows_guard.insert(key.clone(), tx.clone());
+            drop(flows_guard);
 
             let flows_clone = self.flows.clone();
             let outgoing_tx = self.outgoing_tx.clone();
@@ -128,7 +179,7 @@ impl TcpProxyManager {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 handle_tcp_flow(key.src, key.dst, rx, outgoing_tx, policy, config, vm_id).await;
-                flows_clone.lock().await.remove(&key);
+                flows_clone.remove(&key);
             });
         }
     }
@@ -156,23 +207,23 @@ impl TcpProxyManager {
         }
 
         let key = TcpFlowKey { src: dst, dst: src };
-        let mut flows_guard = self.flows.lock().await;
-        if flows_guard.len() >= self.config.max_flows {
+        if self.flows.len() >= self.config.max_flows {
             crate::stats::stats()
                 .tcp_inbound_rejected
                 .fetch_add(1, Ordering::Relaxed);
             anyhow::bail!("too many TCP flows");
         }
-        if flows_guard.contains_key(&key) {
-            crate::stats::stats()
-                .tcp_flow_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            anyhow::bail!("inbound TCP flow already exists");
-        }
-
         let (tx, rx) = mpsc::channel(self.config.per_flow_queue_capacity);
-        flows_guard.insert(key.clone(), tx);
-        drop(flows_guard);
+        {
+            let mut flows_guard = self.flows.shard(&key);
+            if flows_guard.contains_key(&key) {
+                crate::stats::stats()
+                    .tcp_flow_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("inbound TCP flow already exists");
+            }
+            flows_guard.insert(key.clone(), tx);
+        }
 
         let (caller_stream, mesh_stream) = tokio::io::duplex(usize::from(default_tcp_mss()) * 4);
         let outgoing_tx = self.outgoing_tx.clone();
@@ -190,7 +241,7 @@ impl TcpProxyManager {
                     .tcp_flow_error
                     .fetch_add(1, Ordering::Relaxed);
             }
-            flows.lock().await.remove(&key);
+            flows.remove(&key);
         });
 
         match ready_rx.await {
@@ -234,7 +285,7 @@ async fn handle_inbound_tcp_flow(
             seq: initial_remote_seq,
             ack: 0,
             options: tcp_syn_options().to_vec(),
-            payload: Vec::new(),
+            payload: Bytes::new(),
         },
         &outgoing_tx,
         direct_guest_tx.as_ref(),
@@ -298,7 +349,7 @@ async fn handle_inbound_tcp_flow(
             seq: expected_ack,
             ack: guest_seq,
             options: Vec::new(),
-            payload: Vec::new(),
+            payload: Bytes::new(),
         },
         &outgoing_tx,
         direct_guest_tx.as_ref(),
@@ -354,9 +405,7 @@ async fn handle_inbound_tcp_flow(
                                 .fetch_add(1, Ordering::Relaxed);
                             break;
                         }
-                        crate::stats::stats()
-                            .tcp_payload_guest_to_host
-                            .fetch_add(new_data.len() as u64, Ordering::Relaxed);
+                        crate::stats::record_tcp_guest_to_host(new_data.len());
                         crate::stats::stats()
                             .tcp_guest_write_calls
                             .fetch_add(1, Ordering::Relaxed);
@@ -375,15 +424,13 @@ async fn handle_inbound_tcp_flow(
                         seq: r_seq,
                         ack: guest_seq,
                         options: Vec::new(),
-                        payload: Vec::new(),
+                        payload: Bytes::new(),
                     },
                     &outgoing_tx_a,
                     direct_guest_tx_a.as_ref(),
                 )
                 .await;
-                crate::stats::stats()
-                    .tcp_ack_sent
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::stats::record_tcp_ack_sent();
             }
             if pkt.fin {
                 let r_seq = remote_seq_a.load(Ordering::Relaxed);
@@ -399,7 +446,7 @@ async fn handle_inbound_tcp_flow(
                         seq: r_seq,
                         ack: final_guest_seq,
                         options: Vec::new(),
-                        payload: Vec::new(),
+                        payload: Bytes::new(),
                     },
                     &outgoing_tx_a,
                     direct_guest_tx_a.as_ref(),
@@ -428,7 +475,7 @@ async fn handle_inbound_tcp_flow(
                             seq: r_seq,
                             ack: g_seq,
                             options: Vec::new(),
-                            payload: Vec::new(),
+                            payload: Bytes::new(),
                         },
                         &outgoing_tx,
                         direct_guest_tx.as_ref(),
@@ -440,9 +487,7 @@ async fn handle_inbound_tcp_flow(
                     break;
                 }
                 Ok(n) => {
-                    crate::stats::stats()
-                        .tcp_payload_host_to_guest
-                        .fetch_add(n as u64, Ordering::Relaxed);
+                    crate::stats::record_tcp_host_to_guest(n);
                     crate::stats::stats()
                         .tcp_host_read_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -469,7 +514,6 @@ async fn handle_inbound_tcp_flow(
                         }
                     }
 
-                    remote_seq_shared.fetch_add(n as u32, Ordering::Release);
                     let g_seq = guest_seq_shared.load(Ordering::Relaxed);
                     if !send_tcp4_output(
                         Tcp4Output {
@@ -481,7 +525,7 @@ async fn handle_inbound_tcp_flow(
                             seq: r_seq,
                             ack: g_seq,
                             options: Vec::new(),
-                            payload: buf[..n].to_vec(),
+                            payload: Bytes::copy_from_slice(&buf[..n]),
                         },
                         &outgoing_tx,
                         direct_guest_tx.as_ref(),
@@ -493,9 +537,11 @@ async fn handle_inbound_tcp_flow(
                             .fetch_add(1, Ordering::Relaxed);
                         break;
                     }
-                    crate::stats::stats()
-                        .tcp_data_sent
-                        .fetch_add(1, Ordering::Relaxed);
+                    // Keep the published seq aligned with frames already
+                    // accepted for output; otherwise close/control frames can
+                    // race ahead of data in the guest-visible TCP stream.
+                    remote_seq_shared.fetch_add(n as u32, Ordering::Release);
+                    crate::stats::record_tcp_data_sent();
                 }
                 Err(_) => {
                     crate::stats::stats()
@@ -520,6 +566,7 @@ async fn handle_inbound_tcp_flow(
     crate::stats::stats()
         .tcp_flow_close
         .fetch_add(1, Ordering::Relaxed);
+    crate::stats::flush_hot_counters();
     Ok(())
 }
 
@@ -637,7 +684,7 @@ async fn handle_tcp_flow(
             seq: initial_server_seq,
             ack: syn_pkt.seq.wrapping_add(1),
             options: syn_ack_options.clone(),
-            payload: Vec::new(),
+            payload: Bytes::new(),
         },
         &outgoing_tx,
         direct_guest_tx.as_ref(),
@@ -700,7 +747,7 @@ async fn handle_tcp_flow(
                     seq: initial_server_seq,
                     ack: syn_pkt.seq.wrapping_add(1),
                     options: syn_ack_options.clone(),
-                    payload: Vec::new(),
+                    payload: Bytes::new(),
                 },
                 &outgoing_tx,
                 direct_guest_tx.as_ref(),
@@ -771,8 +818,42 @@ async fn handle_tcp_flow(
         let mut ooo_buf: std::collections::BTreeMap<u32, bytes::Bytes> =
             std::collections::BTreeMap::new();
         let mut ooo_bytes = 0usize;
+        let mut pending_ack = false;
+        let mut pending_ack_seq = client_seq;
+        let mut pending_ack_segments = 0u8;
 
-        while let Some(pkt) = rx.recv().await {
+        loop {
+            let pkt = if pending_ack {
+                tokio::select! {
+                    pkt = rx.recv() => pkt,
+                    _ = tokio::time::sleep(DELAYED_ACK_TIMEOUT) => {
+                        let s_seq = server_seq_a.load(Ordering::Relaxed);
+                        if !send_tcp_ack(
+                            dst_ip_v4,
+                            dst.port(),
+                            src_ip_v4,
+                            src.port(),
+                            s_seq,
+                            pending_ack_seq,
+                            &outgoing_tx_a,
+                            direct_guest_tx_a.as_ref(),
+                        ).await {
+                            crate::stats::stats()
+                                .tun_output_queue_full
+                                .fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        pending_ack = false;
+                        pending_ack_segments = 0;
+                        continue;
+                    }
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some(pkt) = pkt else {
+                break;
+            };
             if pkt.rst {
                 break;
             }
@@ -799,9 +880,7 @@ async fn handle_tcp_flow(
                                 .fetch_add(1, Ordering::Relaxed);
                             break;
                         }
-                        crate::stats::stats()
-                            .tcp_payload_guest_to_host
-                            .fetch_add(new_data.len() as u64, Ordering::Relaxed);
+                        crate::stats::record_tcp_guest_to_host(new_data.len());
                         crate::stats::stats()
                             .tcp_guest_write_calls
                             .fetch_add(1, Ordering::Relaxed);
@@ -817,9 +896,7 @@ async fn handle_tcp_flow(
                                     .fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            crate::stats::stats()
-                                .tcp_payload_guest_to_host
-                                .fetch_add(seg.len() as u64, Ordering::Relaxed);
+                            crate::stats::record_tcp_guest_to_host(seg.len());
                             crate::stats::stats()
                                 .tcp_guest_write_calls
                                 .fetch_add(1, Ordering::Relaxed);
@@ -850,7 +927,7 @@ async fn handle_tcp_flow(
                                 seq: s_seq,
                                 ack: client_seq,
                                 options: Vec::new(),
-                                payload: Vec::new(),
+                                payload: Bytes::new(),
                             },
                             &outgoing_tx_a,
                             direct_guest_tx_a.as_ref(),
@@ -862,35 +939,51 @@ async fn handle_tcp_flow(
                 // If pkt.seq + len <= client_seq, it's a pure retransmit of
                 // already-received data — ack but don't re-deliver.
 
-                let s_seq = server_seq_a.load(Ordering::Relaxed);
-                if !send_tcp4_output(
-                    Tcp4Output {
-                        src_addr: dst_ip_v4,
-                        src_port: dst.port(),
-                        dst_addr: src_ip_v4,
-                        dst_port: src.port(),
-                        flags: 0x10,
-                        seq: s_seq,
-                        ack: client_seq,
-                        options: Vec::new(),
-                        payload: Vec::new(),
-                    },
-                    &outgoing_tx_a,
-                    direct_guest_tx_a.as_ref(),
-                )
-                .await
-                {
-                    crate::stats::stats()
-                        .tun_output_queue_full
-                        .fetch_add(1, Ordering::Relaxed);
-                    break;
+                pending_ack = true;
+                pending_ack_seq = client_seq;
+                pending_ack_segments = pending_ack_segments.saturating_add(1);
+                // ACK coalescing reduces TAP packet rate during uploads. Flush
+                // every second data segment or after a short timer above; the
+                // timer keeps request/response flows responsive.
+                if pending_ack_segments >= DELAYED_ACK_EVERY_SEGMENTS {
+                    let s_seq = server_seq_a.load(Ordering::Relaxed);
+                    if !send_tcp_ack(
+                        dst_ip_v4,
+                        dst.port(),
+                        src_ip_v4,
+                        src.port(),
+                        s_seq,
+                        pending_ack_seq,
+                        &outgoing_tx_a,
+                        direct_guest_tx_a.as_ref(),
+                    )
+                    .await
+                    {
+                        crate::stats::stats()
+                            .tun_output_queue_full
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    pending_ack = false;
+                    pending_ack_segments = 0;
                 }
-                crate::stats::stats()
-                    .tcp_ack_sent
-                    .fetch_add(1, Ordering::Relaxed);
             }
 
             if pkt.fin {
+                if pending_ack {
+                    let s_seq = server_seq_a.load(Ordering::Relaxed);
+                    let _ = send_tcp_ack(
+                        dst_ip_v4,
+                        dst.port(),
+                        src_ip_v4,
+                        src.port(),
+                        s_seq,
+                        pending_ack_seq,
+                        &outgoing_tx_a,
+                        direct_guest_tx_a.as_ref(),
+                    )
+                    .await;
+                }
                 let s_seq = server_seq_a.load(Ordering::Relaxed);
                 let final_client_seq = client_seq.wrapping_add(1);
                 client_seq_a.store(final_client_seq, Ordering::Release);
@@ -906,7 +999,7 @@ async fn handle_tcp_flow(
                         seq: s_seq,
                         ack: final_client_seq,
                         options: Vec::new(),
-                        payload: Vec::new(),
+                        payload: Bytes::new(),
                     },
                     &outgoing_tx_a,
                     direct_guest_tx_a.as_ref(),
@@ -941,7 +1034,7 @@ async fn handle_tcp_flow(
                             seq: s_seq,
                             ack: c_seq,
                             options: Vec::new(),
-                            payload: Vec::new(),
+                            payload: Bytes::new(),
                         },
                         &outgoing_tx,
                         direct_guest_tx.as_ref(),
@@ -956,9 +1049,7 @@ async fn handle_tcp_flow(
                     break;
                 }
                 Ok(n) => {
-                    crate::stats::stats()
-                        .tcp_payload_host_to_guest
-                        .fetch_add(n as u64, Ordering::Relaxed);
+                    crate::stats::record_tcp_host_to_guest(n);
                     crate::stats::stats()
                         .tcp_host_read_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -993,7 +1084,6 @@ async fn handle_tcp_flow(
                         }
                     }
 
-                    server_seq_shared.fetch_add(n as u32, Ordering::Release);
                     let c_seq = client_seq_shared.load(Ordering::Relaxed);
                     if !send_tcp4_output(
                         Tcp4Output {
@@ -1005,7 +1095,7 @@ async fn handle_tcp_flow(
                             seq: s_seq,
                             ack: c_seq,
                             options: Vec::new(),
-                            payload: buf[..n].to_vec(),
+                            payload: Bytes::copy_from_slice(&buf[..n]),
                         },
                         &outgoing_tx,
                         direct_guest_tx.as_ref(),
@@ -1017,9 +1107,11 @@ async fn handle_tcp_flow(
                             .fetch_add(1, Ordering::Relaxed);
                         break;
                     }
-                    crate::stats::stats()
-                        .tcp_data_sent
-                        .fetch_add(1, Ordering::Relaxed);
+                    // Advance only after the frame is accepted for output.
+                    // This prevents a concurrent FIN/RST response from seeing
+                    // a post-data seq before the guest can receive that data.
+                    server_seq_shared.fetch_add(n as u32, Ordering::Release);
+                    crate::stats::record_tcp_data_sent();
                 }
                 Err(_) => {
                     crate::stats::stats()
@@ -1044,6 +1136,7 @@ async fn handle_tcp_flow(
             res
         }
     };
+    crate::stats::flush_hot_counters();
 }
 
 fn tcp_syn_ack_options() -> [u8; 8] {
@@ -1083,13 +1176,13 @@ struct Tcp4Output {
     seq: u32,
     ack: u32,
     options: Vec<u8>,
-    payload: Vec<u8>,
+    payload: Bytes,
 }
 
 async fn send_tcp4_output(
     output: Tcp4Output,
     outgoing_tx: &mpsc::Sender<Vec<u8>>,
-    direct_guest_tx: Option<&mpsc::Sender<TapInject>>,
+    direct_guest_tx: Option<&TapInjectSender>,
 ) -> bool {
     if let Some(tx) = direct_guest_tx {
         let direct = TapInject::Tcp4 {
@@ -1168,6 +1261,38 @@ async fn build_and_send_tcp4(output: Tcp4Output, outgoing_tx: &mpsc::Sender<Vec<
     }
 }
 
+async fn send_tcp_ack(
+    src_addr: std::net::Ipv4Addr,
+    src_port: u16,
+    dst_addr: std::net::Ipv4Addr,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    outgoing_tx: &mpsc::Sender<Vec<u8>>,
+    direct_guest_tx: Option<&TapInjectSender>,
+) -> bool {
+    let sent = send_tcp4_output(
+        Tcp4Output {
+            src_addr,
+            src_port,
+            dst_addr,
+            dst_port,
+            flags: 0x10,
+            seq,
+            ack,
+            options: Vec::new(),
+            payload: Bytes::new(),
+        },
+        outgoing_tx,
+        direct_guest_tx,
+    )
+    .await;
+    if sent {
+        crate::stats::record_tcp_ack_sent();
+    }
+    sent
+}
+
 async fn send_tcp_reset(
     src_ip_v4: std::net::Ipv4Addr,
     src_port: u16,
@@ -1175,7 +1300,7 @@ async fn send_tcp_reset(
     dst_port: u16,
     syn_pkt: &TunTcpPacket,
     outgoing_tx: &mpsc::Sender<Vec<u8>>,
-    direct_guest_tx: Option<&mpsc::Sender<TapInject>>,
+    direct_guest_tx: Option<&TapInjectSender>,
 ) {
     let _ = send_tcp4_output(
         Tcp4Output {
@@ -1187,7 +1312,7 @@ async fn send_tcp_reset(
             seq: 0,
             ack: syn_pkt.seq.wrapping_add(1),
             options: Vec::new(),
-            payload: Vec::new(),
+            payload: Bytes::new(),
         },
         outgoing_tx,
         direct_guest_tx,
@@ -1345,7 +1470,7 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
-        assert_eq!(manager.flows.lock().await.len(), 0);
+        assert_eq!(manager.flows.len(), 0);
     }
 
     #[tokio::test]
@@ -1373,7 +1498,7 @@ mod tests {
         assert!(tcp.ack);
         assert!(!tcp.syn);
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(manager.flows.lock().await.len(), 0);
+        assert_eq!(manager.flows.len(), 0);
     }
 
     #[tokio::test]
@@ -1401,7 +1526,7 @@ mod tests {
         assert!(tcp.ack);
         assert!(!tcp.syn);
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(manager.flows.lock().await.len(), 0);
+        assert_eq!(manager.flows.len(), 0);
     }
 
     #[tokio::test]
