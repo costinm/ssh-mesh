@@ -132,8 +132,12 @@ pub enum ActivationFd {
     Stdio(std::os::fd::OwnedFd),
     /// Terminal-style activation: PTY slave → controlling terminal and stdio.
     Pty(std::os::fd::OwnedFd),
-    /// xinetd-style (wait=true): listening socket → FD 3(+), LISTEN_FD env var.
-    Listen(std::os::fd::OwnedFd),
+    /// wait=true mode: listening socket passed to the child.
+    ///
+    /// The `Option<i32>` is the `xinetd_fd` target:
+    /// - `Some(n)` → dup2 to FD `n`, set `LISTEN_FD=<n>`, `LISTEN_FDS=1` (xinetd style)
+    /// - `None` → dup2 to FD 3, set `LISTEN_FDS=1` (systemd style)
+    Listen(std::os::fd::OwnedFd, Option<i32>),
 }
 
 /// Spawn a new process for a service.
@@ -215,24 +219,35 @@ pub fn spawn_process(
                 });
             }
         }
-        Some(ActivationFd::Listen(fd)) => {
-            // xinetd-style: pass as extra FD and set env var.
-            // The FD will be inherited as-is; we use pre_exec to clear CLOEXEC.
+        Some(ActivationFd::Listen(fd, xinetd_fd)) => {
+            // wait=true: pass the listening FD to the child.
+            //
+            // Two styles:
+            //   xinetd style (xinetd_fd = Some(n)):
+            //     dup2(fd, n), LISTEN_FD=<n>, LISTEN_FDS=1
+            //   systemd style (xinetd_fd = None):
+            //     dup2(fd, 3), LISTEN_FDS=1
             use std::os::fd::AsRawFd;
             let raw = fd.as_raw_fd();
-            // Tell the child where to find it
-            cmd.env("LISTEN_FD", raw.to_string());
+            let target_fd = xinetd_fd.unwrap_or(3);
+            cmd.env("LISTEN_FDS", "1");
+            if xinetd_fd.is_some() {
+                cmd.env("LISTEN_FD", target_fd.to_string());
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
                 // SAFETY: only calls async-signal-safe libc functions
                 unsafe {
-                    let fd_to_keep = raw;
                     cmd.pre_exec(move || {
+                        // dup2 the FD to the target position
+                        if libc::dup2(raw, target_fd) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                         // Clear CLOEXEC so the FD survives exec
-                        let flags = libc::fcntl(fd_to_keep, libc::F_GETFD);
+                        let flags = libc::fcntl(target_fd, libc::F_GETFD);
                         if flags >= 0 {
-                            libc::fcntl(fd_to_keep, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                            libc::fcntl(target_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
                         }
                         Ok(())
                     });
@@ -242,8 +257,6 @@ pub fn spawn_process(
             // until after `cmd.spawn()` returns; the child inherits the FD
             // (CLOEXEC was cleared in pre_exec), and the parent's copy is
             // then closed when `_passed_fd_keepalive` drops at end of scope.
-            // Previously this used `mem::forget`, which leaked the parent's
-            // copy permanently (one FD per wait=true activation).
             _passed_fd_keepalive = Some(fd);
         }
         None => {}

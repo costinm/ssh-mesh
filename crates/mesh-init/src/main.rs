@@ -158,6 +158,10 @@ fn print_response(response: Response) -> Result<()> {
 
 /// Common startup: create daemon, start everything, optionally run a CLI command.
 async fn run(config_dir: String, socket_path: String, command: Option<Vec<String>>) -> Result<()> {
+    // Collect systemd socket activation file descriptors before the daemon
+    // creates its own listeners. This must happen before start_background_tasks.
+    mesh_init::activation::collect_systemd_fds();
+
     let config = DaemonConfig {
         config_dirs: vec![config_dir],
         socket_path: socket_path.clone(),

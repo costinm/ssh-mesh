@@ -1,12 +1,23 @@
 //! Socket activation for mesh-init services.
 //!
 //! Handles listening on TCP ports and UDS sockets on behalf of services.
-//! Uses the xinetd model: configurable inetd-style per-connection invocation or
-//! xinetd-style pass-listening-FD behavior.
+//! Supports three activation models:
+//!
+//! - **Systemd socket activation** — mesh-init receives pre-bound file
+//!   descriptors from systemd via `LISTEN_PID`/`LISTEN_FDS`. Uses them
+//!   directly instead of binding new sockets.
+//! - **Xinetd-style (wait=true)** — passes the listening file descriptor
+//!   to the child service, which calls `accept()` itself.
+//! - **Inetd-style (wait=false)** — accepts the connection in mesh-init
+//!   and passes the connected client socket as stdin/stdout/stderr.
 
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
+use parking_lot::Mutex;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
@@ -15,6 +26,10 @@ use crate::config::AppConfig;
 use crate::daemon::Daemon;
 use crate::process::ActivationFd;
 use crate::protocol::ServiceState;
+
+// ============================================================================
+// Concurrency limits
+// ============================================================================
 
 /// Default maximum number of concurrent inetd-style (wait=false) activation
 /// children. Prevents a connection flood from exhausting PIDs/memory/FDs.
@@ -30,13 +45,234 @@ fn max_activation_children() -> usize {
 }
 
 /// Global semaphore capping concurrent inetd-style activation spawns.
-static ACTIVATION_SEMAPHORE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+static ACTIVATION_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn activation_semaphore() -> Arc<Semaphore> {
     ACTIVATION_SEMAPHORE
         .get_or_init(|| Arc::new(Semaphore::new(max_activation_children())))
         .clone()
 }
+
+// ============================================================================
+// Systemd socket activation — FD identification
+// ============================================================================
+
+/// The kind of a systemd socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketKind {
+    Stream,
+    Datagram,
+}
+
+/// Identity of a systemd socket activation file descriptor.
+#[derive(Debug, Clone, PartialEq)]
+enum FdIdentity {
+    Tcp(u16, SocketKind),
+    Unix(PathBuf, SocketKind),
+    Unknown,
+}
+
+/// Global pool of file descriptors received from systemd socket activation.
+/// Populated once by [`collect_systemd_fds`] before any listener starts.
+static SYSTEMD_FDS: OnceLock<Mutex<VecDeque<(OwnedFd, FdIdentity)>>> = OnceLock::new();
+
+/// Collect file descriptors from systemd socket activation.
+///
+/// Checks `LISTEN_PID` and `LISTEN_FDS` environment variables. If the PID
+/// matches the current process and `LISTEN_FDS > 0`, takes ownership of the
+/// file descriptors starting from FD 3 and populates the global [`SYSTEMD_FDS`]
+/// pool. Clears both environment variables so they are not inherited by child
+/// processes.
+///
+/// Must be called early in startup, before any activation listeners are started.
+/// Idempotent — only the first call has effect.
+pub fn collect_systemd_fds() {
+    if SYSTEMD_FDS.get().is_some() {
+        return;
+    }
+
+    let listen_pid = match std::env::var("LISTEN_PID") {
+        Ok(pid_str) => match pid_str.parse::<u32>() {
+            Ok(pid) if pid == std::process::id() => pid,
+            _ => return,
+        },
+        Err(_) => return,
+    };
+
+    let listen_fds: usize = match std::env::var("LISTEN_FDS") {
+        Ok(fds_str) => match fds_str.parse() {
+            Ok(n) if n > 0 => n,
+            _ => return,
+        },
+        Err(_) => return,
+    };
+
+    // Clear env vars so children don't misinterpret them as their own activation
+    // SAFETY: removing these env vars is safe — they were set by systemd and
+    // are only meaningful for the process that matches LISTEN_PID (us).
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+    }
+
+    info!(
+        "Detected systemd socket activation: LISTEN_PID={}, LISTEN_FDS={}",
+        listen_pid, listen_fds,
+    );
+
+    const SD_LISTEN_FDS_START: i32 = 3;
+    let pool = SYSTEMD_FDS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut pool = pool.lock();
+
+    for i in 0..listen_fds {
+        let raw_fd = SD_LISTEN_FDS_START + i as i32;
+        // SAFETY: systemd guarantees these FDs are open and their ownership
+        // is transferred to us when `LISTEN_PID` matches our PID.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let identity = identify_fd(&owned);
+        debug!(
+            "Systemd activation FD {} (raw_fd={}): {:?}",
+            i, raw_fd, identity
+        );
+        pool.push_back((owned, identity));
+    }
+
+    info!(
+        "Collected {} systemd activation file descriptor(s)",
+        listen_fds
+    );
+}
+
+/// Identify the type, address, and socket kind of a file descriptor.
+fn identify_fd(fd: &OwnedFd) -> FdIdentity {
+    let raw_fd = fd.as_raw_fd();
+
+    // Determine socket type (SOCK_STREAM vs SOCK_DGRAM)
+    let sock_kind = get_sock_type(raw_fd);
+
+    // Try UDS first
+    let mut sockaddr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockname(
+            raw_fd,
+            &mut sockaddr as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if ret == 0 && sockaddr.sun_family == libc::AF_UNIX as libc::sa_family_t {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes: &[i8] = &sockaddr.sun_path;
+        let path_len = path_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(path_bytes.len());
+        if path_len > 0 && path_bytes[0] != 0 {
+            // SAFETY: casting i8 sun_path to u8 for OsStrExt::from_bytes.
+            // The path bytes are valid ASCII/UTF-8 filesystem paths.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    path_bytes.as_ptr() as *const u8,
+                    path_len,
+                )
+            };
+            let path = PathBuf::from(<std::ffi::OsStr as OsStrExt>::from_bytes(bytes));
+            return FdIdentity::Unix(path, sock_kind);
+        }
+        // Abstract namespace or empty — treat as Unknown
+        return FdIdentity::Unknown;
+    }
+
+    // Try TCP (IPv4)
+    let mut sockaddr_in: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockname(
+            raw_fd,
+            &mut sockaddr_in as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if ret == 0 && sockaddr_in.sin_family == libc::AF_INET as libc::sa_family_t {
+        let port = u16::from_be(sockaddr_in.sin_port);
+        return FdIdentity::Tcp(port, sock_kind);
+    }
+
+    // Try TCP (IPv6)
+    let mut sockaddr_in6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockname(
+            raw_fd,
+            &mut sockaddr_in6 as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if ret == 0 && sockaddr_in6.sin6_family == libc::AF_INET6 as libc::sa_family_t {
+        let port = u16::from_be(sockaddr_in6.sin6_port);
+        return FdIdentity::Tcp(port, sock_kind);
+    }
+
+    FdIdentity::Unknown
+}
+
+/// Determine the socket type (SOCK_STREAM or SOCK_DGRAM) via `getsockopt(SO_TYPE)`.
+fn get_sock_type(raw_fd: i32) -> SocketKind {
+    let mut sock_type: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            raw_fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut sock_type as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 && sock_type == libc::SOCK_DGRAM {
+        SocketKind::Datagram
+    } else {
+        SocketKind::Stream
+    }
+}
+
+/// Try to take a matching systemd-provided TCP listener FD by port and kind.
+fn take_systemd_tcp_fd(port: u16, datagram: bool) -> Option<OwnedFd> {
+    let kind = if datagram {
+        SocketKind::Datagram
+    } else {
+        SocketKind::Stream
+    };
+    let pool = SYSTEMD_FDS.get()?;
+    let mut pool = pool.lock();
+    let idx = pool.iter().position(|(_, identity)| {
+        matches!(identity, FdIdentity::Tcp(p, k) if *p == port && *k == kind)
+    });
+    idx.map(|i| pool.remove(i).unwrap().0)
+}
+
+/// Try to take a matching systemd-provided UDS listener FD by path and kind.
+fn take_systemd_uds_fd(path: &str, datagram: bool) -> Option<OwnedFd> {
+    let kind = if datagram {
+        SocketKind::Datagram
+    } else {
+        SocketKind::Stream
+    };
+    let pool = SYSTEMD_FDS.get()?;
+    let mut pool = pool.lock();
+    let idx = pool.iter().position(|(_, identity)| {
+        if let FdIdentity::Unix(p, k) = identity {
+            p.as_os_str() == path && *k == kind
+        } else {
+            false
+        }
+    });
+    idx.map(|i| pool.remove(i).unwrap().0)
+}
+
+// ============================================================================
+// Peer credential helper
+// ============================================================================
 
 /// Get peer UID from a raw file descriptor using SO_PEERCRED.
 fn get_peer_uid(fd: i32) -> Option<u32> {
@@ -59,34 +295,89 @@ fn get_peer_uid(fd: i32) -> Option<u32> {
     }
 }
 
+// ============================================================================
+// Start listeners
+// ============================================================================
+
 /// Start activation listeners for a given service.
 pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
     for act in &config.activation {
         if let Some(port) = act.port {
+            // Check for pre-bound systemd socket activation FD
+            if let Some(fd) = take_systemd_tcp_fd(port, act.datagram) {
+                info!(
+                    "Using systemd socket FD for '{}' TCP port {} (datagram={})",
+                    config.name, port, act.datagram
+                );
+                let daemon_clone = daemon.clone();
+                let name = config.name.clone();
+                let wait = act.wait;
+                let xinetd_fd = act.xinetd_fd;
+                tokio::spawn(async move {
+                    handle_listener(fd, name, wait, xinetd_fd, daemon_clone).await;
+                });
+                continue;
+            }
             let daemon_clone = daemon.clone();
             let name = config.name.clone();
             let wait = act.wait;
+            let xinetd_fd = act.xinetd_fd;
             tokio::spawn(async move {
-                run_tcp_listener(port, name, wait, daemon_clone).await;
+                run_tcp_listener(port, name, wait, xinetd_fd, daemon_clone).await;
             });
         }
         if let Some(ref path) = act.socket {
+            // Check for pre-bound systemd socket activation FD
+            if let Some(fd) = take_systemd_uds_fd(path, act.datagram) {
+                info!(
+                    "Using systemd socket FD for '{}' UDS {}",
+                    config.name, path
+                );
+                let daemon_clone = daemon.clone();
+                let name = config.name.clone();
+                let wait = act.wait;
+                let xinetd_fd = act.xinetd_fd;
+                tokio::spawn(async move {
+                    handle_listener(fd, name, wait, xinetd_fd, daemon_clone).await;
+                });
+                continue;
+            }
             let daemon_clone = daemon.clone();
             let name = config.name.clone();
             let path_clone = path.clone();
             let wait = act.wait;
+            let socket_mode = act.socket_mode;
+            let socket_user = act.socket_user.clone();
+            let socket_group = act.socket_group.clone();
+            let xinetd_fd = act.xinetd_fd;
             tokio::spawn(async move {
-                run_uds_listener(path_clone, name, wait, daemon_clone).await;
+                run_uds_listener(
+                    path_clone,
+                    name,
+                    wait,
+                    xinetd_fd,
+                    socket_mode,
+                    socket_user,
+                    socket_group,
+                    daemon_clone,
+                )
+                .await;
             });
         }
     }
 }
 
-async fn run_tcp_listener(port: u16, service_name: String, wait: bool, daemon: Arc<Daemon>) {
-    // Default bind address is 127.0.0.1 (loopback) to avoid exposing
-    // unauthenticated activation services on all interfaces. Operators can
-    // opt into a public bind by setting the `bind` field on the activation
-    // config, but this is a conscious choice.
+// ============================================================================
+// TCP listener
+// ============================================================================
+
+async fn run_tcp_listener(
+    port: u16,
+    service_name: String,
+    wait: bool,
+    xinetd_fd: Option<i32>,
+    daemon: Arc<Daemon>,
+) {
     let bind_addr = daemon
         .configs
         .lock()
@@ -109,8 +400,6 @@ async fn run_tcp_listener(port: u16, service_name: String, wait: bool, daemon: A
         service_name, addr, wait
     );
 
-    // wait=true cannot enforce peer auth (the child calls accept), so reject
-    // the combination explicitly to prevent silent unauthenticated exposure.
     if wait {
         let has_auth = daemon
             .configs
@@ -143,12 +432,24 @@ async fn run_tcp_listener(port: u16, service_name: String, wait: bool, daemon: A
         return;
     }
 
-    // Convert to OwnedFd to pass around generically
     let fd = listener.into();
-    handle_listener(fd, service_name, wait, daemon).await;
+    handle_listener(fd, service_name, wait, xinetd_fd, daemon).await;
 }
 
-async fn run_uds_listener(path: String, service_name: String, wait: bool, daemon: Arc<Daemon>) {
+// ============================================================================
+// UDS listener
+// ============================================================================
+
+async fn run_uds_listener(
+    path: String,
+    service_name: String,
+    wait: bool,
+    xinetd_fd: Option<i32>,
+    socket_mode: Option<u32>,
+    socket_user: Option<String>,
+    socket_group: Option<String>,
+    daemon: Arc<Daemon>,
+) {
     info!(
         "Starting UDS activation listener for '{}' on {}",
         service_name, path
@@ -176,28 +477,98 @@ async fn run_uds_listener(path: String, service_name: String, wait: bool, daemon
             return;
         }
     };
+
+    // Apply socket permissions from config, or default 0o660
     if let Ok(metadata) = std::fs::metadata(&path) {
+        let mode = socket_mode.unwrap_or(0o660);
         let mut perms = metadata.permissions();
-        // 0o660: owner and group can connect, others cannot. World-connectable
-        // (0o666) UDS activation sockets let any local user trigger service
-        // spawns, which is a privilege boundary violation when the service
-        // runs with elevated privileges.
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o660);
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, mode);
         let _ = std::fs::set_permissions(&path, perms);
     }
+
+    // Apply socket ownership from config
+    if let Some(user) = socket_user {
+        if unsafe { libc::getuid() } == 0 {
+            let uid = match user.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => {
+                    // Resolve username to UID
+                    let c_user = std::ffi::CString::new(user.as_str()).unwrap_or_default();
+                    let pw = unsafe { libc::getpwnam(c_user.as_ptr()) };
+                    if pw.is_null() {
+                        warn!("Failed to resolve socket user '{}' for '{}'", user, service_name);
+                        0
+                    } else {
+                        unsafe { (*pw).pw_uid }
+                    }
+                }
+            };
+            let c_path = std::ffi::CString::new(path.as_str()).unwrap_or_default();
+            let gid = socket_group.as_ref().and_then(|g| {
+                if g.is_empty() {
+                    None
+                } else {
+                    match g.parse::<u32>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            let c_group = std::ffi::CString::new(g.as_str()).unwrap_or_default();
+                            let gr = unsafe { libc::getgrnam(c_group.as_ptr()) };
+                            if gr.is_null() {
+                                warn!("Failed to resolve socket group '{}' for '{}'", g, service_name);
+                                None
+                            } else {
+                                Some(unsafe { (*gr).gr_gid })
+                            }
+                        }
+                    }
+                }
+            }).unwrap_or(u32::MAX);
+            unsafe {
+                libc::chown(c_path.as_ptr() as *const _, uid, gid);
+            }
+        } else {
+            warn!("Not running as root, cannot chown UDS socket '{}'", path);
+        }
+    } else if let Some(group) = socket_group
+        && unsafe { libc::getuid() } == 0
+    {
+        let gid = match group.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => {
+                let c_group = std::ffi::CString::new(group.as_str()).unwrap_or_default();
+                let gr = unsafe { libc::getgrnam(c_group.as_ptr()) };
+                if gr.is_null() {
+                    warn!("Failed to resolve socket group '{}' for '{}'", group, service_name);
+                    u32::MAX
+                } else {
+                    unsafe { (*gr).gr_gid }
+                }
+            }
+        };
+        let c_path = std::ffi::CString::new(path.as_str()).unwrap_or_default();
+        unsafe {
+            libc::chown(c_path.as_ptr() as *const _, u32::MAX, gid);
+        }
+    }
+
     if let Err(e) = listener.set_nonblocking(true) {
         error!("Failed to set UDS listener non-blocking: {}", e);
         return;
     }
 
     let fd = listener.into();
-    handle_listener(fd, service_name, wait, daemon).await;
+    handle_listener(fd, service_name, wait, xinetd_fd, daemon).await;
 }
+
+// ============================================================================
+// Core listener loop
+// ============================================================================
 
 async fn handle_listener(
     listener_fd: OwnedFd,
     service_name: String,
     wait: bool,
+    xinetd_fd: Option<i32>,
     daemon: Arc<Daemon>,
 ) {
     let async_fd = match AsyncFd::new(listener_fd) {
@@ -220,17 +591,7 @@ async fn handle_listener(
         debug!("Activation connection ready for {}", service_name);
 
         if wait {
-            // wait=true mode (xinetd style).
-            //
-            // The listening FD is passed to the child, which calls accept() on
-            // it directly. B6: Previously the parent blocked in a sleep loop
-            // until the child exited, which deadlocked for long-running servers
-            // (the parent could never handle another activation event). Now we
-            // spawn the child (if not already running) and return to the
-            // listener loop immediately. Because the child holds the listening
-            // socket, the kernel will not signal readable on the parent's fd
-            // until the child exits (releasing the listener); at that point the
-            // parent re-enters the loop and re-spawns the service.
+            // wait=true — pass the listening FD to the child (xinetd-style or systemd-style)
             let already_running = {
                 let services = daemon.services.lock();
                 services.get(&service_name).is_some_and(|p| {
@@ -259,20 +620,15 @@ async fn handle_listener(
                     .get_ref()
                     .try_clone()
                     .ok()
-                    .map(ActivationFd::Listen);
+                    .map(|fd| ActivationFd::Listen(fd, xinetd_fd));
                 if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
                     error!("Failed to activate service {}: {}", service_name, e);
                 }
-                // Do NOT block waiting for the child to exit; return to the
-                // listener loop. The child holds the listener FD, so no further
-                // readable events arrive until it exits.
             }
 
             guard.clear_ready();
         } else {
-            // wait=false mode (inetd style)
-            // We accept the connection and pass the client socket.
-            // Since we're working with raw FDs, we'll use libc::accept or tokio wrapper.
+            // wait=false (inetd-style) — accept and pass the client fd
             let raw_fd = async_fd.get_ref().as_raw_fd();
             let client_fd =
                 unsafe { libc::accept(raw_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -284,13 +640,11 @@ async fn handle_listener(
                     continue;
                 }
                 error!("Accept error on {}: {}", service_name, err);
-                // Try again after delay
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
 
-            // Successfully accepted
-            guard.retain_ready(); // there might be more connections
+            guard.retain_ready();
             let client_owned = unsafe { OwnedFd::from_raw_fd(client_fd) };
 
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
@@ -301,8 +655,6 @@ async fn handle_listener(
 
                 // UDS peer auth check
                 if let Some(ref auth) = config.auth {
-                    // Get peer UID from the accepted client fd
-                    use std::os::fd::AsRawFd;
                     let peer_uid = get_peer_uid(client_owned.as_raw_fd());
                     let current_uid = unsafe { libc::getuid() };
 
@@ -316,22 +668,16 @@ async fn handle_listener(
                             continue;
                         }
 
-                        // Check if this peer is a delegate — set env vars accordingly
                         if let Some(_pattern) = auth.get_delegate(peer_uid) {
-                            // Delegate: env vars will be set by the service itself
-                            // after reading the delegation envelope from stdin.
-                            // We just mark the connection as delegated.
                             config
                                 .env
                                 .insert("X_PEER_DELEGATE_UID".to_string(), peer_uid.to_string());
                         } else {
-                            // Direct peer: set UID env var
                             config
                                 .env
                                 .insert("X_PEER_UID".to_string(), peer_uid.to_string());
                         }
                     } else {
-                        // Peer UID is None (e.g. TCP connection), but auth is configured
                         error!(
                             "Rejected activation for '{}': auth configured but peer UID unavailable (TCP?)",
                             service_name
@@ -344,21 +690,18 @@ async fn handle_listener(
                 let cg = crate::cgroup::create_cgroup(&service_name)
                     .unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
 
-                // Acquire a permit before spawning to cap concurrent inetd-style
-                // children and prevent fork-bomb / resource exhaustion under a
-                // connection flood. The permit is held for the lifetime of the
-                // spawned task (released on drop).
                 let permit = match activation_semaphore().acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => {
-                        error!("Activation semaphore closed for '{}': {}", service_name, e);
+                        error!(
+                            "Activation semaphore closed for '{}': {}",
+                            service_name, e
+                        );
                         drop(client_owned);
                         continue;
                     }
                 };
 
-                // Spawn the process directly, passing the client socket.
-                // We do NOT use start_service_with_config because there could be multiple instances.
                 match crate::process::spawn_process(
                     &config,
                     &cg,
@@ -366,14 +709,10 @@ async fn handle_listener(
                 ) {
                     Ok(pid) => {
                         debug!("Spawned activated instance (wait=false) PID {}", pid);
-                        // Hold the permit until the child exits. We poll
-                        // periodically; a more robust solution would integrate
-                        // with the SIGCHLD reaper, but this caps the flood.
                         tokio::spawn(async move {
                             let _permit = permit;
                             loop {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                                // If the child is gone, release the permit.
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                 if unsafe { libc::kill(pid as i32, 0) } != 0 {
                                     break;
                                 }

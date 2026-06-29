@@ -98,6 +98,21 @@ pub struct ActivationConfig {
     /// or `::` to listen on all interfaces — only do this with auth configured.
     #[serde(default)]
     pub bind: Option<String>,
+    /// ListenDatagram (true) vs ListenStream (false). Maps to SOCK_DGRAM vs
+    /// SOCK_STREAM. Datagram activation with wait=false is not supported.
+    #[serde(default)]
+    pub datagram: bool,
+    /// Socket file permissions (octal, e.g. 0o660) for UDS activation.
+    /// Ignored for TCP and when receiving FDs from systemd activation.
+    pub socket_mode: Option<u32>,
+    /// Socket file owner for UDS activation. Ignored for TCP.
+    pub socket_user: Option<String>,
+    /// Socket file group for UDS activation. Ignored for TCP.
+    pub socket_group: Option<String>,
+    /// If set, pass the listening FD as this FD number with `LISTEN_FD=<n>`
+    /// (xinetd style). If None, pass as FD 3 with `LISTEN_FDS=1` (systemd
+    /// style). Only meaningful when `wait=true`.
+    pub xinetd_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

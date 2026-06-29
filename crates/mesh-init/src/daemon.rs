@@ -194,6 +194,28 @@ impl Daemon {
             }
         }
 
+        // 1b. Load systemd .socket units and merge activation entries into
+        //     matching service configs. Skip if no .toml with that name exists.
+        for dir in &dirs {
+            let socket_units = crate::socket_unit::load_socket_units(dir);
+            for (service_name, act_configs) in socket_units {
+                let mut configs = self.configs.lock();
+                if let Some(cfg) = configs.get_mut(&service_name) {
+                    let count = act_configs.len();
+                    cfg.activation.extend(act_configs);
+                    info!(
+                        "Merged {} activation(s) from socket unit into service '{}'",
+                        count, service_name
+                    );
+                } else {
+                    error!(
+                        "Socket unit for '{}' has no matching service '{}' (expected '{}.toml'). Skipping.",
+                        service_name, service_name, service_name
+                    );
+                }
+            }
+        }
+
         // 2. Start resource manager
         if let Some(ref rm) = self.resource_manager {
             rm.start();
