@@ -1,0 +1,31 @@
+# On-demand activator for a no-network VM started by the unprivileged host1
+# mesh-init. vrun selects crosvm when KVM is available and falls back to QEMU.
+
+[Service]
+
+ExecStart = "/opt/ssh-mesh/bin/vrun start"
+Type = "oneshot"
+OOMScoreAdjust = -766
+[[Peer]]
+uid = 103
+
+[Resources]
+memory_high = "384M"
+memory_max = "768M"
+cpu_weight = 50
+
+[Environment]
+RUST_LOG = "info"
+SSH_MESH_EXAMPLE_ROOT = "/tmp/mesh/state"
+SSH_MESH_VRUN_APP = "1"
+NIX_PROFILE = "/nix-profile"
+SSH_MESH_APP_VM_KERNEL = "/tmp/mesh/state/vm-artifacts/vmlinux-cloud"
+SSH_MESH_APP_VM_ROOTFS = "/tmp/mesh/state/vm-artifacts/ssh-mesh.erofs"
+SSH_MESH_APP_VM_MODULES = "/tmp/mesh/state/vm-artifacts/modules-cloud.erofs"
+SSH_MESH_VM_NODE = "app5-vm"
+SSH_MESH_APP_HOME = "app5"
+SSH_MESH_APP_TEMPLATE_DIR = "/tmp/mesh/state/host1/home/app5-vm"
+SSH_MESH_VM_HYPERVISOR = "qemu"
+SSH_MESH_VM_VSOCK_CID = "55"
+SSH_MESH_VM_VSOCK_PORT = "18522"
+SSH_MESH_VM_REQUIRE_NATIVE_VSOCK = "1"

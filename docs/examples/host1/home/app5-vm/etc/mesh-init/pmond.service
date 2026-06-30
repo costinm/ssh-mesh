@@ -1,0 +1,15 @@
+# Process monitor for app5-vm.
+
+[Service]
+# Socket activation is declared in pmond.socket.
+
+ExecStart = "pmond"
+OOMScoreAdjust = -820
+[Resources]
+memory_high = "128M"
+memory_max = "256M"
+cpu_weight = 50
+
+[Environment]
+PATH = "/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
+RUST_LOG = "info"

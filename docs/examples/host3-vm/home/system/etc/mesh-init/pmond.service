@@ -1,0 +1,18 @@
+# Process monitor for host3-vm. In a QEMU guest this observes guest processes and
+# exposes the pmond JSONL API over:
+#
+#   $HOME/run/pmond/control.sock
+
+[Service]
+# Socket activation is declared in pmond.socket.
+
+ExecStart = "pmond"
+OOMScoreAdjust = -820
+[Resources]
+memory_high = "128M"
+memory_max = "256M"
+cpu_weight = 50
+
+[Environment]
+PATH = "/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
+RUST_LOG = "info"

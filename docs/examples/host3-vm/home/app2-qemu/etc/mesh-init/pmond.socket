@@ -1,0 +1,4 @@
+[Socket]
+ListenStream=/home/app2/run/pmond/control.sock
+Accept=false
+SocketMode=0660

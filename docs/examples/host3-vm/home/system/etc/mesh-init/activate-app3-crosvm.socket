@@ -1,0 +1,3 @@
+[Socket]
+ListenStream=/tmp/mesh/shared/app3-crosvm/trusted.sock
+Accept=true

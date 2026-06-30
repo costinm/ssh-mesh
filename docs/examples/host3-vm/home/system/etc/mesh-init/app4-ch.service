@@ -1,0 +1,29 @@
+# On-demand activator for a no-network Cloud Hypervisor VM reached over virtio-vsock.
+
+[Service]
+
+ExecStart = "/opt/ssh-mesh/bin/vrun start"
+Type = "oneshot"
+OOMScoreAdjust = -767
+[[Peer]]
+uid = 103
+
+[Resources]
+memory_high = "384M"
+memory_max = "768M"
+cpu_weight = 50
+
+[Environment]
+RUST_LOG = "info"
+SSH_MESH_EXAMPLE_ROOT = "/src"
+SSH_MESH_VRUN_APP = "1"
+NIX_PROFILE = "/src/host3-vm/nix-profile"
+SSH_MESH_APP_VM_KERNEL = "/src/vm-artifacts/vmlinux-cloud"
+SSH_MESH_APP_VM_ROOTFS = "/src/vm-artifacts/ssh-mesh.erofs"
+SSH_MESH_APP_VM_MODULES = "/src/vm-artifacts/modules-cloud.erofs"
+SSH_MESH_VM_NODE = "app4-ch"
+SSH_MESH_APP_HOME = "app4"
+SSH_MESH_APP_TEMPLATE_DIR = "/src/host3-vm/home/app4-ch"
+SSH_MESH_VM_HYPERVISOR = "ch"
+SSH_MESH_VM_VSOCK_CID = "45"
+SSH_MESH_VM_VSOCK_PORT = "18522"

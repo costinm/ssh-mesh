@@ -1,0 +1,16 @@
+# Local mesh discovery for host3-vm. If the VM uses QEMU host1 networking, multicast
+# discovery may be limited; with tap/bridge networking it should discover host2
+# and host1 just like a normal host.
+
+[Service]
+
+ExecStart = "lmesh"
+OOMScoreAdjust = -810
+[Resources]
+memory_high = "64M"
+memory_max = "128M"
+cpu_weight = 50
+
+[Environment]
+PATH = "/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"
+RUST_LOG = "info"

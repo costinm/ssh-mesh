@@ -1,0 +1,4 @@
+[Service]
+ExecStart = "/opt/busybox/bin/sh -c 'mkdir -p /home/system/mesh9p-export; printf '\"'\"'host2-9p-export-ok\n'\"'\"' >/home/system/mesh9p-export/host2.txt; echo '\"'\"'init-setup complete'\"'\"''"
+Type = "oneshot"
+OOMScoreAdjust = -990

@@ -1,0 +1,23 @@
+# Local mesh discovery for host2.
+#
+# lmesh announces on multicast UDP and serves JSON-lines over a mesh-init
+# activated UDS at:
+#
+#   $HOME/run/lmesh/control.sock
+#
+# Query it from inside the node with:
+#
+#   printf '{"method":"nodes"}\n' | nc -U "$HOME/run/lmesh/control.sock"
+
+[Service]
+
+ExecStart = "lmesh"
+OOMScoreAdjust = -810
+[Resources]
+memory_high = "64M"
+memory_max = "128M"
+cpu_weight = 50
+
+[Environment]
+PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin"
+RUST_LOG = "info"

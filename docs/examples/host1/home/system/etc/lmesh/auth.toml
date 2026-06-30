@@ -1,0 +1,16 @@
+# Example standalone auth config for lmesh
+# Location: $HOME/etc/lmesh/auth.toml
+
+# Local host1
+[[peer]]
+uid = 1000
+
+# sshd — trusted to delegate identities for *.meshlocal
+[[peer]]
+uid = 1001
+id = "sshd.meshlocal"
+delegate = "*.meshlocal"
+
+# Workload identity (reachable only via delegation)
+[[peer]]
+id = "worker-1.meshlocal"

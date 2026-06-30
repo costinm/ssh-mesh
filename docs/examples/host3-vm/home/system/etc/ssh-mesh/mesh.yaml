@@ -1,0 +1,71 @@
+# ssh-mesh node configuration for host3-vm.
+#
+# Host3-vm is the worker VM example. The expected guest layout is the same as a real
+# install:
+#
+#   $HOME/.ssh
+#   $HOME/etc/ssh-mesh/mesh.yaml
+#   $HOME/run/ssh-mesh
+#
+# Fixed guest ports are forwarded by run-host3-vm when QEMU user networking is
+# used:
+#
+#   host 18322 -> guest 18322
+#   host 18380 -> guest 18380
+
+ssh_port: 18322
+http_port: 18380
+trusted_uds_path: /tmp/mesh/shared/host3-vm/trusted.sock
+
+auth:
+  impersonation:
+    - from: root@example.m
+      to: "*"
+    - from: host1
+      to: root@host3-vm.example.m
+
+ssh_routes:
+  - name: app2-qemu
+    user: system@app2-qemu.example.m
+    jump_host: app2-qemu.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    activation_service: activate-app2-qemu
+    client:
+      transport: vsock
+      user: app2
+      vsock_cid: 43
+      vsock_port: 18522
+      uds_path: /tmp/mesh/shared/app2-qemu/trusted.sock
+
+  - name: app3-crosvm
+    user: system@app3-crosvm.example.m
+    jump_host: app3-crosvm.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    activation_service: activate-app3-crosvm
+    client:
+      transport: vsock
+      user: app3
+      vsock_cid: 44
+      vsock_port: 18522
+      uds_path: /tmp/mesh/shared/app3-crosvm/trusted.sock
+
+  - name: app4-ch
+    user: system@app4-ch.example.m
+    jump_host: app4-ch.example.m
+    jump_port: 22
+    target_host: 127.0.0.1
+    target_port: 22
+    activation_service: activate-app4-ch
+    activation_uds_path: /tmp/mesh/shared/app4-ch/trusted.sock
+    client:
+      transport: uds
+      user: app4
+      vsock_port: 18522
+      uds_path: /src/app4-ch/vm/vsock.sock
+      line_handshake:
+        send: "connect {vsock_port}"
+        expect_prefix: "OK "

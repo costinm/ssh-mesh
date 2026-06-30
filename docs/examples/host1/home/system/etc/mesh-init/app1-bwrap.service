@@ -1,0 +1,27 @@
+# On-demand activator for the no-network bubblewrap environment.
+#
+# mesh-init owns /tmp/mesh/shared/app1-bwrap/trusted.sock in the host1
+# environment. When a trusted UDS client connects, mesh-init accepts the
+# connection and starts app1-bwrap with that accepted socket wired to
+# stdin/stdout. Inside app1-bwrap, ssh-mesh runs with SSH_MESH_TRUSTED_STDIO=1
+# and has no network namespace access.
+#
+[Service]
+
+ExecStart = "/opt/ssh-mesh/bin/run_bwrap.sh --stdio"
+Type = "oneshot"
+OOMScoreAdjust = -780
+[[Peer]]
+uid = 103
+
+[Resources]
+memory_high = "384M"
+memory_max = "768M"
+cpu_weight = 50
+
+[Environment]
+RUST_LOG = "info"
+SSH_MESH_EXAMPLE_ROOT = "/tmp/mesh/state"
+SSH_MESH_APP_NAME = "app1-bwrap"
+SSH_MESH_APP_HOME = "app1"
+SSH_MESH_APP_TEMPLATE_DIR = "/tmp/mesh/state/host1/home/app1-bwrap"

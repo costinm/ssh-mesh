@@ -1,0 +1,36 @@
+# mesh-init service definition for the "host1" example host.
+#
+# host1/start.sh runs mesh-init as the invoking non-root host1. The config lives
+# at the normal default path:
+#
+#   $HOME/etc/mesh-init/ssh-mesh.toml
+
+[Service]
+
+ExecStart = "ssh-mesh"
+OOMScoreAdjust = -900
+[Resources]
+# Resource limits are harmless if cgroup control is unavailable.
+memory_high = "256M"
+memory_max = "512M"
+cpu_weight = 100
+
+[Environment]
+PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin"
+RUST_LOG = "info"
+SSH_PORT = "18422"
+HTTP_PORT = "18480"
+MUX_DIR = "/home/system/run/ssh-mesh/mux"
+MESH_INIT_SOCK = "/home/system/run/mesh-init/control.sock"
+SSH_MESH_HOME_ROOT = "/home"
+
+# Right now ssh-mesh runs all the time, to test
+# maintaining connections and remote FS.
+#
+# With wireguard (or other external net security)
+# this is not needed and it can be activated.
+# When activating, 2 units will be used, one for
+# http and one for ssh, usually just one will be
+# used.
+#
+# Gateways can also use ssh-mesh - in http2 mode.

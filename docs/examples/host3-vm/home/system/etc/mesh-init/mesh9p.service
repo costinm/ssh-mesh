@@ -1,0 +1,11 @@
+[Service]
+
+ExecStart = "mesh9p /home/system:/host3-vm:rw /tmp/mesh/9p:/imports:rw /opt"
+OOMScoreAdjust = -600
+[Resources]
+memory_low = "64M"
+memory_high = "128M"
+cpu_weight = 50
+
+[Environment]
+RUST_LOG = "info"

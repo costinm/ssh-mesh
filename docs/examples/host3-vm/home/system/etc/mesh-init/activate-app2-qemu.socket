@@ -1,0 +1,3 @@
+[Socket]
+ListenStream=/tmp/mesh/shared/app2-qemu/trusted.sock
+Accept=true
