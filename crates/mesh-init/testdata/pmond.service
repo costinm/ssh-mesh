@@ -1,0 +1,11 @@
+[Service]
+
+ExecStart = "./pmond --server --refresh 5"
+OOMScoreAdjust = -800
+[Resources]
+memory_max = "256M"
+
+[Environment]
+RUST_LOG = "info"
+
+# Socket activation is declared in pmond.socket.

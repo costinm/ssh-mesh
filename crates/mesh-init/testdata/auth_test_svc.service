@@ -1,0 +1,6 @@
+[Service]
+
+ExecStart = "/bin/sh -c 'echo SUCCESS PEER=$X_PEER_UID'"
+OOMScoreAdjust = -800
+[[Peer]]
+uid = 9999

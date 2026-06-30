@@ -1,0 +1,12 @@
+# default.service - Applied to the main command in execution mode.
+# Sets the UID/GID, resource limits, and environment for the main process.
+[Service]
+
+ExecStart = "_placeholder_"
+OOMScoreAdjust = -1000
+[Resources]
+memory_max = "256M"
+cpu_weight = 100
+
+[Environment]
+RUST_LOG = "info"

@@ -1,0 +1,14 @@
+[Service]
+
+ExecStart = "./ssh-mesh"
+OOMScoreAdjust = -900
+[Resources]
+memory_max = "1G"
+cpu_weight = 100
+
+[Environment]
+RUST_LOG = "info"
+SSH_PORT = "14022"
+HTTP_PORT = "14080"
+
+# Socket activation is declared in ssh-mesh.socket.

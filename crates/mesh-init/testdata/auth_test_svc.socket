@@ -1,0 +1,4 @@
+[Socket]
+ListenStream=/tmp/mesh-init-auth-test.sock
+ListenStream=14033
+Accept=true
