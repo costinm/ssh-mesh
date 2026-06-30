@@ -20,13 +20,14 @@ except ImportError:
     current_file = Path(__file__).resolve()
     # Structure: .../python/dmesh/__init__.py
     # parents[0]: dmesh
-    # parents[1]: python
-    # parents[2]: workspace root
-    workspace_root = current_file.parents[2]
+    # parents[1]: python (where target/ lives)
+    python_root = current_file.parents[1]
 
     potential_libs = [
-        workspace_root / "target" / "debug" / "libdmesh.so",
-        workspace_root / "target" / "release" / "libdmesh.so",
+        python_root / "target" / "debug" / "libdmesh.so",
+        python_root / "target" / "release" / "libdmesh.so",
+        python_root / "target" / "x86_64-unknown-linux-gnu" / "debug" / "libdmesh.so",
+        python_root / "target" / "x86_64-unknown-linux-gnu" / "release" / "libdmesh.so",
     ]
 
     lib_path = None
@@ -46,7 +47,7 @@ except ImportError:
     else:
         raise ImportError(
             "Could not find dmesh_py extension. "
-            "Run 'cargo build -p dmesh --features python' or install via 'maturin develop'."
+            "Run 'cargo build -p dmesh --features python' in python/ or install via 'maturin develop'."
         )
 
 # Re-export key classes

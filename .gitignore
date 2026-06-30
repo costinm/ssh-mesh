@@ -6,7 +6,7 @@ AGENT.md
 .venv
 tmp
 result*
-python/dmesh/__pycache__
+python/**/__pycache__
 java/classes
 .antigravitycli
 result

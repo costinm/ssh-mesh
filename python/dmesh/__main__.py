@@ -7,7 +7,6 @@ Usage:
     python -m dmesh --base-dir /path/to/data --ssh-port 15022 --http-port 8080
 
 Equivalent launchers exist in other languages — keep them in sync:
-- Rust:  cargo run -p dmesh -- --base-dir ... --ssh-port ... --http-port ...
 - Java:  java -cp ... com.github.costinm.dmeshnative.Main --base-dir ... --ssh-port ...
 """
 

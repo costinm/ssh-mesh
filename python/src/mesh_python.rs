@@ -6,8 +6,7 @@
 //! and callback plumbing.
 //!
 //! See also:
-//! - Rust binary: `src/main.rs`
-//! - Python launcher: `python/dmesh/__main__.py`
+//! - Python launcher: `dmesh/__main__.py`
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;

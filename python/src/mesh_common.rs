@@ -2,9 +2,6 @@
 //!
 //! The Python wrapper (`mesh_python.rs`) delegates to these functions for the
 //! actual mesh logic. PyO3-specific conversions stay in the wrapper module.
-//!
-//! The Rust binary (`main.rs`) and Python launcher start a single node using
-//! the same feature set. Keep them in sync when adding new capabilities.
 
 use ssh_mesh::sshc::SshClientManager;
 use ssh_mesh::{MeshNode, MeshNodeConfig, run_ssh_server};

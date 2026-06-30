@@ -23,8 +23,8 @@ import tempfile
 import time
 import threading
 
-# Add project root to path so we can import dmesh
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+# Add python/ directory to path so we can import dmesh
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dmesh import PyMeshNode, PyMeshStream
 
