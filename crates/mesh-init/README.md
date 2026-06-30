@@ -32,7 +32,7 @@ The actual execution can be handled directly for simple cases or delegated. If m
 
 ## API 
 
-- 'start' request receives the name of the app ("google-chrome"). If a config file exists ('google-chrome.toml'), it is loaded and used to configure the jail, including
+- 'start' request receives the name of the app ("google-chrome"). If a config file exists ('google-chrome.service'), it is loaded and used to configure the jail, including
  resources, command to launch, etc. Additional parameters are env, args and a set of FDs. The user ID is in the config.
 
 - stop / freeze / unfreeze

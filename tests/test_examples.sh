@@ -48,12 +48,8 @@ http_ok() {
   curl -fsS --max-time 2 "$1" >/dev/null
 }
 
-uds_http_ok() {
-  curl -fsS --max-time 2 --unix-socket "$1" "$2" >/dev/null
-}
-
-uds_http_post_ok() {
-  curl -fsS --max-time 2 -X POST --unix-socket "$1" "$2" >/dev/null
+uds_jsonl_ok() {
+  printf '%s\n' "$2" | timeout 2 nc -U "$1" | grep -q '"success":true\|"result"'
 }
 
 tcp_open() {
@@ -124,12 +120,12 @@ export SSH_MESH_HOST3_VM_HOST_HTTP_PORT="${SSH_MESH_HOST3_VM_HOST_HTTP_PORT:-293
 
 need bwrap
 need curl
+need nc
 need qemu-system-x86_64
 need mesh-init
 need ssh-mesh
 need pmond
 need lmesh
-need mcp-pmond
 need h2t
 
 if [ "${SSH_MESH_TEST_SKIP_PORT_CHECK:-0}" != "1" ]; then
@@ -195,15 +191,17 @@ wait_for "app2-qemu activation UDS" 30 test -S "${state_root}/shared/app2-qemu/t
 wait_for "host1 local forward to host2 SSH" 60 tcp_open 19005
 wait_for "host1 remote forward HTTP" 60 http_ok "http://127.0.0.1:19105/_m/api/ssh/clients"
 
-wait_for "host2 pmond UDS" 60 uds_http_ok \
-  "${state_root}/host2/home/system/.run/pmond/control.sock" \
-  "http://localhost/_m/pmon/_ps"
-wait_for "host1 pmond UDS" 60 uds_http_ok \
-  "${state_root}/host1/home/system/.run/pmond/control.sock" \
-  "http://localhost/_m/pmon/_ps"
-if ! wait_for "host2 lmesh UDS" 10 uds_http_post_ok \
-  "${state_root}/host2/home/system/.run/lmesh/control.sock" \
-  "http://localhost/nodes"; then
+wait_for "host2 pmond JSONL UDS" 60 uds_jsonl_ok \
+  "${state_root}/host2/home/system/run/pmond/control.sock" \
+  '{"jsonrpc":"2.0","method":"ps","id":1}'
+wait_for "host1 pmond JSONL UDS" 60 uds_jsonl_ok \
+  "${state_root}/host1/home/system/run/pmond/control.sock" \
+  '{"jsonrpc":"2.0","method":"ps","id":1}'
+wait_for "host2 pmond HTTP proxy" 60 http_ok "http://127.0.0.1:18280/_m/pmon/_ps"
+wait_for "host1 pmond HTTP proxy" 60 http_ok "http://127.0.0.1:18480/_m/pmon/_ps"
+if ! wait_for "host2 lmesh UDS" 10 uds_jsonl_ok \
+  "${state_root}/host2/home/system/run/lmesh/control.sock" \
+  '{"jsonrpc":"2.0","method":"nodes","id":1}'; then
   echo "warn: host2 lmesh UDS unavailable; multicast can be disabled in restricted namespaces"
 fi
 

@@ -1,5 +1,0 @@
-# ssh-mesh node configuration for app2-qemu.
-
-ssh_port: 18522
-http_port: 18580
-trusted_vsock_port: 18522

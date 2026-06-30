@@ -17,63 +17,76 @@ pub const DEFAULT_MESH_TUN_MTU: u32 = 65_520;
 /// Top-level TOML structure for a config file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfigFile {
+    #[serde(rename = "Service")]
     pub service: ServiceSection,
-    #[serde(default)]
+    #[serde(default, rename = "Resources")]
     pub resources: ResourceLimits,
-    #[serde(default)]
+    #[serde(default, rename = "Environment")]
     pub environment: HashMap<String, String>,
-    #[serde(default)]
-    pub activation: Vec<ActivationConfig>,
-    #[serde(default)]
+    #[serde(default, rename = "Network")]
     pub network: NetworkConfig,
-    #[serde(default)]
+    #[serde(default, rename = "Schedule")]
     pub schedule: Option<ScheduleConfig>,
-    #[serde(default)]
+    #[serde(default, rename = "Constraints")]
     pub constraints: Option<ConstraintConfig>,
-    #[serde(default)]
+    #[serde(default, rename = "Backoff")]
     pub backoff: BackoffConfig,
-    /// Authorization peer entries. Same `[[peer]]` keyword as standalone `auth.toml`.
-    #[serde(default, rename = "peer")]
+    /// Authorization peer entries. Same shape as standalone `auth.toml`.
+    #[serde(default, rename = "Peer")]
     pub peers: Vec<PeerConfig>,
-    /// Identity impersonation entries. Same `[[impersonation]]` keyword as standalone auth.
-    #[serde(default, rename = "impersonation")]
+    /// Identity impersonation entries. Same shape as standalone auth.
+    #[serde(default, rename = "MeshImpersonation")]
     pub impersonation: Vec<ImpersonationRule>,
 
     // Job-specific metadata
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", rename = "MeshPersisted")]
     pub persisted: bool,
-    #[serde(default)]
+    #[serde(default, rename = "MeshPrefetch")]
     pub prefetch: bool,
-    #[serde(default)]
+    #[serde(default, rename = "MeshSaveResult")]
     pub save_result: bool,
+    #[serde(rename = "MeshTraceTag")]
     pub trace_tag: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "MeshUserInitiated")]
     pub user_initiated: bool,
-    #[serde(default)]
+    #[serde(default, rename = "MeshExpedited")]
     pub expedited: bool,
+    #[serde(rename = "MeshEstimatedDownloadBytes")]
     pub estimated_download_bytes: Option<u64>,
+    #[serde(rename = "MeshEstimatedUploadBytes")]
     pub estimated_upload_bytes: Option<u64>,
+    #[serde(rename = "MeshMinimumNetworkChunkBytes")]
     pub minimum_network_chunk_bytes: Option<u64>,
 }
 
-/// The `[service]` section of a config file.
+/// The `[Service]` section of a config file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServiceSection {
-    pub name: String,
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
+    #[serde(rename = "ExecStart")]
+    pub exec_start: String,
+    /// How mesh-init handles Accept=true socket-unit activations for this
+    /// service. `stdio` is classic inetd. `hybrid` starts the service with a
+    /// systemd-style JSONL listener first, then forwards accepted connection
+    /// FDs to that JSONL socket.
+    #[serde(default, rename = "MeshActivationMode")]
+    pub activation_mode: ServiceActivationMode,
+    /// JSONL Unix socket used by hybrid activation. Defaults to
+    /// `/home/<service>/run/<service>/control.sock` when omitted.
+    #[serde(rename = "MeshActivationSocket")]
+    pub activation_socket: Option<String>,
+    #[serde(rename = "User")]
     pub user: Option<String>,
+    #[serde(rename = "Group")]
     pub group: Option<String>,
+    #[serde(rename = "MeshUID")]
     pub uid: Option<u32>,
+    #[serde(rename = "MeshGID")]
     pub gid: Option<u32>,
-    /// Priority for eviction ordering. Lower = more important. Default 500.
-    #[serde(default = "default_priority")]
-    pub priority: u32,
-    /// If true, do not restart after exit.
-    #[serde(default)]
-    pub oneshot: bool,
+    /// `Type=oneshot` marks the service as one-shot and disables restart.
+    #[serde(rename = "Type")]
+    pub service_type: Option<String>,
     /// OOM score adjustment (-1000 to 1000).
+    #[serde(rename = "OOMScoreAdjust")]
     pub oom_score_adjust: Option<i32>,
 }
 
@@ -86,7 +99,22 @@ pub struct ResourceLimits {
     pub cpu_weight: Option<u32>,
 }
 
-/// A single `[[activation]]` entry.
+/// Service-level behavior for Accept=true socket activations.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceActivationMode {
+    /// Classic inetd: accepted socket becomes child stdin/stdout/stderr.
+    #[default]
+    Stdio,
+    /// Hybrid: service receives its JSONL listener first, then accepted FDs
+    /// are sent to that socket with SCM_RIGHTS.
+    Hybrid,
+}
+
+/// Legacy inline activation entry.
+///
+/// New configs should use systemd-style `.socket` files. This type remains
+/// because mesh-init merges parsed socket units into the same runtime shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ActivationConfig {
     pub port: Option<u16>,
@@ -99,7 +127,7 @@ pub struct ActivationConfig {
     #[serde(default)]
     pub bind: Option<String>,
     /// ListenDatagram (true) vs ListenStream (false). Maps to SOCK_DGRAM vs
-    /// SOCK_STREAM. Datagram activation with wait=false is not supported.
+    /// SOCK_STREAM. Datagram activation with Accept=true is not supported.
     #[serde(default)]
     pub datagram: bool,
     /// Socket file permissions (octal, e.g. 0o660) for UDS activation.
@@ -109,10 +137,6 @@ pub struct ActivationConfig {
     pub socket_user: Option<String>,
     /// Socket file group for UDS activation. Ignored for TCP.
     pub socket_group: Option<String>,
-    /// If set, pass the listening FD as this FD number with `LISTEN_FD=<n>`
-    /// (xinetd style). If None, pass as FD 3 with `LISTEN_FDS=1` (systemd
-    /// style). Only meaningful when `wait=true`.
-    pub xinetd_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,6 +277,8 @@ pub struct AppConfig {
     pub env: HashMap<String, String>,
     pub priority: u32,
     pub oneshot: bool,
+    pub activation_mode: ServiceActivationMode,
+    pub activation_socket: Option<String>,
     pub oom_score_adjust: Option<i32>,
     pub resources: ResolvedResourceLimits,
     pub activation: Vec<ActivationConfig>,
@@ -297,10 +323,6 @@ pub struct ResolvedResourceLimits {
 // ============================================================================
 // Defaults
 // ============================================================================
-
-fn default_priority() -> u32 {
-    500
-}
 
 fn default_true() -> bool {
     true
@@ -366,18 +388,27 @@ fn resolve_limits(limits: &ResourceLimits) -> Result<ResolvedResourceLimits, Con
 }
 
 pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
+    parse_service(content, None)
+}
+
+pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppConfig, ConfigError> {
     let file: AppConfigFile = toml::from_str(content)?;
     let resolved = resolve_limits(&file.resources)?;
 
-    if file.service.command.is_empty() {
+    if file.service.exec_start.trim().is_empty() {
         return Err(ConfigError::Invalid(
-            "service.command must not be empty".to_string(),
+            "Service.ExecStart must not be empty".to_string(),
         ));
     }
 
+    let (command, args) = parse_exec_start(&file.service.exec_start)?;
+    let name = service_name
+        .map(str::to_string)
+        .unwrap_or_else(|| "service".to_string());
+
     // Reject names that could escape the jobs/cgroup directory or be used in
     // filesystem paths unsafely.
-    if let Err(reason) = validate_service_name(&file.service.name) {
+    if let Err(reason) = validate_service_name(&name) {
         return Err(ConfigError::Invalid(format!(
             "invalid service name: {reason}"
         )));
@@ -386,26 +417,32 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
     if let Some(oom) = file.service.oom_score_adjust {
         if !(-1000..=1000).contains(&oom) {
             return Err(ConfigError::Invalid(format!(
-                "oom_score_adjust must be between -1000 and 1000, got {}",
+                "OOMScoreAdjust must be between -1000 and 1000, got {}",
                 oom
             )));
         }
     }
 
     Ok(AppConfig {
-        name: file.service.name,
-        command: file.service.command,
-        args: file.service.args,
+        name,
+        command,
+        args,
+        activation_mode: file.service.activation_mode,
+        activation_socket: file.service.activation_socket,
         uid: file.service.uid,
         gid: file.service.gid,
         user: file.service.user,
         group: file.service.group,
         env: file.environment,
-        priority: file.service.priority,
-        oneshot: file.service.oneshot,
+        priority: priority_from_oom_score(file.service.oom_score_adjust),
+        oneshot: file
+            .service
+            .service_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("oneshot")),
         oom_score_adjust: file.service.oom_score_adjust,
         resources: resolved,
-        activation: file.activation,
+        activation: Vec::new(),
         network: file.network,
         source_path: None,
         auth: if file.peers.is_empty() && file.impersonation.is_empty() {
@@ -432,12 +469,92 @@ pub fn parse_toml(content: &str) -> Result<AppConfig, ConfigError> {
     })
 }
 
+fn priority_from_oom_score(oom_score_adjust: Option<i32>) -> u32 {
+    match oom_score_adjust {
+        Some(score) => (score + 1000).clamp(0, 2000) as u32,
+        None => 1000,
+    }
+}
+
+fn parse_exec_start(exec_start: &str) -> Result<(String, Vec<String>), ConfigError> {
+    let words = split_exec_words(exec_start)?;
+    let Some((command, args)) = words.split_first() else {
+        return Err(ConfigError::Invalid(
+            "Service.ExecStart must include a command".to_string(),
+        ));
+    };
+    Ok((command.clone(), args.to_vec()))
+}
+
+fn split_exec_words(input: &str) -> Result<Vec<String>, ConfigError> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut quote = None;
+    let mut in_word = false;
+
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                    in_word = true;
+                } else {
+                    current.push('\\');
+                    in_word = true;
+                }
+            }
+            (Some(_), c) => {
+                current.push(c);
+                in_word = true;
+            }
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                    in_word = true;
+                } else {
+                    current.push('\\');
+                    in_word = true;
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+
+    if let Some(q) = quote {
+        return Err(ConfigError::Invalid(format!(
+            "unterminated quote {} in Service.ExecStart",
+            q
+        )));
+    }
+
+    if in_word {
+        words.push(current);
+    }
+
+    Ok(words)
+}
+
 /// Validate a service/job name for safe use in filesystem paths (cgroup
 /// scopes, jobs directory, user config directory).
 ///
 /// A valid name:
 /// - is non-empty
-/// - is at most 251 characters (leaving room for the `.scope`/`.toml`
+/// - is at most 251 characters (leaving room for the `.scope`/`.service`
 ///   suffixes under NAME_MAX=255)
 /// - contains no path separators (`/`, `\`)
 /// - is not `.` or `..` and contains no `..` component

@@ -29,6 +29,7 @@ async fn main() -> Result<(), anyhow::Error> {
     use log::{error, info};
     use ssh_mesh::{AppState, ExecConfig, MeshNode, MeshNodeConfig, handlers, run_ssh_server};
 
+    let app_paths = mesh::paths::AppPaths::for_app("ssh-mesh");
     let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
 
     // Get SSH port from environment variable or use default
@@ -65,14 +66,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
         let config_dir = env::var("SSH_MESH_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let mut path = env::var("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("/tmp"));
-                path.push(".config");
-                path.push("ssh-mesh");
-                path
-            });
+            .unwrap_or_else(|_| app_paths.etc.clone());
 
         // Layer config file from config_dir (mesh.yaml, mesh.json, mesh.toml)
         for ext in &["yaml", "json", "toml"] {
@@ -307,8 +301,6 @@ async fn main() -> Result<(), anyhow::Error> {
         app = app.merge(ws::app_ws(ws_state));
     }
 
-    // app = app.nest("/", pmond::handlers::app(proc_mon.clone()));
-
     // HTTPS admin server with mTLS client-certificate authentication.
     //
     // When a CA certificate is available (base_dir/id_ecdsa.crt for the
@@ -367,13 +359,14 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    // HTTP over UDS server - let MeshApp auto-detect app_name from $0
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let control_uds = format!("{}/.run/ssh-mesh/control.sock", home);
+    // HTTP over UDS server. mesh provides activation/UDS auth; ssh-mesh owns HTTP.
+    let control_uds = app_paths
+        .control_socket("ssh-mesh")
+        .to_string_lossy()
+        .into_owned();
     let app_clone = app.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            mesh::server::run_axum_server("ssh-mesh", Some(&control_uds), app_clone).await
+        if let Err(e) = run_axum_over_mesh_listener("ssh-mesh", Some(&control_uds), app_clone).await
         {
             error!("UDS HTTP server failed: {}", e);
         }
@@ -397,8 +390,14 @@ async fn main() -> Result<(), anyhow::Error> {
                 http_bind
             );
         }
-        let http_addr = format!("{}:{}", http_bind, http_port);
-        let listener = TcpListener::bind(&http_addr).await?;
+        let listener = if let Some(listener) = mesh::server::take_activated_tcp_listener()
+            .map_err(|e| anyhow::anyhow!("activated TCP listener error: {}", e))?
+        {
+            TcpListener::from_std(listener)?
+        } else {
+            let http_addr = format!("{}:{}", http_bind, http_port);
+            TcpListener::bind(&http_addr).await?
+        };
         // Run HTTP server in background
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app.into_make_service()).await {
@@ -443,4 +442,34 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Exiting");
     std::process::exit(0);
+}
+
+async fn run_axum_over_mesh_listener(
+    app_name: &str,
+    listen_path: Option<&str>,
+    app: axum::Router,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use hyper_util::rt::TokioIo;
+    use hyper_util::service::TowerToHyperService;
+
+    let mut listener = mesh::server::MeshListener::new(app_name, listen_path)?;
+    while let Some(stream) = listener.accept().await? {
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, TowerToHyperService::new(app_clone))
+                .with_upgrades()
+                .await
+            {
+                let err_str = err.to_string();
+                if !err_str.contains("connection error: not connected")
+                    && !err_str.contains("early eof")
+                {
+                    log::error!("UDS HTTP connection failed: {:?}", err);
+                }
+            }
+        });
+    }
+    Ok(())
 }

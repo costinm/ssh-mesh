@@ -11,9 +11,6 @@ if [ "$#" -gt 0 ]; then
 fi
 
 default_nix_profile="${target_dir}/nix/profile"
-if [ ! -e "${default_nix_profile}" ] && [ -e "${target_dir}/nix/profiles" ]; then
-  default_nix_profile="${target_dir}/nix/profiles"
-fi
 staged_opt="${target_dir}/dist/opt"
 
 mkdir -p \

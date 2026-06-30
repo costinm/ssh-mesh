@@ -1,13 +1,12 @@
 use crate::auth::{AuthConfig, DelegationEnvelope};
-use hyper_util::rt::TokioIo;
-use hyper_util::service::TowerToHyperService;
+use crate::paths::AppPaths;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufStream, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Set `FD_CLOEXEC` on an existing file descriptor.
 ///
@@ -87,6 +86,13 @@ enum ListenerMode {
     Stdio(bool), // bool is `has_yielded`
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivatedFdKind {
+    Tcp,
+    Unix,
+    Other(i32),
+}
+
 pub struct MeshListener {
     mode: ListenerMode,
     auth: Option<AuthConfig>,
@@ -112,49 +118,10 @@ impl MeshListener {
             })
             .unwrap_or(false);
 
-        let mode = if let Ok(fd_str) = std::env::var("LISTEN_FD") {
-            if let Ok(fd) = fd_str.parse::<i32>() {
-                info!("MeshListener: Using activated listener FD {}", fd);
-                // SAFETY: the FD was passed by the parent (systemd-style socket
-                // activation) and is a valid UnixListener fd owned by us.
-                let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-                std_listener.set_nonblocking(true)?;
-                // Ensure close-on-exec so the listener does not leak into child
-                // processes spawned by handlers (e.g. exec, terminal).
-                set_cloexec(std_listener.as_raw_fd());
-                ListenerMode::Uds(UnixListener::from_std(std_listener)?)
-            } else {
-                return Err("Invalid LISTEN_FD".into());
-            }
-        } else if let Some(path_str) = listen_path {
-            let actual_path = if path_str.starts_with('_') {
-                path_str.replacen('_', "\0", 1)
-            } else if path_str.starts_with('/') {
-                path_str.to_string()
-            } else {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                let dir = format!("{}/.run/{}", home, app_name);
-                let _ = std::fs::create_dir_all(&dir);
-                format!("{}/{}", dir, path_str)
-            };
-
-            if !actual_path.starts_with('\0') {
-                let path = std::path::Path::new(&actual_path);
-                if path.exists() {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-            let listener = UnixListener::bind(&actual_path)?;
-            info!("MeshListener: Listening on UDS {:?}", actual_path);
-
-            if !actual_path.starts_with('\0') {
-                // Set permissions to 0660
-                let mut perms = std::fs::metadata(&actual_path)?.permissions();
-                perms.set_mode(0o660);
-                std::fs::set_permissions(&actual_path, perms)?;
-            }
-
+        let mode = if let Some(listener) = take_activated_unix_listener()? {
             ListenerMode::Uds(listener)
+        } else if let Some(path_str) = listen_path {
+            Self::bind_uds(app_name, path_str)?
         } else {
             info!("MeshListener: Serving over stdin/stdout");
             ListenerMode::Stdio(false)
@@ -166,6 +133,39 @@ impl MeshListener {
             current_uid,
             enforce_delegation,
         })
+    }
+
+    fn bind_uds(
+        app_name: &str,
+        path_str: &str,
+    ) -> Result<ListenerMode, Box<dyn std::error::Error>> {
+        let actual_path = if path_str.starts_with('_') {
+            path_str.replacen('_', "\0", 1)
+        } else if path_str.starts_with('/') {
+            path_str.to_string()
+        } else {
+            let dir = AppPaths::for_app(app_name).run_dir(app_name);
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join(path_str).to_string_lossy().into_owned()
+        };
+
+        if !actual_path.starts_with('\0') {
+            let path = std::path::Path::new(&actual_path);
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let listener = UnixListener::bind(&actual_path)?;
+        info!("MeshListener: Listening on UDS {:?}", actual_path);
+
+        if !actual_path.starts_with('\0') {
+            // Set permissions to 0660
+            let mut perms = std::fs::metadata(&actual_path)?.permissions();
+            perms.set_mode(0o660);
+            std::fs::set_permissions(&actual_path, perms)?;
+        }
+
+        Ok(ListenerMode::Uds(listener))
     }
 
     pub async fn accept(&mut self) -> Result<Option<MeshStream>, Box<dyn std::error::Error>> {
@@ -282,31 +282,133 @@ impl MeshListener {
     }
 }
 
-pub async fn run_axum_server(
-    app_name: &str,
-    listen_path: Option<&str>,
-    app: axum::Router,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut listener = MeshListener::new(app_name, listen_path)?;
-
-    while let Some(stream) = listener.accept().await? {
-        let app_clone = app.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, TowerToHyperService::new(app_clone))
-                .with_upgrades()
-                .await
-            {
-                let err_str = err.to_string();
-                if !err_str.contains("connection error: not connected")
-                    && !err_str.contains("early eof")
-                {
-                    error!("Error serving HTTP connection: {:?}", err);
-                }
-            }
-        });
+pub fn activated_listener_fds() -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    if let Ok(fd_str) = std::env::var("LISTEN_FD") {
+        let fd = fd_str.parse::<i32>()?;
+        return Ok(vec![fd]);
     }
 
-    Ok(())
+    if let Ok(fds_str) = std::env::var("LISTEN_FDS") {
+        let fds = fds_str.parse::<i32>()?;
+        if fds > 0 {
+            // systemd socket activation always starts passing descriptors at
+            // fd 3. mesh-init uses the same convention for Accept=false services.
+            return Ok((3..3 + fds).collect());
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+pub fn activated_fd_kind(fd: i32) -> Result<ActivatedFdKind, Box<dyn std::error::Error>> {
+    let mut socket_type: libc::c_int = 0;
+    let mut socket_type_len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    // SAFETY: socket_type points to writable memory of socket_type_len bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut socket_type as *mut libc::c_int).cast(),
+            &mut socket_type_len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if socket_type != libc::SOCK_STREAM {
+        return Ok(ActivatedFdKind::Other(socket_type));
+    }
+
+    // SAFETY: sockaddr_storage is a plain old data buffer initialized by getsockname.
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addr_len = std::mem::size_of_val(&addr) as libc::socklen_t;
+    // SAFETY: addr points to writable storage large enough for addr_len bytes.
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut addr as *mut libc::sockaddr_storage).cast(),
+            &mut addr_len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let family = addr.ss_family as libc::c_int;
+    if family == libc::AF_UNIX {
+        Ok(ActivatedFdKind::Unix)
+    } else if family == libc::AF_INET || family == libc::AF_INET6 {
+        Ok(ActivatedFdKind::Tcp)
+    } else {
+        Ok(ActivatedFdKind::Other(family))
+    }
+}
+
+pub fn first_activated_listener_fd(
+    kind: ActivatedFdKind,
+) -> Result<Option<i32>, Box<dyn std::error::Error>> {
+    for fd in activated_listener_fds()? {
+        match activated_fd_kind(fd) {
+            Ok(fd_kind) if fd_kind == kind => return Ok(Some(fd)),
+            Ok(fd_kind) => debug!(
+                fd,
+                ?fd_kind,
+                wanted = ?kind,
+                "skipping activated listener fd"
+            ),
+            Err(e) => debug!(fd, error = %e, "skipping unusable activated listener fd"),
+        }
+    }
+    Ok(None)
+}
+
+pub fn take_activated_unix_listener() -> Result<Option<UnixListener>, Box<dyn std::error::Error>> {
+    let Some(fd) = first_activated_listener_fd(ActivatedFdKind::Unix)? else {
+        return Ok(None);
+    };
+    info!("MeshListener: Using activated Unix listener FD {}", fd);
+    // SAFETY: activated_fd_kind verifies that fd is an open Unix stream socket.
+    // from_raw_fd takes ownership exactly once in this activation path.
+    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    std_listener.set_nonblocking(true)?;
+    set_cloexec(std_listener.as_raw_fd());
+    Ok(Some(UnixListener::from_std(std_listener)?))
+}
+
+pub fn take_activated_tcp_listener()
+-> Result<Option<std::net::TcpListener>, Box<dyn std::error::Error>> {
+    let Some(fd) = first_activated_listener_fd(ActivatedFdKind::Tcp)? else {
+        return Ok(None);
+    };
+    info!("Using activated TCP listener FD {}", fd);
+    // SAFETY: activated_fd_kind verifies that fd is an open TCP stream socket.
+    // from_raw_fd takes ownership exactly once in this activation path.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    listener.set_nonblocking(true)?;
+    set_cloexec(listener.as_raw_fd());
+    Ok(Some(listener))
+}
+
+pub fn activated_listener_names() -> Vec<String> {
+    std::env::var("LISTEN_FDNAMES")
+        .ok()
+        .map(|names| names.split(':').map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+pub fn activated_listener_fd_by_name(
+    name: &str,
+) -> Result<Option<i32>, Box<dyn std::error::Error>> {
+    let names = activated_listener_names();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let fds = activated_listener_fds()?;
+    for (idx, fd_name) in names.iter().enumerate() {
+        if fd_name == name {
+            return Ok(fds.get(idx).copied());
+        }
+    }
+    Ok(None)
 }

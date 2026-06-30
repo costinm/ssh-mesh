@@ -200,10 +200,10 @@ mesh_prepare_app_vm() {
   vm_cpu="${vm_cpu:-${SSH_MESH_APP_VM_QEMU_CPUS:-${SSH_MESH_VM_CPUS:-1}}}"
 
   mkdir -p \
-    "${state_home_dir}/.config/mesh-init" \
-    "${state_home_dir}/.config/ssh-mesh" \
-    "${state_home_dir}/.run/mesh-init" \
-    "${state_home_dir}/.run/ssh-mesh/mux" \
+    "${state_home_dir}/etc/mesh-init" \
+    "${state_home_dir}/etc/ssh-mesh" \
+    "${state_home_dir}/run/mesh-init" \
+    "${state_home_dir}/run/ssh-mesh/mux" \
     "${state_home_dir}/.ssh" \
     "${shared_dir}" \
     "${WORK}"

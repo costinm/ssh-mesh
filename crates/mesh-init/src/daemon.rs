@@ -195,7 +195,7 @@ impl Daemon {
         }
 
         // 1b. Load systemd .socket units and merge activation entries into
-        //     matching service configs. Skip if no .toml with that name exists.
+        //     matching service configs. Skip if no .service with that name exists.
         for dir in &dirs {
             let socket_units = crate::socket_unit::load_socket_units(dir);
             for (service_name, act_configs) in socket_units {
@@ -209,7 +209,7 @@ impl Daemon {
                     );
                 } else {
                     error!(
-                        "Socket unit for '{}' has no matching service '{}' (expected '{}.toml'). Skipping.",
+                        "Socket unit for '{}' has no matching service '{}' (expected '{}.service'). Skipping.",
                         service_name, service_name, service_name
                     );
                 }
@@ -223,11 +223,12 @@ impl Daemon {
 
         // 3. Auto-start system services or start activation listeners.
         // init-* services run first (sorted by priority), then the rest.
-        let mut init_configs: Vec<&AppConfig> = Vec::new();
-        let mut other_configs: Vec<&AppConfig> = Vec::new();
-        for cfg in &loaded_configs {
+        let startup_configs: Vec<AppConfig> = self.configs.lock().values().cloned().collect();
+        let mut init_configs: Vec<AppConfig> = Vec::new();
+        let mut other_configs: Vec<AppConfig> = Vec::new();
+        for cfg in startup_configs {
             if cfg.name == "default" {
-                // default.toml only provides defaults for execution mode
+                // default.service only provides defaults for execution mode
                 continue;
             }
             if cfg.name.starts_with("init-") {
@@ -503,10 +504,10 @@ impl Daemon {
                 let base_dir =
                     std::env::var("USER_INIT").unwrap_or_else(|_| "/data/mesh".to_string());
                 let app_dir = std::path::Path::new(&base_dir).join(name);
-                let toml_path = app_dir.join("init.toml");
+                let service_path = app_dir.join("init.service");
 
-                if toml_path.exists() {
-                    match config::load_app_config(&toml_path) {
+                if service_path.exists() {
+                    match config::load_app_config(&service_path) {
                         Ok(mut new_cfg) => {
                             // Enforce UID/GID from directory, ignoring whatever the file says
                             if let Ok(metadata) = std::fs::metadata(&app_dir) {
@@ -1424,15 +1425,13 @@ mod tests {
     #[test]
     fn test_daemon_config_loading() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("sleep.toml");
+        let config_path = dir.path().join("sleep.service");
         std::fs::write(
             &config_path,
             r#"
-[service]
-name = "sleep"
-command = "/bin/sleep"
-args = ["10"]
-priority = 300
+[Service]
+ExecStart = "/bin/sleep 10"
+OOMScoreAdjust = -700
 "#,
         )
         .unwrap();
@@ -1531,6 +1530,10 @@ priority = 300
         // Request a uid different from the peer's (current_uid).
         let requested_uid = if current_uid == 0 {
             // root peer is allowed to spawn as any uid; nothing to test here.
+            return;
+        } else if privileged_uids().contains(&current_uid) {
+            // Privileged mesh-init peers, such as the default system uid 1000,
+            // are also allowed to spawn as another uid.
             return;
         } else {
             current_uid.saturating_add(1)

@@ -170,8 +170,9 @@ fn resolve_socket_path(cli: &Cli) -> Result<PathBuf> {
     let mux_dir = std::env::var("SSH_MUX")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(format!("{}/.run/ssh-mesh/mux", home))
+            mesh::paths::AppPaths::for_app("ssh-mesh")
+                .run_dir("ssh-mesh")
+                .join("mux")
         });
 
     let filename = format!("ssh-{}@{}", user, host);
@@ -191,8 +192,8 @@ async fn main() -> Result<()> {
         Err(e) => {
             debug!("Failed to connect to mux, trying UDS HTTP fallback: {}", e);
 
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let control_uds_path = PathBuf::from(format!("{}/.run/ssh-mesh/control.sock", home));
+            let control_uds_path =
+                mesh::paths::AppPaths::for_app("ssh-mesh").control_socket("ssh-mesh");
 
             // Fallback: try to request a connection via HTTP API over UDS
             let (user, host) = if let Some((u, h)) = cli.destination.split_once('@') {

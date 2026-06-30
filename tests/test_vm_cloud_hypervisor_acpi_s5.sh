@@ -15,8 +15,8 @@ VM_STATE="${VM_STATE:-${PROJECT_ROOT}/target/vm/${POD}}"
 SRC="${SRC:-${VM_STATE}/src}"
 NIX_PROFILE="${NIX_PROFILE:-}"
 if [[ -z "${NIX_PROFILE}" ]]; then
-  if [[ -d "${PROJECT_ROOT}/target/nix/profiles" ]]; then
-    NIX_PROFILE="${PROJECT_ROOT}/target/nix/profiles"
+  if [[ -d "${PROJECT_ROOT}/target/nix/profile" ]]; then
+    NIX_PROFILE="${PROJECT_ROOT}/target/nix/profile"
   elif [[ -d "${PROJECT_ROOT}/target/nix" ]]; then
     NIX_PROFILE="${PROJECT_ROOT}/target/nix"
   else

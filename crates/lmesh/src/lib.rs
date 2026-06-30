@@ -11,12 +11,15 @@ use p256::elliptic_curve::Generate;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -26,6 +29,7 @@ use tracing::{debug, error, info, instrument, warn};
 const MULTICAST_PORT: u16 = 5227;
 const MULTICAST_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
 const MULTICAST_IPV6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
+const MAX_STORED_ANNOUNCES: usize = 16;
 
 /// Announcement message sent over multicast
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +66,8 @@ pub struct LocalDiscovery {
     public_key_b64: String,
     /// Map of discovered nodes, keyed by base64url encoded public key
     nodes: Arc<RwLock<HashMap<String, Node>>>,
+    /// Directory where per-node discovery files are written.
+    node_store_dir: Arc<PathBuf>,
     /// IPv4 UDP socket
     socket_v4: Option<Arc<UdpSocket>>,
     /// IPv6 UDP socket
@@ -102,6 +108,7 @@ impl LocalDiscovery {
             public_key,
             public_key_b64,
             nodes: Arc::new(RwLock::new(HashMap::new())),
+            node_store_dir: Arc::new(Self::default_node_store_dir()?),
             socket_v4: None,
             socket_v6: None,
         })
@@ -134,7 +141,15 @@ impl LocalDiscovery {
         let key_pem = key
             .to_pkcs8_pem(Default::default())
             .context("Failed to serialize private key to PEM")?;
-        fs::write(&key_path, key_pem.as_bytes()).context("Failed to write key to file")?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&key_path)
+            .context("Failed to write key to file")?;
+        std::io::Write::write_all(&mut file, key_pem.as_bytes())
+            .context("Failed to write key to file")?;
 
         Ok(key)
     }
@@ -146,13 +161,14 @@ impl LocalDiscovery {
         match Self::setup_multicast_v4().await {
             Ok(socket) => {
                 self.socket_v4 = Some(Arc::new(socket));
-                info!(
-                    "IPv4 multicast listener started on {}:{}",
-                    MULTICAST_IPV4, MULTICAST_PORT
+                debug!(
+                    multicast_ip = %MULTICAST_IPV4,
+                    multicast_port = MULTICAST_PORT,
+                    "mcast_v4"
                 );
             }
             Err(e) => {
-                log::warn!("Failed to setup IPv4 multicast: {}", e);
+                warn!("Failed to setup IPv4 multicast: {}", e);
             }
         }
 
@@ -160,18 +176,19 @@ impl LocalDiscovery {
         match Self::setup_multicast_v6().await {
             Ok(socket) => {
                 self.socket_v6 = Some(Arc::new(socket));
-                info!(
-                    "IPv6 multicast listener started on [{}]:{}",
-                    MULTICAST_IPV6, MULTICAST_PORT
+                debug!(
+                    multicast_ip = %MULTICAST_IPV6,
+                    multicast_port = MULTICAST_PORT,
+                    "mcast_v6"
                 );
             }
             Err(e) => {
-                log::warn!("Failed to setup IPv6 multicast: {}", e);
+                warn!("Failed to setup IPv6 multicast: {}", e);
             }
         }
 
         if self.socket_v4.is_none() && self.socket_v6.is_none() {
-            log::warn!("No multicast sockets available; discovery announcements disabled");
+            debug!("mcast_none");
         }
 
         // Start receiver tasks
@@ -179,8 +196,11 @@ impl LocalDiscovery {
             let nodes = self.nodes.clone();
             let socket = socket.clone();
             let local_public_key = self.public_key_b64.clone();
+            let node_store_dir = self.node_store_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::receive_loop(socket, nodes, local_public_key).await {
+                if let Err(e) =
+                    Self::receive_loop(socket, nodes, local_public_key, node_store_dir).await
+                {
                     error!("IPv4 receive loop error: {}", e);
                 }
             });
@@ -190,8 +210,11 @@ impl LocalDiscovery {
             let nodes = self.nodes.clone();
             let socket = socket.clone();
             let local_public_key = self.public_key_b64.clone();
+            let node_store_dir = self.node_store_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::receive_loop(socket, nodes, local_public_key).await {
+                if let Err(e) =
+                    Self::receive_loop(socket, nodes, local_public_key, node_store_dir).await
+                {
                     error!("IPv6 receive loop error: {}", e);
                 }
             });
@@ -235,11 +258,15 @@ impl LocalDiscovery {
     }
 
     /// Receive and process announcements
-    #[instrument(skip(socket, nodes, local_public_key), fields(buf_size = 65536))]
+    #[instrument(
+        skip(socket, nodes, local_public_key, node_store_dir),
+        fields(buf_size = 65536)
+    )]
     async fn receive_loop(
         socket: Arc<UdpSocket>,
         nodes: Arc<RwLock<HashMap<String, Node>>>,
         local_public_key: String,
+        node_store_dir: Arc<PathBuf>,
     ) -> Result<()> {
         let mut buf = vec![0u8; 65536];
 
@@ -267,12 +294,43 @@ impl LocalDiscovery {
                         public_key: announce.public_key.clone(),
                         address: addr,
                         last_seen: std::time::Instant::now(),
-                        metadata: announce.metadata,
+                        metadata: announce.metadata.clone(),
                     };
 
-                    // Update nodes map
-                    let mut nodes_map = nodes.write().await;
-                    nodes_map.insert(announce.public_key, node);
+                    let public_key = node.public_key.clone();
+                    let address = node.address;
+                    let metadata = node.metadata.clone();
+                    let is_new = {
+                        let mut nodes_map = nodes.write().await;
+                        let is_new = !nodes_map.contains_key(&announce.public_key);
+                        nodes_map.insert(announce.public_key.clone(), node);
+                        is_new
+                    };
+
+                    if let Err(e) = persist_announcement(&node_store_dir, &announce, addr) {
+                        warn!(
+                            public_key = %public_key,
+                            address = %address,
+                            error = %e,
+                            "persist_fail"
+                        );
+                    }
+
+                    if is_new {
+                        info!(
+                            public_key = %public_key,
+                            address = %address,
+                            metadata = ?metadata,
+                            "node_seen"
+                        );
+                    } else {
+                        info!(
+                            public_key = %public_key,
+                            address = %address,
+                            metadata = ?metadata,
+                            "node_updated"
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to parse announcement from {}: {}", addr, e);
@@ -329,10 +387,7 @@ impl LocalDiscovery {
     /// Get a snapshot of currently discovered nodes
     #[instrument(skip(self))]
     pub async fn get_nodes(&self) -> HashMap<String, Node> {
-        let nodes = self.nodes.read().await;
-        drop(nodes); // Release the lock early
-        let result = self.nodes.read().await.clone();
-        result
+        self.nodes.read().await.clone()
     }
 
     /// Get a specific node by its public key
@@ -343,6 +398,187 @@ impl LocalDiscovery {
         let result = nodes.get(public_key).cloned();
         debug!("Node {}found", if result.is_some() { "" } else { "not " });
         result
+    }
+
+    fn default_node_store_dir() -> Result<PathBuf> {
+        Ok(mesh::paths::AppPaths::for_app("lmesh").files.join("nodes"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredNode {
+    public_key: String,
+    address: String,
+    announces: Vec<serde_json::Value>,
+}
+
+fn persist_announcement(dir: &Path, announce: &Announce, addr: SocketAddr) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+
+    let path = node_record_path(dir, &announce.public_key);
+    let mut record = if path.exists() {
+        let data = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_str::<StoredNode>(&data).unwrap_or_else(|e| {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "replacing invalid lmesh node record"
+            );
+            StoredNode::new(&announce.public_key, addr)
+        })
+    } else {
+        StoredNode::new(&announce.public_key, addr)
+    };
+
+    record.public_key = announce.public_key.clone();
+    record.address = addr.to_string();
+    record.announces.push(serde_json::json!([
+        current_timestamp_millis(),
+        announce.public_key.clone(),
+        addr.to_string(),
+        announce.clone()
+    ]));
+
+    if record.announces.len() > MAX_STORED_ANNOUNCES {
+        let overflow = record.announces.len() - MAX_STORED_ANNOUNCES;
+        record.announces.drain(0..overflow);
+    }
+
+    let data = serde_json::to_vec_pretty(&record).context("failed to serialize node record")?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, data)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to move {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+impl StoredNode {
+    fn new(public_key: &str, addr: SocketAddr) -> Self {
+        Self {
+            public_key: public_key.to_string(),
+            address: addr.to_string(),
+            announces: Vec::new(),
+        }
+    }
+}
+
+fn node_record_path(dir: &Path, public_key: &str) -> PathBuf {
+    dir.join(format!("{}.json", public_key_sha(public_key)))
+}
+
+fn public_key_sha(public_key: &str) -> String {
+    let digest = Sha256::digest(public_key.as_bytes());
+    hex_encode(&digest)
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(data.len() * 2);
+    for byte in data {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn current_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// Serializable node info returned by the JSON-lines API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInfo {
+    /// Base64url encoded public key.
+    pub public_key: String,
+    /// Last seen address.
+    pub address: SocketAddr,
+    /// Optional metadata from the announcement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+impl From<Node> for NodeInfo {
+    fn from(node: Node) -> Self {
+        Self {
+            public_key: node.public_key,
+            address: node.address,
+            metadata: node.metadata,
+        }
+    }
+}
+
+/// JSON-lines request methods for lmesh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method")]
+pub enum Request {
+    /// Return all currently discovered nodes.
+    #[serde(rename = "nodes", alias = "list_nodes")]
+    Nodes,
+    /// Return one discovered node by public key.
+    #[serde(rename = "get_node")]
+    GetNode { public_key: String },
+    /// Send a multicast announcement.
+    #[serde(rename = "announce")]
+    Announce {
+        /// Optional metadata to include in the announcement.
+        #[serde(default)]
+        metadata: Option<HashMap<String, String>>,
+    },
+}
+
+/// Reusable lmesh command service.
+pub struct LmeshService {
+    discovery: Arc<LocalDiscovery>,
+}
+
+impl LmeshService {
+    /// Create a service around an initialized discovery instance.
+    pub fn new(discovery: Arc<LocalDiscovery>) -> Self {
+        Self { discovery }
+    }
+
+    /// Return the local public key used for announcements.
+    pub fn public_key_b64(&self) -> &str {
+        self.discovery.public_key_b64()
+    }
+
+    /// Handle a single JSON-lines request.
+    pub async fn handle_request(&self, request: Request) -> mesh::protocol::Response {
+        match request {
+            Request::Nodes => {
+                let nodes = self
+                    .discovery
+                    .get_nodes()
+                    .await
+                    .into_values()
+                    .map(NodeInfo::from)
+                    .collect::<Vec<_>>();
+                mesh::protocol::Response::ok_with_data(serde_json::json!(nodes))
+            }
+            Request::GetNode { public_key } => match self.discovery.get_node(&public_key).await {
+                Some(node) => {
+                    mesh::protocol::Response::ok_with_data(serde_json::json!(NodeInfo::from(node)))
+                }
+                None => mesh::protocol::Response::err("node not found"),
+            },
+            Request::Announce { metadata } => {
+                match self.discovery.announce_with_metadata(metadata).await {
+                    Ok(()) => mesh::protocol::Response::ok(),
+                    Err(e) => mesh::protocol::Response::err(e.to_string()),
+                }
+            }
+        }
     }
 }
 
@@ -380,6 +616,9 @@ fn base64_url_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn test_base64_url_encode() {
@@ -388,6 +627,33 @@ mod tests {
         assert!(!encoded.contains('+'));
         assert!(!encoded.contains('/'));
         assert!(!encoded.contains('='));
+    }
+
+    #[test]
+    fn test_persist_announcement_caps_history_and_updates_address() {
+        let dir = unique_test_dir();
+        let announce = Announce {
+            public_key: "test_key_12345".to_string(),
+            metadata: Some(HashMap::from([(
+                "version".to_string(),
+                "1.0.0".to_string(),
+            )])),
+        };
+
+        for port in 10_000..10_017 {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            persist_announcement(&dir, &announce, addr).unwrap();
+        }
+
+        let path = node_record_path(&dir, &announce.public_key);
+        let record: StoredNode = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(record.public_key, announce.public_key);
+        assert_eq!(record.address, "127.0.0.1:10016");
+        assert_eq!(record.announces.len(), MAX_STORED_ANNOUNCES);
+        assert_eq!(record.announces[0][2], "127.0.0.1:10001");
+        assert_eq!(record.announces[15][2], "127.0.0.1:10016");
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -432,23 +698,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_discovery_full_lifecycle() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-
         // Create a discovery instance
         let mut discovery = LocalDiscovery::new(None).await.unwrap();
         let key = discovery.public_key_b64().to_string();
 
-        log::info!("Discovery key: {}", key);
+        tracing::info!("Discovery key: {}", key);
 
         // Start the discovery service
         // Note: This may fail in test environments due to permission issues
         // or if another test is already using the multicast port
         if let Err(e) = discovery.start().await {
-            log::warn!("Could not start discovery in test: {}", e);
+            tracing::warn!("Could not start discovery in test: {}", e);
             // This is acceptable in test environments where multicast may not be available
             return;
         }
@@ -458,7 +718,7 @@ mod tests {
 
         // Send an announcement
         if let Err(e) = discovery.announce().await {
-            log::warn!("Could not send announcement in test: {}", e);
+            tracing::warn!("Could not send announcement in test: {}", e);
             return;
         }
 
@@ -467,10 +727,15 @@ mod tests {
 
         // Check if we received our own announcement (multicast loopback)
         let nodes = discovery.get_nodes().await;
-        log::info!("Discovery received {} nodes", nodes.len());
+        tracing::info!("Discovery received {} nodes", nodes.len());
 
         // In some systems, multicast loopback is enabled and we'll receive our own announcement
         // In others, it may not work in test environments
         // So we don't assert a specific count, just that the test completes successfully
+    }
+
+    fn unique_test_dir() -> PathBuf {
+        let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("lmesh-test-{}-{}", std::process::id(), counter))
     }
 }

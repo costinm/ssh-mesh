@@ -2,7 +2,6 @@ use clap::Parser;
 
 use pmond::{ProcMon, proc_netlink, psi::PsiWatcher};
 
-use std::fs::OpenOptions;
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
@@ -11,9 +10,6 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Duration, sleep};
 
 use tracing::{debug, error, info};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
 
 #[derive(Parser, Debug)]
 #[clap(name = "pmond", version = "0.1.0", author = "Author")]
@@ -34,10 +30,6 @@ struct Args {
     #[clap(long = "refresh", default_value = "10", value_name = "SECONDS")]
     refresh: u64,
 
-    /// Run HTTP server via UDS at the specified path
-    #[clap(long = "uds", value_name = "PATH")]
-    http_uds: Option<String>,
-
     /// Start monitoring processes via netlink
     #[clap(long = "monitor")]
     monitor: bool,
@@ -47,30 +39,10 @@ struct Args {
     debug: bool,
 }
 
-fn init_telemetry() {
-    let filter = EnvFilter::from_default_env();
-    let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/pmond/pmond.log", home)
-    });
-
-    if let Some(parent) = std::path::Path::new(&log_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        let out_layer = tracing_subscriber::fmt::layer()
-            .compact()
-            .with_writer(move || file.try_clone().expect("clone pmond log file"));
-        Registry::default().with(filter).with(out_layer).init();
-    } else {
-        Registry::default().with(filter).init();
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_telemetry();
+    let (trace_buffer, _trace_guard) = mesh::local_trace::init("pmond");
+    mesh::local_trace::serve("pmond", trace_buffer);
 
     let args = Args::parse();
 
@@ -85,28 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.monitor {
-        run_monitor(args.debug, args.http_uds).await?;
+        run_monitor(args.debug, None).await?;
         return Ok(());
     }
 
-    // Auth config: CLI env var, then $HOME/.config/pmond/auth.toml
-    let auth = if let Some(uid) = std::env::var("PMOND_AUTHORIZED_UID")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-    {
-        Some(mesh::auth::AuthConfig {
-            peers: vec![mesh::auth::PeerConfig {
-                uid: Some(uid),
-                ..Default::default()
-            }],
-            ..Default::default()
-        })
-    } else {
-        mesh::auth::AuthConfig::load_for_app("pmond")
-    };
-
     // Default server mode
-    run_server(args.refresh, args.http_uds, auth).await?;
+    run_server(args.refresh).await?;
 
     Ok(())
 }
@@ -138,8 +94,11 @@ async fn run_monitor(
     let path_str = if let Some(path) = mon_uds {
         format!("{}/pwatch.sock", path)
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/pmond/pwatch.sock", home)
+        mesh::paths::AppPaths::for_app("pmond")
+            .run_dir("pmond")
+            .join("pwatch.sock")
+            .to_string_lossy()
+            .into_owned()
     };
 
     // Ensure parent directory exists
@@ -469,15 +428,9 @@ async fn watch_process(pid: u32, refresh: u64) -> Result<(), Box<dyn std::error:
     }
 }
 
-async fn run_server(
-    refresh: u64,
-    http_uds: Option<String>,
-    auth: Option<mesh::auth::AuthConfig>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(refresh: u64) -> Result<(), Box<dyn std::error::Error>> {
     let config = pmond::ServerConfig {
         refresh_interval: refresh,
-        http_uds_path: http_uds,
-        auth,
     };
 
     let server = pmond::PmonServer::new(config)?;

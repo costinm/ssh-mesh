@@ -30,8 +30,11 @@ struct Args {
 fn init_telemetry() {
     let filter = EnvFilter::from_default_env();
     let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/mesh-init/mesh-init.log", home)
+        mesh::paths::AppPaths::for_app("system")
+            .run_dir("mesh-init")
+            .join("mesh-init.log")
+            .to_string_lossy()
+            .into_owned()
     });
 
     if let Some(parent) = std::path::Path::new(&log_path).parent() {
@@ -202,7 +205,7 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
         let cmd = command[0].clone();
         let args = command[1..].to_vec();
 
-        // Apply defaults from default.toml if present
+        // Apply defaults from default.service if present
         let default_cfg = daemon.configs.lock().get("default").cloned();
 
         let cfg = mesh_init::config::AppConfig {
@@ -242,8 +245,11 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
         daemon.start_background_tasks();
 
         // Start job scheduler
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let jobs_dir = format!("{}/.config/mesh-init/jobs", home);
+        let jobs_dir = mesh::paths::AppPaths::for_app("system")
+            .etc
+            .join("mesh-init/jobs")
+            .to_string_lossy()
+            .into_owned();
         let executor =
             std::sync::Arc::new(mesh::jobs::executor::MeshInitExecutor::new(socket_path));
         let scheduler =
@@ -286,18 +292,20 @@ fn get_config_dir() -> String {
     if let Ok(dir) = std::env::var("MESH_INIT_DIR") {
         return dir;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    format!("{}/.config/mesh-init", home)
+    mesh::paths::AppPaths::for_app("system")
+        .etc
+        .join("mesh-init")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn get_socket_path() -> String {
     let run_dir = if let Ok(dir) = std::env::var("MESH_INIT_RUN") {
-        dir
+        std::path::PathBuf::from(dir)
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!("{}/.run/mesh-init", home)
+        mesh::paths::AppPaths::for_app("system").run_dir("mesh-init")
     };
-    format!("{}/control.sock", run_dir)
+    run_dir.join("control.sock").to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -317,5 +325,11 @@ mod tests {
     fn unknown_command_remains_exec_mode() {
         let args = vec!["echo".to_string(), "hi".to_string()];
         assert!(control_request(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn default_paths_use_system_app_home() {
+        assert_eq!(get_config_dir(), "/home/system/etc/mesh-init");
+        assert_eq!(get_socket_path(), "/home/system/run/mesh-init/control.sock");
     }
 }

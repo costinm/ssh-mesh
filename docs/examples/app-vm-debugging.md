@@ -58,9 +58,9 @@ If `mesh-init status activate-app2-qemu` or `activate-app3-crosvm` returns
 configs:
 
 ```bash
-ls -la /home/system/.config/mesh-init/
-cat /home/system/.config/mesh-init/app2-qemu.toml
-cat /home/system/.config/mesh-init/app3-crosvm.toml
+ls -la /home/system/etc/mesh-init/
+cat /home/system/etc/mesh-init/app2-qemu.service
+cat /home/system/etc/mesh-init/app3-crosvm.service
 mesh-init reload
 ```
 
@@ -82,8 +82,8 @@ A bare socket connect may fail as an SSH session, but it should still cause
 Host3-vm mesh-init:
 
 ```bash
-ls -l /home/system/.run/mesh-init/control.sock
-cat /home/system/.run/mesh-init/mesh-init.log
+ls -l /home/system/run/mesh-init/control.sock
+cat /home/system/run/mesh-init/mesh-init.log
 ```
 
 App2 QEMU state:

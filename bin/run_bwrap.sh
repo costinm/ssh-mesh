@@ -54,10 +54,10 @@ inner_nix_profile="${nix_profile}"
 opt_dir="${SSH_MESH_OPT_DIR:-}"
 
 mkdir -p \
-  "${home_dir}/.config/mesh-init" \
-  "${home_dir}/.config/ssh-mesh" \
-  "${home_dir}/.run/mesh-init" \
-  "${home_dir}/.run/ssh-mesh/mux" \
+  "${home_dir}/etc/mesh-init" \
+  "${home_dir}/etc/ssh-mesh" \
+  "${home_dir}/run/mesh-init" \
+  "${home_dir}/run/ssh-mesh/mux" \
   "${home_dir}/.ssh" \
   "${shared_dir}" \
   "${state_dir}/run"
@@ -142,7 +142,7 @@ if [ "${mode}" = "stdio" ]; then
   mode_command=(
     /opt/busybox/bin/sh
     -c
-    'mkdir -p "$HOME/.run/mesh-init" "$HOME/.run/pmond" "$HOME/.config/mesh-init-stdio"; MESH_INIT_DIR="$HOME/.config/mesh-init-stdio" MESH_INIT_RUN="$HOME/.run/mesh-init" MESH_LOG_FILE="$HOME/.run/mesh-init/mesh-init.log" mesh-init >/dev/null 2>&1 & for i in $(seq 1 50); do [ -S "$HOME/.run/mesh-init/control.sock" ] && break; sleep 0.1; done; MESH_LOG_FILE="$HOME/.run/pmond/pmond.log" pmond --uds control.sock >/dev/null 2>&1 & exec ssh-mesh'
+    'mkdir -p "$HOME/run/mesh-init" "$HOME/run/pmond" "$HOME/etc/mesh-init-stdio"; MESH_INIT_DIR="$HOME/etc/mesh-init-stdio" MESH_INIT_RUN="$HOME/run/mesh-init" MESH_LOG_FILE="$HOME/run/mesh-init/mesh-init.log" mesh-init >/dev/null 2>&1 & for i in $(seq 1 50); do [ -S "$HOME/run/mesh-init/control.sock" ] && break; sleep 0.1; done; MESH_LOG_FILE="$HOME/run/pmond/pmond.log" pmond --uds control.sock >/dev/null 2>&1 & exec ssh-mesh'
   )
 else
   echo "${app} HOME: ${home_dir}"
@@ -178,7 +178,7 @@ exec bwrap \
   --setenv RUST_LOG "${RUST_LOG:-info}" \
   --setenv NIX_PROFILE "${inner_nix_profile}" \
   --setenv SSH_MESH_STATE_ROOT "${state_mount}" \
-  --setenv MESH_INIT_SOCK "/home/${app_home}/.run/mesh-init/control.sock" \
+  --setenv MESH_INIT_SOCK "/home/${app_home}/run/mesh-init/control.sock" \
   --setenv SSH_MESH_HOME_ROOT /home \
   "${mode_env[@]}" \
   "${mode_command[@]}" "$@"

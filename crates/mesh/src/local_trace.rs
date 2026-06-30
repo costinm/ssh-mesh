@@ -432,7 +432,7 @@ fn level_lte(level: &str, threshold: &str) -> bool {
 ///
 /// Example usage:
 /// ```bash
-/// echo '{"global_level":"debug","modules":{"ssh_mesh":"trace"}}' | nc -U ~/.run/traceweb/ssh-mesh.sock
+/// echo '{"global_level":"debug","modules":{"ssh_mesh":"trace"}}' | nc -U /home/traceweb/run/traceweb/ssh-mesh.sock
 /// ```
 pub async fn start_uds_listener(
     socket_path: impl AsRef<Path>,
@@ -440,7 +440,7 @@ pub async fn start_uds_listener(
 ) -> std::io::Result<()> {
     let socket_path = socket_path.as_ref();
 
-    // Ensure the parent directory exists (e.g. ~/.run/traceweb).
+    // Ensure the parent directory exists (e.g. /home/traceweb/run/traceweb).
     if let Some(parent) = socket_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -615,21 +615,18 @@ pub fn create_log_buffer_with_size(size: usize) -> LogBuffer {
 
 /// Resolve the shared directory where trace sockets live.
 ///
-/// Honors the `TRACE_SOCKET_DIR` env var; otherwise defaults to
-/// `$HOME/.run/traceweb`. Both producers (binding `<dir>/<app>.sock`) and
+/// Honors the `TRACE_SOCKET_DIR` env var; otherwise defaults to the traceweb
+/// app runtime directory. Both producers (binding `<dir>/<app>.sock`) and
 /// the traceweb collector (scanning `<dir>`) use this so discovery needs no
 /// extra configuration.
 ///
-/// Returns `None` when `TRACE_SOCKET_DIR` is unset *and* `HOME` is unset —
-/// i.e. the producer has not opted in to a shared trace directory. Callers
-/// should treat `None` as "no trace socket; skip the bind".
 pub fn default_trace_socket_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("TRACE_SOCKET_DIR")
         && !dir.is_empty()
     {
         return Some(std::path::PathBuf::from(dir));
     }
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".run/traceweb"))
+    Some(crate::paths::AppPaths::for_app("traceweb").run_dir("traceweb"))
 }
 
 /// Resolve the default trace socket path for an app: `<dir>/<app>.sock`,

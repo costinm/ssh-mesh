@@ -10,7 +10,6 @@ Required binaries:
 - `ssh-mesh`
 - `h2t`
 - `pmond`
-- `mcp-pmond`
 - `lmesh`
 - `meshkeys` to regenerate checked-in example keys and certificates
 - `bwrap`
@@ -52,10 +51,10 @@ its own `/home/appN` plus read-only package inputs:
 Host and app configuration lives under the runtime home:
 
 ```text
-.config/mesh-init
-.config/ssh-mesh
+etc/mesh-init
+etc/ssh-mesh
 .ssh
-.run
+run
 ```
 
 On Android the same model maps to `/data/data/APPNAME`.
@@ -199,18 +198,14 @@ mesh9p \
 No-network VM over stdio activation:
 
 ```toml
-[service]
-name = "app5-mesh9p-stdio"
-command = "/opt/ssh-mesh/bin/mesh9p"
-args = [
-  "/nix",
-  "/src/home/app5:/home/app5:rw",
-  "/src/shared:/run/ssh-mesh/shared:rw",
-]
+[Service]
+ExecStart = "/opt/ssh-mesh/bin/mesh9p /nix /src/home/app5:/home/app5:rw /src/shared:/run/ssh-mesh/shared:rw"
+```
 
-[[activation]]
-socket = "/home/system/.run/mesh-init/app5-9p.sock"
-wait = false
+```ini
+[Socket]
+ListenStream=/home/system/run/mesh-init/app5-9p.sock
+Accept=true
 ```
 
 No-network VM over vsock uses the same `mesh9p` arguments. In this mode vsock is
@@ -281,8 +276,7 @@ docs/examples/start_all.sh
 ```
 
 `profile` builds the repo-local Nix profile with the VM kernel/rootfs assets and
-hypervisors. It defaults to `target/nix/profile`, or reuses an existing
-`target/nix/profiles`. The default `scripts/build.sh` command builds the musl
+hypervisors. It defaults to `target/nix/profile`. The default `scripts/build.sh` command builds the musl
 Rust binaries and creates `target/dist/opt` plus `target/dist/img`.
 
 ## Start All Nodes
@@ -314,7 +308,7 @@ mesh-init reload
 From the host, point `MESH_INIT_RUN` at the daemon run directory:
 
 ```bash
-MESH_INIT_RUN="$SSH_MESH_STATE_ROOT/host1/home/system/.run/mesh-init" mesh-init reload
+MESH_INIT_RUN="$SSH_MESH_STATE_ROOT/host1/home/system/run/mesh-init" mesh-init reload
 ```
 
 ## Ports
@@ -353,13 +347,19 @@ ssh -F ssh_config app4-ch
 ssh -F ssh_config app5-vm
 ```
 
-Pmond through a local forward:
+Pmond HTTP through ssh-mesh:
+
+```bash
+curl http://127.0.0.1:18480/_m/pmon/_ps
+```
+
+Pmond JSONL through a local forward:
 
 ```bash
 cd docs/examples
 ssh -N -F ssh_config \
-  -L 127.0.0.1:19284:/home/system/.run/pmond/control.sock \
+  -L 127.0.0.1:19284:/home/system/run/pmond/control.sock \
   host1
 
-curl http://127.0.0.1:19284/_m/pmon/_ps
+printf '%s\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19284
 ```

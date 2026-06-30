@@ -6,9 +6,6 @@ workspace_dir="$(cd "${script_dir}/../../.." 2>/dev/null && pwd)"
 target_dir="${SSH_MESH_TARGET_DIR:-${workspace_dir}/target}"
 artifact_dir="${target_dir}/dist"
 default_nix_profile="${target_dir}/nix/profile"
-if [ ! -e "${default_nix_profile}" ] && [ -e "${target_dir}/nix/profiles" ]; then
-  default_nix_profile="${target_dir}/nix/profiles"
-fi
 nix_profile="${NIX_PROFILE:-${default_nix_profile}}"
 
 root_dir="${1:-${target_dir}/examples}"

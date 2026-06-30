@@ -12,15 +12,16 @@ use tracing::trace;
 
 use utoipa::ToSchema;
 
-pub mod handlers;
 pub mod proc;
 pub mod proc_netlink;
 pub mod psi;
+pub mod rpc;
 pub mod server;
 
 pub use server::{PmonServer, ServerConfig};
 
 pub use proc::ProcMon;
+pub use rpc::{PmondService, Request};
 
 /// Base path for procfs
 const PROC_BASE: &str = "/proc";
@@ -101,6 +102,13 @@ pub struct CgroupHighArgs {
     pub percentage: f64,
     /// Seconds before resetting to max (0 = no reset)
     pub interval: u64,
+}
+
+/// Arguments for listing processes in a cgroup.
+#[derive(Deserialize, JsonSchema, ToSchema, Debug, Clone)]
+pub struct CgroupProcsArgs {
+    /// Full cgroup path.
+    pub path: String,
 }
 
 /// Arguments for freezing/unfreezing a process

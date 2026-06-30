@@ -13,10 +13,10 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
 export DEST=${DEST:-/opt/ssh-mesh}
 
-CRATES="mesh-init ssh-mesh mesh pmond mcp mesh9p traceweb sftp-server lmesh ssh-config"
-BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh pmond mcp-pmond mesh9p traceweb sftp-server lmesh ssh-config"
+CRATES="mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh ssh-config"
+BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh ssh-config"
 INSTALL_BIN_TARGETS="$BIN_TARGETS dmesh"
-EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh sshmc pmond lmesh mcp-pmond mesh9p sftp-server h2t meshkeys"
+EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh sshmc pmond lmesh mesh9p sftp-server h2t meshkeys"
 
 help() {
     cat <<'EOF'
@@ -45,8 +45,7 @@ Common commands:
   deploy_examples      Compatibility alias for dist.
   stage_examples       Compatibility alias for staging target/dist/opt.
   stage_example_tree   Refresh checked-in example files under target/examples.
-  profile [path]       Build/update the Nix profile. Default: target/nix/profile,
-                       or existing target/nix/profiles.
+  profile [path]       Build/update the Nix profile. Default: target/nix/profile.
   dist [path]          Build release binaries into an install-like tree.
   erofs [out ...]      Build the VM EROFS rootfs image.
   install [path]       Install runtime binaries and scripts. Default: /opt/ssh-mesh.
@@ -55,8 +54,7 @@ Common commands:
 
 Environment:
   SSH_MESH_BUSYBOX         Busybox path used for staged target/dist/opt/busybox.
-  NIX_PROFILE              Nix profile used by examples. Default: target/nix/profile,
-                           or existing target/nix/profiles.
+  NIX_PROFILE              Nix profile used by examples. Default: target/nix/profile.
 EOF
 }
 
@@ -100,10 +98,6 @@ find_busybox() {
         printf '%s\n' "$PWD/target/nix/profile/bin/busybox"
         return 0
     fi
-    if [ -x "$PWD/target/nix/profiles/bin/busybox" ]; then
-        printf '%s\n' "$PWD/target/nix/profiles/bin/busybox"
-        return 0
-    fi
     if [ -x "/ws/initos/target/nix/bin/busybox" ]; then
         printf '%s\n' "/ws/initos/target/nix/bin/busybox"
         return 0
@@ -117,15 +111,7 @@ find_busybox() {
 }
 
 default_nix_profile() {
-    local target_profile="$PWD/target/nix/profile"
-    if [ ! -e "$target_profile" ] && [ -e "$PWD/target/nix/profiles" ]; then
-        if [ -e "$PWD/target/nix/profiles/profile" ]; then
-            target_profile="$PWD/target/nix/profiles/profile"
-        else
-            target_profile="$PWD/target/nix/profiles"
-        fi
-    fi
-    printf '%s\n' "$target_profile"
+    printf '%s\n' "$PWD/target/nix/profile"
 }
 
 resolve_nix_profile() {
@@ -204,7 +190,7 @@ configure_swagger_ui_assets() {
 add_nix_profile_deps() {
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
     shift || true
-    local deps="${*:-musl-toolchain swagger-ui-assets}"
+    local deps="${*:-dev-tools}"
     local dep
 
     target_profile="$(resolve_nix_profile "$target_profile")"
@@ -331,6 +317,7 @@ stage_example_tree() {
     fi
 
     echo "Refreshing example tree under $root"
+    rm -rf "$root"
     mkdir -p "$root" "$root/bin"
     cp -a docs/examples/. "$root/"
     cp -a "$opt/ssh-mesh/bin/." "$root/bin/"

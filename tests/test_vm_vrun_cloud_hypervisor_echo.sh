@@ -15,7 +15,7 @@ VM_STATE="${VM_STATE:-${PROJECT_ROOT}/target/vm/${POD}}"
 SRC="${SRC:-${VM_STATE}/src}"
 NIX_PROFILE="${NIX_PROFILE:-}"
 if [[ -z "${NIX_PROFILE}" ]]; then
-  NIX_PROFILE="${PROJECT_ROOT}/target/nix/profiles"
+  NIX_PROFILE="${PROJECT_ROOT}/target/nix/profile"
 fi
 PROFILE="${PROFILE:-${NIX_PROFILE}}"
 SERIAL_LOG="${VM_STATE}/run/serial.log"

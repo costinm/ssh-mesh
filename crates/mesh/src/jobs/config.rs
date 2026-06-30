@@ -37,21 +37,22 @@ impl JobConfig {
 
     pub async fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path).await?;
-        Self::parse(&content)
+        let name = path.file_stem().and_then(|s| s.to_str());
+        crate::config::parse_service(&content, name)
+            .map_err(|e| anyhow::anyhow!("Failed to parse JobConfig from TOML: {}", e))
     }
 
     pub async fn save(&self, dir: &Path) -> Result<()> {
         let file = crate::config::AppConfigFile {
             service: crate::config::ServiceSection {
-                name: self.name.clone(),
-                command: self.command.clone(),
-                args: self.args.clone(),
+                exec_start: exec_start_to_toml(&self.command, &self.args),
+                activation_mode: self.activation_mode,
+                activation_socket: self.activation_socket.clone(),
                 user: self.user.clone(),
                 group: self.group.clone(),
                 uid: self.uid,
                 gid: self.gid,
-                priority: self.priority,
-                oneshot: self.oneshot,
+                service_type: self.oneshot.then(|| "oneshot".to_string()),
                 oom_score_adjust: self.oom_score_adjust,
             },
             resources: crate::config::ResourceLimits {
@@ -61,7 +62,6 @@ impl JobConfig {
                 cpu_weight: self.resources.cpu_weight,
             },
             environment: self.env.clone(),
-            activation: self.activation.clone(),
             network: self.network.clone(),
             schedule: self.schedule.clone(),
             constraints: self.constraints.clone(),
@@ -97,6 +97,26 @@ impl JobConfig {
 
 fn memory_limit_to_toml(limit: Option<u64>) -> Option<String> {
     limit.map(|bytes| bytes.to_string())
+}
+
+fn exec_start_to_toml(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .map(quote_exec_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_exec_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        return word.to_string();
+    }
+
+    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

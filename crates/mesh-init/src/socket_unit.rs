@@ -21,9 +21,9 @@ pub struct SystemdSocketConfig {
     pub listen_streams: Vec<String>,
     /// Listen addresses from `ListenDatagram=` directives.
     pub listen_datagrams: Vec<String>,
-    /// If true, accept connections and pass client FDs (inetd-style).
-    /// If false, pass the listening FD (xinetd-style).
-    /// Maps to mesh-init's `wait` field inverted: `wait = !accept`.
+    /// If true, accept connections and pass client FDs in inetd style.
+    /// If false, pass the listening FD using systemd-style activation.
+    /// Internally maps to the runtime listener-passing flag.
     pub accept: bool,
     /// Socket file permissions (octal).
     pub socket_mode: Option<u32>,
@@ -72,7 +72,13 @@ fn parse_ini(content: &str) -> Result<HashMap<String, HashMap<String, Vec<String
 
         let section = current_section
             .as_ref()
-            .ok_or_else(|| format!("line {}: key-value outside of section: {}", line_num + 1, raw_line))?
+            .ok_or_else(|| {
+                format!(
+                    "line {}: key-value outside of section: {}",
+                    line_num + 1,
+                    raw_line
+                )
+            })?
             .clone();
 
         // Key=Value or Key=Value with continuation
@@ -106,8 +112,8 @@ fn parse_ini(content: &str) -> Result<HashMap<String, HashMap<String, Vec<String
 
 /// Parse a systemd `.socket` file from disk.
 pub fn parse_socket_file(path: &Path) -> Result<SystemdSocketConfig, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
 
     let sections = parse_ini(&content)?;
 
@@ -286,12 +292,12 @@ pub fn socket_to_activation_configs(config: &SystemdSocketConfig) -> Vec<Activat
 
     for addr in &config.listen_datagrams {
         if let Some(act) = parse_listen_address(addr, config.accept, true) {
-            // wait=false (accept=true / inetd-style) + datagram is not supported
+            // Accept=true + datagram is not supported
             // because accepting a datagram connection doesn't produce a connected
             // client socket suitable for stdin/stdout passing.
             if config.accept {
                 error!(
-                    "wait=false (inetd-style) with ListenDatagram='{}' is not supported — skipping",
+                    "Accept=true with ListenDatagram='{}' is not supported - skipping",
                     addr
                 );
                 continue;
@@ -301,7 +307,8 @@ pub fn socket_to_activation_configs(config: &SystemdSocketConfig) -> Vec<Activat
     }
 
     // Apply socket metadata to each activation config
-    if config.socket_mode.is_some() || config.socket_user.is_some() || config.socket_group.is_some() {
+    if config.socket_mode.is_some() || config.socket_user.is_some() || config.socket_group.is_some()
+    {
         for act in &mut results {
             if act.socket.is_some() {
                 act.socket_mode = config.socket_mode;
@@ -362,11 +369,7 @@ pub fn load_socket_units(dir: &str) -> Vec<(String, Vec<ActivationConfig>)> {
                     results.push((socket_config.service_name, activation_configs));
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to parse socket unit '{}': {}",
-                        path.display(),
-                        e
-                    );
+                    warn!("Failed to parse socket unit '{}': {}", path.display(), e);
                 }
             }
         }
@@ -521,7 +524,7 @@ ListenStream=8080
             socket_user: None,
             socket_group: None,
         };
-        // wait=false (Accept=true) + datagram → skipped with error
+        // Accept=true + datagram is skipped with an error.
         let acts = socket_to_activation_configs(&cfg);
         assert!(acts.is_empty());
     }

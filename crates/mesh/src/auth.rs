@@ -285,12 +285,13 @@ impl AuthConfig {
         Ok(config)
     }
 
-    /// Load an `AuthConfig` from `$HOME/.config/$APP/auth.toml`.
+    /// Load an `AuthConfig` from the app's mutable config directory.
     ///
     /// Returns `None` if the file does not exist. Logs a warning on parse errors.
     pub fn load_for_app(app_name: &str) -> Option<Self> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let path = std::path::PathBuf::from(format!("{}/.config/{}/auth.toml", home, app_name));
+        let path = crate::paths::AppPaths::for_app(app_name)
+            .etc
+            .join("auth.toml");
         if !path.exists() {
             return None;
         }

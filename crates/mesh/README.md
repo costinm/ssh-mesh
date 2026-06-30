@@ -2,8 +2,7 @@
 
 This create provides an optional library for interacting with a Mesh, i.e. a mechanism for running apps with configurable and (more) consistent security, telemetry, networking.
 
-Any application using stdin/stdout/stderr or UDS or HTTP/1.1 or H2C can be used with no changes by SSH mesh - the library allows few 
-extra features like a control socket, opinionated telemetry setup.
+Any application using stdin/stdout/stderr or UDS can be used with no changes by SSH mesh - the library allows a few extra features like a JSONL control socket, activation support, and opinionated telemetry setup.
 
 
 
@@ -13,9 +12,7 @@ In many cases H2C is overkill - many apps can just expose
 an MCP-like JSON-RPC or plain JSON over stdin/stdout or UDS. In this case the mesh proxy can handle HTTP2 or SSH forwarding, with headers and metadata exposed as either env variables or in the json sent to the app.
 The app will not include a HTTP or H2 library, keeping deps small.
 
-If HTTP is needed, it is useful to expose H2C or HTTP/1.1 over UDS service avoiding a TCP localhost port. The UDS socket can verify the 
-peer identity and use a deterministic/opinionanted file structure.
-A helper is included as a feature, with verifications for peer.
+If HTTP is needed, it belongs in `ssh-mesh` or the application itself. The `mesh` crate intentionally avoids Axum/Hyper/http dependencies and only provides the activation, peer-checked stream, JSONL, and telemetry primitives.
 
 If the app is exposing HTTP over TCP without TLS - ideally localhost
 is used, and normal port forwarding by the mesh proxy, with H2 or SSH
@@ -24,7 +21,7 @@ model only works well for 'pods', with isolated network namespace.
 
 If the app is exposing HTTPS or other secure protocol and handling its
 own security - there is no need for a proxy or mesh library, but the
-init pattern (xinetd/serverless) can still be used.
+init pattern (systemd socket activation/serverless) can still be used.
 
 ## Resource management
 

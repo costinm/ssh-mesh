@@ -1,28 +1,26 @@
-[service]
-name = "sync-data"
-command = "echo"
-args = ["Mocking sync data!"]
-priority = 300
+[Service]
+ExecStart = "echo 'Mocking sync data!'"
+OOMScoreAdjust = -700
 
 persisted = true
 save_result = true
 
-[schedule]
+[Schedule]
 periodic_secs = 3600
 flex_secs = 900
 
-[constraints]
+[Constraints]
 network_type = "unmetered"
 requires_charging = false
 requires_battery_not_low = true
 
-[constraints.custom]
+[Constraints.custom]
 vpn_connected = true
 
-[backoff]
+[Backoff]
 initial_secs = 30
 policy = "exponential"
 max_retries = 5
 
-[environment]
+[Environment]
 SYNC_MODE = "incremental"

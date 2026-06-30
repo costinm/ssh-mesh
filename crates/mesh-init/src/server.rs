@@ -141,8 +141,7 @@ impl ControlServer {
 /// Reads JSON lines from the stream, dispatches each to the daemon,
 /// and writes back JSON responses.
 enum ProtocolFormat {
-    FlatJson { id: Option<serde_json::Value> },
-    JsonRpc { id: Option<serde_json::Value> },
+    Json(mesh::jsonl::ProtocolFormat),
     TextCommand,
 }
 
@@ -154,63 +153,8 @@ fn parse_incoming(trimmed: &str) -> (ProtocolFormat, Result<Request, String>) {
             parsed.map_err(|e| e.to_string()),
         )
     } else {
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    ProtocolFormat::FlatJson { id: None },
-                    Err(format!("Invalid JSON: {}", e)),
-                );
-            }
-        };
-
-        if let Some(obj) = val.as_object() {
-            let id = obj.get("id").cloned();
-            if obj.contains_key("jsonrpc") {
-                let format = ProtocolFormat::JsonRpc { id };
-                let method = match obj.get("method").and_then(|m| m.as_str()) {
-                    Some(m) => m,
-                    None => {
-                        return (
-                            format,
-                            Err("Missing or invalid 'method' in JSON-RPC request".to_string()),
-                        );
-                    }
-                };
-
-                let mut flat = serde_json::Map::new();
-                flat.insert("method".to_string(), serde_json::json!(method));
-
-                if let Some(params) = obj.get("params") {
-                    if let Some(params_obj) = params.as_object() {
-                        for (k, v) in params_obj {
-                            flat.insert(k.clone(), v.clone());
-                        }
-                    } else if !params.is_null() {
-                        return (
-                            format,
-                            Err("JSON-RPC 'params' must be an object".to_string()),
-                        );
-                    }
-                }
-
-                match serde_json::from_value::<Request>(serde_json::Value::Object(flat)) {
-                    Ok(req) => (format, Ok(req)),
-                    Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
-                }
-            } else {
-                let format = ProtocolFormat::FlatJson { id };
-                match serde_json::from_str::<Request>(trimmed) {
-                    Ok(req) => (format, Ok(req)),
-                    Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
-                }
-            }
-        } else {
-            (
-                ProtocolFormat::FlatJson { id: None },
-                Err("JSON payload is not an object".to_string()),
-            )
-        }
+        let (format, parsed) = mesh::jsonl::parse_request::<Request>(trimmed);
+        (ProtocolFormat::Json(format), parsed)
     }
 }
 
@@ -321,43 +265,7 @@ fn format_text_success(data: &Option<serde_json::Value>) -> String {
 
 fn format_response(response: Response, format: &ProtocolFormat) -> Result<String> {
     match format {
-        ProtocolFormat::FlatJson { id } => {
-            let mut val = serde_json::to_value(&response)?;
-            if let Some(obj) = val.as_object_mut() {
-                if let Some(id_val) = id {
-                    obj.insert("id".to_string(), id_val.clone());
-                }
-            }
-            Ok(serde_json::to_string(&val)?)
-        }
-        ProtocolFormat::JsonRpc { id } => {
-            let mut map = serde_json::Map::new();
-            map.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
-            if response.success {
-                map.insert(
-                    "result".to_string(),
-                    response.data.clone().unwrap_or(serde_json::Value::Null),
-                );
-            } else {
-                let mut err_map = serde_json::Map::new();
-                err_map.insert("code".to_string(), serde_json::json!(-32603));
-                err_map.insert(
-                    "message".to_string(),
-                    serde_json::json!(
-                        response
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "Unknown error".to_string())
-                    ),
-                );
-                map.insert("error".to_string(), serde_json::Value::Object(err_map));
-            }
-            map.insert(
-                "id".to_string(),
-                id.clone().unwrap_or(serde_json::Value::Null),
-            );
-            Ok(serde_json::to_string(&serde_json::Value::Object(map))?)
-        }
+        ProtocolFormat::Json(format) => mesh::jsonl::format_response(response, format),
         ProtocolFormat::TextCommand => {
             if response.success {
                 Ok(format_text_success(&response.data))
@@ -569,7 +477,7 @@ mod tests {
         let trimmed = r#"{"method":"status","name":"x","id":"req-id"}"#;
         let (format, parsed) = parse_incoming(trimmed);
         assert!(
-            matches!(format, ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) } if s == "req-id")
+            matches!(format, ProtocolFormat::Json(mesh::jsonl::ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) }) if s == "req-id")
         );
         let req = parsed.unwrap();
         match req {
@@ -583,7 +491,7 @@ mod tests {
         let trimmed = r#"{"jsonrpc":"2.0","method":"status","params":{"name":"x"},"id":100}"#;
         let (format, parsed) = parse_incoming(trimmed);
         assert!(
-            matches!(format, ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) } if n.as_i64() == Some(100))
+            matches!(format, ProtocolFormat::Json(mesh::jsonl::ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) }) if n.as_i64() == Some(100))
         );
         let req = parsed.unwrap();
         match req {
@@ -607,9 +515,9 @@ mod tests {
     #[test]
     fn test_format_response_jsonrpc() {
         let response = Response::ok_with_data(serde_json::json!({"pid": 42}));
-        let format = ProtocolFormat::JsonRpc {
+        let format = ProtocolFormat::Json(mesh::jsonl::ProtocolFormat::JsonRpc {
             id: Some(serde_json::json!(100)),
-        };
+        });
         let formatted = format_response(response, &format).unwrap();
         let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
         assert_eq!(val["jsonrpc"], "2.0");

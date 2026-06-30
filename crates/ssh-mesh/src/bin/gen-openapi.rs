@@ -4,8 +4,6 @@ use std::fs;
 use std::path::Path;
 use utoipa::OpenApi;
 
-use pmond::handlers::ApiDoc as PmondApiDoc;
-
 fn main() {
     println!("Generating OpenAPI schema...");
 
@@ -15,10 +13,6 @@ fn main() {
     println!("Including sshc schema...");
     let sshc_openapi = SshcApiDoc::openapi();
     openapi.merge(sshc_openapi);
-
-    println!("Including pmond schema...");
-    let pmond_openapi = PmondApiDoc::openapi();
-    openapi.merge(pmond_openapi);
 
     // Convert to pretty JSON
     let json = openapi

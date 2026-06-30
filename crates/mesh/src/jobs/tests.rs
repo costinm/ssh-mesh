@@ -53,6 +53,8 @@ fn create_base_job(name: &str) -> JobConfig {
         env: Default::default(),
         priority: 500,
         oneshot: false,
+        activation_mode: Default::default(),
+        activation_socket: None,
         oom_score_adjust: None,
         resources: Default::default(),
         activation: vec![],

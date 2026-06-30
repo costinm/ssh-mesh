@@ -1,9 +1,0 @@
-[service]
-name = "activated_svc"
-command = "/bin/sh"
-args = ["-c", "echo SUCCESS"]
-priority = 200
-
-[[activation]]
-port = 14032
-wait = false

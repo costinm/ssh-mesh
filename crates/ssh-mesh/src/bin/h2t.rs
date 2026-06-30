@@ -311,8 +311,11 @@ fn detect_transport(arg: &str) -> Transport {
 fn init_telemetry() {
     let filter = tracing_subscriber::EnvFilter::from_default_env();
     let log_path = env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/h2t/h2t.log", home)
+        mesh::paths::AppPaths::for_app("h2t")
+            .run_dir("h2t")
+            .join("h2t.log")
+            .to_string_lossy()
+            .into_owned()
     });
 
     if let Some(parent) = std::path::Path::new(&log_path).parent() {

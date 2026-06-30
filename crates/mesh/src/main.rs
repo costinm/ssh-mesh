@@ -235,12 +235,11 @@ fn get_socket_path(app: &str) -> String {
     let env_var = format!("{}_RUN", env_prefix);
 
     let run_dir = if let Ok(dir) = std::env::var(&env_var) {
-        dir
+        std::path::PathBuf::from(dir)
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/{}", home, app)
+        mesh::paths::AppPaths::for_app(app).run_dir(app)
     };
-    format!("{}/control.sock", run_dir)
+    run_dir.join("control.sock").to_string_lossy().into_owned()
 }
 
 async fn send_request(socket_path: &str, request: &Request) -> Result<Response> {

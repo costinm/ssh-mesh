@@ -1,4 +1,3 @@
-use log::{error, info, trace};
 use nix::sys::socket::{NetlinkAddr, bind, recv, send};
 use nix::unistd::getpid;
 use std::mem::size_of;
@@ -8,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
+use tracing::{error, info, trace};
 
 // linux/connector.h
 const CN_IDX_PROC: u32 = 0x1;

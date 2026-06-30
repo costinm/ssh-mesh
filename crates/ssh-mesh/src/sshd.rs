@@ -1091,12 +1091,10 @@ fn mesh_init_socket_path() -> String {
     if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
         return path;
     }
-    if unsafe { libc::getuid() } == 0 {
-        "/run/mesh-init/control.sock".to_string()
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/mesh-init/control.sock", home)
-    }
+    mesh::paths::AppPaths::for_app("system")
+        .control_socket("mesh-init")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn user_part(identity: &str) -> String {
@@ -1123,7 +1121,9 @@ fn safe_user_part(identity: &str) -> Option<String> {
 }
 
 fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
-    let home_root = std::env::var("SSH_MESH_HOME_ROOT").unwrap_or_else(|_| "/home".to_string());
+    let home_root = std::env::var("SSH_MESH_HOME_ROOT")
+        .or_else(|_| std::env::var("MESH_HOME_BASE"))
+        .unwrap_or_else(|_| "/home".to_string());
     let home_path = std::path::Path::new(&home_root).join(user);
     let metadata = std::fs::metadata(&home_path).ok()?;
     if !metadata.is_dir() {

@@ -1,8 +1,0 @@
-# init-setup.toml — Runs before the main application and other services.
-# Example: create directories, set permissions, etc.
-[service]
-name = "init-setup"
-command = "/opt/busybox/bin/sh"
-args = ["-c", "mkdir -p /home/system/mesh9p-export; printf 'host1-9p-export-ok\n' >/home/system/mesh9p-export/host1.txt; echo 'init-setup complete'"]
-priority = 10
-oneshot = true

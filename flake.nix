@@ -22,6 +22,7 @@
         };
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [ "rust-src" "rustfmt" "clippy" ];
           targets = [ muslTarget ];
         };
 
@@ -131,8 +132,23 @@
             bubblewrap
             iperf3
             iproute2
+            netcat
             nftables
             util-linux
+          ];
+        };
+
+        dev-tools = pkgs.symlinkJoin {
+          name = "ssh-mesh-dev-tools";
+          paths = with pkgs; [
+            build-deps
+            rustToolchain
+            pkg-config
+            cargo-watch
+            cargo-edit
+            curl
+            netcat
+            jq
           ];
         };
 
@@ -246,7 +262,7 @@
       in
       {
         packages = {
-            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets mesh-net-tools build-deps;
+            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets mesh-net-tools build-deps dev-tools;
             default = ssh-mesh-full;
         };
 
@@ -258,15 +274,7 @@
         };
 
         devShells.default = craneLib.devShell {
-          packages = with pkgs; [
-            rustToolchain
-            pkg-config
-            cargo-watch
-            cargo-edit
-            iperf3
-            iproute2
-            nftables
-          ];
+          packages = [ dev-tools ];
         };
 
         checks = {

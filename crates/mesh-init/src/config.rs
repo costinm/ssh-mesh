@@ -1,8 +1,8 @@
 //! Application configuration for mesh-init services.
 //!
-//! Supports TOML config files with Android init-like semantics:
-//! - Services have a name, command, user/group, priority, and resource limits.
-//! - `oneshot` services are not restarted after exit.
+//! Supports systemd-style `.service` config files with mesh-init extensions:
+//! - Service names are derived from the `.service` filename.
+//! - `Type = "oneshot"` services are not restarted after exit.
 //! - Socket configs define FDs to listen on; accept triggers service start.
 //! - Resource limits map to cgroup v2 knobs (memory.low/high/max, cpu.weight).
 
@@ -44,12 +44,13 @@ pub fn validate_cgroup_name(name: &str) -> Result<(), String> {
 pub fn load_app_config(path: &Path) -> Result<AppConfig, ConfigError> {
     info!("Loading config from {}", path.display());
     let content = std::fs::read_to_string(path)?;
-    let mut config = parse_toml(&content)?;
+    let service_name = path.file_stem().and_then(|s| s.to_str());
+    let mut config = parse_service(&content, service_name)?;
     config.source_path = Some(path.to_string_lossy().into_owned());
     Ok(config)
 }
 
-/// Scan directories for `.toml` config files and load all of them.
+/// Scan directories for `.service` config files and load all of them.
 ///
 /// Non-existent directories are silently skipped. Individual parse errors
 /// are logged as warnings but do not stop loading of other configs.
@@ -73,7 +74,7 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            if path.extension().and_then(|e| e.to_str()) == Some("service") {
                 match load_app_config(&path) {
                     Ok(config) => {
                         info!("Loaded config for service '{}'", config.name);
@@ -101,92 +102,70 @@ mod tests {
     #[test]
     fn test_parse_toml_basic() {
         let toml = r#"
-[service]
-name = "test-svc"
-command = "/bin/sleep"
-args = ["60"]
+[Service]
+ExecStart = "/bin/sleep 60"
 "#;
-        let config = parse_toml(toml).unwrap();
+        let config = parse_service(toml, Some("test-svc")).unwrap();
         assert_eq!(config.name, "test-svc");
         assert_eq!(config.command, "/bin/sleep");
         assert_eq!(config.args, vec!["60"]);
-        assert_eq!(config.priority, 500); // default
+        assert_eq!(config.priority, 1000); // default OOMScoreAdjust=0 equivalent
         assert!(!config.oneshot);
     }
 
     #[test]
     fn test_parse_toml_full() {
         let toml = r#"
-[service]
-name = "chrome"
-command = "/usr/bin/google-chrome-stable"
-args = ["--no-sandbox"]
-user = "user1"
-group = "user1"
-uid = 1000
-gid = 1000
-priority = 200
-oneshot = false
-oom_score_adjust = -100
+[Service]
+ExecStart = "/usr/bin/google-chrome-stable --no-sandbox"
+User = "user1"
+Group = "user1"
+MeshUID = 1000
+MeshGID = 1000
+OOMScoreAdjust = -800
 
-[resources]
+[Resources]
 memory_low = "256M"
 memory_high = "2G"
 memory_max = "4G"
 cpu_weight = 100
 
-[environment]
+[Environment]
 DISPLAY = ":0"
 HOME = "/home/user1"
-
-[[activation]]
-socket = "/run/mesh-init/chrome.sock"
-wait = true
-
-[[activation]]
-port = 14022
-wait = false
 "#;
-        let config = parse_toml(toml).unwrap();
+        let config = parse_service(toml, Some("chrome")).unwrap();
         assert_eq!(config.name, "chrome");
         assert_eq!(config.uid, Some(1000));
         assert_eq!(config.user.as_deref(), Some("user1"));
         assert_eq!(config.priority, 200);
-        assert_eq!(config.oom_score_adjust, Some(-100));
+        assert_eq!(config.oom_score_adjust, Some(-800));
         assert_eq!(config.resources.memory_low, Some(256 * 1024 * 1024));
         assert_eq!(config.resources.memory_high, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(config.resources.memory_max, Some(4 * 1024 * 1024 * 1024));
         assert_eq!(config.resources.cpu_weight, Some(100));
         assert_eq!(config.env.get("DISPLAY").unwrap(), ":0");
-        assert_eq!(config.activation.len(), 2);
-        assert_eq!(
-            config.activation[0].socket.as_deref(),
-            Some("/run/mesh-init/chrome.sock")
-        );
-        assert_eq!(config.activation[0].wait, true);
-        assert_eq!(config.activation[1].port, Some(14022));
-        assert_eq!(config.activation[1].wait, false);
+        assert!(config.activation.is_empty());
     }
 
     #[test]
     fn test_parse_toml_with_peer() {
         let toml = r#"
-[service]
-name = "auth-svc"
-command = "/bin/true"
+[Service]
+ExecStart = "/bin/true"
 
-[[peer]]
+[[Peer]]
 uid = 1000
 
-[[peer]]
+[[Peer]]
 uid = 1001
 delegate = "*.mesh.local"
 
-[[impersonation]]
+[[MeshImpersonation]]
 from = "root@example.m"
 to = "*"
 "#;
-        let config = parse_toml(toml).unwrap();
+        let config = parse_service(toml, Some("auth-svc")).unwrap();
         assert_eq!(config.name, "auth-svc");
         let auth = config.auth.expect("auth should be present");
         assert_eq!(auth.peers.len(), 2);
@@ -198,19 +177,33 @@ to = "*"
     }
 
     #[test]
+    fn test_parse_toml_with_hybrid_activation_mode() {
+        let toml = r#"
+[Service]
+ExecStart = "/bin/true"
+MeshActivationMode = "hybrid"
+MeshActivationSocket = "/run/hybrid-svc/control.sock"
+"#;
+        let config = parse_service(toml, Some("hybrid-svc")).unwrap();
+        assert_eq!(config.activation_mode, ServiceActivationMode::Hybrid);
+        assert_eq!(
+            config.activation_socket.as_deref(),
+            Some("/run/hybrid-svc/control.sock")
+        );
+    }
+
+    #[test]
     fn test_parse_toml_with_pasta_network() {
         let toml = r#"
-[service]
-name = "net-svc"
-command = "/bin/sleep"
-args = ["60"]
+[Service]
+ExecStart = "/bin/sleep 60"
 
-[network]
+[Network]
 backend = "pasta"
 command = "pasta"
 args = ["--config-net", "{pid}"]
 "#;
-        let config = parse_toml(toml).unwrap();
+        let config = parse_service(toml, Some("net-svc")).unwrap();
         assert_eq!(config.network.backend, NetworkBackend::Pasta);
         assert_eq!(config.network.command.as_deref(), Some("pasta"));
         assert_eq!(config.network.args, vec!["--config-net", "{pid}"]);
@@ -219,12 +212,10 @@ args = ["--config-net", "{pid}"]
     #[test]
     fn test_parse_toml_with_mesh_tun_network() {
         let toml = r#"
-[service]
-name = "mesh-tun-svc"
-command = "/bin/sleep"
-args = ["60"]
+[Service]
+ExecStart = "/bin/sleep 60"
 
-[network]
+[Network]
 backend = "mesh-tun"
 control_socket = "/tmp/mesh/control.sock"
 if_name = "tap0"
@@ -235,7 +226,7 @@ default_route = true
 egress_redirect_port = 15001
 egress_redirect_uid = 1234
 "#;
-        let config = parse_toml(toml).unwrap();
+        let config = parse_service(toml, Some("mesh-tun-svc")).unwrap();
         assert_eq!(config.network.backend, NetworkBackend::MeshTun);
         assert_eq!(
             config.network.control_socket.as_deref(),
@@ -273,22 +264,20 @@ egress_redirect_uid = 1234
     #[test]
     fn test_invalid_config_empty_command() {
         let toml = r#"
-[service]
-name = "bad"
-command = ""
+[Service]
+ExecStart = ""
 "#;
-        assert!(parse_toml(toml).is_err());
+        assert!(parse_service(toml, Some("bad")).is_err());
     }
 
     #[test]
     fn test_invalid_oom_score() {
         let toml = r#"
-[service]
-name = "bad"
-command = "/bin/true"
-oom_score_adjust = 2000
+[Service]
+ExecStart = "/bin/true"
+OOMScoreAdjust = 2000
 "#;
-        assert!(parse_toml(toml).is_err());
+        assert!(parse_service(toml, Some("bad")).is_err());
     }
 
     #[test]
@@ -296,13 +285,12 @@ oom_score_adjust = 2000
         let dir = tempfile::tempdir().unwrap();
 
         // Write a valid config
-        let config_path = dir.path().join("test.toml");
+        let config_path = dir.path().join("test.service");
         std::fs::write(
             &config_path,
             r#"
-[service]
-name = "test"
-command = "/bin/true"
+[Service]
+ExecStart = "/bin/true"
 "#,
         )
         .unwrap();

@@ -213,8 +213,8 @@ dump_regular_logs() {
   exit "$status"
 }
 trap dump_regular_logs EXIT
-HOME_ROOT="${HOME}/.local/home"
-CONTROL_DIR="${HOME}/.run/mesh-init"
+HOME_ROOT="${HOME}/home"
+CONTROL_DIR="${HOME}/run/mesh-init"
 mkdir -p "${HOME_ROOT}/alice" "${CONTROL_DIR}"
 if [ "$(id -u)" = 0 ] && [ "${REGULAR_PREPARED:-0}" = 0 ]; then
   RUNTIME=/run/ssh-mesh-regular-test
@@ -371,7 +371,7 @@ run_regular_user_subuid_bwrap() {
   export SUBUID="$subuid" SUBGID="$subgid"
   export -f wait_port
 
-  echo "== regular-user mesh-init and ssh-mesh with ~/.local/home/alice owned by subuid =="
+  echo "== regular-user mesh-init and ssh-mesh with ~/home/alice owned by subuid =="
   REGULAR_UID=1000
   REGULAR_GID=1000
   ALICE_HOME_UID=1001

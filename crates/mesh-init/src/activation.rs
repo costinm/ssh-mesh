@@ -6,13 +6,17 @@
 //! - **Systemd socket activation** — mesh-init receives pre-bound file
 //!   descriptors from systemd via `LISTEN_PID`/`LISTEN_FDS`. Uses them
 //!   directly instead of binding new sockets.
-//! - **Xinetd-style (wait=true)** — passes the listening file descriptor
-//!   to the child service, which calls `accept()` itself.
-//! - **Inetd-style (wait=false)** — accepts the connection in mesh-init
+//! - **Listener activation (Accept=false)** - passes listening file descriptors
+//!   to the child service using systemd fd 3.. + `LISTEN_FDS=N`.
+//! - **Inetd-style (Accept=true)** - accepts the connection in mesh-init
 //!   and passes the connected client socket as stdin/stdout/stderr.
+//! - **Hybrid activation (service activation_mode=hybrid)** - accepts the
+//!   connection in mesh-init and forwards the accepted fd to a service JSONL
+//!   Unix socket using SCM_RIGHTS.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -22,7 +26,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ServiceActivationMode};
 use crate::daemon::Daemon;
 use crate::process::ActivationFd;
 use crate::protocol::ServiceState;
@@ -31,7 +35,7 @@ use crate::protocol::ServiceState;
 // Concurrency limits
 // ============================================================================
 
-/// Default maximum number of concurrent inetd-style (wait=false) activation
+/// Default maximum number of concurrent inetd-style activation
 /// children. Prevents a connection flood from exhausting PIDs/memory/FDs.
 /// Override via the `MESH_INIT_MAX_ACTIVATION_CHILDREN` env var.
 const DEFAULT_MAX_ACTIVATION_CHILDREN: usize = 64;
@@ -46,11 +50,48 @@ fn max_activation_children() -> usize {
 
 /// Global semaphore capping concurrent inetd-style activation spawns.
 static ACTIVATION_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static SERVICE_LISTENER_FDS: OnceLock<Mutex<HashMap<String, Vec<(usize, OwnedFd)>>>> =
+    OnceLock::new();
 
 fn activation_semaphore() -> Arc<Semaphore> {
     ACTIVATION_SEMAPHORE
         .get_or_init(|| Arc::new(Semaphore::new(max_activation_children())))
         .clone()
+}
+
+fn register_service_listener_fd(service_name: &str, order: usize, fd: &OwnedFd) {
+    let Ok(fd_clone) = fd.try_clone() else {
+        warn!(
+            "Failed to clone activation listener fd for '{}'",
+            service_name
+        );
+        return;
+    };
+    let registry = SERVICE_LISTENER_FDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock();
+    let listeners = registry.entry(service_name.to_string()).or_default();
+    if let Some((_, existing)) = listeners.iter_mut().find(|(idx, _)| *idx == order) {
+        *existing = fd_clone;
+    } else {
+        listeners.push((order, fd_clone));
+        listeners.sort_by_key(|(idx, _)| *idx);
+    }
+}
+
+fn service_listener_fds(service_name: &str) -> Vec<OwnedFd> {
+    let Some(registry) = SERVICE_LISTENER_FDS.get() else {
+        return Vec::new();
+    };
+    registry
+        .lock()
+        .get(service_name)
+        .map(|listeners| {
+            listeners
+                .iter()
+                .filter_map(|(_, fd)| fd.try_clone().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ============================================================================
@@ -170,12 +211,8 @@ fn identify_fd(fd: &OwnedFd) -> FdIdentity {
         if path_len > 0 && path_bytes[0] != 0 {
             // SAFETY: casting i8 sun_path to u8 for OsStrExt::from_bytes.
             // The path bytes are valid ASCII/UTF-8 filesystem paths.
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    path_bytes.as_ptr() as *const u8,
-                    path_len,
-                )
-            };
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(path_bytes.as_ptr() as *const u8, path_len) };
             let path = PathBuf::from(<std::ffi::OsStr as OsStrExt>::from_bytes(bytes));
             return FdIdentity::Unix(path, sock_kind);
         }
@@ -245,9 +282,9 @@ fn take_systemd_tcp_fd(port: u16, datagram: bool) -> Option<OwnedFd> {
     };
     let pool = SYSTEMD_FDS.get()?;
     let mut pool = pool.lock();
-    let idx = pool.iter().position(|(_, identity)| {
-        matches!(identity, FdIdentity::Tcp(p, k) if *p == port && *k == kind)
-    });
+    let idx = pool.iter().position(
+        |(_, identity)| matches!(identity, FdIdentity::Tcp(p, k) if *p == port && *k == kind),
+    );
     idx.map(|i| pool.remove(i).unwrap().0)
 }
 
@@ -295,13 +332,154 @@ fn get_peer_uid(fd: i32) -> Option<u32> {
     }
 }
 
+async fn forward_accepted_fd(
+    service_name: &str,
+    activation_socket: &str,
+    client_fd: OwnedFd,
+    stream_cache: &mut Option<StdUnixStream>,
+    daemon: Arc<Daemon>,
+) -> anyhow::Result<()> {
+    let message = serde_json::json!({
+        "method": "accepted_fd",
+        "service": service_name,
+        "activation_socket": activation_socket,
+        "peer_uid": get_peer_uid(client_fd.as_raw_fd()),
+    });
+
+    if stream_cache.is_none() {
+        *stream_cache = Some(
+            connect_or_start_activation_socket(service_name, activation_socket, daemon.clone())
+                .await?,
+        );
+    }
+
+    if let Some(stream) = stream_cache.as_mut() {
+        if mesh::jsonl::send_json_with_fd(stream, &message, &client_fd).is_ok() {
+            return Ok(());
+        }
+    }
+
+    debug!(
+        "Activation fd send to {} for '{}' failed; reconnecting",
+        activation_socket, service_name
+    );
+    *stream_cache = None;
+    let mut stream =
+        connect_or_start_activation_socket(service_name, activation_socket, daemon).await?;
+    mesh::jsonl::send_json_with_fd(&mut stream, &message, &client_fd)?;
+    *stream_cache = Some(stream);
+    Ok(())
+}
+
+async fn connect_or_start_activation_socket(
+    service_name: &str,
+    activation_socket: &str,
+    daemon: Arc<Daemon>,
+) -> anyhow::Result<StdUnixStream> {
+    match StdUnixStream::connect(activation_socket) {
+        Ok(stream) => Ok(stream),
+        Err(first_error) => {
+            debug!(
+                "Activation socket {} for '{}' not ready: {}",
+                activation_socket, service_name, first_error
+            );
+            start_activation_socket_target(service_name, activation_socket, daemon)?;
+            connect_activation_socket(activation_socket).await
+        }
+    }
+}
+
+fn start_activation_socket_target(
+    service_name: &str,
+    activation_socket: &str,
+    daemon: Arc<Daemon>,
+) -> anyhow::Result<()> {
+    let already_running = {
+        let services = daemon.services.lock();
+        services
+            .get(service_name)
+            .is_some_and(|p| p.state == ServiceState::Running || p.state == ServiceState::Starting)
+    };
+
+    if already_running {
+        return Ok(());
+    }
+
+    let mut config = daemon
+        .configs
+        .lock()
+        .get(service_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing service config for {}", service_name))?;
+
+    if let Some(context) = daemon.take_activation_context(service_name) {
+        config.env.extend(context.to_env());
+    }
+
+    let listener = bind_activation_socket(activation_socket)?;
+    daemon
+        .start_service_with_config(config, Some(ActivationFd::Listen(vec![listener])))
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("failed to start forward target {}: {}", service_name, e))
+}
+
+fn bind_activation_socket(path: &str) -> anyhow::Result<OwnedFd> {
+    let path_ref = std::path::Path::new(path);
+    if let Some(parent) = path_ref.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(path_ref);
+
+    let listener = std::os::unix::net::UnixListener::bind(path_ref)?;
+    listener.set_nonblocking(true)?;
+
+    if let Ok(metadata) = std::fs::metadata(path_ref) {
+        let mut perms = metadata.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o660);
+        let _ = std::fs::set_permissions(path_ref, perms);
+    }
+
+    Ok(listener.into())
+}
+
+fn activation_socket_for_service(config: &AppConfig, service_name: &str) -> String {
+    config
+        .activation_socket
+        .clone()
+        .unwrap_or_else(|| default_activation_socket(service_name))
+}
+
+fn default_activation_socket(service_name: &str) -> String {
+    mesh::paths::AppPaths::for_app(service_name)
+        .control_socket(service_name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+async fn connect_activation_socket(path: &str) -> anyhow::Result<StdUnixStream> {
+    let mut last_error = None;
+    for _ in 0..40 {
+        match StdUnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last_error = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("failed to connect to {}", path)))
+}
+
 // ============================================================================
 // Start listeners
 // ============================================================================
 
 /// Start activation listeners for a given service.
 pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
-    for act in &config.activation {
+    for (order, act) in config.activation.iter().enumerate() {
         if let Some(port) = act.port {
             // Check for pre-bound systemd socket activation FD
             if let Some(fd) = take_systemd_tcp_fd(port, act.datagram) {
@@ -312,33 +490,33 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
                 let daemon_clone = daemon.clone();
                 let name = config.name.clone();
                 let wait = act.wait;
-                let xinetd_fd = act.xinetd_fd;
+                if wait {
+                    register_service_listener_fd(&name, order, &fd);
+                }
                 tokio::spawn(async move {
-                    handle_listener(fd, name, wait, xinetd_fd, daemon_clone).await;
+                    handle_listener(fd, name, wait, daemon_clone).await;
                 });
                 continue;
             }
             let daemon_clone = daemon.clone();
             let name = config.name.clone();
             let wait = act.wait;
-            let xinetd_fd = act.xinetd_fd;
             tokio::spawn(async move {
-                run_tcp_listener(port, name, wait, xinetd_fd, daemon_clone).await;
+                run_tcp_listener(port, name, wait, order, daemon_clone).await;
             });
         }
         if let Some(ref path) = act.socket {
             // Check for pre-bound systemd socket activation FD
             if let Some(fd) = take_systemd_uds_fd(path, act.datagram) {
-                info!(
-                    "Using systemd socket FD for '{}' UDS {}",
-                    config.name, path
-                );
+                info!("Using systemd socket FD for '{}' UDS {}", config.name, path);
                 let daemon_clone = daemon.clone();
                 let name = config.name.clone();
                 let wait = act.wait;
-                let xinetd_fd = act.xinetd_fd;
+                if wait {
+                    register_service_listener_fd(&name, order, &fd);
+                }
                 tokio::spawn(async move {
-                    handle_listener(fd, name, wait, xinetd_fd, daemon_clone).await;
+                    handle_listener(fd, name, wait, daemon_clone).await;
                 });
                 continue;
             }
@@ -349,13 +527,12 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
             let socket_mode = act.socket_mode;
             let socket_user = act.socket_user.clone();
             let socket_group = act.socket_group.clone();
-            let xinetd_fd = act.xinetd_fd;
             tokio::spawn(async move {
                 run_uds_listener(
                     path_clone,
                     name,
                     wait,
-                    xinetd_fd,
+                    order,
                     socket_mode,
                     socket_user,
                     socket_group,
@@ -375,7 +552,7 @@ async fn run_tcp_listener(
     port: u16,
     service_name: String,
     wait: bool,
-    xinetd_fd: Option<i32>,
+    order: usize,
     daemon: Arc<Daemon>,
 ) {
     let bind_addr = daemon
@@ -408,9 +585,9 @@ async fn run_tcp_listener(
             .is_some_and(|c| c.auth.is_some());
         if has_auth {
             error!(
-                "Service '{}' has auth configured but uses wait=true activation, \
+                "Service '{}' has auth configured but uses listener activation, \
                  which cannot enforce peer authentication. Refusing to start the \
-                 listener. Remove the auth config or set wait=false.",
+                 listener. Remove the auth config or use Accept=true.",
                 service_name
             );
             return;
@@ -433,7 +610,10 @@ async fn run_tcp_listener(
     }
 
     let fd = listener.into();
-    handle_listener(fd, service_name, wait, xinetd_fd, daemon).await;
+    if wait {
+        register_service_listener_fd(&service_name, order, &fd);
+    }
+    handle_listener(fd, service_name, wait, daemon).await;
 }
 
 // ============================================================================
@@ -444,7 +624,7 @@ async fn run_uds_listener(
     path: String,
     service_name: String,
     wait: bool,
-    xinetd_fd: Option<i32>,
+    order: usize,
     socket_mode: Option<u32>,
     socket_user: Option<String>,
     socket_group: Option<String>,
@@ -496,7 +676,10 @@ async fn run_uds_listener(
                     let c_user = std::ffi::CString::new(user.as_str()).unwrap_or_default();
                     let pw = unsafe { libc::getpwnam(c_user.as_ptr()) };
                     if pw.is_null() {
-                        warn!("Failed to resolve socket user '{}' for '{}'", user, service_name);
+                        warn!(
+                            "Failed to resolve socket user '{}' for '{}'",
+                            user, service_name
+                        );
                         0
                     } else {
                         unsafe { (*pw).pw_uid }
@@ -504,25 +687,32 @@ async fn run_uds_listener(
                 }
             };
             let c_path = std::ffi::CString::new(path.as_str()).unwrap_or_default();
-            let gid = socket_group.as_ref().and_then(|g| {
-                if g.is_empty() {
-                    None
-                } else {
-                    match g.parse::<u32>() {
-                        Ok(n) => Some(n),
-                        Err(_) => {
-                            let c_group = std::ffi::CString::new(g.as_str()).unwrap_or_default();
-                            let gr = unsafe { libc::getgrnam(c_group.as_ptr()) };
-                            if gr.is_null() {
-                                warn!("Failed to resolve socket group '{}' for '{}'", g, service_name);
-                                None
-                            } else {
-                                Some(unsafe { (*gr).gr_gid })
+            let gid = socket_group
+                .as_ref()
+                .and_then(|g| {
+                    if g.is_empty() {
+                        None
+                    } else {
+                        match g.parse::<u32>() {
+                            Ok(n) => Some(n),
+                            Err(_) => {
+                                let c_group =
+                                    std::ffi::CString::new(g.as_str()).unwrap_or_default();
+                                let gr = unsafe { libc::getgrnam(c_group.as_ptr()) };
+                                if gr.is_null() {
+                                    warn!(
+                                        "Failed to resolve socket group '{}' for '{}'",
+                                        g, service_name
+                                    );
+                                    None
+                                } else {
+                                    Some(unsafe { (*gr).gr_gid })
+                                }
                             }
                         }
                     }
-                }
-            }).unwrap_or(u32::MAX);
+                })
+                .unwrap_or(u32::MAX);
             unsafe {
                 libc::chown(c_path.as_ptr() as *const _, uid, gid);
             }
@@ -538,7 +728,10 @@ async fn run_uds_listener(
                 let c_group = std::ffi::CString::new(group.as_str()).unwrap_or_default();
                 let gr = unsafe { libc::getgrnam(c_group.as_ptr()) };
                 if gr.is_null() {
-                    warn!("Failed to resolve socket group '{}' for '{}'", group, service_name);
+                    warn!(
+                        "Failed to resolve socket group '{}' for '{}'",
+                        group, service_name
+                    );
                     u32::MAX
                 } else {
                     unsafe { (*gr).gr_gid }
@@ -557,7 +750,10 @@ async fn run_uds_listener(
     }
 
     let fd = listener.into();
-    handle_listener(fd, service_name, wait, xinetd_fd, daemon).await;
+    if wait {
+        register_service_listener_fd(&service_name, order, &fd);
+    }
+    handle_listener(fd, service_name, wait, daemon).await;
 }
 
 // ============================================================================
@@ -568,7 +764,6 @@ async fn handle_listener(
     listener_fd: OwnedFd,
     service_name: String,
     wait: bool,
-    xinetd_fd: Option<i32>,
     daemon: Arc<Daemon>,
 ) {
     let async_fd = match AsyncFd::new(listener_fd) {
@@ -578,6 +773,7 @@ async fn handle_listener(
             return;
         }
     };
+    let mut activation_stream: Option<StdUnixStream> = None;
 
     loop {
         let mut guard = match async_fd.readable().await {
@@ -591,7 +787,7 @@ async fn handle_listener(
         debug!("Activation connection ready for {}", service_name);
 
         if wait {
-            // wait=true — pass the listening FD to the child (xinetd-style or systemd-style)
+            // Accept=false: pass the listening FD to the child using systemd-style activation.
             let already_running = {
                 let services = daemon.services.lock();
                 services.get(&service_name).is_some_and(|p| {
@@ -607,7 +803,7 @@ async fn handle_listener(
             if let Some(mut config) = config_opt {
                 if config.auth.is_some() {
                     warn!(
-                        "Auth configuration is ignored for wait=true activation on service '{}'",
+                        "Auth configuration is ignored for listener activation on service '{}'",
                         service_name
                     );
                 }
@@ -616,11 +812,13 @@ async fn handle_listener(
                     config.env.extend(context.to_env());
                 }
 
-                let passed_fd = async_fd
-                    .get_ref()
-                    .try_clone()
-                    .ok()
-                    .map(|fd| ActivationFd::Listen(fd, xinetd_fd));
+                let mut fds = service_listener_fds(&service_name);
+                if fds.is_empty()
+                    && let Ok(fd) = async_fd.get_ref().try_clone()
+                {
+                    fds.push(fd);
+                }
+                let passed_fd = Some(ActivationFd::Listen(fds));
                 if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
                     error!("Failed to activate service {}: {}", service_name, e);
                 }
@@ -628,7 +826,7 @@ async fn handle_listener(
 
             guard.clear_ready();
         } else {
-            // wait=false (inetd-style) — accept and pass the client fd
+            // Accept=true: accept and pass the client fd in inetd style.
             let raw_fd = async_fd.get_ref().as_raw_fd();
             let client_fd =
                 unsafe { libc::accept(raw_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -687,16 +885,32 @@ async fn handle_listener(
                     }
                 }
 
+                if config.activation_mode == ServiceActivationMode::Hybrid {
+                    let activation_socket = activation_socket_for_service(&config, &service_name);
+                    if let Err(e) = forward_accepted_fd(
+                        &service_name,
+                        &activation_socket,
+                        client_owned,
+                        &mut activation_stream,
+                        daemon.clone(),
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to forward activated fd for {} to {}: {}",
+                            service_name, activation_socket, e
+                        );
+                    }
+                    continue;
+                }
+
                 let cg = crate::cgroup::create_cgroup(&service_name)
                     .unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
 
                 let permit = match activation_semaphore().acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => {
-                        error!(
-                            "Activation semaphore closed for '{}': {}",
-                            service_name, e
-                        );
+                        error!("Activation semaphore closed for '{}': {}", service_name, e);
                         drop(client_owned);
                         continue;
                     }
@@ -708,7 +922,7 @@ async fn handle_listener(
                     Some(ActivationFd::Stdio(client_owned)),
                 ) {
                     Ok(pid) => {
-                        debug!("Spawned activated instance (wait=false) PID {}", pid);
+                        debug!("Spawned activated instance PID {}", pid);
                         tokio::spawn(async move {
                             let _permit = permit;
                             loop {

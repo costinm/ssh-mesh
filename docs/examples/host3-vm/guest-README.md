@@ -44,17 +44,17 @@ export HOME=/home/system
 export USER=system
 export LOGNAME=system
 export RUST_LOG=info
-export MESH_INIT_SOCK=$HOME/.run/mesh-init/control.sock
+export MESH_INIT_SOCK=$HOME/run/mesh-init/control.sock
 mesh-init
 ```
 
 With that contract, host3-vm uses the same HOME-relative layout as host2 and host1:
 
 ```text
-$HOME/.config/mesh-init/*.toml
-$HOME/.config/ssh-mesh/mesh.yaml
+$HOME/etc/mesh-init/*.service
+$HOME/etc/ssh-mesh/mesh.yaml
 $HOME/.ssh/config
-$HOME/.run/*
+$HOME/run/*
 ```
 
 Persistent config and runtime state come from the host example state tree,

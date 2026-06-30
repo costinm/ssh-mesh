@@ -1,9 +1,0 @@
-[service]
-name = "init-info"
-command = "/opt/busybox/bin/sh"
-args = ["-c", "echo '=== host3-vm startup info ==='; date; uname -a; echo '-- cmdline --'; cat /proc/cmdline 2>/dev/null || true; echo '-- cpu virtualization --'; grep -m1 -E '(^flags|^Features)' /proc/cpuinfo 2>/dev/null | grep -Eo 'vmx|svm' || echo 'no vmx/svm flag'; echo '-- memory --'; free -m 2>/dev/null || cat /proc/meminfo 2>/dev/null || true; echo '-- interfaces --'; ip addr 2>/dev/null || ifconfig -a 2>/dev/null || true; echo '-- routes --'; ip route 2>/dev/null || route -n 2>/dev/null || true; echo '-- virtio/kvm/vsock --'; ls -l /dev/kvm /dev/vhost-vsock /dev/vsock 2>/dev/null || true; grep -E ' kvm$|vsock|vhost' /proc/misc 2>/dev/null || true; find /sys/bus/virtio/devices -maxdepth 2 -type f -name modalias -print -exec cat {} \\; 2>/dev/null || true; echo '-- /nix --'; if [ -d /nix ]; then echo '/nix present'; ls -ld /nix; ls /nix/store 2>/dev/null | sed -n '1,10p'; else echo '/nix missing'; fi; echo '-- app homes --'; ls -la /home 2>/dev/null || true; echo '=== host3-vm startup info done ==='"]
-priority = 5
-oneshot = true
-
-[resources]
-memory_max = "64M"

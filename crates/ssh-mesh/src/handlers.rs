@@ -142,6 +142,9 @@ pub fn app(app_state: AppState) -> Router {
         .route("/_m/_uds/*path", any(handle_uds_proxy))
         .route("/_m/_exec/*cmd", any(handle_exec))
         .route("/_m/_ssh/*rest", any(handle_ssh_request))
+        .nest("/_m/mcp", crate::mcp_proxy::routes())
+        .nest("/_m/pmon", crate::pmon_proxy::routes())
+        .nest("/_m/trace", crate::trace_proxy::routes())
         .fallback(handle_proxy_request)
         .route("/_m/api/ssh/clients", get(get_ssh_clients))
         .nest_service(
@@ -542,12 +545,10 @@ fn mesh_init_socket_path() -> String {
     if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
         return path;
     }
-    if unsafe { libc::getuid() } == 0 {
-        "/run/mesh-init/control.sock".to_string()
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/mesh-init/control.sock", home)
-    }
+    mesh::paths::AppPaths::for_app("system")
+        .control_socket("mesh-init")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Execute a shell command and stream stdin/stdout over the HTTP/2 body.

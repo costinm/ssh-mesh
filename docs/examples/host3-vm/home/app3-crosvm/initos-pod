@@ -28,10 +28,10 @@ sshd_gid=103
 
 mkdir -p \
   "${home}" \
-  "${home}/.config/mesh-init" \
-  "${home}/.config/ssh-mesh" \
-  "${home}/.run/mesh-init" \
-  "${home}/.run/ssh-mesh/mux" \
+  "${home}/etc/mesh-init" \
+  "${home}/etc/ssh-mesh" \
+  "${home}/run/mesh-init" \
+  "${home}/run/ssh-mesh/mux" \
   "${home}/.ssh" \
   /tmp/mesh \
   /tmp/mesh/shared
@@ -62,27 +62,27 @@ if [ -d "${home_src}" ]; then
   fi
 fi
 
-# Mount a tmpfs on ${home}/.run to avoid placing UDS sockets on 9p share which QEMU blocks
-mkdir -p "${home}/.run"
-if mount -t tmpfs -o mode=0777,nosuid,nodev tmpfs "${home}/.run" 2>/dev/null; then
-  log "mounted tmpfs on ${home}/.run"
+# Mount a tmpfs on ${home}/run to avoid placing UDS sockets on 9p share which QEMU blocks
+mkdir -p "${home}/run"
+if mount -t tmpfs -o mode=0777,nosuid,nodev tmpfs "${home}/run" 2>/dev/null; then
+  log "mounted tmpfs on ${home}/run"
 else
-  log "warning: failed to mount tmpfs on ${home}/.run"
+  log "warning: failed to mount tmpfs on ${home}/run"
 fi
 
 mkdir -p \
-  "${home}/.config/mesh-init" \
-  "${home}/.config/ssh-mesh" \
-  "${home}/.run/mesh-init" \
-  "${home}/.run/ssh-mesh/mux" \
+  "${home}/etc/mesh-init" \
+  "${home}/etc/ssh-mesh" \
+  "${home}/run/mesh-init" \
+  "${home}/run/ssh-mesh/mux" \
   "${home}/.ssh"
 
 chmod 700 "${home}/.ssh"
 chmod 600 "${home}/.ssh/config" 2>/dev/null || true
 chown -R "${sshd_uid}:${sshd_gid}" \
   "${home}/.ssh" \
-  "${home}/.config/ssh-mesh" \
-  "${home}/.run/ssh-mesh" 2>/dev/null || true
+  "${home}/etc/ssh-mesh" \
+  "${home}/run/ssh-mesh" 2>/dev/null || true
 
 ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || true
@@ -93,9 +93,9 @@ export USER="${app_home}"
 export LOGNAME="${app_home}"
 export RUST_LOG="${RUST_LOG:-info}"
 export MESH_LOG_FILE="${MESH_LOG_FILE:-/dev/console}"
-export MESH_INIT_SOCK="${home}/.run/mesh-init/control.sock"
-export MESH_INIT_RUN="${home}/.run/mesh-init"
-export MESH_INIT_DIR="${home}/.config/mesh-init"
+export MESH_INIT_SOCK="${home}/run/mesh-init/control.sock"
+export MESH_INIT_RUN="${home}/run/mesh-init"
+export MESH_INIT_DIR="${home}/etc/mesh-init"
 export SSH_MESH_HOME_ROOT=/home
 
 log "starting mesh-init from /opt/ssh-mesh/bin/mesh-init"

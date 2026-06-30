@@ -25,11 +25,15 @@ use utoipa::ToSchema;
 pub mod auth;
 pub mod config_provider;
 pub mod handlers;
+pub mod jsonl_proxy;
+pub mod mcp_proxy;
 pub mod mux;
+pub mod pmon_proxy;
 pub mod socks5;
 pub mod sshc;
 pub mod sshd;
 pub mod sshmuxc;
+pub mod trace_proxy;
 pub mod trusted_transport;
 pub mod utils;
 
@@ -537,14 +541,7 @@ impl MeshNode {
             .config_dir
             .clone()
             .or_else(|| std::env::var("SSH_MESH_CONFIG").ok().map(PathBuf::from))
-            .unwrap_or_else(|| {
-                let mut path = std::env::var("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("/tmp"));
-                path.push(".config");
-                path.push("ssh-mesh");
-                path
-            })
+            .unwrap_or_else(|| mesh::paths::AppPaths::for_app("ssh-mesh").etc)
     }
 
     /// Convenience accessor for ssh_port from config.

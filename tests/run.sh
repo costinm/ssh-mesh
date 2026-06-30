@@ -31,10 +31,7 @@ start_servers() {
     tmux rename-window -t ssh-mesh-servers:0 'ssh-mesh'
     tmux send-keys -t ssh-mesh-servers:0 'RUST_LOG=info HTTP_PORT=15080 cargo run --bin ssh-mesh' C-m
 
-    # Window 1: pmond
-    tmux new-window -t ssh-mesh-servers -n 'pmond'
-    # pmond --server listens on 8081/8082 by default
-    tmux send-keys -t ssh-mesh-servers:1 'RUST_LOG=info cargo run --bin pmond -- --server' C-m
+    # pmond is started by mesh-init activation in docs/examples/pmond_activation_flow.sh.
 
     echo "Servers started in tmux session: ssh-mesh-servers"
     echo "To attach, run: tmux attach-session -t ssh-mesh-servers"
@@ -46,30 +43,15 @@ start_servers_nix() {
     tmux rename-window -t ssh-mesh-servers:0 'ssh-mesh'
     tmux send-keys -t ssh-mesh-servers:0 'RUST_LOG=info HTTP_PORT=15080 ssh-mesh' C-m
 
-    tmux new-window -t ssh-mesh-servers -n 'pmond'
-    # Force port to 8081 to be deterministic
-    tmux send-keys -t ssh-mesh-servers:1 'RUST_LOG=info HTTP_PORT=8081 pmond --server' C-m
+    # pmond is started by mesh-init activation in docs/examples/pmond_activation_flow.sh.
 
     echo "Servers started in tmux session: ssh-mesh-servers"
 }
 
 test_servers() {
-    echo "Starting servers from nix env built binaries..."
-    start_servers_nix
-    
-    echo "Waiting for servers to start..."
-    sleep 3
-    
-    echo "Testing ssh-mesh HTTP server via UDS ($(get_control_uds))..."
-    local uds=$(get_control_uds)
-    curl -s -f --unix-socket "$uds" http://localhost/_m/api/ssh/clients || { echo "ssh-mesh failed on UDS"; tmux kill-session -t ssh-mesh-servers; exit 1; }
-    
-    echo "Testing pmond HTTP server (port 8081)..."
-    curl -s -f http://localhost:8081/_m/pmon/_ps || { echo "pmond failed"; tmux kill-session -t ssh-mesh-servers; exit 1; }
-
-    echo "All tests passed! Stopping servers..."
-    tmux kill-session -t ssh-mesh-servers
-    echo "Servers stopped."
+    echo "Testing pmond activation through mesh-init and ssh-mesh..."
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/examples/pmond_activation_flow.sh"
+    echo "All tests passed."
 }
 
 connect_host8() {
