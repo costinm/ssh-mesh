@@ -1,0 +1,33 @@
+[package]
+name = "dmesh"
+version = "0.0.1"
+edition = "2024" 
+
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+
+[dependencies]
+ssh-mesh = { path = "../crates/ssh-mesh" }
+mesh-tun = { path = "../crates/tun", default-features = false }
+pmond = { path = "../crates/pmond" }
+lmesh = { path = "../crates/lmesh" }
+mesh = { path = "../crates/mesh" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = "0.7"
+log = "0.4"
+hyper-util = { version = "0.1", features = ["full"] }
+
+# Optional Python wrapper
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.3"
+serial_test = "3.0"
+
+[lib]
+name = "dmesh"
+crate-type = ["rlib", "cdylib"]
