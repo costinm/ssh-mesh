@@ -12,7 +12,7 @@ license = {text = "Apache-2.0"}
 dependencies = []
 
 [tool.maturin]
-manifest-path = "../crates/dmesh/Cargo.toml"
+manifest-path = "Cargo.toml"
 module-name = "dmesh.dmesh_py"
 python-source = "."
 python-packages = ["dmesh"]
