@@ -1,0 +1,25 @@
+[Socket]
+# TCP listeners:
+#   ssh        - SSH TCP
+#   mesh-mtls  - mesh H2/mTLS TCP
+#   http       - public static HTTP from <ssh-mesh_home>/web
+#   https      - public static HTTPS from <ssh-mesh_home>/web
+#   admin      - admin/API HTTP
+ListenStream=0.0.0.0:15022
+ListenStream=0.0.0.0:15443
+ListenStream=0.0.0.0:80
+ListenStream=0.0.0.0:443
+ListenStream=127.0.0.1:15080
+
+# Common mesh JSONL/JSON-RPC control socket:
+#   jsonl
+ListenStream=/home/ssh-mesh/run/ssh-mesh/jsonl.sock
+
+# Trusted SSH transports:
+#   ssh-uds    - trusted SSH over UDS
+#   vsock      - trusted SSH over AF_VSOCK
+ListenStream=/home/ssh-mesh/run/ssh-mesh/trusted-ssh.sock
+ListenStream=vsock:2:15022
+FileDescriptorName=ssh mesh-mtls http https admin jsonl ssh-uds vsock
+Accept=false
+Service=ssh-mesh
