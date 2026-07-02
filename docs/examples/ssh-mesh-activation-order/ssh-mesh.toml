@@ -1,0 +1,16 @@
+[Service]
+ExecStart=ssh-mesh
+
+[Socket]
+# Ordered activation without FileDescriptorName.
+ListenStream = [
+  "0.0.0.0:15022",
+  "0.0.0.0:15443",
+  "0.0.0.0:80",
+  "0.0.0.0:443",
+  "127.0.0.1:15080",
+  "/home/ssh-mesh/run/ssh-mesh/jsonl.sock",
+  "/home/ssh-mesh/run/ssh-mesh/trusted-ssh.sock",
+  "vsock:2:15022",
+]
+Accept = false

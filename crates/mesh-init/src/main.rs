@@ -189,7 +189,7 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
         let cmd = command[0].clone();
         let args = command[1..].to_vec();
 
-        // Apply defaults from default.service if present
+        // Apply defaults from default.toml if present
         let default_cfg = daemon.configs.lock().get("default").cloned();
 
         let cfg = mesh_init::config::AppConfig {

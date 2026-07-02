@@ -1,3 +1,0 @@
-[Socket]
-ListenStream=/tmp/mesh/shared/app1-bwrap/trusted.sock
-Accept=true

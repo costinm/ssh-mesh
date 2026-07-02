@@ -35,18 +35,17 @@ use crate::resource::ResourceManager;
 ///
 /// In addition, the configurable sshd UID (resolved via
 /// `mesh::auth::trusted_sshd_uid`, env var `MESH_TRUSTED_SSHD_UID`, default
-/// 103) is included, since sshd must spawn shells as other users.
+/// 103) and the ssh-mesh UID (resolved via `mesh::auth::ssh_mesh_uid`, env var
+/// `MESH_SSH_MESH_UID`, default 150) are included, since both must spawn
+/// shells as other users.
 ///
 /// Root (UID 0) is always privileged. The full list can be overridden with the
 /// `MESH_INIT_PRIVILEGED_UIDS` env var (comma-separated).
-const DEFAULT_SYSTEM_UID: u32 = 1000;
-
-/// Resolve the set of UIDs permitted to act as a different user (i.e. spawn
-/// or control a process whose UID differs from the peer's).
 ///
-/// If `MESH_INIT_PRIVILEGED_UIDS` is set, it fully overrides the default list.
-/// Otherwise the list is `[0, 1000]` plus the sshd UID from
-/// [`mesh::auth::trusted_sshd_uid`] (if `Some`).
+/// **Note:** UID 1000 (system) is root-equivalent for all mesh-init
+/// permissions, including system-wide observer methods. The ssh-mesh UID
+/// (default 150) is trusted for terminal/start operations and impersonation
+/// but NOT for observer methods — see [`require_system_or_root`].
 fn privileged_uids() -> Vec<u32> {
     if let Ok(v) = std::env::var("MESH_INIT_PRIVILEGED_UIDS") {
         let parsed: Vec<u32> = v
@@ -57,13 +56,39 @@ fn privileged_uids() -> Vec<u32> {
             return parsed;
         }
     }
-    let mut uids = vec![0, DEFAULT_SYSTEM_UID];
+    let mut uids = vec![0];
+    if let Some(sys) = mesh::auth::system_uid() {
+        uids.push(sys);
+    }
     if let Some(sshd) = mesh::auth::trusted_sshd_uid() {
         if !uids.contains(&sshd) {
             uids.push(sshd);
         }
     }
+    if let Some(mesh) = mesh::auth::ssh_mesh_uid() {
+        if !uids.contains(&mesh) {
+            uids.push(mesh);
+        }
+    }
     uids
+}
+
+/// Require that the peer is root (0) or the system UID.
+///
+/// Used by system-wide observer methods (`freeze_process`, `move_process`,
+/// `cgroup_high`, `clear_refs`, `freeze_cgroup`) that operate on arbitrary
+/// PIDs or cgroup paths. The ssh-mesh UID and the sshd UID are **not**
+/// sufficient for these operations — they must use the named-service APIs
+/// (`start`/`stop`/`freeze`/`unfreeze`) instead.
+fn require_system_or_root(peer_uid: u32) -> Result<(), Response> {
+    if mesh::auth::is_system_or_root(peer_uid) {
+        Ok(())
+    } else {
+        Err(Response::err(format!(
+            "permission denied: system-wide observer methods require root or system UID; peer UID {} is not authorized",
+            peer_uid
+        )))
+    }
 }
 
 /// Check whether `peer_uid` is permitted to act as `target_uid`/`target_gid`.
@@ -235,28 +260,6 @@ impl Daemon {
             }
         }
 
-        // 1b. Load systemd .socket units and merge activation entries into
-        //     matching service configs. Skip if no .service with that name exists.
-        for dir in &dirs {
-            let socket_units = crate::socket_unit::load_socket_units(dir);
-            for (service_name, act_configs) in socket_units {
-                let mut configs = self.configs.lock();
-                if let Some(cfg) = configs.get_mut(&service_name) {
-                    let count = act_configs.len();
-                    cfg.activation.extend(act_configs);
-                    info!(
-                        "Merged {} activation(s) from socket unit into service '{}'",
-                        count, service_name
-                    );
-                } else {
-                    error!(
-                        "Socket unit for '{}' has no matching service '{}' (expected '{}.service'). Skipping.",
-                        service_name, service_name, service_name
-                    );
-                }
-            }
-        }
-
         // 2. Start resource manager
         if let Some(ref rm) = self.resource_manager {
             rm.start();
@@ -271,7 +274,7 @@ impl Daemon {
         let mut other_configs: Vec<AppConfig> = Vec::new();
         for cfg in startup_configs {
             if cfg.name == "default" {
-                // default.service only provides defaults for execution mode
+                // default.toml only provides defaults for execution mode
                 continue;
             }
             if cfg.name.starts_with("init-") {
@@ -410,17 +413,19 @@ impl Daemon {
                 path,
                 percentage,
                 interval,
-            } => self.handle_observer_cgroup_high(path, percentage, interval),
+            } => self.handle_observer_cgroup_high(path, percentage, interval, peer_uid),
             Request::CgroupProcs { path } => self.handle_observer_cgroup_procs(&path),
             Request::MoveProcess { pid, cgroup_name } => {
-                self.handle_observer_move_process(pid, cgroup_name)
+                self.handle_observer_move_process(pid, cgroup_name, peer_uid)
             }
-            Request::ClearRefs { pid, value } => self.handle_observer_clear_refs(pid, &value),
+            Request::ClearRefs { pid, value } => {
+                self.handle_observer_clear_refs(pid, &value, peer_uid)
+            }
             Request::FreezeProcess { pid, freeze } => {
-                self.handle_observer_freeze_process(pid, freeze)
+                self.handle_observer_freeze_process(pid, freeze, peer_uid)
             }
             Request::FreezeCgroup { path, freeze } => {
-                self.handle_observer_freeze_cgroup(&path, freeze)
+                self.handle_observer_freeze_cgroup(&path, freeze, peer_uid)
             }
             // Job scheduling requests are handled by the JobScheduler, not the main Daemon service manager
             Request::ScheduleJob { .. }
@@ -616,7 +621,7 @@ impl Daemon {
                 let base_dir =
                     std::env::var("USER_INIT").unwrap_or_else(|_| "/data/mesh".to_string());
                 let app_dir = std::path::Path::new(&base_dir).join(name);
-                let service_path = app_dir.join("init.service");
+                let service_path = app_dir.join("init.toml");
 
                 if service_path.exists() {
                     match config::load_app_config(&service_path) {
@@ -646,6 +651,21 @@ impl Daemon {
                 }
             }
         };
+
+        // A5: Re-check authorization against the freshly loaded/reloaded config.
+        // The config was just reloaded from disk (or loaded for the first time
+        // from USER_INIT). Its `uid` may differ from the cached copy used for
+        // the initial auth check above. A non-privileged peer must not benefit
+        // from a config that resolves to a different UID.
+        if let Err(resp) = check_impersonation(
+            peer_uid,
+            peer_gid,
+            config.uid.unwrap_or(peer_uid),
+            config.gid,
+            name,
+        ) {
+            return resp;
+        }
 
         // Determine if already running and if config changed
         let mut should_restart = false;
@@ -1176,7 +1196,11 @@ impl Daemon {
         path: String,
         percentage: f64,
         interval: u64,
+        peer_uid: u32,
     ) -> Response {
+        if let Err(resp) = require_system_or_root(peer_uid) {
+            return resp;
+        }
         match self
             .observer
             .adjust_cgroup_memory_high(path, percentage, interval)
@@ -1192,14 +1216,25 @@ impl Daemon {
         ))
     }
 
-    fn handle_observer_move_process(&self, pid: u32, cgroup_name: Option<String>) -> Response {
+    fn handle_observer_move_process(
+        &self,
+        pid: u32,
+        cgroup_name: Option<String>,
+        peer_uid: u32,
+    ) -> Response {
+        if let Err(resp) = require_system_or_root(peer_uid) {
+            return resp;
+        }
         match self.observer.move_process_to_cgroup(pid, cgroup_name) {
             Ok(()) => Response::ok(),
             Err(e) => Response::err(e.to_string()),
         }
     }
 
-    fn handle_observer_clear_refs(&self, pid: u32, value: &str) -> Response {
+    fn handle_observer_clear_refs(&self, pid: u32, value: &str, peer_uid: u32) -> Response {
+        if let Err(resp) = require_system_or_root(peer_uid) {
+            return resp;
+        }
         match self.observer.clear_refs(pid, value) {
             Ok(()) => Response::ok_with_data(serde_json::json!({
                 "message": format!("cleared refs for process {pid} with value {value}")
@@ -1208,14 +1243,20 @@ impl Daemon {
         }
     }
 
-    fn handle_observer_freeze_process(&self, pid: u32, freeze: bool) -> Response {
+    fn handle_observer_freeze_process(&self, pid: u32, freeze: bool, peer_uid: u32) -> Response {
+        if let Err(resp) = require_system_or_root(peer_uid) {
+            return resp;
+        }
         match self.observer.freeze_process(pid, freeze) {
             Ok(()) => Response::ok(),
             Err(e) => Response::err(e.to_string()),
         }
     }
 
-    fn handle_observer_freeze_cgroup(&self, path: &str, freeze: bool) -> Response {
+    fn handle_observer_freeze_cgroup(&self, path: &str, freeze: bool, peer_uid: u32) -> Response {
+        if let Err(resp) = require_system_or_root(peer_uid) {
+            return resp;
+        }
         match self.observer.freeze_cgroup(path, freeze) {
             Ok(()) => Response::ok(),
             Err(e) => Response::err(e.to_string()),
@@ -1755,7 +1796,7 @@ mod tests {
     #[test]
     fn test_daemon_config_loading() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("sleep.service");
+        let config_path = dir.path().join("sleep.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -1990,13 +2031,17 @@ OOMScoreAdjust = -700
     }
 
     #[tokio::test]
-    async fn test_privileged_uids_default_includes_root_system_and_sshd() {
+    async fn test_privileged_uids_default_includes_root_system_sshd_and_mesh() {
         let uids = privileged_uids();
         assert!(uids.contains(&0), "root must be privileged");
         assert!(uids.contains(&1000), "system (1000) must be privileged");
         assert!(
             uids.contains(&103),
             "default sshd uid (103) must be privileged"
+        );
+        assert!(
+            uids.contains(&150),
+            "default ssh-mesh uid (150) must be privileged"
         );
     }
 

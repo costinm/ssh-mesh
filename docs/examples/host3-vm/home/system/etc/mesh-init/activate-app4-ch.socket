@@ -1,3 +1,0 @@
-[Socket]
-ListenStream=/tmp/mesh/shared/app4-ch/trusted.sock
-Accept=true

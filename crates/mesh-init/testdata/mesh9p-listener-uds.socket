@@ -1,3 +1,0 @@
-[Socket]
-ListenStream=/tmp/mesh9p_listener.sock
-Accept=false

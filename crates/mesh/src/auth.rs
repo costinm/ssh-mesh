@@ -4,6 +4,28 @@
 //! authorization. Supports both standalone `auth.toml` files and embedded
 //! `[[peer]]` sections in service TOML configs.
 //!
+//! # Privileged UIDs
+//!
+//! Three service UIDs have hardcoded defaults that mesh-init treats as
+//! root-equivalent for the purpose of spawning and controlling services:
+//!
+//! | UID  | Constant                | Env var                  | Purpose                |
+//! |------|-------------------------|--------------------------|------------------------|
+//! | 0    | (root)                  | —                        | Unrestricted           |
+//! | 1000 | [`DEFAULT_SYSTEM_UID`]  | `MESH_SYSTEM_UID`        | "system" service acct  |
+//! | 103  | [`DEFAULT_TRUSTED_SSHD_UID`] | `MESH_TRUSTED_SSHD_UID` | sshd (Debian)     |
+//! | 150  | [`DEFAULT_SSH_MESH_UID`]     | `MESH_SSH_MESH_UID`     | ssh-mesh service acct  |
+//!
+//! **UID 1000 (system) is trusted and equivalent to root for all permissions.**
+//! It can start/stop/freeze services running as any UID, spawn terminals as
+//! any user, and access the process-observer control methods. Operators who
+//! do not want this must set `MESH_SYSTEM_UID` to a different value or `none`.
+//!
+//! The ssh-mesh UID (default 150) is trusted for terminal/start operations and
+//! impersonation, but **not** for system-wide observer methods
+//! (`freeze_process`, `move_process`, `cgroup_high`, etc.) which require
+//! root (0) or system (1000) — see [`is_system_or_root`].
+//!
 //! # Delegation
 //!
 //! A peer with a `delegate` pattern is trusted to assert identities on behalf
@@ -22,6 +44,29 @@ use serde::{Deserialize, Serialize};
 /// the builtin sshd-UID allowlist entirely. Relying on this hardcoded default
 /// is insecure on systems where UID 103 belongs to an unrelated account.
 pub const DEFAULT_TRUSTED_SSHD_UID: u32 = 103;
+
+/// Hardcoded UID for the `system` service account.
+///
+/// UID 1000 is the conventional "system" user on mesh-init-managed hosts.
+/// It is **trusted and equivalent to root** for all mesh-init permissions:
+/// it may start/stop/freeze services running as any UID, spawn terminals as
+/// any user, and invoke system-wide observer methods.
+///
+/// Operators who do not want UID 1000 to be privileged must set
+/// `MESH_SYSTEM_UID` to a different value or `none` to disable it.
+pub const DEFAULT_SYSTEM_UID: u32 = 1000;
+
+/// Hardcoded UID for the `ssh-mesh` service account.
+///
+/// This is the UID under which the `ssh-mesh` daemon is expected to run.
+/// It is trusted for terminal/start operations and impersonation (it can
+/// spawn shells as any UID), but **not** for system-wide observer methods
+/// (`freeze_process`, `move_process`, `cgroup_high`, `clear_refs`,
+/// `freeze_cgroup`) which require root or the system UID — see
+/// [`is_system_or_root`].
+///
+/// Override with the `MESH_SSH_MESH_UID` environment variable.
+pub const DEFAULT_SSH_MESH_UID: u32 = 150;
 use tracing::warn;
 
 /// Resolve the trusted sshd UID.
@@ -36,7 +81,34 @@ use tracing::warn;
 /// is trusted by the builtin allowlist; all other UIDs must be listed in
 /// `[[peer]]` entries.
 pub fn trusted_sshd_uid() -> Option<u32> {
-    match std::env::var("MESH_TRUSTED_SSHD_UID") {
+    resolve_privileged_uid("MESH_TRUSTED_SSHD_UID", DEFAULT_TRUSTED_SSHD_UID)
+}
+
+/// Resolve the `system` service UID.
+///
+/// Reads the `MESH_SYSTEM_UID` environment variable:
+/// - unset → falls back to [`DEFAULT_SYSTEM_UID`] (1000)
+/// - a number → that UID
+/// - `none` or `off` → `None` (disables the system-UID allowlist)
+/// - invalid → falls back to the default with a warning
+pub fn system_uid() -> Option<u32> {
+    resolve_privileged_uid("MESH_SYSTEM_UID", DEFAULT_SYSTEM_UID)
+}
+
+/// Resolve the `ssh-mesh` service UID.
+///
+/// Reads the `MESH_SSH_MESH_UID` environment variable:
+/// - unset → falls back to [`DEFAULT_SSH_MESH_UID`] (150)
+/// - a number → that UID
+/// - `none` or `off` → `None` (disables the ssh-mesh-UID allowlist)
+/// - invalid → falls back to the default with a warning
+pub fn ssh_mesh_uid() -> Option<u32> {
+    resolve_privileged_uid("MESH_SSH_MESH_UID", DEFAULT_SSH_MESH_UID)
+}
+
+/// Shared helper: resolve a privileged-service UID from an env var.
+fn resolve_privileged_uid(env_var: &str, default: u32) -> Option<u32> {
+    match std::env::var(env_var) {
         Ok(v) => {
             let trimmed = v.trim();
             if trimmed.eq_ignore_ascii_case("none")
@@ -49,16 +121,25 @@ pub fn trusted_sshd_uid() -> Option<u32> {
                     Ok(n) => Some(n),
                     Err(_) => {
                         warn!(
-                            "Invalid MESH_TRUSTED_SSHD_UID='{}'; falling back to default {}",
-                            v, DEFAULT_TRUSTED_SSHD_UID
+                            "Invalid {}='{}'; falling back to default {}",
+                            env_var, v, default
                         );
-                        Some(DEFAULT_TRUSTED_SSHD_UID)
+                        Some(default)
                     }
                 }
             }
         }
-        Err(_) => Some(DEFAULT_TRUSTED_SSHD_UID),
+        Err(_) => Some(default),
     }
+}
+
+/// Check whether `uid` is root (0) or the configured system UID.
+///
+/// System-wide observer methods (`freeze_process`, `move_process`,
+/// `cgroup_high`, `clear_refs`, `freeze_cgroup`) require this privilege
+/// level. The ssh-mesh UID is **not** sufficient for these operations.
+pub fn is_system_or_root(uid: u32) -> bool {
+    uid == 0 || system_uid().is_some_and(|sys| uid == sys)
 }
 
 // ============================================================================
@@ -141,12 +222,17 @@ pub struct DelegationEnvelope {
 impl AuthConfig {
     /// Check the built-in local UDS peer allowlist.
     ///
-    /// Root (UID 0) and the daemon's own UID (`current_uid`) are always
-    /// authorized. The sshd service UID is authorized only if
-    /// [`trusted_sshd_uid`] returns `Some` (configurable via
-    /// `MESH_TRUSTED_SSHD_UID`; set to `none` to disable).
+    /// Root (UID 0), the daemon's own UID (`current_uid`), the system UID
+    /// (default 1000, see [`system_uid`]), the sshd UID (default 103, see
+    /// [`trusted_sshd_uid`]), and the ssh-mesh UID (default 150, see
+    /// [`ssh_mesh_uid`]) are always authorized. Each can be disabled by
+    /// setting its env var to `none`/`off`.
     pub fn is_builtin_uid_authorized(uid: u32, current_uid: u32) -> bool {
-        uid == 0 || uid == current_uid || trusted_sshd_uid().is_some_and(|sshd| uid == sshd)
+        uid == 0
+            || uid == current_uid
+            || system_uid().is_some_and(|sys| uid == sys)
+            || trusted_sshd_uid().is_some_and(|sshd| uid == sshd)
+            || ssh_mesh_uid().is_some_and(|mesh| uid == mesh)
     }
 
     /// Check if a UID is authorized to connect directly.
@@ -421,6 +507,26 @@ mod tests {
     fn test_auth_default_sshd_uid_always_authorized() {
         let config = AuthConfig::default();
         assert!(config.is_uid_authorized(DEFAULT_TRUSTED_SSHD_UID, 5000));
+    }
+
+    #[test]
+    fn test_auth_default_system_uid_always_authorized() {
+        let config = AuthConfig::default();
+        assert!(config.is_uid_authorized(DEFAULT_SYSTEM_UID, 5000));
+    }
+
+    #[test]
+    fn test_auth_default_ssh_mesh_uid_always_authorized() {
+        let config = AuthConfig::default();
+        assert!(config.is_uid_authorized(DEFAULT_SSH_MESH_UID, 5000));
+    }
+
+    #[test]
+    fn test_is_system_or_root() {
+        assert!(is_system_or_root(0));
+        assert!(is_system_or_root(DEFAULT_SYSTEM_UID));
+        assert!(!is_system_or_root(DEFAULT_SSH_MESH_UID));
+        assert!(!is_system_or_root(9999));
     }
 
     #[test]

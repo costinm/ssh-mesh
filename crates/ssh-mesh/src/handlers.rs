@@ -451,13 +451,20 @@ fn send_mesh_init_exec_fd_blocking(
 ) -> Result<(), anyhow::Error> {
     let socket_path = mesh_init_socket_path();
     let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)?;
-    let user = std::env::var("USER").unwrap_or_else(|_| "system".to_string());
+    // The admin interface impersonates the 'system' user (UID 1000) when
+    // calling mesh-init. ssh-mesh itself runs as the ssh-mesh service UID
+    // (default 150, see mesh::auth::ssh_mesh_uid), which is in
+    // privileged_uids() and therefore allowed to target any UID. We
+    // explicitly request UID 1000 (system) so the exec'd command runs as
+    // the system service account, not as root.
+    let system_uid = mesh::auth::system_uid().unwrap_or(1000);
+    let system_gid = system_uid; // system user's primary GID matches UID
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let request = mesh::protocol::Request::StartTerminal {
-        name: user,
+        name: "system".to_string(),
         home,
-        uid: unsafe { libc::getuid() },
-        gid: Some(unsafe { libc::getgid() }),
+        uid: system_uid,
+        gid: Some(system_gid),
         pty: false,
         env,
         context: None,

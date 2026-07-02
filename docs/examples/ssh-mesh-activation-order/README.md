@@ -1,9 +1,9 @@
 # ssh-mesh activation by fd order
 
-This example intentionally does not use `FileDescriptorName=`.
+This example intentionally does not use `FileDescriptorName`.
 
 `ssh-mesh` can consume all supported startup listeners by order. The order is
-documented as comments in `ssh-mesh.socket`; keep that file in sync with the
+documented as comments in `ssh-mesh.toml`; keep that file in sync with the
 startup order if surfaces are added.
 
 The JSONL UDS entry is the common `mesh::server::MeshListener` JSONL/JSON-RPC

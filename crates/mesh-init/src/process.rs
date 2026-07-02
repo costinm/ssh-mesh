@@ -168,51 +168,82 @@ pub fn spawn_process(
         cmd.env(key, value);
     }
 
-    // Set uid/gid if specified
+    // A2: Privilege drop and hardening — all in pre_exec, in the correct
+    // order. Rust's std applies cmd.uid()/cmd.gid() BEFORE pre_exec, which
+    // means setgroups would fail (EPERM) after the uid drop. So we do NOT use
+    // cmd.uid()/cmd.gid() and instead perform the full privilege drop inside
+    // pre_exec where we control the ordering:
+    //
+    //   1. unshare(CLONE_NEWNET)  — needs CAP_SYS_ADMIN (root)
+    //   2. setgroups              — needs CAP_SETGID (root); clear or set
+    //   3. setresgid              — drop GID
+    //   4. setresuid              — drop UID
+    //   5. umask
+    //   6. prctl(NoNewPrivs)      — always, prevents setuid re-escalation
+    //
+    // The PTY/listen pre_exec closures (registered after this one) run
+    // next; they don't need root.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
 
-        if !config.supplementary_groups.is_empty()
-            || config.umask.is_some()
-            || config.no_new_privileges
-            || config.private_network
-        {
-            let supplementary_groups = config.supplementary_groups.clone();
-            let umask = config.umask;
-            let no_new_privileges = config.no_new_privileges;
-            let private_network = config.private_network;
-            unsafe {
-                cmd.pre_exec(move || {
-                    if private_network && libc::unshare(libc::CLONE_NEWNET) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if !supplementary_groups.is_empty() {
-                        let groups: Vec<libc::gid_t> = supplementary_groups
-                            .iter()
-                            .copied()
-                            .map(|gid| gid as libc::gid_t)
-                            .collect();
-                        if libc::setgroups(groups.len(), groups.as_ptr()) < 0 {
-                            return Err(std::io::Error::last_os_error());
+        let drop_uid = config.uid;
+        let drop_gid = config.gid;
+        let supplementary_groups = config.supplementary_groups.clone();
+        let umask = config.umask;
+        let private_network = config.private_network;
+
+        unsafe {
+            cmd.pre_exec(move || {
+                // 1. Private network namespace (needs root)
+                if private_network && libc::unshare(libc::CLONE_NEWNET) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // 2. Set supplementary groups (or clear them). Must run
+                //    while we still have CAP_SETGID, i.e. before setresgid.
+                if supplementary_groups.is_empty() {
+                    // Clear all supplementary groups so the child doesn't
+                    // retain the daemon's groups (root, disk, shadow, etc.).
+                    let ret = libc::setgroups(0, std::ptr::null());
+                    if ret < 0 {
+                        let err = std::io::Error::last_os_error();
+                        // EPERM is expected if we're already non-root.
+                        if err.raw_os_error() != Some(libc::EPERM) {
+                            return Err(err);
                         }
                     }
-                    if let Some(mask) = umask {
-                        libc::umask(mask as libc::mode_t);
-                    }
-                    if no_new_privileges && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                } else {
+                    let groups: Vec<libc::gid_t> = supplementary_groups
+                        .iter()
+                        .copied()
+                        .map(|gid| gid as libc::gid_t)
+                        .collect();
+                    if libc::setgroups(groups.len(), groups.as_ptr()) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    Ok(())
-                });
-            }
-        }
-
-        if let Some(uid) = config.uid {
-            cmd.uid(uid);
-        }
-        if let Some(gid) = config.gid {
-            cmd.gid(gid);
+                }
+                // 3. Drop GID (real, effective, saved)
+                if let Some(gid) = drop_gid {
+                    if libc::setresgid(gid, gid, gid) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // 4. Drop UID (real, effective, saved)
+                if let Some(uid) = drop_uid {
+                    if libc::setresuid(uid, uid, uid) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // 5. Umask
+                if let Some(mask) = umask {
+                    libc::umask(mask as libc::mode_t);
+                }
+                // 6. NoNewPrivs — always set, prevents setuid re-escalation
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
     }
 

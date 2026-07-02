@@ -8,4 +8,3 @@ pub mod process;
 pub use mesh::protocol;
 pub mod resource;
 pub mod server;
-pub mod socket_unit;

@@ -1,0 +1,117 @@
+# Example mesh-init service file containing every currently supported service
+# config field. Service files are TOML, not systemd INI.
+
+# Job metadata fields are top-level TOML keys and must appear before tables.
+MeshPersisted = true
+MeshPrefetch = false
+MeshSaveResult = true
+MeshTraceTag = "example.all-fields"
+MeshUserInitiated = true
+MeshExpedited = false
+MeshEstimatedDownloadBytes = 1048576
+MeshEstimatedUploadBytes = 65536
+MeshMinimumNetworkChunkBytes = 4096
+
+[Service]
+ExecStartPre = ["/bin/true"]
+ExecStart = "/bin/sh -c 'echo mesh-init all-fields example; sleep 60'"
+ExecStartPost = ["/bin/true"]
+ExecStop = ["/bin/true"]
+ExecReload = ["/bin/true"]
+Type = "oneshot"
+User = "1000"
+Group = "1000"
+WorkingDirectory = "/tmp"
+Restart = "on-failure"
+RestartSec = "5s"
+TimeoutStartSec = "30s"
+TimeoutStopSec = "10s"
+KillSignal = "SIGTERM"
+KillMode = "control-group"
+SendSIGKILL = true
+UMask = "0022"
+SupplementaryGroups = ["0"]
+OOMScoreAdjust = -500
+NoNewPrivileges = true
+PrivateTmp = false
+PrivateDevices = false
+PrivateNetwork = false
+ProtectSystem = "off"
+ProtectHome = "off"
+ReadWritePaths = ["/tmp"]
+ReadOnlyPaths = ["/etc"]
+InaccessiblePaths = ["/root"]
+CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE"]
+AmbientCapabilities = []
+MeshActivationMode = "hybrid"
+MeshActivationSocket = "/tmp/mesh-init-all-fields/control.sock"
+
+[Socket]
+ListenStream = ["127.0.0.1:14022", "/tmp/mesh-init-all-fields/public.sock"]
+ListenDatagram = ["127.0.0.1:14023", "/tmp/mesh-init-all-fields/events.sock"]
+Accept = false
+SocketMode = 0o660
+SocketUser = "1000"
+SocketGroup = "1000"
+FileDescriptorName = ["ssh", "public", "udp-events", "uds-events"]
+
+[Resources]
+MemoryMin = "64M"
+MemoryHigh = "256M"
+MemoryMax = "512M"
+CPUWeight = 100
+
+[Environment]
+RUST_LOG = "info"
+EXAMPLE_MODE = "all-fields"
+
+[Network]
+backend = "mesh-tun"
+command = "pasta"
+args = ["--config-net", "{pid}"]
+control_socket = "/tmp/mesh-tun/control.sock"
+if_name = "mesh0"
+address = "10.5.0.2/24"
+gateway = "10.5.0.1"
+mtu = 65520
+default_route = true
+egress_redirect_port = 15001
+egress_redirect_uid = 1000
+
+[Network.env]
+PASTA_TRACE = "0"
+
+[[Peer]]
+uid = 1000
+id = "example.mesh.local"
+email = "example@example.com"
+delegate = "*.mesh.local"
+
+[[MeshImpersonation]]
+from = "example.mesh.local"
+to = "*.mesh.local"
+
+[Schedule]
+periodic_secs = 3600
+flex_secs = 300
+minimum_latency_secs = 30
+override_deadline_secs = 7200
+
+[Constraints]
+network_type = "unmetered"
+requires_charging = false
+requires_device_idle = false
+requires_battery_not_low = true
+requires_storage_not_low = true
+triggers = ["network", "timer"]
+trigger_max_delay_secs = 60
+
+[Constraints.custom]
+has_gpu = false
+inside_vm = true
+
+[Backoff]
+initial_secs = 5
+policy = "exponential"
+max_retries = 10
+max_secs = 3600

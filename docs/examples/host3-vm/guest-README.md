@@ -51,7 +51,7 @@ mesh-init
 With that contract, host3-vm uses the same HOME-relative layout as host2 and host1:
 
 ```text
-$HOME/etc/mesh-init/*.service
+$HOME/etc/mesh-init/*.toml
 $HOME/etc/ssh-mesh/mesh.yaml
 $HOME/.ssh/config
 $HOME/run/*

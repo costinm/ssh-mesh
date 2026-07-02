@@ -1,8 +1,8 @@
 # mesh-init Usage Guide
 
 `mesh-init` manages local background services, lifecycle, cgroup resources, and
-socket activation. Service configs use systemd-style `.service` and `.socket`
-files with a small set of mesh-init extensions.
+socket activation. Service configs use strict TOML files with systemd-style
+tables and a small set of mesh-init extensions.
 
 See `CONFIG.md` for the complete supported field list.
 
@@ -14,7 +14,7 @@ config directory.
 ```bash
 TEST_DIR=$(mktemp -d)
 
-cat <<EOF > "$TEST_DIR/echo-service.service"
+cat <<EOF > "$TEST_DIR/echo-service.toml"
 [Service]
 ExecStart = "/bin/sleep 3600"
 OOMScoreAdjust = -900
@@ -55,42 +55,36 @@ workspace `target/` directory.
 
 ## Socket Activation
 
-Sockets are declared only with `.socket` files. A matching `name.socket` targets
-`name.service` unless `Service=` is set in the socket file.
+Sockets are declared in the same `name.toml` file as the service by adding an
+optional `[Socket]` table.
 
 `Accept=false` passes listener FDs to the service using systemd activation
 (`LISTEN_FDS`, starting at fd 3). `Accept=true` accepts each connection in
 `mesh-init` and passes the accepted socket as stdin/stdout/stderr.
 
 ```toml
-# activated_svc.service
+# activated_svc.toml
 [Service]
 ExecStart = "/bin/sh -c 'echo SUCCESS'"
-```
 
-```ini
-# activated_svc.socket
 [Socket]
-ListenStream=14022
-Accept=true
+ListenStream = "14022"
+Accept = true
 ```
 
-Hybrid activation also uses `.socket` files, but accepted sockets are forwarded
+Hybrid activation also uses `.toml` files, but accepted sockets are forwarded
 to the service's JSONL Unix socket with `SCM_RIGHTS`.
 
 ```toml
-# hybrid_svc.service
+# hybrid_svc.toml
 [Service]
 ExecStart = "/opt/ssh-mesh/bin/hybrid_svc"
 MeshActivationMode = "hybrid"
 MeshActivationSocket = "/run/hybrid_svc/control.sock"
-```
 
-```ini
-# hybrid_svc.socket
 [Socket]
-ListenStream=/run/hybrid_svc/public.sock
-Accept=true
+ListenStream = "/run/hybrid_svc/public.sock"
+Accept = true
 ```
 
 ## Execution Mode
@@ -102,11 +96,11 @@ then cleans up and exits.
 ./target/debug/mesh-init sleep 5
 ```
 
-In execution mode, `default.service` in `$MESH_INIT_DIR` provides defaults for
+In execution mode, `default.toml` in `$MESH_INIT_DIR` provides defaults for
 the foreground command.
 
 ```toml
-# $MESH_INIT_DIR/default.service
+# $MESH_INIT_DIR/default.toml
 [Service]
 ExecStart = "_placeholder_"
 User = "1000"
@@ -121,12 +115,12 @@ CPUWeight = 100
 RUST_LOG = "info"
 ```
 
-Files named `init-*.service` run before the main command and regular services.
+Files named `init-*.toml` run before the main command and regular services.
 Use `Type = "oneshot"` when `mesh-init` should wait for completion and avoid
 restarting the init service.
 
 ```toml
-# $MESH_INIT_DIR/init-setup.service
+# $MESH_INIT_DIR/init-setup.toml
 [Service]
 ExecStart = "/bin/sh -c 'mkdir -p /data/app && chown 1000:1000 /data/app'"
 OOMScoreAdjust = -990

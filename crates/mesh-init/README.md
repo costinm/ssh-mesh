@@ -32,7 +32,7 @@ The actual execution can be handled directly for simple cases or delegated. If m
 
 ## API 
 
-- 'start' request receives the name of the app ("google-chrome"). If a config file exists ('google-chrome.service'), it is loaded and used to configure the jail, including
+- 'start' request receives the name of the app ("google-chrome"). If a config file exists ('google-chrome.toml'), it is loaded and used to configure the jail, including
  resources, command to launch, etc. Additional parameters are env, args and a set of FDs. The user ID is in the config.
 
 - stop / freeze / unfreeze
@@ -99,7 +99,7 @@ added later, but native mesh-init config should remain TOML.
 `[Unit]` and `[Install]` sections are not supported and are not planned. mesh-init
 does not implement a full dependency solver, target graph, enable/install state,
 or boot transaction model. Service names come from file names, and socket
-activation comes from matching `.socket` files.
+activation comes from the optional `[Socket]` table in the same `.toml` file.
 
 `[Environment]` remains a TOML table. We do not plan to copy systemd's repeated
 `Environment=` syntax because the table form is stricter and easier to validate.
@@ -171,6 +171,18 @@ not restarted automatically.
 - env variable to set system and app config dir.
 - check peer identity - allow 0, 1000 and current user if not 
 running as root.
+- Find or build a converter for mesh-init TOML and systemd INI units. Example
+LLM prompt:
+
+```text
+Convert this mesh-init TOML service into equivalent systemd .service and
+.socket units, then convert the result back to mesh-init TOML. Preserve
+[Service] command, identity, restart, timeout, kill, sandboxing, capability,
+and resource semantics. Convert [Socket] ListenStream, ListenDatagram, Accept,
+SocketMode, SocketUser, SocketGroup, and FileDescriptorName into systemd socket
+unit fields. Keep [Environment] as TOML table form when converting back, and
+report any systemd fields that have no mesh-init equivalent.
+```
 
 Useful crates:
 - unshare https://github.com/tailhook/unshare

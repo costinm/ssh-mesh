@@ -1,0 +1,35 @@
+
+# On-demand activator for the no-network QEMU VM environment reached over
+# virtio-vsock.
+
+[Service]
+
+ExecStart = "/opt/ssh-mesh/bin/vrun start"
+Type = "oneshot"
+OOMScoreAdjust = -770
+[[Peer]]
+uid = 103
+
+[Resources]
+MemoryHigh = "384M"
+MemoryMax = "768M"
+CPUWeight = 50
+
+[Environment]
+RUST_LOG = "info"
+SSH_MESH_EXAMPLE_ROOT = "/src"
+SSH_MESH_VRUN_APP = "1"
+NIX_PROFILE = "/src/host3-vm/nix-profile"
+SSH_MESH_APP_VM_KERNEL = "/src/vm-artifacts/vmlinux-cloud"
+SSH_MESH_APP_VM_ROOTFS = "/src/vm-artifacts/ssh-mesh.erofs"
+SSH_MESH_APP_VM_MODULES = "/src/vm-artifacts/modules-cloud.erofs"
+SSH_MESH_VM_NODE = "app2-qemu"
+SSH_MESH_APP_HOME = "app2"
+SSH_MESH_APP_TEMPLATE_DIR = "/src/host3-vm/home/app2-qemu"
+SSH_MESH_VM_HYPERVISOR = "qemu"
+SSH_MESH_VM_VSOCK_CID = "43"
+SSH_MESH_VM_VSOCK_PORT = "18522"
+
+[Socket]
+ListenStream = "/tmp/mesh/shared/app2-qemu/trusted.sock"
+Accept = true

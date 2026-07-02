@@ -395,6 +395,16 @@ impl ProcessObserver {
             format!("{}.scope", name)
         };
 
+        // A4: Validate the name to prevent path traversal. Without this, a
+        // peer-supplied cgroup_name like "../../system.slice" would escape the
+        // base_path via format!("{}/{}", base_path, name).
+        if let Err(reason) = crate::config::validate_cgroup_name(&name) {
+            return Err(ObserverError::CgroupError(format!(
+                "invalid cgroup name '{}': {}",
+                name, reason
+            )));
+        }
+
         let target_cgroup_path = format!("{}/{}", base_path, name);
 
         if !std::path::Path::new(&target_cgroup_path).exists() {

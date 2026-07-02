@@ -1,15 +1,13 @@
 # ssh-mesh activation with named fds
 
-This example uses one `.socket` file with every listener surface.
-`FileDescriptorName=` normally names every fd in the socket unit. `mesh-init`
-also accepts a space-separated list in a single `FileDescriptorName=` value and
-maps that list to listeners in fd order:
+This example uses one `.toml` file with every listener surface.
+`FileDescriptorName` names every fd from the `[Socket]` table. `mesh-init`
+accepts a TOML list and maps that list to listeners in fd order:
 
-```ini
+```toml
 [Socket]
-ListenStream=8443
-ListenStream=vsock:2:5000
-FileDescriptorName=http-secure vm-ipc
+ListenStream = ["8443", "vsock:2:5000"]
+FileDescriptorName = ["http-secure", "vm-ipc"]
 ```
 
 `ssh-mesh` consumes these names:
@@ -31,7 +29,7 @@ descriptor name `admin`.
 
 The `jsonl` listener is the common `mesh::server::MeshListener` JSONL/JSON-RPC
 surface. Apps that are not `ssh-mesh` should use the same name in their own
-socket unit with their own `Service=`.
+service TOML file.
 
 `ssh-uds` and `vsock` are both trusted SSH transports. They are grouped after
 the JSONL/admin surfaces because they are not control APIs.

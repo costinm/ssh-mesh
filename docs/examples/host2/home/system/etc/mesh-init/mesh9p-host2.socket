@@ -1,4 +1,0 @@
-[Socket]
-Service=mesh9p
-ListenStream=15102
-Accept=true

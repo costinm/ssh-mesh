@@ -1,3 +1,0 @@
-[Service]
-ExecStart = "/bin/sh -c 'echo SUCCESS'"
-OOMScoreAdjust = -800

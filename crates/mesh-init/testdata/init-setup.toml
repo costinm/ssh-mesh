@@ -1,0 +1,6 @@
+# init-setup.toml - Runs before the main application and other services.
+# Example: create directories, set permissions, etc.
+[Service]
+ExecStart = "/bin/sh -c 'echo '\"'\"'init-setup complete'\"'\"''"
+Type = "oneshot"
+OOMScoreAdjust = -990

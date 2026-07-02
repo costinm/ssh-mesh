@@ -22,6 +22,8 @@ pub const DEFAULT_MESH_TUN_MTU: u32 = 65_520;
 pub struct AppConfigFile {
     #[serde(rename = "Service")]
     pub service: ServiceSection,
+    #[serde(default, rename = "Socket")]
+    pub socket: Option<SocketSection>,
     #[serde(default, rename = "Resources")]
     pub resources: ResourceLimits,
     #[serde(default, rename = "Environment")]
@@ -155,6 +157,28 @@ pub struct ServiceSection {
     pub ambient_capabilities: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SocketSection {
+    #[serde(default, rename = "ListenStream", deserialize_with = "string_or_vec")]
+    pub listen_streams: Vec<String>,
+    #[serde(default, rename = "ListenDatagram", deserialize_with = "string_or_vec")]
+    pub listen_datagrams: Vec<String>,
+    #[serde(default, rename = "Accept")]
+    pub accept: bool,
+    #[serde(rename = "SocketMode")]
+    pub socket_mode: Option<u32>,
+    #[serde(rename = "SocketUser")]
+    pub socket_user: Option<String>,
+    #[serde(rename = "SocketGroup")]
+    pub socket_group: Option<String>,
+    #[serde(
+        default,
+        rename = "FileDescriptorName",
+        deserialize_with = "string_or_vec"
+    )]
+    pub file_descriptor_names: Vec<String>,
+}
+
 /// The `[resources]` section — maps to cgroup v2 knobs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ResourceLimits {
@@ -202,10 +226,7 @@ pub enum ServiceActivationMode {
     Hybrid,
 }
 
-/// Legacy inline activation entry.
-///
-/// New configs should use systemd-style `.socket` files. This type remains
-/// because mesh-init merges parsed socket units into the same runtime shape.
+/// Socket activation entry derived from a service TOML `[Socket]` table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ActivationConfig {
     pub port: Option<u16>,
@@ -220,15 +241,15 @@ pub struct ActivationConfig {
     pub vsock_port: Option<u32>,
     #[serde(default)]
     pub wait: bool,
-    /// Bind address for TCP activation. For systemd-style socket units, a bare
+    /// Bind address for TCP activation. For systemd-style `[Socket]`, a bare
     /// `ListenStream=PORT` defaults to IPv6-any with dual-stack enabled where
     /// the OS permits it. Inline activation entries without `bind` use the same
     /// default.
     #[serde(default)]
     pub bind: Option<String>,
     /// File descriptor name passed through `LISTEN_FDNAMES` for systemd-style
-    /// activation. From `.socket` files this comes from `FileDescriptorName=`,
-    /// defaulting to the socket unit file name.
+    /// activation. From `[Socket]` this comes from `FileDescriptorName`,
+    /// defaulting to the service name.
     #[serde(default)]
     pub fd_name: Option<String>,
     /// ListenDatagram (true) vs ListenStream (false). Maps to SOCK_DGRAM vs
@@ -617,6 +638,156 @@ fn parse_signal(value: Option<&str>) -> Result<i32, ConfigError> {
     Ok(signal)
 }
 
+fn parse_socket_listen_address(
+    address: &str,
+    accept: bool,
+    datagram: bool,
+) -> Result<ActivationConfig, ConfigError> {
+    let addr = address.trim();
+    if addr.is_empty() {
+        return Err(ConfigError::Invalid(
+            "empty socket listen address".to_string(),
+        ));
+    }
+
+    if let Some(rest) = addr.strip_prefix("vsock:") {
+        if datagram {
+            return Err(ConfigError::Invalid(format!(
+                "ListenDatagram AF_VSOCK address is not supported: {addr}"
+            )));
+        }
+        let Some((cid_str, port_str)) = rest.split_once(':') else {
+            return Err(ConfigError::Invalid(format!(
+                "invalid ListenStream AF_VSOCK address: {addr}"
+            )));
+        };
+        let vsock_cid = if cid_str.is_empty() {
+            None
+        } else {
+            Some(cid_str.parse::<u32>().map_err(|_| {
+                ConfigError::Invalid(format!("invalid ListenStream AF_VSOCK CID: {addr}"))
+            })?)
+        };
+        let vsock_port = port_str.parse::<u32>().map_err(|_| {
+            ConfigError::Invalid(format!("invalid ListenStream AF_VSOCK port: {addr}"))
+        })?;
+        return Ok(ActivationConfig {
+            vsock_cid,
+            vsock_port: Some(vsock_port),
+            wait: !accept,
+            datagram,
+            ..Default::default()
+        });
+    }
+
+    if addr.starts_with('@') || addr.starts_with('\0') {
+        return Err(ConfigError::Invalid(format!(
+            "abstract namespace socket activation is not supported: {addr:?}"
+        )));
+    }
+
+    if addr.starts_with('/') {
+        return Ok(ActivationConfig {
+            socket: Some(addr.to_string()),
+            wait: !accept,
+            datagram,
+            ..Default::default()
+        });
+    }
+
+    if let Ok(port) = addr.parse::<u16>() {
+        return Ok(ActivationConfig {
+            port: Some(port),
+            bind: Some("[::]".to_string()),
+            wait: !accept,
+            datagram,
+            ..Default::default()
+        });
+    }
+
+    if addr.starts_with('[') {
+        if let Some(bracket_end) = addr.find(']') {
+            let host = &addr[1..bracket_end];
+            let rest = &addr[bracket_end + 1..];
+            if let Some(port_str) = rest.strip_prefix(':') {
+                let port = port_str.parse::<u16>().map_err(|_| {
+                    ConfigError::Invalid(format!("invalid listen address port: {addr}"))
+                })?;
+                return Ok(ActivationConfig {
+                    port: Some(port),
+                    bind: Some(format!("[{host}]")),
+                    wait: !accept,
+                    datagram,
+                    ..Default::default()
+                });
+            }
+        }
+    } else if let Some((host, port_str)) = addr.rsplit_once(':') {
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| ConfigError::Invalid(format!("invalid listen address port: {addr}")))?;
+        return Ok(ActivationConfig {
+            port: Some(port),
+            bind: Some(host.to_string()),
+            wait: !accept,
+            datagram,
+            ..Default::default()
+        });
+    }
+
+    Err(ConfigError::Invalid(format!(
+        "unsupported socket listen address: {addr}"
+    )))
+}
+
+fn socket_to_activation_configs(
+    socket: Option<&SocketSection>,
+    service_name: &str,
+) -> Result<Vec<ActivationConfig>, ConfigError> {
+    let Some(socket) = socket else {
+        return Ok(Vec::new());
+    };
+    if socket.listen_streams.is_empty() && socket.listen_datagrams.is_empty() {
+        return Err(ConfigError::Invalid(
+            "[Socket] requires ListenStream or ListenDatagram".to_string(),
+        ));
+    }
+
+    let mut activations = Vec::new();
+    for addr in &socket.listen_streams {
+        activations.push(parse_socket_listen_address(addr, socket.accept, false)?);
+    }
+
+    let (udp_datagrams, unix_datagrams): (Vec<_>, Vec<_>) = socket
+        .listen_datagrams
+        .iter()
+        .partition(|addr| !addr.trim().starts_with('/'));
+    for addr in udp_datagrams.into_iter().chain(unix_datagrams) {
+        if socket.accept {
+            return Err(ConfigError::Invalid(format!(
+                "Accept=true with ListenDatagram is not supported: {addr}"
+            )));
+        }
+        activations.push(parse_socket_listen_address(addr, socket.accept, true)?);
+    }
+
+    for (idx, activation) in activations.iter_mut().enumerate() {
+        activation.fd_name = socket
+            .file_descriptor_names
+            .get(idx)
+            .cloned()
+            .or_else(|| socket.file_descriptor_names.first().cloned())
+            .or_else(|| Some(service_name.to_string()));
+        if activation.socket.is_some() {
+            activation.socket_mode = socket.socket_mode;
+            activation.socket_user.clone_from(&socket.socket_user);
+            activation.socket_group.clone_from(&socket.socket_group);
+        }
+    }
+
+    Ok(activations)
+}
+
 fn resolve_limits(limits: &ResourceLimits) -> Result<ResolvedResourceLimits, ConfigError> {
     Ok(ResolvedResourceLimits {
         memory_low: limits
@@ -771,6 +942,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         parse_duration_secs(file.service.timeout_stop_sec.as_deref(), "TimeoutStopSec")?;
     let kill_signal = parse_signal(file.service.kill_signal.as_deref())?;
     let umask = parse_umask(file.service.umask.as_deref())?;
+    let activation = socket_to_activation_configs(file.socket.as_ref(), &name)?;
     let supplementary_groups = file
         .service
         .supplementary_groups
@@ -822,7 +994,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         capability_bounding_set: file.service.capability_bounding_set,
         ambient_capabilities: file.service.ambient_capabilities,
         resources: resolved,
-        activation: Vec::new(),
+        activation,
         network: file.network,
         source_path: None,
         auth: if file.peers.is_empty() && file.impersonation.is_empty() {
@@ -934,8 +1106,7 @@ fn split_exec_words(input: &str) -> Result<Vec<String>, ConfigError> {
 ///
 /// A valid name:
 /// - is non-empty
-/// - is at most 251 characters (leaving room for the `.scope`/`.service`
-///   suffixes under NAME_MAX=255)
+/// - is at most 251 characters (leaving room for suffixes under NAME_MAX=255)
 /// - contains no path separators (`/`, `\`)
 /// - is not `.` or `..` and contains no `..` component
 /// - contains no NUL bytes

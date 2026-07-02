@@ -1,0 +1,16 @@
+[Service]
+
+ExecStart = "./ssh-mesh"
+OOMScoreAdjust = -900
+[Resources]
+MemoryMax = "1G"
+CPUWeight = 100
+
+[Environment]
+RUST_LOG = "info"
+SSH_PORT = "14022"
+HTTP_PORT = "14080"
+
+[Socket]
+ListenStream = "14022"
+Accept = false

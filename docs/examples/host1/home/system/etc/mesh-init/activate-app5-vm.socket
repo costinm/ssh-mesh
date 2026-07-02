@@ -1,3 +1,0 @@
-[Socket]
-ListenStream=/tmp/mesh/shared/app5-vm/trusted.sock
-Accept=true

@@ -1,9 +1,9 @@
 //! Application configuration for mesh-init services.
 //!
-//! Supports systemd-style `.service` config files with mesh-init extensions:
-//! - Service names are derived from the `.service` filename.
+//! Supports TOML config files with mesh-init extensions:
+//! - Service names are derived from the `.toml` filename.
 //! - `Type = "oneshot"` services are not restarted after exit.
-//! - Socket configs define FDs to listen on; accept triggers service start.
+//! - `[Socket]` configs define FDs to listen on; accept triggers service start.
 //! - Resource limits map to cgroup v2 knobs (memory.low/high/max, cpu.weight).
 
 use std::path::Path;
@@ -50,7 +50,7 @@ pub fn load_app_config(path: &Path) -> Result<AppConfig, ConfigError> {
     Ok(config)
 }
 
-/// Scan directories for `.service` config files and load all of them.
+/// Scan directories for `.toml` config files and load all of them.
 ///
 /// Non-existent directories are silently skipped. Individual parse errors
 /// are logged as warnings but do not stop loading of other configs.
@@ -74,7 +74,7 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("service") {
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
                 match load_app_config(&path) {
                     Ok(config) => {
                         info!("Loaded config for service '{}'", config.name);
@@ -184,7 +184,7 @@ MeshGID = 1000
 
     #[test]
     fn test_parse_all_fields_example() {
-        let toml = include_str!("../examples/all-fields.service");
+        let toml = include_str!("../examples/all-fields.toml");
         let config = parse_service(toml, Some("all-fields")).unwrap();
         assert_eq!(config.name, "all-fields");
         assert_eq!(config.uid, Some(1000));
@@ -350,7 +350,7 @@ OOMScoreAdjust = 2000
         let dir = tempfile::tempdir().unwrap();
 
         // Write a valid config
-        let config_path = dir.path().join("test.service");
+        let config_path = dir.path().join("test.toml");
         std::fs::write(
             &config_path,
             r#"

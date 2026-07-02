@@ -361,7 +361,9 @@ async fn handle_connection(
                         let mut std_stream = stream.into_std()?;
                         std_stream.set_nonblocking(false)?;
                         let fd = recv_one_fd(&std_stream)?;
-                        let response = daemon.handle_request_with_fd(request, fd, peer_uid, peer_gid).await;
+                        let response = daemon
+                            .handle_request_with_fd(request, fd, peer_uid, peer_gid)
+                            .await;
                         let response_str = format_response(response, &format)?;
                         std_stream.write_all(response_str.as_bytes())?;
                         std_stream.write_all(b"\n")?;

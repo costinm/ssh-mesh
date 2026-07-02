@@ -1,0 +1,7 @@
+[Service]
+ExecStart = "/bin/sh -c 'echo SUCCESS'"
+OOMScoreAdjust = -800
+
+[Socket]
+ListenStream = "14032"
+Accept = true

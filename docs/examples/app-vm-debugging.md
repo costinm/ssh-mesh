@@ -59,8 +59,8 @@ configs:
 
 ```bash
 ls -la /home/system/etc/mesh-init/
-cat /home/system/etc/mesh-init/app2-qemu.service
-cat /home/system/etc/mesh-init/app3-crosvm.service
+cat /home/system/etc/mesh-init/app2-qemu.toml
+cat /home/system/etc/mesh-init/app3-crosvm.toml
 mesh-init reload
 ```
 

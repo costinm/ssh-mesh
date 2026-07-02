@@ -17,9 +17,15 @@ pub fn start_network_sidecar(
 ) -> Result<Option<NetworkSidecar>, anyhow::Error> {
     match config.network.backend {
         NetworkBackend::None => Ok(None),
-        NetworkBackend::Pasta => {
-            start_pasta(&config.name, &config.network, service_pid, cgroup_path).map(Some)
-        }
+        NetworkBackend::Pasta => start_pasta(
+            &config.name,
+            &config.network,
+            service_pid,
+            cgroup_path,
+            config.uid,
+            config.gid,
+        )
+        .map(Some),
         NetworkBackend::MeshTun => Ok(None),
     }
 }
@@ -96,6 +102,8 @@ fn start_pasta(
     config: &NetworkConfig,
     service_pid: u32,
     cgroup_path: &str,
+    drop_uid: Option<u32>,
+    drop_gid: Option<u32>,
 ) -> Result<NetworkSidecar, anyhow::Error> {
     // pasta is intentionally modeled as a sidecar backend here so it can
     // validate the host-owned lifecycle and namespace attachment shape without
@@ -122,6 +130,44 @@ fn start_pasta(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+
+    // A1: Drop privileges before exec. Without this, the pasta sidecar (which
+    // runs a config-supplied command) inherits the daemon's UID (root) and all
+    // supplementary groups. A USER_INIT config could set command="/bin/sh" and
+    // get a root shell.
+    //
+    // We use pre_exec instead of cmd.uid()/cmd.gid() so that setgroups(0,NULL)
+    // runs while we still have CAP_SETGID.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(move || {
+                // Clear supplementary groups (needs CAP_SETGID)
+                let ret = libc::setgroups(0, std::ptr::null());
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EPERM) {
+                        return Err(err);
+                    }
+                }
+                if let Some(gid) = drop_gid {
+                    if libc::setresgid(gid, gid, gid) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if let Some(uid) = drop_uid {
+                    if libc::setresuid(uid, uid, uid) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     let child = cmd.spawn().map_err(|error| {
         anyhow::anyhow!(

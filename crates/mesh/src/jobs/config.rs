@@ -78,6 +78,7 @@ impl JobConfig {
                 capability_bounding_set: self.capability_bounding_set.clone(),
                 ambient_capabilities: self.ambient_capabilities.clone(),
             },
+            socket: None,
             resources: crate::config::ResourceLimits {
                 memory_low: memory_limit_to_toml(self.resources.memory_low),
                 memory_high: memory_limit_to_toml(self.resources.memory_high),

@@ -1,0 +1,27 @@
+# Local mesh discovery for the host1-mode node.
+
+[Service]
+
+ExecStart = "lmesh"
+OOMScoreAdjust = -810
+[Resources]
+MemoryHigh = "64M"
+MemoryMax = "128M"
+CPUWeight = 50
+
+[Environment]
+PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin"
+RUST_LOG = "info"
+
+[[Peer]]
+uid = 1000
+
+[[Peer]]
+uid = 1001
+id = "sshd.meshlocal"
+delegate = "*.meshlocal"
+
+[Socket]
+ListenStream = "/home/system/run/lmesh/control.sock"
+Accept = false
+SocketMode = 0o660
