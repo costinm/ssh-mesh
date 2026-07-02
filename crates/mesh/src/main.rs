@@ -101,6 +101,18 @@ enum Command {
         #[clap(trailing_var_arg = true)]
         params: Vec<String>,
     },
+    /// Send an arbitrary flat JSONL method to an app.
+    Jsonl {
+        method: String,
+        #[clap(long)]
+        params: Option<String>,
+    },
+    /// Send an arbitrary JSON-RPC method to an app.
+    Jsonrpc {
+        method: String,
+        #[clap(long)]
+        params: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -196,6 +208,38 @@ async fn main() -> Result<()> {
             }
             serde_json::from_value(serde_json::Value::Object(map))?
         }
+        Command::Jsonl { method, params } => {
+            let mut request = serde_json::Map::new();
+            request.insert("method".to_string(), json!(method));
+            if let Some(params) = params {
+                let params: serde_json::Value = serde_json::from_str(&params)?;
+                if let Some(params) = params.as_object() {
+                    for (key, value) in params {
+                        request.insert(key.clone(), value.clone());
+                    }
+                } else {
+                    anyhow::bail!("--params for jsonl must be a JSON object");
+                }
+            }
+            let response = send_value(&socket_path, &serde_json::Value::Object(request)).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(());
+        }
+        Command::Jsonrpc { method, params } => {
+            let params = match params {
+                Some(params) => serde_json::from_str(&params)?,
+                None => json!({}),
+            };
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            });
+            let response = send_value(&socket_path, &request).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(());
+        }
     };
 
     let response = send_request(&socket_path, &request).await?;
@@ -236,6 +280,8 @@ fn get_socket_path(app: &str) -> String {
 
     let run_dir = if let Ok(dir) = std::env::var(&env_var) {
         std::path::PathBuf::from(dir)
+    } else if app == "mesh-init" {
+        mesh::paths::AppPaths::for_app("system").run_dir("mesh-init")
     } else {
         mesh::paths::AppPaths::for_app(app).run_dir(app)
     };
@@ -267,6 +313,25 @@ async fn send_request(socket_path: &str, request: &Request) -> Result<Response> 
     let response: Response = serde_json::from_str(line.trim())
         .with_context(|| format!("failed to parse response: {}", line))?;
     Ok(response)
+}
+
+async fn send_value(socket_path: &str, request: &serde_json::Value) -> Result<serde_json::Value> {
+    let stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("failed to connect to UDS at {}", socket_path))?;
+    let (reader, mut writer) = stream.into_split();
+
+    writer
+        .write_all(serde_json::to_string(request)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    drop(writer);
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    Ok(serde_json::from_str(line.trim())?)
 }
 
 async fn send_terminal_request(

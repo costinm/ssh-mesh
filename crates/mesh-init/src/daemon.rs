@@ -14,9 +14,10 @@ use std::sync::{
 use anyhow::Result;
 
 use parking_lot::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{self, AppConfig};
+use crate::observer::{self, ProcessDetailedInfo, ProcessObserver};
 use crate::process::{self, ManagedProcess};
 use crate::protocol::{
     ActivationContext, NamespaceKind, Request, Response, ServiceState, ServiceStatus,
@@ -125,6 +126,7 @@ pub struct Daemon {
     pub pending_activation_contexts: Arc<Mutex<HashMap<String, VecDeque<ActivationContext>>>>,
     terminal_sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
     next_terminal_id: AtomicU64,
+    observer: Arc<ProcessObserver>,
     resource_manager: Option<ResourceManager>,
     /// Set of tracked child PIDs for the reaper (only used when not PID 1).
     tracked_child_pids: Mutex<Option<Arc<parking_lot::Mutex<std::collections::HashSet<u32>>>>>,
@@ -147,6 +149,7 @@ impl Daemon {
     pub fn new(config: DaemonConfig) -> Arc<Self> {
         let services = Arc::new(Mutex::new(HashMap::new()));
         let resource_manager = Some(ResourceManager::new(services.clone()));
+        let observer = Arc::new(ProcessObserver::new().expect("create mesh-init process observer"));
 
         Arc::new(Self {
             config,
@@ -155,6 +158,7 @@ impl Daemon {
             pending_activation_contexts: Arc::new(Mutex::new(HashMap::new())),
             terminal_sessions: Arc::new(Mutex::new(HashMap::new())),
             next_terminal_id: AtomicU64::new(1),
+            observer,
             resource_manager,
             tracked_child_pids: Mutex::new(None),
         })
@@ -221,6 +225,8 @@ impl Daemon {
             rm.start();
         }
 
+        self.start_process_observer();
+
         // 3. Auto-start system services or start activation listeners.
         // init-* services run first (sorted by priority), then the rest.
         let startup_configs: Vec<AppConfig> = self.configs.lock().values().cloned().collect();
@@ -250,6 +256,43 @@ impl Daemon {
 
         // 4. Spawn child process manager (zombie reaper + restarts)
         self.start_child_manager();
+    }
+
+    fn start_process_observer(&self) {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
+        match self.observer.start(true, true, Some(event_tx.clone())) {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("failed to start mesh-init process observer: {}", e);
+                return;
+            }
+        }
+
+        let running = self.observer.running.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = observer::proc_netlink::run_netlink_listener(event_tx, running) {
+                debug!("process netlink listener stopped: {}", e);
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    observer::MonitoringEvent::Netlink(event) => {
+                        trace!(?event, "process observer netlink event");
+                    }
+                    observer::MonitoringEvent::Pressure(event) => {
+                        trace!(
+                            cgroup = %event.cgroup_path,
+                            avg10 = event.pressure_data.avg10,
+                            avg60 = event.pressure_data.avg60,
+                            total = event.pressure_data.total,
+                            "process observer pressure event"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Spawn the child process manager (zombie reaper + restart loop).
@@ -318,6 +361,28 @@ impl Daemon {
             Request::Status { name } => self.handle_status(name.as_deref()),
             Request::Shutdown => self.handle_shutdown().await,
             Request::Reload => self.handle_reload(),
+            Request::Processes => self.handle_observer_processes(),
+            Request::Process { pid } => self.handle_observer_process(pid),
+            Request::ProcessOnly { pid } => self.handle_observer_process_only(pid),
+            Request::Cgroups => self.handle_observer_cgroups(),
+            Request::Cgroup { path } => self.handle_observer_cgroup(&path),
+            Request::Pressure => self.handle_observer_pressure(),
+            Request::CgroupHigh {
+                path,
+                percentage,
+                interval,
+            } => self.handle_observer_cgroup_high(path, percentage, interval),
+            Request::CgroupProcs { path } => self.handle_observer_cgroup_procs(&path),
+            Request::MoveProcess { pid, cgroup_name } => {
+                self.handle_observer_move_process(pid, cgroup_name)
+            }
+            Request::ClearRefs { pid, value } => self.handle_observer_clear_refs(pid, &value),
+            Request::FreezeProcess { pid, freeze } => {
+                self.handle_observer_freeze_process(pid, freeze)
+            }
+            Request::FreezeCgroup { path, freeze } => {
+                self.handle_observer_freeze_cgroup(&path, freeze)
+            }
             // Job scheduling requests are handled by the JobScheduler, not the main Daemon service manager
             Request::ScheduleJob { .. }
             | Request::CancelJob { .. }
@@ -719,6 +784,9 @@ impl Daemon {
 
         match process::spawn_process(&config, &cg, Some(activation_fd)) {
             Ok(pid) => {
+                if let Some(ref tracked) = *self.tracked_child_pids.lock() {
+                    tracked.lock().insert(pid);
+                }
                 let terminal_id = format!(
                     "term-{}",
                     self.next_terminal_id.fetch_add(1, Ordering::Relaxed)
@@ -971,6 +1039,108 @@ impl Daemon {
                 let statuses: Vec<ServiceStatus> = services.values().map(|p| p.status()).collect();
                 Response::ok_with_data(serde_json::to_value(statuses).unwrap_or_default())
             }
+        }
+    }
+
+    fn handle_observer_processes(&self) -> Response {
+        let processes = self.observer.get_all_processes(1);
+        Response::ok_with_data(serde_json::json!(
+            processes.into_values().collect::<Vec<_>>()
+        ))
+    }
+
+    fn handle_observer_process(&self, pid: u32) -> Response {
+        match self.observer.get_process(pid) {
+            Some(process) => {
+                let cgroup = process
+                    .cgroup_path
+                    .as_ref()
+                    .and_then(|p| observer::read_cgroup_detailed(p));
+                let parent_cgroups = process
+                    .cgroup_path
+                    .as_ref()
+                    .map(|p| observer::get_parent_cgroups(p))
+                    .unwrap_or_default();
+                Response::ok_with_data(serde_json::json!(ProcessDetailedInfo {
+                    process,
+                    cgroup,
+                    parent_cgroups,
+                }))
+            }
+            None => Response::err(format!("process {pid} not found")),
+        }
+    }
+
+    fn handle_observer_process_only(&self, pid: u32) -> Response {
+        match self.observer.get_process(pid) {
+            Some(process) => Response::ok_with_data(serde_json::json!(process)),
+            None => Response::err(format!("process {pid} not found")),
+        }
+    }
+
+    fn handle_observer_cgroups(&self) -> Response {
+        Response::ok_with_data(serde_json::json!(self.observer.get_all_cgroups()))
+    }
+
+    fn handle_observer_cgroup(&self, path: &str) -> Response {
+        match observer::read_cgroup_detailed(path) {
+            Some(cgroup) => Response::ok_with_data(serde_json::json!(cgroup)),
+            None => Response::err(format!("cgroup {path} not found")),
+        }
+    }
+
+    fn handle_observer_pressure(&self) -> Response {
+        Response::ok_with_data(serde_json::json!(self.observer.get_psi_watches()))
+    }
+
+    fn handle_observer_cgroup_high(
+        &self,
+        path: String,
+        percentage: f64,
+        interval: u64,
+    ) -> Response {
+        match self
+            .observer
+            .adjust_cgroup_memory_high(path, percentage, interval)
+        {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn handle_observer_cgroup_procs(&self, path: &str) -> Response {
+        Response::ok_with_data(serde_json::json!(
+            self.observer.get_processes_in_cgroup(path)
+        ))
+    }
+
+    fn handle_observer_move_process(&self, pid: u32, cgroup_name: Option<String>) -> Response {
+        match self.observer.move_process_to_cgroup(pid, cgroup_name) {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn handle_observer_clear_refs(&self, pid: u32, value: &str) -> Response {
+        match self.observer.clear_refs(pid, value) {
+            Ok(()) => Response::ok_with_data(serde_json::json!({
+                "message": format!("cleared refs for process {pid} with value {value}")
+            })),
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn handle_observer_freeze_process(&self, pid: u32, freeze: bool) -> Response {
+        match self.observer.freeze_process(pid, freeze) {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn handle_observer_freeze_cgroup(&self, path: &str, freeze: bool) -> Response {
+        match self.observer.freeze_cgroup(path, freeze) {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::err(e.to_string()),
         }
     }
 
@@ -1419,8 +1589,10 @@ fn restart_delay_with_jitter(service_name: &str, base_secs: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::io::Read;
     use std::os::fd::OwnedFd;
+    use std::sync::Arc;
 
     #[test]
     fn test_daemon_config_loading() {
@@ -1460,6 +1632,8 @@ OOMScoreAdjust = -700
             socket_path: "/tmp/mesh-init-test.sock".to_string(),
         };
         let daemon = Daemon::new(cfg);
+        let tracked = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        *daemon.tracked_child_pids.lock() = Some(tracked.clone());
         let current_uid = unsafe { libc::getuid() };
         let current_gid = unsafe { libc::getgid() };
         let home = tempfile::tempdir().unwrap();
@@ -1501,9 +1675,19 @@ OOMScoreAdjust = -700
         };
 
         let response = daemon
-            .handle_request_with_fd(request, OwnedFd::from(child_end), current_uid)
+            .handle_request_with_fd(request, OwnedFd::from(child_end), 0)
             .await;
         assert!(response.success, "{:?}", response.error);
+        let pid = response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            .expect("terminal response includes pid") as u32;
+        assert!(
+            tracked.lock().contains(&pid),
+            "terminal pid {pid} should be tracked for SIGCHLD reaping"
+        );
 
         let mut output = String::new();
         parent_end.read_to_string(&mut output).unwrap();

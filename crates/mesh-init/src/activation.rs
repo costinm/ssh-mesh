@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{AppConfig, ServiceActivationMode};
 use crate::daemon::Daemon;
-use crate::process::ActivationFd;
+use crate::process::{ActivationFd, ActivationListenFd};
 use crate::protocol::ServiceState;
 
 // ============================================================================
@@ -50,8 +50,9 @@ fn max_activation_children() -> usize {
 
 /// Global semaphore capping concurrent inetd-style activation spawns.
 static ACTIVATION_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static SERVICE_LISTENER_FDS: OnceLock<Mutex<HashMap<String, Vec<(usize, OwnedFd)>>>> =
-    OnceLock::new();
+static SERVICE_LISTENER_FDS: OnceLock<
+    Mutex<HashMap<String, Vec<(usize, OwnedFd, Option<String>)>>>,
+> = OnceLock::new();
 
 fn activation_semaphore() -> Arc<Semaphore> {
     ACTIVATION_SEMAPHORE
@@ -59,7 +60,12 @@ fn activation_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 
-fn register_service_listener_fd(service_name: &str, order: usize, fd: &OwnedFd) {
+fn register_service_listener_fd(
+    service_name: &str,
+    order: usize,
+    fd: &OwnedFd,
+    fd_name: Option<String>,
+) {
     let Ok(fd_clone) = fd.try_clone() else {
         warn!(
             "Failed to clone activation listener fd for '{}'",
@@ -70,15 +76,18 @@ fn register_service_listener_fd(service_name: &str, order: usize, fd: &OwnedFd) 
     let registry = SERVICE_LISTENER_FDS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry.lock();
     let listeners = registry.entry(service_name.to_string()).or_default();
-    if let Some((_, existing)) = listeners.iter_mut().find(|(idx, _)| *idx == order) {
+    if let Some((_, existing, existing_name)) =
+        listeners.iter_mut().find(|(idx, _, _)| *idx == order)
+    {
         *existing = fd_clone;
+        *existing_name = fd_name;
     } else {
-        listeners.push((order, fd_clone));
-        listeners.sort_by_key(|(idx, _)| *idx);
+        listeners.push((order, fd_clone, fd_name));
+        listeners.sort_by_key(|(idx, _, _)| *idx);
     }
 }
 
-fn service_listener_fds(service_name: &str) -> Vec<OwnedFd> {
+fn service_listener_fds(service_name: &str) -> Vec<ActivationListenFd> {
     let Some(registry) = SERVICE_LISTENER_FDS.get() else {
         return Vec::new();
     };
@@ -88,7 +97,12 @@ fn service_listener_fds(service_name: &str) -> Vec<OwnedFd> {
         .map(|listeners| {
             listeners
                 .iter()
-                .filter_map(|(_, fd)| fd.try_clone().ok())
+                .filter_map(|(_, fd, name)| {
+                    fd.try_clone().ok().map(|fd| ActivationListenFd {
+                        fd,
+                        name: name.clone(),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -115,7 +129,8 @@ enum FdIdentity {
 
 /// Global pool of file descriptors received from systemd socket activation.
 /// Populated once by [`collect_systemd_fds`] before any listener starts.
-static SYSTEMD_FDS: OnceLock<Mutex<VecDeque<(OwnedFd, FdIdentity)>>> = OnceLock::new();
+static SYSTEMD_FDS: OnceLock<Mutex<VecDeque<(OwnedFd, FdIdentity, Option<String>)>>> =
+    OnceLock::new();
 
 /// Collect file descriptors from systemd socket activation.
 ///
@@ -147,6 +162,22 @@ pub fn collect_systemd_fds() {
         },
         Err(_) => return,
     };
+    let listen_fd_names: Vec<Option<String>> = std::env::var("LISTEN_FDNAMES")
+        .ok()
+        .map(|names| {
+            names
+                .split(|c: char| c == ':' || c.is_ascii_whitespace())
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(name.to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Clear env vars so children don't misinterpret them as their own activation
     // SAFETY: removing these env vars is safe — they were set by systemd and
@@ -154,6 +185,7 @@ pub fn collect_systemd_fds() {
     unsafe {
         std::env::remove_var("LISTEN_PID");
         std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_FDNAMES");
     }
 
     info!(
@@ -171,11 +203,12 @@ pub fn collect_systemd_fds() {
         // is transferred to us when `LISTEN_PID` matches our PID.
         let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
         let identity = identify_fd(&owned);
+        let fd_name = listen_fd_names.get(i).cloned().flatten();
         debug!(
-            "Systemd activation FD {} (raw_fd={}): {:?}",
-            i, raw_fd, identity
+            "Systemd activation FD {} (raw_fd={}): {:?}, name={:?}",
+            i, raw_fd, identity, fd_name
         );
-        pool.push_back((owned, identity));
+        pool.push_back((owned, identity, fd_name));
     }
 
     info!(
@@ -274,7 +307,7 @@ fn get_sock_type(raw_fd: i32) -> SocketKind {
 }
 
 /// Try to take a matching systemd-provided TCP listener FD by port and kind.
-fn take_systemd_tcp_fd(port: u16, datagram: bool) -> Option<OwnedFd> {
+fn take_systemd_tcp_fd(port: u16, datagram: bool) -> Option<ActivationListenFd> {
     let kind = if datagram {
         SocketKind::Datagram
     } else {
@@ -283,13 +316,16 @@ fn take_systemd_tcp_fd(port: u16, datagram: bool) -> Option<OwnedFd> {
     let pool = SYSTEMD_FDS.get()?;
     let mut pool = pool.lock();
     let idx = pool.iter().position(
-        |(_, identity)| matches!(identity, FdIdentity::Tcp(p, k) if *p == port && *k == kind),
+        |(_, identity, _)| matches!(identity, FdIdentity::Tcp(p, k) if *p == port && *k == kind),
     );
-    idx.map(|i| pool.remove(i).unwrap().0)
+    idx.map(|i| {
+        let (fd, _, name) = pool.remove(i).unwrap();
+        ActivationListenFd { fd, name }
+    })
 }
 
 /// Try to take a matching systemd-provided UDS listener FD by path and kind.
-fn take_systemd_uds_fd(path: &str, datagram: bool) -> Option<OwnedFd> {
+fn take_systemd_uds_fd(path: &str, datagram: bool) -> Option<ActivationListenFd> {
     let kind = if datagram {
         SocketKind::Datagram
     } else {
@@ -297,14 +333,17 @@ fn take_systemd_uds_fd(path: &str, datagram: bool) -> Option<OwnedFd> {
     };
     let pool = SYSTEMD_FDS.get()?;
     let mut pool = pool.lock();
-    let idx = pool.iter().position(|(_, identity)| {
+    let idx = pool.iter().position(|(_, identity, _)| {
         if let FdIdentity::Unix(p, k) = identity {
             p.as_os_str() == path && *k == kind
         } else {
             false
         }
     });
-    idx.map(|i| pool.remove(i).unwrap().0)
+    idx.map(|i| {
+        let (fd, _, name) = pool.remove(i).unwrap();
+        ActivationListenFd { fd, name }
+    })
 }
 
 // ============================================================================
@@ -418,7 +457,13 @@ fn start_activation_socket_target(
 
     let listener = bind_activation_socket(activation_socket)?;
     daemon
-        .start_service_with_config(config, Some(ActivationFd::Listen(vec![listener])))
+        .start_service_with_config(
+            config,
+            Some(ActivationFd::Listen(vec![ActivationListenFd {
+                fd: listener,
+                name: Some("activation".to_string()),
+            }])),
+        )
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("failed to start forward target {}: {}", service_name, e))
 }
@@ -491,18 +536,20 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
                 let name = config.name.clone();
                 let wait = act.wait;
                 if wait {
-                    register_service_listener_fd(&name, order, &fd);
+                    register_service_listener_fd(&name, order, &fd.fd, fd.name.clone());
                 }
                 tokio::spawn(async move {
-                    handle_listener(fd, name, wait, daemon_clone).await;
+                    handle_listener(fd.fd, name, wait, daemon_clone).await;
                 });
                 continue;
             }
             let daemon_clone = daemon.clone();
             let name = config.name.clone();
             let wait = act.wait;
+            let bind = act.bind.clone();
+            let fd_name = act.fd_name.clone();
             tokio::spawn(async move {
-                run_tcp_listener(port, name, wait, order, daemon_clone).await;
+                run_tcp_listener(port, bind, fd_name, name, wait, order, daemon_clone).await;
             });
         }
         if let Some(ref path) = act.socket {
@@ -513,10 +560,10 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
                 let name = config.name.clone();
                 let wait = act.wait;
                 if wait {
-                    register_service_listener_fd(&name, order, &fd);
+                    register_service_listener_fd(&name, order, &fd.fd, fd.name.clone());
                 }
                 tokio::spawn(async move {
-                    handle_listener(fd, name, wait, daemon_clone).await;
+                    handle_listener(fd.fd, name, wait, daemon_clone).await;
                 });
                 continue;
             }
@@ -524,6 +571,7 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
             let name = config.name.clone();
             let path_clone = path.clone();
             let wait = act.wait;
+            let fd_name = act.fd_name.clone();
             let socket_mode = act.socket_mode;
             let socket_user = act.socket_user.clone();
             let socket_group = act.socket_group.clone();
@@ -536,9 +584,27 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
                     socket_mode,
                     socket_user,
                     socket_group,
+                    fd_name,
                     daemon_clone,
                 )
                 .await;
+            });
+        }
+        if let Some(vsock_port) = act.vsock_port {
+            if act.datagram {
+                error!(
+                    "AF_VSOCK datagram activation for '{}' port {} is not supported",
+                    config.name, vsock_port
+                );
+                continue;
+            }
+            let daemon_clone = daemon.clone();
+            let name = config.name.clone();
+            let wait = act.wait;
+            let cid = act.vsock_cid;
+            let fd_name = act.fd_name.clone();
+            tokio::spawn(async move {
+                run_vsock_listener(cid, vsock_port, fd_name, name, wait, order, daemon_clone).await;
             });
         }
     }
@@ -550,23 +616,18 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
 
 async fn run_tcp_listener(
     port: u16,
+    bind: Option<String>,
+    fd_name: Option<String>,
     service_name: String,
     wait: bool,
     order: usize,
     daemon: Arc<Daemon>,
 ) {
-    let bind_addr = daemon
-        .configs
-        .lock()
-        .get(&service_name)
-        .and_then(|c| {
-            c.activation
-                .iter()
-                .find_map(|a| a.bind.clone().filter(|b| !b.is_empty()))
-        })
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_addr = bind
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "[::]".to_string());
     let addr = format!("{}:{}", bind_addr, port);
-    if bind_addr == "0.0.0.0" || bind_addr == "::" {
+    if bind_addr == "0.0.0.0" || bind_addr == "::" || bind_addr == "[::]" {
         warn!(
             "TCP activation for '{}' binds {} — ensure auth or firewalling is in place",
             service_name, addr
@@ -594,7 +655,7 @@ async fn run_tcp_listener(
         }
     }
 
-    let listener = match std::net::TcpListener::bind(&addr) {
+    let listener = match bind_tcp_listener(&bind_addr, port) {
         Ok(l) => l,
         Err(e) => {
             error!(
@@ -611,9 +672,222 @@ async fn run_tcp_listener(
 
     let fd = listener.into();
     if wait {
-        register_service_listener_fd(&service_name, order, &fd);
+        register_service_listener_fd(&service_name, order, &fd, fd_name);
     }
     handle_listener(fd, service_name, wait, daemon).await;
+}
+
+fn bind_tcp_listener(bind_addr: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
+    let host = bind_addr
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(bind_addr);
+
+    if host.contains(':')
+        && let Ok(ip) = host
+            .split_once('%')
+            .map(|(addr, _)| addr)
+            .unwrap_or(host)
+            .parse::<std::net::Ipv6Addr>()
+    {
+        return bind_ipv6_dual_stack(ip, port);
+    }
+
+    std::net::TcpListener::bind(format!("{}:{}", bind_addr, port))
+}
+
+fn bind_ipv6_dual_stack(
+    ip: std::net::Ipv6Addr,
+    port: u16,
+) -> std::io::Result<std::net::TcpListener> {
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: libc::socket returns a new fd or -1.
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let close_fd = |fd| {
+        // SAFETY: fd is owned by this function until converted with from_raw_fd.
+        let _ = unsafe { libc::close(fd) };
+    };
+
+    let reuse: libc::c_int = 1;
+    // SAFETY: setsockopt reads `reuse` for the specified size.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&reuse as *const libc::c_int).cast(),
+            std::mem::size_of_val(&reuse) as libc::socklen_t,
+        )
+    } != 0
+    {
+        let err = std::io::Error::last_os_error();
+        close_fd(fd);
+        return Err(err);
+    }
+
+    let v6only: libc::c_int = 0;
+    // SAFETY: setsockopt reads `v6only` for the specified size.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (&v6only as *const libc::c_int).cast(),
+            std::mem::size_of_val(&v6only) as libc::socklen_t,
+        )
+    } != 0
+    {
+        let err = std::io::Error::last_os_error();
+        close_fd(fd);
+        return Err(err);
+    }
+
+    let octets = ip.octets();
+    let addr = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr { s6_addr: octets },
+        sin6_scope_id: 0,
+    };
+    // SAFETY: addr points to a valid sockaddr_in6 for the specified length.
+    if unsafe {
+        libc::bind(
+            fd,
+            (&addr as *const libc::sockaddr_in6).cast(),
+            std::mem::size_of_val(&addr) as libc::socklen_t,
+        )
+    } != 0
+    {
+        let err = std::io::Error::last_os_error();
+        close_fd(fd);
+        return Err(err);
+    }
+    // SAFETY: fd is a valid socket fd.
+    if unsafe { libc::listen(fd, 128) } != 0 {
+        let err = std::io::Error::last_os_error();
+        close_fd(fd);
+        return Err(err);
+    }
+
+    // SAFETY: fd is uniquely owned and is now transferred to TcpListener.
+    Ok(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+}
+
+// ============================================================================
+// AF_VSOCK listener
+// ============================================================================
+
+async fn run_vsock_listener(
+    cid: Option<u32>,
+    port: u32,
+    fd_name: Option<String>,
+    service_name: String,
+    wait: bool,
+    order: usize,
+    daemon: Arc<Daemon>,
+) {
+    let cid = cid.unwrap_or(VMADDR_CID_ANY);
+    info!(
+        "Starting AF_VSOCK activation listener for '{}' on vsock:{}:{} (wait={})",
+        service_name, cid, port, wait
+    );
+
+    if wait {
+        let has_auth = daemon
+            .configs
+            .lock()
+            .get(&service_name)
+            .is_some_and(|c| c.auth.is_some());
+        if has_auth {
+            error!(
+                "Service '{}' has auth configured but uses listener activation, \
+                 which cannot enforce peer authentication. Refusing to start the \
+                 listener. Remove the auth config or use Accept=true.",
+                service_name
+            );
+            return;
+        }
+    }
+
+    let fd = match bind_vsock_listener(cid, port) {
+        Ok(fd) => fd,
+        Err(e) => {
+            error!(
+                "Failed to bind AF_VSOCK activation listener vsock:{}:{} for '{}': {}",
+                cid, port, service_name, e
+            );
+            return;
+        }
+    };
+    if wait {
+        register_service_listener_fd(&service_name, order, &fd, fd_name);
+    }
+    handle_listener(fd, service_name, wait, daemon).await;
+}
+
+#[cfg(target_os = "linux")]
+const VMADDR_CID_ANY: u32 = 0xffff_ffff;
+
+#[cfg(not(target_os = "linux"))]
+const VMADDR_CID_ANY: u32 = 0xffff_ffff;
+
+#[cfg(target_os = "linux")]
+fn bind_vsock_listener(cid: u32, port: u32) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_fd_nonblocking(fd.as_raw_fd())?;
+
+    let addr = libc::sockaddr_vm {
+        svm_family: libc::AF_VSOCK as libc::sa_family_t,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: cid,
+        svm_zero: [0; 4],
+    };
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::listen(fd.as_raw_fd(), 128) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_vsock_listener(_cid: u32, _port: u32) -> std::io::Result<OwnedFd> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "AF_VSOCK is only supported on Linux",
+    ))
+}
+
+fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -628,6 +902,7 @@ async fn run_uds_listener(
     socket_mode: Option<u32>,
     socket_user: Option<String>,
     socket_group: Option<String>,
+    fd_name: Option<String>,
     daemon: Arc<Daemon>,
 ) {
     info!(
@@ -751,7 +1026,7 @@ async fn run_uds_listener(
 
     let fd = listener.into();
     if wait {
-        register_service_listener_fd(&service_name, order, &fd);
+        register_service_listener_fd(&service_name, order, &fd, fd_name);
     }
     handle_listener(fd, service_name, wait, daemon).await;
 }
@@ -816,7 +1091,7 @@ async fn handle_listener(
                 if fds.is_empty()
                     && let Ok(fd) = async_fd.get_ref().try_clone()
                 {
-                    fds.push(fd);
+                    fds.push(ActivationListenFd { fd, name: None });
                 }
                 let passed_fd = Some(ActivationFd::Listen(fds));
                 if let Err(e) = daemon.start_service_with_config(config, passed_fd) {

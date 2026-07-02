@@ -70,7 +70,7 @@ Connected source entries:
 `subscribe` keeps the connection open and emits JSON-RPC notifications:
 
 ```json
-{"jsonrpc":"2.0","method":"trace_entry","params":{"source":"pmond","timestamp":"...","level":"info","target":"...","message":"...","fields":{}}}
+{"jsonrpc":"2.0","method":"trace_entry","params":{"source":"mesh-init","timestamp":"...","level":"info","target":"...","message":"...","fields":{}}}
 ```
 
 `params` contains a source-tagged `mesh::local_trace::LogEntry`:

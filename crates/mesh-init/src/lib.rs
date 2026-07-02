@@ -3,6 +3,7 @@ pub mod cgroup;
 pub mod config;
 pub mod daemon;
 pub mod network;
+pub mod observer;
 pub mod process;
 pub use mesh::protocol;
 pub mod resource;

@@ -127,7 +127,7 @@ pub async fn setup_test_environment(
         if start_http {
             let app_state = crate::AppState {
                 ssh_server: mesh_node_clone.clone(),
-                target_http_address: std::env::var("HTTP_PORT").ok(),
+                target_http_address: std::env::var("APP_HTTP_PORT").ok(),
                 ssh_client_manager: std::sync::Arc::new(
                     crate::sshc::SshClientManager::new(
                         mesh_node_clone.private_key().clone(),

@@ -31,6 +31,11 @@ pub struct SystemdSocketConfig {
     pub socket_user: Option<String>,
     /// Socket file group.
     pub socket_group: Option<String>,
+    /// Name assigned to all descriptors from this socket unit.
+    pub file_descriptor_name: Option<String>,
+    /// Optional descriptor names assigned by listener order. This is populated
+    /// by splitting a single `FileDescriptorName=` value on whitespace.
+    pub file_descriptor_names: Vec<String>,
 }
 
 // ============================================================================
@@ -127,6 +132,11 @@ pub fn parse_socket_file(path: &Path) -> Result<SystemdSocketConfig, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
+    let socket_file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
 
     // Service= directive overrides the service name
     let service_name = socket_section
@@ -184,6 +194,25 @@ pub fn parse_socket_file(path: &Path) -> Result<SystemdSocketConfig, String> {
         .get("SocketGroup")
         .and_then(|v| v.first().cloned())
         .filter(|s| !s.is_empty());
+    let configured_fd_name = socket_section
+        .get("FileDescriptorName")
+        .and_then(|v| v.last())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let file_descriptor_names = configured_fd_name
+        .map(parse_file_descriptor_name_list)
+        .transpose()?
+        .unwrap_or_default();
+    let file_descriptor_name = configured_fd_name
+        .filter(|value| !value.split_whitespace().nth(1).is_some())
+        .map(str::to_string)
+        .or_else(|| {
+            if socket_file_name.is_empty() {
+                None
+            } else {
+                Some(socket_file_name)
+            }
+        });
 
     Ok(SystemdSocketConfig {
         service_name,
@@ -193,7 +222,27 @@ pub fn parse_socket_file(path: &Path) -> Result<SystemdSocketConfig, String> {
         socket_mode,
         socket_user,
         socket_group,
+        file_descriptor_name,
+        file_descriptor_names,
     })
+}
+
+fn parse_file_descriptor_name_list(value: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for name in value.split_whitespace() {
+        if !valid_file_descriptor_name(name) {
+            return Err(format!("invalid FileDescriptorName entry '{}'", name));
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
+fn valid_file_descriptor_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.contains(':')
+        && name.bytes().all(|b| b.is_ascii() && !b.is_ascii_control())
 }
 
 // ============================================================================
@@ -206,6 +255,42 @@ fn parse_listen_address(address: &str, accept: bool, datagram: bool) -> Option<A
 
     if addr.is_empty() {
         return None;
+    }
+
+    if let Some(rest) = addr.strip_prefix("vsock:") {
+        if datagram {
+            warn!(
+                "ListenDatagram AF_VSOCK address '{}' is not supported",
+                addr
+            );
+            return None;
+        }
+        let Some((cid_str, port_str)) = rest.split_once(':') else {
+            warn!("Cannot parse ListenStream AF_VSOCK address '{}'", addr);
+            return None;
+        };
+        let vsock_cid = if cid_str.is_empty() {
+            None
+        } else {
+            match cid_str.parse::<u32>() {
+                Ok(cid) => Some(cid),
+                Err(_) => {
+                    warn!("Cannot parse ListenStream AF_VSOCK CID '{}'", addr);
+                    return None;
+                }
+            }
+        };
+        let Ok(vsock_port) = port_str.parse::<u32>() else {
+            warn!("Cannot parse ListenStream AF_VSOCK port '{}'", addr);
+            return None;
+        };
+        return Some(ActivationConfig {
+            vsock_cid,
+            vsock_port: Some(vsock_port),
+            wait: !accept,
+            datagram,
+            ..Default::default()
+        });
     }
 
     // Abstract namespace socket (starts with @ or \0)
@@ -231,6 +316,7 @@ fn parse_listen_address(address: &str, accept: bool, datagram: bool) -> Option<A
     if let Ok(port) = addr.parse::<u16>() {
         return Some(ActivationConfig {
             port: Some(port),
+            bind: Some("[::]".to_string()),
             wait: !accept,
             datagram,
             ..Default::default()
@@ -316,6 +402,13 @@ pub fn socket_to_activation_configs(config: &SystemdSocketConfig) -> Vec<Activat
                 act.socket_group.clone_from(&config.socket_group);
             }
         }
+    }
+    for (idx, act) in results.iter_mut().enumerate() {
+        act.fd_name = config
+            .file_descriptor_names
+            .get(idx)
+            .cloned()
+            .or_else(|| config.file_descriptor_name.clone());
     }
 
     results
@@ -430,9 +523,113 @@ ListenStream=8080
     }
 
     #[test]
+    fn test_parse_socket_file_descriptor_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web.socket");
+        std::fs::write(
+            &path,
+            r#"
+[Socket]
+ListenStream=8080
+FileDescriptorName=http
+"#,
+        )
+        .unwrap();
+        let cfg = parse_socket_file(&path).unwrap();
+
+        let acts = socket_to_activation_configs(&cfg);
+        assert_eq!(acts[0].fd_name.as_deref(), Some("http"));
+    }
+
+    #[test]
+    fn test_parse_socket_file_descriptor_name_applies_to_all_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ssh-mesh.socket");
+        std::fs::write(
+            &path,
+            r#"
+[Socket]
+ListenStream=15022
+ListenStream=80
+ListenStream=vsock:2:5000
+FileDescriptorName=ssh-mesh
+"#,
+        )
+        .unwrap();
+        let cfg = parse_socket_file(&path).unwrap();
+        let acts = socket_to_activation_configs(&cfg);
+        assert_eq!(acts.len(), 3);
+        assert_eq!(acts[0].fd_name.as_deref(), Some("ssh-mesh"));
+        assert_eq!(acts[1].fd_name.as_deref(), Some("ssh-mesh"));
+        assert_eq!(acts[2].fd_name.as_deref(), Some("ssh-mesh"));
+    }
+
+    #[test]
+    fn test_parse_socket_file_descriptor_name_list_by_listener_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ssh-mesh.socket");
+        std::fs::write(
+            &path,
+            r#"
+[Socket]
+ListenStream=15022
+ListenStream=80
+ListenStream=vsock:2:5000
+FileDescriptorName=ssh http vsock
+"#,
+        )
+        .unwrap();
+        let cfg = parse_socket_file(&path).unwrap();
+        let acts = socket_to_activation_configs(&cfg);
+        assert_eq!(acts.len(), 3);
+        assert_eq!(acts[0].fd_name.as_deref(), Some("ssh"));
+        assert_eq!(acts[1].fd_name.as_deref(), Some("http"));
+        assert_eq!(acts[2].fd_name.as_deref(), Some("vsock"));
+    }
+
+    #[test]
+    fn test_parse_socket_file_descriptor_name_list_default_for_missing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ssh-mesh.socket");
+        std::fs::write(
+            &path,
+            r#"
+[Socket]
+ListenStream=15022
+ListenStream=80
+ListenStream=vsock:2:5000
+FileDescriptorName=ssh http
+"#,
+        )
+        .unwrap();
+        let cfg = parse_socket_file(&path).unwrap();
+        let acts = socket_to_activation_configs(&cfg);
+        assert_eq!(acts[0].fd_name.as_deref(), Some("ssh"));
+        assert_eq!(acts[1].fd_name.as_deref(), Some("http"));
+        assert_eq!(acts[2].fd_name.as_deref(), Some("ssh-mesh.socket"));
+    }
+
+    #[test]
+    fn test_parse_socket_file_descriptor_name_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web.socket");
+        std::fs::write(
+            &path,
+            r#"
+[Socket]
+ListenStream=8080
+"#,
+        )
+        .unwrap();
+        let cfg = parse_socket_file(&path).unwrap();
+        assert_eq!(cfg.file_descriptor_name.as_deref(), Some("web.socket"));
+    }
+
+    #[test]
     fn test_parse_listen_address_bare_port() {
         let act = parse_listen_address("8080", false, false).unwrap();
         assert_eq!(act.port, Some(8080));
+        assert_eq!(act.bind.as_deref(), Some("[::]"));
         assert_eq!(act.wait, true); // !accept = !false
         assert!(!act.datagram);
     }
@@ -456,6 +653,27 @@ ListenStream=8080
         let act = parse_listen_address("[::1]:443", false, false).unwrap();
         assert_eq!(act.port, Some(443));
         assert_eq!(act.bind.as_deref(), Some("[::1]"));
+    }
+
+    #[test]
+    fn test_parse_listen_address_vsock() {
+        let act = parse_listen_address("vsock:2:5000", false, false).unwrap();
+        assert_eq!(act.vsock_cid, Some(2));
+        assert_eq!(act.vsock_port, Some(5000));
+        assert_eq!(act.wait, true);
+        assert!(!act.datagram);
+    }
+
+    #[test]
+    fn test_parse_listen_address_vsock_default_cid() {
+        let act = parse_listen_address("vsock::5000", false, false).unwrap();
+        assert_eq!(act.vsock_cid, None);
+        assert_eq!(act.vsock_port, Some(5000));
+    }
+
+    #[test]
+    fn test_parse_listen_address_vsock_datagram_skipped() {
+        assert!(parse_listen_address("vsock:2:5000", false, true).is_none());
     }
 
     #[test]
@@ -487,12 +705,17 @@ ListenStream=8080
             socket_mode: None,
             socket_user: None,
             socket_group: None,
+            file_descriptor_name: Some("test.socket".to_string()),
+            file_descriptor_names: Vec::new(),
         };
         let acts = socket_to_activation_configs(&cfg);
         assert_eq!(acts.len(), 2);
         assert_eq!(acts[0].port, Some(8080));
+        assert_eq!(acts[0].bind.as_deref(), Some("[::]"));
+        assert_eq!(acts[0].fd_name.as_deref(), Some("test.socket"));
         assert_eq!(acts[0].wait, true);
         assert_eq!(acts[1].socket.as_deref(), Some("/run/test.sock"));
+        assert_eq!(acts[1].fd_name.as_deref(), Some("test.socket"));
         assert_eq!(acts[1].wait, true);
     }
 
@@ -506,6 +729,8 @@ ListenStream=8080
             socket_mode: None,
             socket_user: None,
             socket_group: None,
+            file_descriptor_name: None,
+            file_descriptor_names: Vec::new(),
         };
         let acts = socket_to_activation_configs(&cfg);
         assert_eq!(acts.len(), 1);
@@ -523,6 +748,8 @@ ListenStream=8080
             socket_mode: None,
             socket_user: None,
             socket_group: None,
+            file_descriptor_name: None,
+            file_descriptor_names: Vec::new(),
         };
         // Accept=true + datagram is skipped with an error.
         let acts = socket_to_activation_configs(&cfg);
@@ -539,6 +766,8 @@ ListenStream=8080
             socket_mode: None,
             socket_user: None,
             socket_group: None,
+            file_descriptor_name: None,
+            file_descriptor_names: Vec::new(),
         };
         let acts = socket_to_activation_configs(&cfg);
         assert_eq!(acts.len(), 1);

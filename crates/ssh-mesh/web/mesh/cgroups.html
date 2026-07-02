@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PMOND - CGroup Monitor</title>
+    <title>Mesh - CGroup Monitor</title>
     <style>
         :root {
             --primary: #4361ee;
@@ -389,7 +389,7 @@
     <div class="container">
         <header>
             <div class="header-content">
-                <h1>PMOND - CGroup Monitor</h1>
+                <h1>Mesh - CGroup Monitor</h1>
                 <p>Advanced system cgroup resource & VM statistics</p>
             </div>
             <div style="display: flex; gap: 30px; align-items: center; flex-wrap: wrap;">
@@ -461,11 +461,11 @@
         </div>
 
         <footer>
-            <p>PMOND Advanced CGroup Monitor | Real-time System Analytics</p>
+            <p>Mesh Advanced CGroup Monitor | Real-time System Analytics</p>
         </footer>
     </div>
 
-    <script src="pmond.js"></script>
+    <script src="mesh.js"></script>
     <script>
         // DOM elements
         const tableBody = document.getElementById('cgroup-table-body');
@@ -485,9 +485,7 @@
 
         async function fetchData() {
             try {
-                const response = await fetch('../_cgroups');
-                if (!response.ok) throw new Error('Failed to fetch cgroups');
-                cgroupsData = await response.json();
+                cgroupsData = await meshCall('cgroups');
                 renderTable();
                 updateStats();
             } catch (err) {
@@ -667,18 +665,9 @@
 
         async function setCgroupHigh(path, percentage, interval) {
             try {
-                const response = await fetch('../_cgroup_high', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path, percentage, interval })
-                });
-                if (response.ok) {
-                    console.log(`Successfully set memory.high for ${path}`);
-                    fetchData();
-                } else {
-                    const err = await response.json();
-                    alert(`Error: ${err.error}`);
-                }
+                await meshCall('cgroup_high', { path, percentage, interval });
+                console.log(`Successfully set memory.high for ${path}`);
+                fetchData();
             } catch (err) {
                 alert(`Failed to set memory.high: ${err}`);
             }
@@ -696,18 +685,9 @@
         async function freezeCgroup(path, freeze) {
             const action = freeze ? 'Freeze' : 'Unfreeze';
             try {
-                const response = await fetch('../_freeze_cgroup', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path, freeze })
-                });
-                if (response.ok) {
-                    console.log(`Successfully ${action.toLowerCase()}d cgroup ${path}`);
-                    alert(`${action}d cgroup successfully!`);
-                } else {
-                    const err = await response.json();
-                    alert(`Error: ${err.error}`);
-                }
+                await meshCall('freeze_cgroup', { path, freeze });
+                console.log(`Successfully ${action.toLowerCase()}d cgroup ${path}`);
+                alert(`${action}d cgroup successfully!`);
             } catch (err) {
                 alert(`Failed to ${action.toLowerCase()} cgroup: ${err}`);
             }
@@ -729,15 +709,7 @@
             listContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--gray)">Loading processes...</div>';
 
             try {
-                const response = await fetch('../_cgroup_procs', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path })
-                });
-
-                if (!response.ok) throw new Error('Failed to fetch processes');
-
-                const processes = await response.json();
+                const processes = await meshCall('cgroup_procs', { path });
 
                 if (processes.length === 0) {
                     listContainer.innerHTML = '<div style="padding: 15px; text-align: center; color: var(--gray)">No processes found in this cgroup</div>';

@@ -1,7 +1,7 @@
 # ssh-mesh API
 
 `ssh-mesh` owns the HTTP-facing API surface for the workspace. Components such as
-`pmond`, `lmesh`, and `traceweb` expose local JSONL/JSON-RPC over activated Unix
+`mesh-init`, `lmesh`, and `traceweb` expose local JSONL/JSON-RPC over activated Unix
 sockets; ssh-mesh maps selected HTTP routes to those sockets.
 
 ## JSONL Proxying
@@ -70,20 +70,22 @@ The upstream traceweb UDS path comes from `TRACEWEB_UDS`, defaulting to:
 
 SSE event data is the `trace_entry.params` object from traceweb.
 
-## pmond Proxy
+## Generic App Proxy
 
-Base route: `/_m/pmon`
+Base route: `/_m/proxy`
 
-The upstream pmond UDS path comes from `PMOND_UDS`, defaulting to:
+The upstream UDS path comes from `<APP>_UDS` when set. Otherwise `mesh-init`
+defaults to the system control socket:
 
 ```text
-/home/pmond/run/pmond/control.sock
+/home/system/run/mesh-init/control.sock
 ```
 
-These routes forward to pmond JSONL methods: `_ps`, `_ps/:pid`, `_process/:pid`, `_cg`,
-`_cgroups`, `_psi`, `_cgroup_high`, `_cgroup_procs`, `_move_process`, `_clear_refs`,
-`_freeze_process`, and `_freeze_cgroup`. See `crates/pmond/API.md` for the upstream
-method contracts.
+| HTTP route | Description |
+| --- | --- |
+| `POST /_m/proxy/jsonl/:app` | Sends the JSON body as one flat JSONL request. |
+| `POST /_m/proxy/jsonrpc/:app` | Sends a JSON-RPC request to the app UDS. |
+| `POST /_m/proxy/mcp/:app?tools=mesh/tools.json` | Serves generic MCP methods and maps `tools/call` to the app UDS. |
 
 ## SSH Routes
 

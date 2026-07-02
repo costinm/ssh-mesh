@@ -119,13 +119,27 @@ pub enum ServiceActivationMode {
 pub struct ActivationConfig {
     pub port: Option<u16>,
     pub socket: Option<String>,
+    /// AF_VSOCK CID for `ListenStream=vsock:CID:PORT`. An omitted CID in the
+    /// socket unit is represented as `None` and defaults to VMADDR_CID_ANY at
+    /// bind time.
+    #[serde(default)]
+    pub vsock_cid: Option<u32>,
+    /// AF_VSOCK port for `ListenStream=vsock:CID:PORT`.
+    #[serde(default)]
+    pub vsock_port: Option<u32>,
     #[serde(default)]
     pub wait: bool,
-    /// Bind address for TCP activation. Defaults to `127.0.0.1` (loopback) to
-    /// avoid exposing unauthenticated activation services. Set to `0.0.0.0`
-    /// or `::` to listen on all interfaces — only do this with auth configured.
+    /// Bind address for TCP activation. For systemd-style socket units, a bare
+    /// `ListenStream=PORT` defaults to IPv6-any with dual-stack enabled where
+    /// the OS permits it. Inline activation entries without `bind` use the same
+    /// default.
     #[serde(default)]
     pub bind: Option<String>,
+    /// File descriptor name passed through `LISTEN_FDNAMES` for systemd-style
+    /// activation. From `.socket` files this comes from `FileDescriptorName=`,
+    /// defaulting to the socket unit file name.
+    #[serde(default)]
+    pub fd_name: Option<String>,
     /// ListenDatagram (true) vs ListenStream (false). Maps to SOCK_DGRAM vs
     /// SOCK_STREAM. Datagram activation with Accept=true is not supported.
     #[serde(default)]

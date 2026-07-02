@@ -37,15 +37,12 @@
 //! The `-S` option can override this and point to a specific file.
 use anyhow::{Context, Result};
 use clap::Parser;
-use http_body_util::Full;
-use hyper::Request;
-use hyper::body::Bytes;
-use hyper_util::rt::TokioIo;
 use log::debug;
 use serde_json::json;
 use ssh_mesh::sshd::UDS_FORWARD_PORT;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::sleep;
 
@@ -105,6 +102,45 @@ enum ForwardSpec {
         listen_path: String,
         connect_path: String,
     },
+}
+
+async fn request_jsonl_connect(host: &str, user: &str) -> Result<()> {
+    let jsonl_path = mesh::paths::AppPaths::for_app("ssh-mesh")
+        .run_dir("ssh-mesh")
+        .join("jsonl.sock");
+    let stream = UnixStream::connect(&jsonl_path)
+        .await
+        .with_context(|| format!("connect ssh-mesh JSONL socket {}", jsonl_path.display()))?;
+    let (read, mut write) = stream.into_split();
+    let request = json!({
+        "method": "sshc/connect",
+        "host": host,
+        "port": 15022,
+        "user": user,
+        "server_key": ""
+    });
+    write.write_all(request.to_string().as_bytes()).await?;
+    write.write_all(b"\n").await?;
+    write.flush().await?;
+
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .context("read ssh-mesh JSONL response")?;
+    let response: mesh::protocol::Response =
+        serde_json::from_str(line.trim()).context("parse ssh-mesh JSONL response")?;
+    if response.success {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "ssh-mesh JSONL connect failed: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        )
+    }
 }
 
 fn parse_forward_spec(s: &str, is_remote: bool) -> Result<ForwardSpec> {
@@ -190,12 +226,8 @@ async fn main() -> Result<()> {
     let mut client = match ssh_mesh::sshmuxc::MuxClient::connect(&socket_path).await {
         Ok(c) => c,
         Err(e) => {
-            debug!("Failed to connect to mux, trying UDS HTTP fallback: {}", e);
+            debug!("Failed to connect to mux, trying JSONL activation: {}", e);
 
-            let control_uds_path =
-                mesh::paths::AppPaths::for_app("ssh-mesh").control_socket("ssh-mesh");
-
-            // Fallback: try to request a connection via HTTP API over UDS
             let (user, host) = if let Some((u, h)) = cli.destination.split_once('@') {
                 (u.to_string(), h.to_string())
             } else {
@@ -204,67 +236,19 @@ async fn main() -> Result<()> {
                     cli.destination.clone(),
                 )
             };
-
-            let json_body = json!({
-                "host": host,
-                "port": 15022,
-                "user": user,
-                "server_key": ""
-            })
-            .to_string();
-
-            let stream = UnixStream::connect(&control_uds_path)
-                .await
-                .context(format!(
-                    "Failed to connect to control UDS at {:?}",
-                    control_uds_path
-                ))?;
-
-            let (mut request_sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                    .await
-                    .context("HTTP handshake failed")?;
-
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    debug!("Error in UDS connection: {}", e);
+            request_jsonl_connect(&host, &user).await?;
+            debug!("JSONL connect request successful, waiting for mux socket...");
+            let mut maybe_client = None;
+            for _ in 0..10 {
+                sleep(Duration::from_millis(500)).await;
+                if let Ok(c) = ssh_mesh::sshmuxc::MuxClient::connect(&socket_path).await {
+                    maybe_client = Some(c);
+                    break;
                 }
-            });
-
-            let request = Request::builder()
-                .uri("/_m/api/sshc/connect")
-                .method("POST")
-                .header("Host", "localhost")
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(json_body)))
-                .context("Failed to build HTTP request")?;
-
-            let response = request_sender
-                .send_request(request)
-                .await
-                .context("Failed to send HTTP request over UDS")?;
-
-            if response.status().is_success() {
-                debug!("HTTP connect request successful, waiting for mux socket...");
-                // Wait for the mux socket to be created
-                let mut maybe_client = None;
-                for _ in 0..10 {
-                    sleep(Duration::from_millis(500)).await;
-                    if let Ok(c) = ssh_mesh::sshmuxc::MuxClient::connect(&socket_path).await {
-                        maybe_client = Some(c);
-                        break;
-                    }
-                }
-                match maybe_client {
-                    Some(c) => c,
-                    None => anyhow::bail!("Mux socket failed to appear after HTTP connect request"),
-                }
-            } else {
-                anyhow::bail!(
-                    "HTTP fallback failed with status {}: {:?}",
-                    response.status(),
-                    response.into_body()
-                );
+            }
+            match maybe_client {
+                Some(c) => c,
+                None => anyhow::bail!("Mux socket failed to appear after JSONL connect request"),
             }
         }
     };

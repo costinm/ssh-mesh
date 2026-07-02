@@ -134,7 +134,13 @@ pub enum ActivationFd {
     Pty(std::os::fd::OwnedFd),
     /// Accept=false mode: listening sockets passed to the child using systemd
     /// socket activation conventions: fd 3.. with `LISTEN_FDS=N`.
-    Listen(Vec<std::os::fd::OwnedFd>),
+    Listen(Vec<ActivationListenFd>),
+}
+
+/// A listener fd plus its optional `LISTEN_FDNAMES` entry.
+pub struct ActivationListenFd {
+    pub fd: std::os::fd::OwnedFd,
+    pub name: Option<String>,
 }
 
 /// Spawn a new process for a service.
@@ -220,12 +226,12 @@ pub fn spawn_process(
             // Accept=false: pass listening FDs to the child using systemd
             // socket activation conventions.
             use std::os::fd::AsRawFd;
-            let raw_fds: Vec<i32> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+            let raw_fds: Vec<i32> = fds.iter().map(|fd| fd.fd.as_raw_fd()).collect();
             cmd.env("LISTEN_FDS", raw_fds.len().to_string());
             cmd.env(
                 "LISTEN_FDNAMES",
-                (0..raw_fds.len())
-                    .map(|_| "unknown")
+                fds.iter()
+                    .map(|fd| fd.name.as_deref().unwrap_or("unknown"))
                     .collect::<Vec<_>>()
                     .join(":"),
             );
@@ -253,7 +259,7 @@ pub fn spawn_process(
             // until after `cmd.spawn()` returns; the child inherits the FD
             // values (CLOEXEC was cleared in pre_exec), and the parent's copy is
             // then closed when `_passed_fd_keepalive` drops at end of scope.
-            _passed_fd_keepalive = fds;
+            _passed_fd_keepalive = fds.into_iter().map(|fd| fd.fd).collect();
         }
         None => {}
     }
@@ -538,6 +544,40 @@ mod tests {
         let mut output = String::new();
         let _ = master.read_to_string(&mut output);
         assert!(output.contains("tty-ok"), "{output}");
+    }
+
+    #[test]
+    fn test_listen_activation_sets_fd_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("fdnames");
+        let (fd, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(peer);
+
+        let mut config = test_config("fdnames-test");
+        config.command = "/bin/sh".to_string();
+        config.args = vec![
+            "-c".to_string(),
+            format!("printf '%s' \"$LISTEN_FDNAMES\" > {}", out.display()),
+        ];
+        config.oneshot = true;
+
+        let pid = spawn_process(
+            &config,
+            "/sys/fs/cgroup",
+            Some(ActivationFd::Listen(vec![ActivationListenFd {
+                fd: fd.into(),
+                name: Some("http".to_string()),
+            }])),
+        )
+        .unwrap();
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+        assert_eq!(waited, pid as i32);
+        assert!(libc::WIFEXITED(status), "status={status}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "status={status}");
+
+        assert_eq!(std::fs::read_to_string(out).unwrap(), "http");
     }
 
     #[test]

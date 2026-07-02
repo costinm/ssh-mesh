@@ -1,6 +1,8 @@
+use serde::Deserialize;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(feature = "ws")]
 use ws::WSServer;
@@ -12,14 +14,6 @@ fn get_local_ip() -> Option<String> {
     socket.local_addr().ok().map(|addr| addr.ip().to_string())
 }
 
-/// Function to get port from environment variable or use default
-fn get_port_from_env(var_name: &str, default: u16) -> u16 {
-    std::env::var(var_name)
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(default)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let (log_buffer, _trace_guard) = mesh::local_trace::init("ssh-mesh");
@@ -27,17 +21,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Import required items
     use log::{error, info};
-    use ssh_mesh::{AppState, ExecConfig, MeshNode, MeshNodeConfig, handlers, run_ssh_server};
+    use ssh_mesh::{
+        AppState, ExecConfig, MeshNode, MeshNodeConfig, handlers, run_ssh_server_on_listener,
+    };
 
     let app_paths = mesh::paths::AppPaths::for_app("ssh-mesh");
     let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
-
-    // Get SSH port from environment variable or use default
-    let ssh_port = get_port_from_env("SSH_PORT", 15022);
-    let http_port = get_port_from_env("HTTP_PORT", 15080);
-    let https_port = get_port_from_env("HTTPS_PORT", 15028);
-    // Start SOCKS5 server if SOCKS_PORT is set
-    let socks_port = get_port_from_env("SOCKS_PORT", 0);
 
     // Get base directory from environment variable SSH_BASEDIR
     // If not set, use $HOME/.ssh or /tmp/.ssh as default
@@ -57,7 +46,9 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create config from env vars, layering: defaults → config file → env vars
     let cfg: MeshNodeConfig = {
         let mut builder = config::Config::builder()
-            .set_default("ssh_port", ssh_port as i64)
+            .set_default("ssh_port", 15022)
+            .unwrap()
+            .set_default("http_port", 15080)
             .unwrap()
             .set_default("sftp_server_path", env::var("SFTP_SERVER_PATH").ok())
             .unwrap()
@@ -77,17 +68,11 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
 
-        // Layer env overrides
-        if http_port > 0 {
-            builder = builder.set_override("http_port", http_port as i64).unwrap();
-        }
-
         match builder.build().and_then(|c| c.try_deserialize()) {
             Ok(mut c) => {
                 let c: &mut MeshNodeConfig = &mut c;
                 c.base_dir = Some(base_dir.clone());
                 c.config_dir = Some(config_dir.clone());
-                c.ssh_port = Some(ssh_port);
                 c.clone()
             }
             Err(e) => {
@@ -95,8 +80,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 MeshNodeConfig {
                     base_dir: Some(base_dir.clone()),
                     config_dir: Some(config_dir.clone()),
-                    ssh_port: Some(ssh_port),
-                    http_port: if http_port > 0 { Some(http_port) } else { None },
+                    ssh_port: Some(15022),
+                    http_port: Some(15080),
                     sftp_server_path: env::var("SFTP_SERVER_PATH").ok(),
                     sftp_root: env::var("SFTP_ROOT").ok().map(PathBuf::from),
                     ..Default::default()
@@ -115,57 +100,6 @@ async fn main() -> Result<(), anyhow::Error> {
         info!("Starting trusted SSH transport on stdin/stdout");
         ssh_mesh::trusted_transport::run_trusted_server_stdio((*ssh_server).clone()).await?;
         return Ok(());
-    }
-
-    let trusted_uds_path = env::var("SSH_MESH_TRUSTED_UDS_PATH")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| ssh_server.cfg.trusted_uds_path.clone());
-    if let Some(uds_path) = trusted_uds_path {
-        let trusted_server = ssh_server.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ssh_mesh::trusted_transport::run_trusted_uds_server(
-                (*trusted_server).clone(),
-                uds_path,
-            )
-            .await
-            {
-                error!("trusted UDS SSH server failed: {}", e);
-            }
-        });
-    }
-
-    let trusted_vsock_port = env::var("SSH_MESH_VSOCK_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .or(ssh_server.cfg.trusted_vsock_port);
-    if let Some(vsock_port) = trusted_vsock_port {
-        #[cfg(target_os = "linux")]
-        {
-            let vsock_cid = env::var("SSH_MESH_VSOCK_CID")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .or(ssh_server.cfg.trusted_vsock_cid)
-                .unwrap_or(ssh_mesh::trusted_transport::VMADDR_CID_ANY);
-            let trusted_server = ssh_server.clone();
-            tokio::spawn(async move {
-                if let Err(e) = ssh_mesh::trusted_transport::run_trusted_vsock_server(
-                    (*trusted_server).clone(),
-                    vsock_cid,
-                    vsock_port,
-                )
-                .await
-                {
-                    error!("trusted vsock SSH server failed: {}", e);
-                }
-            });
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = vsock_port;
-            error!("SSH_MESH_VSOCK_PORT is set, but virtio-vsock is only supported on Linux");
-        }
     }
 
     // Create WebSocket server instance
@@ -231,37 +165,25 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     info!(
-        "Starting SSH_PORT {} and HTTPS_PORT={} HTTP_PORT={} SSH_BASEDIR={:?} app_port={:?} ip={}",
-        ssh_port, https_port, http_port, base_dir, &app_state.target_http_address, host_ip
+        "Starting ssh-mesh with activation fds {:?} SSH_BASEDIR={:?} app_port={:?} ip={}",
+        mesh::server::activated_listener_names(),
+        base_dir,
+        &app_state.target_http_address,
+        host_ip
     );
 
-    // Start SSH server in a separate task
-    let ssh_server_clone = ssh_server.clone();
-    let _ssh_server_task = tokio::spawn(async move {
-        let config = ssh_server_clone.get_config();
-        if let Err(e) = run_ssh_server(ssh_port, config, (*ssh_server_clone).clone()).await {
-            error!("SSH server failed: {}", e);
-        }
-    });
-
-    if socks_port > 0 {
-        let socks_addr = format!("127.0.0.1:{}", socks_port);
+    if let Some(listener) = take_named_or_next_tcp_listener(&["ssh", "ssh-tcp"], "SSH")? {
+        let ssh_server_clone = ssh_server.clone();
         tokio::spawn(async move {
-            match ssh_mesh::socks5::Socks5Server::bind_with_config(
-                &socks_addr,
-                ssh_mesh::socks5::Socks5Config::default(),
-            )
-            .await
+            let config = Arc::new(ssh_server_clone.get_config());
+            if let Err(e) =
+                run_ssh_server_on_listener(listener, config, (*ssh_server_clone).clone()).await
             {
-                Ok(server) => {
-                    info!("SOCKS5 server listening on {}", socks_addr);
-                    server.run().await;
-                }
-                Err(e) => {
-                    error!("Failed to start SOCKS5 server: {}", e);
-                }
+                error!("SSH server failed: {}", e);
             }
         });
+    } else {
+        log::warn!("no activated SSH TCP listener found");
     }
 
     // Create Axum app
@@ -301,107 +223,54 @@ async fn main() -> Result<(), anyhow::Error> {
         app = app.merge(ws::app_ws(ws_state));
     }
 
-    // HTTPS admin server with mTLS client-certificate authentication.
-    //
-    // When a CA certificate is available (base_dir/id_ecdsa.crt for the
-    // server, and a CA bundle for clients), the HTTPS server requires a valid
-    // client certificate. This is the recommended mode for exposing the admin
-    // (`/_m/...`) endpoints. Without mTLS, anyone who can reach the port has
-    // full admin access (RCE via `_exec`, open relay via `_tcp`/`_uds`).
-    if https_port > 0 {
-        let cert_path = base_dir.join("id_ecdsa.crt");
-        let key_path = base_dir.join("id_ecdsa");
-        if cert_path.exists() && key_path.exists() {
-            let app = app.clone();
-            let https_bind =
-                std::env::var("SSH_MESH_HTTPS_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
-            let https_addr = format!("{}:{}", https_bind, https_port);
-            // Look for a CA bundle to enable client-cert verification.
-            // Defaults to base_dir/authorized_cas (the same file used for SSH
-            // CA validation). Can be overridden with SSH_MESH_HTTPS_CA.
-            let ca_path = std::env::var("SSH_MESH_HTTPS_CA")
-                .map(PathBuf::from)
-                .ok()
-                .unwrap_or_else(|| base_dir.join("authorized_cas"));
-            let ca_arg = if ca_path.exists() {
-                info!(
-                    "HTTPS admin server will require mTLS client certs validated against {}",
-                    ca_path.display()
-                );
-                Some(ca_path.as_path())
-            } else {
-                log::warn!(
-                    "HTTPS admin server starting WITHOUT client-cert authentication. \
-                     The admin endpoints (_exec, _tcp, _uds) will be unauthenticated. \
-                     Provide an authorized_cas file or SSH_MESH_HTTPS_CA to enable mTLS."
-                );
-                None
-            };
-            match ssh_mesh::auth::TlsServer::new(&cert_path, &key_path, ca_arg, &https_addr) {
-                Ok(tls_server) => {
-                    info!("Starting HTTPS server on https://{}", https_addr);
-                    tokio::spawn(async move {
-                        if let Err(e) = ssh_mesh::auth::run_axum_https_server(
-                            https_port,
-                            tls_server.acceptor,
-                            app,
-                        )
-                        .await
-                        {
-                            error!("HTTPS server failed: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to initialize TLS config: {}", e);
-                }
+    let web_app = public_web_app(app_paths.home.join("web"));
+    start_tls_listener_if_present(
+        &base_dir,
+        &["h2", "mesh", "mesh-mtls", "mtls"],
+        "mesh H2/mTLS",
+        app.clone(),
+        true,
+    )?;
+    start_http_listener_if_present(&["http"], "HTTP", web_app.clone(), true)?;
+    start_tls_listener_if_present(&base_dir, &["https"], "HTTPS", web_app, true)?;
+    start_admin_listener_if_present(app.clone())?;
+    start_jsonl_listener_if_present(app_state.ssh_client_manager.clone())?;
+
+    if let Some(listener) =
+        take_named_or_next_unix_listener(&["ssh-uds", "trusted-ssh-uds"], "trusted SSH UDS")?
+    {
+        let trusted_server = ssh_server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ssh_mesh::trusted_transport::run_trusted_uds_listener(
+                (*trusted_server).clone(),
+                listener,
+                "ssh-uds",
+            )
+            .await
+            {
+                error!("trusted UDS SSH server failed: {}", e);
             }
-        }
+        });
     }
 
-    // HTTP over UDS server. mesh provides activation/UDS auth; ssh-mesh owns HTTP.
-    let control_uds = app_paths
-        .control_socket("ssh-mesh")
-        .to_string_lossy()
-        .into_owned();
-    let app_clone = app.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_axum_over_mesh_listener("ssh-mesh", Some(&control_uds), app_clone).await
-        {
-            error!("UDS HTTP server failed: {}", e);
-        }
-    });
-
-    // HTTP server - forwards to the app's port, with handlers for
-    // ssh tunneling and an admin interface.
-    //
-    // Security: the admin (`/_m/...`) endpoints are served on this port. By
-    // default bind to 127.0.0.1 (loopback) so that the admin surface is not
-    // reachable from the network without an explicit opt-in. Set
-    // `SSH_MESH_HTTP_BIND=0.0.0.0` to listen on all interfaces — only do this
-    // behind a reverse proxy or with mTLS on the HTTPS port.
-    if http_port > 0 {
-        let http_bind =
-            std::env::var("SSH_MESH_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-        if http_bind == "0.0.0.0" || http_bind == "::" {
-            log::warn!(
-                "HTTP admin server binds {} with unauthenticated admin endpoints (_exec, _tcp, _uds). \
-                 Restrict to localhost or use the HTTPS port with mTLS.",
-                http_bind
-            );
-        }
-        let listener = if let Some(listener) = mesh::server::take_activated_tcp_listener()
-            .map_err(|e| anyhow::anyhow!("activated TCP listener error: {}", e))?
-        {
-            TcpListener::from_std(listener)?
-        } else {
-            let http_addr = format!("{}:{}", http_bind, http_port);
-            TcpListener::bind(&http_addr).await?
-        };
-        // Run HTTP server in background
+    if let Some(fd) =
+        take_named_or_next_vsock_listener(&["vsock", "ssh-vsock", "trusted-ssh-vsock"], "VSOCK")?
+    {
+        let trusted_server = ssh_server.clone();
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.into_make_service()).await {
-                error!("HTTP server failed: {}", e);
+            match ssh_mesh::trusted_transport::VsockListener::from_owned_fd(fd) {
+                Ok(listener) => {
+                    if let Err(e) = ssh_mesh::trusted_transport::run_trusted_vsock_listener(
+                        (*trusted_server).clone(),
+                        listener,
+                        "activated".to_string(),
+                    )
+                    .await
+                    {
+                        error!("trusted VSOCK SSH server failed: {}", e);
+                    }
+                }
+                Err(e) => error!("trusted VSOCK listener activation failed: {}", e),
             }
         });
     }
@@ -444,16 +313,387 @@ async fn main() -> Result<(), anyhow::Error> {
     std::process::exit(0);
 }
 
-async fn run_axum_over_mesh_listener(
-    app_name: &str,
-    listen_path: Option<&str>,
+fn take_named_tcp_listener(names: &[&str]) -> anyhow::Result<Option<TcpListener>> {
+    for name in names {
+        if let Some(listener) = mesh::server::take_activated_tcp_listener_by_name(name)
+            .map_err(|e| anyhow::anyhow!("activated TCP listener '{}' error: {}", name, e))?
+        {
+            return Ok(Some(TcpListener::from_std(listener)?));
+        }
+    }
+    Ok(None)
+}
+
+fn take_named_or_next_tcp_listener(
+    names: &[&str],
+    role: &str,
+) -> anyhow::Result<Option<TcpListener>> {
+    if let Some(listener) = take_named_tcp_listener(names)? {
+        return Ok(Some(listener));
+    }
+    if has_activated_listener_names() {
+        return Ok(None);
+    }
+    if let Some(listener) = mesh::server::take_activated_tcp_listener()
+        .map_err(|e| anyhow::anyhow!("activated {} listener error: {}", role, e))?
+    {
+        log::warn!("{} using activated TCP listener by fd order", role);
+        return Ok(Some(TcpListener::from_std(listener)?));
+    }
+    Ok(None)
+}
+
+fn take_named_unix_listener(names: &[&str]) -> anyhow::Result<Option<tokio::net::UnixListener>> {
+    for name in names {
+        if let Some(listener) = mesh::server::take_activated_unix_listener_by_name(name)
+            .map_err(|e| anyhow::anyhow!("activated Unix listener '{}' error: {}", name, e))?
+        {
+            return Ok(Some(listener));
+        }
+    }
+    Ok(None)
+}
+
+fn take_named_or_next_unix_listener(
+    names: &[&str],
+    role: &str,
+) -> anyhow::Result<Option<tokio::net::UnixListener>> {
+    if let Some(listener) = take_named_unix_listener(names)? {
+        return Ok(Some(listener));
+    }
+    if has_activated_listener_names() {
+        return Ok(None);
+    }
+    if let Some(listener) = mesh::server::take_activated_unix_listener()
+        .map_err(|e| anyhow::anyhow!("activated {} listener error: {}", role, e))?
+    {
+        log::warn!("{} using activated Unix listener by fd order", role);
+        return Ok(Some(listener));
+    }
+    Ok(None)
+}
+
+fn take_named_vsock_listener(names: &[&str]) -> anyhow::Result<Option<std::os::fd::OwnedFd>> {
+    for name in names {
+        if let Some(fd) = mesh::server::take_activated_vsock_listener_by_name(name)
+            .map_err(|e| anyhow::anyhow!("activated AF_VSOCK listener '{}' error: {}", name, e))?
+        {
+            return Ok(Some(fd));
+        }
+    }
+    Ok(None)
+}
+
+fn take_named_or_next_vsock_listener(
+    names: &[&str],
+    role: &str,
+) -> anyhow::Result<Option<std::os::fd::OwnedFd>> {
+    if let Some(fd) = take_named_vsock_listener(names)? {
+        return Ok(Some(fd));
+    }
+    if has_activated_listener_names() {
+        return Ok(None);
+    }
+    if let Some(fd) = mesh::server::take_activated_vsock_listener()
+        .map_err(|e| anyhow::anyhow!("activated {} listener error: {}", role, e))?
+    {
+        log::warn!("{} using activated AF_VSOCK listener by fd order", role);
+        return Ok(Some(fd));
+    }
+    Ok(None)
+}
+
+fn has_activated_listener_names() -> bool {
+    !mesh::server::activated_listener_names().is_empty()
+}
+
+fn start_http_listener_if_present(
+    names: &[&str],
+    label: &'static str,
+    app: axum::Router,
+    allow_order_fallback: bool,
+) -> anyhow::Result<()> {
+    let listener = if allow_order_fallback {
+        take_named_or_next_tcp_listener(names, label)?
+    } else {
+        take_named_tcp_listener(names)?
+    };
+    if let Some(listener) = listener {
+        tokio::spawn(async move {
+            let addr = listener
+                .local_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            log::info!("{} listener serving HTTP on {}", label, addr);
+            if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+                log::error!("{} server failed: {}", label, e);
+            }
+        });
+    }
+    Ok(())
+}
+
+fn start_admin_listener_if_present(app: axum::Router) -> anyhow::Result<()> {
+    if let Some(listener) = take_named_or_next_tcp_listener(&["admin"], "admin HTTP")? {
+        tokio::spawn(async move {
+            let addr = listener
+                .local_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            log::info!("admin listener serving HTTP on {}", addr);
+            if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+                log::error!("admin HTTP server failed: {}", e);
+            }
+        });
+        return Ok(());
+    }
+
+    if let Some(listener) = take_named_unix_listener(&["admin"])? {
+        tokio::spawn(async move {
+            if let Err(e) = run_axum_over_mesh_stream_listener(listener, app).await {
+                log::error!("admin UDS HTTP server failed: {}", e);
+            }
+        });
+    }
+    Ok(())
+}
+
+fn start_jsonl_listener_if_present(
+    manager: Arc<ssh_mesh::sshc::SshClientManager>,
+) -> anyhow::Result<()> {
+    if let Some(listener) = take_named_or_next_unix_listener(&["jsonl"], "JSONL")? {
+        tokio::spawn(async move {
+            if let Err(e) = run_jsonl_listener(listener, manager).await {
+                log::error!("JSONL listener failed: {}", e);
+            }
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "method")]
+enum SshMeshJsonlRequest {
+    #[serde(rename = "sshc/connect")]
+    SshcConnect(ssh_mesh::sshc::ConnectRequest),
+    #[serde(other)]
+    Unknown,
+}
+
+async fn run_jsonl_listener(
+    listener: tokio::net::UnixListener,
+    manager: Arc<ssh_mesh::sshc::SshClientManager>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_jsonl_stream(stream, manager).await {
+                log::debug!("JSONL connection failed: {}", e);
+            }
+        });
+    }
+}
+
+async fn handle_jsonl_stream(
+    stream: tokio::net::UnixStream,
+    manager: Arc<ssh_mesh::sshc::SshClientManager>,
+) -> anyhow::Result<()> {
+    let registry = mesh::jsonl::McpRegistry::new("ssh-mesh");
+    let (read, mut write) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let manager = manager.clone();
+        let (format, response) = mesh::jsonl::dispatch_request::<SshMeshJsonlRequest, _, _>(
+            trimmed,
+            &registry,
+            |request| handle_jsonl_request(manager.clone(), request),
+        )
+        .await;
+        if let Some(response) = response {
+            let encoded = mesh::jsonl::format_response(response, &format)?;
+            write.write_all(encoded.as_bytes()).await?;
+            write.write_all(b"\n").await?;
+            write.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_jsonl_request(
+    manager: Arc<ssh_mesh::sshc::SshClientManager>,
+    request: SshMeshJsonlRequest,
+) -> mesh::protocol::Response {
+    match request {
+        SshMeshJsonlRequest::SshcConnect(req) => match manager
+            .connect(&req.host, req.port, &req.user, &req.server_key)
+            .await
+        {
+            Ok(id) => mesh::protocol::Response::ok_with_data(serde_json::json!({ "id": id })),
+            Err(e) => mesh::protocol::Response::err(e.to_string()),
+        },
+        SshMeshJsonlRequest::Unknown => {
+            mesh::protocol::Response::err("unknown ssh-mesh JSONL method")
+        }
+    }
+}
+
+fn start_tls_listener_if_present(
+    base_dir: &std::path::Path,
+    names: &[&str],
+    label: &'static str,
+    app: axum::Router,
+    allow_order_fallback: bool,
+) -> anyhow::Result<()> {
+    let listener = if allow_order_fallback {
+        take_named_or_next_tcp_listener(names, label)?
+    } else {
+        take_named_tcp_listener(names)?
+    };
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    let cert_path = base_dir.join("id_ecdsa.crt");
+    let key_path = base_dir.join("id_ecdsa");
+    if !cert_path.exists() || !key_path.exists() {
+        log::error!(
+            "{} activated listener present, but TLS cert/key are missing: {} {}",
+            label,
+            cert_path.display(),
+            key_path.display()
+        );
+        return Ok(());
+    }
+
+    let ca_path = std::env::var("SSH_MESH_HTTPS_CA")
+        .map(PathBuf::from)
+        .ok()
+        .unwrap_or_else(|| base_dir.join("authorized_cas"));
+    let ca_arg = if ca_path.exists() {
+        log::info!(
+            "{} will require mTLS client certs validated against {}",
+            label,
+            ca_path.display()
+        );
+        Some(ca_path.as_path())
+    } else {
+        log::warn!(
+            "{} starting without client-cert authentication; provide authorized_cas or SSH_MESH_HTTPS_CA to enable mTLS",
+            label
+        );
+        None
+    };
+    let bind_label = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "activated".to_string());
+    let tls_server = ssh_mesh::auth::TlsServer::new(&cert_path, &key_path, ca_arg, &bind_label)?;
+    tokio::spawn(async move {
+        if let Err(e) =
+            ssh_mesh::auth::run_axum_https_listener(listener, tls_server.acceptor, app).await
+        {
+            log::error!("{} server failed: {}", label, e);
+        }
+    });
+    Ok(())
+}
+
+fn public_web_app(web_dir: PathBuf) -> axum::Router {
+    axum::Router::new()
+        .fallback(public_web_file)
+        .with_state(web_dir)
+}
+
+async fn public_web_file(
+    axum::extract::State(web_dir): axum::extract::State<PathBuf>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let request_path = uri.path();
+    for rel in public_web_candidates(request_path) {
+        if let Some(path) = confined_web_path(&web_dir, &rel)
+            && path.is_file()
+        {
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => {
+                    let mime = mime_guess::from_path(&path)
+                        .first_or_octet_stream()
+                        .to_string();
+                    return (StatusCode::OK, [(header::CONTENT_TYPE, mime)], bytes).into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to read {}: {}", path.display(), e),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    (StatusCode::NOT_FOUND, "Not Found").into_response()
+}
+
+fn public_web_candidates(path: &str) -> Vec<String> {
+    let direct = public_web_normalize_path(path);
+    let mut out = vec![direct.clone()];
+    let parts: Vec<&str> = direct.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() >= 2 {
+        let stripped = if parts.len() == 2 {
+            "index.html".to_string()
+        } else {
+            parts[2..].join("/")
+        };
+        if stripped != direct {
+            out.push(stripped);
+        }
+    }
+    out
+}
+
+fn public_web_normalize_path(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.ends_with('/') {
+        format!("{}index.html", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn confined_web_path(web_dir: &Path, rel: &str) -> Option<PathBuf> {
+    let mut path = web_dir.to_path_buf();
+    for component in Path::new(rel).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(path)
+}
+
+async fn run_axum_over_mesh_stream_listener(
+    listener: tokio::net::UnixListener,
     app: axum::Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use hyper_util::rt::TokioIo;
     use hyper_util::service::TowerToHyperService;
 
-    let mut listener = mesh::server::MeshListener::new(app_name, listen_path)?;
-    while let Some(stream) = listener.accept().await? {
+    loop {
+        let (stream, _) = listener.accept().await?;
         let app_clone = app.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -471,5 +711,4 @@ async fn run_axum_over_mesh_listener(
             }
         });
     }
-    Ok(())
 }

@@ -7,7 +7,7 @@
 #   TCP SSH:          ssh -p 18222 system@127.0.0.1
 #   HTTP/admin:       curl http://127.0.0.1:18280/_m/api/ssh/clients
 #   SSH over HTTP/2:  ssh -o 'ProxyCommand h2t http://127.0.0.1:18280/_m/_ssh' host2@ignored
-#   HTTP UDS proxy:   POST /_m/_uds/home/system/run/pmond/control.sock
+#   HTTP UDS proxy:   POST /_m/_uds/home/system/run/demo/control.sock
 
 ssh_port: 18222
 http_port: 18280

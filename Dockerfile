@@ -28,18 +28,18 @@ FROM base AS build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build both pmond and ssh-mesh targets for MUSL, built individually
+# Build mesh-init and ssh-mesh targets for MUSL, built individually
 # Less efficient (duplicate builds of common deps), but want to evaluate each
-RUN cargo build --target x86_64-unknown-linux-musl --release -p pmond
-RUN cargo build --features pmon --target x86_64-unknown-linux-musl --release -p ssh-mesh
+RUN cargo build --target x86_64-unknown-linux-musl --release -p mesh-init
+RUN cargo build --target x86_64-unknown-linux-musl --release -p ssh-mesh
 
 # Build traceweb with glibc
 RUN cargo build --release -p traceweb
 
 RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    cargo build --features pmon --target aarch64-unknown-linux-musl --release -p ssh-mesh
+    cargo build --target aarch64-unknown-linux-musl --release -p ssh-mesh
 RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    cargo build --target aarch64-unknown-linux-musl --release -p pmond
+    cargo build --target aarch64-unknown-linux-musl --release -p mesh-init
 
 # -----------------------
 FROM rust:slim-bookworm AS build-android
@@ -78,10 +78,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Build for aarch64-linux-android
-RUN cargo build --features pmon --target aarch64-linux-android --release -p ssh-mesh
+RUN cargo build --target aarch64-linux-android --release -p ssh-mesh
 
 # Build for x86_64-linux-android
-RUN cargo build --features pmon --target x86_64-linux-android --release -p ssh-mesh
+RUN cargo build --target x86_64-linux-android --release -p ssh-mesh
 
 
 # -----------------------
@@ -93,10 +93,10 @@ COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/h2t .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/meshkeys .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/sshmc .
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond .
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh-init .
 COPY --from=build /src/target/release/traceweb .
 
-COPY --from=build /src/target/aarch64-unknown-linux-musl/release/pmond aarch64/
+COPY --from=build /src/target/aarch64-unknown-linux-musl/release/mesh-init aarch64/
 COPY --from=build /src/target/aarch64-unknown-linux-musl/release/ssh-mesh aarch64/
 
 # ------------------------
@@ -105,7 +105,7 @@ FROM nicolaka/netshoot
 
 # Copy the statically linked binaries from the build stage
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh /usr/local/bin/ssh-mesh
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/pmond /usr/local/bin/pmond
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh-init /usr/local/bin/mesh-init
 COPY --from=build /src/target/release/traceweb /usr/local/bin/traceweb
 
 # Use ssh-mesh as the default entrypoint

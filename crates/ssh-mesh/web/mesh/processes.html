@@ -871,7 +871,7 @@
                     <h1>Memory Monitor</h1>
                 </div>
                 <div class="divider"></div>
-                <button onclick="location.href='cgmon.html'" class="header-btn" title="View CGroups">
+                <button onclick="location.href='cgroups.html'" class="header-btn" title="View CGroups">
                     📂 CGroups
                 </button>
             </div>
@@ -949,13 +949,13 @@
         </div>
 
         <footer>
-            <p>PMOND Process Monitor | Real-time system monitoring</p>
+            <p>Mesh Process Monitor | Real-time system monitoring</p>
         </footer>
     </div>
 
     </div>
 
-    <script src="pmond.js"></script>
+    <script src="mesh.js"></script>
     <script>
         // DOM elements
         const processTableBody = document.getElementById('process-table-body');
@@ -989,25 +989,13 @@
         // Move process to a new cgroup subdirectory
         function moveToCgroup(pid) {
             // No longer prompting for name, using default command-pid
-            fetch('../_move_process', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
+            meshCall('move_process', {
                     pid: parseInt(pid),
                     cgroup_name: null // Backend will use default
-                }),
-            })
-                .then(response => response.json())
+                })
                 .then(data => {
-                    if (data.status === 'ok') {
-                        addLogEntry(`Successfully moved process ${pid} to mesh.slice`, 'success');
-                        refreshProcesses();
-                    } else {
-                        addLogEntry(`Failed to move process ${pid}: ${data.error}`, 'error');
-                        alert('Error: ' + data.error);
-                    }
+                    addLogEntry(`Successfully moved process ${pid} to mesh.slice`, 'success');
+                    refreshProcesses();
                 })
                 .catch(error => {
                     addLogEntry(`Request failed for process ${pid}: ${error.message}`, 'error');
@@ -1017,25 +1005,13 @@
 
         // Clear process memory references (PSS, etc)
         function clearRefs(pid, value = '7') {
-            fetch('../_clear_refs', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
+            meshCall('clear_refs', {
                     pid: parseInt(pid),
                     value: value
-                }),
-            })
-                .then(response => response.json())
+                })
                 .then(data => {
-                    if (data.status === 'ok') {
-                        addLogEntry(`Successfully cleared refs for process ${pid}`, 'success');
-                        refreshProcesses();
-                    } else {
-                        addLogEntry(`Failed to clear refs for process ${pid}: ${data.error}`, 'error');
-                        alert('Error: ' + data.error);
-                    }
+                    addLogEntry(`Successfully cleared refs for process ${pid}`, 'success');
+                    refreshProcesses();
                 })
                 .catch(error => {
                     addLogEntry(`Request failed for process ${pid}: ${error.message}`, 'error');
@@ -1046,19 +1022,9 @@
         // Freeze or unfreeze a process (SIGSTOP / SIGCONT)
         function freezeProcess(pid, freeze) {
             const action = freeze ? 'Freeze' : 'Unfreeze';
-            fetch('../_freeze_process', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ pid: parseInt(pid), freeze: freeze }),
-            })
-                .then(response => response.json())
+            meshCall('freeze_process', { pid: parseInt(pid), freeze: freeze })
                 .then(data => {
-                    if (data.status === 'ok') {
-                        addLogEntry(`${action}d process ${pid}`, 'success');
-                    } else {
-                        addLogEntry(`Failed to ${action.toLowerCase()} process ${pid}: ${data.error}`, 'error');
-                        alert('Error: ' + data.error);
-                    }
+                    addLogEntry(`${action}d process ${pid}`, 'success');
                 })
                 .catch(error => {
                     addLogEntry(`Request failed: ${error.message}`, 'error');
@@ -1105,9 +1071,7 @@
 
             try {
                 // Fetch only the direct cgroup info
-                const response = await fetch(`../_cg?path=${encodeURIComponent(cgroupPath)}`);
-                if (!response.ok) throw new Error('Failed to fetch cgroup info');
-                const cgroupData = await response.json();
+                const cgroupData = await meshCall('cgroup', { path: cgroupPath });
 
                 renderCgroupInline(container, cgroupData);
                 container.dataset.loaded = 'true';
@@ -1154,18 +1118,9 @@
 
         async function setCgroupHigh(path, percentage, interval) {
             try {
-                const response = await fetch('../_cgroup_high', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path, percentage, interval })
-                });
-                if (response.ok) {
-                    addLogEntry(`Set memory.high for ${path}`, 'success');
-                    alert('Memory high limit updated!');
-                } else {
-                    const err = await response.json();
-                    alert(`Error: ${err.error}`);
-                }
+                await meshCall('cgroup_high', { path, percentage, interval });
+                addLogEntry(`Set memory.high for ${path}`, 'success');
+                alert('Memory high limit updated!');
             } catch (err) {
                 alert(`Failed: ${err}`);
             }
@@ -1568,8 +1523,7 @@
 
         // Refresh processes via REST API
         function refreshProcesses() {
-            fetch('../_ps')
-                .then(response => response.json())
+            meshCall('processes')
                 .then(data => {
                     updateProcessList(data);
                     addLogEntry(`Refreshed process list with ${Object.keys(data).length} processes`, 'success');
@@ -1621,8 +1575,7 @@
         }
 
         // Auto-mark on initial load
-        fetch('../_ps')
-            .then(response => response.json())
+        meshCall('processes')
             .then(data => {
                 allProcesses = data;
                 markCurrentState(); // Auto-mark
@@ -1635,7 +1588,7 @@
 
 
         setTimeout(() => {
-            addLogEntry('PMOND web interface loaded successfully', 'success');
+            addLogEntry('Mesh web interface loaded successfully', 'success');
             addLogEntry('Ready to monitor system processes', 'info');
         }, 1000);
     </script>

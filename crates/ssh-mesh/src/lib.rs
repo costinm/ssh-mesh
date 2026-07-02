@@ -24,12 +24,11 @@ use utoipa::ToSchema;
 // File paths for SSH authentication
 pub mod auth;
 pub mod config_provider;
+pub mod generic_proxy;
 pub mod handlers;
 pub mod jsonl_proxy;
 pub mod mcp_proxy;
 pub mod mux;
-pub mod pmon_proxy;
-pub mod socks5;
 pub mod sshc;
 pub mod sshd;
 pub mod sshmuxc;
@@ -671,25 +670,26 @@ pub async fn run_ssh_server(
 ) -> Result<(), anyhow::Error> {
     let config = Arc::new(config);
 
-    // Check for socket activation via LISTEN_FD
-    let listener = if let Ok(fd_str) = std::env::var("LISTEN_FD") {
-        if let Ok(fd) = fd_str.parse::<i32>() {
-            info!("Using activated listener FD {} for SSH server", fd);
-            use std::os::fd::FromRawFd;
-            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-            std_listener.set_nonblocking(true)?;
-            tokio::net::TcpListener::from_std(std_listener)?
-        } else {
-            let addr = format!("0.0.0.0:{}", port);
-            info!("Starting SSH server on {}", addr);
-            tokio::net::TcpListener::bind(&addr).await?
-        }
+    // Systemd-style activation passes listeners in socket-unit order, starting
+    // at fd 3. For ssh-mesh, the first TCP listener is SSH.
+    let listener = if let Some(listener) = mesh::server::take_activated_tcp_listener()
+        .map_err(|e| anyhow::anyhow!("activated SSH listener error: {}", e))?
+    {
+        tokio::net::TcpListener::from_std(listener)?
     } else {
         let addr = format!("0.0.0.0:{}", port);
         info!("Starting SSH server on {}", addr);
         tokio::net::TcpListener::bind(&addr).await?
     };
 
+    run_ssh_server_on_listener(listener, config, server).await
+}
+
+pub async fn run_ssh_server_on_listener(
+    listener: tokio::net::TcpListener,
+    config: Arc<server::Config>,
+    server: MeshNode,
+) -> Result<(), anyhow::Error> {
     loop {
         debug!("Waiting for new connection...");
         let (stream, peer_addr) = listener.accept().await?;

@@ -142,7 +142,7 @@ if [ "${mode}" = "stdio" ]; then
   mode_command=(
     /opt/busybox/bin/sh
     -c
-    'mkdir -p "$HOME/run/mesh-init" "$HOME/run/pmond" "$HOME/etc/mesh-init-stdio"; MESH_INIT_DIR="$HOME/etc/mesh-init-stdio" MESH_INIT_RUN="$HOME/run/mesh-init" MESH_LOG_FILE="$HOME/run/mesh-init/mesh-init.log" mesh-init >/dev/null 2>&1 & for i in $(seq 1 50); do [ -S "$HOME/run/mesh-init/control.sock" ] && break; sleep 0.1; done; MESH_LOG_FILE="$HOME/run/pmond/pmond.log" pmond --uds control.sock >/dev/null 2>&1 & exec ssh-mesh'
+    'mkdir -p "$HOME/run/mesh-init" "$HOME/etc/mesh-init-stdio"; MESH_INIT_DIR="$HOME/etc/mesh-init-stdio" MESH_INIT_RUN="$HOME/run/mesh-init" MESH_LOG_FILE="$HOME/run/mesh-init/mesh-init.log" mesh-init >/dev/null 2>&1 & for i in $(seq 1 50); do [ -S "$HOME/run/mesh-init/control.sock" ] && break; sleep 0.1; done; exec ssh-mesh'
   )
 else
   echo "${app} HOME: ${home_dir}"

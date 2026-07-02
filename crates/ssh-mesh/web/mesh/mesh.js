@@ -1,6 +1,26 @@
 // ============================================================================
-// Shared utility functions for pmond web UI
+// Shared utility functions for the mesh web UI
 // ============================================================================
+
+const MESH_INIT_PROXY = new URL('../../proxy/jsonl/mesh-init', window.location.href).toString();
+
+async function meshCall(method, params = {}) {
+    const response = await fetch(MESH_INIT_PROXY, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            method,
+            ...params,
+        }),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        throw new Error(data.error || `Request failed: ${response.status}`);
+    }
+    return data;
+}
 
 // Format bytes to human-readable memory size
 function formatMemory(bytes) {

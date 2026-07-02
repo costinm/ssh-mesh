@@ -41,7 +41,7 @@ EOF
 chmod 755 "${SRC}/initos-pod"
 
 if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
-  echo "Error: VM profile not found at ${PROFILE}. Build it first (e.g. scripts/build.sh vm)." >&2
+  echo "Error: VM profile not found at ${PROFILE}. Run scripts/build.sh test vm_vrun_crosvm_echo." >&2
   exit 1
 fi
 

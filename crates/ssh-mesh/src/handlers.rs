@@ -2,9 +2,10 @@ use crate::ConnectedClientInfo;
 use axum::{
     Router,
     body::Body,
+    extract::OriginalUri,
     extract::{Path as AxumPath, State},
     http::{Method, Request, StatusCode},
-    response::{Html, IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{any, get},
 };
 use bytes::Bytes;
@@ -134,27 +135,53 @@ pub fn app_mesh(app_state: AppState) -> Router {
 /// Has all other features - for testing.
 pub fn app(app_state: AppState) -> Router {
     let router = Router::new()
-        .route("/_m/adm", get(serve_index))
-        .route("/_m/adm/*path", get(handle_web_request))
-        .route("/_m/_ssh", any(handle_ssh_request))
-        .route("/_m/_tcp/:host/:port", any(handle_tcp_proxy))
-        .route("/_m/_uds", any(handle_uds_proxy))
-        .route("/_m/_uds/*path", any(handle_uds_proxy))
-        .route("/_m/_exec/*cmd", any(handle_exec))
-        .route("/_m/_ssh/*rest", any(handle_ssh_request))
-        .nest("/_m/mcp", crate::mcp_proxy::routes())
-        .nest("/_m/pmon", crate::pmon_proxy::routes())
-        .nest("/_m/trace", crate::trace_proxy::routes())
-        .fallback(handle_proxy_request)
-        .route("/_m/api/ssh/clients", get(get_ssh_clients))
-        .nest_service(
-            "/_m/api/sshc",
-            crate::sshc::sshc_routes(app_state.ssh_client_manager.clone()),
-        )
-        // Serve pre-generated OpenAPI schema
-        .route("/_m/api/*path", get(serve_json));
+        .route("/", get(redirect_admin))
+        .nest("/_m", mesh_routes(&app_state))
+        .nest("/:prefix1/_m", mesh_routes(&app_state))
+        .nest("/:prefix1/:prefix2/_m", mesh_routes(&app_state))
+        .fallback(handle_proxy_request);
 
     router.with_state(app_state)
+}
+
+async fn redirect_admin() -> Redirect {
+    Redirect::temporary("/_m/adm/")
+}
+
+fn mesh_routes(app_state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/", get(redirect_admin_from_uri))
+        .route("/adm", get(redirect_trailing_slash))
+        .route("/adm/", get(serve_index))
+        .route("/adm/*path", get(handle_web_request))
+        .route("/_ssh", any(handle_ssh_request))
+        .route("/_tcp/:host/:port", any(handle_tcp_proxy))
+        .route("/_uds", any(handle_uds_proxy))
+        .route("/_uds/*path", any(handle_uds_proxy))
+        .route("/_exec/*cmd", any(handle_exec))
+        .route("/_ssh/*rest", any(handle_ssh_request))
+        .nest("/mcp", crate::mcp_proxy::routes())
+        .nest("/proxy", crate::generic_proxy::routes())
+        .nest("/trace", crate::trace_proxy::routes())
+        .route("/api/ssh/clients", get(get_ssh_clients))
+        .nest_service(
+            "/api/sshc",
+            crate::sshc::sshc_routes(app_state.ssh_client_manager.clone()),
+        )
+        .route("/api/*path", get(serve_json))
+}
+
+async fn redirect_admin_from_uri(OriginalUri(uri): OriginalUri) -> Redirect {
+    let path = uri.path().trim_end_matches('/');
+    Redirect::temporary(&format!("{path}/adm/"))
+}
+
+async fn redirect_trailing_slash(OriginalUri(uri): OriginalUri) -> Redirect {
+    let mut path = uri.path().to_string();
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    Redirect::temporary(&path)
 }
 
 /// Guess the MIME type for a file path.
@@ -197,11 +224,11 @@ pub async fn handle_web_request(
     }
 }
 
-/// Serve the main SSH web UI (ssh.html) as the index page.
+/// Serve the web asset index page.
 async fn serve_index() -> impl IntoResponse {
-    match Assets::get("ssh.html") {
+    match Assets::get("index.html").or_else(|| Assets::get("ssh.html")) {
         Some(content) => Html(String::from_utf8_lossy(&content.data).into_owned()),
-        None => Html("<h1>Error: ssh.html not found</h1>".to_string()),
+        None => Html("<h1>Error: index.html not found</h1>".to_string()),
     }
 }
 
@@ -798,9 +825,18 @@ pub async fn handle_proxy_request(
     State(state): State<AppState>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
+    if let Some(response) = prefixed_admin_response(req.uri().path()).await {
+        return response;
+    }
+
     let target_addr = match &state.target_http_address {
         Some(addr) => addr,
-        None => return (StatusCode::NOT_FOUND, "Not Found").into_response(),
+        None => {
+            if let Some(location) = prefixed_admin_location(req.uri().path()) {
+                return Redirect::temporary(&location).into_response();
+            }
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
     };
 
     let path = req.uri().path();
@@ -851,5 +887,58 @@ pub async fn handle_proxy_request(
     match client.request(proxy_req).await {
         Ok(res) => res.into_response(),
         Err(err) => (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", err)).into_response(),
+    }
+}
+
+async fn prefixed_admin_response(path: &str) -> Option<Response> {
+    let marker = "/_m/adm";
+    let idx = path.find(marker)?;
+    let prefix = &path[..idx];
+    let admin_path = &path[idx..];
+
+    if admin_path == marker {
+        return Some(Redirect::temporary(&format!("{prefix}{marker}/")).into_response());
+    }
+    if admin_path == format!("{marker}/") {
+        return Some(serve_index().await.into_response());
+    }
+    let asset_path = admin_path.strip_prefix("/_m/adm/")?;
+    Some(
+        handle_web_request(AxumPath(asset_path.to_string()))
+            .await
+            .into_response(),
+    )
+}
+
+fn prefixed_admin_location(path: &str) -> Option<String> {
+    if path == "/" {
+        return Some("/_m/adm/".to_string());
+    }
+    if path.ends_with('/') && !path.contains("/_m") {
+        return Some(format!("{}_m/adm/", path));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirects_prefixed_root_to_admin() {
+        assert_eq!(prefixed_admin_location("/").as_deref(), Some("/_m/adm/"));
+        assert_eq!(
+            prefixed_admin_location("/proxy/15080/").as_deref(),
+            Some("/proxy/15080/_m/adm/")
+        );
+        assert_eq!(prefixed_admin_location("/favicon.ico"), None);
+    }
+
+    #[tokio::test]
+    async fn serves_prefixed_admin_index_from_fallback() {
+        let response = prefixed_admin_response("/proxy/15080/_m/adm/")
+            .await
+            .expect("prefixed admin response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

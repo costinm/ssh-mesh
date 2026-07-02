@@ -248,7 +248,7 @@ pub fn proc_set_ev_listen(nl_sock: &OwnedFd, enable: bool) -> Result<(), nix::Er
 }
 
 pub fn run_netlink_listener(
-    tx: mpsc::Sender<crate::MonitoringEvent>,
+    tx: mpsc::Sender<super::MonitoringEvent>,
     running: Arc<AtomicBool>,
 ) -> Result<(), nix::Error> {
     let nl_sock = proc_nl_connect()?;
@@ -349,7 +349,7 @@ pub fn run_netlink_listener(
             // blocking_send is appropriate here because we are likely running in a dedicated thread
             // (or using spawn_blocking) and we don't want to async await inside this tight blocking loop
             // without converting the socket to async.
-            if let Err(err) = tx.blocking_send(crate::MonitoringEvent::Netlink(e)) {
+            if let Err(err) = tx.blocking_send(super::MonitoringEvent::Netlink(e)) {
                 error!("Failed to send netlink event: {}", err);
                 break;
             }

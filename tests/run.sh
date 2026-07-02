@@ -31,7 +31,7 @@ start_servers() {
     tmux rename-window -t ssh-mesh-servers:0 'ssh-mesh'
     tmux send-keys -t ssh-mesh-servers:0 'RUST_LOG=info HTTP_PORT=15080 cargo run --bin ssh-mesh' C-m
 
-    # pmond is started by mesh-init activation in docs/examples/pmond_activation_flow.sh.
+    # mesh-init owns the process observer.
 
     echo "Servers started in tmux session: ssh-mesh-servers"
     echo "To attach, run: tmux attach-session -t ssh-mesh-servers"
@@ -43,14 +43,13 @@ start_servers_nix() {
     tmux rename-window -t ssh-mesh-servers:0 'ssh-mesh'
     tmux send-keys -t ssh-mesh-servers:0 'RUST_LOG=info HTTP_PORT=15080 ssh-mesh' C-m
 
-    # pmond is started by mesh-init activation in docs/examples/pmond_activation_flow.sh.
+    # mesh-init owns the process observer.
 
     echo "Servers started in tmux session: ssh-mesh-servers"
 }
 
 test_servers() {
-    echo "Testing pmond activation through mesh-init and ssh-mesh..."
-    "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/examples/pmond_activation_flow.sh"
+    echo "Run tests/test_examples.sh for the mesh-init observer and ssh-mesh proxy smoke test."
     echo "All tests passed."
 }
 

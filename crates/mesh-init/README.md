@@ -68,7 +68,7 @@ socket - will be kept alive for x seconds after the last request or session is t
 - scripts or separate programs can be used to launch - main init should fork as user and exec, with all logic post-fork 
 separated to keep 'as root' code isolated and minimal.
 
-- a separate app can be used to handle termination and freezing, does not need to run as root. For example the pmond crate can handle this.
+- mesh-init owns process observation, cgroup control, pressure watching, termination, and freezing when it runs as root.
 
 - cgroups should be created, with group write - and owned by
 a dedicated 

@@ -43,11 +43,22 @@ impl ControlServer {
     /// Each connection is handled in a separate task.
     pub async fn run(&self) -> Result<()> {
         // Clean up stale socket
-        let _ = std::fs::remove_file(&self.socket_path);
+        if let Err(error) = std::fs::remove_file(&self.socket_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| {
+                format!("remove stale mesh-init control socket {}", self.socket_path)
+            });
+        }
 
         // Ensure parent directory exists
         if let Some(parent) = std::path::Path::new(&self.socket_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create mesh-init control socket directory {}",
+                    parent.display()
+                )
+            })?;
             if unsafe { libc::getuid() } == 0
                 && let Ok(path) = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())
             {
@@ -62,11 +73,17 @@ impl ControlServer {
             if let Ok(metadata) = std::fs::metadata(parent) {
                 let mut perms = metadata.permissions();
                 std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o770);
-                let _ = std::fs::set_permissions(parent, perms);
+                std::fs::set_permissions(parent, perms).with_context(|| {
+                    format!(
+                        "set permissions on mesh-init control socket directory {}",
+                        parent.display()
+                    )
+                })?;
             }
         }
 
-        let listener = UnixListener::bind(&self.socket_path)?;
+        let listener = UnixListener::bind(&self.socket_path)
+            .with_context(|| format!("bind mesh-init control socket {}", self.socket_path))?;
         if unsafe { libc::getuid() } == 0
             && let Ok(path) = std::ffi::CString::new(self.socket_path.as_str())
         {
@@ -80,9 +97,16 @@ impl ControlServer {
         }
 
         // Set permissions so root/owner/group can connect
-        let mut perms = std::fs::metadata(&self.socket_path)?.permissions();
+        let mut perms = std::fs::metadata(&self.socket_path)
+            .with_context(|| format!("stat mesh-init control socket {}", self.socket_path))?
+            .permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o660);
-        std::fs::set_permissions(&self.socket_path, perms)?;
+        std::fs::set_permissions(&self.socket_path, perms).with_context(|| {
+            format!(
+                "set permissions on mesh-init control socket {}",
+                self.socket_path
+            )
+        })?;
 
         info!("Control server listening on {}", self.socket_path);
 
@@ -423,7 +447,7 @@ fn set_fd_cloexec(fd: i32) {
 pub async fn send_request(socket_path: &str, request: &Request) -> Result<Response> {
     let stream = tokio::net::UnixStream::connect(socket_path)
         .await
-        .context("failed to connect to mesh-init daemon")?;
+        .with_context(|| format!("connect to mesh-init daemon at {}", socket_path))?;
     let (reader, mut writer) = stream.into_split();
 
     let request_json = serde_json::to_string(request)?;

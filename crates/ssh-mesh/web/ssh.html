@@ -508,8 +508,8 @@
     <div id="toast" class="toast"></div>
 
     <script>
-        const API_SSHC = '/_m/api/sshc';
-        const API_SSH = '/_m/api/ssh/clients';
+        const API_SSHC = new URL('../api/sshc', window.location.href).toString();
+        const API_SSH = new URL('../api/ssh/clients', window.location.href).toString();
 
         // ── Tabs ──────────────────────────────────────────────────
         document.querySelectorAll('.tab').forEach(tab => {

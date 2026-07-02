@@ -1,8 +1,10 @@
 use crate::auth::{AuthConfig, DelegationEnvelope};
 use crate::paths::AppPaths;
+use std::collections::HashSet;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufStream, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
@@ -90,7 +92,14 @@ enum ListenerMode {
 pub enum ActivatedFdKind {
     Tcp,
     Unix,
+    Vsock,
     Other(i32),
+}
+
+static TAKEN_ACTIVATED_FDS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+
+fn taken_activated_fds() -> &'static Mutex<HashSet<i32>> {
+    TAKEN_ACTIVATED_FDS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 pub struct MeshListener {
@@ -340,6 +349,8 @@ pub fn activated_fd_kind(fd: i32) -> Result<ActivatedFdKind, Box<dyn std::error:
         Ok(ActivatedFdKind::Unix)
     } else if family == libc::AF_INET || family == libc::AF_INET6 {
         Ok(ActivatedFdKind::Tcp)
+    } else if family == libc::AF_VSOCK {
+        Ok(ActivatedFdKind::Vsock)
     } else {
         Ok(ActivatedFdKind::Other(family))
     }
@@ -349,6 +360,15 @@ pub fn first_activated_listener_fd(
     kind: ActivatedFdKind,
 ) -> Result<Option<i32>, Box<dyn std::error::Error>> {
     for fd in activated_listener_fds()? {
+        if taken_activated_fds()
+            .lock()
+            .map(|taken| taken.contains(&fd))
+            .unwrap_or(false)
+        {
+            debug!(fd, "skipping already claimed activated listener fd");
+            continue;
+        }
+
         match activated_fd_kind(fd) {
             Ok(fd_kind) if fd_kind == kind => return Ok(Some(fd)),
             Ok(fd_kind) => debug!(
@@ -363,10 +383,17 @@ pub fn first_activated_listener_fd(
     Ok(None)
 }
 
+fn mark_activated_listener_fd_taken(fd: i32) {
+    if let Ok(mut taken) = taken_activated_fds().lock() {
+        taken.insert(fd);
+    }
+}
+
 pub fn take_activated_unix_listener() -> Result<Option<UnixListener>, Box<dyn std::error::Error>> {
     let Some(fd) = first_activated_listener_fd(ActivatedFdKind::Unix)? else {
         return Ok(None);
     };
+    mark_activated_listener_fd_taken(fd);
     info!("MeshListener: Using activated Unix listener FD {}", fd);
     // SAFETY: activated_fd_kind verifies that fd is an open Unix stream socket.
     // from_raw_fd takes ownership exactly once in this activation path.
@@ -381,6 +408,7 @@ pub fn take_activated_tcp_listener()
     let Some(fd) = first_activated_listener_fd(ActivatedFdKind::Tcp)? else {
         return Ok(None);
     };
+    mark_activated_listener_fd_taken(fd);
     info!("Using activated TCP listener FD {}", fd);
     // SAFETY: activated_fd_kind verifies that fd is an open TCP stream socket.
     // from_raw_fd takes ownership exactly once in this activation path.
@@ -393,8 +421,16 @@ pub fn take_activated_tcp_listener()
 pub fn activated_listener_names() -> Vec<String> {
     std::env::var("LISTEN_FDNAMES")
         .ok()
-        .map(|names| names.split(':').map(str::to_string).collect())
+        .map(|names| parse_activated_listener_names(&names))
         .unwrap_or_default()
+}
+
+fn parse_activated_listener_names(names: &str) -> Vec<String> {
+    names
+        .split(|c: char| c == ':' || c.is_ascii_whitespace())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn activated_listener_fd_by_name(
@@ -411,4 +447,124 @@ pub fn activated_listener_fd_by_name(
         }
     }
     Ok(None)
+}
+
+pub fn first_activated_listener_fd_by_name(
+    name: &str,
+    kind: ActivatedFdKind,
+) -> Result<Option<i32>, Box<dyn std::error::Error>> {
+    let names = activated_listener_names();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let fds = activated_listener_fds()?;
+    for (idx, fd_name) in names.iter().enumerate() {
+        if fd_name != name {
+            continue;
+        }
+        let Some(fd) = fds.get(idx).copied() else {
+            continue;
+        };
+        if taken_activated_fds()
+            .lock()
+            .map(|taken| taken.contains(&fd))
+            .unwrap_or(false)
+        {
+            debug!(
+                fd,
+                name, "skipping already claimed named activated listener fd"
+            );
+            continue;
+        }
+        match activated_fd_kind(fd) {
+            Ok(fd_kind) if fd_kind == kind => return Ok(Some(fd)),
+            Ok(fd_kind) => debug!(
+                fd,
+                name,
+                ?fd_kind,
+                wanted = ?kind,
+                "skipping named activated listener fd"
+            ),
+            Err(e) => {
+                debug!(fd, name, error = %e, "skipping unusable named activated listener fd");
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub fn take_activated_unix_listener_by_name(
+    name: &str,
+) -> Result<Option<UnixListener>, Box<dyn std::error::Error>> {
+    let Some(fd) = first_activated_listener_fd_by_name(name, ActivatedFdKind::Unix)? else {
+        return Ok(None);
+    };
+    mark_activated_listener_fd_taken(fd);
+    info!(
+        "MeshListener: Using activated Unix listener FD {} ({})",
+        fd, name
+    );
+    // SAFETY: activated_fd_kind verifies that fd is an open Unix stream socket.
+    // from_raw_fd takes ownership exactly once in this activation path.
+    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    std_listener.set_nonblocking(true)?;
+    set_cloexec(std_listener.as_raw_fd());
+    Ok(Some(UnixListener::from_std(std_listener)?))
+}
+
+pub fn take_activated_tcp_listener_by_name(
+    name: &str,
+) -> Result<Option<std::net::TcpListener>, Box<dyn std::error::Error>> {
+    let Some(fd) = first_activated_listener_fd_by_name(name, ActivatedFdKind::Tcp)? else {
+        return Ok(None);
+    };
+    mark_activated_listener_fd_taken(fd);
+    info!("Using activated TCP listener FD {} ({})", fd, name);
+    // SAFETY: activated_fd_kind verifies that fd is an open TCP stream socket.
+    // from_raw_fd takes ownership exactly once in this activation path.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    listener.set_nonblocking(true)?;
+    set_cloexec(listener.as_raw_fd());
+    Ok(Some(listener))
+}
+
+pub fn take_activated_vsock_listener_by_name(
+    name: &str,
+) -> Result<Option<OwnedFd>, Box<dyn std::error::Error>> {
+    let Some(fd) = first_activated_listener_fd_by_name(name, ActivatedFdKind::Vsock)? else {
+        return Ok(None);
+    };
+    mark_activated_listener_fd_taken(fd);
+    info!("Using activated AF_VSOCK listener FD {} ({})", fd, name);
+    // SAFETY: activated_fd_kind verifies that fd is an open AF_VSOCK stream socket.
+    // from_raw_fd takes ownership exactly once in this activation path.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_cloexec(fd.as_raw_fd());
+    Ok(Some(fd))
+}
+
+pub fn take_activated_vsock_listener() -> Result<Option<OwnedFd>, Box<dyn std::error::Error>> {
+    let Some(fd) = first_activated_listener_fd(ActivatedFdKind::Vsock)? else {
+        return Ok(None);
+    };
+    mark_activated_listener_fd_taken(fd);
+    info!("Using activated AF_VSOCK listener FD {}", fd);
+    // SAFETY: activated_fd_kind verifies that fd is an open AF_VSOCK stream socket.
+    // from_raw_fd takes ownership exactly once in this activation path.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_cloexec(fd.as_raw_fd());
+    Ok(Some(fd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_activated_listener_names_accepts_colons_and_spaces() {
+        assert_eq!(
+            parse_activated_listener_names("ssh:http admin:jsonl ssh-uds"),
+            vec!["ssh", "http", "admin", "jsonl", "ssh-uds"]
+        );
+    }
 }

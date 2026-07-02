@@ -113,8 +113,8 @@
     }
   },
   {
-    "name": "psi_watches",
-    "description": "Get current PSI (Pressure Stall Information) watches",
+    "name": "pressure",
+    "description": "Get current pressure watches",
     "inputSchema": {
       "type": "object",
       "properties": {},

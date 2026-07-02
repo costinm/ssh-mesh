@@ -9,7 +9,6 @@ Required binaries:
 - `mesh-init`
 - `ssh-mesh`
 - `h2t`
-- `pmond`
 - `lmesh`
 - `meshkeys` to regenerate checked-in example keys and certificates
 - `bwrap`
@@ -347,19 +346,21 @@ ssh -F ssh_config app4-ch
 ssh -F ssh_config app5-vm
 ```
 
-Pmond HTTP through ssh-mesh:
+Mesh-init observer HTTP through ssh-mesh:
 
 ```bash
-curl http://127.0.0.1:18480/_m/pmon/_ps
+curl -H 'content-type: application/json' \
+  -d '{"method":"processes"}' \
+  http://127.0.0.1:18480/_m/proxy/jsonl/mesh-init
 ```
 
-Pmond JSONL through a local forward:
+Mesh-init observer JSONL through a local forward:
 
 ```bash
 cd docs/examples
 ssh -N -F ssh_config \
-  -L 127.0.0.1:19284:/home/system/run/pmond/control.sock \
+  -L 127.0.0.1:19284:/home/system/run/mesh-init/control.sock \
   host1
 
-printf '%s\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19284
+printf '%s\n' '{"jsonrpc":"2.0","method":"processes","id":1}' | nc -N 127.0.0.1 19284
 ```

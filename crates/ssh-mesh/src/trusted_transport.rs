@@ -100,16 +100,24 @@ pub async fn run_trusted_uds_server(server: MeshNode, socket_path: impl AsRef<Pa
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("bind trusted SSH UDS socket {}", socket_path.display()))?;
-    let config = Arc::new(server.get_trusted_transport_config());
     info!("trusted SSH UDS listener on {}", socket_path.display());
+    run_trusted_uds_listener(server, listener, "uds").await
+}
+
+pub async fn run_trusted_uds_listener(
+    server: MeshNode,
+    listener: UnixListener,
+    label: &'static str,
+) -> Result<()> {
+    let config = Arc::new(server.get_trusted_transport_config());
 
     loop {
         let (stream, _) = listener.accept().await?;
         let config = config.clone();
         let server = server.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::run_ssh_stream(config, stream, server, None, "uds", true).await {
-                error!("trusted UDS SSH stream failed: {}", e);
+            if let Err(e) = crate::run_ssh_stream(config, stream, server, None, label, true).await {
+                error!("trusted {} SSH stream failed: {}", label, e);
             }
         });
     }
@@ -246,8 +254,16 @@ where
 
 pub async fn run_trusted_vsock_server(server: MeshNode, cid: u32, port: u32) -> Result<()> {
     let listener = VsockListener::bind(cid, port)?;
+    run_trusted_vsock_listener(server, listener, format!("cid={} port={}", cid, port)).await
+}
+
+pub async fn run_trusted_vsock_listener(
+    server: MeshNode,
+    listener: VsockListener,
+    address: String,
+) -> Result<()> {
     let config = Arc::new(server.get_trusted_transport_config());
-    info!("trusted SSH vsock listener on cid={} port={}", cid, port);
+    info!("trusted SSH vsock listener on {}", address);
 
     loop {
         let stream = listener.accept().await?;
@@ -372,6 +388,13 @@ pub struct VsockListener {
 
 #[cfg(target_os = "linux")]
 impl VsockListener {
+    pub fn from_owned_fd(fd: OwnedFd) -> Result<Self> {
+        set_nonblocking(fd.as_raw_fd())?;
+        Ok(Self {
+            fd: AsyncFd::new(fd).context("register activated AF_VSOCK listener")?,
+        })
+    }
+
     pub fn bind(cid: u32, port: u32) -> Result<Self> {
         let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
@@ -438,6 +461,10 @@ pub struct VsockListener;
 
 #[cfg(not(target_os = "linux"))]
 impl VsockListener {
+    pub fn from_owned_fd(_fd: OwnedFd) -> Result<Self> {
+        anyhow::bail!("virtio-vsock is only supported on Linux")
+    }
+
     pub fn bind(_cid: u32, _port: u32) -> Result<Self> {
         anyhow::bail!("virtio-vsock is only supported on Linux")
     }

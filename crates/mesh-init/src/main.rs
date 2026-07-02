@@ -6,12 +6,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use tracing::info;
-
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
 
 use mesh_init::daemon::{Daemon, DaemonConfig};
 use mesh_init::protocol::{Request, Response};
@@ -23,42 +18,9 @@ struct Args {
     command: Vec<String>,
 }
 
-// ============================================================================
-// Main
-// ============================================================================
-
-fn init_telemetry() {
-    let filter = EnvFilter::from_default_env();
-    let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
-        mesh::paths::AppPaths::for_app("system")
-            .run_dir("mesh-init")
-            .join("mesh-init.log")
-            .to_string_lossy()
-            .into_owned()
-    });
-
-    if let Some(parent) = std::path::Path::new(&log_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        let out_layer = tracing_subscriber::fmt::layer().compact().with_writer(
-            move || -> Box<dyn std::io::Write + Send> {
-                match file.try_clone() {
-                    Ok(file) => Box::new(file),
-                    Err(_) => Box::new(std::io::sink()),
-                }
-            },
-        );
-        Registry::default().with(filter).with(out_layer).init();
-    } else {
-        Registry::default().with(filter).init();
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_telemetry();
+    let (_log_buffer, _trace_guard) = mesh::local_trace::init("mesh-init");
 
     let args = Args::parse();
     let socket_path = get_socket_path();
@@ -329,7 +291,17 @@ mod tests {
 
     #[test]
     fn default_paths_use_system_app_home() {
-        assert_eq!(get_config_dir(), "/home/system/etc/mesh-init");
-        assert_eq!(get_socket_path(), "/home/system/run/mesh-init/control.sock");
+        let paths = mesh::paths::AppPaths::for_app("system");
+        assert_eq!(
+            get_config_dir(),
+            paths.etc.join("mesh-init").to_string_lossy()
+        );
+        assert_eq!(
+            get_socket_path(),
+            paths
+                .run_dir("mesh-init")
+                .join("control.sock")
+                .to_string_lossy()
+        );
     }
 }

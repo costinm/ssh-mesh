@@ -3,7 +3,7 @@
 //! This module provides:
 //! - [`ProcessInfo`]: Information about a running process
 //! - [`ProcMemInfo`]: Memory statistics from `/proc/[pid]` or cgroups
-//! - [`ProcMon`]: Process monitor for tracking process lifecycle
+//! - [`ProcessObserver`]: Process monitor for tracking process lifecycle
 //! - Helper functions for reading process details from procfs
 
 use schemars::JsonSchema;
@@ -15,13 +15,7 @@ use utoipa::ToSchema;
 pub mod proc;
 pub mod proc_netlink;
 pub mod psi;
-pub mod rpc;
-pub mod server;
-
-pub use server::{PmonServer, ServerConfig};
-
-pub use proc::ProcMon;
-pub use rpc::{PmondService, Request};
+pub use proc::ProcessObserver;
 
 /// Base path for procfs
 const PROC_BASE: &str = "/proc";
@@ -135,8 +129,8 @@ pub struct PsiWatchesArgs {}
 
 #[derive(Debug, Clone)]
 pub enum MonitoringEvent {
-    Netlink(crate::proc_netlink::NetlinkEvent),
-    Pressure(crate::psi::PressureEvent),
+    Netlink(proc_netlink::NetlinkEvent),
+    Pressure(psi::PressureEvent),
 }
 
 /// Memory info for a process or set of processes. Each field should have a

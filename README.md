@@ -10,7 +10,7 @@ It is designed to orchestrate secure edge networks and run on-demand, socket-act
 
 - **On-Demand Process Supervisor (`mesh-init`)**: Coordinates process lifecycles, socket activation, and system configurations. Supports freezing/unfreezing applications when idle to eliminate daemon resource overhead.
 - **Secure Multiplexed L4 Proxy (`ssh-mesh`)**: Built-in SSH client and server supporting SOCKS5, UDS/vsock forwarding, ControlMaster Control Socket multiplexing, and HTTP/2 and WebSocket tunneling.
-- **Resource Limits & Monitoring (`pmond`)**: Real-time monitor of process cgroups, CPU, and Memory Pressure Stall Information (PSI). Integrates with Model Context Protocol (MCP) to allow agentic AI monitoring.
+- **Resource Limits & Monitoring (`mesh-init`)**: Real-time observer for process cgroups, CPU, and Memory Pressure Stall Information (PSI), exposed through generic mesh JSONL/MCP proxying.
 - **Secure Workload Identity**: End-to-end encryption with OpenSSH ECDSA public keys and CA-signed user/host certificates.
 
 ---
@@ -20,9 +20,7 @@ It is designed to orchestrate secure edge networks and run on-demand, socket-act
 The project consists of several Rust crates:
 
 - **[ssh-mesh](file:///ws/rust/ssh-mesh/crates/ssh-mesh)**: Core SSH/HTTP server/client and ControlMaster multiplexer.
-- **[mesh-init](file:///ws/rust/ssh-mesh/crates/mesh-init)**: Minimal system init/supervisor daemon.
-- **[pmond](file:///ws/rust/ssh-mesh/crates/pmond)**: Process and cgroup memory monitor.
-- **[mcp](file:///ws/rust/ssh-mesh/crates/mcp)**: Model Context Protocol (MCP) server wrapping `pmond`.
+- **[mesh-init](file:///ws/rust/ssh-mesh/crates/mesh-init)**: Minimal system init/supervisor daemon and root process observer.
 - **[mesh](file:///ws/rust/ssh-mesh/crates/mesh)**: Common mesh library (Axum server, JSON protocol, UDS helpers).
 - **[lmesh](file:///ws/rust/ssh-mesh/crates/lmesh)**: Lightweight mesh networking utilities.
 - **[ws](file:///ws/rust/ssh-mesh/crates/ws)**: WebSocket bridging and client management.

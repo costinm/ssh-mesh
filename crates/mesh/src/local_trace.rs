@@ -643,19 +643,20 @@ pub fn default_trace_socket_path(app_name: &str) -> Option<std::path::PathBuf> {
 /// this and then (optionally) [`serve`] to expose the buffer over UDS.
 ///
 /// `app` is the producer's short name (e.g. `"ssh-mesh"`, `"mesh-tun"`).
-/// It is used as the `TRACE_DIR` log file's basename (`<TRACE_DIR>/<app>.log`).
+/// It is used as the directory-based log file's basename (`<dir>/<app>.log`).
 ///
 /// The initial filter is taken from `RUST_LOG` (via `EnvFilter::from_default_env`).
 /// A global reload handle is installed so UDS collectors can raise the level
 /// at runtime (see `handle_uds_connection`).
 ///
-/// If `TRACE_DIR` is set, a non-blocking JSON `fmt` layer is also installed
-/// that writes every event (subject to the same `EnvFilter`) to
-/// `<TRACE_DIR>/<app>.log`. The directory is created if missing. The
-/// returned `WorkerGuard` must be kept alive for the lifetime of the
-/// process (dropping it stops the background writer thread and flushes
-/// pending events); bind it to a named variable in `main` to be safe. If
-/// `TRACE_DIR` is unset, no file is written and the second tuple element
+/// If `MESH_LOG_FILE` or `MESH_LOG_DIR` is set, a non-blocking JSON `fmt`
+/// layer is also installed that writes every event (subject to the same
+/// `EnvFilter`) to that path. `MESH_LOG_FILE` is an exact file path;
+/// `MESH_LOG_DIR` writes `<dir>/<app>.log`. Parent directories are created if
+/// missing. The returned `WorkerGuard` must be kept alive for the lifetime of
+/// the process (dropping it stops the background writer thread and flushes
+/// pending events); bind it to a named variable in `main` to be safe. If none
+/// of the file env vars is set, no file is written and the second tuple element
 /// is `None`.
 ///
 /// This calls `tracing_subscriber`'s global `.init()`, so it can only be
@@ -696,31 +697,39 @@ pub fn init(
     (log_buffer, guard)
 }
 
-/// Build the optional non-blocking JSON file writer for `TRACE_DIR/<app>.log`.
+/// Build the optional non-blocking JSON file writer.
 ///
-/// Returns `Some((writer, guard))` when `TRACE_DIR` is set and usable, or
-/// `None` when it's unset (producer is in-memory / UDS only) or the
-/// directory cannot be created (logged as a warning; the buffer still
-/// works).
+/// Returns `Some((writer, guard))` when `MESH_LOG_FILE` or `MESH_LOG_DIR` is
+/// set and usable. Returns `None` when no file output is configured or the path
+/// cannot be created (logged as a warning; the buffer still works).
 fn build_file_writer(
     app: &str,
 ) -> Option<(
     tracing_appender::non_blocking::NonBlocking,
     tracing_appender::non_blocking::WorkerGuard,
 )> {
-    let dir = std::env::var_os("TRACE_DIR").filter(|s| !s.is_empty())?;
-    let dir = std::path::PathBuf::from(dir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    let log_path = if let Some(path) = std::env::var_os("MESH_LOG_FILE").filter(|s| !s.is_empty()) {
+        std::path::PathBuf::from(path)
+    } else {
+        let dir = std::env::var_os("MESH_LOG_DIR").filter(|s| !s.is_empty())?;
+        std::path::PathBuf::from(dir).join(format!("{}.log", app))
+    };
+
+    let parent = log_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Err(e) = std::fs::create_dir_all(parent) {
         tracing::warn!(
-            path = ?dir,
+            path = ?parent,
             error = %e,
-            "TRACE_DIR is set but could not be created; file logging disabled"
+            "log directory could not be created; file logging disabled"
         );
         return None;
     }
 
-    let file_name = format!("{}.log", app);
-    let appender = tracing_appender::rolling::never(&dir, &file_name);
+    let dir = parent;
+    let file_name = log_path.file_name()?.to_string_lossy();
+    let appender = tracing_appender::rolling::never(dir, file_name.as_ref());
     Some(tracing_appender::non_blocking(appender))
 }
 
@@ -762,17 +771,17 @@ mod tests {
     use super::*;
 
     /// `init` installs a global subscriber; only one test in this module can
-    /// call it. Verifies that `TRACE_DIR=<dir> init("smoke-test")` writes a
+    /// call it. Verifies that `MESH_LOG_DIR=<dir> init("smoke-test")` writes a
     /// JSON line per emitted event to `<dir>/smoke-test.log`. Dropping the
     /// returned `WorkerGuard` flushes and shuts down the background writer.
     #[test]
-    fn trace_dir_writes_json_log_file() {
+    fn mesh_log_dir_writes_json_log_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: this test owns `TRACE_DIR` and `RUST_LOG` for its
+        // SAFETY: this test owns `MESH_LOG_DIR` and `RUST_LOG` for its
         // duration; the global subscriber is one-shot so concurrent
         // `init` calls would panic regardless.
         unsafe {
-            std::env::set_var("TRACE_DIR", dir.path());
+            std::env::set_var("MESH_LOG_DIR", dir.path());
             std::env::set_var("RUST_LOG", "info");
         }
 

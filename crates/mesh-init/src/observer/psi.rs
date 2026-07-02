@@ -276,7 +276,7 @@ impl PsiWatcher {
     #[instrument(skip(self))]
     pub fn start(
         &self,
-        monitoring_tx: Option<mpsc::Sender<crate::MonitoringEvent>>,
+        monitoring_tx: Option<mpsc::Sender<super::MonitoringEvent>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
@@ -546,7 +546,7 @@ impl PsiWatcher {
 
                                         if let Some(ref tx) = internal_monitoring_tx {
                                             let _ = tx.blocking_send(
-                                                crate::MonitoringEvent::Pressure(event),
+                                                super::MonitoringEvent::Pressure(event),
                                             );
                                         }
                                     }
@@ -607,7 +607,7 @@ mod tests {
             let watcher = PsiWatcher::new();
 
             // Get current process cgroup and add it
-            if let Some(cgroup_path) = crate::read_cgroup_path(std::process::id()) {
+            if let Some(cgroup_path) = crate::observer::read_cgroup_path(std::process::id()) {
                 watcher.add_cgroup(&cgroup_path);
             }
 

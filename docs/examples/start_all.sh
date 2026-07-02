@@ -300,7 +300,7 @@ HTTP URLs from crates/ssh-mesh route mappings:
   host2 OpenAPI:        http://127.0.0.1:18280/_m/api/openapi.json
   host2 SSH over H2C:   http://127.0.0.1:18280/_m/_ssh
   host2 TCP proxy:      http://127.0.0.1:18280/_m/_tcp/127.0.0.1/22
-  host2 pmond JSON:     http://127.0.0.1:18280/_m/pmon/_ps
+  host2 mesh observer:  POST http://127.0.0.1:18280/_m/proxy/jsonl/mesh-init '{"method":"processes"}'
 
   host3-vm admin UI:          http://127.0.0.1:${vm_host_http_port}/_m/adm
   host3-vm SSH clients:       http://127.0.0.1:${vm_host_http_port}/_m/api/ssh/clients
@@ -308,7 +308,7 @@ HTTP URLs from crates/ssh-mesh route mappings:
   host3-vm OpenAPI:           http://127.0.0.1:${vm_host_http_port}/_m/api/openapi.json
   host3-vm SSH over H2C:      http://127.0.0.1:${vm_host_http_port}/_m/_ssh
   host3-vm TCP proxy:         http://127.0.0.1:${vm_host_http_port}/_m/_tcp/127.0.0.1/22
-  host3-vm pmond JSON:        http://127.0.0.1:${vm_host_http_port}/_m/pmon/_ps
+  host3-vm mesh observer:     POST http://127.0.0.1:${vm_host_http_port}/_m/proxy/jsonl/mesh-init '{"method":"processes"}'
 
   host1 admin UI:            http://127.0.0.1:18480/_m/adm
   host1 SSH clients:         http://127.0.0.1:18480/_m/api/ssh/clients
@@ -316,7 +316,7 @@ HTTP URLs from crates/ssh-mesh route mappings:
   host1 OpenAPI:             http://127.0.0.1:18480/_m/api/openapi.json
   host1 SSH over H2C:        http://127.0.0.1:18480/_m/_ssh
   host1 TCP proxy:           http://127.0.0.1:18480/_m/_tcp/127.0.0.1/22
-  host1 pmond JSON:          http://127.0.0.1:18480/_m/pmon/_ps
+  host1 mesh observer:       POST http://127.0.0.1:18480/_m/proxy/jsonl/mesh-init '{"method":"processes"}'
 
 Seeded SSH keys:
   main node key/cert homes are checked in under:
@@ -346,36 +346,21 @@ Direct SSH shells:
   ssh -F ssh_config -p ${vm_host_ssh_port} host3-vm-direct
   ssh -F ssh_config -p ${vm_host_ssh_port} host3-vm-root-direct
 
-Example pmond local forwards speak JSONL:
+Example mesh-init local forwards speak JSONL:
   ssh -N -F ssh_config \\
-    -L 127.0.0.1:19282:/home/system/run/pmond/control.sock \\
+    -L 127.0.0.1:19282:/home/system/run/mesh-init/control.sock \\
     host2-direct
-  printf '%s\\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19282
+  printf '%s\\n' '{"jsonrpc":"2.0","method":"processes","id":1}' | nc -N 127.0.0.1 19282
 
   ssh -N -F ssh_config -p ${vm_host_ssh_port} \\
-    -L 127.0.0.1:19283:/home/system/run/pmond/control.sock \\
+    -L 127.0.0.1:19283:/home/system/run/mesh-init/control.sock \\
     host3-vm-direct
-  printf '%s\\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19283
+  printf '%s\\n' '{"jsonrpc":"2.0","method":"processes","id":1}' | nc -N 127.0.0.1 19283
 
   ssh -N -F ssh_config \\
-    -L 127.0.0.1:19284:/home/system/run/pmond/control.sock \\
+    -L 127.0.0.1:19284:/home/system/run/mesh-init/control.sock \\
     host1
-  printf '%s\\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19284
-
-  ssh -N -F ssh_config \\
-    -L 127.0.0.1:19285:/home/app1/run/pmond/control.sock \\
-    app1-bwrap
-  printf '%s\\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19285
-
-  ssh -N -F ssh_config \\
-    -L 127.0.0.1:19286:/home/app2/run/pmond/control.sock \\
-    app2-qemu
-  printf '%s\\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19286
-
-  ssh -N -F ssh_config \\
-    -L 127.0.0.1:19287:/home/app5/run/pmond/control.sock \\
-    app5-vm
-  printf '%s\\n' '{"jsonrpc":"2.0","method":"ps","id":1}' | nc -N 127.0.0.1 19287
+  printf '%s\\n' '{"jsonrpc":"2.0","method":"processes","id":1}' | nc -N 127.0.0.1 19284
 
 Press Ctrl-C to stop all example nodes.
 EOF

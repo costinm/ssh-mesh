@@ -239,6 +239,61 @@ pub enum Request {
     /// Deliver a system event to the job scheduler.
     #[serde(rename = "event")]
     Event { event: serde_json::Value },
+
+    /// List observed processes from mesh-init's process observer.
+    #[serde(rename = "processes", alias = "list_processes")]
+    Processes,
+
+    /// Return detailed information for one process.
+    #[serde(rename = "process", alias = "get_process")]
+    Process { pid: u32 },
+
+    /// Return a single process record without cgroup expansion.
+    #[serde(rename = "process_only", alias = "ps_one")]
+    ProcessOnly { pid: u32 },
+
+    /// Return all observed cgroups.
+    #[serde(rename = "cgroups", alias = "list_cgroups")]
+    Cgroups,
+
+    /// Return detailed information for one cgroup path.
+    #[serde(rename = "cgroup", alias = "get_cgroup")]
+    Cgroup { path: String },
+
+    /// Return pressure watch state.
+    #[serde(rename = "pressure", alias = "psi", alias = "psi_watches")]
+    Pressure,
+
+    /// Set memory.high for a cgroup based on current memory usage.
+    #[serde(rename = "cgroup_high")]
+    CgroupHigh {
+        path: String,
+        percentage: f64,
+        interval: u64,
+    },
+
+    /// List process records for PIDs in a cgroup.
+    #[serde(rename = "cgroup_procs")]
+    CgroupProcs { path: String },
+
+    /// Move a process to a named cgroup.
+    #[serde(rename = "move_process")]
+    MoveProcess {
+        pid: u32,
+        cgroup_name: Option<String>,
+    },
+
+    /// Write to /proc/<pid>/clear_refs.
+    #[serde(rename = "clear_refs")]
+    ClearRefs { pid: u32, value: String },
+
+    /// Freeze or thaw one process.
+    #[serde(rename = "freeze_process")]
+    FreezeProcess { pid: u32, freeze: bool },
+
+    /// Freeze or thaw one cgroup.
+    #[serde(rename = "freeze_cgroup")]
+    FreezeCgroup { path: String, freeze: bool },
 }
 
 // ============================================================================

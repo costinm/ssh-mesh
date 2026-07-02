@@ -13,10 +13,10 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
 export DEST=${DEST:-/opt/ssh-mesh}
 
-CRATES="mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh ssh-config"
-BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh pmond mesh9p traceweb sftp-server lmesh ssh-config"
+CRATES="mesh-init ssh-mesh mesh mesh9p traceweb sftp-server lmesh ssh-config"
+BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh mesh9p traceweb sftp-server lmesh ssh-config"
 INSTALL_BIN_TARGETS="$BIN_TARGETS dmesh"
-EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh sshmc pmond lmesh mesh9p sftp-server h2t meshkeys"
+EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh sshmc lmesh mesh9p sftp-server h2t meshkeys"
 
 help() {
     cat <<'EOF'
@@ -41,6 +41,7 @@ Fresh target/examples sequence:
 Common commands:
   help                 Show this help.
   rust                 Build x86_64 musl release Rust binaries.
+  test NAME            Build and run a focused test from tests/test_NAME.sh.
   deps [path]          Add missing build dependencies to the Nix profile.
   deploy_examples      Compatibility alias for dist.
   stage_examples       Compatibility alias for staging target/dist/opt.
@@ -379,7 +380,7 @@ _all() {
     done
 
 
-    #cargo build --target $target ${mode} --features pmon -p ssh-mesh
+    #cargo build --target $target ${mode} -p ssh-mesh
 }
 
 # upstream unpfs
@@ -391,7 +392,7 @@ unpfs() {
 push() {
     # Can't push debug builds - the embeded files are loaded from disk.
     release
-    scp target/x86_64-unknown-linux-musl/release/{pmond,ssh-mesh} a1:/data/INITOS/bin
+    scp target/x86_64-unknown-linux-musl/release/{mesh-init,ssh-mesh} a1:/data/INITOS/bin
 }
 
 dist() {
@@ -659,6 +660,53 @@ build() {
     stage_example_tree "$PWD/target/examples" "$PWD/target/dist/opt"
 }
 
+test_cmd() {
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        echo "Usage: scripts/build.sh test NAME" >&2
+        echo "Known tests: examples, ssh_mesh_activation, traceweb, vm_cloud_hypervisor_acpi_s5," >&2
+        echo "             vm_echo_latency, vm_microvm_echo, vm_qemu_echo," >&2
+        echo "             vm_vrun_cloud_hypervisor_echo, vm_vrun_crosvm_echo," >&2
+        echo "             vrun_pod_name, vrun_stop_cleanup" >&2
+        return 2
+    fi
+    shift
+
+    case "$name" in
+        examples)
+            build
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            tests/test_examples.sh
+            ;;
+        ssh_mesh_activation)
+            rust
+            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            tests/test_ssh_mesh_activation.sh
+            ;;
+        traceweb)
+            rust
+            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            tests/test_traceweb.sh "$@"
+            ;;
+        vm_cloud_hypervisor_acpi_s5|vm_echo_latency|vm_microvm_echo|vm_qemu_echo|vm_vrun_cloud_hypervisor_echo|vm_vrun_crosvm_echo)
+            profile "${NIX_PROFILE:-$(default_nix_profile)}"
+            export NIX_PROFILE="$(resolve_nix_profile "${NIX_PROFILE:-$(default_nix_profile)}")"
+            export PATH="$NIX_PROFILE/bin:${PATH:-}"
+            "tests/test_${name}.sh" "$@"
+            ;;
+        vrun_pod_name|vrun_stop_cleanup)
+            "tests/test_${name}.sh" "$@"
+            ;;
+        *)
+            echo "Unknown test: $name" >&2
+            echo "Run scripts/build.sh test with no NAME to list known tests." >&2
+            return 2
+            ;;
+    esac
+}
+
 main() {
     local cmd="${1:-default}"
     if [ "$#" -gt 0 ]; then
@@ -671,6 +719,9 @@ main() {
             ;;
         default|rust|deps|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|jni|dmesh_java|arm_release|erofs|vm|profile|build)
             "$cmd" "$@"
+            ;;
+        test)
+            test_cmd "$@"
             ;;
         *)
             echo "Unknown command: $cmd" >&2

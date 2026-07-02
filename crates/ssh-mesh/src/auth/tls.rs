@@ -155,6 +155,39 @@ pub async fn run_axum_https_server(
     }
 }
 
+pub async fn run_axum_https_listener(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    app: axum::Router,
+) -> Result<()> {
+    info!("HTTPS server listening on {}", listener.local_addr()?);
+
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("TLS handshake failed from {}: {}", peer_addr, e);
+                    return;
+                }
+            };
+
+            let io = TokioIo::new(tls_stream);
+
+            if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(io, hyper_util::service::TowerToHyperService::new(app))
+                .await
+            {
+                warn!("Error serving HTTPS connection from {}: {}", peer_addr, err);
+            }
+        });
+    }
+}
+
 pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);

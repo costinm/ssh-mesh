@@ -13,7 +13,7 @@
 # Capabilities shown by this node:
 #
 #   Trusted stdio:    SSH_MESH_TRUSTED_STDIO=1 ssh-mesh
-#   HTTP UDS proxy:   POST /_m/_uds/home/app1/run/pmond/control.sock
+#   HTTP UDS proxy:   POST /_m/_uds/home/app1/run/demo/control.sock
 #   Activator UDS:    /tmp/mesh/shared/app1-bwrap/trusted.sock
 
 ssh_port: 18522

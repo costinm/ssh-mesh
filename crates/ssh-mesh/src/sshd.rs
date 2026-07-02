@@ -1123,8 +1123,9 @@ fn safe_user_part(identity: &str) -> Option<String> {
 fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
     let home_root = std::env::var("SSH_MESH_HOME_ROOT")
         .or_else(|_| std::env::var("MESH_HOME_BASE"))
-        .unwrap_or_else(|_| "/home".to_string());
-    let home_path = std::path::Path::new(&home_root).join(user);
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| mesh::paths::default_home_base());
+    let home_path = home_root.join(user);
     let metadata = std::fs::metadata(&home_path).ok()?;
     if !metadata.is_dir() {
         return None;

@@ -1,5 +1,5 @@
-use crate::psi::PsiWatcher;
-use crate::{ProcMemInfo, ProcessInfo, read_process_info_from_proc};
+use super::psi::PsiWatcher;
+use super::{ProcMemInfo, ProcessInfo, read_process_info_from_proc};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -15,9 +15,9 @@ use users::get_current_uid;
 // Error Types
 // ============================================================================
 
-/// Custom error type for pmond operations.
+/// Custom error type for mesh-init observer operations.
 #[derive(Debug, thiserror::Error)]
-pub enum PmondError {
+pub enum ObserverError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -37,9 +37,9 @@ pub enum PmondError {
     PsiError(String),
 }
 
-impl From<Box<dyn std::error::Error>> for PmondError {
+impl From<Box<dyn std::error::Error>> for ObserverError {
     fn from(e: Box<dyn std::error::Error>) -> Self {
-        PmondError::PsiError(e.to_string())
+        ObserverError::PsiError(e.to_string())
     }
 }
 
@@ -58,7 +58,7 @@ pub struct ProcCfg {
 // ============================================================================
 
 /// Monitors process state.
-pub struct ProcMon {
+pub struct ProcessObserver {
     pub running: Arc<AtomicBool>,
     pub handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 
@@ -76,13 +76,13 @@ pub struct ProcMon {
     pub snap_user: Arc<Mutex<HashMap<u32, ProcessInfo>>>,
 }
 
-impl ProcMon {
+impl ProcessObserver {
     /// Create a new monitor.
     #[instrument]
-    pub fn new() -> Result<Self, PmondError> {
+    pub fn new() -> Result<Self, ObserverError> {
         let psi_watcher = Arc::new(PsiWatcher::new());
 
-        Ok(ProcMon {
+        Ok(ProcessObserver {
             running: Arc::new(AtomicBool::new(false)),
             handles: Arc::new(Mutex::new(Vec::new())),
             psi_watcher,
@@ -109,10 +109,10 @@ impl ProcMon {
         &self,
         _read_sync: bool,
         watch_psi: bool,
-        event_tx: Option<mpsc::Sender<crate::MonitoringEvent>>,
-    ) -> Result<(), PmondError> {
+        event_tx: Option<mpsc::Sender<super::MonitoringEvent>>,
+    ) -> Result<(), ObserverError> {
         if self.running.load(Ordering::SeqCst) {
-            return Err(PmondError::AlreadyRunning);
+            return Err(ObserverError::AlreadyRunning);
         }
         self.running.store(true, Ordering::SeqCst);
 
@@ -146,7 +146,7 @@ impl ProcMon {
 
     /// Stop monitoring.
     #[instrument(skip(self))]
-    pub fn stop(&self) -> Result<(), PmondError> {
+    pub fn stop(&self) -> Result<(), ObserverError> {
         debug!("Stopping monitoring");
         self.running.store(false, Ordering::SeqCst);
 
@@ -165,10 +165,10 @@ impl ProcMon {
 
     /// Close the monitor and release resources.
     #[instrument(skip(self))]
-    pub fn close(&self) -> Result<(), PmondError> {
-        debug!("Closing ProcMon");
+    pub fn close(&self) -> Result<(), ObserverError> {
+        debug!("Closing ProcessObserver");
         self.stop()?;
-        info!("ProcMon closed successfully");
+        info!("ProcessObserver closed successfully");
         Ok(())
     }
 
@@ -206,7 +206,7 @@ impl ProcMon {
 
     /// Read cgroup information by path.
     pub fn read_cgroup(&self, cgroup_path: &str) -> Option<ProcMemInfo> {
-        crate::read_cgroup_info(cgroup_path).ok()
+        super::read_cgroup_info(cgroup_path).ok()
     }
 
     /// Get all cgroups used by known processes or present in /sys/fs/cgroup.
@@ -240,7 +240,7 @@ impl ProcMon {
                         if !cgroups.contains_key(&path) {
                             let procs_file = format!("{}/cgroup.procs", path);
                             if std::path::Path::new(&procs_file).exists() {
-                                if let Ok(mem_info) = crate::read_cgroup_info(&path) {
+                                if let Ok(mem_info) = super::read_cgroup_info(&path) {
                                     cgroups.insert(path.clone(), mem_info);
                                 }
                             }
@@ -261,14 +261,14 @@ impl ProcMon {
         cgroup_path: String,
         percentage: f64,
         interval_secs: u64,
-    ) -> Result<(), PmondError> {
+    ) -> Result<(), ObserverError> {
         let current_path = format!("{}/memory.current", cgroup_path);
         let high_path = format!("{}/memory.high", cgroup_path);
 
         let current_str = fs::read_to_string(&current_path).map_err(|e| {
             let msg = format!("Failed to read {}: {}", current_path, e);
             error!("{}", msg);
-            PmondError::CgroupError(msg)
+            ObserverError::CgroupError(msg)
         })?;
 
         let current: u64 = current_str.trim().parse().map_err(|e| {
@@ -277,7 +277,7 @@ impl ProcMon {
                 current_path, e
             );
             error!("{}", msg);
-            PmondError::ParseError(msg)
+            ObserverError::ParseError(msg)
         })?;
 
         let target_str = if percentage < 0.0 {
@@ -296,7 +296,7 @@ impl ProcMon {
         fs::write(&high_path, &target_str).map_err(|e| {
             let msg = format!("Failed to write to {}: {}", high_path, e);
             error!("{}", msg);
-            PmondError::CgroupError(msg)
+            ObserverError::CgroupError(msg)
         })?;
 
         info!(
@@ -326,14 +326,14 @@ impl ProcMon {
     }
 
     /// Get all processes in a specific cgroup.
-    pub fn get_processes_in_cgroup(&self, cgroup_path: &str) -> Vec<crate::ProcessInfo> {
+    pub fn get_processes_in_cgroup(&self, cgroup_path: &str) -> Vec<super::ProcessInfo> {
         let procs_path = format!("{}/cgroup.procs", cgroup_path);
         let mut result = Vec::new();
 
         if let Ok(content) = fs::read_to_string(&procs_path) {
             for line in content.lines() {
                 if let Ok(pid) = line.trim().parse::<u32>() {
-                    if let Ok(info) = crate::read_process_info_from_proc(pid) {
+                    if let Ok(info) = super::read_process_info_from_proc(pid) {
                         result.push(info);
                     }
                 }
@@ -358,10 +358,10 @@ impl ProcMon {
         &self,
         pid: u32,
         cgroup_name: Option<String>,
-    ) -> Result<(), PmondError> {
+    ) -> Result<(), ObserverError> {
         let process_info = self
             .get_process(pid)
-            .ok_or(PmondError::ProcessNotFound(pid))?;
+            .ok_or(ObserverError::ProcessNotFound(pid))?;
 
         // 1. Determine the base path for systemd delegation
         let uid = process_info.uid.unwrap_or(1000);
@@ -414,7 +414,7 @@ impl ProcMon {
     }
 
     /// Ensure a cgroup directory exists and has controllers enabled in its parent.
-    fn setup_cgroup_dir(&self, parent: &str, name: &str) -> Result<(), PmondError> {
+    fn setup_cgroup_dir(&self, parent: &str, name: &str) -> Result<(), ObserverError> {
         let path = format!("{}/{}", parent, name);
         if !std::path::Path::new(&path).exists() {
             fs::create_dir_all(&path)?;
@@ -425,7 +425,7 @@ impl ProcMon {
         Ok(())
     }
 
-    fn enable_controllers(&self, path: &str) -> Result<(), PmondError> {
+    fn enable_controllers(&self, path: &str) -> Result<(), ObserverError> {
         let controllers_path = format!("{}/cgroup.controllers", path);
         let subtree_control_path = format!("{}/cgroup.subtree_control", path);
 
@@ -465,15 +465,15 @@ impl ProcMon {
     }
 
     /// Clear process memory references (PSS, etc)
-    pub fn clear_refs(&self, pid: u32, value: &str) -> Result<(), PmondError> {
-        crate::clear_process_refs(pid, value)?;
+    pub fn clear_refs(&self, pid: u32, value: &str) -> Result<(), ObserverError> {
+        super::clear_process_refs(pid, value)?;
         // After clearing, we might want to refresh the stats immediately
         let _ = self.get_process(pid);
         Ok(())
     }
 
     /// Freeze or unfreeze a process
-    pub fn freeze_process(&self, pid: u32, freeze: bool) -> Result<(), PmondError> {
+    pub fn freeze_process(&self, pid: u32, freeze: bool) -> Result<(), ObserverError> {
         let sig = if freeze { libc::SIGSTOP } else { libc::SIGCONT };
         let res = unsafe { libc::kill(pid as i32, sig) };
         if res == 0 {
@@ -482,25 +482,25 @@ impl ProcMon {
         } else {
             let err = std::io::Error::last_os_error();
             error!("Failed to freeze/unfreeze process {}: {}", pid, err);
-            Err(PmondError::Io(err))
+            Err(ObserverError::Io(err))
         }
     }
 
     /// Freeze or unfreeze a cgroup
-    pub fn freeze_cgroup(&self, cgroup_path: &str, freeze: bool) -> Result<(), PmondError> {
+    pub fn freeze_cgroup(&self, cgroup_path: &str, freeze: bool) -> Result<(), ObserverError> {
         let freeze_path = format!("{}/cgroup.freeze", cgroup_path);
         let val = if freeze { "1" } else { "0" };
         fs::write(&freeze_path, val).map_err(|e| {
             let msg = format!("Failed to write to {}: {}", freeze_path, e);
             error!("{}", msg);
-            PmondError::CgroupError(msg)
+            ObserverError::CgroupError(msg)
         })?;
         info!("Successfully set {} to {}", freeze_path, val);
         Ok(())
     }
 
     /// Get all PSI watches and their current status.
-    pub fn get_psi_watches(&self) -> std::collections::HashMap<String, crate::psi::PressureInfo> {
+    pub fn get_psi_watches(&self) -> std::collections::HashMap<String, super::psi::PressureInfo> {
         self.psi_watcher.watches.lock().clone()
     }
 }
@@ -510,7 +510,7 @@ impl ProcMon {
 // ============================================================================
 
 /// Read existing processes from /proc. This is a standalone function that doesn't
-/// require a full ProcMon instance.
+/// require a full ProcessObserver instance.
 fn read_existing_processes_impl() -> HashMap<u32, ProcessInfo> {
     let mut result = HashMap::new();
 
@@ -525,7 +525,7 @@ fn read_existing_processes_impl() -> HashMap<u32, ProcessInfo> {
                 .to_str()
                 .and_then(|s| s.parse::<u32>().ok())
             {
-                if let Ok(process_info) = crate::read_process_info_from_proc(pid) {
+                if let Ok(process_info) = super::read_process_info_from_proc(pid) {
                     // Filter processes if not running as root
                     if !is_root && process_info.uid != Some(current_uid) {
                         continue;
@@ -627,13 +627,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_procmon_start_and_get_processes() {
-        let proc_mon = ProcMon::new().expect("Failed to create ProcMon");
+        let proc_mon = ProcessObserver::new().expect("Failed to create ProcessObserver");
         proc_mon.set_config(ProcCfg {
             refresh_interval: Some(std::time::Duration::from_millis(100)),
         });
         proc_mon
             .start(true, false, None)
-            .expect("Failed to start ProcMon");
+            .expect("Failed to start ProcessObserver");
 
         let processes = proc_mon.get_all_processes(1);
         assert!(
@@ -641,18 +641,18 @@ mod tests {
             "Processes list should not be empty after start()"
         );
 
-        proc_mon.stop().expect("Failed to stop ProcMon");
+        proc_mon.stop().expect("Failed to stop ProcessObserver");
     }
 
     #[test]
-    fn test_pmond_error_display() {
-        let io_err = PmondError::Io(std::io::Error::new(
+    fn test_observer_error_display() {
+        let io_err = ObserverError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "test error",
         ));
         assert!(io_err.to_string().contains("I/O error"));
 
-        let proc_err = PmondError::ProcessNotFound(1234);
+        let proc_err = ObserverError::ProcessNotFound(1234);
         assert!(proc_err.to_string().contains("1234"));
     }
 }

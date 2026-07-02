@@ -923,11 +923,11 @@ mod tests {
             r#"{"tools":[{"name":"explicit"}]}"#,
         );
         write(
-            &home_base.join("pmond/etc/resources/tools.json"),
+            &home_base.join("demo/etc/resources/tools.json"),
             r#"{"tools":[{"name":"home"}]}"#,
         );
         write(
-            &opt_base.join("pmond/resources/tools.json"),
+            &opt_base.join("demo/resources/tools.json"),
             r#"{"tools":[{"name":"opt"}]}"#,
         );
 
@@ -938,7 +938,7 @@ mod tests {
                 std::env::set_var("MESH_HOME_BASE", &home_base);
                 std::env::set_var("MESH_OPT_BASE", &opt_base);
             }
-            let registry = McpRegistry::new("pmond");
+            let registry = McpRegistry::new("demo");
             unsafe {
                 std::env::remove_var("MESH_RES_DIR");
                 std::env::remove_var("MESH_HOME_BASE");

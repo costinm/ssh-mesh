@@ -28,8 +28,16 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
-        # Filter source to only Cargo/Rust files — excludes .git, target/, java/, python/, etc.
-        src = craneLib.cleanCargoSource ./.;
+        # Filter source to Cargo/Rust files plus compile-time resources used by
+        # include_str!/RustEmbed. This still excludes .git, target/, java/,
+        # python/, etc.
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (craneLib.filterCargoSources path type)
+            || pkgs.lib.hasInfix "/resources/" (toString path)
+            || pkgs.lib.hasInfix "/web/" (toString path);
+        };
 
         # Pre-fetch Swagger UI zip for utoipa-swagger-ui (no network in Nix sandbox)
         swaggerUiZip = pkgs.fetchurl {
@@ -164,7 +172,6 @@
           '';
 
         ssh-mesh  = selectBins "ssh-mesh"  [ "ssh-mesh" ];
-        pmond     = selectBins "pmond"     [ "pmond" ];
         mesh-init = selectBins "mesh-init" [ "mesh-init" ];
         h2t       = selectBins "h2t"       [ "h2t" ];
         meshkeys  = selectBins "meshkeys"  [ "meshkeys" ];
@@ -262,7 +269,7 @@
       in
       {
         packages = {
-            inherit ssh-mesh ssh-mesh-full mesh-init pmond h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets mesh-net-tools build-deps dev-tools;
+            inherit ssh-mesh ssh-mesh-full mesh-init h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets mesh-net-tools build-deps dev-tools;
             default = ssh-mesh-full;
         };
 

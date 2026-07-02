@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mesh Console</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f6f8fb;
+            --panel: #ffffff;
+            --text: #172033;
+            --muted: #667085;
+            --border: #d8dee8;
+            --accent: #1466cc;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+        header {
+            padding: 22px 28px;
+            border-bottom: 1px solid var(--border);
+            background: var(--panel);
+        }
+        h1 {
+            margin: 0;
+            font-size: 22px;
+            font-weight: 650;
+        }
+        main {
+            max-width: 980px;
+            margin: 0 auto;
+            padding: 28px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 14px;
+        }
+        a {
+            display: block;
+            min-height: 108px;
+            padding: 18px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--panel);
+            color: inherit;
+            text-decoration: none;
+        }
+        a:hover {
+            border-color: var(--accent);
+        }
+        strong {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 16px;
+        }
+        span {
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Mesh Console</h1>
+    </header>
+    <main>
+        <div class="grid">
+            <a href="mesh/processes.html">
+                <strong>Processes</strong>
+                <span>Inspect process memory, cgroup placement, and process actions.</span>
+            </a>
+            <a href="mesh/cgroups.html">
+                <strong>CGroups</strong>
+                <span>Inspect cgroup memory, pressure, and control operations.</span>
+            </a>
+            <a href="trace/trace_viewer.html">
+                <strong>Trace</strong>
+                <span>Open the trace aggregation viewer.</span>
+            </a>
+            <a href="ssh.html">
+                <strong>SSH</strong>
+                <span>Open the browser SSH terminal interface.</span>
+            </a>
+        </div>
+    </main>
+</body>
+</html>
