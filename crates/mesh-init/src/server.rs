@@ -112,8 +112,28 @@ impl ControlServer {
 
         let current_uid = unsafe { libc::getuid() };
 
+        let mut shutdown_rx = self.daemon.shutdown_tx.subscribe();
+
         loop {
-            let (stream, _) = listener.accept().await?;
+            let stream = tokio::select! {
+                res = listener.accept() => {
+                    match res {
+                        Ok((stream, _)) => stream,
+                        Err(e) => {
+                            error!("Accept error: {}", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Control server stopping due to shutdown");
+                        break;
+                    }
+                    continue;
+                }
+            };
 
             // Verify peer credentials
             let peer_cred = match stream.peer_cred() {
@@ -125,12 +145,13 @@ impl ControlServer {
             };
 
             let peer_uid = peer_cred.uid();
+            let peer_gid = peer_cred.gid();
 
             // Use daemon's auth config if available, otherwise fallback to root+self
             let is_authorized = {
                 let configs = self.daemon.configs.lock();
-                // Check if any loaded config has auth rules
-                let auth = configs.values().find_map(|c| c.auth.as_ref());
+                // Check if default config has auth rules
+                let auth = configs.get("default").and_then(|c| c.auth.as_ref());
                 match auth {
                     Some(auth_config) => auth_config.is_uid_authorized(peer_uid, current_uid),
                     None => {
@@ -152,11 +173,12 @@ impl ControlServer {
 
             let daemon = self.daemon.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, daemon, peer_uid).await {
+                if let Err(e) = handle_connection(stream, daemon, peer_uid, peer_gid).await {
                     error!("Control connection error: {}", e);
                 }
             });
         }
+        Ok(())
     }
 }
 
@@ -311,6 +333,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     daemon: Arc<Daemon>,
     peer_uid: u32,
+    peer_gid: u32,
 ) -> Result<()> {
     let mut stream = stream;
     let mut line = String::new();
@@ -338,7 +361,7 @@ async fn handle_connection(
                         let mut std_stream = stream.into_std()?;
                         std_stream.set_nonblocking(false)?;
                         let fd = recv_one_fd(&std_stream)?;
-                        let response = daemon.handle_request_with_fd(request, fd, peer_uid).await;
+                        let response = daemon.handle_request_with_fd(request, fd, peer_uid, peer_gid).await;
                         let response_str = format_response(response, &format)?;
                         std_stream.write_all(response_str.as_bytes())?;
                         std_stream.write_all(b"\n")?;
@@ -347,7 +370,21 @@ async fn handle_connection(
                         stream = tokio::net::UnixStream::from_std(std_stream)?;
                         continue;
                     }
-                    request => daemon.handle_request(request, peer_uid).await,
+                    Request::Shutdown => {
+                        let response = Response::ok();
+                        let response_str = format_response(response, &format)?;
+                        stream.write_all(response_str.as_bytes()).await?;
+                        stream.write_all(b"\n").await?;
+                        stream.flush().await?;
+
+                        let daemon_clone = daemon.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            daemon_clone.shutdown().await;
+                        });
+                        break;
+                    }
+                    request => daemon.handle_request(request, peer_uid, peer_gid).await,
                 }
             }
             Err(e) => {

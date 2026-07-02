@@ -39,12 +39,6 @@
             || pkgs.lib.hasInfix "/web/" (toString path);
         };
 
-        # Pre-fetch Swagger UI zip for utoipa-swagger-ui (no network in Nix sandbox)
-        swaggerUiZip = pkgs.fetchurl {
-          url = "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip";
-          sha256 = "1p6cf4zf3jrswqa9b7wwgxhp3ca2v5qrzxzfp8gv35r0h78484j8";
-        };
-
         nativeBuildInputs = with pkgs; [
           pkg-config
           curl
@@ -60,14 +54,6 @@
 
           CARGO_BUILD_TARGET = muslTarget;
           CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
-
-          # Copy pre-fetched Swagger UI zip so utoipa-swagger-ui's build.rs
-          # can find it via the file:// protocol. Use install to set writable
-          # permissions (nix store files are read-only).
-          preBuild = ''
-            install -m644 ${swaggerUiZip} $PWD/v5.17.14.zip
-            export SWAGGER_UI_DOWNLOAD_URL="file://$PWD/v5.17.14.zip"
-          '';
         };
 
         # Native glibc build args for dmesh. dmesh carries Python/JNI wrapper
@@ -77,15 +63,10 @@
           version = "0.1.0";
           strictDeps = true;
           doCheck = false;
-
-          preBuild = ''
-            install -m644 ${swaggerUiZip} $PWD/v5.17.14.zip
-            export SWAGGER_UI_DOWNLOAD_URL="file://$PWD/v5.17.14.zip"
-          '';
         };
 
         mainCargoExtraArgs =
-          "--workspace --bins --exclude dmesh --features ssh-mesh/openapi,mesh-tun/bin-full";
+          "--workspace --bins --exclude dmesh --features mesh-tun/bin-full";
 
         # Build main workspace deps once — shared by all main binary outputs.
         # Kernel, VM, and rootfs packages remain separate opt-in outputs.
@@ -124,14 +105,9 @@
           done
         '';
 
-        swagger-ui-assets = pkgs.runCommand "ssh-mesh-swagger-ui-assets" { } ''
-          mkdir -p "$out/share/ssh-mesh/swagger-ui"
-          ln -s ${swaggerUiZip} "$out/share/ssh-mesh/swagger-ui/v5.17.14.zip"
-        '';
-
         build-deps = pkgs.symlinkJoin {
           name = "ssh-mesh-build-deps";
-          paths = [ musl-toolchain swagger-ui-assets mesh-net-tools ];
+          paths = [ musl-toolchain mesh-net-tools ];
         };
 
         mesh-net-tools = pkgs.symlinkJoin {
@@ -176,7 +152,6 @@
         h2t       = selectBins "h2t"       [ "h2t" ];
         meshkeys  = selectBins "meshkeys"  [ "meshkeys" ];
         sshmc     = selectBins "sshmc"     [ "sshmc" ];
-        gen-openapi = selectBins "gen-openapi" [ "gen-openapi" ];
         traceweb  = selectBins "traceweb"  [ "traceweb" ];
         sftp-server = selectBins "sftp-server" [ "sftp-server" ];
         mesh-tun = selectBins "mesh-tun" [ "mesh-tun" ];
@@ -269,7 +244,7 @@
       in
       {
         packages = {
-            inherit ssh-mesh ssh-mesh-full mesh-init h2t meshkeys sshmc gen-openapi traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain swagger-ui-assets mesh-net-tools build-deps dev-tools;
+            inherit ssh-mesh ssh-mesh-full mesh-init h2t meshkeys sshmc traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain mesh-net-tools build-deps dev-tools;
             default = ssh-mesh-full;
         };
 

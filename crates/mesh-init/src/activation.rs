@@ -1,6 +1,6 @@
 //! Socket activation for mesh-init services.
 //!
-//! Handles listening on TCP ports and UDS sockets on behalf of services.
+//! Handles listening on TCP ports, UDP ports, and Unix sockets on behalf of services.
 //! Supports three activation models:
 //!
 //! - **Systemd socket activation** — mesh-init receives pre-bound file
@@ -15,7 +15,7 @@
 //!   Unix socket using SCM_RIGHTS.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,6 +53,21 @@ static ACTIVATION_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static SERVICE_LISTENER_FDS: OnceLock<
     Mutex<HashMap<String, Vec<(usize, OwnedFd, Option<String>)>>>,
 > = OnceLock::new();
+static ACTIVE_INETD_PERMITS: OnceLock<Mutex<HashMap<u32, tokio::sync::OwnedSemaphorePermit>>> =
+    OnceLock::new();
+
+pub fn register_inetd_permit(pid: u32, permit: tokio::sync::OwnedSemaphorePermit) {
+    let registry = ACTIVE_INETD_PERMITS.get_or_init(|| Mutex::new(HashMap::new()));
+    registry.lock().insert(pid, permit);
+}
+
+pub fn reclaim_inetd_permit(pid: u32) {
+    if let Some(registry) = ACTIVE_INETD_PERMITS.get() {
+        if registry.lock().remove(&pid).is_some() {
+            debug!("Reclaimed inetd permit for PID {}", pid);
+        }
+    }
+}
 
 fn activation_semaphore() -> Arc<Semaphore> {
     ACTIVATION_SEMAPHORE
@@ -548,8 +563,19 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
             let wait = act.wait;
             let bind = act.bind.clone();
             let fd_name = act.fd_name.clone();
+            let datagram = act.datagram;
             tokio::spawn(async move {
-                run_tcp_listener(port, bind, fd_name, name, wait, order, daemon_clone).await;
+                run_inet_listener(
+                    port,
+                    bind,
+                    fd_name,
+                    datagram,
+                    name,
+                    wait,
+                    order,
+                    daemon_clone,
+                )
+                .await;
             });
         }
         if let Some(ref path) = act.socket {
@@ -575,12 +601,14 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
             let socket_mode = act.socket_mode;
             let socket_user = act.socket_user.clone();
             let socket_group = act.socket_group.clone();
+            let datagram = act.datagram;
             tokio::spawn(async move {
                 run_uds_listener(
                     path_clone,
                     name,
                     wait,
                     order,
+                    datagram,
                     socket_mode,
                     socket_user,
                     socket_group,
@@ -611,13 +639,14 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
 }
 
 // ============================================================================
-// TCP listener
+// Internet listeners
 // ============================================================================
 
-async fn run_tcp_listener(
+async fn run_inet_listener(
     port: u16,
     bind: Option<String>,
     fd_name: Option<String>,
+    datagram: bool,
     service_name: String,
     wait: bool,
     order: usize,
@@ -629,14 +658,28 @@ async fn run_tcp_listener(
     let addr = format!("{}:{}", bind_addr, port);
     if bind_addr == "0.0.0.0" || bind_addr == "::" || bind_addr == "[::]" {
         warn!(
-            "TCP activation for '{}' binds {} — ensure auth or firewalling is in place",
-            service_name, addr
+            "{} activation for '{}' binds {} — ensure auth or firewalling is in place",
+            if datagram { "UDP" } else { "TCP" },
+            service_name,
+            addr
         );
     }
     info!(
-        "Starting TCP activation listener for '{}' on {} (wait={})",
-        service_name, addr, wait
+        "Starting {} activation listener for '{}' on {} (wait={})",
+        if datagram { "UDP" } else { "TCP" },
+        service_name,
+        addr,
+        wait
     );
+
+    if datagram && !wait {
+        error!(
+            "Service '{}' uses Accept=true with UDP datagram activation; \
+             datagram sockets cannot be accepted into an inetd-style client fd",
+            service_name
+        );
+        return;
+    }
 
     if wait {
         let has_auth = daemon
@@ -655,26 +698,34 @@ async fn run_tcp_listener(
         }
     }
 
-    let listener = match bind_tcp_listener(&bind_addr, port) {
-        Ok(l) => l,
+    let fd = match bind_inet_socket(&bind_addr, port, datagram) {
+        Ok(fd) => fd,
         Err(e) => {
             error!(
-                "Failed to bind TCP activation port {} for '{}': {}",
-                port, service_name, e
+                "Failed to bind {} activation port {} for '{}': {}",
+                if datagram { "UDP" } else { "TCP" },
+                port,
+                service_name,
+                e
             );
             return;
         }
     };
-    if let Err(e) = listener.set_nonblocking(true) {
-        error!("Failed to set TCP listener non-blocking: {}", e);
-        return;
-    }
-
-    let fd = listener.into();
     if wait {
         register_service_listener_fd(&service_name, order, &fd, fd_name);
     }
     handle_listener(fd, service_name, wait, daemon).await;
+}
+
+fn bind_inet_socket(bind_addr: &str, port: u16, datagram: bool) -> std::io::Result<OwnedFd> {
+    if datagram {
+        let socket = bind_udp_socket(bind_addr, port)?;
+        return Ok(unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) });
+    }
+
+    let listener = bind_tcp_listener(bind_addr, port)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener.into())
 }
 
 fn bind_tcp_listener(bind_addr: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
@@ -694,6 +745,21 @@ fn bind_tcp_listener(bind_addr: &str, port: u16) -> std::io::Result<std::net::Tc
     }
 
     std::net::TcpListener::bind(format!("{}:{}", bind_addr, port))
+}
+
+fn bind_udp_socket(bind_addr: &str, port: u16) -> std::io::Result<std::net::UdpSocket> {
+    let host = bind_addr
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(bind_addr);
+    let bind_target = if host.contains(':') && !bind_addr.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", bind_addr, port)
+    };
+    let socket = std::net::UdpSocket::bind(bind_target)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
 }
 
 fn bind_ipv6_dual_stack(
@@ -899,6 +965,7 @@ async fn run_uds_listener(
     service_name: String,
     wait: bool,
     order: usize,
+    datagram: bool,
     socket_mode: Option<u32>,
     socket_user: Option<String>,
     socket_group: Option<String>,
@@ -906,9 +973,23 @@ async fn run_uds_listener(
     daemon: Arc<Daemon>,
 ) {
     info!(
-        "Starting UDS activation listener for '{}' on {}",
-        service_name, path
+        "Starting {} activation listener for '{}' on {}",
+        if datagram {
+            "UDS datagram"
+        } else {
+            "UDS stream"
+        },
+        service_name,
+        path
     );
+    if datagram && !wait {
+        error!(
+            "Service '{}' uses Accept=true with Unix datagram activation; \
+             datagram sockets cannot be accepted into an inetd-style client fd",
+            service_name
+        );
+        return;
+    }
     if let Some(parent) = std::path::Path::new(&path).parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -922,8 +1003,8 @@ async fn run_uds_listener(
     }
     let _ = std::fs::remove_file(&path);
 
-    let listener = match std::os::unix::net::UnixListener::bind(&path) {
-        Ok(l) => l,
+    let fd = match bind_unix_socket(&path, datagram) {
+        Ok(fd) => fd,
         Err(e) => {
             error!(
                 "Failed to bind UDS activation socket {} for '{}': {}",
@@ -1019,16 +1100,22 @@ async fn run_uds_listener(
         }
     }
 
-    if let Err(e) = listener.set_nonblocking(true) {
-        error!("Failed to set UDS listener non-blocking: {}", e);
-        return;
-    }
-
-    let fd = listener.into();
     if wait {
         register_service_listener_fd(&service_name, order, &fd, fd_name);
     }
     handle_listener(fd, service_name, wait, daemon).await;
+}
+
+fn bind_unix_socket(path: &str, datagram: bool) -> std::io::Result<OwnedFd> {
+    if datagram {
+        let socket = std::os::unix::net::UnixDatagram::bind(path)?;
+        socket.set_nonblocking(true)?;
+        return Ok(socket.into());
+    }
+
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener.into())
 }
 
 // ============================================================================
@@ -1198,15 +1285,10 @@ async fn handle_listener(
                 ) {
                     Ok(pid) => {
                         debug!("Spawned activated instance PID {}", pid);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                if unsafe { libc::kill(pid as i32, 0) } != 0 {
-                                    break;
-                                }
-                            }
-                        });
+                        if let Some(ref tracked) = *daemon.tracked_child_pids.lock() {
+                            tracked.lock().insert(pid);
+                        }
+                        register_inetd_permit(pid, permit);
                     }
                     Err(e) => {
                         error!(
@@ -1218,5 +1300,25 @@ async fn handle_listener(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_udp_socket_returns_datagram_fd() {
+        let fd = bind_inet_socket("127.0.0.1", 0, true).unwrap();
+        assert_eq!(get_sock_type(fd.as_raw_fd()), SocketKind::Datagram);
+    }
+
+    #[test]
+    fn bind_unix_datagram_socket_returns_datagram_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.sock");
+        let fd = bind_unix_socket(path.to_str().unwrap(), true).unwrap();
+        assert_eq!(get_sock_type(fd.as_raw_fd()), SocketKind::Datagram);
+        assert!(path.exists());
     }
 }

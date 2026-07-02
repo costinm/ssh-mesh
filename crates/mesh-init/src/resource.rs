@@ -109,20 +109,40 @@ fn parse_kv(s: &str) -> Option<f64> {
     val.parse().ok()
 }
 
+fn psi_threshold_critical() -> f64 {
+    std::env::var("MESH_INIT_PSI_CRITICAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60.0)
+}
+
+fn psi_threshold_medium() -> f64 {
+    std::env::var("MESH_INIT_PSI_MEDIUM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20.0)
+}
+
+fn psi_threshold_low() -> f64 {
+    std::env::var("MESH_INIT_PSI_LOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5.0)
+}
+
 /// Classify memory pressure into a level based on PSI some_avg10.
 ///
-/// Thresholds (configurable in future):
-/// - `< 5.0` → None
-/// - `5.0 - 20.0` → Low
-/// - `20.0 - 60.0` → Medium
-/// - `>= 60.0` → Critical
+/// Thresholds can be overridden via env vars:
+/// - `MESH_INIT_PSI_CRITICAL` (default: 60.0)
+/// - `MESH_INIT_PSI_MEDIUM` (default: 20.0)
+/// - `MESH_INIT_PSI_LOW` (default: 5.0)
 pub fn classify_pressure(data: &PressureData) -> PressureLevel {
     let avg10 = data.some_avg10;
-    if avg10 >= 60.0 {
+    if avg10 >= psi_threshold_critical() {
         PressureLevel::Critical
-    } else if avg10 >= 20.0 {
+    } else if avg10 >= psi_threshold_medium() {
         PressureLevel::Medium
-    } else if avg10 >= 5.0 {
+    } else if avg10 >= psi_threshold_low() {
         PressureLevel::Low
     } else {
         PressureLevel::None
@@ -418,10 +438,12 @@ Cached:         32937264 kB
         assert_eq!(rm.committed_memory_low(), 256 * 1024 * 1024);
     }
 
+    static ENV_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn test_pressure_level_classification() {
+        let _guard = ENV_MUTEX.lock();
         let mut data = PressureData::default();
-
         data.some_avg10 = 0.0;
         assert_eq!(classify_pressure(&data), PressureLevel::None);
 
@@ -445,6 +467,41 @@ Cached:         32937264 kB
 
         data.some_avg10 = 100.0;
         assert_eq!(classify_pressure(&data), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn test_classify_pressure_with_env_override() {
+        let _guard = ENV_MUTEX.lock();
+        unsafe {
+            std::env::set_var("MESH_INIT_PSI_CRITICAL", "80.0");
+            std::env::set_var("MESH_INIT_PSI_MEDIUM", "40.0");
+            std::env::set_var("MESH_INIT_PSI_LOW", "10.0");
+        }
+
+        let mut data = PressureData::default();
+        data.some_avg10 = 9.0;
+        assert_eq!(classify_pressure(&data), PressureLevel::None);
+
+        data.some_avg10 = 10.0;
+        assert_eq!(classify_pressure(&data), PressureLevel::Low);
+
+        data.some_avg10 = 39.9;
+        assert_eq!(classify_pressure(&data), PressureLevel::Low);
+
+        data.some_avg10 = 40.0;
+        assert_eq!(classify_pressure(&data), PressureLevel::Medium);
+
+        data.some_avg10 = 79.9;
+        assert_eq!(classify_pressure(&data), PressureLevel::Medium);
+
+        data.some_avg10 = 80.0;
+        assert_eq!(classify_pressure(&data), PressureLevel::Critical);
+
+        unsafe {
+            std::env::remove_var("MESH_INIT_PSI_CRITICAL");
+            std::env::remove_var("MESH_INIT_PSI_MEDIUM");
+            std::env::remove_var("MESH_INIT_PSI_LOW");
+        }
     }
 
     #[test]

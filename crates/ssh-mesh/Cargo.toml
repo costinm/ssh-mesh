@@ -17,18 +17,12 @@ name = "meshkeys"
 path = "src/bin/meshkeys.rs"
 
 [[bin]]
-name = "gen-openapi"
-path = "src/bin/gen-openapi.rs"
-required-features = ["openapi"]
-
-[[bin]]
 name = "sshmc"
 path = "src/bin/sshmc.rs"
 
 [features]
 default = ["test-utils", "sftp"]
 test-utils = ["tempfile", "once_cell"]
-openapi = []
 sftp = ["dep:sftp-server", "dep:russh-sftp"]
 ws = ["dep:ws"]
 
@@ -78,7 +72,6 @@ rust-embed = "8.11.0"
 mime_guess = "2.0.5"
 russh-sftp = { version = "2", optional = true }
 sftp-server = { path = "../sftp", optional = true }
-utoipa = { version = "5.4.0", features = ["axum_extras"] }
 env_logger = "0.11"
 serde_yaml = "0.9.34"
 config = "0.14"

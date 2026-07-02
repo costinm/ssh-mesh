@@ -1,8 +1,8 @@
 # mesh-init service definition for app5-vm's ssh-mesh node.
 
 [Service]
-MeshUID = 103
-MeshGID = 103
+User = "103"
+Group = "103"
 
 ExecStart = "ssh-mesh"
 OOMScoreAdjust = -900
@@ -10,9 +10,9 @@ OOMScoreAdjust = -900
 uid = 103
 
 [Resources]
-memory_high = "256M"
-memory_max = "512M"
-cpu_weight = 100
+MemoryHigh = "256M"
+MemoryMax = "512M"
+CPUWeight = 100
 
 [Environment]
 PATH = "/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"

@@ -1,4 +1,3 @@
-use crate::ConnectedClientInfo;
 use axum::{
     Router,
     body::Body,
@@ -21,34 +20,12 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
-use utoipa::OpenApi;
 
 #[derive(RustEmbed)]
 #[folder = "web/"]
 pub struct Assets;
 
 use crate::AppState;
-
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        get_ssh_clients,
-        handle_ssh_request,
-        handle_tcp_proxy,
-        handle_uds_proxy,
-        handle_exec,
-        handle_proxy_request
-    ),
-    components(
-        schemas(
-            ConnectedClientInfo
-        )
-    ),
-    tags(
-        (name = "ssh-mesh", description = "SSH Mesh API")
-    )
-)]
-pub struct ApiDoc;
 
 /// Serve a JSON file from the `web/` directory by path.
 ///
@@ -238,14 +215,6 @@ fn response_with_status(status: StatusCode, body: Body) -> Response {
     response
 }
 
-#[utoipa::path(
-    get,
-    path = "/_m/api/ssh/clients",
-    tag = "ssh-mesh",
-    responses(
-        (status = 200, description = "List connected SSH clients", body = Vec<ConnectedClientInfo>)
-    )
-)]
 async fn get_ssh_clients(State(app_state): State<AppState>) -> impl IntoResponse {
     let clients = app_state.ssh_server.connected_clients.lock().await;
     (StatusCode::OK, Json(clients.clone()))
@@ -255,15 +224,6 @@ async fn get_ssh_clients(State(app_state): State<AppState>) -> impl IntoResponse
 ///
 /// Bridges a bidirectional HTTP/2 body stream to a `russh` server session,
 /// allowing SSH protocol to tunnel over H2C.
-#[utoipa::path(
-    post,
-    path = "/_m/_ssh",
-    tag = "ssh-mesh",
-    responses(
-        (status = 200, description = "SSH session stream"),
-        (status = 500, description = "SSH session failed")
-    )
-)]
 #[instrument(skip(req, state), fields(method = %req.method(), uri = %req.uri()))]
 pub async fn handle_ssh_request(
     State(state): State<AppState>,
@@ -358,20 +318,6 @@ async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Err
 ///
 /// * `host` — Target hostname or IP.
 /// * `port` — Target port number.
-#[utoipa::path(
-    post,
-    path = "/_m/_tcp/{host}/{port}",
-    tag = "ssh-mesh",
-    params(
-        ("host" = String, Path, description = "Target host"),
-        ("port" = u32, Path, description = "Target port")
-    ),
-    responses(
-        (status = 200, description = "TCP proxy stream"),
-        (status = 405, description = "Method not allowed"),
-        (status = 502, description = "Connection failed")
-    )
-)]
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), host = %host, port = %port))]
 pub async fn handle_tcp_proxy(
     State(_state): State<AppState>,
@@ -429,19 +375,6 @@ pub async fn handle_tcp_proxy(
 /// Connects to a UDS at the given path and bridges it over the HTTP/2 body stream.
 ///
 /// * `path` — Absolute path to the Unix domain socket.
-#[utoipa::path(
-    post,
-    path = "/_m/_uds/{path}",
-    tag = "ssh-mesh",
-    params(
-        ("path" = String, Path, description = "UDS socket path")
-    ),
-    responses(
-        (status = 200, description = "UDS proxy stream"),
-        (status = 405, description = "Method not allowed"),
-        (status = 502, description = "Connection failed")
-    )
-)]
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), path = %path))]
 pub async fn handle_uds_proxy(
     State(_state): State<AppState>,
@@ -583,19 +516,6 @@ fn mesh_init_socket_path() -> String {
 /// Environment variables can be passed via `X-E-<NAME>` request headers.
 ///
 /// * `cmd` — Shell command to execute via `sh -c`.
-#[utoipa::path(
-    post,
-    path = "/_m/_exec/{cmd}",
-    tag = "ssh-mesh",
-    params(
-        ("cmd" = String, Path, description = "Command to execute")
-    ),
-    responses(
-        (status = 200, description = "Command I/O stream"),
-        (status = 405, description = "Method not allowed"),
-        (status = 500, description = "Spawn failed")
-    )
-)]
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), cmd = %cmd))]
 pub async fn handle_exec(
     State(_state): State<AppState>,
@@ -811,16 +731,6 @@ impl mesh::StreamHandler for ExecWsHandler {
 /// Fallback reverse proxy handler.
 ///
 /// Forwards unmatched requests to `target_http_address` if configured.
-#[utoipa::path(
-    get,
-    path = "/",
-    tag = "ssh-mesh",
-    responses(
-        (status = 200, description = "Proxied response"),
-        (status = 404, description = "No target configured"),
-        (status = 502, description = "Proxy error")
-    )
-)]
 pub async fn handle_proxy_request(
     State(state): State<AppState>,
     req: axum::extract::Request,

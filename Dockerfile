@@ -8,8 +8,6 @@ RUN apt-get update && apt-get install -y \
     gcc-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
-# Utoipa-swagger-ui build depends on curl to download swagger-ui
-
 RUN rustup target add x86_64-unknown-linux-musl
 RUN rustup target add aarch64-unknown-linux-musl
 

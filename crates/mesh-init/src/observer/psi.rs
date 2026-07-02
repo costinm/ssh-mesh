@@ -17,7 +17,6 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, trace, warn};
-use utoipa::ToSchema;
 
 const WAKER_TOKEN: Token = Token(1024);
 
@@ -28,7 +27,7 @@ const DEFAULT_THRESHOLD_US: u64 = 10000000;
 
 /// Parsed PSI pressure data from /proc/pressure or cgroup memory.pressure files.
 /// Format: "some avg10=X.XX avg60=X.XX avg300=X.XX total=N"
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, JsonSchema, ToSchema)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub struct PressureData {
     /// Average percentage of time stalled in the last 10 seconds
     pub avg10: f64,
@@ -75,12 +74,11 @@ impl PressureData {
 }
 
 /// Tracks pressure information for a cgroup, including historical events.
-#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PressureInfo {
     /// The cgroup path being watched
     pub cgroup_path: String,
     /// When this cgroup was first added to the watch list
-    #[schema(value_type = String, format = DateTime)]
     pub watch_started: SystemTime,
     /// The most recent pressure event data
     pub last_event: Option<PressureData>,
@@ -122,12 +120,12 @@ impl PressureInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PressureType {
     Memory,
 }
 
-#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PressureEvent {
     pub cgroup_path: String,
     pub pressure_type: PressureType,

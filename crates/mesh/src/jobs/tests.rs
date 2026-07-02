@@ -73,6 +73,7 @@ fn create_base_job(name: &str) -> JobConfig {
         estimated_download_bytes: None,
         estimated_upload_bytes: None,
         minimum_network_chunk_bytes: None,
+        ..Default::default()
     }
 }
 

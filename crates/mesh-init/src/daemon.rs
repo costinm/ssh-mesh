@@ -16,7 +16,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, RestartPolicy};
 use crate::observer::{self, ProcessDetailedInfo, ProcessObserver};
 use crate::process::{self, ManagedProcess};
 use crate::protocol::{
@@ -73,6 +73,7 @@ fn privileged_uids() -> Vec<u32> {
 /// or `Err(Response)` with a permission-denied response.
 fn check_impersonation(
     peer_uid: u32,
+    peer_gid: u32,
     target_uid: u32,
     target_gid: Option<u32>,
     name: &str,
@@ -87,11 +88,11 @@ fn check_impersonation(
         )));
     }
     if let Some(g) = target_gid
-        && g != peer_uid
+        && g != peer_gid
     {
         return Err(Response::err(format!(
-            "permission denied: peer UID {} may not operate on service '{}' (GID {})",
-            peer_uid, name, g
+            "permission denied: peer GID {} may not operate on service '{}' (GID {})",
+            peer_gid, name, g
         )));
     }
     Ok(())
@@ -129,7 +130,9 @@ pub struct Daemon {
     observer: Arc<ProcessObserver>,
     resource_manager: Option<ResourceManager>,
     /// Set of tracked child PIDs for the reaper (only used when not PID 1).
-    tracked_child_pids: Mutex<Option<Arc<parking_lot::Mutex<std::collections::HashSet<u32>>>>>,
+    pub tracked_child_pids: Mutex<Option<Arc<parking_lot::Mutex<std::collections::HashSet<u32>>>>>,
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub service_exit_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 struct TerminalSession {
@@ -144,12 +147,40 @@ fn apply_activation_context_env(config: &mut AppConfig, context: Option<Activati
     }
 }
 
+fn run_service_commands(
+    config: &AppConfig,
+    commands: &[String],
+    label: &str,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    for command in commands {
+        let exit_code = process::run_service_command(config, command, timeout_secs)
+            .map_err(|e| anyhow::anyhow!("{} command '{}' failed: {}", label, command, e))?;
+        if exit_code != 0 {
+            anyhow::bail!("{} command '{}' exited with {}", label, command, exit_code);
+        }
+    }
+    Ok(())
+}
+
+fn should_restart_for_policy(policy: RestartPolicy, exit_code: i32) -> bool {
+    match policy {
+        RestartPolicy::No => false,
+        RestartPolicy::Always => true,
+        RestartPolicy::OnSuccess => exit_code == 0,
+        RestartPolicy::OnFailure => exit_code != 0,
+        RestartPolicy::OnAbnormal | RestartPolicy::OnAbort => exit_code < 0 || exit_code >= 128,
+    }
+}
+
 impl Daemon {
     /// Create a new daemon instance.
     pub fn new(config: DaemonConfig) -> Arc<Self> {
         let services = Arc::new(Mutex::new(HashMap::new()));
         let resource_manager = Some(ResourceManager::new(services.clone()));
         let observer = Arc::new(ProcessObserver::new().expect("create mesh-init process observer"));
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (service_exit_tx, _) = tokio::sync::broadcast::channel(128);
 
         Arc::new(Self {
             config,
@@ -161,7 +192,13 @@ impl Daemon {
             observer,
             resource_manager,
             tracked_child_pids: Mutex::new(None),
+            shutdown_tx,
+            service_exit_tx,
         })
+    }
+
+    fn notify_service_exit(&self, name: &str) {
+        let _ = self.service_exit_tx.send(name.to_string());
     }
 
     /// Run the daemon main loop.
@@ -320,14 +357,14 @@ impl Daemon {
     }
 
     /// Handle a control protocol request.
-    pub async fn handle_request(&self, request: Request, peer_uid: u32) -> Response {
+    pub async fn handle_request(&self, request: Request, peer_uid: u32, peer_gid: u32) -> Response {
         match request {
             Request::Start {
                 name,
                 args,
                 env,
                 context,
-            } => self.handle_start(&name, args, env, context, peer_uid),
+            } => self.handle_start(&name, args, env, context, peer_uid, peer_gid),
             Request::PrepareActivation { name, context } => {
                 self.prepare_activation_context(name, context)
             }
@@ -355,9 +392,11 @@ impl Daemon {
                 command,
                 data,
             } => self.handle_terminal_command(&terminal_id, &command, data),
-            Request::Stop { name, signal } => self.handle_stop(&name, signal, peer_uid).await,
-            Request::Freeze { name } => self.handle_freeze(&name, peer_uid),
-            Request::Unfreeze { name } => self.handle_unfreeze(&name, peer_uid),
+            Request::Stop { name, signal } => {
+                self.handle_stop(&name, signal, peer_uid, peer_gid).await
+            }
+            Request::Freeze { name } => self.handle_freeze(&name, peer_uid, peer_gid),
+            Request::Unfreeze { name } => self.handle_unfreeze(&name, peer_uid, peer_gid),
             Request::Status { name } => self.handle_status(name.as_deref()),
             Request::Shutdown => self.handle_shutdown().await,
             Request::Reload => self.handle_reload(),
@@ -401,6 +440,7 @@ impl Daemon {
         request: Request,
         fd: OwnedFd,
         peer_uid: u32,
+        peer_gid: u32,
     ) -> Response {
         match request {
             Request::StartTerminal {
@@ -414,13 +454,13 @@ impl Daemon {
                 command,
                 ..
             } => self.handle_start_terminal(
-                &name, &home, uid, gid, pty, env, context, command, fd, peer_uid,
+                &name, &home, uid, gid, pty, env, context, command, fd, peer_uid, peer_gid,
             ),
             Request::RegisterNamespace {
                 name,
                 kind,
                 target_pid,
-            } => self.handle_register_namespace(&name, kind, target_pid, fd, peer_uid),
+            } => self.handle_register_namespace(&name, kind, target_pid, fd, peer_uid, peer_gid),
             _ => Response::err("request does not accept a passed file descriptor"),
         }
     }
@@ -436,6 +476,7 @@ impl Daemon {
         target_pid: Option<u32>,
         fd: OwnedFd,
         peer_uid: u32,
+        peer_gid: u32,
     ) -> Response {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
@@ -451,6 +492,7 @@ impl Daemon {
             }
             if let Err(resp) = check_impersonation(
                 peer_uid,
+                peer_gid,
                 proc.config.uid.unwrap_or(peer_uid),
                 proc.config.gid,
                 name,
@@ -528,6 +570,7 @@ impl Daemon {
         extra_env: HashMap<String, String>,
         context: Option<ActivationContext>,
         peer_uid: u32,
+        peer_gid: u32,
     ) -> Response {
         // Reject names that could escape the config/cgroup directories.
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
@@ -538,9 +581,13 @@ impl Daemon {
         {
             let configs = self.configs.lock();
             if let Some(cfg) = configs.get(name) {
-                if let Err(resp) =
-                    check_impersonation(peer_uid, cfg.uid.unwrap_or(peer_uid), cfg.gid, name)
-                {
+                if let Err(resp) = check_impersonation(
+                    peer_uid,
+                    peer_gid,
+                    cfg.uid.unwrap_or(peer_uid),
+                    cfg.gid,
+                    name,
+                ) {
                     return resp;
                 }
             }
@@ -670,6 +717,7 @@ impl Daemon {
         command: Option<String>,
         fd: OwnedFd,
         peer_uid: u32,
+        peer_gid: u32,
     ) -> Response {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
@@ -678,7 +726,7 @@ impl Daemon {
         // itself. Privileged UIDs (root, system, sshd — see `privileged_uids`)
         // may target any UID. This prevents privilege escalation where an
         // authorized non-privileged peer requests uid=0.
-        if let Err(resp) = check_impersonation(peer_uid, uid, gid, name) {
+        if let Err(resp) = check_impersonation(peer_uid, peer_gid, uid, gid, name) {
             return resp;
         }
         let home_path = std::path::Path::new(home);
@@ -760,9 +808,13 @@ impl Daemon {
         // Final authorization guard on the resolved config. The config file
         // may have specified a uid different from the request; a non-privileged
         // peer must not benefit from that.
-        if let Err(resp) =
-            check_impersonation(peer_uid, config.uid.unwrap_or(peer_uid), config.gid, name)
-        {
+        if let Err(resp) = check_impersonation(
+            peer_uid,
+            peer_gid,
+            config.uid.unwrap_or(peer_uid),
+            config.gid,
+            name,
+        ) {
             return resp;
         }
 
@@ -906,11 +958,17 @@ impl Daemon {
         context
     }
 
-    async fn handle_stop(&self, name: &str, signal: Option<i32>, peer_uid: u32) -> Response {
+    async fn handle_stop(
+        &self,
+        name: &str,
+        signal: Option<i32>,
+        peer_uid: u32,
+        peer_gid: u32,
+    ) -> Response {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
         }
-        let (pid, network_pid) = {
+        let (pid, network_pid, config) = {
             let mut services = self.services.lock();
             match services.get_mut(name) {
                 Some(proc)
@@ -921,7 +979,9 @@ impl Daemon {
                     // services running as its own UID.
                     let svc_uid = proc.config.uid.unwrap_or(peer_uid);
                     let svc_gid = proc.config.gid;
-                    if let Err(resp) = check_impersonation(peer_uid, svc_uid, svc_gid, name) {
+                    if let Err(resp) =
+                        check_impersonation(peer_uid, peer_gid, svc_uid, svc_gid, name)
+                    {
                         return resp;
                     }
                     proc.state = ServiceState::Stopping;
@@ -930,18 +990,35 @@ impl Daemon {
                     proc.userns_fd = None;
                     proc.namespace_pid = None;
                     proc.mesh_tun_attached = false;
-                    (proc.pid, proc.network_pid)
+                    (proc.pid, proc.network_pid, proc.config.clone())
                 }
                 Some(_) => return Response::err(format!("service '{}' is not running", name)),
                 None => return Response::err(format!("service '{}' not found", name)),
             }
         };
 
+        if let Err(e) = run_service_commands(
+            &config,
+            &config.exec_stop,
+            "ExecStop",
+            config.timeout_stop_sec,
+        ) {
+            error!("ExecStop failed for '{}': {}", name, e);
+            return Response::err(e.to_string());
+        }
+
         if let Some(network_pid) = network_pid {
             let _ = process::send_signal(network_pid, libc::SIGTERM);
         }
         if let Some(pid) = pid
-            && let Err(e) = process::stop_process(pid, signal).await
+            && config.kill_mode != crate::config::KillMode::None
+            && let Err(e) = process::stop_process(
+                pid,
+                signal.or(Some(config.kill_signal)),
+                config.timeout_stop_sec,
+                config.send_sigkill,
+            )
+            .await
         {
             error!("Failed to stop '{}': {}", name, e);
             return Response::err(e.to_string());
@@ -960,12 +1037,13 @@ impl Daemon {
                 proc.mesh_tun_attached = false;
             }
         }
+        self.notify_service_exit(name);
 
         info!("Stopped service '{}'", name);
         Response::ok()
     }
 
-    fn handle_freeze(&self, name: &str, peer_uid: u32) -> Response {
+    fn handle_freeze(&self, name: &str, peer_uid: u32, peer_gid: u32) -> Response {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
         }
@@ -979,7 +1057,7 @@ impl Daemon {
         // running as its own UID.
         let svc_uid = proc.config.uid.unwrap_or(peer_uid);
         let svc_gid = proc.config.gid;
-        if let Err(resp) = check_impersonation(peer_uid, svc_uid, svc_gid, name) {
+        if let Err(resp) = check_impersonation(peer_uid, peer_gid, svc_uid, svc_gid, name) {
             return resp;
         }
 
@@ -994,7 +1072,7 @@ impl Daemon {
         Response::ok()
     }
 
-    fn handle_unfreeze(&self, name: &str, peer_uid: u32) -> Response {
+    fn handle_unfreeze(&self, name: &str, peer_uid: u32, peer_gid: u32) -> Response {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
         }
@@ -1008,7 +1086,7 @@ impl Daemon {
         // running as its own UID.
         let svc_uid = proc.config.uid.unwrap_or(peer_uid);
         let svc_gid = proc.config.gid;
-        if let Err(resp) = check_impersonation(peer_uid, svc_uid, svc_gid, name) {
+        if let Err(resp) = check_impersonation(peer_uid, peer_gid, svc_uid, svc_gid, name) {
             return resp;
         }
 
@@ -1161,11 +1239,24 @@ impl Daemon {
         let mut changed = 0;
         let mut configs = self.configs.lock();
         let mut services = self.services.lock();
+        let mut reload_commands = Vec::new();
 
         for new_cfg in loaded_configs {
             let name = new_cfg.name.clone();
             let is_changed = match configs.get(&name) {
-                Some(old_cfg) => *old_cfg != new_cfg,
+                Some(old_cfg) => {
+                    if *old_cfg == new_cfg {
+                        if services
+                            .get(&name)
+                            .is_some_and(|proc| proc.state == ServiceState::Running)
+                        {
+                            reload_commands.push(new_cfg.clone());
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                }
                 None => true,
             };
 
@@ -1189,6 +1280,19 @@ impl Daemon {
                 }
             }
         }
+        drop(services);
+        drop(configs);
+
+        for config in reload_commands {
+            if let Err(e) = run_service_commands(
+                &config,
+                &config.exec_reload,
+                "ExecReload",
+                config.timeout_start_sec,
+            ) {
+                warn!("ExecReload failed for '{}': {}", config.name, e);
+            }
+        }
 
         Response::ok_with_data(serde_json::json!({"reloaded": true, "changed": changed}))
     }
@@ -1198,6 +1302,7 @@ impl Daemon {
     // ========================================================================
 
     fn handle_child_exit(&self, pid: u32, exit_code: i32) {
+        crate::activation::reclaim_inetd_permit(pid);
         let removed_terminals: Vec<String> = {
             let mut terminals = self.terminal_sessions.lock();
             let ids: Vec<String> = terminals
@@ -1235,6 +1340,11 @@ impl Daemon {
                     name, pid, exit_code
                 );
                 proc.network_pid = None;
+                if proc.pid.is_none() {
+                    if let Some(ref cg) = proc.cgroup_path.take() {
+                        let _ = crate::cgroup::remove_cgroup(cg);
+                    }
+                }
                 return;
             }
 
@@ -1251,15 +1361,27 @@ impl Daemon {
                 proc.userns_fd = None;
                 proc.namespace_pid = None;
                 proc.mesh_tun_attached = false;
-                if let Some(network_pid) = proc.network_pid.take() {
+                if let Some(network_pid) = proc.network_pid {
                     let _ = process::send_signal(network_pid, libc::SIGTERM);
                 }
+
+                if proc.network_pid.is_none() {
+                    if let Some(ref cg) = proc.cgroup_path.take() {
+                        let _ = crate::cgroup::remove_cgroup(cg);
+                    }
+                }
+
+                self.notify_service_exit(name);
 
                 if proc.config.oneshot {
                     proc.target_state = ServiceState::Stopped;
                 }
 
                 if !intentionally_stopped && proc.target_state == ServiceState::Running {
+                    if !should_restart_for_policy(proc.config.restart, exit_code) {
+                        proc.target_state = ServiceState::Stopped;
+                        return;
+                    }
                     // crashed or was killed for restart!
                     proc.consecutive_failures += 1;
 
@@ -1270,28 +1392,14 @@ impl Daemon {
                                 name, proc.consecutive_failures, max_retries
                             );
                             proc.target_state = ServiceState::Stopped;
+                            if let Some(ref cg) = proc.cgroup_path.take() {
+                                let _ = crate::cgroup::remove_cgroup(cg);
+                            }
                             return;
                         }
                     }
 
-                    let initial = proc.config.backoff.initial_secs;
-                    let mut backoff_secs = match proc.config.backoff.policy {
-                        crate::config::BackoffPolicy::Linear => {
-                            initial.saturating_mul(proc.consecutive_failures as u64)
-                        }
-                        crate::config::BackoffPolicy::Exponential => {
-                            let multiplier = 1_u64
-                                .checked_shl(proc.consecutive_failures - 1)
-                                .unwrap_or(u64::MAX);
-                            initial.saturating_mul(multiplier)
-                        }
-                    };
-
-                    if proc.config.backoff.max_retries.is_none() {
-                        backoff_secs = backoff_secs.min(24 * 3600);
-                    }
-
-                    let restart_delay_secs = restart_delay_with_jitter(name, backoff_secs);
+                    let restart_delay_secs = proc.config.restart_sec;
 
                     info!(
                         "Service '{}' crashed. Scheduling restart #{} in {}s",
@@ -1364,7 +1472,8 @@ impl Daemon {
                         proc.state = ServiceState::Stopped;
                         // Increase failure count
                         proc.consecutive_failures += 1;
-                        let backoff_secs = (1 << (proc.consecutive_failures - 1)).min(60);
+                        let backoff_secs =
+                            calculate_backoff(&proc.config, proc.consecutive_failures);
                         let restart_delay_secs =
                             restart_delay_with_jitter(&config.name, backoff_secs);
                         proc.next_restart_at = Some(
@@ -1396,6 +1505,13 @@ impl Daemon {
         passed_fd: Option<crate::process::ActivationFd>,
     ) -> Result<u32> {
         let name = config.name.clone();
+
+        run_service_commands(
+            &config,
+            &config.exec_start_pre,
+            "ExecStartPre",
+            config.timeout_start_sec,
+        )?;
 
         // Create cgroup
         let cgroup_path = match crate::cgroup::create_cgroup(&name) {
@@ -1511,10 +1627,20 @@ impl Daemon {
                 proc.network_pid = network_sidecar.as_ref().map(|sidecar| sidecar.pid);
                 proc.started_at = Some(std::time::Instant::now());
                 proc.cgroup_path = cgroup_path;
-                proc.config = config;
+                proc.config = config.clone();
             }
         }
         info!("Service '{}' started with PID {}", name, pid);
+
+        if let Err(error) = run_service_commands(
+            &config,
+            &config.exec_start_post,
+            "ExecStartPost",
+            config.timeout_start_sec,
+        ) {
+            let _ = process::send_signal(pid, config.kill_signal);
+            return Err(error);
+        }
 
         Ok(pid)
     }
@@ -1543,7 +1669,17 @@ impl Daemon {
 
             if let Some(pid) = pid {
                 debug!("Stopping service '{}' (PID {})", name, pid);
-                let _ = process::stop_process(pid, None).await;
+                let config = {
+                    let services = self.services.lock();
+                    services.get(&name).map(|p| p.config.clone())
+                };
+                let _ = process::stop_process(
+                    pid,
+                    config.as_ref().map(|c| c.kill_signal),
+                    config.as_ref().and_then(|c| c.timeout_stop_sec),
+                    config.as_ref().is_none_or(|c| c.send_sigkill),
+                )
+                .await;
             }
 
             let network_pid = {
@@ -1567,6 +1703,7 @@ impl Daemon {
 
         // Clean up socket
         let _ = std::fs::remove_file(&self.config.socket_path);
+        let _ = self.shutdown_tx.send(true);
         info!("Daemon shutdown complete");
     }
 }
@@ -1580,6 +1717,27 @@ fn restart_delay_with_jitter(service_name: &str, base_secs: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
     service_name.hash(&mut hasher);
     base_secs.saturating_add(hasher.finish() % (jitter_window + 1))
+}
+
+fn calculate_backoff(config: &AppConfig, consecutive_failures: u32) -> u64 {
+    if consecutive_failures == 0 {
+        return 0;
+    }
+    let initial = config.backoff.initial_secs;
+    let mut backoff_secs = match config.backoff.policy {
+        crate::config::BackoffPolicy::Linear => initial.saturating_mul(consecutive_failures as u64),
+        crate::config::BackoffPolicy::Exponential => {
+            let multiplier = 1_u64
+                .checked_shl(consecutive_failures - 1)
+                .unwrap_or(u64::MAX);
+            initial.saturating_mul(multiplier)
+        }
+    };
+
+    if config.backoff.max_retries.is_none() {
+        backoff_secs = backoff_secs.min(24 * 3600);
+    }
+    backoff_secs
 }
 
 // ============================================================================
@@ -1675,7 +1833,7 @@ OOMScoreAdjust = -700
         };
 
         let response = daemon
-            .handle_request_with_fd(request, OwnedFd::from(child_end), 0)
+            .handle_request_with_fd(request, OwnedFd::from(child_end), 0, 0)
             .await;
         assert!(response.success, "{:?}", response.error);
         let pid = response
@@ -1736,7 +1894,7 @@ OOMScoreAdjust = -700
 
         // Pass peer_uid = current_uid (the actual non-root user).
         let response = daemon
-            .handle_request_with_fd(request, OwnedFd::from(child_end), current_uid)
+            .handle_request_with_fd(request, OwnedFd::from(child_end), current_uid, current_gid)
             .await;
         assert!(
             !response.success,
@@ -1783,6 +1941,7 @@ OOMScoreAdjust = -700
                 },
                 OwnedFd::from(child_end),
                 current_uid,
+                unsafe { libc::getgid() },
             )
             .await;
 
@@ -1815,6 +1974,7 @@ OOMScoreAdjust = -700
                 },
                 OwnedFd::from(child_end),
                 current_uid,
+                unsafe { libc::getgid() },
             )
             .await;
 
@@ -1840,9 +2000,11 @@ OOMScoreAdjust = -700
         );
     }
 
+    static ENV_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[tokio::test]
     async fn test_privileged_uids_env_override() {
-        // SAFETY: this test runs single-threaded under the TEST_MUTEX.
+        let _guard = ENV_MUTEX.lock();
         unsafe { std::env::set_var("MESH_INIT_PRIVILEGED_UIDS", "0,42") };
         let uids = privileged_uids();
         unsafe { std::env::remove_var("MESH_INIT_PRIVILEGED_UIDS") };
@@ -1851,17 +2013,19 @@ OOMScoreAdjust = -700
 
     #[tokio::test]
     async fn test_check_impersonation_allows_privileged_for_any_target() {
+        let _guard = ENV_MUTEX.lock();
         // A privileged UID (1000) may target any UID.
-        assert!(check_impersonation(1000, 0, None, "svc").is_ok());
-        assert!(check_impersonation(1000, 9999, Some(9999), "svc").is_ok());
+        assert!(check_impersonation(1000, 1000, 0, None, "svc").is_ok());
+        assert!(check_impersonation(1000, 1000, 9999, Some(9999), "svc").is_ok());
     }
 
     #[tokio::test]
     async fn test_check_impersonation_rejects_unprivileged_mismatch() {
         // A non-privileged UID may only target itself.
-        assert!(check_impersonation(5000, 5000, None, "svc").is_ok());
-        assert!(check_impersonation(5000, 0, None, "svc").is_err());
-        assert!(check_impersonation(5000, 5000, Some(6000), "svc").is_err());
+        assert!(check_impersonation(5000, 5000, 5000, None, "svc").is_ok());
+        assert!(check_impersonation(5000, 5000, 0, None, "svc").is_err());
+        assert!(check_impersonation(5000, 5000, 5000, Some(6000), "svc").is_err());
+        assert!(check_impersonation(5000, 6000, 5000, Some(6000), "svc").is_ok());
     }
 
     #[test]

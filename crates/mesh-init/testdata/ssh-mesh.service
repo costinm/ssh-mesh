@@ -3,8 +3,8 @@
 ExecStart = "./ssh-mesh"
 OOMScoreAdjust = -900
 [Resources]
-memory_max = "1G"
-cpu_weight = 100
+MemoryMax = "1G"
+CPUWeight = 100
 
 [Environment]
 RUST_LOG = "info"

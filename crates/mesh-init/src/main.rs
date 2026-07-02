@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{error, info};
 
 use mesh_init::daemon::{Daemon, DaemonConfig};
 use mesh_init::protocol::{Request, Response};
@@ -153,15 +153,37 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
                 .map(|s| s.as_str())
                 .collect();
             let loaded_configs = mesh_init::config::load_system_configs(&dirs);
-            if let Some(default_cfg) = loaded_configs.into_iter().find(|cfg| cfg.name == "default")
-            {
-                daemon
-                    .configs
-                    .lock()
-                    .insert("default".to_string(), default_cfg);
+            let mut configs = daemon.configs.lock();
+            for cfg in loaded_configs {
+                configs.insert(cfg.name.clone(), cfg.clone());
             }
         }
         daemon.start_child_manager();
+
+        // Run init-* services first
+        let init_configs = {
+            let configs = daemon.configs.lock();
+            let mut inits: Vec<_> = configs
+                .values()
+                .filter(|c| c.name.starts_with("init-"))
+                .cloned()
+                .collect();
+            inits.sort_by_key(|c| c.priority);
+            inits
+        };
+
+        for init_cfg in init_configs {
+            info!("Running init setup service '{}'", init_cfg.name);
+            let name = init_cfg.name.clone();
+            match daemon.start_service_with_config(init_cfg, None) {
+                Ok(_) => {
+                    wait_for_service_exit(&daemon, &name).await;
+                }
+                Err(e) => {
+                    error!("Failed to start init setup service '{}': {}", name, e);
+                }
+            }
+        }
 
         let app_name = "cmd";
         let cmd = command[0].clone();
@@ -237,15 +259,30 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
 
 /// Wait until a service transitions to Stopped state.
 async fn wait_for_service_exit(daemon: &std::sync::Arc<Daemon>, name: &str) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut rx = daemon.service_exit_tx.subscribe();
+
+    // Check initial state first to avoid missing an exit that happened before we subscribed
+    {
         let services = daemon.services.lock();
         if let Some(proc) = services.get(name) {
             if proc.state == mesh_init::protocol::ServiceState::Stopped && proc.pid.is_none() {
-                break;
+                return;
             }
         } else {
-            break;
+            return;
+        }
+    }
+
+    while let Ok(exited_name) = rx.recv().await {
+        if exited_name == name {
+            let services = daemon.services.lock();
+            if let Some(proc) = services.get(name) {
+                if proc.state == mesh_init::protocol::ServiceState::Stopped && proc.pid.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
     }
 }

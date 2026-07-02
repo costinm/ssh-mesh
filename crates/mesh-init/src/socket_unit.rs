@@ -259,6 +259,12 @@ fn parse_listen_address(address: &str, accept: bool, datagram: bool) -> Option<A
 
     if let Some(rest) = addr.strip_prefix("vsock:") {
         if datagram {
+            // AF_VSOCK/SOCK_DGRAM is not a practical systemd-compatible
+            // activation target today: Linux exposes constants on some
+            // systems, but virtio-vsock datagram transport support is not
+            // consistently available and Rust std/tokio provide no socket
+            // wrapper. Add this with a raw-fd binder once there is a concrete
+            // guest/host transport to validate against.
             warn!(
                 "ListenDatagram AF_VSOCK address '{}' is not supported",
                 addr
@@ -293,7 +299,9 @@ fn parse_listen_address(address: &str, accept: bool, datagram: bool) -> Option<A
         });
     }
 
-    // Abstract namespace socket (starts with @ or \0)
+    // Abstract namespace socket (starts with @ or \0). systemd accepts these
+    // for Unix sockets, but mesh-init intentionally supports pathname sockets
+    // first because they fit service configs, permissions, and child fd names.
     if addr.starts_with('@') || addr.starts_with('\0') {
         warn!(
             "Abstract namespace socket '{}' is not supported in activation config",
@@ -358,7 +366,21 @@ fn parse_listen_address(address: &str, accept: bool, datagram: bool) -> Option<A
         }
     }
 
-    warn!("Cannot parse ListenStream address '{}'", addr);
+    // Missing systemd socket families for follow-up:
+    // - ListenSequentialPacket: Unix SOCK_SEQPACKET needs a separate socket
+    //   kind and accept loop, not the stream/datagram split used here.
+    // - ListenFIFO, ListenSpecial, ListenMessageQueue, ListenNetlink: these
+    //   are not internet/Unix socket listeners and need resource-specific
+    //   open/bind logic plus service readiness tests.
+    warn!(
+        "Cannot parse {} address '{}'",
+        if datagram {
+            "ListenDatagram"
+        } else {
+            "ListenStream"
+        },
+        addr
+    );
     None
 }
 
@@ -376,7 +398,12 @@ pub fn socket_to_activation_configs(config: &SystemdSocketConfig) -> Vec<Activat
         }
     }
 
-    for addr in &config.listen_datagrams {
+    let (udp_datagrams, unix_datagrams): (Vec<_>, Vec<_>) = config
+        .listen_datagrams
+        .iter()
+        .partition(|addr| !addr.trim().starts_with('/'));
+
+    for addr in udp_datagrams.into_iter().chain(unix_datagrams) {
         if let Some(act) = parse_listen_address(addr, config.accept, true) {
             // Accept=true + datagram is not supported
             // because accepting a datagram connection doesn't produce a connected
@@ -774,5 +801,25 @@ ListenStream=8080
         assert_eq!(acts[0].port, Some(8080));
         assert_eq!(acts[0].wait, true);
         assert!(acts[0].datagram);
+    }
+
+    #[test]
+    fn test_socket_to_activation_configs_datagram_udp_before_unix() {
+        let cfg = SystemdSocketConfig {
+            service_name: "test".to_string(),
+            listen_streams: vec![],
+            listen_datagrams: vec!["/run/test.sock".to_string(), "8125".to_string()],
+            accept: false,
+            socket_mode: None,
+            socket_user: None,
+            socket_group: None,
+            file_descriptor_name: None,
+            file_descriptor_names: Vec::new(),
+        };
+        let acts = socket_to_activation_configs(&cfg);
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[0].port, Some(8125));
+        assert_eq!(acts[1].socket.as_deref(), Some("/run/test.sock"));
+        assert!(acts.iter().all(|act| act.datagram));
     }
 }

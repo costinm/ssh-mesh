@@ -11,9 +11,9 @@ ExecStart = "ssh-mesh"
 OOMScoreAdjust = -900
 [Resources]
 # Resource limits are harmless if cgroup control is unavailable.
-memory_high = "256M"
-memory_max = "512M"
-cpu_weight = 100
+MemoryHigh = "256M"
+MemoryMax = "512M"
+CPUWeight = 100
 
 [Environment]
 PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin"

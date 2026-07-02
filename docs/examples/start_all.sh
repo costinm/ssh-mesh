@@ -297,7 +297,6 @@ HTTP URLs from crates/ssh-mesh route mappings:
   host2 admin UI:       http://127.0.0.1:18280/_m/adm
   host2 SSH clients:    http://127.0.0.1:18280/_m/api/ssh/clients
   host2 SSH config API: http://127.0.0.1:18280/_m/api/sshc/config/hosts
-  host2 OpenAPI:        http://127.0.0.1:18280/_m/api/openapi.json
   host2 SSH over H2C:   http://127.0.0.1:18280/_m/_ssh
   host2 TCP proxy:      http://127.0.0.1:18280/_m/_tcp/127.0.0.1/22
   host2 mesh observer:  POST http://127.0.0.1:18280/_m/proxy/jsonl/mesh-init '{"method":"processes"}'
@@ -305,16 +304,14 @@ HTTP URLs from crates/ssh-mesh route mappings:
   host3-vm admin UI:          http://127.0.0.1:${vm_host_http_port}/_m/adm
   host3-vm SSH clients:       http://127.0.0.1:${vm_host_http_port}/_m/api/ssh/clients
   host3-vm SSH config API:    http://127.0.0.1:${vm_host_http_port}/_m/api/sshc/config/hosts
-  host3-vm OpenAPI:           http://127.0.0.1:${vm_host_http_port}/_m/api/openapi.json
   host3-vm SSH over H2C:      http://127.0.0.1:${vm_host_http_port}/_m/_ssh
   host3-vm TCP proxy:         http://127.0.0.1:${vm_host_http_port}/_m/_tcp/127.0.0.1/22
   host3-vm mesh observer:     POST http://127.0.0.1:${vm_host_http_port}/_m/proxy/jsonl/mesh-init '{"method":"processes"}'
 
   host1 admin UI:            http://127.0.0.1:18480/_m/adm
   host1 SSH clients:         http://127.0.0.1:18480/_m/api/ssh/clients
-  host1 SSH config API:      http://127.0.0.1:18480/_m/api/sshc/config/hosts
-  host1 OpenAPI:             http://127.0.0.1:18480/_m/api/openapi.json
-  host1 SSH over H2C:        http://127.0.0.1:18480/_m/_ssh
+  host1 SSH config API:     http://127.0.0.1:18480/_m/api/sshc/config/hosts
+  host1 SSH over H2C:       http://127.0.0.1:18480/_m/_ssh
   host1 TCP proxy:           http://127.0.0.1:18480/_m/_tcp/127.0.0.1/22
   host1 mesh observer:       POST http://127.0.0.1:18480/_m/proxy/jsonl/mesh-init '{"method":"processes"}'
 

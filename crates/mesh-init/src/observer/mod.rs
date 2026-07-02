@@ -10,8 +10,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
-use utoipa::ToSchema;
-
 pub mod proc;
 pub mod proc_netlink;
 pub mod psi;
@@ -32,7 +30,7 @@ pub fn read_comm(pid: u32) -> String {
 
 pub use read_process_info as read_process_info_from_proc;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema, ToSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub ppid: u32,
@@ -48,29 +46,29 @@ pub struct ProcessInfo {
 // ============================================================================
 
 /// Arguments for list_processes - no parameters needed
-#[derive(Deserialize, JsonSchema, Default, ToSchema)]
+#[derive(Deserialize, JsonSchema, Default)]
 pub struct ListProcessesArgs {}
 
 /// Arguments for get_process
-#[derive(Deserialize, JsonSchema, ToSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct GetProcessArgs {
     /// Process ID or name to look up
     pub process: String,
 }
 
 /// Arguments for list_cgroups - no parameters needed
-#[derive(Deserialize, JsonSchema, Default, ToSchema)]
+#[derive(Deserialize, JsonSchema, Default)]
 pub struct ListCgroupsArgs {}
 
 /// Arguments for get_cgroup
-#[derive(Deserialize, JsonSchema, ToSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct GetCgroupArgs {
     /// Full cgroup path
     pub path: String,
 }
 
 /// Arguments for move_process
-#[derive(Deserialize, JsonSchema, ToSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct MoveProcessArgs {
     /// Process ID to move
     pub pid: u32,
@@ -79,7 +77,7 @@ pub struct MoveProcessArgs {
 }
 
 /// Arguments for clear_refs
-#[derive(Deserialize, JsonSchema, ToSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct ClearRefsArgs {
     /// Process ID
     pub pid: u32,
@@ -88,7 +86,7 @@ pub struct ClearRefsArgs {
 }
 
 /// Arguments for cgroup_high
-#[derive(Deserialize, JsonSchema, ToSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct CgroupHighArgs {
     /// Full cgroup path
     pub path: String,
@@ -99,14 +97,14 @@ pub struct CgroupHighArgs {
 }
 
 /// Arguments for listing processes in a cgroup.
-#[derive(Deserialize, JsonSchema, ToSchema, Debug, Clone)]
+#[derive(Deserialize, JsonSchema, Debug, Clone)]
 pub struct CgroupProcsArgs {
     /// Full cgroup path.
     pub path: String,
 }
 
 /// Arguments for freezing/unfreezing a process
-#[derive(Deserialize, JsonSchema, ToSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct FreezeProcessArgs {
     /// Process ID
     pub pid: u32,
@@ -115,7 +113,7 @@ pub struct FreezeProcessArgs {
 }
 
 /// Arguments for freezing/unfreezing a cgroup
-#[derive(Deserialize, JsonSchema, ToSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct FreezeCgroupArgs {
     /// Full cgroup path
     pub path: String,
@@ -124,7 +122,7 @@ pub struct FreezeCgroupArgs {
 }
 
 /// Arguments for psi_watches - no parameters needed
-#[derive(Deserialize, JsonSchema, Default, ToSchema)]
+#[derive(Deserialize, JsonSchema, Default)]
 pub struct PsiWatchesArgs {}
 
 #[derive(Debug, Clone)]
@@ -139,7 +137,7 @@ pub enum MonitoringEvent {
 /// This is also used for cgroups - ideally one cgroup per process (like docker/Android),
 /// not ideal mapping in systemd sessions since it's a set of processes.
 ///
-#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema, ToSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
 pub struct ProcMemInfo {
     // --- Common Fields (Both Process and Cgroup) ---
     // For single process - the fields are from /proc - cgroup holding single process
@@ -320,7 +318,7 @@ impl ProcMemInfo {
 
 /// Information about a cgroup including pressure metrics and process list.
 /// This struct is separate from ProcMemInfo to provide a complete view of a cgroup.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema, ToSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
 pub struct CGroupInfo {
     /// Full cgroup path
     pub path: String,
@@ -337,7 +335,7 @@ pub struct CGroupInfo {
 }
 
 /// Detailed process information including cgroup hierarchy.
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, ToSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 pub struct ProcessDetailedInfo {
     /// Core process information
     pub process: ProcessInfo,

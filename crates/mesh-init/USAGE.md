@@ -20,7 +20,7 @@ ExecStart = "/bin/sleep 3600"
 OOMScoreAdjust = -900
 
 [Resources]
-memory_max = "64M"
+MemoryMax = "64M"
 EOF
 
 export MESH_INIT_DIR="$TEST_DIR"
@@ -109,13 +109,13 @@ the foreground command.
 # $MESH_INIT_DIR/default.service
 [Service]
 ExecStart = "_placeholder_"
-MeshUID = 1000
-MeshGID = 1000
+User = "1000"
+Group = "1000"
 OOMScoreAdjust = -1000
 
 [Resources]
-memory_max = "256M"
-cpu_weight = 100
+MemoryMax = "256M"
+CPUWeight = 100
 
 [Environment]
 RUST_LOG = "info"

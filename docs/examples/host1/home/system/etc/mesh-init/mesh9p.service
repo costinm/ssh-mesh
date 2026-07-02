@@ -3,9 +3,9 @@
 ExecStart = "mesh9p /home/system:/host1:rw /tmp/mesh/shared:/shared:rw /opt"
 OOMScoreAdjust = -600
 [Resources]
-memory_low = "64M"
-memory_high = "128M"
-cpu_weight = 50
+MemoryMin = "64M"
+MemoryHigh = "128M"
+CPUWeight = 50
 
 [Environment]
 RUST_LOG = "info"

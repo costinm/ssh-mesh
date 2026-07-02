@@ -159,6 +159,9 @@ pub fn spawn_process(
 
     let mut cmd = std::process::Command::new(&config.command);
     cmd.args(&config.args);
+    if let Some(working_directory) = &config.working_directory {
+        cmd.current_dir(working_directory);
+    }
 
     // Set environment
     for (key, value) in &config.env {
@@ -169,6 +172,41 @@ pub fn spawn_process(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+
+        if !config.supplementary_groups.is_empty()
+            || config.umask.is_some()
+            || config.no_new_privileges
+            || config.private_network
+        {
+            let supplementary_groups = config.supplementary_groups.clone();
+            let umask = config.umask;
+            let no_new_privileges = config.no_new_privileges;
+            let private_network = config.private_network;
+            unsafe {
+                cmd.pre_exec(move || {
+                    if private_network && libc::unshare(libc::CLONE_NEWNET) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if !supplementary_groups.is_empty() {
+                        let groups: Vec<libc::gid_t> = supplementary_groups
+                            .iter()
+                            .copied()
+                            .map(|gid| gid as libc::gid_t)
+                            .collect();
+                        if libc::setgroups(groups.len(), groups.as_ptr()) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(mask) = umask {
+                        libc::umask(mask as libc::mode_t);
+                    }
+                    if no_new_privileges && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         if let Some(uid) = config.uid {
             cmd.uid(uid);
@@ -290,6 +328,57 @@ pub fn spawn_process(
     Ok(pid)
 }
 
+pub fn run_service_command(
+    config: &AppConfig,
+    command: &str,
+    timeout_secs: Option<u64>,
+) -> Result<i32, ProcessError> {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(command);
+    for (key, value) in &config.env {
+        cmd.env(key, value);
+    }
+    if let Some(working_directory) = &config.working_directory {
+        cmd.current_dir(working_directory);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        if let Some(uid) = config.uid {
+            cmd.uid(uid);
+        }
+        if let Some(gid) = config.gid {
+            cmd.gid(gid);
+        }
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        error!("Failed to run service command '{}': {}", command, e);
+        ProcessError::SpawnFailed(format!("{}: {}", command, e))
+    })?;
+    let pid = child.id();
+    let deadline = timeout_secs
+        .filter(|secs| *secs > 0)
+        .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
+
+    loop {
+        match child.try_wait().map_err(ProcessError::Io)? {
+            Some(status) => return Ok(status.code().unwrap_or(1)),
+            None => {
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                    let _ = send_signal(pid, libc::SIGKILL);
+                    return Err(ProcessError::SpawnFailed(format!(
+                        "service command timed out after {:?}: {}",
+                        timeout_secs, command
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 /// Send a signal to a process.
 pub fn send_signal(pid: u32, signal: i32) -> Result<(), ProcessError> {
     let res = unsafe { libc::kill(pid as i32, signal) };
@@ -318,14 +407,22 @@ pub fn send_signal(pid: u32, signal: i32) -> Result<(), ProcessError> {
 /// SIGKILL an unrelated process. `waitpid(pid)` returns `ECHILD` for a PID
 /// that is not our child (already reaped or recycled), so we never signal a
 /// stranger.
-pub async fn stop_process(pid: u32, signal: Option<i32>) -> Result<(), ProcessError> {
+pub async fn stop_process(
+    pid: u32,
+    signal: Option<i32>,
+    timeout_secs: Option<u64>,
+    send_sigkill: bool,
+) -> Result<(), ProcessError> {
     let sig = signal.unwrap_or(libc::SIGTERM);
     info!("Stopping PID {} with signal {}", pid, sig);
 
     send_signal(pid, sig)?;
 
     // Give it a moment to exit
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(
+        timeout_secs.unwrap_or(1).max(1),
+    ))
+    .await;
 
     // Check if the child has exited using waitpid on the specific PID.
     // Returns:
@@ -335,7 +432,7 @@ pub async fn stop_process(pid: u32, signal: Option<i32>) -> Result<(), ProcessEr
     //         PID was recycled). Either way, do NOT escalate to SIGKILL.
     let mut status: libc::c_int = 0;
     let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-    if ret == 0 {
+    if ret == 0 && send_sigkill {
         warn!(
             "PID {} still alive after signal {}, sending SIGKILL",
             pid, sig
@@ -345,6 +442,11 @@ pub async fn stop_process(pid: u32, signal: Option<i32>) -> Result<(), ProcessEr
         // race us, which is harmless).
         let mut s: libc::c_int = 0;
         let _ = unsafe { libc::waitpid(pid as libc::pid_t, &mut s, libc::WNOHANG) };
+    } else if ret == 0 {
+        warn!(
+            "PID {} still alive after signal {}; SendSIGKILL=no",
+            pid, sig
+        );
     } else {
         debug!(
             "PID {} exited after signal {} (waitpid ret={})",

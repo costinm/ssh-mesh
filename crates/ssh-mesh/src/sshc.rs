@@ -22,7 +22,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use utoipa::{OpenApi, ToSchema};
 
 // TODO: create a UDS for each connection, compatible with ssh client
 // ControlPersist yes, ControlMaster auto, controlpath /tmp/ssh-%u-%n-%r@%h:%p
@@ -32,7 +31,7 @@ use utoipa::{OpenApi, ToSchema};
 // ---------------------------------------------------------------------------
 
 /// Holds forward metadata for cleanup/tracking.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ForwardInfo {
     pub local_port: u16,
     pub remote_host: String,
@@ -68,7 +67,7 @@ pub struct DiscoveryEntry {
 }
 
 /// Metadata about one SSH client connection.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConnectionInfo {
     pub id: u64,
     pub host: String,
@@ -1378,7 +1377,7 @@ pub async fn handle_local_forward(
 // REST API types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ConnectRequest {
     pub host: String,
     pub port: u16,
@@ -1388,19 +1387,19 @@ pub struct ConnectRequest {
     pub server_key: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectResponse {
     pub id: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LocalForwardRequest {
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
 }
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RemoteForwardRequest {
     pub remote_port: u16,
     pub local_host: String,
@@ -1410,17 +1409,17 @@ pub struct RemoteForwardRequest {
 // Add local_host to ForwardInfo to support tracking remote forwards properly
 // Update ForwardInfo definition (need to do this first or in same step)
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RemoteForwardResponse {
     pub actual_port: u32,
 }
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ExecRequest {
     pub command: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
@@ -1428,7 +1427,7 @@ pub struct ExecResult {
 }
 
 /// A node configuration entry, typically loaded from SSH config or config files.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// The alias name from the `Host` directive.
     pub name: String,
@@ -1446,30 +1445,6 @@ pub struct NodeConfig {
 // ---------------------------------------------------------------------------
 // REST API Handlers
 // ---------------------------------------------------------------------------
-
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        handle_connect,
-        handle_list_connections,
-        handle_disconnect,
-        handle_add_local_forward,
-        handle_add_remote_forward,
-        sshc_handle_exec,
-        handle_list_config_hosts
-    ),
-    components(
-        schemas(
-            ConnectRequest, ConnectResponse, ConnectionInfo, ForwardInfo,
-            LocalForwardRequest, RemoteForwardRequest, RemoteForwardResponse,
-            ExecRequest, ExecResult, NodeConfig
-        )
-    ),
-    tags(
-        (name = "sshc", description = "SSH Client REST API")
-    )
-)]
-pub struct SshcApiDoc;
 
 /// Build the SSH client REST API router.
 pub fn sshc_routes(manager: Arc<SshClientManager>) -> Router {
@@ -1491,14 +1466,6 @@ pub fn sshc_routes(manager: Arc<SshClientManager>) -> Router {
 }
 
 /// List all hosts from the SSH config file.
-#[utoipa::path(
-    get,
-    path = "/_m/api/sshc/config/hosts",
-    tag = "sshc",
-    responses(
-        (status = 200, description = "List of SSH config hosts", body = Vec<NodeConfig>)
-    )
-)]
 async fn handle_list_config_hosts(
     State(manager): State<Arc<SshClientManager>>,
 ) -> impl IntoResponse {
@@ -1509,16 +1476,6 @@ async fn handle_list_config_hosts(
 /// Connect to a remote SSH server.
 ///
 /// * `req` — Connection parameters (host, port, user, optional server_key).
-#[utoipa::path(
-    post,
-    path = "/_m/api/sshc/connect",
-    tag = "sshc",
-    request_body = ConnectRequest,
-    responses(
-        (status = 200, description = "Connection established", body = ConnectResponse),
-        (status = 500, description = "Connection failed")
-    )
-)]
 async fn handle_connect(
     State(manager): State<Arc<SshClientManager>>,
     Json(req): Json<ConnectRequest>,
@@ -1537,14 +1494,6 @@ async fn handle_connect(
 }
 
 /// List all active SSH client connections.
-#[utoipa::path(
-    get,
-    path = "/_m/api/sshc/connections",
-    tag = "sshc",
-    responses(
-        (status = 200, description = "Active connections", body = Vec<ConnectionInfo>)
-    )
-)]
 async fn handle_list_connections(
     State(manager): State<Arc<SshClientManager>>,
 ) -> impl IntoResponse {
@@ -1555,18 +1504,6 @@ async fn handle_list_connections(
 /// Disconnect an SSH client connection by ID.
 ///
 /// * `id` — Connection ID to disconnect.
-#[utoipa::path(
-    delete,
-    path = "/_m/api/sshc/connections/{id}",
-    tag = "sshc",
-    params(
-        ("id" = u64, Path, description = "Connection ID")
-    ),
-    responses(
-        (status = 200, description = "Disconnected"),
-        (status = 404, description = "Connection not found")
-    )
-)]
 async fn handle_disconnect(
     State(manager): State<Arc<SshClientManager>>,
     AxumPath(id): AxumPath<u64>,
@@ -1589,19 +1526,6 @@ async fn handle_disconnect(
 ///
 /// * `id` — Connection ID.
 /// * `req` — Local port, remote host, and remote port.
-#[utoipa::path(
-    post,
-    path = "/_m/api/sshc/connections/{id}/forward/local",
-    tag = "sshc",
-    params(
-        ("id" = u64, Path, description = "Connection ID")
-    ),
-    request_body = LocalForwardRequest,
-    responses(
-        (status = 200, description = "Forward added"),
-        (status = 500, description = "Failed to add forward")
-    )
-)]
 async fn handle_add_local_forward(
     State(manager): State<Arc<SshClientManager>>,
     AxumPath(id): AxumPath<u64>,
@@ -1624,19 +1548,6 @@ async fn handle_add_local_forward(
 ///
 /// * `id` — Connection ID.
 /// * `req` — Remote port, local host, and local port.
-#[utoipa::path(
-    post,
-    path = "/_m/api/sshc/connections/{id}/forward/remote",
-    tag = "sshc",
-    params(
-        ("id" = u64, Path, description = "Connection ID")
-    ),
-    request_body = RemoteForwardRequest,
-    responses(
-        (status = 200, description = "Forward added", body = RemoteForwardResponse),
-        (status = 500, description = "Failed to add forward")
-    )
-)]
 async fn handle_add_remote_forward(
     State(manager): State<Arc<SshClientManager>>,
     AxumPath(id): AxumPath<u64>,
@@ -1663,19 +1574,6 @@ async fn handle_add_remote_forward(
 ///
 /// * `id` — Connection ID.
 /// * `req` — Command to execute.
-#[utoipa::path(
-    post,
-    path = "/_m/api/sshc/connections/{id}/exec",
-    tag = "sshc",
-    params(
-        ("id" = u64, Path, description = "Connection ID")
-    ),
-    request_body = ExecRequest,
-    responses(
-        (status = 200, description = "Execution result", body = ExecResult),
-        (status = 500, description = "Execution failed")
-    )
-)]
 async fn sshc_handle_exec(
     State(manager): State<Arc<SshClientManager>>,
     AxumPath(id): AxumPath<u64>,

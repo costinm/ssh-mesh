@@ -23,7 +23,6 @@ parking_lot = "0.12"
 mio = { version = "0.8", features = ["os-poll", "os-ext"] }
 schemars = "0.8"
 users = "0.11"
-utoipa = "5.4.0"
 
 [dev-dependencies]
 tempfile = "3.3"

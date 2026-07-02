@@ -5,8 +5,8 @@
 ExecStart = "_placeholder_"
 OOMScoreAdjust = -1000
 [Resources]
-memory_max = "256M"
-cpu_weight = 100
+MemoryMax = "256M"
+CPUWeight = 100
 
 [Environment]
 RUST_LOG = "info"

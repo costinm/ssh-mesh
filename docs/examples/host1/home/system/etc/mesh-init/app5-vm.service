@@ -10,9 +10,9 @@ OOMScoreAdjust = -766
 uid = 103
 
 [Resources]
-memory_high = "384M"
-memory_max = "768M"
-cpu_weight = 50
+MemoryHigh = "384M"
+MemoryMax = "768M"
+CPUWeight = 50
 
 [Environment]
 RUST_LOG = "info"

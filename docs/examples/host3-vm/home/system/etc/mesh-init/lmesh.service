@@ -7,9 +7,9 @@
 ExecStart = "lmesh"
 OOMScoreAdjust = -810
 [Resources]
-memory_high = "64M"
-memory_max = "128M"
-cpu_weight = 50
+MemoryHigh = "64M"
+MemoryMax = "128M"
+CPUWeight = 50
 
 [Environment]
 PATH = "/opt/ssh-mesh/bin:/opt/initos/bin:/opt/busybox/bin"

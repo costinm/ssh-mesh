@@ -173,21 +173,6 @@ configure_musl_toolchain() {
     fi
 }
 
-configure_swagger_ui_assets() {
-    local profile_path
-    local swagger_zip
-
-    profile_path="$(resolve_nix_profile "${1:-$(default_nix_profile)}")"
-    swagger_zip="$profile_path/share/ssh-mesh/swagger-ui/v5.17.14.zip"
-
-    if [ ! -e "$swagger_zip" ]; then
-        echo "Missing Swagger UI zip in Nix profile; run scripts/build.sh deps" >&2
-        return 1
-    fi
-
-    export SWAGGER_UI_DOWNLOAD_URL="file://$swagger_zip"
-}
-
 add_nix_profile_deps() {
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
     shift || true
@@ -223,12 +208,8 @@ ensure_musl_toolchain_profile() {
        ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
         add_nix_profile_deps "$target_profile" musl-toolchain
     fi
-    if [ ! -e "$target_profile/share/ssh-mesh/swagger-ui/v5.17.14.zip" ]; then
-        add_nix_profile_deps "$target_profile" swagger-ui-assets
-    fi
 
     configure_musl_toolchain "$target_profile"
-    configure_swagger_ui_assets "$target_profile"
 }
 
 install_busybox_tree() {

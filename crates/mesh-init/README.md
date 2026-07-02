@@ -89,6 +89,63 @@ If UID is not 0, it will still work, but without ability to change UIDs and may 
 
 Testing can also be done with bubblewrap and user namespaces.
 
+## Systemd Compatibility And Gaps
+
+mesh-init service files intentionally use TOML instead of systemd INI syntax.
+This is a feature: TOML gives stricter parsing, typed values, nested tables,
+and fewer ambiguous repeated-key rules. A systemd-to-mesh-init converter may be
+added later, but native mesh-init config should remain TOML.
+
+`[Unit]` and `[Install]` sections are not supported and are not planned. mesh-init
+does not implement a full dependency solver, target graph, enable/install state,
+or boot transaction model. Service names come from file names, and socket
+activation comes from matching `.socket` files.
+
+`[Environment]` remains a TOML table. We do not plan to copy systemd's repeated
+`Environment=` syntax because the table form is stricter and easier to validate.
+
+Supported systemd-style `[Service]` fields:
+
+- Process identity and command: `ExecStart`, `User`, `Group`,
+  `WorkingDirectory`, `UMask`, and `SupplementaryGroups`.
+- Lifecycle hooks: `ExecStartPre`, `ExecStartPost`, `ExecStop`, and
+  `ExecReload`.
+- Restart and timeout controls: `Restart`, `RestartSec`, `TimeoutStartSec`, and
+  `TimeoutStopSec`.
+- Termination controls: `KillSignal`, `KillMode`, and `SendSIGKILL`.
+- Resource controls in `[Resources]`: `MemoryMin`, `MemoryHigh`, `MemoryMax`,
+  and `CPUWeight`.
+- Basic hardening: `NoNewPrivileges` and `PrivateNetwork`.
+
+Parsed but not yet enforced:
+
+- Mount/device sandboxing: `PrivateTmp`, `PrivateDevices`, `ProtectSystem`,
+  `ProtectHome`, `ReadWritePaths`, `ReadOnlyPaths`, and `InaccessiblePaths`.
+- Linux capability controls: `CapabilityBoundingSet` and
+  `AmbientCapabilities`.
+- Full `KillMode=control-group` and `KillMode=mixed` semantics. The current
+  implementation is main-process oriented, with `KillMode=none` honored.
+
+Useful systemd fields not supported yet, in likely implementation order:
+
+1. `EnvironmentFile`.
+2. `StandardInput`, `StandardOutput`, and `StandardError`.
+3. `RuntimeDirectory`, `StateDirectory`, `CacheDirectory`, and `LogsDirectory`.
+4. `RootDirectory`, `RootImage`, and bind-mount related fields.
+5. `CPUQuota`, `TasksMax`, `MemorySwapMax`, `AllowedCPUs`, and IO controls.
+6. `DynamicUser`.
+7. `RemainAfterExit` and richer `Type=` modes: `exec`, `forking`, and `notify`.
+8. `SuccessExitStatus`, `RestartPreventExitStatus`, and
+   `RestartForceExitStatus`.
+9. `WatchdogSec` and `NotifyAccess`.
+
+Not planned:
+
+- `[Unit]` dependency fields such as `After`, `Before`, `Wants`, `Requires`,
+  `PartOf`, `Conflicts`, `OnFailure`, and conditions/assertions.
+- `[Install]` fields such as `WantedBy`, `RequiredBy`, `Alias`, and `Also`.
+- D-Bus activation fields such as `BusName` and `Type=dbus`.
+
 ## Similar projects
 
 Bubblewrap - focused on user namespace isolation - no resource

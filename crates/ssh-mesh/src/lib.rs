@@ -19,8 +19,6 @@ use std::{
 };
 use tracing::{debug, instrument};
 
-use utoipa::ToSchema;
-
 // File paths for SSH authentication
 pub mod auth;
 pub mod config_provider;
@@ -332,14 +330,13 @@ pub struct MeshNode {
 }
 
 /// Information about a connected client
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ConnectedClientInfo {
     pub id: u64,
     pub user: String,
     pub comment: String,
     pub options: Option<String>,
     pub remote_forward_listeners: Vec<(String, u32)>,
-    #[schema(value_type = String, format = DateTime)]
     pub connected_at: SystemTime,
 }
 

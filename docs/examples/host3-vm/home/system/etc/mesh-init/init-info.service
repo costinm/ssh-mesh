@@ -4,4 +4,4 @@ ExecStart = "/opt/busybox/bin/sh -c 'echo '\"'\"'=== host3-vm startup info ==='\
 Type = "oneshot"
 OOMScoreAdjust = -995
 [Resources]
-memory_max = "64M"
+MemoryMax = "64M"

@@ -118,17 +118,15 @@ ExecStart = "/bin/sleep 60"
         let toml = r#"
 [Service]
 ExecStart = "/usr/bin/google-chrome-stable --no-sandbox"
-User = "user1"
-Group = "user1"
-MeshUID = 1000
-MeshGID = 1000
+User = "1000"
+Group = "1000"
 OOMScoreAdjust = -800
 
 [Resources]
-memory_low = "256M"
-memory_high = "2G"
-memory_max = "4G"
-cpu_weight = 100
+MemoryMin = "256M"
+MemoryHigh = "2G"
+MemoryMax = "4G"
+CPUWeight = 100
 
 [Environment]
 DISPLAY = ":0"
@@ -137,7 +135,9 @@ HOME = "/home/user1"
         let config = parse_service(toml, Some("chrome")).unwrap();
         assert_eq!(config.name, "chrome");
         assert_eq!(config.uid, Some(1000));
-        assert_eq!(config.user.as_deref(), Some("user1"));
+        assert_eq!(config.gid, Some(1000));
+        assert_eq!(config.user.as_deref(), Some("1000"));
+        assert_eq!(config.group.as_deref(), Some("1000"));
         assert_eq!(config.priority, 200);
         assert_eq!(config.oom_score_adjust, Some(-800));
         assert_eq!(config.resources.memory_low, Some(256 * 1024 * 1024));
@@ -146,6 +146,71 @@ HOME = "/home/user1"
         assert_eq!(config.resources.cpu_weight, Some(100));
         assert_eq!(config.env.get("DISPLAY").unwrap(), ":0");
         assert!(config.activation.is_empty());
+    }
+
+    #[test]
+    fn test_parse_toml_resolves_user_and_primary_group() {
+        let toml = r#"
+[Service]
+ExecStart = "/bin/true"
+User = "root"
+"#;
+        let config = parse_service(toml, Some("root-svc")).unwrap();
+        assert_eq!(config.uid, Some(0));
+        assert_eq!(config.gid, Some(0));
+    }
+
+    #[test]
+    fn test_parse_toml_rejects_unknown_user() {
+        let toml = r#"
+[Service]
+ExecStart = "/bin/true"
+User = "mesh-init-user-that-should-not-exist"
+"#;
+        assert!(parse_service(toml, Some("bad-user")).is_err());
+    }
+
+    #[test]
+    fn test_parse_toml_rejects_removed_mesh_uid_gid() {
+        let toml = r#"
+[Service]
+ExecStart = "/bin/true"
+MeshUID = 1000
+MeshGID = 1000
+"#;
+        let err = parse_service(toml, Some("old-identity")).unwrap_err();
+        assert!(err.to_string().contains("User=/Group="));
+    }
+
+    #[test]
+    fn test_parse_all_fields_example() {
+        let toml = include_str!("../examples/all-fields.service");
+        let config = parse_service(toml, Some("all-fields")).unwrap();
+        assert_eq!(config.name, "all-fields");
+        assert_eq!(config.uid, Some(1000));
+        assert_eq!(config.gid, Some(1000));
+        assert_eq!(config.activation_mode, ServiceActivationMode::Hybrid);
+        assert_eq!(config.exec_start_pre, vec!["/bin/true"]);
+        assert_eq!(config.exec_start_post, vec!["/bin/true"]);
+        assert_eq!(config.exec_stop, vec!["/bin/true"]);
+        assert_eq!(config.exec_reload, vec!["/bin/true"]);
+        assert_eq!(config.working_directory.as_deref(), Some("/tmp"));
+        assert_eq!(config.restart, RestartPolicy::OnFailure);
+        assert_eq!(config.restart_sec, 5);
+        assert_eq!(config.timeout_start_sec, Some(30));
+        assert_eq!(config.timeout_stop_sec, Some(10));
+        assert_eq!(config.kill_signal, libc::SIGTERM);
+        assert_eq!(config.umask, Some(0o022));
+        assert_eq!(config.supplementary_groups, vec![0]);
+        assert!(config.no_new_privileges);
+        assert_eq!(config.resources.memory_max, Some(512 * 1024 * 1024));
+        assert_eq!(config.network.backend, NetworkBackend::MeshTun);
+        assert_eq!(config.network.egress_redirect_port, Some(15001));
+        assert!(config.auth.is_some());
+        assert!(config.schedule.is_some());
+        assert!(config.constraints.is_some());
+        assert_eq!(config.backoff.max_retries, Some(10));
+        assert_eq!(config.trace_tag.as_deref(), Some("example.all-fields"));
     }
 
     #[test]
