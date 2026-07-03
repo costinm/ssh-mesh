@@ -27,7 +27,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AppConfig, ServiceActivationMode};
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, apply_activation_context_env};
 use crate::process::{ActivationFd, ActivationListenFd};
 use crate::protocol::ServiceState;
 
@@ -386,6 +386,52 @@ fn get_peer_uid(fd: i32) -> Option<u32> {
     }
 }
 
+/// Resolve a username to a UID via the reentrant libc lookup.
+///
+/// Returns `None` on missing user, NUL byte in the name, or lookup error.
+/// Uses `getpwnam_r` so concurrent calls from async tasks don't race on
+/// libc's static passwd buffer.
+fn lookup_uid_by_name(name: &str) -> Option<u32> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let rc = unsafe {
+        libc::getpwnam_r(
+            c_name.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some(entry.pw_uid)
+}
+
+/// Resolve a group name to a GID via the reentrant libc lookup.
+fn lookup_gid_by_name(name: &str) -> Option<u32> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let mut entry: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let rc = unsafe {
+        libc::getgrnam_r(
+            c_name.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some(entry.gr_gid)
+}
+
 async fn forward_accepted_fd(
     service_name: &str,
     activation_socket: &str,
@@ -466,9 +512,8 @@ fn start_activation_socket_target(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("missing service config for {}", service_name))?;
 
-    if let Some(context) = daemon.take_activation_context(service_name) {
-        config.env.extend(context.to_env());
-    }
+    let context = daemon.take_activation_context(service_name);
+    apply_activation_context_env(&mut config, context);
 
     let listener = bind_activation_socket(activation_socket)?;
     daemon
@@ -1027,20 +1072,19 @@ async fn run_uds_listener(
         if unsafe { libc::getuid() } == 0 {
             let uid = match user.parse::<u32>() {
                 Ok(n) => n,
-                Err(_) => {
-                    // Resolve username to UID
-                    let c_user = std::ffi::CString::new(user.as_str()).unwrap_or_default();
-                    let pw = unsafe { libc::getpwnam(c_user.as_ptr()) };
-                    if pw.is_null() {
+                Err(_) => match lookup_uid_by_name(&user) {
+                    Some(n) => n,
+                    None => {
+                        // Don't fall back to UID 0 (root) — that would
+                        // chown the socket to root. Leave ownership unchanged.
                         warn!(
-                            "Failed to resolve socket user '{}' for '{}'",
+                            "Failed to resolve socket user '{}' for '{}'; \
+                             leaving user unchanged",
                             user, service_name
                         );
-                        0
-                    } else {
-                        unsafe { (*pw).pw_uid }
+                        u32::MAX
                     }
-                }
+                },
             };
             let c_path = std::ffi::CString::new(path.as_str()).unwrap_or_default();
             let gid = socket_group
@@ -1049,23 +1093,20 @@ async fn run_uds_listener(
                     if g.is_empty() {
                         None
                     } else {
-                        match g.parse::<u32>() {
-                            Ok(n) => Some(n),
-                            Err(_) => {
-                                let c_group =
-                                    std::ffi::CString::new(g.as_str()).unwrap_or_default();
-                                let gr = unsafe { libc::getgrnam(c_group.as_ptr()) };
-                                if gr.is_null() {
+                        Some(match g.parse::<u32>() {
+                            Ok(n) => n,
+                            Err(_) => match lookup_gid_by_name(g) {
+                                Some(n) => n,
+                                None => {
                                     warn!(
-                                        "Failed to resolve socket group '{}' for '{}'",
+                                        "Failed to resolve socket group '{}' for '{}'; \
+                                         leaving group unchanged",
                                         g, service_name
                                     );
-                                    None
-                                } else {
-                                    Some(unsafe { (*gr).gr_gid })
+                                    u32::MAX
                                 }
-                            }
-                        }
+                            },
+                        })
                     }
                 })
                 .unwrap_or(u32::MAX);
@@ -1080,19 +1121,17 @@ async fn run_uds_listener(
     {
         let gid = match group.parse::<u32>() {
             Ok(n) => n,
-            Err(_) => {
-                let c_group = std::ffi::CString::new(group.as_str()).unwrap_or_default();
-                let gr = unsafe { libc::getgrnam(c_group.as_ptr()) };
-                if gr.is_null() {
+            Err(_) => match lookup_gid_by_name(&group) {
+                Some(n) => n,
+                None => {
                     warn!(
-                        "Failed to resolve socket group '{}' for '{}'",
+                        "Failed to resolve socket group '{}' for '{}'; \
+                         leaving group unchanged",
                         group, service_name
                     );
                     u32::MAX
-                } else {
-                    unsafe { (*gr).gr_gid }
                 }
-            }
+            },
         };
         let c_path = std::ffi::CString::new(path.as_str()).unwrap_or_default();
         unsafe {
@@ -1170,9 +1209,8 @@ async fn handle_listener(
                     );
                 }
 
-                if let Some(context) = daemon.take_activation_context(&service_name) {
-                    config.env.extend(context.to_env());
-                }
+                let context = daemon.take_activation_context(&service_name);
+                apply_activation_context_env(&mut config, context);
 
                 let mut fds = service_listener_fds(&service_name);
                 if fds.is_empty()
@@ -1209,9 +1247,8 @@ async fn handle_listener(
 
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
             if let Some(mut config) = config_opt {
-                if let Some(context) = daemon.take_activation_context(&service_name) {
-                    config.env.extend(context.to_env());
-                }
+                let context = daemon.take_activation_context(&service_name);
+                apply_activation_context_env(&mut config, context);
 
                 // UDS peer auth check
                 if let Some(ref auth) = config.auth {

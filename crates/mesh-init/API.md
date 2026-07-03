@@ -106,7 +106,7 @@ acting UID is in `privileged_uids()` before allowing a target that differs.
 | `home`      | String | Home directory (must exist; becomes `HOME`).    |
 | `command`   | String?| Shell command (`sh -c <command>`). If `None`, interactive shell. |
 | `context`   | Object?| `ActivationContext` carrying provenance (see below). |
-| `env`       | Object?| Additional environment variables merged into the child. |
+| `env`       | Object?| Additional caller env filtered by mesh-init policy, then merged into the child. |
 | `pty`       | bool?  | If `true`, the passed fd becomes the controlling terminal. |
 | `fd_count`  | u32?   | Number of FDs passed via `SCM_RIGHTS` (default 1). |
 
@@ -116,7 +116,7 @@ acting UID is in `privileged_uids()` before allowing a target that differs.
 |------------|--------|------------------------------------------------------|
 | `name`     | String | Service name. The service config's `User=` determines the target UID. |
 | `args`     | [String]? | Extra args appended to `ExecStart`.               |
-| `env`      | Object?| Additional env merged with the config's environment. |
+| `env`      | Object?| Additional caller env filtered by mesh-init policy, then merged with the config's environment. |
 | `context`  | Object?| `ActivationContext` carrying provenance (see below). |
 
 For `start`, the target UID comes from the service config (`User=` field),
@@ -152,9 +152,15 @@ environment variables into the child process.
 | `certificate_user`  | String? | ssh-mesh   | `SSH_MESH_ROUTE_CERTIFICATE_USER`             |
 | `peer_key_sha`      | String? | ssh-mesh   | `SSH_MESH_ROUTE_PEER_KEY_SHA`                 |
 | `client_id`         | u64?    | ssh-mesh   | `SSH_MESH_ROUTE_CLIENT_ID`                    |
-| `env`               | Object? | caller     | Merged directly into child env                |
+| `env`               | Object? | caller     | Filtered by mesh-init policy, then merged into child env |
 
 The full context is also serialized as `MESH_INIT_CONTEXT_JSON`.
+
+Caller-supplied env is accepted by default except for dangerous names. The
+default dangerous list includes loader, shell startup, language/runtime
+injection, `BASH_FUNC_*`, and `PATH` variables. A service may allow specific
+dangerous names with `AllowDangerousEnv`; mesh-init's global dangerous list can
+be replaced with the comma-separated `MESH_DANGEROUS_ENV` environment variable.
 
 When `kind = "ssh"`, `user` is the SSH-authenticated username (from the
 certificate principal or `authorized_keys`), `certificate_user` is the

@@ -243,17 +243,24 @@ to = "*"
 
     #[test]
     fn test_parse_toml_with_hybrid_activation_mode() {
-        let toml = r#"
+        // A11: MeshActivationSocket must be under the service's run_dir.
+        // The test resolves run_dir relative to the test working directory.
+        let run_dir = mesh::paths::AppPaths::for_app("hybrid-svc").run_dir("hybrid-svc");
+        let socket_path = run_dir.join("control.sock");
+        let toml = format!(
+            r#"
 [Service]
 ExecStart = "/bin/true"
 MeshActivationMode = "hybrid"
-MeshActivationSocket = "/run/hybrid-svc/control.sock"
-"#;
-        let config = parse_service(toml, Some("hybrid-svc")).unwrap();
+MeshActivationSocket = "{}"
+"#,
+            socket_path.display()
+        );
+        let config = parse_service(&toml, Some("hybrid-svc")).unwrap();
         assert_eq!(config.activation_mode, ServiceActivationMode::Hybrid);
         assert_eq!(
             config.activation_socket.as_deref(),
-            Some("/run/hybrid-svc/control.sock")
+            Some(socket_path.to_string_lossy().as_ref())
         );
     }
 

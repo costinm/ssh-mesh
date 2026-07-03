@@ -71,6 +71,15 @@ Systemd-compatible fields:
 Unsupported hardening values or capability names are logged with `WARN` and
 fail only that service start. mesh-init continues running.
 
+- `AllowDangerousEnv` (array of strings, default `[]`): dangerous
+  caller-supplied environment variables this service accepts. Exact names and
+  trailing-`*` prefix patterns are supported. By default mesh-init drops
+  dangerous caller env such as `LD_PRELOAD`, `LD_LIBRARY_PATH`, `BASH_ENV`,
+  `ENV`, `BASH_FUNC_*`, `PYTHONPATH`, `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, and
+  `PATH`. Set `MESH_DANGEROUS_ENV` on mesh-init to replace the global dangerous
+  list with comma-separated names/prefixes. Client-side code decides which env
+  variables to send; mesh-init only filters what it receives.
+
 mesh-init extension fields:
 
 - `MeshActivationMode` (string): `stdio` or `hybrid`. `stdio` passes accepted

@@ -841,7 +841,7 @@ pub fn read_cgroup_info(cgroup_path: &str) -> Result<ProcMemInfo, Box<dyn std::e
 /// 4: reset dirty (find how many pages are written to)
 /// 5: reset 'peak memory'
 /// 6: reset huge pages
-/// 7: all of the above.
+/// 7: all of the above (1–5; note: 6 is not included).
 pub fn clear_process_refs(pid: u32, value: &str) -> std::io::Result<()> {
     let path = format!("/proc/{}/clear_refs", pid);
     if value.eq("7") {
@@ -851,7 +851,17 @@ pub fn clear_process_refs(pid: u32, value: &str) -> std::io::Result<()> {
         std::fs::write(path.clone(), "4")?;
         std::fs::write(path, "5")
     } else {
-        std::fs::write(path, value)
+        // Validate that `value` is one of the accepted kernel values. The
+        // kernel rejects unknown values, but a peer-supplied string could
+        // include path separators or other garbage that would be rejected
+        // with a confusing error. We normalize and check first.
+        match value {
+            "1" | "2" | "3" | "4" | "5" | "6" => std::fs::write(path, value),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("clear_refs value must be 1-7, got {value:?}"),
+            )),
+        }
     }
 }
 

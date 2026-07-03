@@ -12,7 +12,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
+    (flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         muslTarget = "x86_64-unknown-linux-musl";
 
@@ -80,6 +80,11 @@
           craneLib.buildPackage (commonArgs // {
             inherit pname cargoArtifacts;
             cargoExtraArgs = cargoExtraArgs;
+            postInstall = ''
+              mkdir -p "$out/share/ssh-mesh/nixos"
+              cp ${./nixos/module.nix} "$out/share/ssh-mesh/nixos/module.nix"
+              cp ${./nixos/example.nix} "$out/share/ssh-mesh/nixos/example.nix"
+            '';
           });
 
         # ── Packages ──────────────────────────────────────────────
@@ -133,6 +138,7 @@
             curl
             netcat
             jq
+            nixos-install-tools
           ];
         };
 
@@ -145,6 +151,8 @@
             ${pkgs.lib.concatMapStringsSep "\n" (bin: ''
               ln -s ${ssh-mesh-full}/bin/${bin} "$out/bin/${bin}"
             '') bins}
+            mkdir -p "$out/share"
+            ln -s ${ssh-mesh-full}/share/ssh-mesh "$out/share/ssh-mesh"
           '';
 
         ssh-mesh  = selectBins "ssh-mesh"  [ "ssh-mesh" ];
@@ -244,6 +252,7 @@
       in
       {
         packages = {
+            nixos-install-tools = pkgs.nixos-install-tools;
             inherit ssh-mesh ssh-mesh-full mesh-init h2t meshkeys sshmc traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain mesh-net-tools build-deps dev-tools;
             default = ssh-mesh-full;
         };
@@ -275,5 +284,153 @@
           };
         };
       }
-    );
+    )) // {
+      nixosModules.default = ./nixos/module.nix;
+
+      nixosConfigurations = {
+        containerSystem = nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [
+            ./nixos/module.nix
+            ({ pkgs, ... }: {
+              services.ssh-mesh = {
+                enable = true;
+                package = self.packages.x86_64-linux.ssh-mesh-full;
+              };
+
+              boot.isContainer = true;
+              boot.loader.grub.enable = false;
+              boot.loader.systemd-boot.enable = false;
+
+              environment.systemPackages = with pkgs; [
+                bash
+                coreutils
+                util-linux
+              ];
+
+              system.stateVersion = "26.05";
+            })
+          ];
+        };
+
+        vmSystem = nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [
+            "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+            ./nixos/module.nix
+            ({ pkgs, ... }: {
+              services.ssh-mesh = {
+                enable = true;
+                package = self.packages.x86_64-linux.ssh-mesh-full;
+              };
+
+              virtualisation = {
+                graphics = false;
+                memorySize = 1024;
+                cores = 1;
+                forwardPorts = [
+                  { from = "host"; host.port = 25022; guest.port = 15022; }
+                  { from = "host"; host.port = 28080; guest.port = 8080; }
+                ];
+              };
+
+              services.getty.autologinUser = "system";
+
+              users.users.system.openssh.authorizedKeys.keys = [
+                (builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub)
+              ];
+
+              environment.etc."ssh-mesh/authorized_keys".text =
+                builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub;
+
+              # mesh-init hardening and limit test configs
+              environment.etc."mesh-init/memlimit.toml".text = ''
+                [Service]
+                ExecStart = "${pkgs.busybox}/bin/sleep 3600"
+                OOMScoreAdjust = -500
+                [Resources]
+                MemoryMin = "64M"
+                MemoryHigh = "256M"
+                MemoryMax = "512M"
+                CPUWeight = 50
+              '';
+
+              environment.etc."mesh-init/activated_svc.toml".text = ''
+                [Service]
+                ExecStart = "${pkgs.busybox}/bin/sh -c 'echo SUCCESS'"
+                OOMScoreAdjust = -800
+                [Socket]
+                ListenStream = "14032"
+                Accept = true
+              '';
+
+              environment.etc."mesh-init/auth_test_svc.toml".text = ''
+                [Service]
+                ExecStart = "${pkgs.busybox}/bin/sh -c 'echo SUCCESS PEER=$X_PEER_UID'"
+                OOMScoreAdjust = -800
+                [[Peer]]
+                uid = 9999
+                [Socket]
+                Accept = true
+                [[Socket.Listen]]
+                Type = "stream"
+                Address = "/run/mesh-init-auth-test.sock"
+                [[Socket.Listen]]
+                Type = "stream"
+                Address = "14033"
+              '';
+
+              environment.etc."mesh-init/hardening-mounts.toml".text = ''
+                [Service]
+                Type = "oneshot"
+                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -q \" /tmp \" /proc/self/mountinfo; if [ -e /opt ]; then grep -Eq \" /opt ro(,| )\" /proc/self/mountinfo; fi; if [ -e /nix ]; then grep -Eq \" /nix ro(,| )\" /proc/self/mountinfo; fi; touch /tmp/private-ok; [ -c /dev/null ]; [ -c /dev/zero ]; [ ! -e /dev/kmsg ]; ! touch /etc/mesh-init-should-not-write 2>/dev/null; echo PASS mounts > /run/results-mounts'"
+                PrivateTmp = true
+                PrivateDevices = true
+                ProtectSystem = "strict"
+                ReadWritePaths = ["/run"]
+                StandardOutput = "inherit"
+                StandardError = "inherit"
+              '';
+
+              environment.etc."mesh-init/hardening-process.toml".text = ''
+                [Service]
+                Type = "oneshot"
+                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -q \"^NoNewPrivs:[[:space:]]*1\" /proc/self/status; ! grep -q \"eth0:\" /proc/net/dev; touch /run/umask-file; [ \"$(stat -c %a /run/umask-file)\" = \"600\" ]; id -G | grep -qw 0; echo PASS process > /run/results-process'"
+                NoNewPrivileges = true
+                PrivateNetwork = true
+                UMask = "0077"
+                SupplementaryGroups = ["0"]
+                StandardOutput = "inherit"
+                StandardError = "inherit"
+              '';
+
+              environment.etc."mesh-init/hardening-caps-drop.toml".text = ''
+                [Service]
+                Type = "oneshot"
+                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -q \"^CapEff:[[:space:]]*0000000000000001\" /proc/self/status; echo PASS caps-drop > /run/results-caps-drop'"
+                CapabilityBoundingSet = ["CAP_CHOWN"]
+                StandardOutput = "inherit"
+                StandardError = "inherit"
+              '';
+
+              environment.etc."mesh-init/hardening-caps-ambient.toml".text = ''
+                [Service]
+                Type = "oneshot"
+                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -Eq \"^CapAmb:[[:space:]]*0*400$\" /proc/self/status; echo PASS caps-ambient > /run/results-caps-ambient'"
+                User = "65534"
+                Group = "65534"
+                CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE", "CAP_SETPCAP"]
+                AmbientCapabilities = ["CAP_NET_BIND_SERVICE"]
+                StandardOutput = "inherit"
+                StandardError = "inherit"
+              '';
+
+              boot.loader.grub.enable = false;
+
+              system.stateVersion = "26.05";
+            })
+          ];
+        };
+      };
+    };
 }

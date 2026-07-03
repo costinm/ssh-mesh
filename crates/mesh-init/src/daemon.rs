@@ -131,6 +131,37 @@ fn preferred_shell() -> &'static str {
     }
 }
 
+/// Read the running kernel version and require at least `min_major.min_minor`.
+///
+/// mesh-init uses `pidfd_open(2)` / `pidfd_send_signal(2)` (Linux 5.3) to
+/// make PID recycling impossible. On older kernels the daemon refuses to
+/// start rather than silently falling back to `kill(2)` + `waitpid(2)`,
+/// which can signal a recycled PID that no longer belongs to the service.
+fn check_kernel_version(min_major: u32, min_minor: u32) {
+    let raw = match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        Ok(s) => s,
+        Err(error) => {
+            panic!(
+                "mesh-init requires Linux >= {min_major}.{min_minor} for \
+                 pidfd_open / pidfd_send_signal; cannot read /proc/sys/kernel/osrelease: {error}"
+            );
+        }
+    };
+    let mut parts = raw.trim().split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts
+        .next()
+        .and_then(|p| p.split_once('-').map_or(Some(p), |(n, _)| Some(n)))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    if (major, minor) < (min_major, min_minor) {
+        panic!(
+            "mesh-init requires Linux >= {min_major}.{min_minor} for \
+             pidfd_open / pidfd_send_signal; running kernel is {raw} (>= 5.3 required, 2019)"
+        );
+    }
+}
+
 /// Configuration for the daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -164,11 +195,94 @@ struct TerminalSession {
     name: String,
     pid: u32,
     pty_fd: Option<OwnedFd>,
+    /// pidfd for the terminal process. Used by `pidfd_send_signal(2)` to
+    /// signal without PID-recycle risk. See `process::open_pidfd`.
+    pidfd: Option<OwnedFd>,
 }
 
-fn apply_activation_context_env(config: &mut AppConfig, context: Option<ActivationContext>) {
+/// Environment variables that are dangerous when set by a caller because they
+/// can hijack the spawned process (library injection, shell-config, etc.).
+///
+/// `PATH` is also listed because a trusted peer could shadow system
+/// binaries (e.g. inject a `su` in `/tmp`).
+const DEFAULT_DANGEROUS_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_BIND_NOW",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_HWCAP_MASK",
+    "LD_KEEPDIR",
+    "LD_NOEXEC",
+    "LD_ORIGIN_PATH",
+    "LD_POINTER_GUARD",
+    "LD_PROFILE",
+    "LD_SHOW_AUXV",
+    "LD_USE_LOAD_BIAS",
+    "BASH_ENV",
+    "ENV",
+    "BASH_FUNC_*",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PERL5OPT",
+    "PERL5LIB",
+    "PERLLIB",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "RUBYOPT",
+    "GEM_PATH",
+    "JAVA_TOOL_OPTIONS",
+    "PATH",
+];
+
+fn dangerous_env_patterns() -> Vec<String> {
+    std::env::var("MESH_DANGEROUS_ENV")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            DEFAULT_DANGEROUS_ENV_VARS
+                .iter()
+                .map(|entry| (*entry).to_string())
+                .collect()
+        })
+}
+
+fn env_name_matches(key: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            key.starts_with(prefix)
+        } else {
+            key == pattern
+        }
+    })
+}
+
+/// Strip dangerous caller-supplied environment variables unless the service
+/// explicitly allowlists that name via `AllowDangerousEnv`.
+pub(crate) fn scrub_dangerous_env(env: &mut HashMap<String, String>, config: &AppConfig) {
+    let dangerous = dangerous_env_patterns();
+    env.retain(|key, _| {
+        !env_name_matches(key, &dangerous) || env_name_matches(key, &config.allow_dangerous_env)
+    });
+}
+
+pub(crate) fn apply_activation_context_env(
+    config: &mut AppConfig,
+    context: Option<ActivationContext>,
+) {
     if let Some(context) = context {
-        config.env.extend(context.to_env());
+        let mut env = context.to_env();
+        scrub_dangerous_env(&mut env, config);
+        config.env.extend(env);
     }
 }
 
@@ -201,6 +315,12 @@ fn should_restart_for_policy(policy: RestartPolicy, exit_code: i32) -> bool {
 impl Daemon {
     /// Create a new daemon instance.
     pub fn new(config: DaemonConfig) -> Arc<Self> {
+        // A10: Require Linux >= 5.3 (2019) for pidfd_open / pidfd_send_signal.
+        // These syscalls make PID recycling impossible, which the
+        // `kill + waitpid` flow cannot guarantee. Refuse to start on
+        // older kernels rather than silently fall back to the unsafe flow.
+        check_kernel_version(5, 3);
+
         let services = Arc::new(Mutex::new(HashMap::new()));
         let resource_manager = Some(ResourceManager::new(services.clone()));
         let observer = Arc::new(ProcessObserver::new().expect("create mesh-init process observer"));
@@ -572,7 +692,7 @@ impl Daemon {
         &self,
         name: &str,
         extra_args: Vec<String>,
-        extra_env: HashMap<String, String>,
+        mut extra_env: HashMap<String, String>,
         context: Option<ActivationContext>,
         peer_uid: u32,
         peer_gid: u32,
@@ -707,8 +827,9 @@ impl Daemon {
             }
         }
 
-        // Merge extra args and env
+        // Merge extra args and caller env.
         config.args.extend(extra_args);
+        scrub_dangerous_env(&mut extra_env, &config);
         config.env.extend(extra_env);
         apply_activation_context_env(&mut config, context);
 
@@ -732,7 +853,7 @@ impl Daemon {
         uid: u32,
         gid: Option<u32>,
         pty: bool,
-        extra_env: HashMap<String, String>,
+        mut extra_env: HashMap<String, String>,
         context: Option<ActivationContext>,
         command: Option<String>,
         fd: OwnedFd,
@@ -752,6 +873,20 @@ impl Daemon {
         let home_path = std::path::Path::new(home);
         if !home_path.is_dir() {
             return Response::err(format!("home directory '{}' does not exist", home));
+        }
+        // A16: Validate that the home directory is owned by the target
+        // UID. Otherwise a privileged peer (sshd, ssh-mesh) could set HOME
+        // to any directory, influencing the child's startup scripts.
+        if let Ok(metadata) = std::fs::metadata(home_path) {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != uid {
+                return Response::err(format!(
+                    "home directory '{}' is owned by UID {}, not the target UID {}",
+                    home,
+                    metadata.uid(),
+                    uid
+                ));
+            }
         }
 
         let mut config = {
@@ -816,6 +951,7 @@ impl Daemon {
             .env
             .entry("LOGNAME".to_string())
             .or_insert_with(|| name.to_string());
+        scrub_dangerous_env(&mut extra_env, &config);
         config.env.extend(extra_env);
         apply_activation_context_env(&mut config, context);
 
@@ -869,6 +1005,7 @@ impl Daemon {
                         name: name.to_string(),
                         pid,
                         pty_fd: retained_pty,
+                        pidfd: process::open_pidfd(pid).ok(),
                     },
                 );
                 Response::ok_with_data(serde_json::json!({
@@ -941,15 +1078,15 @@ impl Daemon {
             ));
         };
 
-        let pid = {
-            let terminals = self.terminal_sessions.lock();
-            let Some(session) = terminals.get(terminal_id) else {
+        let (pid, pidfd) = {
+            let mut terminals = self.terminal_sessions.lock();
+            let Some(session) = terminals.get_mut(terminal_id) else {
                 return Response::err(format!("terminal session '{}' not found", terminal_id));
             };
-            session.pid
+            (session.pid, session.pidfd.take())
         };
 
-        match process::send_signal(pid, signal) {
+        match process::send_signal_pidfd(pidfd.as_ref(), pid, signal) {
             Ok(()) => Response::ok_with_data(serde_json::json!({
                 "terminal_id": terminal_id,
                 "pid": pid,
@@ -961,6 +1098,20 @@ impl Daemon {
 
     fn prepare_activation_context(&self, name: String, context: ActivationContext) -> Response {
         let mut pending = self.pending_activation_contexts.lock();
+        // Enforce a global cap across all services to prevent unbounded
+        // HashMap growth from a peer creating contexts under many distinct
+        // service names.
+        const MAX_TOTAL_PENDING_CONTEXTS: usize = 1024;
+        let total: usize = pending.values().map(|q| q.len()).sum();
+        if total >= MAX_TOTAL_PENDING_CONTEXTS {
+            warn!(
+                "Refusing activation context for '{}': total pending contexts already at cap {}",
+                name, MAX_TOTAL_PENDING_CONTEXTS
+            );
+            return Response::err(format!(
+                "pending activation context cap of {MAX_TOTAL_PENDING_CONTEXTS} reached"
+            ));
+        }
         let queue = pending.entry(name).or_default();
         queue.push_back(context);
         while queue.len() > 32 {
@@ -988,7 +1139,7 @@ impl Daemon {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
         }
-        let (pid, network_pid, config) = {
+        let (pid, network_pid, pidfd, config) = {
             let mut services = self.services.lock();
             match services.get_mut(name) {
                 Some(proc)
@@ -1010,7 +1161,8 @@ impl Daemon {
                     proc.userns_fd = None;
                     proc.namespace_pid = None;
                     proc.mesh_tun_attached = false;
-                    (proc.pid, proc.network_pid, proc.config.clone())
+                    let pidfd = proc.pidfd.take();
+                    (proc.pid, proc.network_pid, pidfd, proc.config.clone())
                 }
                 Some(_) => return Response::err(format!("service '{}' is not running", name)),
                 None => return Response::err(format!("service '{}' not found", name)),
@@ -1034,6 +1186,7 @@ impl Daemon {
             && config.kill_mode != crate::config::KillMode::None
             && let Err(e) = process::stop_process(
                 pid,
+                pidfd.as_ref(),
                 signal.or(Some(config.kill_signal)),
                 config.timeout_stop_sec,
                 config.send_sigkill,
@@ -1669,6 +1822,16 @@ impl Daemon {
                 proc.started_at = Some(std::time::Instant::now());
                 proc.cgroup_path = cgroup_path;
                 proc.config = config.clone();
+                // A10: open a pidfd for PID-safe signaling. On failure
+                // (extremely unlikely after spawn succeeded), leave pidfd
+                // None; send_signal_pidfd will fall back to kill(2).
+                match process::open_pidfd(pid) {
+                    Ok(fd) => proc.pidfd = Some(fd),
+                    Err(e) => warn!(
+                        "open_pidfd for PID {} failed: {}; signals will use kill(2)",
+                        pid, e
+                    ),
+                }
             }
         }
         info!("Service '{}' started with PID {}", name, pid);
@@ -1710,15 +1873,24 @@ impl Daemon {
 
             if let Some(pid) = pid {
                 debug!("Stopping service '{}' (PID {})", name, pid);
-                let config = {
-                    let services = self.services.lock();
-                    services.get(&name).map(|p| p.config.clone())
+                let (kill_signal, timeout_stop, send_sigkill, pidfd) = {
+                    let mut services = self.services.lock();
+                    match services.get_mut(&name) {
+                        Some(p) => (
+                            p.config.kill_signal,
+                            p.config.timeout_stop_sec,
+                            p.config.send_sigkill,
+                            p.pidfd.take(),
+                        ),
+                        None => (libc::SIGTERM, None, true, None),
+                    }
                 };
                 let _ = process::stop_process(
                     pid,
-                    config.as_ref().map(|c| c.kill_signal),
-                    config.as_ref().and_then(|c| c.timeout_stop_sec),
-                    config.as_ref().is_none_or(|c| c.send_sigkill),
+                    pidfd.as_ref(),
+                    Some(kill_signal),
+                    timeout_stop,
+                    send_sigkill,
                 )
                 .await;
             }
@@ -1792,6 +1964,97 @@ mod tests {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::sync::Arc;
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn test_dangerous_env_filter_drops_default_blocked_names() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("MESH_DANGEROUS_ENV") };
+        let config = AppConfig::default();
+        let mut env = HashMap::from([
+            ("APP_MODE".to_string(), "prod".to_string()),
+            ("PATH".to_string(), "/tmp/bin".to_string()),
+            ("LD_PRELOAD".to_string(), "/tmp/libhack.so".to_string()),
+            ("BASH_FUNC_demo%%".to_string(), "() { :; }".to_string()),
+        ]);
+
+        scrub_dangerous_env(&mut env, &config);
+
+        assert_eq!(env.get("APP_MODE").map(String::as_str), Some("prod"));
+        assert!(!env.contains_key("PATH"));
+        assert!(!env.contains_key("LD_PRELOAD"));
+        assert!(!env.contains_key("BASH_FUNC_demo%%"));
+    }
+
+    #[test]
+    fn test_dangerous_env_filter_honors_service_allowlist() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("MESH_DANGEROUS_ENV") };
+        let config = AppConfig {
+            allow_dangerous_env: vec!["PATH".to_string(), "BASH_FUNC_*".to_string()],
+            ..Default::default()
+        };
+        let mut env = HashMap::from([
+            ("PATH".to_string(), "/opt/app/bin".to_string()),
+            ("LD_PRELOAD".to_string(), "/tmp/libhack.so".to_string()),
+            ("BASH_FUNC_demo%%".to_string(), "() { :; }".to_string()),
+        ]);
+
+        scrub_dangerous_env(&mut env, &config);
+
+        assert!(env.contains_key("PATH"));
+        assert!(env.contains_key("BASH_FUNC_demo%%"));
+        assert!(!env.contains_key("LD_PRELOAD"));
+    }
+
+    #[test]
+    fn test_dangerous_env_filter_uses_global_override() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe { std::env::set_var("MESH_DANGEROUS_ENV", "SECRET_*,APP_MODE") };
+        let config = AppConfig::default();
+        let mut env = HashMap::from([
+            ("PATH".to_string(), "/tmp/bin".to_string()),
+            ("APP_MODE".to_string(), "prod".to_string()),
+            ("SECRET_TOKEN".to_string(), "s3cr3t".to_string()),
+        ]);
+
+        scrub_dangerous_env(&mut env, &config);
+
+        unsafe { std::env::remove_var("MESH_DANGEROUS_ENV") };
+        assert!(env.contains_key("PATH"));
+        assert!(!env.contains_key("APP_MODE"));
+        assert!(!env.contains_key("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn test_activation_context_overrides_caller_metadata_env() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("MESH_DANGEROUS_ENV") };
+        let mut config = AppConfig {
+            env: HashMap::from([("SSH_MESH_ROUTE_USER".to_string(), "spoofed".to_string())]),
+            ..Default::default()
+        };
+        let context = ActivationContext {
+            kind: "ssh".to_string(),
+            user: "alice".to_string(),
+            command: None,
+            certificate_user: None,
+            peer_key_sha: None,
+            client_id: None,
+            env: HashMap::new(),
+        };
+
+        apply_activation_context_env(&mut config, Some(context));
+
+        assert_eq!(
+            config.env.get("SSH_MESH_ROUTE_USER").map(String::as_str),
+            Some("alice")
+        );
+    }
 
     #[test]
     fn test_daemon_config_loading() {
@@ -2032,6 +2295,9 @@ OOMScoreAdjust = -700
 
     #[tokio::test]
     async fn test_privileged_uids_default_includes_root_system_sshd_and_mesh() {
+        let _guard = ENV_MUTEX.lock();
+        // Ensure no override env var leaks from another test.
+        unsafe { std::env::remove_var("MESH_INIT_PRIVILEGED_UIDS") };
         let uids = privileged_uids();
         assert!(uids.contains(&0), "root must be privileged");
         assert!(uids.contains(&1000), "system (1000) must be privileged");

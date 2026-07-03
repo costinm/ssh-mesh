@@ -5,6 +5,7 @@
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -629,6 +630,9 @@ pub struct ManagedProcess {
     pub namespace_pid: Option<u32>,
     /// True after the shared mesh-tun daemon accepted this service namespace.
     pub mesh_tun_attached: bool,
+    /// pidfd for the main process. None when the process is not running.
+    /// Used by `pidfd_send_signal(2)` to signal without PID-recycle risk.
+    pub pidfd: Option<std::os::fd::OwnedFd>,
     /// When the process was last started.
     pub started_at: Option<Instant>,
     /// Number of times this service has been restarted.
@@ -654,6 +658,7 @@ impl ManagedProcess {
             userns_fd: None,
             namespace_pid: None,
             mesh_tun_attached: false,
+            pidfd: None,
             started_at: None,
             restarts: 0,
             consecutive_failures: 0,
@@ -1102,6 +1107,66 @@ pub fn run_service_command(
     }
 }
 
+/// Open a pidfd for the given PID. Caller owns the returned fd and
+/// should store it in `ManagedProcess::pidfd`.
+///
+/// `pidfd_open(2)` returns a pollable fd that is invalidated when the
+/// process exits, making it safe to use with `pidfd_send_signal(2)`
+/// without PID-recycle risk. Requires Linux 5.3+; the daemon startup
+/// check in `daemon::new` enforces this.
+pub fn open_pidfd(pid: u32) -> Result<std::os::fd::OwnedFd, ProcessError> {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) };
+    if raw < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(ProcessError::SignalError(format!(
+            "pidfd_open({}): {}",
+            pid, err
+        )));
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+    Ok(fd)
+}
+
+/// Send a signal to a process using `pidfd_send_signal(2)` if a pidfd
+/// is available, falling back to `kill(2)` otherwise.
+///
+/// Prefer `pidfd_send_signal` because it cannot be confused with a
+/// recycled PID — the pidfd is invalidated when the original process
+/// exits.
+pub fn send_signal_pidfd(
+    pidfd: Option<&std::os::fd::OwnedFd>,
+    pid: u32,
+    signal: i32,
+) -> Result<(), ProcessError> {
+    if let Some(fd) = pidfd {
+        let raw = fd.as_raw_fd();
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                raw,
+                signal as libc::c_int,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        };
+        if res == 0 {
+            debug!("Sent signal {} to pidfd for PID {}", signal, pid);
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Err(ProcessError::NotFound(pid));
+        }
+        // Fall through to kill() for non-fatal errors (e.g. EINVAL on
+        // some exotic signal values).
+        warn!(
+            "pidfd_send_signal failed for PID {}: {}; falling back to kill()",
+            pid, err
+        );
+    }
+    send_signal(pid, signal)
+}
+
 /// Send a signal to a process.
 pub fn send_signal(pid: u32, signal: i32) -> Result<(), ProcessError> {
     let res = unsafe { libc::kill(pid as i32, signal) };
@@ -1124,14 +1189,17 @@ pub fn send_signal(pid: u32, signal: i32) -> Result<(), ProcessError> {
 /// Stop a process. Sends the given signal (default SIGTERM), waits briefly,
 /// then sends SIGKILL if still alive.
 ///
-/// Liveness is checked with `waitpid(pid, WNOHANG)` rather than `kill(pid, 0)`
-/// to avoid the PID-recycle hazard: if the child already exited and its PID was
-/// recycled by the kernel, `kill(pid, 0)` would succeed (alive) and we would
-/// SIGKILL an unrelated process. `waitpid(pid)` returns `ECHILD` for a PID
-/// that is not our child (already reaped or recycled), so we never signal a
-/// stranger.
+/// A pidfd (from `pidfd_open(2)`) is used for signaling when available,
+/// making the operation immune to PID recycling. Liveness is checked with
+/// `waitpid(pid, WNOHANG)` rather than `kill(pid, 0)` to avoid the
+/// PID-recycle hazard: if the child already exited and its PID was
+/// recycled by the kernel, `kill(pid, 0)` would succeed (alive) and we
+/// would SIGKILL an unrelated process. `waitpid(pid)` returns `ECHILD`
+/// for a PID that is not our child (already reaped or recycled), so we
+/// never signal a stranger.
 pub async fn stop_process(
     pid: u32,
+    pidfd: Option<&std::os::fd::OwnedFd>,
     signal: Option<i32>,
     timeout_secs: Option<u64>,
     send_sigkill: bool,
@@ -1139,7 +1207,7 @@ pub async fn stop_process(
     let sig = signal.unwrap_or(libc::SIGTERM);
     info!("Stopping PID {} with signal {}", pid, sig);
 
-    send_signal(pid, sig)?;
+    send_signal_pidfd(pidfd, pid, sig)?;
 
     // Give it a moment to exit
     tokio::time::sleep(std::time::Duration::from_secs(
@@ -1160,7 +1228,7 @@ pub async fn stop_process(
             "PID {} still alive after signal {}, sending SIGKILL",
             pid, sig
         );
-        let _ = send_signal(pid, libc::SIGKILL);
+        let _ = send_signal_pidfd(pidfd, pid, libc::SIGKILL);
         // Reap the killed child if we can (best-effort; the global reaper may
         // race us, which is harmless).
         let mut s: libc::c_int = 0;

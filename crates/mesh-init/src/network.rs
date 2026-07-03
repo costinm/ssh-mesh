@@ -52,11 +52,11 @@ pub fn attach_mesh_tun(
 
     let mut request = format!(
         "capture-tap vm_id={} netns={} if={} setup=tap addr={} gw={} route={}",
-        shell_field(service_name),
-        shell_field(netns_path),
-        shell_field(if_name),
-        shell_field(address),
-        shell_field(gateway),
+        shell_field(service_name)?,
+        shell_field(netns_path)?,
+        shell_field(if_name)?,
+        shell_field(address)?,
+        shell_field(gateway)?,
         route
     );
     request.push_str(" mtu=");
@@ -71,7 +71,7 @@ pub fn attach_mesh_tun(
     }
     if let Some(userns_path) = userns_path {
         request.push_str(" userns=");
-        request.push_str(&shell_field(userns_path));
+        request.push_str(&shell_field(userns_path)?);
     }
     request.push('\n');
 
@@ -202,8 +202,25 @@ fn expand_network_template(value: &str, service_name: &str, service_pid: u32) ->
         .replace("{userns}", &format!("/proc/{}/ns/user", service_pid))
 }
 
-fn shell_field(value: &str) -> String {
-    value.replace(char::is_whitespace, "_")
+/// Sanitize a value for use as a positional field in the text-based
+/// `mesh-tun` capture-tap protocol.
+///
+/// The protocol is parsed by splitting on `=` and whitespace, so any value
+/// containing `=`, `\n`, `\r`, or leading/trailing whitespace can corrupt
+/// the request. We reject those values outright rather than try to escape
+/// them — callers should pass already-validated configuration.
+fn shell_field(value: &str) -> Result<String, anyhow::Error> {
+    if value.contains('=')
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.trim().len() != value.len()
+    {
+        anyhow::bail!(
+            "value contains characters that are not safe for the mesh-tun text protocol: {:?}",
+            value
+        );
+    }
+    Ok(value.replace(char::is_whitespace, "_"))
 }
 
 #[cfg(test)]

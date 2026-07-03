@@ -126,6 +126,16 @@ pub struct ServiceSection {
         deserialize_with = "string_or_vec"
     )]
     pub supplementary_groups: Vec<String>,
+    /// Dangerous environment variables that callers may pass to this service.
+    ///
+    /// Caller-supplied env is otherwise filtered against mesh-init's dangerous
+    /// env list. Entries support exact names and a trailing `*` prefix match.
+    #[serde(
+        default,
+        rename = "AllowDangerousEnv",
+        deserialize_with = "string_or_vec"
+    )]
+    pub allow_dangerous_env: Vec<String>,
     /// `Type=oneshot` marks the service as one-shot and disables restart.
     #[serde(rename = "Type")]
     pub service_type: Option<String>,
@@ -453,6 +463,7 @@ pub struct AppConfig {
     pub standard_error: Option<String>,
     pub supplementary_groups: Vec<u32>,
     pub env: HashMap<String, String>,
+    pub allow_dangerous_env: Vec<String>,
     pub priority: u32,
     pub oneshot: bool,
     pub activation_mode: ServiceActivationMode,
@@ -1020,6 +1031,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         .map(|group| resolve_group_required(group, "SupplementaryGroups"))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let activation_socket = validate_activation_socket(file.service.activation_socket, &name)?;
     Ok(AppConfig {
         name,
         command,
@@ -1029,7 +1041,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         exec_stop: file.service.exec_stop,
         exec_reload: file.service.exec_reload,
         activation_mode: file.service.activation_mode,
-        activation_socket: file.service.activation_socket,
+        activation_socket,
         uid,
         gid,
         user: file.service.user,
@@ -1047,6 +1059,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         standard_error: file.service.standard_error,
         supplementary_groups,
         env: file.environment,
+        allow_dangerous_env: file.service.allow_dangerous_env,
         priority: priority_from_oom_score(file.service.oom_score_adjust),
         oneshot: file
             .service
@@ -1218,6 +1231,80 @@ pub fn validate_service_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate that `MeshActivationSocket` is under the service's safe run directory.
+///
+/// The activation socket path is used by mesh-init (running as root) to
+/// `create_dir_all` the parent directory and `bind()` the socket. Without
+/// this check, a config can set `MeshActivationSocket = "/etc/evil.sock"`
+/// and have mesh-init create arbitrary files on the host. This function
+/// requires the path to be under `<AppPaths::for_app(name).run_dir(name)>`.
+///
+/// The validation is purely lexical: we walk the path components and
+/// ensure no `..` escapes, then compare to the run_dir's components. This
+/// works whether or not the run_dir exists on disk, which is important
+/// because mesh-init creates the run_dir on first run.
+fn validate_activation_socket(
+    socket: Option<String>,
+    service_name: &str,
+) -> Result<Option<String>, ConfigError> {
+    let Some(socket) = socket else {
+        return Ok(None);
+    };
+    let run_dir = crate::paths::AppPaths::for_app(service_name).run_dir(service_name);
+
+    // Reject relative paths — they resolve against CWD which varies.
+    let path = std::path::Path::new(&socket);
+    if !path.is_absolute() {
+        return Err(ConfigError::Invalid(format!(
+            "MeshActivationSocket '{}' must be an absolute path under {}",
+            socket,
+            run_dir.display()
+        )));
+    }
+
+    // Reject any `..` components — they would let the path escape the
+    // run_dir via symlink resolution or CWD-relative resolution.
+    for component in path.components() {
+        if let std::path::Component::ParentDir = component {
+            return Err(ConfigError::Invalid(format!(
+                "MeshActivationSocket '{}' must not contain '..' components",
+                socket
+            )));
+        }
+    }
+
+    // Lexical prefix check: the socket path must start with the run_dir
+    // path. We do this component-by-component (rather than via
+    // `Path::starts_with`) to avoid the trailing-component edge case
+    // where `/foo` would be a prefix of `/foo-bar`.
+    let run_components: Vec<std::ffi::OsString> = run_dir
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let path_components: Vec<std::ffi::OsString> = path
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    if path_components.len() <= run_components.len() {
+        return Err(ConfigError::Invalid(format!(
+            "MeshActivationSocket '{}' must be under '{}'",
+            socket,
+            run_dir.display()
+        )));
+    }
+    for (i, expected) in run_components.iter().enumerate() {
+        if path_components[i] != *expected {
+            return Err(ConfigError::Invalid(format!(
+                "MeshActivationSocket '{}' must be under '{}'",
+                socket,
+                run_dir.display()
+            )));
+        }
+    }
+
+    Ok(Some(socket))
+}
+
 #[cfg(test)]
 mod name_validation_tests {
     use super::*;
@@ -1252,5 +1339,33 @@ mod name_validation_tests {
         assert!(validate_service_name("app1").is_ok());
         assert!(validate_service_name("worker-1.mesh").is_ok());
         assert!(validate_service_name("_underscore").is_ok());
+    }
+
+    #[test]
+    fn validate_activation_socket_rejects_outside_run_dir() {
+        // The test working directory is the crate root; the resolved run_dir
+        // for "my-svc" will be under it. A clearly absolute path outside
+        // the run_dir must be rejected.
+        assert!(validate_activation_socket(Some("/etc/evil.sock".to_string()), "my-svc",).is_err());
+        assert!(validate_activation_socket(Some("../escape.sock".to_string()), "my-svc",).is_err());
+        assert!(validate_activation_socket(None, "my-svc",).is_ok());
+    }
+
+    #[test]
+    fn parses_allow_dangerous_env() {
+        let config = parse_service(
+            r#"
+[Service]
+ExecStart = "/bin/true"
+AllowDangerousEnv = ["PATH", "LD_LIBRARY_PATH"]
+"#,
+            Some("env-test"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.allow_dangerous_env,
+            vec!["PATH".to_string(), "LD_LIBRARY_PATH".to_string()]
+        );
     }
 }

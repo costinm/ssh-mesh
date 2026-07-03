@@ -818,11 +818,13 @@ impl SshHandler {
                         .as_ref()
                         .map(|pty| pty.term.clone())
                         .unwrap_or_else(|| "xterm-256color".to_string());
+                    let env = channel_session.env.clone();
                     let control = send_terminal_to_mesh_init_with_term(
                         terminal,
                         slave_for_mesh_init,
                         term,
                         command.clone(),
+                        env,
                         activation_context,
                     )
                     .await?;
@@ -1198,6 +1200,7 @@ async fn send_terminal_to_mesh_init_with_term(
     slave: std::fs::File,
     term: String,
     command: Option<String>,
+    env: std::collections::HashMap<String, String>,
     context: Option<mesh::protocol::ActivationContext>,
 ) -> Result<MeshInitTerminalControl, anyhow::Error> {
     use std::os::fd::AsRawFd;
@@ -1209,7 +1212,7 @@ async fn send_terminal_to_mesh_init_with_term(
             true,
             term,
             command,
-            std::collections::HashMap::new(),
+            env,
             context,
         )
     })

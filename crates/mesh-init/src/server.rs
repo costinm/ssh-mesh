@@ -13,6 +13,7 @@ use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
 use std::io::IoSliceMut;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::Daemon;
@@ -22,10 +23,24 @@ use crate::protocol::{Request, Response};
 // Control Server
 // ============================================================================
 
+/// Default maximum number of concurrent control-socket connections.
+const DEFAULT_MAX_CONTROL_CONNECTIONS: usize = 32;
+
+/// Resolve the configured maximum number of concurrent control-socket
+/// connections from the `MESH_INIT_MAX_CONTROL_CONNECTIONS` env var.
+fn max_control_connections() -> usize {
+    std::env::var("MESH_INIT_MAX_CONTROL_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONTROL_CONNECTIONS)
+}
+
 /// UDS control server that dispatches JSON-lines protocol requests to the daemon.
 pub struct ControlServer {
     socket_path: String,
     daemon: Arc<Daemon>,
+    connection_slots: Arc<Semaphore>,
 }
 
 impl ControlServer {
@@ -34,6 +49,7 @@ impl ControlServer {
         Self {
             socket_path,
             daemon,
+            connection_slots: Arc::new(Semaphore::new(max_control_connections())),
         }
     }
 
@@ -172,10 +188,21 @@ impl ControlServer {
             debug!("Accepted control connection from UID {}", peer_uid);
 
             let daemon = self.daemon.clone();
+            let slots = self.connection_slots.clone();
+            // Acquire a connection-slot permit; if the daemon is at capacity,
+            // wait for a slot to free up rather than spawning unbounded tasks.
+            let permit = match slots.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Control connection semaphore closed: {}", e);
+                    continue;
+                }
+            };
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(stream, daemon, peer_uid, peer_gid).await {
                     error!("Control connection error: {}", e);
                 }
+                drop(permit);
             });
         }
         Ok(())
@@ -360,7 +387,11 @@ async fn handle_connection(
                     | Request::RegisterNamespace { .. }) => {
                         let mut std_stream = stream.into_std()?;
                         std_stream.set_nonblocking(false)?;
-                        let fd = recv_one_fd(&std_stream)?;
+                        let fds = recv_fds(&std_stream)?;
+                        if fds.len() > 1 {
+                            debug!("Received {} FDs with request; using the first", fds.len());
+                        }
+                        let fd = fds.into_iter().next().expect("at least one FD");
                         let response = daemon
                             .handle_request_with_fd(request, fd, peer_uid, peer_gid)
                             .await;
@@ -437,10 +468,18 @@ async fn read_json_line(stream: &mut tokio::net::UnixStream, line: &mut String) 
     Ok(len)
 }
 
-fn recv_one_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd> {
+/// Receive any number of file descriptors from a single `recvmsg`.
+///
+/// Returns all FDs from all `SCM_RIGHTS` cmsgs. Each FD has `FD_CLOEXEC` set
+/// to prevent it from leaking into child processes the daemon may spawn
+/// later. FDs received via `SCM_RIGHTS` do not inherit the sender's
+/// `FD_CLOEXEC` flag, so we set it explicitly.
+fn recv_fds(stream: &std::os::unix::net::UnixStream) -> Result<Vec<OwnedFd>> {
     let mut buf = [0u8; 1];
     let mut iov = [IoSliceMut::new(&mut buf)];
-    let mut cmsgspace = cmsg_space!([std::os::fd::RawFd; 1]);
+    // Accept up to 4 FDs in a single message; the kernel itself limits the
+    // number of FDs that can be passed in a single `SCM_RIGHTS` cmsg.
+    let mut cmsgspace = cmsg_space!([std::os::fd::RawFd; 4]);
     let msg = recvmsg::<()>(
         stream.as_raw_fd(),
         &mut iov,
@@ -448,21 +487,22 @@ fn recv_one_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd> {
         MsgFlags::empty(),
     )?;
 
+    let mut fds = Vec::new();
     for cmsg in msg.cmsgs()? {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg
-            && let Some(fd) = fds.first()
-        {
-            // SAFETY: recvmsg transferred ownership of this descriptor.
-            let owned = unsafe { OwnedFd::from_raw_fd(*fd) };
-            // FDs received via SCM_RIGHTS do not inherit the sender's
-            // FD_CLOEXEC flag. Set it explicitly so the PTY/stdio FD does not
-            // leak into any child process the daemon might spawn later.
-            set_fd_cloexec(owned.as_raw_fd());
-            return Ok(owned);
+        if let ControlMessageOwned::ScmRights(raw_fds) = cmsg {
+            for raw in raw_fds {
+                // SAFETY: recvmsg transferred ownership of this descriptor.
+                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                set_fd_cloexec(owned.as_raw_fd());
+                fds.push(owned);
+            }
         }
     }
 
-    anyhow::bail!("missing passed file descriptor")
+    if fds.is_empty() {
+        anyhow::bail!("missing passed file descriptor");
+    }
+    Ok(fds)
 }
 
 /// Set `FD_CLOEXEC` on a file descriptor. Best-effort.

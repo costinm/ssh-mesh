@@ -16,6 +16,16 @@ Common variables inherited from the `mesh` crate are documented in
 | `MESH_INIT_PRIVILEGED_UIDS` | `0,1000,103,150` | Comma-separated UIDs allowed to operate on services for other UIDs/GIDs. If set to a non-empty parsed list, it fully replaces the default (root, system, sshd, ssh-mesh). |
 | `MESH_INIT_MAX_ACTIVATION_CHILDREN` | `64` | Maximum concurrent inetd-style activation children. Invalid, zero, or unset values use `64`. |
 | `MESH_INIT_REAP_ALL` | `false` unless running as PID 1 | When `1` or `true`, the child reaper uses `waitpid(-1)` even when not PID 1. |
+| `MESH_INIT_MAX_CONTROL_CONNECTIONS` | `32` | Maximum concurrent control-socket connections. Excess connections wait for a slot to free up. Invalid, zero, or unset values use `32`. |
+
+## Privileged UIDs
+
+mesh-init requires a non-root system and sidecar (ssh) users. The four
+privileged service UIDs below ship enabled by default and can be disabled
+by setting their env var to `none` or `off`. Disabling any of them is not
+supported as a core feature — mesh-init's design assumes sshd, ssh-mesh, and
+the system service account can be trusted to perform service lifecycle on
+behalf of any user.
 
 ## Privileged UIDs
 
@@ -74,6 +84,7 @@ Name = "vm-ipc"
 ```
 
 Specialized:
+| `MESH_DANGEROUS_ENV` | default dangerous env list | Comma-separated replacement for the dangerous caller env names mesh-init filters before starting services. Entries support exact names and trailing-`*` prefixes. The built-in list is `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_BIND_NOW`, `LD_DEBUG`, `LD_DEBUG_OUTPUT`, `LD_DYNAMIC_WEAK`, `LD_HWCAP_MASK`, `LD_KEEPDIR`, `LD_NOEXEC`, `LD_ORIGIN_PATH`, `LD_POINTER_GUARD`, `LD_PROFILE`, `LD_SHOW_AUXV`, `LD_USE_LOAD_BIAS`, `BASH_ENV`, `ENV`, `BASH_FUNC_*`, `PYTHONPATH`, `PYTHONSTARTUP`, `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `NODE_OPTIONS`, `NODE_PATH`, `RUBYOPT`, `GEM_PATH`, `JAVA_TOOL_OPTIONS`, and `PATH`. Services can allow individual dangerous names with `AllowDangerousEnv`. |
 | `MESH_TUN_CONTROL_SOCKET` | `/tmp/mesh-tun-control.sock` | Fallback control socket used when attaching a service namespace to mesh-tun and no service config `control_socket` is set. |
 | `LISTEN_PID` | unset | Process ID that owns systemd-style inherited socket FDs. FDs are collected only when it matches the current process. |
 

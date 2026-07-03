@@ -44,13 +44,14 @@ const MESH_SLICE_PATH: &str = "/sys/fs/cgroup/mesh.slice";
 ///
 /// `name` is validated to reject path separators and `..` components, which
 /// would otherwise allow escaping `mesh.slice`.
-pub fn cgroup_path_for(name: &str) -> String {
+pub fn cgroup_path_for(name: &str) -> Result<String, CgroupError> {
     if let Err(reason) = crate::config::validate_cgroup_name(name) {
         error!("rejecting invalid cgroup name {:?}: {}", name, reason);
-        // Return a path that will fail to create rather than a traversal target.
-        return format!("{}/invalid.scope", MESH_SLICE_PATH);
+        return Err(CgroupError::CgroupError(format!(
+            "invalid cgroup name: {reason}"
+        )));
     }
-    format!("{}/{}.scope", MESH_SLICE_PATH, name)
+    Ok(format!("{}/{}.scope", MESH_SLICE_PATH, name))
 }
 
 /// Create a cgroup for a service under `mesh.slice`.
@@ -72,7 +73,7 @@ pub fn create_cgroup(name: &str) -> Result<String, CgroupError> {
     let _ = enable_controllers(MESH_SLICE_PATH);
 
     // Create the scope
-    let scope_path = cgroup_path_for(name);
+    let scope_path = cgroup_path_for(name)?;
     if !Path::new(&scope_path).exists() {
         fs::create_dir_all(&scope_path)?;
         info!("Created cgroup {}", scope_path);
@@ -225,13 +226,17 @@ mod tests {
     #[test]
     fn test_cgroup_path_construction() {
         assert_eq!(
-            cgroup_path_for("chrome"),
+            cgroup_path_for("chrome").unwrap(),
             "/sys/fs/cgroup/mesh.slice/chrome.scope"
         );
         assert_eq!(
-            cgroup_path_for("my-service"),
+            cgroup_path_for("my-service").unwrap(),
             "/sys/fs/cgroup/mesh.slice/my-service.scope"
         );
+        // A17: invalid names return Err, not a sentinel path
+        assert!(cgroup_path_for("../escape").is_err());
+        assert!(cgroup_path_for("a/b").is_err());
+        assert!(cgroup_path_for("").is_err());
     }
 
     #[test]

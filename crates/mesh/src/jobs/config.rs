@@ -79,6 +79,7 @@ impl JobConfig {
                 inaccessible_paths: self.inaccessible_paths.clone(),
                 capability_bounding_set: self.capability_bounding_set.clone(),
                 ambient_capabilities: self.ambient_capabilities.clone(),
+                allow_dangerous_env: self.allow_dangerous_env.clone(),
             },
             socket: None,
             resources: crate::config::ResourceLimits {

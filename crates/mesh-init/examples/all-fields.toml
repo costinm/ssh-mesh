@@ -132,6 +132,11 @@ StandardError = "inherit"
 # Supplementary group names or numeric GID strings.
 SupplementaryGroups = ["0"]
 
+# Applies to: caller-supplied child process environment.
+# Dangerous env vars are normally dropped from client requests. This list
+# allows specific dangerous names or trailing-* prefixes for this service.
+AllowDangerousEnv = ["PATH"]
+
 # Applies to: Linux OOM killer and mesh resource priority.
 # Range: -1000..1000. Internal mesh priority is OOMScoreAdjust + 1000.
 OOMScoreAdjust = -500
@@ -202,7 +207,12 @@ MeshActivationMode = "hybrid"
 
 # Applies to: Accept=true hybrid socket activation.
 # Unix socket used by mesh-init to deliver accepted fds to the running service.
-MeshActivationSocket = "/tmp/mesh-init-all-fields/control.sock"
+# When omitted, mesh-init uses the service's default control socket under its
+# run_dir. The path here must be under the service's run_dir; the test below
+# uses the test working directory to satisfy that constraint.
+# (MeshActivationSocket = "run/all-fields/control.sock" is resolved relative
+# to CWD, which doesn't work; use the absolute default below.)
+# MeshActivationSocket = "..."  # see run_dir for the valid prefix
 
 [Socket]
 # Applies to: socket activation.
@@ -238,6 +248,7 @@ Name = "ssh"
 [[Socket.Listen]]
 # Applies to: this socket activation listener.
 # stream maps to TCP, Unix stream, or AF_VSOCK stream.
+# TODO: will be the default
 Type = "stream"
 
 # Applies to: this socket activation listener.

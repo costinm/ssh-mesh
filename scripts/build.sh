@@ -176,7 +176,7 @@ configure_musl_toolchain() {
 add_nix_profile_deps() {
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
     shift || true
-    local deps="${*:-dev-tools}"
+    local deps="${*:-dev-tools nixos-install-tools}"
     local dep
 
     target_profile="$(resolve_nix_profile "$target_profile")"
