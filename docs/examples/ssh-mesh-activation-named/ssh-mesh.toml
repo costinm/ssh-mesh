@@ -1,16 +1,45 @@
 [Service]
-ExecStart=ssh-mesh
+ExecStart = "ssh-mesh"
 
 [Socket]
-ListenStream = [
-  "0.0.0.0:15022",
-  "0.0.0.0:15443",
-  "0.0.0.0:80",
-  "0.0.0.0:443",
-  "127.0.0.1:15080",
-  "/home/ssh-mesh/run/ssh-mesh/jsonl.sock",
-  "/home/ssh-mesh/run/ssh-mesh/trusted-ssh.sock",
-  "vsock:2:15022",
-]
-FileDescriptorName = ["ssh", "mesh-mtls", "http", "https", "admin", "jsonl", "ssh-uds", "vsock"]
 Accept = false
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:15022"
+Name = "ssh"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:15443"
+Name = "mesh-mtls"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:80"
+Name = "http"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:443"
+Name = "https"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "127.0.0.1:15080"
+Name = "admin"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/home/ssh-mesh/run/ssh-mesh/jsonl.sock"
+Name = "jsonl"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/home/ssh-mesh/run/ssh-mesh/trusted-ssh.sock"
+Name = "ssh-uds"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "vsock:2:15022"
+Name = "vsock"

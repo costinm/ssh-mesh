@@ -767,6 +767,7 @@ impl SshHandler {
         channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
         session: &mut server::Session,
         mesh_init_terminal: Option<MeshInitTerminal>,
+        activation_context: Option<mesh::protocol::ActivationContext>,
     ) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send {
         let session_handle = session.handle();
         let label = match &command {
@@ -822,6 +823,7 @@ impl SshHandler {
                         slave_for_mesh_init,
                         term,
                         command.clone(),
+                        activation_context,
                     )
                     .await?;
                     channel_session.mesh_init_terminal = Some(control);
@@ -903,7 +905,8 @@ impl SshHandler {
                 })?;
                 let env = channel_session.env.clone();
                 let (stdin_stream, stdout_stream, stderr_stream, control) =
-                    send_stdio_to_mesh_init(terminal, command.clone(), env).await?;
+                    send_stdio_to_mesh_init(terminal, command.clone(), env, activation_context)
+                        .await?;
                 channel_session.mesh_init_terminal = Some(control);
                 drop(sessions_lock);
 
@@ -1195,6 +1198,7 @@ async fn send_terminal_to_mesh_init_with_term(
     slave: std::fs::File,
     term: String,
     command: Option<String>,
+    context: Option<mesh::protocol::ActivationContext>,
 ) -> Result<MeshInitTerminalControl, anyhow::Error> {
     use std::os::fd::AsRawFd;
     let slave_fd = OwnedFd::from(slave);
@@ -1206,6 +1210,7 @@ async fn send_terminal_to_mesh_init_with_term(
             term,
             command,
             std::collections::HashMap::new(),
+            context,
         )
     })
     .await
@@ -1216,6 +1221,7 @@ async fn send_stdio_to_mesh_init(
     terminal: MeshInitTerminal,
     command: Option<String>,
     env: std::collections::HashMap<String, String>,
+    context: Option<mesh::protocol::ActivationContext>,
 ) -> Result<
     (
         tokio::net::UnixStream,
@@ -1248,6 +1254,7 @@ async fn send_stdio_to_mesh_init(
             "xterm-256color".to_string(),
             command,
             env,
+            context,
         )
     })
     .await
@@ -1275,6 +1282,7 @@ fn send_start_terminal_to_mesh_init_blocking(
     term: String,
     command: Option<String>,
     extra_env: std::collections::HashMap<String, String>,
+    context: Option<mesh::protocol::ActivationContext>,
 ) -> Result<MeshInitTerminalControl, anyhow::Error> {
     let mut stream = std::os::unix::net::UnixStream::connect(&terminal.socket_path)?;
     let home = terminal.home.clone();
@@ -1293,7 +1301,7 @@ fn send_start_terminal_to_mesh_init_blocking(
         gid: terminal.gid,
         pty,
         env,
-        context: None,
+        context,
         command,
         fd_count: Some(fds.len() as u32),
     };
@@ -2607,6 +2615,7 @@ impl server::Handler for SshHandler {
                 self.channel_writers.clone(),
                 session,
                 mesh_init_terminal,
+                Some(self.activation_context(Some(command.clone()))),
             ))
         } else {
             None
@@ -2666,6 +2675,7 @@ impl server::Handler for SshHandler {
                 self.channel_writers.clone(),
                 session,
                 mesh_init_terminal,
+                Some(self.activation_context(None)),
             ))
         } else {
             None

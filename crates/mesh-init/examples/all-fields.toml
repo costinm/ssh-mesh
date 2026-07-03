@@ -47,13 +47,30 @@ MeshActivationMode = "hybrid"
 MeshActivationSocket = "/tmp/mesh-init-all-fields/control.sock"
 
 [Socket]
-ListenStream = ["127.0.0.1:14022", "/tmp/mesh-init-all-fields/public.sock"]
-ListenDatagram = ["127.0.0.1:14023", "/tmp/mesh-init-all-fields/events.sock"]
 Accept = false
 SocketMode = 0o660
 SocketUser = "1000"
 SocketGroup = "1000"
-FileDescriptorName = ["ssh", "public", "udp-events", "uds-events"]
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "127.0.0.1:14022"
+Name = "ssh"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/tmp/mesh-init-all-fields/public.sock"
+Name = "public"
+
+[[Socket.Listen]]
+Type = "datagram"
+Address = "127.0.0.1:14023"
+Name = "udp-events"
+
+[[Socket.Listen]]
+Type = "datagram"
+Address = "/tmp/mesh-init-all-fields/events.sock"
+Name = "uds-events"
 
 [Resources]
 MemoryMin = "64M"

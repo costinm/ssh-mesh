@@ -68,8 +68,11 @@ optional `[Socket]` table.
 ExecStart = "/bin/sh -c 'echo SUCCESS'"
 
 [Socket]
-ListenStream = "14022"
 Accept = true
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "14022"
 ```
 
 Hybrid activation also uses `.toml` files, but accepted sockets are forwarded
@@ -83,8 +86,11 @@ MeshActivationMode = "hybrid"
 MeshActivationSocket = "/run/hybrid_svc/control.sock"
 
 [Socket]
-ListenStream = "/run/hybrid_svc/public.sock"
 Accept = true
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/run/hybrid_svc/public.sock"
 ```
 
 ## Execution Mode

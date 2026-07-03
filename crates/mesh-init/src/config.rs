@@ -258,6 +258,60 @@ MeshActivationSocket = "/run/hybrid-svc/control.sock"
     }
 
     #[test]
+    fn test_parse_toml_with_ordered_socket_listeners() {
+        let toml = r#"
+[Service]
+ExecStart = "/bin/true"
+
+[Socket]
+Accept = false
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "127.0.0.1:14022"
+Name = "ssh"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/run/example/control.sock"
+Name = "control"
+
+[[Socket.Listen]]
+Type = "datagram"
+Address = "127.0.0.1:14023"
+Name = "events"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "vsock::5000"
+Name = "vsock"
+"#;
+        let config = parse_service(toml, Some("ordered-svc")).unwrap();
+        assert_eq!(config.activation.len(), 4);
+
+        assert_eq!(config.activation[0].port, Some(14022));
+        assert_eq!(config.activation[0].bind.as_deref(), Some("127.0.0.1"));
+        assert!(!config.activation[0].datagram);
+        assert_eq!(config.activation[0].fd_name.as_deref(), Some("ssh"));
+
+        assert_eq!(
+            config.activation[1].socket.as_deref(),
+            Some("/run/example/control.sock")
+        );
+        assert!(!config.activation[1].datagram);
+        assert_eq!(config.activation[1].fd_name.as_deref(), Some("control"));
+
+        assert_eq!(config.activation[2].port, Some(14023));
+        assert!(config.activation[2].datagram);
+        assert_eq!(config.activation[2].fd_name.as_deref(), Some("events"));
+
+        assert_eq!(config.activation[3].vsock_cid, None);
+        assert_eq!(config.activation[3].vsock_port, Some(5000));
+        assert!(!config.activation[3].datagram);
+        assert_eq!(config.activation[3].fd_name.as_deref(), Some("vsock"));
+    }
+
+    #[test]
     fn test_parse_toml_with_pasta_network() {
         let toml = r#"
 [Service]

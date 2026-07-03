@@ -159,6 +159,8 @@ pub struct ServiceSection {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SocketSection {
+    #[serde(default, rename = "Listen")]
+    pub listen: Vec<SocketListenEntry>,
     #[serde(default, rename = "ListenStream", deserialize_with = "string_or_vec")]
     pub listen_streams: Vec<String>,
     #[serde(default, rename = "ListenDatagram", deserialize_with = "string_or_vec")]
@@ -177,6 +179,23 @@ pub struct SocketSection {
         deserialize_with = "string_or_vec"
     )]
     pub file_descriptor_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SocketListenEntry {
+    #[serde(rename = "Type")]
+    pub listen_type: SocketListenType,
+    #[serde(rename = "Address")]
+    pub address: String,
+    #[serde(rename = "Name")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SocketListenType {
+    Stream,
+    Datagram,
 }
 
 /// The `[resources]` section — maps to cgroup v2 knobs.
@@ -747,15 +766,35 @@ fn socket_to_activation_configs(
     let Some(socket) = socket else {
         return Ok(Vec::new());
     };
-    if socket.listen_streams.is_empty() && socket.listen_datagrams.is_empty() {
+    if socket.listen.is_empty()
+        && socket.listen_streams.is_empty()
+        && socket.listen_datagrams.is_empty()
+    {
         return Err(ConfigError::Invalid(
-            "[Socket] requires ListenStream or ListenDatagram".to_string(),
+            "[Socket] requires Listen, ListenStream, or ListenDatagram".to_string(),
         ));
     }
 
-    let mut activations = Vec::new();
+    let mut activations: Vec<(ActivationConfig, Option<String>)> = Vec::new();
+    for listen in &socket.listen {
+        let datagram = listen.listen_type == SocketListenType::Datagram;
+        if socket.accept && datagram {
+            return Err(ConfigError::Invalid(format!(
+                "Accept=true with datagram listener is not supported: {}",
+                listen.address
+            )));
+        }
+        activations.push((
+            parse_socket_listen_address(&listen.address, socket.accept, datagram)?,
+            listen.name.clone(),
+        ));
+    }
+
     for addr in &socket.listen_streams {
-        activations.push(parse_socket_listen_address(addr, socket.accept, false)?);
+        activations.push((
+            parse_socket_listen_address(addr, socket.accept, false)?,
+            None,
+        ));
     }
 
     let (udp_datagrams, unix_datagrams): (Vec<_>, Vec<_>) = socket
@@ -768,14 +807,16 @@ fn socket_to_activation_configs(
                 "Accept=true with ListenDatagram is not supported: {addr}"
             )));
         }
-        activations.push(parse_socket_listen_address(addr, socket.accept, true)?);
+        activations.push((
+            parse_socket_listen_address(addr, socket.accept, true)?,
+            None,
+        ));
     }
 
-    for (idx, activation) in activations.iter_mut().enumerate() {
-        activation.fd_name = socket
-            .file_descriptor_names
-            .get(idx)
-            .cloned()
+    for (idx, (activation, name)) in activations.iter_mut().enumerate() {
+        activation.fd_name = name
+            .clone()
+            .or_else(|| socket.file_descriptor_names.get(idx).cloned())
             .or_else(|| socket.file_descriptor_names.first().cloned())
             .or_else(|| Some(service_name.to_string()));
         if activation.socket.is_some() {
@@ -785,7 +826,10 @@ fn socket_to_activation_configs(
         }
     }
 
-    Ok(activations)
+    Ok(activations
+        .into_iter()
+        .map(|(activation, _)| activation)
+        .collect())
 }
 
 fn resolve_limits(limits: &ResourceLimits) -> Result<ResolvedResourceLimits, ConfigError> {

@@ -27,6 +27,8 @@ Deprecated:
 | --- | --- | --- |
 | `MESH_ENFORCE_DELEGATION` | `false` | When `1`, `true`, or `yes`, `MeshListener` requires trusted delegate peers to send a valid delegation envelope before serving a UDS connection. |
 | `MESH_TRUSTED_SSHD_UID` | `103` | UID trusted as the local sshd delegate. Set to a numeric UID, or `none`/`off`/empty to disable this builtin trust entry. |
+| `MESH_SYSTEM_UID` | `1000` | UID of the "system" service account. Root-equivalent for all mesh-init permissions, including system-wide observer methods. Set to `none`/`off` to disable. |
+| `MESH_SSH_MESH_UID` | `150` | UID of the ssh-mesh service account. Trusted for terminal/start operations and impersonation, but NOT for observer methods. Set to `none`/`off` to disable. |
 | `LISTEN_FDS` | unset | Number of inherited listener FDs starting at fd 3, systemd-style. |
 | `LISTEN_FDNAMES` | empty | Names for inherited listener FDs. Systemd separates socket-unit names with `:`; `mesh` also accepts spaces for mesh-init single-unit name lists. |
 | `<APP>_RUN` | `<app_home>/run/<app>` | `mesh` CLI socket override for the target app, where `<APP>` is the uppercased app name with `-` replaced by `_` (for example `MESH_INIT_RUN`). |

@@ -131,10 +131,13 @@ as `[Service]`.
 
 Systemd-compatible fields:
 
-- `ListenStream`: TCP port/address, Unix stream socket path, or `vsock:CID:PORT`.
-- `ListenDatagram`: UDP port/address or Unix datagram socket path.
+- `[[Socket.Listen]]`: ordered listener entry. `Type` is `stream` or
+  `datagram`; `Address` is a TCP/UDP port or address, Unix socket path, or
+  `vsock:CID:PORT` for stream listeners; `Name` is an optional fd name.
+- `ListenStream`: shorthand string or string list for stream listeners.
+- `ListenDatagram`: shorthand string or string list for datagram listeners.
 - `Accept`: boolean. `false` passes listener FDs with systemd activation;
-  `true` accepts connections in mesh-init. `ListenDatagram` only supports
+  `true` accepts connections in mesh-init. Datagram listeners only support
   `Accept=false`.
 - `SocketMode`: Unix socket mode, for example `0660`.
 - `SocketUser`: Unix socket owner.
@@ -147,4 +150,7 @@ selected in `[Service]` with `MeshActivationMode = "hybrid"`.
 
 When a service has multiple `Accept=false` listeners, mesh-init passes all of
 them to the child in declaration order using the systemd convention:
-`LISTEN_FDS=N` and descriptors starting at fd 3.
+`LISTEN_FDS=N` and descriptors starting at fd 3. Use `[[Socket.Listen]]` when
+mixed stream/datagram ordering matters. The shorthand arrays are expanded as
+all `ListenStream` entries first, followed by UDP `ListenDatagram` entries and
+then Unix datagram entries.

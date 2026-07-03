@@ -61,6 +61,175 @@ Gracefully shut down all services and exit the daemon.
 
 ---
 
+## 1b. Impersonation Protocol
+
+Trusted peers (sshd, ssh-mesh, system) may start processes running as a
+different UID than their own. This is how SSH users get shells as their
+target UID, and how the ssh-mesh admin web UI runs commands as `system`.
+
+### Connection-level authentication
+
+When a UDS connection is accepted, mesh-init reads the peer's UID/GID via
+`SO_PEERCRED` (kernel-verified, unforgeable). The peer UID must be in the
+builtin allowlist:
+
+| UID  | Identity     | Env var                | Capabilities                                     |
+|------|--------------|------------------------|--------------------------------------------------|
+| 0    | root         | —                      | All operations, any target UID                   |
+| 1000 | system       | `MESH_SYSTEM_UID`      | All operations, any target UID (root-equivalent) |
+| 103  | sshd         | `MESH_TRUSTED_SSHD_UID`| Terminal/start/stop/freeze, any target UID       |
+| 150  | ssh-mesh     | `MESH_SSH_MESH_UID`    | Terminal/start/stop/freeze, any target UID       |
+
+**UID 1000 (system) is root-equivalent.** It can call system-wide observer
+methods (`freeze_process`, `move_process`, `cgroup_high`, `clear_refs`,
+`freeze_cgroup`) on any PID or cgroup. The sshd and ssh-mesh UIDs are
+**not** authorized for those methods — they must use the named-service APIs
+(`start`/`stop`/`freeze`/`unfreeze`).
+
+Each env var can be set to `none` or `off` to disable that UID. The full
+list can be overridden with `MESH_INIT_PRIVILEGED_UIDS` (comma-separated).
+
+### Per-request impersonation
+
+Impersonation is specified in the request body, not in the connection. The
+peer's UID (from `SO_PEERCRED`) is the *acting* identity; the request's
+`uid`/`gid` fields are the *target* identity. mesh-init verifies that the
+acting UID is in `privileged_uids()` before allowing a target that differs.
+
+#### `start_terminal` — impersonation fields
+
+| Field       | Type   | Purpose                                         |
+|-------------|--------|-------------------------------------------------|
+| `uid`       | u32    | Target UID to run the shell/command as.         |
+| `gid`       | u32?   | Target GID. If `None`, uses the target UID.     |
+| `name`      | String | Service/config name (also used as `USER`/`LOGNAME`). |
+| `home`      | String | Home directory (must exist; becomes `HOME`).    |
+| `command`   | String?| Shell command (`sh -c <command>`). If `None`, interactive shell. |
+| `context`   | Object?| `ActivationContext` carrying provenance (see below). |
+| `env`       | Object?| Additional environment variables merged into the child. |
+| `pty`       | bool?  | If `true`, the passed fd becomes the controlling terminal. |
+| `fd_count`  | u32?   | Number of FDs passed via `SCM_RIGHTS` (default 1). |
+
+#### `start` — impersonation fields
+
+| Field      | Type   | Purpose                                              |
+|------------|--------|------------------------------------------------------|
+| `name`     | String | Service name. The service config's `User=` determines the target UID. |
+| `args`     | [String]? | Extra args appended to `ExecStart`.               |
+| `env`      | Object?| Additional env merged with the config's environment. |
+| `context`  | Object?| `ActivationContext` carrying provenance (see below). |
+
+For `start`, the target UID comes from the service config (`User=` field),
+not from the request. mesh-init re-checks `check_impersonation` after
+reloading the config from disk to prevent TOCTOU escalation.
+
+#### `prepare_activation` — pre-staging context for socket activation
+
+When a socket-activated service is triggered by an incoming connection
+(rather than an explicit `start` call), the trusted peer can pre-stage an
+`ActivationContext` so that the service receives provenance information when
+it spawns:
+
+```json
+{"method":"prepare_activation","name":"my-service","context":{...}}
+```
+
+The context is queued (max 32 per service) and consumed by the next
+socket-activation spawn for that service.
+
+### `ActivationContext` fields
+
+The `context` object carries **provenance** — who triggered the activation
+and why. It does not affect the target UID (that's `uid`/`gid` in the
+request, or `User=` in the config). It is metadata that gets injected as
+environment variables into the child process.
+
+| Field               | Type    | Set by     | Env var(s) generated                          |
+|---------------------|---------|------------|-----------------------------------------------|
+| `kind`              | String  | ssh-mesh   | `MESH_INIT_CONTEXT_KIND`                      |
+| `user`              | String  | ssh-mesh   | `MESH_INIT_CONTEXT_USER`, `SSH_MESH_ROUTE_USER` |
+| `command`           | String? | ssh-mesh   | `MESH_INIT_CONTEXT_COMMAND`, `SSH_MESH_ROUTE_COMMAND` |
+| `certificate_user`  | String? | ssh-mesh   | `SSH_MESH_ROUTE_CERTIFICATE_USER`             |
+| `peer_key_sha`      | String? | ssh-mesh   | `SSH_MESH_ROUTE_PEER_KEY_SHA`                 |
+| `client_id`         | u64?    | ssh-mesh   | `SSH_MESH_ROUTE_CLIENT_ID`                    |
+| `env`               | Object? | caller     | Merged directly into child env                |
+
+The full context is also serialized as `MESH_INIT_CONTEXT_JSON`.
+
+When `kind = "ssh"`, `user` is the SSH-authenticated username (from the
+certificate principal or `authorized_keys`), `certificate_user` is the
+cert principal (if any), and `peer_key_sha` is the SHA-256 fingerprint of
+the peer's public key.
+
+### Concrete flows
+
+#### sshd → mesh-init (SSH terminal)
+
+sshd (UID 103) authenticates an SSH user, then sends `start_terminal` with
+the user's UID/GID:
+
+```json
+{
+  "method": "start_terminal",
+  "name": "alice",
+  "home": "/home/alice",
+  "uid": 1001,
+  "gid": 1001,
+  "pty": true,
+  "env": {"TERM": "xterm-256color"},
+  "context": {
+    "kind": "ssh",
+    "user": "alice",
+    "certificate_user": "alice@corp.example.com",
+    "peer_key_sha": "SHA256:abc123...",
+    "client_id": 42
+  },
+  "fd_count": 1
+}
+```
+
+mesh-init verifies `check_impersonation(peer_uid=103, target_uid=1001)` →
+allowed (103 is in `privileged_uids`). The child runs as UID 1001 with
+`SSH_MESH_ROUTE_USER=alice` in its environment.
+
+#### ssh-mesh admin web UI → mesh-init (exec as system)
+
+The ssh-mesh admin HTTP interface (`POST /_m/_exec/<cmd>`) impersonates
+`system` (UID 1000) when calling mesh-init:
+
+```json
+{
+  "method": "start_terminal",
+  "name": "system",
+  "home": "/tmp",
+  "uid": 1000,
+  "gid": 1000,
+  "pty": false,
+  "env": {},
+  "context": null,
+  "command": "ls -la /data"
+}
+```
+
+mesh-init verifies `check_impersonation(peer_uid=150, target_uid=1000)` →
+allowed (150 is in `privileged_uids`). The child runs as UID 1000 (system).
+
+#### system (UID 1000) → mesh-init (direct control)
+
+A process running as `system` connects to the control socket directly. It
+can start/stop/freeze any service, call observer methods, and manage
+cgroups — it is root-equivalent.
+
+#### Non-privileged peer → mesh-init
+
+A non-privileged peer (e.g., UID 5000) can only connect if listed in a
+`[[peer]]` entry in `default.service` or `auth.toml`. Once connected, it
+may only `start`/`stop`/`freeze` services whose config UID matches its own
+(`check_impersonation` rejects UID mismatch). It cannot call observer
+methods (`require_system_or_root` rejects).
+
+---
+
 ## 2. File Descriptor-Passing Methods
 
 These requests must be sent over the UDS accompanied by a file descriptor using `SCM_RIGHTS` ancillary data.

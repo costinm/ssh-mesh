@@ -6,5 +6,12 @@ OOMScoreAdjust = -800
 uid = 9999
 
 [Socket]
-ListenStream = ["/tmp/mesh-init-auth-test.sock", "14033"]
 Accept = true
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/tmp/mesh-init-auth-test.sock"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "14033"

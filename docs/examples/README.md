@@ -199,12 +199,13 @@ No-network VM over stdio activation:
 ```toml
 [Service]
 ExecStart = "/opt/ssh-mesh/bin/mesh9p /nix /src/home/app5:/home/app5:rw /src/shared:/run/ssh-mesh/shared:rw"
-```
 
-```ini
 [Socket]
-ListenStream=/home/system/run/mesh-init/app5-9p.sock
-Accept=true
+Accept = true
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/home/system/run/mesh-init/app5-9p.sock"
 ```
 
 No-network VM over vsock uses the same `mesh9p` arguments. In this mode vsock is

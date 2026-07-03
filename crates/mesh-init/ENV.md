@@ -5,16 +5,29 @@ Runtime variables read by the `mesh-init` daemon, CLI, and service activation co
 Common variables inherited from the `mesh` crate are documented in
 [`../mesh/ENV.md`](../mesh/ENV.md). That includes `MESH_HOME`,
 `MESH_HOME_BASE`, `MESH_OPT_BASE`, `MESH_APP_HOME`, `MESH_APP_OPT`,
-`MESH_RES_DIR`, `MESH_TRUSTED_SSHD_UID`, `RUST_LOG`, `MESH_LOG_FILE`,
-`MESH_LOG_DIR`, `LISTEN_FD`, `LISTEN_FDS`, and `LISTEN_FDNAMES`.
+`MESH_RES_DIR`, `MESH_TRUSTED_SSHD_UID`, `MESH_SYSTEM_UID`,
+`MESH_SSH_MESH_UID`, `RUST_LOG`, `MESH_LOG_FILE`, `MESH_LOG_DIR`,
+`LISTEN_FD`, `LISTEN_FDS`, and `LISTEN_FDNAMES`.
 
 ## mesh-init
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MESH_INIT_PRIVILEGED_UIDS` | `0,1000,103` | Comma-separated UIDs allowed to operate on services for other UIDs/GIDs. If set to a non-empty parsed list, it fully replaces the default. |
+| `MESH_INIT_PRIVILEGED_UIDS` | `0,1000,103,150` | Comma-separated UIDs allowed to operate on services for other UIDs/GIDs. If set to a non-empty parsed list, it fully replaces the default (root, system, sshd, ssh-mesh). |
 | `MESH_INIT_MAX_ACTIVATION_CHILDREN` | `64` | Maximum concurrent inetd-style activation children. Invalid, zero, or unset values use `64`. |
 | `MESH_INIT_REAP_ALL` | `false` unless running as PID 1 | When `1` or `true`, the child reaper uses `waitpid(-1)` even when not PID 1. |
+
+## Privileged UIDs
+
+mesh-init recognizes four privileged service UIDs. Each can be disabled by
+setting its env var to `none` or `off`:
+
+| UID  | Env var                  | Default | Purpose                                              |
+|------|--------------------------|---------|------------------------------------------------------|
+| 0    | (root)                   | —       | Unrestricted, always trusted.                        |
+| 1000 | `MESH_SYSTEM_UID`        | 1000    | "system" service account; **root-equivalent** for all permissions including observer methods. |
+| 103  | `MESH_TRUSTED_SSHD_UID`  | 103     | sshd service account (Debian convention). Trusted for terminal/start operations and impersonation. |
+| 150  | `MESH_SSH_MESH_UID`      | 150     | ssh-mesh service account. Trusted for terminal/start operations and impersonation. **Not** authorized for system-wide observer methods (`freeze_process`, `move_process`, `cgroup_high`, `clear_refs`, `freeze_cgroup`) — those require root or system. |
 
 ## Socket Activation Syntax
 
@@ -26,23 +39,38 @@ service `.toml` file. For VSOCK stream listeners, use:
 ExecStart = "/opt/example/bin/server"
 
 [Socket]
-ListenStream = "vsock:2:5000"
-FileDescriptorName = "vsock"
 Accept = false
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "vsock:2:5000"
+Name = "vsock"
 ```
 
-Use `ListenStream = "vsock::5000"` to omit the CID and bind `VMADDR_CID_ANY`.
-`FileDescriptorName` follows the systemd shape: a single value names every
-descriptor, while a list names multiple listeners in fd order:
+Use `Address = "vsock::5000"` to omit the CID and bind `VMADDR_CID_ANY`.
+For ordered mixed listeners, use `[[Socket.Listen]]` entries:
 
 ```toml
 [Service]
 ExecStart = "/opt/example/bin/server"
 
 [Socket]
-ListenStream = ["8443", "vsock:2:5000"]
-FileDescriptorName = ["http-secure", "vm-ipc"]
 Accept = false
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "8443"
+Name = "http-secure"
+
+[[Socket.Listen]]
+Type = "datagram"
+Address = "127.0.0.1:8444"
+Name = "udp-events"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "vsock:2:5000"
+Name = "vm-ipc"
 ```
 
 Specialized:
@@ -66,7 +94,7 @@ Generated variables passed to child processes or activated services.
 | `HOME` | service home from config or terminal request | Child process home. |
 | `USER` | service/user name | Child process user name. |
 | `LISTEN_FDS` | unset | Set to the number of listener FDs for Accept=false socket activation children. |
-| `LISTEN_FDNAMES` | unset | Listener fd names for Accept=false children. `mesh-init` emits colon-separated names; receivers also accept spaces. Names come from `[Socket]` `FileDescriptorName` when set, otherwise from the service filename. |
+| `LISTEN_FDNAMES` | unset | Listener fd names for Accept=false children. `mesh-init` emits colon-separated names; receivers also accept spaces. Names come from `[[Socket.Listen]]` `Name` first, then `[Socket]` `FileDescriptorName`, otherwise from the service filename. |
 | `MESH_INIT_CONTEXT_KIND` | unset | Activation context kind, when present. |
 | `MESH_INIT_CONTEXT_USER` | unset | Activation context user, when present. |
 | `MESH_INIT_CONTEXT_COMMAND` | unset | Activation-triggering command, when present. |
