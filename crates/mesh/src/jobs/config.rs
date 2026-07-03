@@ -63,6 +63,8 @@ impl JobConfig {
                 kill_mode: self.kill_mode,
                 send_sigkill: self.send_sigkill,
                 umask: self.umask.map(|mask| format!("{mask:04o}")),
+                standard_output: self.standard_output.clone(),
+                standard_error: self.standard_error.clone(),
                 supplementary_groups: Vec::new(),
                 service_type: self.oneshot.then(|| "oneshot".to_string()),
                 oom_score_adjust: self.oom_score_adjust,

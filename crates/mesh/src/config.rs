@@ -17,7 +17,11 @@ pub const DEFAULT_MESH_TUN_MTU: u32 = 65_520;
 // Service / Job Unified Config
 // ============================================================================
 
-/// Top-level TOML structure for a config file.
+/// Top-level TOML structure for a mesh-init service or job config file.
+///
+/// Keep `crates/mesh-init/examples/all-fields.toml` in sync with this parser.
+/// That example is the canonical annotated reference for every supported field,
+/// including where each field applies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfigFile {
     #[serde(rename = "Service")]
@@ -65,6 +69,9 @@ pub struct AppConfigFile {
 }
 
 /// The `[Service]` section of a config file.
+///
+/// When adding or changing fields here, update
+/// `crates/mesh-init/examples/all-fields.toml` and `crates/mesh-init/CONFIG.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServiceSection {
     #[serde(rename = "ExecStart")]
@@ -109,6 +116,10 @@ pub struct ServiceSection {
     pub send_sigkill: bool,
     #[serde(rename = "UMask")]
     pub umask: Option<String>,
+    #[serde(rename = "StandardOutput")]
+    pub standard_output: Option<String>,
+    #[serde(rename = "StandardError")]
+    pub standard_error: Option<String>,
     #[serde(
         default,
         rename = "SupplementaryGroups",
@@ -146,9 +157,9 @@ pub struct ServiceSection {
     #[serde(
         default,
         rename = "CapabilityBoundingSet",
-        deserialize_with = "string_or_vec"
+        deserialize_with = "option_string_or_vec"
     )]
-    pub capability_bounding_set: Vec<String>,
+    pub capability_bounding_set: Option<Vec<String>>,
     #[serde(
         default,
         rename = "AmbientCapabilities",
@@ -157,6 +168,12 @@ pub struct ServiceSection {
     pub ambient_capabilities: Vec<String>,
 }
 
+/// The optional `[Socket]` section of a config file.
+///
+/// `[[Socket.Listen]]` preserves mixed stream/datagram declaration order.
+/// `ListenStream` and `ListenDatagram` remain shorthand forms. Keep
+/// `crates/mesh-init/examples/all-fields.toml` updated when socket fields
+/// change.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SocketSection {
     #[serde(default, rename = "Listen")]
@@ -432,6 +449,8 @@ pub struct AppConfig {
     pub kill_mode: KillMode,
     pub send_sigkill: bool,
     pub umask: Option<u32>,
+    pub standard_output: Option<String>,
+    pub standard_error: Option<String>,
     pub supplementary_groups: Vec<u32>,
     pub env: HashMap<String, String>,
     pub priority: u32,
@@ -448,7 +467,7 @@ pub struct AppConfig {
     pub read_write_paths: Vec<String>,
     pub read_only_paths: Vec<String>,
     pub inaccessible_paths: Vec<String>,
-    pub capability_bounding_set: Vec<String>,
+    pub capability_bounding_set: Option<Vec<String>>,
     pub ambient_capabilities: Vec<String>,
     pub resources: ResolvedResourceLimits,
     pub activation: Vec<ActivationConfig>,
@@ -538,6 +557,13 @@ where
     }
 
     deserializer.deserialize_any(StringOrVec)
+}
+
+fn option_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    string_or_vec(deserializer).map(Some)
 }
 
 fn split_systemd_words(value: &str) -> Vec<String> {
@@ -1017,6 +1043,8 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         kill_mode: file.service.kill_mode,
         send_sigkill: file.service.send_sigkill,
         umask,
+        standard_output: file.service.standard_output,
+        standard_error: file.service.standard_error,
         supplementary_groups,
         env: file.environment,
         priority: priority_from_oom_score(file.service.oom_score_adjust),

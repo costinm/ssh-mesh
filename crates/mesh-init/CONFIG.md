@@ -33,19 +33,43 @@ Systemd-compatible fields:
   signalling the main process.
 - `SendSIGKILL` (boolean): controls final SIGKILL after `TimeoutStopSec`.
 - `UMask` (octal string): child umask.
+- `StandardOutput`, `StandardError` (string): daemon-started service stdio.
+  Supported values are `inherit`, `null`, `journal`, `journal+console`, `kmsg`,
+  `kmsg+console`, `console`, `file:/path`, `append:/path`, and
+  `truncate:/path`. Journal/kmsg/console values inherit mesh-init's own
+  stdout/stderr destination. `StandardError = "stdout"` shares stdout.
 - `SupplementaryGroups` (string or string list): group names or numeric GID
   strings.
 - `OOMScoreAdjust` (integer, -1000..1000): applied as the Linux OOM score
   adjustment and used as mesh priority. Internal priority is
   `OOMScoreAdjust + 1000`, clamped to `0..2000`; lower is more protected.
-- `NoNewPrivileges` (boolean): applied with `prctl(PR_SET_NO_NEW_PRIVS)`.
+- `NoNewPrivileges` (boolean): applied with `prctl(PR_SET_NO_NEW_PRIVS)` when
+  set.
 - `PrivateNetwork` (boolean): applied with `unshare(CLONE_NEWNET)`.
+- `PrivateTmp` (boolean): creates private tmpfs mounts for `/tmp` and
+  `/var/tmp`.
+- `PrivateDevices` (boolean): creates a minimal private `/dev` with `null`,
+  `zero`, `full`, `random`, `urandom`, `tty`, `pts`, and `shm`.
+- `ProtectSystem` (string): `true`, `full`, `strict`, or `off`. Any service
+  that creates a private mount namespace also gets `/nix` and `/opt`
+  bind-remounted read-only when those paths exist. `true` also makes `/usr`,
+  `/boot`, and `/efi` read-only. `full` adds `/etc`. `strict` makes `/`
+  read-only.
+- `ProtectHome` (string): `true`, `yes`, `read-only`, `tmpfs`, or `off`.
+  Applies to `/home`, `/root`, and `/run/user`. `true`/`yes` hides them with
+  mode-000 tmpfs mounts, `read-only` bind-remounts them read-only, and `tmpfs`
+  overlays them with mode-0755 tmpfs mounts. Missing paths are skipped.
+- `ReadWritePaths`, `ReadOnlyPaths`, `InaccessiblePaths` (string or string
+  list): path-based mount protections. Paths must be absolute.
+- `CapabilityBoundingSet`, `AmbientCapabilities` (string or string list):
+  common Linux capability names. Supported names are `CAP_CHOWN`,
+  `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_KILL`, `CAP_SETGID`, `CAP_SETUID`,
+  `CAP_SETPCAP`, `CAP_NET_BIND_SERVICE`, `CAP_NET_ADMIN`, and
+  `CAP_SYS_ADMIN`. `CapabilityBoundingSet = []` explicitly drops all supported
+  capabilities; omitting the field leaves the bounding set unchanged.
 
-Parsed but not yet enforced sandboxing/capability fields:
-
-- `PrivateTmp`, `PrivateDevices`, `ProtectSystem`, `ProtectHome`,
-  `ReadWritePaths`, `ReadOnlyPaths`, `InaccessiblePaths`,
-  `CapabilityBoundingSet`, and `AmbientCapabilities`.
+Unsupported hardening values or capability names are logged with `WARN` and
+fail only that service start. mesh-init continues running.
 
 mesh-init extension fields:
 

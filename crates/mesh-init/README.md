@@ -96,6 +96,12 @@ This is a feature: TOML gives stricter parsing, typed values, nested tables,
 and fewer ambiguous repeated-key rules. A systemd-to-mesh-init converter may be
 added later, but native mesh-init config should remain TOML.
 
+The canonical annotated service configuration reference is
+[`examples/all-fields.toml`](examples/all-fields.toml). It contains every
+supported mesh-init service, socket activation, resource, environment, network,
+auth, and job field with comments describing where each field applies. Update it
+in the same change as any config parser or semantic change.
+
 `[Unit]` and `[Install]` sections are not supported and are not planned. mesh-init
 does not implement a full dependency solver, target graph, enable/install state,
 or boot transaction model. Service names come from file names, and socket
@@ -115,21 +121,37 @@ Supported systemd-style `[Service]` fields:
 - Termination controls: `KillSignal`, `KillMode`, and `SendSIGKILL`.
 - Resource controls in `[Resources]`: `MemoryMin`, `MemoryHigh`, `MemoryMax`,
   and `CPUWeight`.
-- Basic hardening: `NoNewPrivileges` and `PrivateNetwork`.
-
-Parsed but not yet enforced:
-
-- Mount/device sandboxing: `PrivateTmp`, `PrivateDevices`, `ProtectSystem`,
-  `ProtectHome`, `ReadWritePaths`, `ReadOnlyPaths`, and `InaccessiblePaths`.
-- Linux capability controls: `CapabilityBoundingSet` and
+- Basic hardening: `NoNewPrivileges`, `PrivateNetwork`, `PrivateTmp`,
+  `PrivateDevices`, `ProtectSystem`, `ProtectHome`, `ReadWritePaths`,
+  `ReadOnlyPaths`, `InaccessiblePaths`, `CapabilityBoundingSet`, and
   `AmbientCapabilities`.
+- Daemon-started service stdio: `StandardOutput` and `StandardError`, with
+  `inherit`, `null`, common console/journal aliases, and basic file targets.
+
+Unsupported hardening values or capability names are logged with `WARN` and
+fail only that service start. mesh-init continues running.
+
+Known differences from systemd:
+
+- Mount sandboxing covers common Linux service hardening behavior, not every
+  systemd mount propagation edge case.
+- Any private mount namespace bind-remounts `/nix` and `/opt` read-only when
+  present, so Nix/NixOS store and package trees remain visible but immutable in
+  sandboxed children.
+- Capability support covers common capabilities used by services, not the full
+  systemd capability expression language.
+- `CapabilityBoundingSet = []` explicitly drops all supported capabilities.
+  Omitting the field leaves the bounding set unchanged.
 - Full `KillMode=control-group` and `KillMode=mixed` semantics. The current
   implementation is main-process oriented, with `KillMode=none` honored.
+- `StandardOutput=journal`/`kmsg` and related console aliases inherit
+  mesh-init's own stdout/stderr destination; mesh-init does not provide a
+  separate journal backend.
 
 Useful systemd fields not supported yet, in likely implementation order:
 
 1. `EnvironmentFile`.
-2. `StandardInput`, `StandardOutput`, and `StandardError`.
+2. `StandardInput`.
 3. `RuntimeDirectory`, `StateDirectory`, `CacheDirectory`, and `LogsDirectory`.
 4. `RootDirectory`, `RootImage`, and bind-mount related fields.
 5. `CPUQuota`, `TasksMax`, `MemorySwapMax`, `AllowedCPUs`, and IO controls.

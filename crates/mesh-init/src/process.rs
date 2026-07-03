@@ -1,14 +1,44 @@
 //! Process lifecycle management for mesh-init services.
 //!
-//! Handles fork/exec with privilege drop (setuid/setgid), signal-based
-//! stop/freeze/unfreeze, and PID 1 zombie reaping.
+//! Handles fork/exec with privilege drop (setuid/setgid), service sandboxing,
+//! signal-based stop/freeze/unfreeze, and PID 1 zombie reaping.
 
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::process::Stdio;
 use std::time::Instant;
 
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use crate::protocol::ServiceState;
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_CHOWN: i32 = 0;
+const CAP_DAC_OVERRIDE: i32 = 1;
+const CAP_FOWNER: i32 = 3;
+const CAP_KILL: i32 = 5;
+const CAP_SETGID: i32 = 6;
+const CAP_SETUID: i32 = 7;
+const CAP_SETPCAP: i32 = 8;
+const CAP_NET_BIND_SERVICE: i32 = 10;
+const CAP_NET_ADMIN: i32 = 12;
+const CAP_SYS_ADMIN: i32 = 21;
+const CAP_LAST_SUPPORTED: i32 = 40;
+
+#[repr(C)]
+struct UserCapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserCapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
 
 // ============================================================================
 // Error Types
@@ -31,6 +61,543 @@ pub enum ProcessError {
 
     #[error("Cgroup error: {0}")]
     Cgroup(#[from] crate::cgroup::CgroupError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectSystemMode {
+    True,
+    Full,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectHomeMode {
+    Yes,
+    ReadOnly,
+    Tmpfs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaskKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone)]
+struct SandboxPlan {
+    private_tmp: bool,
+    private_devices: bool,
+    private_network: bool,
+    no_new_privileges: bool,
+    protect_system: Option<ProtectSystemMode>,
+    protect_home: Option<ProtectHomeMode>,
+    read_write_paths: Vec<CString>,
+    read_only_paths: Vec<CString>,
+    inaccessible_paths: Vec<(CString, MaskKind)>,
+    bounding_caps: Option<Vec<i32>>,
+    ambient_caps: Vec<i32>,
+}
+
+impl SandboxPlan {
+    fn needs_mount_namespace(&self) -> bool {
+        self.private_tmp
+            || self.private_devices
+            || self.protect_system.is_some()
+            || self.protect_home.is_some()
+            || !self.read_write_paths.is_empty()
+            || !self.read_only_paths.is_empty()
+            || !self.inaccessible_paths.is_empty()
+    }
+
+    fn needs_keepcaps(&self) -> bool {
+        !self.ambient_caps.is_empty()
+    }
+}
+
+fn parse_protect_system(value: Option<&str>) -> Result<Option<ProtectSystemMode>, ProcessError> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => Ok(None),
+        "1" | "true" | "yes" => Ok(Some(ProtectSystemMode::True)),
+        "full" => Ok(Some(ProtectSystemMode::Full)),
+        "strict" => Ok(Some(ProtectSystemMode::Strict)),
+        unsupported => {
+            warn!("ProtectSystem={unsupported} is not supported by mesh-init");
+            Err(ProcessError::SpawnFailed(format!(
+                "unsupported ProtectSystem value: {value}"
+            )))
+        }
+    }
+}
+
+fn parse_protect_home(value: Option<&str>) -> Result<Option<ProtectHomeMode>, ProcessError> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => Ok(None),
+        "1" | "true" | "yes" => Ok(Some(ProtectHomeMode::Yes)),
+        "read-only" | "readonly" => Ok(Some(ProtectHomeMode::ReadOnly)),
+        "tmpfs" => Ok(Some(ProtectHomeMode::Tmpfs)),
+        unsupported => {
+            warn!("ProtectHome={unsupported} is not supported by mesh-init");
+            Err(ProcessError::SpawnFailed(format!(
+                "unsupported ProtectHome value: {value}"
+            )))
+        }
+    }
+}
+
+fn path_to_cstring(path: &str, field: &str) -> Result<CString, ProcessError> {
+    if path.is_empty() {
+        warn!("{field} contains an empty path");
+        return Err(ProcessError::SpawnFailed(format!(
+            "{field} contains an empty path"
+        )));
+    }
+    if !path.starts_with('/') {
+        warn!("{field} path is not absolute: {path}");
+        return Err(ProcessError::SpawnFailed(format!(
+            "{field} path must be absolute: {path}"
+        )));
+    }
+    CString::new(path.as_bytes()).map_err(|_| {
+        warn!("{field} path contains NUL byte: {path:?}");
+        ProcessError::SpawnFailed(format!("{field} path contains NUL byte: {path:?}"))
+    })
+}
+
+fn path_list_to_cstrings(paths: &[String], field: &str) -> Result<Vec<CString>, ProcessError> {
+    paths
+        .iter()
+        .map(|path| path_to_cstring(path, field))
+        .collect()
+}
+
+fn inaccessible_path_kind(path: &str) -> Result<MaskKind, ProcessError> {
+    let meta = std::fs::metadata(path).map_err(|error| {
+        warn!("InaccessiblePaths path cannot be inspected: {path}: {error}");
+        ProcessError::SpawnFailed(format!("InaccessiblePaths path missing or invalid: {path}"))
+    })?;
+    Ok(if meta.is_dir() {
+        MaskKind::Directory
+    } else {
+        MaskKind::File
+    })
+}
+
+fn inaccessible_paths(paths: &[String]) -> Result<Vec<(CString, MaskKind)>, ProcessError> {
+    paths
+        .iter()
+        .map(|path| {
+            let kind = inaccessible_path_kind(path)?;
+            Ok((path_to_cstring(path, "InaccessiblePaths")?, kind))
+        })
+        .collect()
+}
+
+fn cap_name_to_number(name: &str) -> Option<i32> {
+    let normalized = name
+        .trim()
+        .strip_prefix("cap_")
+        .or_else(|| name.trim().strip_prefix("CAP_"))
+        .unwrap_or_else(|| name.trim())
+        .to_ascii_uppercase();
+    match normalized.as_str() {
+        "CHOWN" => Some(CAP_CHOWN),
+        "DAC_OVERRIDE" => Some(CAP_DAC_OVERRIDE),
+        "FOWNER" => Some(CAP_FOWNER),
+        "KILL" => Some(CAP_KILL),
+        "SETGID" => Some(CAP_SETGID),
+        "SETUID" => Some(CAP_SETUID),
+        "SETPCAP" => Some(CAP_SETPCAP),
+        "NET_BIND_SERVICE" => Some(CAP_NET_BIND_SERVICE),
+        "NET_ADMIN" => Some(CAP_NET_ADMIN),
+        "SYS_ADMIN" => Some(CAP_SYS_ADMIN),
+        _ => None,
+    }
+}
+
+fn parse_cap_list(values: &[String], field: &str) -> Result<Vec<i32>, ProcessError> {
+    let mut caps = Vec::new();
+    for value in values {
+        let Some(cap) = cap_name_to_number(value) else {
+            warn!("{field} capability is not supported by mesh-init: {value}");
+            return Err(ProcessError::SpawnFailed(format!(
+                "{field} capability is not supported: {value}"
+            )));
+        };
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+    Ok(caps)
+}
+
+fn build_sandbox_plan(config: &AppConfig) -> Result<SandboxPlan, ProcessError> {
+    let protect_system = parse_protect_system(config.protect_system.as_deref())?;
+    let protect_home = parse_protect_home(config.protect_home.as_deref())?;
+    let bounding_caps = config
+        .capability_bounding_set
+        .as_ref()
+        .map(|caps| parse_cap_list(caps, "CapabilityBoundingSet"))
+        .transpose()?;
+    let ambient_caps = parse_cap_list(&config.ambient_capabilities, "AmbientCapabilities")?;
+    if let Some(bounding_caps) = &bounding_caps {
+        for cap in &ambient_caps {
+            if !bounding_caps.contains(cap) {
+                warn!(
+                    "AmbientCapabilities contains capability outside CapabilityBoundingSet: {}",
+                    cap
+                );
+                return Err(ProcessError::SpawnFailed(
+                    "AmbientCapabilities must be a subset of CapabilityBoundingSet".to_string(),
+                ));
+            }
+        }
+        if !ambient_caps.is_empty() && !bounding_caps.contains(&CAP_SETPCAP) {
+            warn!("AmbientCapabilities with CapabilityBoundingSet requires CAP_SETPCAP for setup");
+            return Err(ProcessError::SpawnFailed(
+                "AmbientCapabilities with CapabilityBoundingSet requires CAP_SETPCAP".to_string(),
+            ));
+        }
+    }
+
+    Ok(SandboxPlan {
+        private_tmp: config.private_tmp,
+        private_devices: config.private_devices,
+        private_network: config.private_network,
+        no_new_privileges: config.no_new_privileges,
+        protect_system,
+        protect_home,
+        read_write_paths: path_list_to_cstrings(&config.read_write_paths, "ReadWritePaths")?,
+        read_only_paths: path_list_to_cstrings(&config.read_only_paths, "ReadOnlyPaths")?,
+        inaccessible_paths: inaccessible_paths(&config.inaccessible_paths)?,
+        bounding_caps,
+        ambient_caps,
+    })
+}
+
+fn cstr(bytes: &'static [u8]) -> *const libc::c_char {
+    bytes.as_ptr().cast()
+}
+
+unsafe fn mount_checked(
+    source: *const libc::c_char,
+    target: *const libc::c_char,
+    fstype: *const libc::c_char,
+    flags: libc::c_ulong,
+    data: *const libc::c_void,
+) -> std::io::Result<()> {
+    if unsafe { libc::mount(source, target, fstype, flags, data) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn mkdir_0755(path: *const libc::c_char) -> std::io::Result<()> {
+    if unsafe { libc::mkdir(path, 0o755) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+unsafe fn mknod_chr(
+    path: *const libc::c_char,
+    mode: libc::mode_t,
+    major: u64,
+    minor: u64,
+) -> std::io::Result<()> {
+    if unsafe {
+        libc::mknod(
+            path,
+            mode | libc::S_IFCHR,
+            libc::makedev(major as libc::c_uint, minor as libc::c_uint),
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+unsafe fn bind_remount(path: &CString, flags: libc::c_ulong) -> std::io::Result<()> {
+    unsafe { bind_remount_raw(path.as_ptr(), flags) }
+}
+
+unsafe fn bind_remount_raw(path: *const libc::c_char, flags: libc::c_ulong) -> std::io::Result<()> {
+    unsafe {
+        mount_checked(
+            path,
+            path,
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        )?;
+        mount_checked(
+            std::ptr::null(),
+            path,
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | flags,
+            std::ptr::null(),
+        )
+    }
+}
+
+unsafe fn bind_remount_raw_optional(
+    path: *const libc::c_char,
+    flags: libc::c_ulong,
+) -> std::io::Result<()> {
+    match unsafe { bind_remount_raw(path, flags) } {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        result => result,
+    }
+}
+
+unsafe fn mount_tmpfs(path: *const libc::c_char, options: &'static [u8]) -> std::io::Result<()> {
+    unsafe {
+        mount_checked(
+            cstr(b"tmpfs\0"),
+            path,
+            cstr(b"tmpfs\0"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            cstr(options).cast(),
+        )
+    }
+}
+
+unsafe fn mount_tmpfs_optional(
+    path: *const libc::c_char,
+    options: &'static [u8],
+) -> std::io::Result<()> {
+    match unsafe { mount_tmpfs(path, options) } {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        result => result,
+    }
+}
+
+unsafe fn apply_private_tmp() -> std::io::Result<()> {
+    unsafe {
+        mount_tmpfs(cstr(b"/tmp\0"), b"mode=1777\0")?;
+        mount_tmpfs_optional(cstr(b"/var/tmp\0"), b"mode=1777\0")?;
+    }
+    Ok(())
+}
+
+unsafe fn apply_private_devices() -> std::io::Result<()> {
+    unsafe {
+        mount_checked(
+            cstr(b"tmpfs\0"),
+            cstr(b"/dev\0"),
+            cstr(b"tmpfs\0"),
+            libc::MS_NOSUID,
+            cstr(b"mode=0755\0").cast(),
+        )?;
+        mknod_chr(cstr(b"/dev/null\0"), 0o666, 1, 3)?;
+        mknod_chr(cstr(b"/dev/zero\0"), 0o666, 1, 5)?;
+        mknod_chr(cstr(b"/dev/full\0"), 0o666, 1, 7)?;
+        mknod_chr(cstr(b"/dev/random\0"), 0o666, 1, 8)?;
+        mknod_chr(cstr(b"/dev/urandom\0"), 0o666, 1, 9)?;
+        mknod_chr(cstr(b"/dev/tty\0"), 0o666, 5, 0)?;
+        mkdir_0755(cstr(b"/dev/pts\0"))?;
+        mkdir_0755(cstr(b"/dev/shm\0"))?;
+        let _ = mount_checked(
+            cstr(b"devpts\0"),
+            cstr(b"/dev/pts\0"),
+            cstr(b"devpts\0"),
+            libc::MS_NOSUID | libc::MS_NOEXEC,
+            cstr(b"newinstance,ptmxmode=0666,mode=0620\0").cast(),
+        );
+        let _ = mount_tmpfs(cstr(b"/dev/shm\0"), b"mode=1777\0");
+    }
+    Ok(())
+}
+
+unsafe fn apply_protect_system(mode: ProtectSystemMode) -> std::io::Result<()> {
+    unsafe {
+        if mode == ProtectSystemMode::Strict {
+            bind_remount_raw(cstr(b"/\0"), libc::MS_RDONLY)?;
+            return Ok(());
+        }
+        for path in [cstr(b"/usr\0"), cstr(b"/boot\0"), cstr(b"/efi\0")] {
+            bind_remount_raw_optional(path, libc::MS_RDONLY)?;
+        }
+        if mode == ProtectSystemMode::Full {
+            bind_remount_raw_optional(cstr(b"/etc\0"), libc::MS_RDONLY)?;
+        }
+    }
+    Ok(())
+}
+
+unsafe fn apply_protect_home(mode: ProtectHomeMode) -> std::io::Result<()> {
+    let homes = [cstr(b"/home\0"), cstr(b"/root\0"), cstr(b"/run/user\0")];
+    for path in homes {
+        unsafe {
+            match mode {
+                ProtectHomeMode::Yes => {
+                    mount_tmpfs_optional(path, b"mode=000\0")?;
+                }
+                ProtectHomeMode::ReadOnly => {
+                    bind_remount_raw_optional(path, libc::MS_RDONLY)?;
+                }
+                ProtectHomeMode::Tmpfs => {
+                    mount_tmpfs_optional(path, b"mode=0755\0")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn apply_default_read_only_host_mounts() -> std::io::Result<()> {
+    unsafe {
+        bind_remount_raw_optional(cstr(b"/nix\0"), libc::MS_RDONLY)?;
+        bind_remount_raw_optional(cstr(b"/opt\0"), libc::MS_RDONLY)?;
+    }
+    Ok(())
+}
+
+unsafe fn apply_inaccessible_path(path: &CString, kind: MaskKind) -> std::io::Result<()> {
+    unsafe {
+        match kind {
+            MaskKind::Directory => mount_tmpfs(path.as_ptr(), b"mode=000\0"),
+            MaskKind::File => {
+                mount_checked(
+                    cstr(b"/dev/null\0"),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )?;
+                mount_checked(
+                    std::ptr::null(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID,
+                    std::ptr::null(),
+                )
+            }
+        }
+    }
+}
+
+unsafe fn cap_drop_bounding(cap: i32) -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn cap_mask(caps: &[i32], word: usize) -> u32 {
+    caps.iter().fold(0u32, |mask, cap| {
+        let cap = *cap as usize;
+        if cap / 32 == word {
+            mask | (1u32 << (cap % 32))
+        } else {
+            mask
+        }
+    })
+}
+
+unsafe fn apply_capset(caps: &[i32], include_setpcap: bool) -> std::io::Result<()> {
+    let mut caps = caps.to_vec();
+    if include_setpcap && !caps.contains(&CAP_SETPCAP) {
+        caps.push(CAP_SETPCAP);
+    }
+    let mut header = UserCapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [
+        UserCapData {
+            effective: cap_mask(&caps, 0),
+            permitted: cap_mask(&caps, 0),
+            inheritable: cap_mask(&caps, 0),
+        },
+        UserCapData {
+            effective: cap_mask(&caps, 1),
+            permitted: cap_mask(&caps, 1),
+            inheritable: cap_mask(&caps, 1),
+        },
+    ];
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_mut_ptr()) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn raise_ambient_caps(caps: &[i32]) -> std::io::Result<()> {
+    for cap in caps {
+        if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, *cap, 0, 0) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+unsafe fn apply_sandbox_before_identity(plan: &SandboxPlan) -> std::io::Result<()> {
+    unsafe {
+        if plan.needs_mount_namespace() {
+            if libc::unshare(libc::CLONE_NEWNS) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            mount_checked(
+                std::ptr::null(),
+                cstr(b"/\0"),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )?;
+            apply_default_read_only_host_mounts()?;
+        }
+        if plan.private_tmp {
+            apply_private_tmp()?;
+        }
+        if plan.private_devices {
+            apply_private_devices()?;
+        }
+        if let Some(mode) = plan.protect_system {
+            apply_protect_system(mode)?;
+        }
+        if let Some(mode) = plan.protect_home {
+            apply_protect_home(mode)?;
+        }
+        for path in &plan.read_only_paths {
+            bind_remount(path, libc::MS_RDONLY)?;
+        }
+        for (path, kind) in &plan.inaccessible_paths {
+            apply_inaccessible_path(path, *kind)?;
+        }
+        for path in &plan.read_write_paths {
+            bind_remount(path, 0)?;
+        }
+        if plan.private_network && libc::unshare(libc::CLONE_NEWNET) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if let Some(caps) = &plan.bounding_caps {
+            for cap in 0..=CAP_LAST_SUPPORTED {
+                if !caps.contains(&cap) {
+                    cap_drop_bounding(cap)?;
+                }
+            }
+        }
+        if plan.needs_keepcaps() && libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -143,6 +710,118 @@ pub struct ActivationListenFd {
     pub name: Option<String>,
 }
 
+fn open_standard_file(value: &str) -> Result<File, ProcessError> {
+    if let Some(path) = value.strip_prefix("file:") {
+        return OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .map_err(ProcessError::Io);
+    }
+    if let Some(path) = value.strip_prefix("append:") {
+        return OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(ProcessError::Io);
+    }
+    if let Some(path) = value.strip_prefix("truncate:") {
+        return OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(ProcessError::Io);
+    }
+    Err(ProcessError::SpawnFailed(format!(
+        "unsupported stdio file target: {value}"
+    )))
+}
+
+fn standard_stdio(value: Option<&str>, field: &str) -> Result<Stdio, ProcessError> {
+    let value = value.unwrap_or("inherit").trim();
+    match value {
+        "" | "inherit" => Ok(Stdio::inherit()),
+        "null" => Ok(Stdio::null()),
+        "journal" | "journal+console" | "kmsg" | "kmsg+console" | "console" => {
+            // mesh-init does not own a journal. Map common systemd log targets
+            // to the daemon's own stdout/stderr destination.
+            Ok(Stdio::inherit())
+        }
+        value
+            if value.starts_with("file:")
+                || value.starts_with("append:")
+                || value.starts_with("truncate:") =>
+        {
+            open_standard_file(value).map(Stdio::from)
+        }
+        other => {
+            warn!("{field}={other} is not supported by mesh-init");
+            Err(ProcessError::SpawnFailed(format!(
+                "unsupported {field} value: {other}"
+            )))
+        }
+    }
+}
+
+fn apply_standard_io(
+    cmd: &mut std::process::Command,
+    config: &AppConfig,
+) -> Result<(), ProcessError> {
+    cmd.stdin(Stdio::null());
+
+    let stdout = config
+        .standard_output
+        .as_deref()
+        .unwrap_or("inherit")
+        .trim();
+    let stderr = config.standard_error.as_deref().unwrap_or("inherit").trim();
+
+    if stderr == "stdout" {
+        match stdout {
+            "" | "inherit" => {
+                cmd.stdout(Stdio::inherit());
+                cmd.stderr(Stdio::inherit());
+            }
+            "null" => {
+                cmd.stdout(Stdio::null());
+                cmd.stderr(Stdio::null());
+            }
+            "journal" | "journal+console" | "kmsg" | "kmsg+console" | "console" => {
+                cmd.stdout(Stdio::inherit());
+                cmd.stderr(Stdio::inherit());
+            }
+            value
+                if value.starts_with("file:")
+                    || value.starts_with("append:")
+                    || value.starts_with("truncate:") =>
+            {
+                let stdout_file = open_standard_file(value)?;
+                let stderr_file = stdout_file.try_clone().map_err(ProcessError::Io)?;
+                cmd.stdout(Stdio::from(stdout_file));
+                cmd.stderr(Stdio::from(stderr_file));
+            }
+            other => {
+                warn!("StandardOutput={other} is not supported by mesh-init");
+                return Err(ProcessError::SpawnFailed(format!(
+                    "unsupported StandardOutput value: {other}"
+                )));
+            }
+        }
+    } else {
+        cmd.stdout(standard_stdio(
+            config.standard_output.as_deref(),
+            "StandardOutput",
+        )?);
+        cmd.stderr(standard_stdio(
+            config.standard_error.as_deref(),
+            "StandardError",
+        )?);
+    }
+
+    Ok(())
+}
+
 /// Spawn a new process for a service.
 ///
 /// Uses `std::process::Command` to fork and exec. Sets uid/gid if configured.
@@ -167,6 +846,7 @@ pub fn spawn_process(
     for (key, value) in &config.env {
         cmd.env(key, value);
     }
+    let sandbox = build_sandbox_plan(config)?;
 
     // A2: Privilege drop and hardening — all in pre_exec, in the correct
     // order. Rust's std applies cmd.uid()/cmd.gid() BEFORE pre_exec, which
@@ -174,12 +854,14 @@ pub fn spawn_process(
     // cmd.uid()/cmd.gid() and instead perform the full privilege drop inside
     // pre_exec where we control the ordering:
     //
-    //   1. unshare(CLONE_NEWNET)  — needs CAP_SYS_ADMIN (root)
-    //   2. setgroups              — needs CAP_SETGID (root); clear or set
-    //   3. setresgid              — drop GID
-    //   4. setresuid              — drop UID
-    //   5. umask
-    //   6. prctl(NoNewPrivs)      — always, prevents setuid re-escalation
+    //   1. mount/capability namespace setup — needs privileges
+    //   2. unshare(CLONE_NEWNET)            — needs CAP_SYS_ADMIN
+    //   3. setgroups                        — needs CAP_SETGID; clear or set
+    //   4. setresgid                        — drop GID
+    //   5. setresuid                        — drop UID
+    //   6. capability ambient/effective set — after identity drop if requested
+    //   7. umask
+    //   8. prctl(NoNewPrivs)                — when requested
     //
     // The PTY/listen pre_exec closures (registered after this one) run
     // next; they don't need root.
@@ -191,14 +873,10 @@ pub fn spawn_process(
         let drop_gid = config.gid;
         let supplementary_groups = config.supplementary_groups.clone();
         let umask = config.umask;
-        let private_network = config.private_network;
 
         unsafe {
             cmd.pre_exec(move || {
-                // 1. Private network namespace (needs root)
-                if private_network && libc::unshare(libc::CLONE_NEWNET) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                apply_sandbox_before_identity(&sandbox)?;
                 // 2. Set supplementary groups (or clear them). Must run
                 //    while we still have CAP_SETGID, i.e. before setresgid.
                 if supplementary_groups.is_empty() {
@@ -234,12 +912,24 @@ pub fn spawn_process(
                         return Err(std::io::Error::last_os_error());
                     }
                 }
-                // 5. Umask
+                if !sandbox.ambient_caps.is_empty() {
+                    apply_capset(&sandbox.ambient_caps, true)?;
+                    raise_ambient_caps(&sandbox.ambient_caps)?;
+                    apply_capset(&sandbox.ambient_caps, false)?;
+                } else if let Some(caps) = &sandbox.bounding_caps
+                    && drop_uid.is_none()
+                    && drop_gid.is_none()
+                {
+                    apply_capset(caps, false)?;
+                }
+                // 7. Umask
                 if let Some(mask) = umask {
                     libc::umask(mask as libc::mode_t);
                 }
-                // 6. NoNewPrivs — always set, prevents setuid re-escalation
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                // 8. NoNewPrivs — prevents setuid re-escalation.
+                if sandbox.no_new_privileges
+                    && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -330,7 +1020,9 @@ pub fn spawn_process(
             // then closed when `_passed_fd_keepalive` drops at end of scope.
             _passed_fd_keepalive = fds.into_iter().map(|fd| fd.fd).collect();
         }
-        None => {}
+        None => {
+            apply_standard_io(&mut cmd, config)?;
+        }
     }
 
     let child = cmd.spawn().map_err(|e| {
@@ -711,6 +1403,108 @@ mod tests {
         assert_eq!(libc::WEXITSTATUS(status), 0, "status={status}");
 
         assert_eq!(std::fs::read_to_string(out).unwrap(), "http");
+    }
+
+    #[test]
+    fn sandbox_plan_accepts_common_hardening_fields() {
+        let mut config = test_config("sandbox-plan");
+        config.private_tmp = true;
+        config.private_devices = true;
+        config.private_network = true;
+        config.no_new_privileges = true;
+        config.protect_system = Some("full".to_string());
+        config.protect_home = Some("read-only".to_string());
+        config.read_write_paths = vec!["/tmp".to_string()];
+        config.read_only_paths = vec!["/etc".to_string()];
+        config.capability_bounding_set = Some(vec![
+            "CAP_NET_BIND_SERVICE".to_string(),
+            "CAP_SETPCAP".to_string(),
+        ]);
+        config.ambient_capabilities = vec!["CAP_NET_BIND_SERVICE".to_string()];
+
+        let plan = build_sandbox_plan(&config).unwrap();
+        assert!(plan.needs_mount_namespace());
+        assert_eq!(plan.protect_system, Some(ProtectSystemMode::Full));
+        assert_eq!(plan.protect_home, Some(ProtectHomeMode::ReadOnly));
+        assert_eq!(
+            plan.bounding_caps.as_ref().unwrap(),
+            &vec![CAP_NET_BIND_SERVICE, CAP_SETPCAP]
+        );
+        assert_eq!(plan.ambient_caps, vec![CAP_NET_BIND_SERVICE]);
+    }
+
+    #[test]
+    fn sandbox_plan_rejects_unsupported_protect_value() {
+        let mut config = test_config("bad-protect");
+        config.protect_system = Some("kernel-tent".to_string());
+        let err = build_sandbox_plan(&config).unwrap_err();
+        assert!(err.to_string().contains("unsupported ProtectSystem"));
+    }
+
+    #[test]
+    fn sandbox_plan_rejects_unsupported_capability() {
+        let mut config = test_config("bad-cap");
+        config.capability_bounding_set = Some(vec!["CAP_WAKE_ALARM".to_string()]);
+        let err = build_sandbox_plan(&config).unwrap_err();
+        assert!(err.to_string().contains("CapabilityBoundingSet capability"));
+    }
+
+    #[test]
+    fn sandbox_plan_explicit_empty_bounding_set_drops_all() {
+        let mut config = test_config("drop-all-caps");
+        config.capability_bounding_set = Some(Vec::new());
+        let plan = build_sandbox_plan(&config).unwrap();
+        assert_eq!(plan.bounding_caps.as_ref().unwrap(), &Vec::<i32>::new());
+    }
+
+    #[test]
+    fn sandbox_plan_requires_ambient_subset_and_setpcap() {
+        let mut config = test_config("bad-ambient");
+        config.capability_bounding_set = Some(vec!["CAP_NET_BIND_SERVICE".to_string()]);
+        config.ambient_capabilities = vec!["CAP_NET_BIND_SERVICE".to_string()];
+        let err = build_sandbox_plan(&config).unwrap_err();
+        assert!(err.to_string().contains("requires CAP_SETPCAP"));
+
+        config.capability_bounding_set =
+            Some(vec!["CAP_SETPCAP".to_string(), "CAP_NET_ADMIN".to_string()]);
+        let err = build_sandbox_plan(&config).unwrap_err();
+        assert!(err.to_string().contains("subset"));
+    }
+
+    #[test]
+    fn unsupported_sandbox_request_fails_service_spawn() {
+        let mut config = test_config("bad-sandbox-spawn");
+        config.protect_home = Some("maybe".to_string());
+        let err = spawn_process(&config, "/sys/fs/cgroup", None).unwrap_err();
+        assert!(err.to_string().contains("unsupported ProtectHome"));
+    }
+
+    #[test]
+    fn private_tmp_smoke_when_mount_namespace_allowed() {
+        let mut config = test_config("private-tmp-smoke");
+        config.command = "/bin/sh".to_string();
+        config.args = vec![
+            "-c".to_string(),
+            "test -d /tmp && touch /tmp/mesh-init-private-tmp-smoke".to_string(),
+        ];
+        config.private_tmp = true;
+
+        let pid = match spawn_process(&config, "/sys/fs/cgroup", None) {
+            Ok(pid) => pid,
+            Err(ProcessError::SpawnFailed(error))
+                if error.contains("Operation not permitted") || error.contains("EPERM") =>
+            {
+                eprintln!("skipping PrivateTmp smoke: mount namespace unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("unexpected PrivateTmp spawn error: {error}"),
+        };
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+        assert_eq!(waited, pid as i32);
+        assert!(libc::WIFEXITED(status), "status={status}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "status={status}");
     }
 
     #[test]

@@ -34,3 +34,4 @@ The project consists of several Rust crates:
 - **[User Guide & Tutorial](file:///ws/rust/ssh-mesh/docs/USER_GUIDE.md)**: Conceptual overview, list of use cases, and a step-by-step local mesh tutorial.
 - **[Local Multi-Host Examples](file:///ws/rust/ssh-mesh/docs/examples/README.md)**: Detailed multi-host mesh topology (Gateway, VMs, Bubblewrap) using checked-in certificates.
 - **[App VM Debugging Guide](file:///ws/rust/ssh-mesh/docs/examples/app-vm-debugging.md)**: Detailed troubleshooting commands and logs for VM-based apps.
+- **[mesh-init all-fields TOML](file:///ws/rust/ssh-mesh/crates/mesh-init/examples/all-fields.toml)**: Canonical annotated reference for every supported mesh-init service config field. Keep this file up to date when adding or changing config fields.

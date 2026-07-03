@@ -189,32 +189,24 @@ async fn run(config_dir: String, socket_path: String, command: Option<Vec<String
         let cmd = command[0].clone();
         let args = command[1..].to_vec();
 
-        // Apply defaults from default.toml if present
+        // Apply defaults from default.toml if present. Execution mode is used
+        // by VM/container init scripts as a small "run this command under the
+        // default service policy" entrypoint, so hardening/identity/resource
+        // fields from default.toml should apply to the command too.
         let default_cfg = daemon.configs.lock().get("default").cloned();
 
-        let cfg = mesh_init::config::AppConfig {
-            name: app_name.to_string(),
-            command: cmd,
-            args,
-            uid: default_cfg.as_ref().and_then(|d| d.uid),
-            gid: default_cfg.as_ref().and_then(|d| d.gid),
-            user: default_cfg.as_ref().and_then(|d| d.user.clone()),
-            group: default_cfg.as_ref().and_then(|d| d.group.clone()),
-            env: default_cfg
-                .as_ref()
-                .map(|d| d.env.clone())
-                .unwrap_or_default(),
-            priority: 0,
-            oneshot: true,
-            oom_score_adjust: default_cfg.as_ref().and_then(|d| d.oom_score_adjust),
-            resources: default_cfg
-                .as_ref()
-                .map(|d| d.resources.clone())
-                .unwrap_or_default(),
-            activation: vec![],
-            source_path: None,
-            ..Default::default()
-        };
+        let mut cfg = default_cfg.unwrap_or_default();
+        cfg.name = app_name.to_string();
+        cfg.command = cmd;
+        cfg.args = args;
+        cfg.exec_start_pre.clear();
+        cfg.exec_start_post.clear();
+        cfg.exec_stop.clear();
+        cfg.exec_reload.clear();
+        cfg.restart = mesh_init::config::RestartPolicy::No;
+        cfg.oneshot = true;
+        cfg.activation.clear();
+        cfg.source_path = None;
 
         info!("Executing command: {} {:?}", cfg.command, cfg.args);
         let _pid = daemon.start_service_with_config(cfg, None)?;

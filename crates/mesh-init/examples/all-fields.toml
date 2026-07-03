@@ -1,134 +1,449 @@
-# Example mesh-init service file containing every currently supported service
-# config field. Service files are TOML, not systemd INI.
+# Canonical mesh-init TOML reference.
+#
+# This file intentionally contains every currently supported mesh-init service,
+# socket activation, resource, environment, network, auth, and job field. Keep it
+# in sync with the config structs in crates/mesh/src/config.rs and the
+# human-readable field list in crates/mesh-init/CONFIG.md.
+#
+# Service files are TOML, not systemd INI. Service names come from the filename
+# stem when mesh-init loads a config directory.
 
-# Job metadata fields are top-level TOML keys and must appear before tables.
+# Applies to: mesh job scheduler metadata.
+# Default: true. Persist the job definition so it survives process restarts.
 MeshPersisted = true
+
+# Applies to: mesh job scheduler metadata.
+# Default: false. Hint that work can be prefetched before it is user-visible.
 MeshPrefetch = false
+
+# Applies to: mesh job scheduler metadata.
+# Default: false. Persist the job result for later inspection.
 MeshSaveResult = true
+
+# Applies to: mesh job scheduler tracing.
+# Default: unset. Tag traces/logs produced while this job is handled.
 MeshTraceTag = "example.all-fields"
+
+# Applies to: mesh job scheduler metadata.
+# Default: false. Marks work as directly requested by a user.
 MeshUserInitiated = true
+
+# Applies to: mesh job scheduler metadata.
+# Default: false. Hint that the job should be scheduled with expedited priority.
 MeshExpedited = false
+
+# Applies to: mesh job scheduler constraints/accounting.
+# Default: unset. Estimated download size in bytes.
 MeshEstimatedDownloadBytes = 1048576
+
+# Applies to: mesh job scheduler constraints/accounting.
+# Default: unset. Estimated upload size in bytes.
 MeshEstimatedUploadBytes = 65536
+
+# Applies to: mesh job scheduler constraints/accounting.
+# Default: unset. Minimum useful network chunk size in bytes.
 MeshMinimumNetworkChunkBytes = 4096
 
 [Service]
+# Applies to: service lifecycle before ExecStart.
+# Runs through /bin/sh -c before the main service command.
 ExecStartPre = ["/bin/true"]
+
+# Applies to: service execution.
+# Required command line. The first word is the executable; remaining words become
+# argv after shell-style parsing.
 ExecStart = "/bin/sh -c 'echo mesh-init all-fields example; sleep 60'"
+
+# Applies to: service lifecycle after a successful start.
+# Runs through /bin/sh -c after the main service command is spawned.
 ExecStartPost = ["/bin/true"]
+
+# Applies to: service stop lifecycle.
+# Runs through /bin/sh -c before mesh-init signals the service during stop.
 ExecStop = ["/bin/true"]
+
+# Applies to: mesh-init reload request for this service.
+# Runs through /bin/sh -c when the service is reloaded.
 ExecReload = ["/bin/true"]
+
+# Applies to: service lifecycle.
+# Supported special value: oneshot. Other values behave like a long-running
+# simple service.
 Type = "oneshot"
+
+# Applies to: child process credentials.
+# User name or numeric UID string. Names are resolved with passwd.
 User = "1000"
+
+# Applies to: child process credentials.
+# Group name or numeric GID string. Names are resolved with the group database.
 Group = "1000"
+
+# Applies to: child process setup.
+# Directory used as cwd before exec.
 WorkingDirectory = "/tmp"
+
+# Applies to: service restart policy.
+# Supported values: no, always, on-success, on-failure, on-abnormal, on-abort.
 Restart = "on-failure"
+
+# Applies to: service restart delay.
+# Duration before restart. Supports raw seconds plus ms, s, min, and h suffixes.
 RestartSec = "5s"
+
+# Applies to: service start lifecycle.
+# Maximum time allowed for start hooks and startup before start is considered
+# failed.
 TimeoutStartSec = "30s"
+
+# Applies to: service stop lifecycle.
+# Maximum graceful stop time before optional SIGKILL.
 TimeoutStopSec = "10s"
+
+# Applies to: service stop lifecycle.
+# Signal used for the first stop attempt. Accepts common names or numbers.
 KillSignal = "SIGTERM"
+
+# Applies to: service stop lifecycle.
+# Parsed values: control-group, mixed, process, none. Current enforcement is
+# main-process oriented except none skips signalling.
 KillMode = "control-group"
+
+# Applies to: service stop lifecycle.
+# When true, send SIGKILL after TimeoutStopSec if the service is still alive.
 SendSIGKILL = true
+
+# Applies to: child process setup.
+# Octal umask string applied before exec.
 UMask = "0022"
+
+# Applies to: daemon-started services without socket/PTY activation.
+# Supported values: inherit, null, journal, journal+console, kmsg,
+# kmsg+console, console, file:/path, append:/path, truncate:/path.
+# Journal/kmsg/console values inherit mesh-init's own stdout destination.
+StandardOutput = "inherit"
+
+# Applies to: daemon-started services without socket/PTY activation.
+# Supported values are the same as StandardOutput, plus stdout to share the
+# StandardOutput target.
+StandardError = "inherit"
+
+# Applies to: child process credentials.
+# Supplementary group names or numeric GID strings.
 SupplementaryGroups = ["0"]
+
+# Applies to: Linux OOM killer and mesh resource priority.
+# Range: -1000..1000. Internal mesh priority is OOMScoreAdjust + 1000.
 OOMScoreAdjust = -500
+
+# Applies to: child process privilege hardening.
+# Enforced with prctl(PR_SET_NO_NEW_PRIVS) when true.
 NoNewPrivileges = true
+
+# Applies to: sandboxing configuration.
+# Enforced by mounting private tmpfs instances on /tmp and /var/tmp.
 PrivateTmp = false
+
+# Applies to: sandboxing configuration.
+# Enforced by replacing /dev with a minimal private device tree containing
+# null, zero, full, random, urandom, tty, pts, and shm.
 PrivateDevices = false
+
+# Applies to: child network namespace setup.
+# Enforced with unshare(CLONE_NEWNET).
 PrivateNetwork = false
+
+# Applies to: filesystem sandboxing configuration.
+# Enforced for supported values: true, full, strict, off. Unsupported values
+# warn and fail this service start. In a private mount namespace, mesh-init
+# always bind-remounts /nix and /opt read-only if present. ProtectSystem=true
+# also bind-remounts /usr, /boot, and /efi read-only. ProtectSystem=full adds
+# /etc. ProtectSystem=strict bind-remounts / read-only.
 ProtectSystem = "off"
+
+# Applies to: filesystem sandboxing configuration.
+# Enforced for supported values: true/yes, read-only, tmpfs, off. Unsupported
+# values warn and fail this service start. ProtectHome=true/yes hides /home,
+# /root, and /run/user with mode-000 tmpfs mounts. ProtectHome=read-only
+# bind-remounts those paths read-only. ProtectHome=tmpfs overlays those paths
+# with mode-0755 tmpfs mounts. Missing paths are skipped.
 ProtectHome = "off"
+
+# Applies to: filesystem sandboxing configuration.
+# Re-opens absolute paths as read-write after broader protections.
 ReadWritePaths = ["/tmp"]
+
+# Applies to: filesystem sandboxing configuration.
+# Bind-remounts absolute paths read-only.
 ReadOnlyPaths = ["/etc"]
+
+# Applies to: filesystem sandboxing configuration.
+# Hides absolute paths with an inaccessible mount. Directory paths use an empty
+# mode-000 tmpfs; file paths are masked with /dev/null.
 InaccessiblePaths = ["/root"]
-CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE"]
-AmbientCapabilities = []
+
+# Applies to: Linux capability bounding.
+# Enforced for common capability names. Unsupported names warn and fail this
+# service start. Supported common names: CAP_CHOWN, CAP_DAC_OVERRIDE,
+# CAP_FOWNER, CAP_KILL, CAP_SETGID, CAP_SETUID, CAP_SETPCAP,
+# CAP_NET_BIND_SERVICE, CAP_NET_ADMIN, CAP_SYS_ADMIN. An explicit empty list
+# drops all supported capabilities; omitting the field leaves them unchanged.
+CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE", "CAP_SETPCAP"]
+
+# Applies to: Linux ambient capabilities.
+# Enforced for the same common names as CapabilityBoundingSet. When used with a
+# bounding set, each ambient capability and CAP_SETPCAP must be present there.
+AmbientCapabilities = ["CAP_NET_BIND_SERVICE"]
+
+# Applies to: Accept=true socket activation.
+# stdio passes accepted sockets as stdin/stdout/stderr; hybrid forwards accepted
+# fds to the service JSONL socket with SCM_RIGHTS.
 MeshActivationMode = "hybrid"
+
+# Applies to: Accept=true hybrid socket activation.
+# Unix socket used by mesh-init to deliver accepted fds to the running service.
 MeshActivationSocket = "/tmp/mesh-init-all-fields/control.sock"
 
 [Socket]
+# Applies to: socket activation.
+# false passes listener fds to the service using LISTEN_FDS; true accepts each
+# connection in mesh-init and activates the service per accepted connection.
 Accept = false
+
+# Applies to: Unix socket activation entries.
+# File mode for created Unix sockets. Ignored for TCP/UDP/vsock listeners.
 SocketMode = 0o660
+
+# Applies to: Unix socket activation entries.
+# Owner for created Unix sockets. Ignored for TCP/UDP/vsock listeners.
 SocketUser = "1000"
+
+# Applies to: Unix socket activation entries.
+# Group for created Unix sockets. Ignored for TCP/UDP/vsock listeners.
 SocketGroup = "1000"
 
 [[Socket.Listen]]
+# Applies to: this socket activation listener.
+# stream maps to TCP, Unix stream, or AF_VSOCK stream.
 Type = "stream"
+
+# Applies to: this socket activation listener.
+# TCP bind address. A bare port such as "14022" binds IPv6-any.
 Address = "127.0.0.1:14022"
+
+# Applies to: this socket activation listener.
+# Per-fd name exported through LISTEN_FDNAMES for Accept=false activation.
 Name = "ssh"
 
 [[Socket.Listen]]
+# Applies to: this socket activation listener.
+# stream maps to TCP, Unix stream, or AF_VSOCK stream.
 Type = "stream"
+
+# Applies to: this socket activation listener.
+# Unix stream socket path.
 Address = "/tmp/mesh-init-all-fields/public.sock"
+
+# Applies to: this socket activation listener.
+# Per-fd name exported through LISTEN_FDNAMES for Accept=false activation.
 Name = "public"
 
 [[Socket.Listen]]
+# Applies to: this socket activation listener.
+# datagram maps to UDP or Unix datagram sockets. Accept=true is not supported.
 Type = "datagram"
+
+# Applies to: this socket activation listener.
+# UDP bind address.
 Address = "127.0.0.1:14023"
+
+# Applies to: this socket activation listener.
+# Per-fd name exported through LISTEN_FDNAMES for Accept=false activation.
 Name = "udp-events"
 
 [[Socket.Listen]]
+# Applies to: this socket activation listener.
+# datagram maps to UDP or Unix datagram sockets. Accept=true is not supported.
 Type = "datagram"
+
+# Applies to: this socket activation listener.
+# Unix datagram socket path.
 Address = "/tmp/mesh-init-all-fields/events.sock"
+
+# Applies to: this socket activation listener.
+# Per-fd name exported through LISTEN_FDNAMES for Accept=false activation.
 Name = "uds-events"
 
 [Resources]
+# Applies to: service cgroup v2 memory.low.
+# Memory protected from reclamation when possible.
 MemoryMin = "64M"
+
+# Applies to: service cgroup v2 memory.high.
+# Soft throttling threshold.
 MemoryHigh = "256M"
+
+# Applies to: service cgroup v2 memory.max.
+# Hard memory limit.
 MemoryMax = "512M"
+
+# Applies to: service cgroup v2 cpu.weight.
+# CPU weight in the kernel cgroup range.
 CPUWeight = 100
 
 [Environment]
+# Applies to: child process environment.
+# Passed as RUST_LOG to the child.
 RUST_LOG = "info"
+
+# Applies to: child process environment.
+# Example arbitrary service environment variable.
 EXAMPLE_MODE = "all-fields"
 
 [Network]
+# Applies to: service network setup.
+# Supported values include none, pasta, and mesh-tun.
 backend = "mesh-tun"
+
+# Applies to: service network sidecar setup.
+# Sidecar command for backends such as pasta.
 command = "pasta"
+
+# Applies to: service network sidecar setup.
+# Sidecar argv. {pid} is expanded to the service process pid.
 args = ["--config-net", "{pid}"]
+
+# Applies to: mesh-tun network backend.
+# Control socket used to attach the service namespace.
 control_socket = "/tmp/mesh-tun/control.sock"
+
+# Applies to: mesh-tun network backend.
+# Interface name inside the service namespace.
 if_name = "mesh0"
+
+# Applies to: mesh-tun network backend.
+# Service-side interface address.
 address = "10.5.0.2/24"
+
+# Applies to: mesh-tun network backend.
+# Default gateway address.
 gateway = "10.5.0.1"
+
+# Applies to: mesh-tun network backend.
+# Interface MTU.
 mtu = 65520
+
+# Applies to: mesh-tun network backend.
+# Whether to install a default route through the mesh interface.
 default_route = true
+
+# Applies to: mesh-tun network backend.
+# TCP redirect listener port for egress interception.
 egress_redirect_port = 15001
+
+# Applies to: mesh-tun network backend.
+# UID excluded from egress redirects.
 egress_redirect_uid = 1000
 
 [Network.env]
+# Applies to: service network sidecar setup.
+# Environment variable passed to the network sidecar.
 PASTA_TRACE = "0"
 
 [[Peer]]
+# Applies to: mesh-init control and activation authorization.
+# UID allowed to operate on or activate this service.
 uid = 1000
+
+# Applies to: mesh-init control and activation authorization.
+# Accepted peer identity.
 id = "example.mesh.local"
+
+# Applies to: mesh-init control and activation authorization.
+# Accepted peer email identity.
 email = "example@example.com"
+
+# Applies to: mesh-init delegated authorization.
+# Identity pattern this peer may delegate to.
 delegate = "*.mesh.local"
 
 [[MeshImpersonation]]
+# Applies to: mesh-init identity impersonation rules.
+# Source identity allowed to impersonate.
 from = "example.mesh.local"
+
+# Applies to: mesh-init identity impersonation rules.
+# Target identity pattern allowed for impersonation.
 to = "*.mesh.local"
 
 [Schedule]
+# Applies to: mesh job scheduler.
+# Periodic execution interval in seconds.
 periodic_secs = 3600
+
+# Applies to: mesh job scheduler.
+# Flexible scheduling window in seconds.
 flex_secs = 300
+
+# Applies to: mesh job scheduler.
+# Minimum latency before running in seconds.
 minimum_latency_secs = 30
+
+# Applies to: mesh job scheduler.
+# Latest override deadline in seconds.
 override_deadline_secs = 7200
 
 [Constraints]
+# Applies to: mesh job scheduler constraints.
+# Network requirement such as unmetered.
 network_type = "unmetered"
+
+# Applies to: mesh job scheduler constraints.
+# Require the device to be charging.
 requires_charging = false
+
+# Applies to: mesh job scheduler constraints.
+# Require the device to be idle.
 requires_device_idle = false
+
+# Applies to: mesh job scheduler constraints.
+# Require battery not low.
 requires_battery_not_low = true
+
+# Applies to: mesh job scheduler constraints.
+# Require storage not low.
 requires_storage_not_low = true
+
+# Applies to: mesh job scheduler constraints.
+# Event names that may trigger this job.
 triggers = ["network", "timer"]
+
+# Applies to: mesh job scheduler constraints.
+# Maximum trigger delay in seconds.
 trigger_max_delay_secs = 60
 
 [Constraints.custom]
+# Applies to: mesh job scheduler custom constraints.
+# Example boolean constraint.
 has_gpu = false
+
+# Applies to: mesh job scheduler custom constraints.
+# Example boolean constraint.
 inside_vm = true
 
 [Backoff]
+# Applies to: mesh job scheduler retry policy.
+# Initial retry delay in seconds.
 initial_secs = 5
+
+# Applies to: mesh job scheduler retry policy.
+# Retry policy name.
 policy = "exponential"
+
+# Applies to: mesh job scheduler retry policy.
+# Maximum retry attempts.
 max_retries = 10
+
+# Applies to: mesh job scheduler retry policy.
+# Maximum retry delay in seconds.
 max_secs = 3600
