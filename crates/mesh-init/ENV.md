@@ -89,11 +89,19 @@ Specialized:
 | `LISTEN_PID` | unset | Process ID that owns systemd-style inherited socket FDs. FDs are collected only when it matches the current process. |
 
 
-Deprecated - use 'mesh' envs:
+Config and identity:
 
-| `MESH_INIT_DIR` | `<system_home>/etc/mesh-init` | Directory scanned for service configuration. |
-| `MESH_INIT_RUN` | `<system_home>/run/mesh-init` | Runtime directory for the control socket; socket path is `<MESH_INIT_RUN>/control.sock`. |
-| `USER_INIT` | `/data/mesh` | Base directory for on-demand per-user service configs at `<USER_INIT>/<name>/init.toml`. |
+| `MESH_INIT_DIR` | root: `/opt/system/etc/mesh-init`, then `/home/system/etc/mesh-init`; non-root: `./etc/mesh-init` | Full replacement directory for core service configs. When unset, root loads `/opt` first and `/home` second, so `/home` overrides packaged configs. |
+| `MESH_INIT_SOCK` | `/run/mesh/mesh-init/mesh.sock` for root systems | Exact mesh-init control/API socket path. |
+| `MESH_INIT_UIDMAP` | `/home/system/etc/uidmap` | Persistent root-mode on-demand app UID/GID map. |
+| `MESH_INIT_UID_MIN` | `2000` | First UID/GID mesh-init may allocate for root-mode on-demand apps. |
+| `MESH_INIT_UID_MAX` | `59999` | Last UID/GID mesh-init may allocate for root-mode on-demand apps. |
+| `MESH_RUN_USER_BASE` | `/run/user` | Advanced/test override for the root-mode on-demand app runtime directory base. |
+| `USER_INIT` | root: `/opt/<name>/etc/mesh-init/<name>.toml`, then `/home/<name>/etc/mesh-init/<name>.toml`; non-root: `./etc/mesh-init/<name>.toml` | Legacy replacement base for on-demand configs. When set, lookup is `<USER_INIT>/<name>/init.toml`. |
+
+Deprecated - use explicit socket/config envs:
+
+| `MESH_INIT_RUN` | `<system_home>/run/mesh-init` | Deprecated runtime directory override; socket path is `<MESH_INIT_RUN>/control.sock`. |
 
 
 ## Generated Variables

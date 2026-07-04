@@ -28,17 +28,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let app_paths = mesh::paths::AppPaths::for_app("ssh-mesh");
     let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
 
-    // Get base directory from environment variable SSH_BASEDIR
-    // If not set, use $HOME/.ssh or /tmp/.ssh as default
+    // Get base directory from environment variable SSH_BASEDIR. If not set,
+    // use the ssh-mesh app config directory.
     let base_dir = env::var("SSH_BASEDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut path = env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/tmp"));
-            path.push(".ssh");
-            path
-        });
+        .unwrap_or_else(|_| app_paths.etc.clone());
 
     // Ensure base directory exists
     let _ = std::fs::create_dir_all(&base_dir);

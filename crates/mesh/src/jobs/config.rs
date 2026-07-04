@@ -80,6 +80,7 @@ impl JobConfig {
                 capability_bounding_set: self.capability_bounding_set.clone(),
                 ambient_capabilities: self.ambient_capabilities.clone(),
                 allow_dangerous_env: self.allow_dangerous_env.clone(),
+                ..Default::default()
             },
             socket: None,
             resources: crate::config::ResourceLimits {

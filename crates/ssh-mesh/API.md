@@ -54,7 +54,7 @@ Base route: `/_m/trace`
 The upstream traceweb UDS path comes from `TRACEWEB_UDS`, defaulting to:
 
 ```text
-/home/traceweb/run/traceweb/control.sock
+/run/mesh/traceweb/mesh.sock
 ```
 
 | HTTP route | Upstream JSON-RPC method | Description |
@@ -75,10 +75,10 @@ SSE event data is the `trace_entry.params` object from traceweb.
 Base route: `/_m/proxy`
 
 The upstream UDS path comes from `<APP>_UDS` when set. Otherwise `mesh-init`
-defaults to the system control socket:
+defaults to the shared mesh endpoint:
 
 ```text
-/home/system/run/mesh-init/control.sock
+/run/mesh/mesh-init/mesh.sock
 ```
 
 | HTTP route | Description |

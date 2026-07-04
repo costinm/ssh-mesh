@@ -1,6 +1,6 @@
 # `mesh-init` — UDS Control Protocol API
 
-`mesh-init` exposes a JSONL (JSON lines) control interface over a Unix Domain Socket (UDS) located at `/run/system/mesh-init/control.sock` (or `$HOME/run/mesh-init/control.sock` in user mode).
+`mesh-init` exposes its control interface over a Unix Domain Socket (UDS) located at `/run/mesh/mesh-init/mesh.sock` on root-run systems. The endpoint currently accepts line JSON, JSON-RPC-shaped requests, and fd-passing requests; the path is protocol-neutral so future encodings can reuse it.
 
 Clients can interact using flat JSON structures where the `method` field defines the action. The protocol supports standard control requests as well as file descriptor-passing requests via Unix domain socket ancillary data (`SCM_RIGHTS`).
 

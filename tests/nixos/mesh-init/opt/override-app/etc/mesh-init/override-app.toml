@@ -1,0 +1,5 @@
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/sh -c 'echo opt > /home/override-app/source'"
+StandardOutput = "inherit"
+StandardError = "inherit"

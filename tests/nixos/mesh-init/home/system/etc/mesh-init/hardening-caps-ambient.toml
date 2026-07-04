@@ -1,0 +1,9 @@
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/sh -c 'set -eu; grep -Eq \"^CapAmb:[[:space:]]*0*400$\" /proc/self/status; echo PASS caps-ambient > /home/system/tmp/results-caps-ambient'"
+User = "65534"
+Group = "65534"
+CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE", "CAP_SETPCAP"]
+AmbientCapabilities = ["CAP_NET_BIND_SERVICE"]
+StandardOutput = "inherit"
+StandardError = "inherit"

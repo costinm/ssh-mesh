@@ -1,57 +1,49 @@
-"""DMesh — Python bindings for the ssh-mesh network stack.
+"""DMesh — Pure Python implementation of crates/mesh.
 
-Usage:
-    from dmesh import PyMeshNode, PyMeshStream
-
-    node = PyMeshNode("/path/to/data")
-    node.start(15022, 8080)
-    pub_key = node.get_public_key()
+Provides protocol parsing (JSONL, JSON-RPC 2.0, Text), systemd socket activation,
+SO_PEERCRED peer authentication, UDS SCM_RIGHTS FD passing, and mesh-init control.
 """
 
-import importlib.util
-import sys
-from pathlib import Path
+# Re-export pure Python implementation
+from .jsonl import ProtocolFormat, RawRequest, Response, parse_line, format_response
+from .listener import MeshListener, StdioConnection
+from .client import MeshClient
+from .mcp import McpRegistry
+from .process import (
+    resolve_control_socket_path,
+    is_mesh_init_alive,
+    start_mesh_init,
+    ServiceController,
+)
 
-# 1. Try standard import (installed via maturin/pip)
+# Optional: Try importing legacy PyO3 bindings if compiled, for backward compatibility
 try:
     from . import dmesh_py
+    PyMeshNode = dmesh_py.PyMeshNode
+    PyMeshStream = dmesh_py.PyMeshStream
 except ImportError:
-    # 2. Development mode: find the .so in target/
-    current_file = Path(__file__).resolve()
-    # Structure: .../python/dmesh/__init__.py
-    # parents[0]: dmesh
-    # parents[1]: python (where target/ lives)
-    python_root = current_file.parents[1]
+    # If not compiled, we can define dummy/mock classes if needed
+    class PyMeshNode:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PyMeshNode requires legacy compiled Rust dmesh_py extension module.")
+    class PyMeshStream:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PyMeshStream requires legacy compiled Rust dmesh_py extension module.")
 
-    potential_libs = [
-        python_root / "target" / "debug" / "libdmesh.so",
-        python_root / "target" / "release" / "libdmesh.so",
-        python_root / "target" / "x86_64-unknown-linux-gnu" / "debug" / "libdmesh.so",
-        python_root / "target" / "x86_64-unknown-linux-gnu" / "release" / "libdmesh.so",
-    ]
-
-    lib_path = None
-    for p in potential_libs:
-        if p.exists():
-            lib_path = p
-            break
-
-    if lib_path:
-        spec = importlib.util.spec_from_file_location("dmesh_py", str(lib_path))
-        if spec and spec.loader:
-            dmesh_py = importlib.util.module_from_spec(spec)
-            sys.modules["dmesh.dmesh_py"] = dmesh_py
-            spec.loader.exec_module(dmesh_py)
-        else:
-            raise ImportError(f"Could not load dmesh_py from {lib_path}")
-    else:
-        raise ImportError(
-            "Could not find dmesh_py extension. "
-            "Run 'cargo build -p dmesh --features python' in python/ or install via 'maturin develop'."
-        )
-
-# Re-export key classes
-PyMeshNode = dmesh_py.PyMeshNode
-PyMeshStream = dmesh_py.PyMeshStream
-
-__all__ = ["PyMeshNode", "PyMeshStream"]
+__all__ = [
+    "ProtocolFormat",
+    "RawRequest",
+    "Response",
+    "parse_line",
+    "format_response",
+    "MeshListener",
+    "StdioConnection",
+    "MeshClient",
+    "McpRegistry",
+    "resolve_control_socket_path",
+    "is_mesh_init_alive",
+    "start_mesh_init",
+    "ServiceController",
+    "PyMeshNode",
+    "PyMeshStream",
+]

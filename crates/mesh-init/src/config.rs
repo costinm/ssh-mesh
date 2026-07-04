@@ -6,7 +6,10 @@
 //! - `[Socket]` configs define FDs to listen on; accept triggers service start.
 //! - Resource limits map to cgroup v2 knobs (memory.low/high/max, cpu.weight).
 
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
@@ -91,6 +94,315 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
     configs
 }
 
+/// Resolve core config directories in load order.
+///
+/// Later directories override earlier ones when the same service name appears
+/// more than once.
+pub fn core_config_dirs() -> Vec<PathBuf> {
+    core_config_dirs_with_context(
+        |key| std::env::var_os(key),
+        || std::env::current_dir().ok(),
+        unsafe { libc::getuid() },
+    )
+}
+
+fn core_config_dirs_with_context<F, C>(mut env: F, current_dir: C, uid: u32) -> Vec<PathBuf>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+    C: FnOnce() -> Option<PathBuf>,
+{
+    if let Some(dir) = env("MESH_INIT_DIR") {
+        return vec![PathBuf::from(dir)];
+    }
+    if uid == 0 {
+        let (home_base, opt_base) = home_opt_bases(&mut env);
+        vec![
+            opt_base.join("system/etc/mesh-init"),
+            home_base.join("system/etc/mesh-init"),
+        ]
+    } else {
+        vec![
+            current_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("etc/mesh-init"),
+        ]
+    }
+}
+
+/// Resolve on-demand config candidates for a service in precedence order.
+pub fn on_demand_config_candidates(service_name: &str) -> Vec<PathBuf> {
+    on_demand_config_candidates_with_context(
+        service_name,
+        |key| std::env::var_os(key),
+        || std::env::current_dir().ok(),
+        unsafe { libc::getuid() },
+    )
+}
+
+fn on_demand_config_candidates_with_context<F, C>(
+    service_name: &str,
+    mut env: F,
+    current_dir: C,
+    uid: u32,
+) -> Vec<PathBuf>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+    C: FnOnce() -> Option<PathBuf>,
+{
+    if let Some(dir) = env("USER_INIT") {
+        return vec![PathBuf::from(dir).join(service_name).join("init.toml")];
+    }
+    if uid == 0 {
+        let (home_base, opt_base) = home_opt_bases(&mut env);
+        vec![
+            opt_base
+                .join(service_name)
+                .join("etc/mesh-init")
+                .join(format!("{service_name}.toml")),
+            home_base
+                .join(service_name)
+                .join("etc/mesh-init")
+                .join(format!("{service_name}.toml")),
+        ]
+    } else {
+        vec![
+            current_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("etc/mesh-init")
+                .join(format!("{service_name}.toml")),
+        ]
+    }
+}
+
+fn home_opt_bases<F>(env: &mut F) -> (PathBuf, PathBuf)
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    let mesh_root = env("MESH_HOME").map(PathBuf::from);
+    let home_base = env("MESH_HOME_BASE")
+        .map(PathBuf::from)
+        .or_else(|| mesh_root.as_ref().map(|root| root.join("home")))
+        .unwrap_or_else(|| PathBuf::from("/home"));
+    let opt_base = env("MESH_OPT_BASE")
+        .map(PathBuf::from)
+        .or_else(|| mesh_root.as_ref().map(|root| root.join("opt")))
+        .unwrap_or_else(|| PathBuf::from("/opt"));
+    (home_base, opt_base)
+}
+
+/// Return the last existing candidate, so mutable `/home` configs override
+/// packaged `/opt` configs.
+pub fn select_on_demand_config(service_name: &str) -> Option<PathBuf> {
+    on_demand_config_candidates(service_name)
+        .into_iter()
+        .filter(|path| path.exists())
+        .last()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppIdentity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Resolve or create the root-mode identity for an on-demand app.
+pub fn resolve_or_create_app_identity(service_name: &str) -> Result<AppIdentity, ConfigError> {
+    if unsafe { libc::getuid() } != 0 {
+        return Err(ConfigError::Invalid(
+            "app identity allocation requires root".to_string(),
+        ));
+    }
+    if let Err(reason) = mesh::config::validate_service_name(service_name) {
+        return Err(ConfigError::Invalid(format!(
+            "invalid service name: {reason}"
+        )));
+    }
+
+    let home = mesh::paths::AppPaths::for_app(service_name).home;
+    if home.exists() {
+        if !home.is_dir() {
+            return Err(ConfigError::Invalid(format!(
+                "{} exists but is not a directory",
+                home.display()
+            )));
+        }
+        let metadata = std::fs::metadata(&home)?;
+        let identity = AppIdentity {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        ensure_run_user(identity)?;
+        return Ok(identity);
+    }
+
+    let mut uidmap = load_uidmap()?;
+    let identity = if let Some(identity) = uidmap.get(service_name).copied() {
+        identity
+    } else {
+        let identity = allocate_app_identity(&uidmap)?;
+        uidmap.insert(service_name.to_string(), identity);
+        save_uidmap(&uidmap)?;
+        identity
+    };
+
+    std::fs::create_dir_all(&home)?;
+    chown_path(&home, identity.uid, identity.gid)?;
+    let mut perms = std::fs::metadata(&home)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&home, perms)?;
+    ensure_run_user(identity)?;
+    Ok(identity)
+}
+
+fn uidmap_path() -> PathBuf {
+    std::env::var_os("MESH_INIT_UIDMAP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| mesh::paths::AppPaths::for_app("system").etc.join("uidmap"))
+}
+
+fn uid_range() -> Result<(u32, u32), ConfigError> {
+    let min = std::env::var("MESH_INIT_UID_MIN")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(2000);
+    let max = std::env::var("MESH_INIT_UID_MAX")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(59999);
+    if min > max {
+        return Err(ConfigError::Invalid(format!(
+            "MESH_INIT_UID_MIN ({min}) must be <= MESH_INIT_UID_MAX ({max})"
+        )));
+    }
+    Ok((min, max))
+}
+
+fn load_uidmap() -> Result<BTreeMap<String, AppIdentity>, ConfigError> {
+    let path = uidmap_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries = BTreeMap::new();
+    for (line_no, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or_else(|| ConfigError::Invalid(format!("invalid uidmap line {}", line_no + 1)))?;
+        let uid = parts
+            .next()
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!("missing uid on uidmap line {}", line_no + 1))
+            })?
+            .parse::<u32>()
+            .map_err(|e| {
+                ConfigError::Invalid(format!("invalid uid on uidmap line {}: {}", line_no + 1, e))
+            })?;
+        let gid = parts
+            .next()
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!("missing gid on uidmap line {}", line_no + 1))
+            })?
+            .parse::<u32>()
+            .map_err(|e| {
+                ConfigError::Invalid(format!("invalid gid on uidmap line {}: {}", line_no + 1, e))
+            })?;
+        if parts.next().is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "too many fields on uidmap line {}",
+                line_no + 1
+            )));
+        }
+        if let Err(reason) = mesh::config::validate_service_name(name) {
+            return Err(ConfigError::Invalid(format!(
+                "invalid uidmap service '{}' on line {}: {}",
+                name,
+                line_no + 1,
+                reason
+            )));
+        }
+        entries.insert(name.to_string(), AppIdentity { uid, gid });
+    }
+    Ok(entries)
+}
+
+fn save_uidmap(entries: &BTreeMap<String, AppIdentity>) -> Result<(), ConfigError> {
+    let path = uidmap_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        writeln!(file, "# service uid gid")?;
+        for (service, identity) in entries {
+            writeln!(file, "{} {} {}", service, identity.uid, identity.gid)?;
+        }
+        file.sync_all()?;
+    }
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn allocate_app_identity(
+    entries: &BTreeMap<String, AppIdentity>,
+) -> Result<AppIdentity, ConfigError> {
+    let (min, max) = uid_range()?;
+    let mut used = HashSet::from([0]);
+    if let Some(uid) = mesh::auth::system_uid() {
+        used.insert(uid);
+    }
+    if let Some(uid) = mesh::auth::trusted_sshd_uid() {
+        used.insert(uid);
+    }
+    if let Some(uid) = mesh::auth::ssh_mesh_uid() {
+        used.insert(uid);
+    }
+    for identity in entries.values() {
+        used.insert(identity.uid);
+        used.insert(identity.gid);
+    }
+    for id in min..=max {
+        if !used.contains(&id) {
+            return Ok(AppIdentity { uid: id, gid: id });
+        }
+    }
+    Err(ConfigError::Invalid(format!(
+        "no free UID/GID in range {min}..={max}"
+    )))
+}
+
+fn ensure_run_user(identity: AppIdentity) -> Result<(), ConfigError> {
+    let path = run_user_base().join(identity.uid.to_string());
+    std::fs::create_dir_all(&path)?;
+    chown_path(&path, identity.uid, identity.gid)?;
+    let mut perms = std::fs::metadata(&path)?.permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn run_user_base() -> PathBuf {
+    std::env::var_os("MESH_RUN_USER_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/user"))
+}
+
+fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<(), ConfigError> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        ConfigError::Invalid(format!("path contains NUL bytes: {}", path.display()))
+    })?;
+    if unsafe { libc::chown(path.as_ptr(), uid, gid) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -98,6 +410,132 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_from<'a>(vars: &'a [(&'a str, &'a str)]) -> impl FnMut(&str) -> Option<OsString> + 'a {
+        let map: HashMap<&str, &str> = vars.iter().copied().collect();
+        move |key| map.get(key).map(OsString::from)
+    }
+
+    #[test]
+    fn core_config_dirs_layer_root_opt_then_home() {
+        let dirs = core_config_dirs_with_context(env_from(&[]), || None, 0);
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("/opt/system/etc/mesh-init"),
+                std::path::PathBuf::from("/home/system/etc/mesh-init"),
+            ]
+        );
+    }
+
+    #[test]
+    fn core_config_dirs_non_root_uses_cwd() {
+        let dirs = core_config_dirs_with_context(
+            env_from(&[]),
+            || Some(std::path::PathBuf::from("/workspace/app")),
+            1000,
+        );
+        assert_eq!(
+            dirs,
+            vec![std::path::PathBuf::from("/workspace/app/etc/mesh-init")]
+        );
+    }
+
+    #[test]
+    fn core_config_dirs_env_replaces_defaults() {
+        let dirs = core_config_dirs_with_context(
+            env_from(&[("MESH_INIT_DIR", "/custom/etc")]),
+            || Some(std::path::PathBuf::from("/workspace/app")),
+            0,
+        );
+        assert_eq!(dirs, vec![std::path::PathBuf::from("/custom/etc")]);
+    }
+
+    #[test]
+    fn on_demand_candidates_root_opt_then_home() {
+        let dirs = on_demand_config_candidates_with_context("demo", env_from(&[]), || None, 0);
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("/opt/demo/etc/mesh-init/demo.toml"),
+                std::path::PathBuf::from("/home/demo/etc/mesh-init/demo.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn on_demand_candidates_user_init_replaces_defaults() {
+        let dirs = on_demand_config_candidates_with_context(
+            "demo",
+            env_from(&[("USER_INIT", "/data/mesh")]),
+            || None,
+            0,
+        );
+        assert_eq!(
+            dirs,
+            vec![std::path::PathBuf::from("/data/mesh/demo/init.toml")]
+        );
+    }
+
+    #[test]
+    fn on_demand_candidates_non_root_uses_cwd() {
+        let dirs = on_demand_config_candidates_with_context(
+            "demo",
+            env_from(&[]),
+            || Some(std::path::PathBuf::from("/workspace/app")),
+            1000,
+        );
+        assert_eq!(
+            dirs,
+            vec![std::path::PathBuf::from(
+                "/workspace/app/etc/mesh-init/demo.toml"
+            )]
+        );
+    }
+
+    #[test]
+    fn uidmap_reuses_existing_identity() {
+        if unsafe { libc::getuid() } != 0 {
+            return;
+        }
+        let _guard = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let home_base = tmp.path().join("home");
+        let run_user_base = tmp.path().join("run/user");
+        let uidmap = home_base.join("system/etc/uidmap");
+        std::fs::create_dir_all(uidmap.parent().unwrap()).unwrap();
+        std::fs::write(&uidmap, "demo 4242 4242\n").unwrap();
+        unsafe {
+            std::env::set_var("MESH_HOME_BASE", &home_base);
+            std::env::set_var("MESH_RUN_USER_BASE", &run_user_base);
+            std::env::set_var("MESH_INIT_UIDMAP", &uidmap);
+        }
+
+        let identity = resolve_or_create_app_identity("demo").unwrap();
+
+        unsafe {
+            std::env::remove_var("MESH_HOME_BASE");
+            std::env::remove_var("MESH_RUN_USER_BASE");
+            std::env::remove_var("MESH_INIT_UIDMAP");
+        }
+        assert_eq!(
+            identity,
+            AppIdentity {
+                uid: 4242,
+                gid: 4242
+            }
+        );
+        assert!(home_base.join("demo").is_dir());
+        assert!(run_user_base.join("4242").is_dir());
+    }
 
     #[test]
     fn test_parse_toml_basic() {

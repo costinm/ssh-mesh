@@ -15,6 +15,7 @@ prefer the common helper when possible.
 | `MESH_HOME` | `$PWD/mesh` for non-root, unset for root | Pseudo-root for mesh app layout. When set, defaults become `<MESH_HOME>/home/<app>` and `<MESH_HOME>/opt/<app>`. |
 | `MESH_APP_HOME` | `<home_base>/<app>` | Overrides the full mutable app home path used by `AppPaths::for_app`. |
 | `MESH_APP_OPT` | `<opt_base>/<app>` | Overrides the full packaged/read-only app path used by `AppPaths::for_app`. |
+| `MESH_RUN_BASE` | `<MESH_HOME>/run/mesh` for non-root, `/run/mesh` for root | Base directory for public mesh IPC endpoints. App endpoints are `<MESH_RUN_BASE>/<app>/mesh.sock`. |
 | `MESH_RES_DIR` | `<app_home>/etc/resources`, then `<app_opt>/resources` | Replaces the normal resource lookup overlay with one explicit resource directory. |
 
 Deprecated:

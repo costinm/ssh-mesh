@@ -1,0 +1,5 @@
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/sh -c 'echo home > /home/system/tmp/override-check'"
+StandardOutput = "inherit"
+StandardError = "inherit"

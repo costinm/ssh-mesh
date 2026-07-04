@@ -67,8 +67,8 @@ ExecStop = ["/bin/true"]
 ExecReload = ["/bin/true"]
 
 # Applies to: service lifecycle.
-# Supported special value: oneshot. Other values behave like a long-running
-# simple service.
+# Supported values: oneshot (runs once at startup), exec (long-running daemon started at boot).
+# If Type is omitted or empty, the service does not auto-start at boot and must be started via socket activation or an explicit start command.
 Type = "oneshot"
 
 # Applies to: child process credentials.
@@ -127,6 +127,22 @@ StandardOutput = "inherit"
 # Supported values are the same as StandardOutput, plus stdout to share the
 # StandardOutput target.
 StandardError = "inherit"
+
+# Applies to: service startup readiness detection.
+# Substring to search for in stderr. The service is considered ready when this is seen.
+ReadyMatch = "listening"
+
+# Applies to: service health/watchdog tracking.
+# Substring to search for in stderr. Only lines containing this pattern reset the watchdog.
+WatchdogMatch = "active"
+
+# Applies to: service health/watchdog tracking.
+# Timeout in seconds. If no line matching WatchdogMatch is printed in this duration, the service is killed.
+WatchdogSec = 30
+
+# Applies to: service scale-to-zero / idle termination.
+# Stop the service after this many seconds of being idle (active=0 and no stderr output).
+IdleTerminationSec = 300
 
 # Applies to: child process credentials.
 # Supplementary group names or numeric GID strings.

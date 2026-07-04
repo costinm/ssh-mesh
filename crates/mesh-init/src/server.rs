@@ -88,7 +88,7 @@ impl ControlServer {
             }
             if let Ok(metadata) = std::fs::metadata(parent) {
                 let mut perms = metadata.permissions();
-                std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o770);
+                std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
                 std::fs::set_permissions(parent, perms).with_context(|| {
                     format!(
                         "set permissions on mesh-init control socket directory {}",
@@ -112,11 +112,12 @@ impl ControlServer {
             };
         }
 
-        // Set permissions so root/owner/group can connect
+        // The socket is locally discoverable/connectable; requests are
+        // authorized by the mesh-init protocol after peer credentials are read.
         let mut perms = std::fs::metadata(&self.socket_path)
             .with_context(|| format!("stat mesh-init control socket {}", self.socket_path))?
             .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o660);
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o666);
         std::fs::set_permissions(&self.socket_path, perms).with_context(|| {
             format!(
                 "set permissions on mesh-init control socket {}",
@@ -388,12 +389,8 @@ async fn handle_connection(
                         let mut std_stream = stream.into_std()?;
                         std_stream.set_nonblocking(false)?;
                         let fds = recv_fds(&std_stream)?;
-                        if fds.len() > 1 {
-                            debug!("Received {} FDs with request; using the first", fds.len());
-                        }
-                        let fd = fds.into_iter().next().expect("at least one FD");
                         let response = daemon
-                            .handle_request_with_fd(request, fd, peer_uid, peer_gid)
+                            .handle_request_with_fds(request, fds, peer_uid, peer_gid)
                             .await;
                         let response_str = format_response(response, &format)?;
                         std_stream.write_all(response_str.as_bytes())?;

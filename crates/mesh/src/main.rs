@@ -278,14 +278,24 @@ fn get_socket_path(app: &str) -> String {
     let env_prefix = app.to_uppercase().replace("-", "_");
     let env_var = format!("{}_RUN", env_prefix);
 
-    let run_dir = if let Ok(dir) = std::env::var(&env_var) {
-        std::path::PathBuf::from(dir)
-    } else if app == "mesh-init" {
-        mesh::paths::AppPaths::for_app("system").run_dir("mesh-init")
+    if let Ok(dir) = std::env::var(&env_var) {
+        return std::path::PathBuf::from(dir)
+            .join("control.sock")
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    if app == "mesh-init" {
+        mesh::paths::AppPaths::for_app("mesh-init")
+            .mesh_socket()
+            .to_string_lossy()
+            .into_owned()
     } else {
-        mesh::paths::AppPaths::for_app(app).run_dir(app)
-    };
-    run_dir.join("control.sock").to_string_lossy().into_owned()
+        mesh::paths::AppPaths::for_app(app)
+            .mesh_socket()
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 async fn send_request(socket_path: &str, request: &Request) -> Result<Response> {

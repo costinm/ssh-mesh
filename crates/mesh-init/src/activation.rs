@@ -701,14 +701,7 @@ async fn run_inet_listener(
         .filter(|b| !b.is_empty())
         .unwrap_or_else(|| "[::]".to_string());
     let addr = format!("{}:{}", bind_addr, port);
-    if bind_addr == "0.0.0.0" || bind_addr == "::" || bind_addr == "[::]" {
-        warn!(
-            "{} activation for '{}' binds {} — ensure auth or firewalling is in place",
-            if datagram { "UDP" } else { "TCP" },
-            service_name,
-            addr
-        );
-    }
+
     info!(
         "Starting {} activation listener for '{}' on {} (wait={})",
         if datagram { "UDP" } else { "TCP" },
@@ -1059,9 +1052,10 @@ async fn run_uds_listener(
         }
     };
 
-    // Apply socket permissions from config, or default 0o660
+    // Apply socket permissions from config, or default to public local IPC.
+    // Apps authenticate requests at the protocol layer.
     if let Ok(metadata) = std::fs::metadata(&path) {
-        let mode = socket_mode.unwrap_or(0o660);
+        let mode = socket_mode.unwrap_or(0o666);
         let mut perms = metadata.permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, mode);
         let _ = std::fs::set_permissions(&path, perms);
@@ -1320,7 +1314,7 @@ async fn handle_listener(
                     &cg,
                     Some(ActivationFd::Stdio(client_owned)),
                 ) {
-                    Ok(pid) => {
+                    Ok((pid, _)) => {
                         debug!("Spawned activated instance PID {}", pid);
                         if let Some(ref tracked) = *daemon.tracked_child_pids.lock() {
                             tracked.lock().insert(pid);

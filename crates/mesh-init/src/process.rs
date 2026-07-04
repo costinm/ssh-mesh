@@ -643,6 +643,12 @@ pub struct ManagedProcess {
     pub next_restart_at: Option<Instant>,
     /// Cgroup path for this service.
     pub cgroup_path: Option<String>,
+    pub ready: bool,
+    pub last_watchdog_ping: Option<Instant>,
+    pub last_stderr_at: Option<Instant>,
+    pub last_active: Option<u64>,
+    pub last_sess: Option<u64>,
+    pub idle_since: Option<Instant>,
 }
 
 impl ManagedProcess {
@@ -664,6 +670,12 @@ impl ManagedProcess {
             consecutive_failures: 0,
             next_restart_at: None,
             cgroup_path: None,
+            ready: false,
+            last_watchdog_ping: None,
+            last_stderr_at: None,
+            last_active: None,
+            last_sess: None,
+            idle_since: None,
         }
     }
 
@@ -702,6 +714,12 @@ impl ManagedProcess {
 pub enum ActivationFd {
     /// Accept=true inetd style: accepted client socket to stdin/stdout/stderr.
     Stdio(std::os::fd::OwnedFd),
+    /// Terminal-style activation with distinct stdin/stdout/stderr pipes.
+    StdioPipes {
+        stdin: std::os::fd::OwnedFd,
+        stdout: std::os::fd::OwnedFd,
+        stderr: std::os::fd::OwnedFd,
+    },
     /// Terminal-style activation: PTY slave → controlling terminal and stdio.
     Pty(std::os::fd::OwnedFd),
     /// Accept=false mode: listening sockets passed to the child using systemd
@@ -835,7 +853,7 @@ pub fn spawn_process(
     config: &AppConfig,
     cgroup_path: &str,
     passed_fd: Option<ActivationFd>,
-) -> Result<u32, ProcessError> {
+) -> Result<(u32, Option<std::process::ChildStderr>), ProcessError> {
     info!(
         "Spawning service '{}': {} {:?}",
         config.name, config.command, config.args
@@ -942,8 +960,8 @@ pub fn spawn_process(
         }
     }
 
+    let is_passed_fd_some = passed_fd.is_some();
     let mut _passed_fd_keepalive: Vec<std::os::fd::OwnedFd> = Vec::new();
-
     match passed_fd {
         Some(ActivationFd::Stdio(fd)) => {
             // inetd-style: map client socket to stdin/stdout/stderr
@@ -952,6 +970,15 @@ pub fn spawn_process(
             cmd.stdin(std::process::Stdio::from(fd));
             cmd.stdout(std::process::Stdio::from(stdout_fd));
             cmd.stderr(std::process::Stdio::from(stderr_fd));
+        }
+        Some(ActivationFd::StdioPipes {
+            stdin,
+            stdout,
+            stderr,
+        }) => {
+            cmd.stdin(std::process::Stdio::from(stdin));
+            cmd.stdout(std::process::Stdio::from(stdout));
+            cmd.stderr(std::process::Stdio::from(stderr));
         }
         Some(ActivationFd::Pty(fd)) => {
             use std::os::fd::AsRawFd;
@@ -1030,12 +1057,23 @@ pub fn spawn_process(
         }
     }
 
-    let child = cmd.spawn().map_err(|e| {
+    let has_watchdog_or_ready = config.watchdog_sec.is_some() || config.ready_match.is_some();
+    if has_watchdog_or_ready && !is_passed_fd_some {
+        let std_err = config.standard_error.as_deref().unwrap_or("inherit").trim();
+        if std_err == "null" || std_err.starts_with("file:") || std_err.starts_with("append:") || std_err.starts_with("truncate:") {
+            warn!("StandardError is configured to '{}'; watchdog and readiness detection will not receive output", std_err);
+        } else {
+            cmd.stderr(std::process::Stdio::piped());
+        }
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
         error!("Failed to spawn '{}': {}", config.name, e);
         ProcessError::SpawnFailed(format!("{}: {}", config.command, e))
     })?;
 
     let pid = child.id();
+    let stderr = child.stderr.take();
     info!("Spawned service '{}' with PID {}", config.name, pid);
 
     // Move into cgroup
@@ -1053,7 +1091,7 @@ pub fn spawn_process(
         warn!("Failed to set oom_score_adj for PID {}: {}", pid, e);
     }
 
-    Ok(pid)
+    Ok((pid, stderr))
 }
 
 pub fn run_service_command(
@@ -1426,7 +1464,7 @@ mod tests {
 
         let mut master = unsafe { std::fs::File::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        let pid = spawn_process(&config, "/sys/fs/cgroup", Some(ActivationFd::Pty(slave))).unwrap();
+        let (pid, _) = spawn_process(&config, "/sys/fs/cgroup", Some(ActivationFd::Pty(slave))).unwrap();
 
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
@@ -1454,7 +1492,7 @@ mod tests {
         ];
         config.oneshot = true;
 
-        let pid = spawn_process(
+        let (pid, _) = spawn_process(
             &config,
             "/sys/fs/cgroup",
             Some(ActivationFd::Listen(vec![ActivationListenFd {
@@ -1558,7 +1596,7 @@ mod tests {
         config.private_tmp = true;
 
         let pid = match spawn_process(&config, "/sys/fs/cgroup", None) {
-            Ok(pid) => pid,
+            Ok((pid, _)) => pid,
             Err(ProcessError::SpawnFailed(error))
                 if error.contains("Operation not permitted") || error.contains("EPERM") =>
             {

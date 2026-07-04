@@ -39,7 +39,7 @@ in that socket unit, matching the documented systemd shape.
 | HTTPS TCP static web | `https` | `ListenStream=` TCP | Serves files from `<ssh-mesh_home>/web` over TLS. Requires server cert/key. Use `ListenStream=0.0.0.0:443` when root should expose HTTPS on port 443. |
 | Admin HTTP TCP | `admin` | `ListenStream=` TCP | Serves the same admin/proxy router on a separately activated TCP listener. |
 | Admin HTTP UDS | `admin` | `ListenStream=` Unix path | Same admin/API router as the admin TCP surface, served over UDS instead of TCP. |
-| JSONL app control | `jsonl` | `ListenStream=` Unix path | Common `mesh::server::MeshListener` JSONL/JSON-RPC control socket. Non-`ssh-mesh` apps should use the same name in their own socket unit. |
+| Mesh app endpoint | `jsonl` | `ListenStream=` Unix path | Common protocol-neutral `mesh::server::MeshListener` endpoint. Current handlers accept line JSON, JSON-RPC/MCP-shaped calls, and text protocols; future encodings can reuse the same socket. |
 | Trusted SSH UDS | `ssh-uds`, `trusted-ssh-uds` | `ListenStream=` Unix path | Trusted SSH transport over Unix-domain socket. |
 | Trusted SSH VSOCK | `vsock`, `ssh-vsock`, `trusted-ssh-vsock` | `ListenStream=vsock:CID:PORT` | Trusted SSH transport over AF_VSOCK. Use `vsock::PORT` to omit CID and bind `VMADDR_CID_ANY`. |
 | Trusted SSH stdio | disabled | stdin/stdout | Enabled by `SSH_MESH_TRUSTED_STDIO=1`; skips normal listeners. |
@@ -48,8 +48,8 @@ in that socket unit, matching the documented systemd shape.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `SSH_BASEDIR` | `$HOME/.ssh`, or `/tmp/.ssh` if `HOME` is unset | Directory for server keys, certificates, `authorized_keys`, `authorized_cas`, and default SSH config. |
-| `HOME` | `/tmp` for `SSH_BASEDIR` fallback; `/tmp` for HTTP exec fallback; otherwise process environment | Used for default key/config locations and as the default home in mesh-init exec requests. |
+| `SSH_BASEDIR` | `<ssh-mesh_home>/etc` | Directory for server keys, certificates, `authorized_keys`, `authorized_cas`, and default SSH config. |
+| `HOME` | process environment | Used as the default home in mesh-init exec requests. |
 | `USER` | `system` for HTTP exec; `root` for `sshmc` destination parsing | User name used when constructing mesh-init exec requests or mux socket names. |
 | `SFTP_ROOT` | unset; effective root falls back to `SSH_BASEDIR` | Optional SFTP root path. |
 | `SSH_MESH_CONFIG` | `<ssh-mesh_home>/etc` | Directory for `mesh.yaml`, `mesh.json`, or `mesh.toml`, plus per-user SSH authorization. |
@@ -59,7 +59,7 @@ in that socket unit, matching the documented systemd shape.
 | `SSH_MUX` | `<ssh-mesh_home>/run/ssh-mesh/mux` for `sshmc`; unset for server client manager | Directory for OpenSSH-style mux control sockets. |
 | `SSH_MESH_HTTPS_CA` | `$SSH_BASEDIR/authorized_cas` | CA bundle used to require and validate HTTPS client certificates. If missing, HTTPS starts without client-cert auth. |
 | `EXEC_USER` | `1000` | UID used by the legacy foreground command path. |
-| `MESH_INIT_SOCK` | `<system_home>/run/mesh-init/control.sock` | mesh-init control socket used for HTTP exec, SSH terminal delegation, and route activation. |
+| `MESH_INIT_SOCK` | `/run/mesh/mesh-init/mesh.sock` for root systems | mesh-init mesh endpoint used for HTTP exec, SSH terminal delegation, and route activation. |
 | `SSH_MESH_HOME_ROOT` | shared `mesh` home base | Root used to find certificate terminal homes by SSH username. |
 
 ## Companion Binaries
@@ -80,7 +80,7 @@ in that socket unit, matching the documented systemd shape.
 | --- | --- | --- |
 | `SFTP_SERVER_PATH` | unset | Optional external SFTP server binary path. |
 | `<APP>_UDS` | app-specific | Optional app UDS override for `/_m/proxy/*/:app` generic proxy routes, for example `MESH_INIT_UDS`. |
-| `TRACEWEB_UDS` | `<traceweb_home>/run/traceweb/control.sock` | traceweb JSON-RPC control socket for `/_m/trace` proxy routes. |
+| `TRACEWEB_UDS` | `/run/mesh/traceweb/mesh.sock` for root systems | traceweb mesh endpoint for `/_m/trace` proxy routes. |
 
 
 # Generated Variables

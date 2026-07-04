@@ -21,7 +21,7 @@ use crate::{AppState, handlers::Assets};
 fn traceweb_socket_path() -> String {
     std::env::var("TRACEWEB_UDS").unwrap_or_else(|_| {
         mesh::paths::AppPaths::for_app("traceweb")
-            .control_socket("traceweb")
+            .mesh_socket()
             .to_string_lossy()
             .into_owned()
     })

@@ -4,6 +4,24 @@
 filename stem: `worker.toml` defines service `worker`. Socket activation is
 declared in the same file with an optional `[Socket]` table.
 
+When started as root and `MESH_INIT_DIR` is unset, core config is loaded from
+`/opt/system/etc/mesh-init` first and `/home/system/etc/mesh-init` second. If
+the same service appears in both places, the `/home` file wins. When
+`MESH_INIT_DIR` is set it replaces both default directories. Non-root
+`mesh-init` defaults to `./etc/mesh-init` relative to its working directory.
+
+For on-demand `start NAME` requests without a loaded core config, root mode
+looks for `/opt/NAME/etc/mesh-init/NAME.toml` and then
+`/home/NAME/etc/mesh-init/NAME.toml`; `/home` wins. If `/home/NAME` exists,
+its UID/GID become the service identity. If it does not exist, mesh-init
+allocates a UID/GID in `/home/system/etc/uidmap`, creates `/home/NAME`, and
+creates `/run/user/UID` mode `0700`. If `USER_INIT` is set, config lookup uses
+the legacy `<USER_INIT>/NAME/init.toml` path, but root-mode identity still
+comes from `/home/NAME` or the uidmap allocator.
+
+The mesh sidecar can start services on-demand when SSH or HTTP requests use the service
+name, by calling the 'start' method on mesh-init. 
+
 ## TOML Service Files
 
 Service files are TOML documents. The required table is `[Service]`.
@@ -17,8 +35,7 @@ Systemd-compatible fields:
   escaping are supported.
 - `ExecStartPre`, `ExecStartPost`, `ExecStop`, `ExecReload` (string or string
   list): hook commands run through `/bin/sh -c`.
-- `Type` (string): only `oneshot` is interpreted specially. Omitted or `simple`
-  means a long-running service.
+- `Type` (string): supported values are `oneshot` (runs once at startup), and `exec` (starts as a daemon at boot). If omitted or empty, the service does not auto-start at boot and is only started on-demand via socket activation or an explicit start command.
 - `User` (string): user name or numeric UID string. Names are resolved with passwd.
 - `Group` (string): group name or numeric GID string. Names are resolved with the group database. When omitted, a named `User` uses its primary passwd GID.
 - `WorkingDirectory` (string): child working directory.
@@ -79,6 +96,20 @@ fail only that service start. mesh-init continues running.
   `PATH`. Set `MESH_DANGEROUS_ENV` on mesh-init to replace the global dangerous
   list with comma-separated names/prefixes. Client-side code decides which env
   variables to send; mesh-init only filters what it receives.
+
+Custom mesh-init health and lifecycle fields:
+
+- `ReadyMatch` (string): substring to search for in stderr. The service is considered ready when this is seen.
+- `WatchdogMatch` (string): substring to search for in stderr. Only lines containing this pattern reset the watchdog timer. Defaults to `"active"` if `WatchdogSec` is set.
+- `WatchdogSec` (integer or duration string): watchdog timeout. If no line matching `WatchdogMatch` is printed in this duration, the service is killed and restarted.
+- `IdleTerminationSec` (integer or duration string): stop the service after this duration of being idle. A service is idle when the last reported `active` metric is `0`, `sess` is `0` or omitted, and no output has been written to stderr.
+
+### Unsupported systemd features
+
+The following systemd features are explicitly **not supported**:
+- `Type=notify` (readiness notifications via `sd_notify`) is not supported.
+- Service dependencies (`Wants=`, `Requires=`, `After=`, `Before=`) are not supported.
+- `ExecStopPost` is not supported (only `ExecStartPre`, `ExecStartPost`, `ExecStop`, and `ExecReload` are supported).
 
 mesh-init extension fields:
 
@@ -172,7 +203,7 @@ Systemd-compatible fields:
 - `Accept`: boolean. `false` passes listener FDs with systemd activation;
   `true` accepts connections in mesh-init. Datagram listeners only support
   `Accept=false`.
-- `SocketMode`: Unix socket mode, for example `0660`.
+- `SocketMode`: Unix socket mode, for example `0o660`.
 - `SocketUser`: Unix socket owner.
 - `SocketGroup`: Unix socket group.
 - `FileDescriptorName`: descriptor name or descriptor name list for

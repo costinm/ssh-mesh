@@ -1,0 +1,11 @@
+[Service]
+ExecStart = "/bin/sh -c 'sleep 3600'"
+OOMScoreAdjust = -500
+StandardOutput = "inherit"
+StandardError = "inherit"
+
+[Resources]
+MemoryMin = "64M"
+MemoryHigh = "256M"
+MemoryMax = "512M"
+CPUWeight = 50

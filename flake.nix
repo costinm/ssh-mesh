@@ -56,7 +56,7 @@
           CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
         };
 
-        # Native glibc build args for dmesh. dmesh carries Python/JNI wrapper
+        # Native glibc build args for Python.
         # defaults and is intentionally kept out of the static MUSL aggregate.
         nativeArgs = {
           inherit src nativeBuildInputs;
@@ -66,7 +66,7 @@
         };
 
         mainCargoExtraArgs =
-          "--workspace --bins --exclude dmesh --features mesh-tun/bin-full";
+          "--workspace --bins --features mesh-tun/bin-full";
 
         # Build main workspace deps once — shared by all main binary outputs.
         # Kernel, VM, and rootfs packages remain separate opt-in outputs.
@@ -164,11 +164,6 @@
         sftp-server = selectBins "sftp-server" [ "sftp-server" ];
         mesh-tun = selectBins "mesh-tun" [ "mesh-tun" ];
 
-        dmesh = craneLib.buildPackage (nativeArgs // {
-          pname = "dmesh";
-          cargoExtraArgs = "-p dmesh";
-        });
-
         # ── Docker image ──────────────────────────────────────────
 
         sshm = pkgs.dockerTools.buildLayeredImage {
@@ -253,7 +248,7 @@
       {
         packages = {
             nixos-install-tools = pkgs.nixos-install-tools;
-            inherit ssh-mesh ssh-mesh-full mesh-init h2t meshkeys sshmc traceweb sftp-server mesh-tun dmesh sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain mesh-net-tools build-deps dev-tools;
+            inherit ssh-mesh ssh-mesh-full mesh-init h2t meshkeys sshmc traceweb sftp-server mesh-tun sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain mesh-net-tools build-deps dev-tools;
             default = ssh-mesh-full;
         };
 
@@ -296,6 +291,9 @@
               services.ssh-mesh = {
                 enable = true;
                 package = self.packages.x86_64-linux.ssh-mesh-full;
+                authorizedKeys = [
+                  (builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub)
+                ];
               };
 
               boot.isContainer = true;
@@ -322,6 +320,9 @@
               services.ssh-mesh = {
                 enable = true;
                 package = self.packages.x86_64-linux.ssh-mesh-full;
+                authorizedKeys = [
+                  (builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub)
+                ];
               };
 
               virtualisation = {
@@ -329,100 +330,29 @@
                 memorySize = 1024;
                 cores = 1;
                 forwardPorts = [
-                  { from = "host"; host.port = 25022; guest.port = 15022; }
+                  { from = "host"; host.port = 14022; guest.port = 15022; }
                   { from = "host"; host.port = 28080; guest.port = 8080; }
                 ];
+                sharedDirectories = {
+                  home = {
+                    source = "target/nixos-vm-fs/home";
+                    target = "/home";
+                    securityModel = "mapped-xattr";
+                  };
+                  opt = {
+                    source = "target/nixos-vm-fs/opt";
+                    target = "/opt";
+                    securityModel = "mapped-xattr";
+                  };
+                };
               };
 
-              services.getty.autologinUser = "system";
+              services.getty.autologinUser = "root";
 
-              users.users.system.openssh.authorizedKeys.keys = [
-                (builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub)
-              ];
-
-              environment.etc."ssh-mesh/authorized_keys".text =
-                builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub;
-
-              # mesh-init hardening and limit test configs
-              environment.etc."mesh-init/memlimit.toml".text = ''
-                [Service]
-                ExecStart = "${pkgs.busybox}/bin/sleep 3600"
-                OOMScoreAdjust = -500
-                [Resources]
-                MemoryMin = "64M"
-                MemoryHigh = "256M"
-                MemoryMax = "512M"
-                CPUWeight = 50
-              '';
-
-              environment.etc."mesh-init/activated_svc.toml".text = ''
-                [Service]
-                ExecStart = "${pkgs.busybox}/bin/sh -c 'echo SUCCESS'"
-                OOMScoreAdjust = -800
-                [Socket]
-                ListenStream = "14032"
-                Accept = true
-              '';
-
-              environment.etc."mesh-init/auth_test_svc.toml".text = ''
-                [Service]
-                ExecStart = "${pkgs.busybox}/bin/sh -c 'echo SUCCESS PEER=$X_PEER_UID'"
-                OOMScoreAdjust = -800
-                [[Peer]]
-                uid = 9999
-                [Socket]
-                Accept = true
-                [[Socket.Listen]]
-                Type = "stream"
-                Address = "/run/mesh-init-auth-test.sock"
-                [[Socket.Listen]]
-                Type = "stream"
-                Address = "14033"
-              '';
-
-              environment.etc."mesh-init/hardening-mounts.toml".text = ''
-                [Service]
-                Type = "oneshot"
-                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -q \" /tmp \" /proc/self/mountinfo; if [ -e /opt ]; then grep -Eq \" /opt ro(,| )\" /proc/self/mountinfo; fi; if [ -e /nix ]; then grep -Eq \" /nix ro(,| )\" /proc/self/mountinfo; fi; touch /tmp/private-ok; [ -c /dev/null ]; [ -c /dev/zero ]; [ ! -e /dev/kmsg ]; ! touch /etc/mesh-init-should-not-write 2>/dev/null; echo PASS mounts > /run/results-mounts'"
-                PrivateTmp = true
-                PrivateDevices = true
-                ProtectSystem = "strict"
-                ReadWritePaths = ["/run"]
-                StandardOutput = "inherit"
-                StandardError = "inherit"
-              '';
-
-              environment.etc."mesh-init/hardening-process.toml".text = ''
-                [Service]
-                Type = "oneshot"
-                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -q \"^NoNewPrivs:[[:space:]]*1\" /proc/self/status; ! grep -q \"eth0:\" /proc/net/dev; touch /run/umask-file; [ \"$(stat -c %a /run/umask-file)\" = \"600\" ]; id -G | grep -qw 0; echo PASS process > /run/results-process'"
-                NoNewPrivileges = true
-                PrivateNetwork = true
-                UMask = "0077"
-                SupplementaryGroups = ["0"]
-                StandardOutput = "inherit"
-                StandardError = "inherit"
-              '';
-
-              environment.etc."mesh-init/hardening-caps-drop.toml".text = ''
-                [Service]
-                Type = "oneshot"
-                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -q \"^CapEff:[[:space:]]*0000000000000001\" /proc/self/status; echo PASS caps-drop > /run/results-caps-drop'"
-                CapabilityBoundingSet = ["CAP_CHOWN"]
-                StandardOutput = "inherit"
-                StandardError = "inherit"
-              '';
-
-              environment.etc."mesh-init/hardening-caps-ambient.toml".text = ''
-                [Service]
-                Type = "oneshot"
-                ExecStart = "${pkgs.busybox}/bin/sh -c 'set -eu; grep -Eq \"^CapAmb:[[:space:]]*0*400$\" /proc/self/status; echo PASS caps-ambient > /run/results-caps-ambient'"
-                User = "65534"
-                Group = "65534"
-                CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE", "CAP_SETPCAP"]
-                AmbientCapabilities = ["CAP_NET_BIND_SERVICE"]
-                StandardOutput = "inherit"
-                StandardError = "inherit"
+              system.activationScripts.vm-testdata-keys.text = ''
+                install -d -m 0750 -o ssh-mesh -g ssh-mesh /home/ssh-mesh/etc
+                install -m 0600 -o ssh-mesh -g ssh-mesh ${./crates/ssh-mesh/tests/testdata/alice/id_ecdsa} /home/ssh-mesh/etc/id_ecdsa
+                install -m 0644 -o ssh-mesh -g ssh-mesh ${./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub} /home/ssh-mesh/etc/id_ecdsa.pub
               '';
 
               boot.loader.grub.enable = false;

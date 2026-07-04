@@ -1,0 +1,6 @@
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/sh -c 'set -eu; grep -q \"^CapEff:[[:space:]]*0000000000000001\" /proc/self/status; echo PASS caps-drop > /home/system/tmp/results-caps-drop'"
+CapabilityBoundingSet = ["CAP_CHOWN"]
+StandardOutput = "inherit"
+StandardError = "inherit"

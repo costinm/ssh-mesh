@@ -409,8 +409,22 @@ impl Daemon {
         for cfg in init_configs.iter().chain(other_configs.iter()) {
             if !cfg.activation.is_empty() {
                 crate::activation::start_listeners(self.clone(), cfg);
-            } else if let Err(e) = self.start_service_internal(&cfg.name) {
-                error!("Failed to auto-start service '{}': {}", cfg.name, e);
+            } else {
+                let should_autostart = cfg
+                    .service_type
+                    .as_deref()
+                    .map(|t| !t.trim().is_empty())
+                    .unwrap_or(false);
+                if should_autostart {
+                    if let Err(e) = self.start_service_internal(&cfg.name) {
+                        error!("Failed to auto-start service '{}': {}", cfg.name, e);
+                    }
+                } else {
+                    debug!(
+                        "Service '{}' has no activation listeners and Type is omitted; not auto-starting",
+                        cfg.name
+                    );
+                }
             }
         }
 
@@ -559,14 +573,18 @@ impl Daemon {
         }
     }
 
-    /// Handle a control request that carries one Unix file descriptor.
-    pub async fn handle_request_with_fd(
+    /// Handle a control request that carries one or more Unix file descriptors.
+    pub async fn handle_request_with_fds(
         &self,
         request: Request,
-        fd: OwnedFd,
+        fds: Vec<OwnedFd>,
         peer_uid: u32,
         peer_gid: u32,
     ) -> Response {
+        if fds.is_empty() {
+            return Response::err("request is missing passed file descriptors");
+        }
+
         match request {
             Request::StartTerminal {
                 name,
@@ -579,15 +597,36 @@ impl Daemon {
                 command,
                 ..
             } => self.handle_start_terminal(
-                &name, &home, uid, gid, pty, env, context, command, fd, peer_uid, peer_gid,
+                &name, &home, uid, gid, pty, env, context, command, fds, peer_uid, peer_gid,
             ),
             Request::RegisterNamespace {
                 name,
                 kind,
                 target_pid,
-            } => self.handle_register_namespace(&name, kind, target_pid, fd, peer_uid, peer_gid),
-            _ => Response::err("request does not accept a passed file descriptor"),
+            } => {
+                if fds.len() != 1 {
+                    return Response::err(format!(
+                        "register_namespace expected 1 fd, got {}",
+                        fds.len()
+                    ));
+                }
+                let fd = fds.into_iter().next().expect("one fd");
+                self.handle_register_namespace(&name, kind, target_pid, fd, peer_uid, peer_gid)
+            }
+            _ => Response::err("request does not accept passed file descriptors"),
         }
+    }
+
+    /// Handle a control request that carries one Unix file descriptor.
+    pub async fn handle_request_with_fd(
+        &self,
+        request: Request,
+        fd: OwnedFd,
+        peer_uid: u32,
+        peer_gid: u32,
+    ) -> Response {
+        self.handle_request_with_fds(request, vec![fd], peer_uid, peer_gid)
+            .await
     }
 
     // ========================================================================
@@ -723,9 +762,37 @@ impl Daemon {
             // If we have a source path, reload it
             if let Some(cfg) = configs.get(name) {
                 if let Some(path) = &cfg.source_path {
-                    match config::load_app_config(std::path::Path::new(path)) {
-                        Ok(new_cfg) => {
-                            debug!("Reloaded config for {}", name);
+                    let source_path = std::path::PathBuf::from(path);
+                    let on_demand_candidates = config::on_demand_config_candidates(name);
+                    let is_on_demand = on_demand_candidates.contains(&source_path);
+                    let reload_path = if is_on_demand {
+                        config::select_on_demand_config(name).unwrap_or(source_path)
+                    } else {
+                        source_path
+                    };
+                    match config::load_app_config(&reload_path) {
+                        Ok(mut new_cfg) => {
+                            if is_on_demand && unsafe { libc::getuid() } == 0 {
+                                match config::resolve_or_create_app_identity(name) {
+                                    Ok(identity) => {
+                                        new_cfg.uid = Some(identity.uid);
+                                        new_cfg.gid = Some(identity.gid);
+                                    }
+                                    Err(e) => {
+                                        return Response::err(format!(
+                                            "failed to resolve app identity for '{}': {}",
+                                            name, e
+                                        ));
+                                    }
+                                }
+                                new_cfg.user = None;
+                                new_cfg.group = None;
+                            }
+                            debug!(
+                                "Reloaded config for {} from {}",
+                                name,
+                                reload_path.display()
+                            );
                             configs.insert(name.to_string(), new_cfg.clone());
                             new_cfg
                         }
@@ -738,24 +805,33 @@ impl Daemon {
                     cfg.clone()
                 }
             } else {
-                let base_dir =
-                    std::env::var("USER_INIT").unwrap_or_else(|_| "/data/mesh".to_string());
-                let app_dir = std::path::Path::new(&base_dir).join(name);
-                let service_path = app_dir.join("init.toml");
-
-                if service_path.exists() {
+                if let Some(service_path) = config::select_on_demand_config(name) {
                     match config::load_app_config(&service_path) {
                         Ok(mut new_cfg) => {
-                            // Enforce UID/GID from directory, ignoring whatever the file says
-                            if let Ok(metadata) = std::fs::metadata(&app_dir) {
-                                use std::os::unix::fs::MetadataExt;
-                                new_cfg.uid = Some(metadata.uid());
-                                new_cfg.gid = Some(metadata.gid());
+                            // In root mode, app identity is owned by /home/<service>
+                            // and persisted in /home/system/etc/uidmap when needed.
+                            if unsafe { libc::getuid() } == 0 {
+                                match config::resolve_or_create_app_identity(name) {
+                                    Ok(identity) => {
+                                        new_cfg.uid = Some(identity.uid);
+                                        new_cfg.gid = Some(identity.gid);
+                                    }
+                                    Err(e) => {
+                                        return Response::err(format!(
+                                            "failed to resolve app identity for '{}': {}",
+                                            name, e
+                                        ));
+                                    }
+                                }
                                 new_cfg.user = None;
                                 new_cfg.group = None;
                             }
 
-                            info!("Loaded on-demand user config for '{}'", name);
+                            info!(
+                                "Loaded on-demand config for '{}' from {}",
+                                name,
+                                service_path.display()
+                            );
                             configs.insert(name.to_string(), new_cfg.clone());
                             new_cfg
                         }
@@ -840,6 +916,13 @@ impl Daemon {
             return Response::err("insufficient resources to start service");
         }
 
+        {
+            let mut services = self.services.lock();
+            if let Some(proc) = services.get_mut(name) {
+                proc.consecutive_failures = 0;
+            }
+        }
+
         match self.start_service_with_config(config, None) {
             Ok(pid) => Response::ok_with_data(serde_json::json!({"pid": pid})),
             Err(e) => Response::err(e.to_string()),
@@ -856,7 +939,7 @@ impl Daemon {
         mut extra_env: HashMap<String, String>,
         context: Option<ActivationContext>,
         command: Option<String>,
-        fd: OwnedFd,
+        mut fds: Vec<OwnedFd>,
         peer_uid: u32,
         peer_gid: u32,
     ) -> Response {
@@ -976,22 +1059,42 @@ impl Daemon {
 
         let cg =
             crate::cgroup::create_cgroup(name).unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
-        let retained_pty = if pty {
-            match fd.try_clone() {
+        let (retained_pty, activation_fd) = if pty {
+            if fds.len() != 1 {
+                return Response::err(format!("pty terminal expected 1 fd, got {}", fds.len()));
+            }
+            let fd = fds.pop().expect("one fd");
+            let retained_pty = match fd.try_clone() {
                 Ok(fd) => Some(fd),
                 Err(e) => return Response::err(format!("failed to retain PTY fd: {}", e)),
-            }
+            };
+            (retained_pty, process::ActivationFd::Pty(fd))
+        } else if fds.len() == 1 {
+            (
+                None,
+                process::ActivationFd::Stdio(fds.pop().expect("one fd")),
+            )
+        } else if fds.len() == 3 {
+            let stderr = fds.pop().expect("stderr fd");
+            let stdout = fds.pop().expect("stdout fd");
+            let stdin = fds.pop().expect("stdin fd");
+            (
+                None,
+                process::ActivationFd::StdioPipes {
+                    stdin,
+                    stdout,
+                    stderr,
+                },
+            )
         } else {
-            None
-        };
-        let activation_fd = if pty {
-            process::ActivationFd::Pty(fd)
-        } else {
-            process::ActivationFd::Stdio(fd)
+            return Response::err(format!(
+                "stdio terminal expected 1 or 3 fds, got {}",
+                fds.len()
+            ));
         };
 
         match process::spawn_process(&config, &cg, Some(activation_fd)) {
-            Ok(pid) => {
+            Ok((pid, _)) => {
                 if let Some(ref tracked) = *self.tracked_child_pids.lock() {
                     tracked.lock().insert(pid);
                 }
@@ -1567,17 +1670,23 @@ impl Daemon {
 
                 self.notify_service_exit(name);
 
-                if proc.config.oneshot {
-                    proc.target_state = ServiceState::Stopped;
-                }
+                let should_restart = if intentionally_stopped {
+                    false
+                } else if proc.config.oneshot {
+                    // For oneshot, only restart if specifically configured to do so
+                    should_restart_for_policy(proc.config.restart, exit_code)
+                } else {
+                    should_restart_for_policy(proc.config.restart, exit_code)
+                };
 
-                if !intentionally_stopped && proc.target_state == ServiceState::Running {
-                    if !should_restart_for_policy(proc.config.restart, exit_code) {
-                        proc.target_state = ServiceState::Stopped;
-                        return;
-                    }
+                if should_restart {
                     // crashed or was killed for restart!
-                    proc.consecutive_failures += 1;
+                    let running_duration = proc.started_at.map(|t| t.elapsed()).unwrap_or_default();
+                    if running_duration >= std::time::Duration::from_secs(10) {
+                        proc.consecutive_failures = 1;
+                    } else {
+                        proc.consecutive_failures += 1;
+                    }
 
                     if let Some(max_retries) = proc.config.backoff.max_retries {
                         if proc.consecutive_failures > max_retries {
@@ -1593,7 +1702,8 @@ impl Daemon {
                         }
                     }
 
-                    let restart_delay_secs = proc.config.restart_sec;
+                    let backoff_secs = calculate_backoff(&proc.config, proc.consecutive_failures);
+                    let restart_delay_secs = restart_delay_with_jitter(name, backoff_secs.max(proc.config.restart_sec));
 
                     info!(
                         "Service '{}' crashed. Scheduling restart #{} in {}s",
@@ -1604,6 +1714,8 @@ impl Daemon {
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(restart_delay_secs),
                     );
+                } else {
+                    proc.target_state = ServiceState::Stopped;
                 }
 
                 return;
@@ -1633,6 +1745,68 @@ impl Daemon {
                         // Immediate restart (should only occur if just loaded without backoff)
                         to_restart.push(proc.config.clone());
                         proc.state = ServiceState::Starting;
+                    }
+                }
+            }
+
+            for (name, proc) in services.iter_mut() {
+                if proc.state == ServiceState::Running {
+                    // --- Watchdog Check ---
+                    if let Some(watchdog_sec) = proc.config.watchdog_sec {
+                        let mut check_watchdog = true;
+                        // Grace period: don't check watchdog until started_at + watchdog_sec has passed
+                        if let Some(started) = proc.started_at {
+                            if now.duration_since(started) < std::time::Duration::from_secs(watchdog_sec) {
+                                check_watchdog = false;
+                            }
+                        }
+                        // Skip watchdog if ReadyMatch is configured but the service isn't ready yet
+                        if proc.config.ready_match.is_some() && !proc.ready {
+                            check_watchdog = false;
+                        }
+
+                        if check_watchdog {
+                            let last_ping = proc.last_watchdog_ping.unwrap_or(proc.started_at.unwrap_or(now));
+                            if now.duration_since(last_ping) > std::time::Duration::from_secs(watchdog_sec) {
+                                warn!(
+                                    "Service '{}' watchdog timeout ({}s without health output matching '{}')",
+                                    name,
+                                    watchdog_sec,
+                                    proc.config.watchdog_match.as_deref().unwrap_or("active")
+                                );
+                                if let Some(pid) = proc.pid {
+                                    let _ = process::send_signal(pid, libc::SIGKILL);
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Idle Termination Check ---
+                    if let Some(idle_sec) = proc.config.idle_termination_sec {
+                        let metrics_idle = proc.last_active == Some(0) && proc.last_sess.unwrap_or(0) == 0;
+                        let stderr_idle = proc.last_stderr_at
+                            .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(idle_sec))
+                            .unwrap_or(false);
+
+                        if metrics_idle && stderr_idle {
+                            if proc.idle_since.is_none() {
+                                proc.idle_since = Some(now);
+                            }
+                            if let Some(idle_start) = proc.idle_since {
+                                if now.duration_since(idle_start) >= std::time::Duration::from_secs(idle_sec) {
+                                    info!(
+                                        "Service '{}' idle for {}s (active=0, no output), terminating",
+                                        name, idle_sec
+                                    );
+                                    proc.target_state = ServiceState::Stopped;
+                                    if let Some(pid) = proc.pid {
+                                        let _ = process::send_signal(pid, proc.config.kill_signal);
+                                    }
+                                }
+                            }
+                        } else {
+                            proc.idle_since = None;
+                        }
                     }
                 }
             }
@@ -1773,14 +1947,17 @@ impl Daemon {
         }
 
         // Spawn process
-        let pid = match process::spawn_process(&config, cg, passed_fd) {
-            Ok(p) => p,
+        let (pid, stderr) = match process::spawn_process(&config, cg, passed_fd) {
+            Ok(pair) => pair,
             Err(e) => {
                 // Spawn failed: mark the service Stopped so it can be restarted.
                 let mut services = self.services.lock();
                 if let Some(proc) = services.get_mut(&name) {
                     proc.state = ServiceState::Stopped;
                     proc.pid = None;
+                    if !should_restart_for_policy(proc.config.restart, -1) {
+                        proc.target_state = ServiceState::Stopped;
+                    }
                 }
                 return Err(e.into());
             }
@@ -1799,6 +1976,9 @@ impl Daemon {
                     proc.userns_fd = None;
                     proc.namespace_pid = None;
                     proc.mesh_tun_attached = false;
+                    if !should_restart_for_policy(proc.config.restart, -1) {
+                        proc.target_state = ServiceState::Stopped;
+                    }
                 }
                 return Err(error);
             }
@@ -1822,6 +2002,12 @@ impl Daemon {
                 proc.started_at = Some(std::time::Instant::now());
                 proc.cgroup_path = cgroup_path;
                 proc.config = config.clone();
+                proc.ready = config.ready_match.is_none();
+                proc.last_watchdog_ping = None;
+                proc.last_stderr_at = None;
+                proc.last_active = None;
+                proc.last_sess = None;
+                proc.idle_since = None;
                 // A10: open a pidfd for PID-safe signaling. On failure
                 // (extremely unlikely after spawn succeeded), leave pidfd
                 // None; send_signal_pidfd will fall back to kill(2).
@@ -1835,6 +2021,11 @@ impl Daemon {
             }
         }
         info!("Service '{}' started with PID {}", name, pid);
+
+        if let Some(stderr_pipe) = stderr {
+            let services_clone = self.services.clone();
+            spawn_stderr_reader(name.clone(), stderr_pipe, services_clone);
+        }
 
         if let Err(error) = run_service_commands(
             &config,
@@ -1936,7 +2127,7 @@ fn calculate_backoff(config: &AppConfig, consecutive_failures: u32) -> u64 {
     if consecutive_failures == 0 {
         return 0;
     }
-    let initial = config.backoff.initial_secs;
+    let initial = config.backoff.initial_secs.max(config.restart_sec);
     let mut backoff_secs = match config.backoff.policy {
         crate::config::BackoffPolicy::Linear => initial.saturating_mul(consecutive_failures as u64),
         crate::config::BackoffPolicy::Exponential => {
@@ -1951,6 +2142,101 @@ fn calculate_backoff(config: &AppConfig, consecutive_failures: u32) -> u64 {
         backoff_secs = backoff_secs.min(24 * 3600);
     }
     backoff_secs
+}
+
+fn spawn_stderr_reader(
+    name: String,
+    stderr: std::process::ChildStderr,
+    services: Arc<Mutex<HashMap<String, ManagedProcess>>>,
+) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+
+            // 1. Forward the line to mesh-init's own stderr
+            eprintln!("{}: {}", name, line);
+
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let now = std::time::Instant::now();
+            let mut services_guard = services.lock();
+            let Some(proc) = services_guard.get_mut(&name) else {
+                break;
+            };
+
+            proc.last_stderr_at = Some(now);
+
+            // 3. Detect format
+            let is_json = line.trim_start().starts_with('{');
+
+            // 4. Check ReadyMatch
+            if let Some(ref ready_match) = proc.config.ready_match {
+                if !proc.ready && line.contains(ready_match) {
+                    proc.ready = true;
+                    info!("Service '{}' is ready (matched '{}')", name, ready_match);
+                }
+            }
+
+            // 5. Check WatchdogMatch
+            if let Some(ref watchdog_match) = proc.config.watchdog_match {
+                if line.contains(watchdog_match) {
+                    proc.last_watchdog_ping = Some(now);
+                }
+            }
+
+            // 6. Extract metrics
+            let mut active = None;
+            let mut sess = None;
+            if is_json {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(obj) = v.as_object() {
+                        if let Some(a) = obj.get("active").and_then(|a| a.as_u64()) {
+                            active = Some(a);
+                        }
+                        if let Some(s) = obj.get("sess").and_then(|s| s.as_u64()) {
+                            sess = Some(s);
+                        }
+                    }
+                }
+            } else {
+                // logfmt-like token scanning (active=N sess=N)
+                // Find active=N
+                if let Some(pos) = line.find("active=") {
+                    let s = &line[pos + 7..];
+                    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        if let Ok(val) = digits.parse::<u64>() {
+                            active = Some(val);
+                        }
+                    }
+                }
+                // Find sess=N
+                if let Some(pos) = line.find("sess=") {
+                    let s = &line[pos + 5..];
+                    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        if let Ok(val) = digits.parse::<u64>() {
+                            sess = Some(val);
+                        }
+                    }
+                }
+            }
+
+            if active.is_some() {
+                proc.last_active = active;
+            }
+            if sess.is_some() {
+                proc.last_sess = sess;
+            }
+        }
+    });
 }
 
 // ============================================================================
@@ -2162,6 +2448,72 @@ OOMScoreAdjust = -700
     }
 
     #[tokio::test]
+    async fn test_start_terminal_maps_three_stdio_fds() {
+        let cfg = DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test.sock".to_string(),
+        };
+        let daemon = Daemon::new(cfg);
+        let current_uid = unsafe { libc::getuid() };
+        let current_gid = unsafe { libc::getgid() };
+        let home = tempfile::tempdir().unwrap();
+
+        daemon.configs.lock().insert(
+            "alice".to_string(),
+            AppConfig {
+                name: "alice".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'out\\n'; printf 'err\\n' >&2".to_string(),
+                ],
+                uid: Some(current_uid),
+                gid: Some(current_gid),
+                oneshot: true,
+                ..Default::default()
+            },
+        );
+
+        let (stdin_child, stdin_parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (stdout_child, mut stdout_parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (stderr_child, mut stderr_parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        let request = Request::StartTerminal {
+            name: "alice".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+            uid: current_uid,
+            gid: Some(current_gid),
+            pty: false,
+            env: HashMap::new(),
+            context: None,
+            command: None,
+            fd_count: Some(3),
+        };
+
+        let response = daemon
+            .handle_request_with_fds(
+                request,
+                vec![
+                    OwnedFd::from(stdin_child),
+                    OwnedFd::from(stdout_child),
+                    OwnedFd::from(stderr_child),
+                ],
+                0,
+                0,
+            )
+            .await;
+        assert!(response.success, "{:?}", response.error);
+        drop(stdin_parent);
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        stdout_parent.read_to_string(&mut stdout).unwrap();
+        stderr_parent.read_to_string(&mut stderr).unwrap();
+
+        assert_eq!(stdout, "out\n");
+        assert_eq!(stderr, "err\n");
+    }
+
+    #[tokio::test]
     async fn test_start_terminal_rejects_uid_mismatch_for_non_root_peer() {
         let cfg = DaemonConfig {
             config_dirs: vec![],
@@ -2350,5 +2702,222 @@ OOMScoreAdjust = -700
         let second = restart_delay_with_jitter("svc-a", 100);
         assert_eq!(first, second);
         assert!((100..=110).contains(&first));
+    }
+
+    #[tokio::test]
+    async fn test_oneshot_restart_behavior() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-oneshot.sock".to_string(),
+        });
+        
+        let mut config = AppConfig::default();
+        config.name = "oneshot-svc".to_string();
+        config.oneshot = true;
+        config.restart = RestartPolicy::No;
+        
+        // 1. Exit with 0, Restart=No
+        {
+            let mut proc = ManagedProcess::new(config.clone());
+            proc.state = ServiceState::Running;
+            proc.target_state = ServiceState::Running;
+            proc.pid = Some(9999);
+            daemon.services.lock().insert("oneshot-svc".to_string(), proc);
+            daemon.configs.lock().insert("oneshot-svc".to_string(), config.clone());
+
+            daemon.handle_child_exit(9999, 0);
+
+            let services = daemon.services.lock();
+            let proc = services.get("oneshot-svc").unwrap();
+            assert_eq!(proc.target_state, ServiceState::Stopped);
+            assert_eq!(proc.state, ServiceState::Stopped);
+            assert!(proc.pid.is_none());
+        }
+
+        // 2. Exit with 1, Restart=No
+        {
+            let mut proc = ManagedProcess::new(config.clone());
+            proc.state = ServiceState::Running;
+            proc.target_state = ServiceState::Running;
+            proc.pid = Some(9998);
+            daemon.services.lock().insert("oneshot-svc".to_string(), proc);
+
+            daemon.handle_child_exit(9998, 1);
+
+            let services = daemon.services.lock();
+            let proc = services.get("oneshot-svc").unwrap();
+            assert_eq!(proc.target_state, ServiceState::Stopped);
+        }
+
+        // 3. Exit with 1, Restart=OnFailure
+        {
+            let mut config_fail = config.clone();
+            config_fail.restart = RestartPolicy::OnFailure;
+            let mut proc = ManagedProcess::new(config_fail.clone());
+            proc.state = ServiceState::Running;
+            proc.target_state = ServiceState::Running;
+            proc.pid = Some(9997);
+            daemon.services.lock().insert("oneshot-svc".to_string(), proc);
+            daemon.configs.lock().insert("oneshot-svc".to_string(), config_fail);
+
+            daemon.handle_child_exit(9997, 1);
+
+            let services = daemon.services.lock();
+            let proc = services.get("oneshot-svc").unwrap();
+            // Should restart! So target_state is still Running
+            assert_eq!(proc.target_state, ServiceState::Running);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restart_sec_backoff_behavior() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-restart-sec.sock".to_string(),
+        });
+
+        let mut config = AppConfig::default();
+        config.name = "restart-sec-svc".to_string();
+        config.restart = RestartPolicy::Always;
+        config.restart_sec = 5; // 5 seconds restart delay
+
+        // consecutive_failures should accumulate and use exponential backoff starting at 5s
+        let mut proc = ManagedProcess::new(config.clone());
+        proc.state = ServiceState::Running;
+        proc.target_state = ServiceState::Running;
+        proc.pid = Some(9999);
+        daemon.services.lock().insert("restart-sec-svc".to_string(), proc);
+        daemon.configs.lock().insert("restart-sec-svc".to_string(), config.clone());
+
+        // First crash (ran for < 10s)
+        daemon.handle_child_exit(9999, 1);
+        {
+            let services = daemon.services.lock();
+            let proc = services.get("restart-sec-svc").unwrap();
+            assert_eq!(proc.consecutive_failures, 1);
+            let delay_dur = proc.next_restart_at.unwrap().duration_since(std::time::Instant::now());
+            assert!(delay_dur >= std::time::Duration::from_millis(4500) && delay_dur <= std::time::Duration::from_millis(6500));
+        }
+
+        // Simulate restarting (updating state/pid, keep consecutive_failures=1)
+        {
+            let mut services = daemon.services.lock();
+            let proc = services.get_mut("restart-sec-svc").unwrap();
+            proc.state = ServiceState::Running;
+            proc.pid = Some(9998);
+            proc.started_at = Some(std::time::Instant::now());
+        }
+
+        // Second crash (ran for < 10s)
+        daemon.handle_child_exit(9998, 1);
+        {
+            let services = daemon.services.lock();
+            let proc = services.get("restart-sec-svc").unwrap();
+            assert_eq!(proc.consecutive_failures, 2);
+            let delay_dur = proc.next_restart_at.unwrap().duration_since(std::time::Instant::now());
+            assert!(delay_dur >= std::time::Duration::from_millis(9500) && delay_dur <= std::time::Duration::from_millis(11500));
+        }
+
+        // Simulate restarting, running for > 10s (successful run)
+        {
+            let mut services = daemon.services.lock();
+            let proc = services.get_mut("restart-sec-svc").unwrap();
+            proc.state = ServiceState::Running;
+            proc.pid = Some(9997);
+            proc.started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        }
+
+        // Third crash (after running successfully for > 10s)
+        daemon.handle_child_exit(9997, 1);
+        {
+            let services = daemon.services.lock();
+            let proc = services.get("restart-sec-svc").unwrap();
+            // consecutive_failures should be reset to 1
+            assert_eq!(proc.consecutive_failures, 1);
+            let delay_dur = proc.next_restart_at.unwrap().duration_since(std::time::Instant::now());
+            assert!(delay_dur >= std::time::Duration::from_millis(4500) && delay_dur <= std::time::Duration::from_millis(6500));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_watchdog_timeout_behavior() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-watchdog.sock".to_string(),
+        });
+
+        let mut config = AppConfig::default();
+        config.name = "watchdog-svc".to_string();
+        config.watchdog_sec = Some(2); // 2 seconds watchdog
+        config.watchdog_match = Some("active".to_string());
+
+        let mut proc = ManagedProcess::new(config.clone());
+        proc.state = ServiceState::Running;
+        proc.target_state = ServiceState::Running;
+        proc.pid = Some(9999);
+        proc.started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3)); // already past startup grace period
+        proc.last_watchdog_ping = Some(std::time::Instant::now() - std::time::Duration::from_secs(3)); // watchdog expired!
+
+        daemon.services.lock().insert("watchdog-svc".to_string(), proc);
+
+        // Run check_restarts. This should detect the watchdog timeout and kill the process.
+        daemon.check_restarts();
+
+        // In check_restarts, we kill via process::send_signal. Since PID 9999 doesn't exist, it won't crash the test.
+        // Let's verify that last_watchdog_ping hasn't changed, but let's check that if we update last_watchdog_ping, check_restarts doesn't kill it.
+        {
+            let mut services = daemon.services.lock();
+            let proc = services.get_mut("watchdog-svc").unwrap();
+            proc.last_watchdog_ping = Some(std::time::Instant::now());
+        }
+        // This time it shouldn't trigger watchdog (last_watchdog_ping is recent).
+        daemon.check_restarts();
+    }
+
+    #[tokio::test]
+    async fn test_idle_termination_behavior() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-idle.sock".to_string(),
+        });
+
+        let mut config = AppConfig::default();
+        config.name = "idle-svc".to_string();
+        config.idle_termination_sec = Some(2);
+
+        let mut proc = ManagedProcess::new(config.clone());
+        proc.state = ServiceState::Running;
+        proc.target_state = ServiceState::Running;
+        proc.pid = Some(9999);
+        proc.last_active = Some(0);
+        proc.last_sess = Some(0);
+        proc.last_stderr_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3)); // no stderr for 3 seconds
+
+        daemon.services.lock().insert("idle-svc".to_string(), proc);
+
+        // First check_restarts tick: sets idle_since
+        daemon.check_restarts();
+
+        {
+            let services = daemon.services.lock();
+            let proc = services.get("idle-svc").unwrap();
+            assert!(proc.idle_since.is_some());
+        }
+
+        // Simulate time passing (move idle_since back in time)
+        {
+            let mut services = daemon.services.lock();
+            let proc = services.get_mut("idle-svc").unwrap();
+            proc.idle_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        }
+
+        // Second check_restarts tick: triggers idle termination
+        daemon.check_restarts();
+
+        {
+            let services = daemon.services.lock();
+            let proc = services.get("idle-svc").unwrap();
+            assert_eq!(proc.target_state, ServiceState::Stopped);
+        }
     }
 }

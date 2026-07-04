@@ -1,0 +1,9 @@
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/sh -c 'set -eu; grep -q \" /tmp \" /proc/self/mountinfo; if [ -e /opt ]; then grep -Eq \" /opt ro(,| )\" /proc/self/mountinfo; fi; if [ -e /nix ]; then grep -Eq \" /nix ro(,| )\" /proc/self/mountinfo; fi; touch /tmp/private-ok; [ -c /dev/null ]; [ -c /dev/zero ]; [ ! -e /dev/kmsg ]; ! touch /home/system/etc/mesh-init-should-not-write 2>/dev/null; echo PASS mounts > /home/system/tmp/results-mounts'"
+PrivateTmp = true
+PrivateDevices = true
+ProtectSystem = "strict"
+ReadWritePaths = ["/home/system/tmp"]
+StandardOutput = "inherit"
+StandardError = "inherit"

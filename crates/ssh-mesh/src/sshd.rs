@@ -1096,8 +1096,8 @@ fn mesh_init_socket_path() -> String {
     if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
         return path;
     }
-    mesh::paths::AppPaths::for_app("system")
-        .control_socket("mesh-init")
+    mesh::paths::AppPaths::for_app("mesh-init")
+        .mesh_socket()
         .to_string_lossy()
         .into_owned()
 }
@@ -1131,12 +1131,36 @@ fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| mesh::paths::default_home_base());
     let home_path = home_root.join(user);
-    let metadata = std::fs::metadata(&home_path).ok()?;
+    let metadata = match std::fs::metadata(&home_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(
+                user = %user,
+                home = %home_path.display(),
+                error = %error,
+                "terminal home lookup failed"
+            );
+            return None;
+        }
+    };
     if !metadata.is_dir() {
+        tracing::warn!(
+            user = %user,
+            home = %home_path.display(),
+            "terminal home path is not a directory"
+        );
         return None;
     }
 
     use std::os::unix::fs::MetadataExt;
+    tracing::info!(
+        user = %user,
+        home = %home_path.display(),
+        uid = metadata.uid(),
+        gid = metadata.gid(),
+        socket = %mesh_init_socket_path(),
+        "resolved mesh-init terminal target"
+    );
     Some(MeshInitTerminal {
         socket_path: mesh_init_socket_path(),
         user: user.to_string(),

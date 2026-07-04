@@ -106,11 +106,11 @@ enum ForwardSpec {
 
 async fn request_jsonl_connect(host: &str, user: &str) -> Result<()> {
     let jsonl_path = mesh::paths::AppPaths::for_app("ssh-mesh")
-        .run_dir("ssh-mesh")
-        .join("jsonl.sock");
+        .mesh_socket()
+        .to_path_buf();
     let stream = UnixStream::connect(&jsonl_path)
         .await
-        .with_context(|| format!("connect ssh-mesh JSONL socket {}", jsonl_path.display()))?;
+        .with_context(|| format!("connect ssh-mesh mesh endpoint {}", jsonl_path.display()))?;
     let (read, mut write) = stream.into_split();
     let request = json!({
         "method": "sshc/connect",

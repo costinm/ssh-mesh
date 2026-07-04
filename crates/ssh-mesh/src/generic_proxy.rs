@@ -29,14 +29,14 @@ fn app_socket_path(app: &str, explicit: Option<&str>) -> String {
     }
 
     if app == "mesh-init" {
-        return mesh::paths::AppPaths::for_app("system")
-            .control_socket("mesh-init")
+        return mesh::paths::AppPaths::for_app("mesh-init")
+            .mesh_socket()
             .to_string_lossy()
             .into_owned();
     }
 
     mesh::paths::AppPaths::for_app(app)
-        .control_socket(app)
+        .mesh_socket()
         .to_string_lossy()
         .into_owned()
 }

@@ -28,7 +28,7 @@ Name = "vm-ipc"
 | Public HTTP static web | `http` |
 | Public HTTPS static web | `https` |
 | Admin HTTP/API | `admin` |
-| Common mesh JSONL UDS | `jsonl` |
+| Common mesh endpoint UDS | `jsonl` |
 | Trusted SSH UDS | `ssh-uds` |
 | Trusted SSH VSOCK | `vsock` |
 
@@ -36,9 +36,9 @@ If admin/API should be served over UDS instead of TCP, replace the `admin`
 listener `Address` with a Unix socket path and keep the descriptor name
 `admin`.
 
-The `jsonl` listener is the common `mesh::server::MeshListener` JSONL/JSON-RPC
-surface. Apps that are not `ssh-mesh` should use the same name in their own
-service TOML file.
+The `jsonl` fd name selects the common `mesh::server::MeshListener` endpoint.
+The socket path is protocol-neutral (`mesh.sock`); current apps can speak
+line JSON, JSON-RPC/MCP-shaped calls, or text protocols on the same endpoint.
 
 `ssh-uds` and `vsock` are both trusted SSH transports. They are grouped after
 the JSONL/admin surfaces because they are not control APIs.

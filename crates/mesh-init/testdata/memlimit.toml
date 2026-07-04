@@ -1,5 +1,5 @@
 [Service]
-
+Type = "exec"
 ExecStart = "/bin/sleep 3600"
 OOMScoreAdjust = -500
 [Resources]

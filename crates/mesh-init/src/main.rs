@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let socket_path = get_socket_path();
-    let config_dir = get_config_dir();
+    let config_dirs = get_config_dirs();
 
     if let Some(request) = control_request(&args.command)? {
         let response = mesh_init::server::send_request(&socket_path, &request).await?;
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         Some(args.command)
     };
 
-    run(config_dir, socket_path, command).await
+    run(config_dirs, socket_path, command).await
 }
 
 fn control_request(command: &[String]) -> Result<Option<Request>> {
@@ -122,13 +122,17 @@ fn print_response(response: Response) -> Result<()> {
 }
 
 /// Common startup: create daemon, start everything, optionally run a CLI command.
-async fn run(config_dir: String, socket_path: String, command: Option<Vec<String>>) -> Result<()> {
+async fn run(
+    config_dirs: Vec<String>,
+    socket_path: String,
+    command: Option<Vec<String>>,
+) -> Result<()> {
     // Collect systemd socket activation file descriptors before the daemon
     // creates its own listeners. This must happen before start_background_tasks.
     mesh_init::activation::collect_systemd_fds();
 
     let config = DaemonConfig {
-        config_dirs: vec![config_dir],
+        config_dirs,
         socket_path: socket_path.clone(),
     };
 
@@ -279,24 +283,27 @@ async fn wait_for_service_exit(daemon: &std::sync::Arc<Daemon>, name: &str) {
     }
 }
 
-fn get_config_dir() -> String {
-    if let Ok(dir) = std::env::var("MESH_INIT_DIR") {
-        return dir;
-    }
-    mesh::paths::AppPaths::for_app("system")
-        .etc
-        .join("mesh-init")
-        .to_string_lossy()
-        .into_owned()
+fn get_config_dirs() -> Vec<String> {
+    mesh_init::config::core_config_dirs()
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn get_socket_path() -> String {
-    let run_dir = if let Ok(dir) = std::env::var("MESH_INIT_RUN") {
-        std::path::PathBuf::from(dir)
-    } else {
-        mesh::paths::AppPaths::for_app("system").run_dir("mesh-init")
-    };
-    run_dir.join("control.sock").to_string_lossy().into_owned()
+    if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
+        return path;
+    }
+    if let Ok(dir) = std::env::var("MESH_INIT_RUN") {
+        return std::path::PathBuf::from(dir)
+            .join("control.sock")
+            .to_string_lossy()
+            .into_owned();
+    }
+    mesh::paths::AppPaths::for_app("mesh-init")
+        .mesh_socket()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -320,16 +327,17 @@ mod tests {
 
     #[test]
     fn default_paths_use_system_app_home() {
-        let paths = mesh::paths::AppPaths::for_app("system");
         assert_eq!(
-            get_config_dir(),
-            paths.etc.join("mesh-init").to_string_lossy()
+            get_config_dirs(),
+            mesh_init::config::core_config_dirs()
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             get_socket_path(),
-            paths
-                .run_dir("mesh-init")
-                .join("control.sock")
+            mesh::paths::AppPaths::for_app("mesh-init")
+                .mesh_socket()
                 .to_string_lossy()
         );
     }

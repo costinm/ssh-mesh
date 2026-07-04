@@ -168,9 +168,10 @@ impl MeshListener {
         info!("MeshListener: Listening on UDS {:?}", actual_path);
 
         if !actual_path.starts_with('\0') {
-            // Set permissions to 0660
+            // Public mesh IPC is connectable by local clients; handlers
+            // authenticate requests at the protocol layer.
             let mut perms = std::fs::metadata(&actual_path)?.permissions();
-            perms.set_mode(0o660);
+            perms.set_mode(0o666);
             std::fs::set_permissions(&actual_path, perms)?;
         }
 

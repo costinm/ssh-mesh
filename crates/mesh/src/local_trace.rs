@@ -672,11 +672,17 @@ pub fn init(
     let buffer_layer = LogBufferLayer::new();
     let log_buffer = buffer_layer.buffer();
 
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_thread_names(false);
+
     let guard = match build_file_writer(app) {
         Some((non_blocking, guard)) => {
             Registry::default()
                 .with(filter)
                 .with(buffer_layer)
+                .with(stderr_layer)
                 .with(
                     tracing_subscriber::fmt::layer()
                         .json()
@@ -688,7 +694,11 @@ pub fn init(
             Some(guard)
         }
         None => {
-            Registry::default().with(filter).with(buffer_layer).init();
+            Registry::default()
+                .with(filter)
+                .with(buffer_layer)
+                .with(stderr_layer)
+                .init();
             None
         }
     };

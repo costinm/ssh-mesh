@@ -1,0 +1,5 @@
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/sh -c 'id -u > /home/demo-app/uid; id -g > /home/demo-app/gid; echo opt > /home/demo-app/source'"
+StandardOutput = "inherit"
+StandardError = "inherit"

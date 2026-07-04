@@ -72,7 +72,7 @@ pub struct AppConfigFile {
 ///
 /// When adding or changing fields here, update
 /// `crates/mesh-init/examples/all-fields.toml` and `crates/mesh-init/CONFIG.md`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ServiceSection {
     #[serde(rename = "ExecStart")]
     pub exec_start: String,
@@ -104,6 +104,14 @@ pub struct ServiceSection {
     pub restart: RestartPolicy,
     #[serde(rename = "RestartSec")]
     pub restart_sec: Option<String>,
+    #[serde(rename = "ReadyMatch")]
+    pub ready_match: Option<String>,
+    #[serde(rename = "WatchdogMatch")]
+    pub watchdog_match: Option<String>,
+    #[serde(rename = "WatchdogSec")]
+    pub watchdog_sec: Option<serde_json::Value>,
+    #[serde(rename = "IdleTerminationSec")]
+    pub idle_termination_sec: Option<serde_json::Value>,
     #[serde(rename = "TimeoutStartSec")]
     pub timeout_start_sec: Option<String>,
     #[serde(rename = "TimeoutStopSec")]
@@ -466,6 +474,11 @@ pub struct AppConfig {
     pub allow_dangerous_env: Vec<String>,
     pub priority: u32,
     pub oneshot: bool,
+    pub service_type: Option<String>,
+    pub ready_match: Option<String>,
+    pub watchdog_match: Option<String>,
+    pub watchdog_sec: Option<u64>,
+    pub idle_termination_sec: Option<u64>,
     pub activation_mode: ServiceActivationMode,
     pub activation_socket: Option<String>,
     pub oom_score_adjust: Option<i32>,
@@ -651,6 +664,31 @@ fn parse_duration_secs(value: Option<&str>, field: &str) -> Result<Option<u64>, 
         )));
     }
     Ok(Some((parsed * multiplier).ceil() as u64))
+}
+
+fn parse_duration_from_value(value: Option<&serde_json::Value>, field: &str) -> Result<Option<u64>, ConfigError> {
+    let Some(val) = value else {
+        return Ok(None);
+    };
+    match val {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Ok(Some(u))
+            } else if let Some(f) = n.as_f64() {
+                if f >= 0.0 && f.is_finite() {
+                    Ok(Some(f.ceil() as u64))
+                } else {
+                    Err(ConfigError::Invalid(format!("{field} must be a non-negative number")))
+                }
+            } else {
+                Err(ConfigError::Invalid(format!("{field} must be a valid number")))
+            }
+        }
+        serde_json::Value::String(s) => {
+            parse_duration_secs(Some(s.as_str()), field)
+        }
+        _ => Err(ConfigError::Invalid(format!("{field} must be a number or a duration string"))),
+    }
 }
 
 fn parse_umask(value: Option<&str>) -> Result<Option<u32>, ConfigError> {
@@ -1013,10 +1051,25 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         }
     }
 
+    if let Some(t) = file.service.service_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if !t.eq_ignore_ascii_case("oneshot")
+            && !t.eq_ignore_ascii_case("exec")
+        {
+            return Err(ConfigError::Invalid(format!(
+                "unsupported Type '{}'; supported values are: oneshot, exec",
+                t
+            )));
+        }
+    }
+
     let (uid, primary_gid) = resolve_user(file.service.user.as_deref())?;
     let gid = resolve_group(file.service.group.as_deref())?.or(primary_gid);
     let restart_sec =
         parse_duration_secs(file.service.restart_sec.as_deref(), "RestartSec")?.unwrap_or(1);
+    let watchdog_sec =
+        parse_duration_from_value(file.service.watchdog_sec.as_ref(), "WatchdogSec")?;
+    let idle_termination_sec =
+        parse_duration_from_value(file.service.idle_termination_sec.as_ref(), "IdleTerminationSec")?;
     let timeout_start_sec =
         parse_duration_secs(file.service.timeout_start_sec.as_deref(), "TimeoutStartSec")?;
     let timeout_stop_sec =
@@ -1066,6 +1119,17 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
             .service_type
             .as_deref()
             .is_some_and(|t| t.eq_ignore_ascii_case("oneshot")),
+        service_type: file.service.service_type.clone(),
+        ready_match: file.service.ready_match.clone(),
+        watchdog_match: file.service.watchdog_match.clone().or_else(|| {
+            if watchdog_sec.is_some() {
+                Some("active".to_string())
+            } else {
+                None
+            }
+        }),
+        watchdog_sec,
+        idle_termination_sec,
         oom_score_adjust: file.service.oom_score_adjust,
         no_new_privileges: file.service.no_new_privileges,
         private_tmp: file.service.private_tmp,
@@ -1367,5 +1431,44 @@ AllowDangerousEnv = ["PATH", "LD_LIBRARY_PATH"]
             config.allow_dangerous_env,
             vec!["PATH".to_string(), "LD_LIBRARY_PATH".to_string()]
         );
+    }
+
+    #[test]
+    fn test_service_type_validation() {
+        // Valid types
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"oneshot\"",
+            Some("t1")
+        ).is_ok());
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"exec\"",
+            Some("t2")
+        ).is_ok());
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"Exec\"",
+            Some("t3")
+        ).is_ok());
+
+        // Invalid types
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"simple\"",
+            Some("t4")
+        ).is_err());
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"forking\"",
+            Some("t5")
+        ).is_err());
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"notify\"",
+            Some("t6")
+        ).is_err());
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"dbus\"",
+            Some("t7")
+        ).is_err());
+        assert!(parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\nType = \"\"",
+            Some("t8")
+        ).is_ok()); // empty type is omitted/ignored and is OK
     }
 }

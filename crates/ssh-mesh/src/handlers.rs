@@ -512,8 +512,8 @@ fn mesh_init_socket_path() -> String {
     if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
         return path;
     }
-    mesh::paths::AppPaths::for_app("system")
-        .control_socket("mesh-init")
+    mesh::paths::AppPaths::for_app("mesh-init")
+        .mesh_socket()
         .to_string_lossy()
         .into_owned()
 }

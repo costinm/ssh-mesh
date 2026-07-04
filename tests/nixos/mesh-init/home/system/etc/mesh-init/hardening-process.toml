@@ -1,0 +1,9 @@
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/sh -c 'set -eu; grep -q \"^NoNewPrivs:[[:space:]]*1\" /proc/self/status; ! grep -q \"eth0:\" /proc/net/dev; touch /home/system/tmp/umask-file; [ \"$(stat -c %a /home/system/tmp/umask-file)\" = \"600\" ]; id -G | grep -qw 0; echo PASS process > /home/system/tmp/results-process'"
+NoNewPrivileges = true
+PrivateNetwork = true
+UMask = "0077"
+SupplementaryGroups = ["0"]
+StandardOutput = "inherit"
+StandardError = "inherit"

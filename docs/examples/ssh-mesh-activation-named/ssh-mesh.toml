@@ -31,7 +31,7 @@ Name = "admin"
 
 [[Socket.Listen]]
 Type = "stream"
-Address = "/home/ssh-mesh/run/ssh-mesh/jsonl.sock"
+Address = "/run/mesh/ssh-mesh/mesh.sock"
 Name = "jsonl"
 
 [[Socket.Listen]]

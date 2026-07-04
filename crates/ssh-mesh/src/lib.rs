@@ -400,13 +400,22 @@ impl MeshNode {
         let keys = crate::auth::load_or_generate_keys_save(&base_dir);
 
         // Load authorized keys from file
+        let authorized_keys_path = base_dir.join("authorized_keys");
         let mut authorized_keys_vec = match crate::auth::load_authorized_keys(&base_dir) {
             Ok(keys) => {
-                info!("Loaded {} authorized keys from file", keys.len());
+                info!(
+                    "Loaded {} authorized keys from {}",
+                    keys.len(),
+                    authorized_keys_path.display()
+                );
                 keys
             }
             Err(e) => {
-                error!("Failed to load authorized_keys: {}", e);
+                error!(
+                    "Failed to load authorized_keys from {}: {}",
+                    authorized_keys_path.display(),
+                    e
+                );
                 Vec::new()
             }
         };

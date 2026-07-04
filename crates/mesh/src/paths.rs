@@ -9,6 +9,9 @@ pub struct AppPaths {
     pub app: String,
     pub home: PathBuf,
     pub opt: PathBuf,
+    pub mesh_run_base: PathBuf,
+    pub mesh_ipc_dir: PathBuf,
+    pub mesh_socket: PathBuf,
     pub etc: PathBuf,
     pub files: PathBuf,
     pub cache: PathBuf,
@@ -83,9 +86,20 @@ impl AppPaths {
                 .unwrap_or_else(|| PathBuf::from("/opt"))
                 .join(&app)
         });
+        let mesh_run_base = env("MESH_RUN_BASE").map(PathBuf::from).unwrap_or_else(|| {
+            mesh_root
+                .as_ref()
+                .map(|root| root.join("run/mesh"))
+                .unwrap_or_else(|| PathBuf::from("/run/mesh"))
+        });
+        let mesh_ipc_dir = mesh_run_base.join(&app);
+        let mesh_socket = mesh_ipc_dir.join("mesh.sock");
 
         Self {
             app,
+            mesh_run_base,
+            mesh_ipc_dir,
+            mesh_socket,
             etc: home.join("etc"),
             files: home.join("files"),
             cache: home.join("cache"),
@@ -111,6 +125,16 @@ impl AppPaths {
     /// Default control socket for a service namespace under the app home.
     pub fn control_socket(&self, name: impl AsRef<str>) -> PathBuf {
         self.run_dir(name).join("control.sock")
+    }
+
+    /// Public mesh IPC directory for this app.
+    pub fn mesh_ipc_dir(&self) -> &PathBuf {
+        &self.mesh_ipc_dir
+    }
+
+    /// Public protocol-neutral mesh endpoint for this app.
+    pub fn mesh_socket(&self) -> &PathBuf {
+        &self.mesh_socket
     }
 
     /// Mutable resource override directory.
@@ -180,6 +204,9 @@ mod tests {
     fn root_default_paths_use_system_home_and_opt_bases() {
         let paths = AppPaths::for_app_with_env_and_context("demo", |_| None, || None, 0);
         assert_eq!(paths.home, PathBuf::from("/home/demo"));
+        assert_eq!(paths.mesh_run_base, PathBuf::from("/run/mesh"));
+        assert_eq!(paths.mesh_ipc_dir, PathBuf::from("/run/mesh/demo"));
+        assert_eq!(paths.mesh_socket, PathBuf::from("/run/mesh/demo/mesh.sock"));
         assert_eq!(paths.run, PathBuf::from("/home/demo/run"));
         assert_eq!(paths.etc, PathBuf::from("/home/demo/etc"));
         assert_eq!(paths.files, PathBuf::from("/home/demo/files"));
@@ -198,6 +225,14 @@ mod tests {
         let paths =
             AppPaths::for_app_with_env_and_context("demo", |_| None, || Some(cwd.clone()), 1000);
         assert_eq!(paths.home, PathBuf::from("/workspace/mesh/home/demo"));
+        assert_eq!(
+            paths.mesh_run_base,
+            PathBuf::from("/workspace/mesh/run/mesh")
+        );
+        assert_eq!(
+            paths.mesh_socket,
+            PathBuf::from("/workspace/mesh/run/mesh/demo/mesh.sock")
+        );
         assert_eq!(paths.run, PathBuf::from("/workspace/mesh/home/demo/run"));
         assert_eq!(paths.etc, PathBuf::from("/workspace/mesh/home/demo/etc"));
         assert_eq!(paths.opt, PathBuf::from("/workspace/mesh/opt/demo"));
@@ -212,6 +247,10 @@ mod tests {
         let paths = paths_with(&[("MESH_HOME", "/tmp/mesh-root")]);
         assert_eq!(paths.home, PathBuf::from("/tmp/mesh-root/home/demo"));
         assert_eq!(paths.opt, PathBuf::from("/tmp/mesh-root/opt/demo"));
+        assert_eq!(
+            paths.mesh_socket,
+            PathBuf::from("/tmp/mesh-root/run/mesh/demo/mesh.sock")
+        );
     }
 
     #[test]
@@ -222,6 +261,15 @@ mod tests {
         ]);
         assert_eq!(paths.home, PathBuf::from("/apex/home/demo"));
         assert_eq!(paths.opt, PathBuf::from("/apex/opt/demo"));
+        assert_eq!(paths.mesh_socket, PathBuf::from("/run/mesh/demo/mesh.sock"));
+    }
+
+    #[test]
+    fn mesh_run_base_overrides_public_ipc_base() {
+        let paths = paths_with(&[("MESH_RUN_BASE", "/mesh-ipc")]);
+        assert_eq!(paths.mesh_run_base, PathBuf::from("/mesh-ipc"));
+        assert_eq!(paths.mesh_ipc_dir, PathBuf::from("/mesh-ipc/demo"));
+        assert_eq!(paths.mesh_socket, PathBuf::from("/mesh-ipc/demo/mesh.sock"));
     }
 
     #[test]
