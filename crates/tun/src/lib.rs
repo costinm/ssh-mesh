@@ -220,19 +220,31 @@ fn spawn_packet_router_with_policy(
                 packet::TunPacket::Udp(packet)
                     if packet.src_port == 53 || packet.dst_port == 53 =>
                 {
+                    tracing::info!(
+                        src = %std::net::SocketAddr::new(packet.src_addr, packet.src_port),
+                        dst = %std::net::SocketAddr::new(packet.dst_addr, packet.dst_port),
+                        bytes = packet.payload.len(),
+                        "DNS packet observed from TUN"
+                    );
                     let handler = dns_handler.clone();
                     tokio::spawn(async move {
                         handler.handle_dns(packet).await;
                     });
                 }
                 packet::TunPacket::Udp(packet) => {
+                    tracing::info!(
+                        src = %std::net::SocketAddr::new(packet.src_addr, packet.src_port),
+                        dst = %std::net::SocketAddr::new(packet.dst_addr, packet.dst_port),
+                        bytes = packet.payload.len(),
+                        "UDP packet observed from TUN"
+                    );
                     let handler = udp_handler.clone();
                     tokio::spawn(async move {
                         handler.handle_udp(packet).await;
                     });
                 }
                 packet::TunPacket::Tcp(tcp) => {
-                    tracing::debug!(
+                    tracing::info!(
                         src = %std::net::SocketAddr::new(tcp.src_addr, tcp.src_port),
                         dst = %std::net::SocketAddr::new(tcp.dst_addr, tcp.dst_port),
                         syn = tcp.syn,

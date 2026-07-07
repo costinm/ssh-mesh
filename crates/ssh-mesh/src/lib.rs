@@ -308,6 +308,16 @@ pub struct MeshNodeConfig {
 pub trait MeshListener: Send + Sync {
     fn on_ssh_connection(&self, client_id: u64, user: &str);
     fn on_stream(&self, client_id: u64, host: &str, port: u16, stream: tokio::io::DuplexStream);
+    fn on_session(
+        &self,
+        _client_id: u64,
+        _user: &str,
+        _command: Option<&str>,
+        _env: &HashMap<String, String>,
+        _stream: tokio::io::DuplexStream,
+    ) -> bool {
+        false
+    }
 }
 
 // MeshNode is the main server struct (formerly SshServer).

@@ -763,6 +763,9 @@ impl SshHandler {
     fn spawn_command(
         command: Option<String>,
         channel_id: ChannelId,
+        server: MeshNode,
+        client_id: u64,
+        user: String,
         sessions: Arc<Mutex<HashMap<ChannelId, ChannelSession>>>,
         channel_writers: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Bytes>>>>,
         session: &mut server::Session,
@@ -788,6 +791,45 @@ impl SshHandler {
                 }
             };
             channel_session.shell = true;
+
+            let env = channel_session.env.clone();
+            let (listener_side, ssh_side) = tokio::io::duplex(64 * 1024);
+            let listeners = server.listeners.clone();
+            let mut accepted = false;
+            let mut listener_side = Some(listener_side);
+            {
+                let listeners = listeners.lock().await;
+                for listener in listeners.iter() {
+                    let Some(stream) = listener_side.take() else {
+                        break;
+                    };
+                    if listener.on_session(
+                        client_id,
+                        &user,
+                        command.as_deref(),
+                        &env,
+                        stream,
+                    ) {
+                        accepted = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if accepted {
+                drop(sessions_lock);
+                let _ = session_handle.channel_success(channel_id).await;
+                Self::bridge_shell_stream_to_channel(
+                    ssh_side,
+                    channel_id,
+                    channel_writers.clone(),
+                    session_handle.clone(),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
 
             let has_pty = channel_session.pty.is_some();
 
@@ -2638,6 +2680,9 @@ impl server::Handler for SshHandler {
             Some(Self::spawn_command(
                 Some(command.clone()),
                 channel,
+                self.server.clone(),
+                self.id,
+                self.user.clone(),
                 self.sessions.clone(),
                 self.channel_writers.clone(),
                 session,
@@ -2698,6 +2743,9 @@ impl server::Handler for SshHandler {
             Some(Self::spawn_command(
                 None,
                 channel,
+                self.server.clone(),
+                self.id,
+                self.user.clone(),
                 self.sessions.clone(),
                 self.channel_writers.clone(),
                 session,
