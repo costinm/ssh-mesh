@@ -125,7 +125,7 @@ fn parse_protect_system(value: Option<&str>) -> Result<Option<ProtectSystemMode>
         "full" => Ok(Some(ProtectSystemMode::Full)),
         "strict" => Ok(Some(ProtectSystemMode::Strict)),
         unsupported => {
-            warn!("ProtectSystem={unsupported} is not supported by mesh-init");
+            warn!(value = unsupported, "unsupported_protect_system");
             Err(ProcessError::SpawnFailed(format!(
                 "unsupported ProtectSystem value: {value}"
             )))
@@ -143,7 +143,7 @@ fn parse_protect_home(value: Option<&str>) -> Result<Option<ProtectHomeMode>, Pr
         "read-only" | "readonly" => Ok(Some(ProtectHomeMode::ReadOnly)),
         "tmpfs" => Ok(Some(ProtectHomeMode::Tmpfs)),
         unsupported => {
-            warn!("ProtectHome={unsupported} is not supported by mesh-init");
+            warn!(value = unsupported, "unsupported_protect_home");
             Err(ProcessError::SpawnFailed(format!(
                 "unsupported ProtectHome value: {value}"
             )))
@@ -153,19 +153,19 @@ fn parse_protect_home(value: Option<&str>) -> Result<Option<ProtectHomeMode>, Pr
 
 fn path_to_cstring(path: &str, field: &str) -> Result<CString, ProcessError> {
     if path.is_empty() {
-        warn!("{field} contains an empty path");
+        warn!(field = %field, "empty_path");
         return Err(ProcessError::SpawnFailed(format!(
             "{field} contains an empty path"
         )));
     }
     if !path.starts_with('/') {
-        warn!("{field} path is not absolute: {path}");
+        warn!(field = %field, path = %path, "path_not_absolute");
         return Err(ProcessError::SpawnFailed(format!(
             "{field} path must be absolute: {path}"
         )));
     }
     CString::new(path.as_bytes()).map_err(|_| {
-        warn!("{field} path contains NUL byte: {path:?}");
+        warn!(field = %field, path = ?path, "path_contains_nul");
         ProcessError::SpawnFailed(format!("{field} path contains NUL byte: {path:?}"))
     })
 }
@@ -179,7 +179,7 @@ fn path_list_to_cstrings(paths: &[String], field: &str) -> Result<Vec<CString>, 
 
 fn inaccessible_path_kind(path: &str) -> Result<MaskKind, ProcessError> {
     let meta = std::fs::metadata(path).map_err(|error| {
-        warn!("InaccessiblePaths path cannot be inspected: {path}: {error}");
+        warn!(path = %path, error = %error, "cannot_inspect_inaccessible_path");
         ProcessError::SpawnFailed(format!("InaccessiblePaths path missing or invalid: {path}"))
     })?;
     Ok(if meta.is_dir() {
@@ -225,7 +225,7 @@ fn parse_cap_list(values: &[String], field: &str) -> Result<Vec<i32>, ProcessErr
     let mut caps = Vec::new();
     for value in values {
         let Some(cap) = cap_name_to_number(value) else {
-            warn!("{field} capability is not supported by mesh-init: {value}");
+            warn!(field = %field, capability = %value, "unsupported_capability");
             return Err(ProcessError::SpawnFailed(format!(
                 "{field} capability is not supported: {value}"
             )));
@@ -249,17 +249,14 @@ fn build_sandbox_plan(config: &AppConfig) -> Result<SandboxPlan, ProcessError> {
     if let Some(bounding_caps) = &bounding_caps {
         for cap in &ambient_caps {
             if !bounding_caps.contains(cap) {
-                warn!(
-                    "AmbientCapabilities contains capability outside CapabilityBoundingSet: {}",
-                    cap
-                );
+                warn!(capability = cap, "ambient_cap_outside_bounding_set");
                 return Err(ProcessError::SpawnFailed(
                     "AmbientCapabilities must be a subset of CapabilityBoundingSet".to_string(),
                 ));
             }
         }
         if !ambient_caps.is_empty() && !bounding_caps.contains(&CAP_SETPCAP) {
-            warn!("AmbientCapabilities with CapabilityBoundingSet requires CAP_SETPCAP for setup");
+            warn!("ambient_caps_require_setpcap");
             return Err(ProcessError::SpawnFailed(
                 "AmbientCapabilities with CapabilityBoundingSet requires CAP_SETPCAP".to_string(),
             ));
@@ -779,7 +776,7 @@ fn standard_stdio(value: Option<&str>, field: &str) -> Result<Stdio, ProcessErro
             open_standard_file(value).map(Stdio::from)
         }
         other => {
-            warn!("{field}={other} is not supported by mesh-init");
+            warn!(field = %field, value = %other, "unsupported_stdio_setting");
             Err(ProcessError::SpawnFailed(format!(
                 "unsupported {field} value: {other}"
             )))
@@ -825,7 +822,7 @@ fn apply_standard_io(
                 cmd.stderr(Stdio::from(stderr_file));
             }
             other => {
-                warn!("StandardOutput={other} is not supported by mesh-init");
+                warn!(value = %other, "unsupported_stdout_setting");
                 return Err(ProcessError::SpawnFailed(format!(
                     "unsupported StandardOutput value: {other}"
                 )));
@@ -855,8 +852,10 @@ pub fn spawn_process(
     passed_fd: Option<ActivationFd>,
 ) -> Result<(u32, Option<std::process::ChildStderr>), ProcessError> {
     info!(
-        "Spawning service '{}': {} {:?}",
-        config.name, config.command, config.args
+        service = %config.name,
+        command = %config.command,
+        args = ?config.args,
+        "spawning_service"
     );
 
     let mut cmd = std::process::Command::new(&config.command);
@@ -1057,38 +1056,41 @@ pub fn spawn_process(
         }
     }
 
-    let has_watchdog_or_ready = config.watchdog_sec.is_some() || config.ready_match.is_some();
+    let has_watchdog_or_ready = config.watchdog_sec.is_some()
+        || config.ready_match.is_some()
+        || config.idle_termination_sec.is_some();
     if has_watchdog_or_ready && !is_passed_fd_some {
         let std_err = config.standard_error.as_deref().unwrap_or("inherit").trim();
-        if std_err == "null" || std_err.starts_with("file:") || std_err.starts_with("append:") || std_err.starts_with("truncate:") {
-            warn!("StandardError is configured to '{}'; watchdog and readiness detection will not receive output", std_err);
+        if std_err == "null"
+            || std_err.starts_with("file:")
+            || std_err.starts_with("append:")
+            || std_err.starts_with("truncate:")
+        {
+            warn!(value = %std_err, "stderr_redirected_watchdog_disabled");
         } else {
             cmd.stderr(std::process::Stdio::piped());
         }
     }
 
     let mut child = cmd.spawn().map_err(|e| {
-        error!("Failed to spawn '{}': {}", config.name, e);
+        error!(service = %config.name, error = %e, "service_spawn_failed");
         ProcessError::SpawnFailed(format!("{}: {}", config.command, e))
     })?;
 
     let pid = child.id();
     let stderr = child.stderr.take();
-    info!("Spawned service '{}' with PID {}", config.name, pid);
+    info!(service = %config.name, pid, "service_spawned");
 
     // Move into cgroup
     if let Err(e) = crate::cgroup::move_to_cgroup(pid, cgroup_path) {
-        warn!(
-            "Failed to move PID {} to cgroup {}: {}",
-            pid, cgroup_path, e
-        );
+        warn!(pid, cgroup = %cgroup_path, error = %e, "move_to_cgroup_failed");
     }
 
     // Set OOM score
     if let Some(oom) = config.oom_score_adjust
         && let Err(e) = crate::cgroup::set_oom_score(pid, oom)
     {
-        warn!("Failed to set oom_score_adj for PID {}: {}", pid, e);
+        warn!(pid, error = %e, "set_oom_score_failed");
     }
 
     Ok((pid, stderr))
@@ -1120,7 +1122,7 @@ pub fn run_service_command(
     }
 
     let mut child = cmd.spawn().map_err(|e| {
-        error!("Failed to run service command '{}': {}", command, e);
+        error!(command = %command, error = %e, "run_service_command_failed");
         ProcessError::SpawnFailed(format!("{}: {}", command, e))
     })?;
     let pid = child.id();
@@ -1188,7 +1190,7 @@ pub fn send_signal_pidfd(
             )
         };
         if res == 0 {
-            debug!("Sent signal {} to pidfd for PID {}", signal, pid);
+            debug!(pid, signal, "pidfd_signal_sent");
             return Ok(());
         }
         let err = std::io::Error::last_os_error();
@@ -1197,10 +1199,7 @@ pub fn send_signal_pidfd(
         }
         // Fall through to kill() for non-fatal errors (e.g. EINVAL on
         // some exotic signal values).
-        warn!(
-            "pidfd_send_signal failed for PID {}: {}; falling back to kill()",
-            pid, err
-        );
+        warn!(pid, error = %err, "pidfd_signal_failed_falling_back");
     }
     send_signal(pid, signal)
 }
@@ -1209,7 +1208,7 @@ pub fn send_signal_pidfd(
 pub fn send_signal(pid: u32, signal: i32) -> Result<(), ProcessError> {
     let res = unsafe { libc::kill(pid as i32, signal) };
     if res == 0 {
-        debug!("Sent signal {} to PID {}", signal, pid);
+        debug!(pid, signal, "signal_sent");
         Ok(())
     } else {
         let err = std::io::Error::last_os_error();
@@ -1243,7 +1242,7 @@ pub async fn stop_process(
     send_sigkill: bool,
 ) -> Result<(), ProcessError> {
     let sig = signal.unwrap_or(libc::SIGTERM);
-    info!("Stopping PID {} with signal {}", pid, sig);
+    info!(pid, signal = sig, "stopping_process");
 
     send_signal_pidfd(pidfd, pid, sig)?;
 
@@ -1263,8 +1262,9 @@ pub async fn stop_process(
     let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
     if ret == 0 && send_sigkill {
         warn!(
-            "PID {} still alive after signal {}, sending SIGKILL",
-            pid, sig
+            pid,
+            signal = sig,
+            "process_alive_after_signal_escalating_to_sigkill"
         );
         let _ = send_signal_pidfd(pidfd, pid, libc::SIGKILL);
         // Reap the killed child if we can (best-effort; the global reaper may
@@ -1272,10 +1272,7 @@ pub async fn stop_process(
         let mut s: libc::c_int = 0;
         let _ = unsafe { libc::waitpid(pid as libc::pid_t, &mut s, libc::WNOHANG) };
     } else if ret == 0 {
-        warn!(
-            "PID {} still alive after signal {}; SendSIGKILL=no",
-            pid, sig
-        );
+        warn!(pid, signal = sig, "process_alive_after_signal_no_sigkill");
     } else {
         debug!(
             "PID {} exited after signal {} (waitpid ret={})",
@@ -1291,10 +1288,10 @@ pub async fn stop_process(
 pub fn freeze_process(pid: u32, cgroup_path: Option<&str>) -> Result<(), ProcessError> {
     if let Some(cg) = cgroup_path {
         crate::cgroup::freeze_cgroup(cg, true)?;
-        info!("Froze service via cgroup {}", cg);
+        info!(cgroup = %cg, "cgroup_frozen");
     } else {
         send_signal(pid, libc::SIGSTOP)?;
-        info!("Froze PID {} with SIGSTOP", pid);
+        info!(pid, "pid_sigstop_frozen");
     }
     Ok(())
 }
@@ -1303,10 +1300,10 @@ pub fn freeze_process(pid: u32, cgroup_path: Option<&str>) -> Result<(), Process
 pub fn unfreeze_process(pid: u32, cgroup_path: Option<&str>) -> Result<(), ProcessError> {
     if let Some(cg) = cgroup_path {
         crate::cgroup::freeze_cgroup(cg, false)?;
-        info!("Unfroze service via cgroup {}", cg);
+        info!(cgroup = %cg, "cgroup_unfrozen");
     } else {
         send_signal(pid, libc::SIGCONT)?;
-        info!("Unfroze PID {} with SIGCONT", pid);
+        info!(pid, "pid_sigcont_unfrozen");
     }
     Ok(())
 }
@@ -1336,7 +1333,7 @@ pub fn start_child_reaper(
         {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to register SIGCHLD handler: {}", e);
+                error!(error = %e, "register_sigchld_failed");
                 return;
             }
         };
@@ -1353,7 +1350,7 @@ pub fn start_child_reaper(
                         break;
                     }
                     let exit_code = exit_code_from_status(status);
-                    debug!("Reaped child PID {} with exit code {}", pid, exit_code);
+                    debug!(pid, exit_code, "reaped_child");
                     let _ = tx.send((pid as u32, exit_code)).await;
                 }
             } else {
@@ -1366,10 +1363,7 @@ pub fn start_child_reaper(
                         unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
                     if ret == pid as libc::pid_t {
                         let exit_code = exit_code_from_status(status);
-                        debug!(
-                            "Reaped tracked child PID {} with exit code {}",
-                            pid, exit_code
-                        );
+                        debug!(pid, exit_code, "reaped_tracked_child");
                         tracked.lock().remove(&pid);
                         let _ = tx.send((pid, exit_code)).await;
                     } else if ret > 0 {
@@ -1464,7 +1458,8 @@ mod tests {
 
         let mut master = unsafe { std::fs::File::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        let (pid, _) = spawn_process(&config, "/sys/fs/cgroup", Some(ActivationFd::Pty(slave))).unwrap();
+        let (pid, _) =
+            spawn_process(&config, "/sys/fs/cgroup", Some(ActivationFd::Pty(slave))).unwrap();
 
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid as i32, &mut status, 0) };

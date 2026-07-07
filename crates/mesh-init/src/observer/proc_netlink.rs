@@ -267,7 +267,7 @@ pub fn run_netlink_listener(
         ) {
             Err(nix::Error::EINTR) => continue,
             Err(err) => {
-                error!("Netlink recv error: {}", err);
+                error!(error = %err, "netlink_recv_failed");
                 return Err(err);
             }
             Ok(_) => {}
@@ -340,7 +340,7 @@ pub fn run_netlink_listener(
                 })
             }
             _ => {
-                trace!("Unknown netlink event type: 0x{:08x}", proc_ev.what);
+                trace!(event_type = proc_ev.what, "unknown_netlink_event_type");
                 None
             }
         };
@@ -350,13 +350,13 @@ pub fn run_netlink_listener(
             // (or using spawn_blocking) and we don't want to async await inside this tight blocking loop
             // without converting the socket to async.
             if let Err(err) = tx.blocking_send(super::MonitoringEvent::Netlink(e)) {
-                error!("Failed to send netlink event: {}", err);
+                error!(error = %err, "send_netlink_event_failed");
                 break;
             }
         }
     }
 
-    info!("Stopping netlink listener");
+    info!("stopping_netlink_listener");
     proc_set_ev_listen(&nl_sock, false).ok();
     // nl_sock is automatically closed when OwnedFd is dropped
     Ok(())

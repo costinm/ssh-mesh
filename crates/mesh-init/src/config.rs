@@ -45,7 +45,7 @@ pub fn validate_cgroup_name(name: &str) -> Result<(), String> {
 
 /// Load a single config file from disk.
 pub fn load_app_config(path: &Path) -> Result<AppConfig, ConfigError> {
-    info!("Loading config from {}", path.display());
+    info!(path = %path.display(), "loading_config");
     let content = std::fs::read_to_string(path)?;
     let service_name = path.file_stem().and_then(|s| s.to_str());
     let mut config = parse_service(&content, service_name)?;
@@ -63,14 +63,14 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
     for dir in dirs {
         let dir_path = Path::new(dir);
         if !dir_path.is_dir() {
-            debug!("Config directory {} does not exist, skipping", dir);
+            debug!(directory = %dir, "config_directory_missing_skipping");
             continue;
         }
 
         let entries = match std::fs::read_dir(dir_path) {
             Ok(entries) => entries,
             Err(e) => {
-                warn!("Failed to read config directory {}: {}", dir, e);
+                warn!(directory = %dir, error = %e, "read_config_directory_failed");
                 continue;
             }
         };
@@ -80,11 +80,11 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
             if path.extension().and_then(|e| e.to_str()) == Some("toml") {
                 match load_app_config(&path) {
                     Ok(config) => {
-                        info!("Loaded config for service '{}'", config.name);
+                        info!(service = %config.name, "service_config_loaded");
                         configs.push(config);
                     }
                     Err(e) => {
-                        warn!("Failed to parse config {}: {}", path.display(), e);
+                        warn!(path = %path.display(), error = %e, "parse_config_failed");
                     }
                 }
             }

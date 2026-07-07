@@ -5,6 +5,7 @@
 [Service]
 
 ExecStart = "lmesh"
+Type = "exec"
 OOMScoreAdjust = -810
 [Resources]
 MemoryHigh = "64M"

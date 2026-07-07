@@ -1,14 +1,11 @@
 use clap::Parser;
 use sftp_server::FileSystemHandler;
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixListener;
 use tracing::{error, info};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser)]
 #[command(name = "sftp-server", about = "SFTP server over stdin/stdout or UDS")]
@@ -57,7 +54,7 @@ impl AsyncWrite for StdioStream {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_telemetry();
+    let (_log_buffer, _trace_guard) = mesh::local_trace::init("sftp-server");
 
     let args = Args::parse();
 
@@ -101,23 +98,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn init_telemetry() {
-    let filter = tracing_subscriber::EnvFilter::from_default_env();
-    let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/sftp-server/sftp-server.log", home)
-    });
-
-    if let Some(parent) = std::path::Path::new(&log_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(move || file.try_clone().expect("clone sftp-server log file"))
-            .init();
-    } else {
-        tracing_subscriber::registry().with(filter).init();
-    }
-}

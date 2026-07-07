@@ -673,9 +673,9 @@ pub fn init(
     let log_buffer = buffer_layer.buffer();
 
     let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_thread_names(false);
+        .json()
+        .with_current_span(false)
+        .with_span_list(false);
 
     let guard = match build_file_writer(app) {
         Some((non_blocking, guard)) => {

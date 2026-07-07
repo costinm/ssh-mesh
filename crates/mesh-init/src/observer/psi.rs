@@ -182,7 +182,7 @@ impl PsiWatcher {
         {
             let mut watches = self.watches.lock();
             if watches.contains_key(cgroup_path) {
-                trace!("Cgroup {} already watched, skipping", cgroup_path);
+                trace!(cgroup = %cgroup_path, "cgroup_already_watched_skipping");
                 return;
             }
             watches.insert(
@@ -198,12 +198,9 @@ impl PsiWatcher {
 
         if let Some(waker) = self.waker.lock().as_ref() {
             if let Err(e) = waker.wake() {
-                debug!(
-                    "Failed to wake PSI watcher for cgroup {}: {}",
-                    cgroup_path, e
-                );
+                debug!(cgroup = %cgroup_path, error = %e, "wake_psi_watcher_failed");
             } else {
-                debug!("Wake signal sent for new cgroup {}", cgroup_path);
+                debug!(cgroup = %cgroup_path, "wake_signal_sent_for_new_cgroup");
             }
         }
     }
@@ -222,13 +219,10 @@ impl PsiWatcher {
         removed.push(cgroup_path.to_string());
         if let Some(waker) = self.waker.lock().as_ref() {
             if let Err(e) = waker.wake() {
-                error!(
-                    "Failed to wake PSI watcher for cgroup {}: {}",
-                    cgroup_path, e
-                );
+                error!(cgroup = %cgroup_path, error = %e, "wake_psi_watcher_failed");
             }
         }
-        debug!("Cgroup {} removal signal queued", cgroup_path);
+        debug!(cgroup = %cgroup_path, "cgroup_removal_signal_queued");
     }
 
     /// Prune cgroups that are no longer active.
@@ -296,7 +290,7 @@ impl PsiWatcher {
             let mut poll = match Poll::new() {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("Failed to create mio Poll: {}", e);
+                    error!(error = %e, "create_mio_poll_failed");
                     return;
                 }
             };
@@ -312,7 +306,7 @@ impl PsiWatcher {
             let new_waker = match Waker::new(poll.registry(), WAKER_TOKEN) {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to create Waker: {}", e);
+                    error!(error = %e, "create_waker_failed");
                     return;
                 }
             };
@@ -340,9 +334,9 @@ impl PsiWatcher {
                     Err(e) => {
                         let is_root = unsafe { libc::getuid() } == 0;
                         if is_root {
-                            debug!("Failed to open {}: {}", pressure_file_path, e);
+                            debug!(path = %pressure_file_path, error = %e, "open_pressure_file_failed");
                         } else {
-                            trace!("Failed to open {}: {}", pressure_file_path, e);
+                            trace!(path = %pressure_file_path, error = %e, "open_pressure_file_failed");
                         }
                         return false;
                     }
@@ -352,9 +346,9 @@ impl PsiWatcher {
                 if let Err(e) = file.write_all(trig.as_bytes()) {
                     let is_root = unsafe { libc::getuid() } == 0;
                     if is_root {
-                        debug!("Failed to write trigger to {}: {}", pressure_file_path, e);
+                        debug!(path = %pressure_file_path, error = %e, "write_trigger_failed");
                     } else {
-                        trace!("Failed to write trigger to {}: {}", pressure_file_path, e);
+                        trace!(path = %pressure_file_path, error = %e, "write_trigger_failed");
                     }
                     return false;
                 }
@@ -369,9 +363,9 @@ impl PsiWatcher {
                 {
                     let is_root = unsafe { libc::getuid() } == 0;
                     if is_root {
-                        debug!("Failed to register {} with mio: {}", pressure_file_path, e);
+                        debug!(path = %pressure_file_path, error = %e, "register_mio_source_failed");
                     } else {
-                        trace!("Failed to register {} with mio: {}", pressure_file_path, e);
+                        trace!(path = %pressure_file_path, error = %e, "register_mio_source_failed");
                     }
                     return false;
                 }
@@ -379,7 +373,7 @@ impl PsiWatcher {
                 token_to_cgroup.insert(token, cgroup_path.to_string());
                 cgroup_to_token.insert(cgroup_path.to_string(), token);
                 cgroup_to_file.insert(cgroup_path.to_string(), file);
-                debug!("Started watching cgroup: {}", cgroup_path);
+                debug!(cgroup = %cgroup_path, "cgroup_watch_started");
                 true
             }
 
@@ -398,7 +392,7 @@ impl PsiWatcher {
                         token_to_cgroup.remove(&t);
                     }
                 }
-                debug!("Cleaned up watch for cgroup: {}", cgroup_path);
+                debug!(cgroup = %cgroup_path, "cgroup_watch_cleaned_up");
             }
 
             {
@@ -428,7 +422,7 @@ impl PsiWatcher {
                     Ok(mut file) => {
                         let trig = format!("some {} {}", interval_us, threshold_us);
                         if let Err(e) = file.write_all(trig.as_bytes()) {
-                            error!("Failed to write trigger to {}: {}", system_pressure_path, e);
+                            error!(path = %system_pressure_path, error = %e, "write_trigger_failed");
                         } else {
                             let fd = file.as_raw_fd();
                             let token = Token(next_token.0);
@@ -439,30 +433,31 @@ impl PsiWatcher {
                                 Interest::PRIORITY,
                             ) {
                                 error!(
-                                    "Failed to register {} with mio: {}",
-                                    system_pressure_path, e
+                                    path = %system_pressure_path,
+                                    error = %e,
+                                    "register_mio_source_failed"
                                 );
                             } else {
                                 token_to_cgroup.insert(token, system_pressure_path.to_string());
                                 cgroup_to_file.insert(system_pressure_path.to_string(), file);
                                 debug!(
-                                    "Started watching system pressure: {}",
-                                    system_pressure_path
+                                    path = %system_pressure_path,
+                                    "system_pressure_watch_started"
                                 );
                             }
                         }
                     }
-                    Err(e) => debug!("Failed to open system pressure file: {}", e),
+                    Err(e) => debug!(error = %e, "open_system_pressure_failed"),
                 }
             }
 
             while running.load(Ordering::SeqCst) {
-                trace!("Polling for PSI events");
+                trace!("polling_for_psi_events");
                 match poll.poll(&mut events, None) {
                     Ok(_) => (),
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        error!("Poll failed: {}", e);
+                        error!(error = %e, "psi_poll_failed");
                         break;
                     }
                 }
@@ -471,7 +466,7 @@ impl PsiWatcher {
                     match event.token() {
                         WAKER_TOKEN => {
                             if !running.load(Ordering::SeqCst) {
-                                debug!("PSI monitoring stopping");
+                                debug!("psi_monitoring_stopping");
                                 return;
                             }
 
@@ -514,15 +509,16 @@ impl PsiWatcher {
                         }
                         token => {
                             if let Some(cgroup_path) = token_to_cgroup.get(&token) {
-                                trace!("PSI event for cgroup: {}", cgroup_path);
+                                trace!(cgroup = %cgroup_path, "psi_event_for_cgroup");
                                 let mut content = String::new();
                                 // We need to read from the file to clear the event
                                 if let Some(file) = cgroup_to_file.get_mut(cgroup_path) {
                                     // Seek to start to read again
                                     if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
                                         warn!(
-                                            "Failed to seek in pressure file for {}: {}",
-                                            cgroup_path, e
+                                            cgroup = %cgroup_path,
+                                            error = %e,
+                                            "seek_pressure_file_failed"
                                         );
                                     }
                                     if file.read_to_string(&mut content).is_ok() {
@@ -554,7 +550,7 @@ impl PsiWatcher {
                     }
                 }
             }
-            debug!("PSI monitoring thread exiting");
+            debug!("psi_monitoring_thread_exiting");
         });
 
         let mut h = self.handle.lock();
@@ -566,23 +562,23 @@ impl PsiWatcher {
     /// Stop the PSI monitoring
     #[instrument(skip(self))]
     pub fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("Stopping PSI monitoring");
+        debug!("psi_monitoring_stopping");
         self.running.store(false, Ordering::SeqCst);
 
         if let Some(waker) = self.waker.lock().as_ref() {
-            debug!("Waking PSI monitoring thread");
+            debug!("waking_psi_monitoring_thread");
             waker.wake()?;
         }
 
-        debug!("Joining PSI monitoring thread");
+        debug!("joining_psi_monitoring_thread");
         let mut h = self.handle.lock();
         if let Some(handle) = h.take() {
-            debug!("Waiting for thread to complete");
+            debug!("waiting_for_psi_thread_join");
             let _ = handle.join();
-            debug!("Thread completed");
+            debug!("psi_thread_joined");
         }
 
-        info!("PSI monitoring stopped");
+        info!("psi_monitoring_stopped");
         Ok(())
     }
 }

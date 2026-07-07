@@ -2138,7 +2138,6 @@ name = "lmesh"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "clap",
  "mesh",
  "p256",
  "rand 0.10.1",
@@ -3879,6 +3878,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "mesh",
  "russh-sftp",
  "tempfile",
  "tokio",

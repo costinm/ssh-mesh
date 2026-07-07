@@ -378,7 +378,7 @@ pub fn read_cgroup_pids(cgroup_path: &str) -> Vec<u32> {
             .filter_map(|line| line.trim().parse::<u32>().ok())
             .collect(),
         Err(e) => {
-            trace!("Failed to read {}: {}", procs_path, e);
+            trace!(path = %procs_path, error = %e, "read_procs_failed");
             Vec::new()
         }
     }
@@ -487,7 +487,7 @@ pub fn read_cgroup_path(pid: u32) -> Option<String> {
             }
         }
         Err(e) => {
-            trace!("Failed to read {}: {}", cgroup_file, e);
+            trace!(path = %cgroup_file, error = %e, "read_cgroup_file_failed");
         }
     }
     None
@@ -544,7 +544,7 @@ fn read_fault_stats(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
             }
         }
         Err(e) => {
-            trace!("Failed to read {}: {}", stat_path, e);
+            trace!(path = %stat_path, error = %e, "read_stat_failed");
         }
     }
     false
@@ -597,7 +597,7 @@ fn read_smaps_rollup(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
             rollup_found
         }
         Err(e) => {
-            trace!("Failed to read {}: {}", rollup_path, e);
+            trace!(path = %rollup_path, error = %e, "read_rollup_failed");
             false
         }
     }
@@ -658,7 +658,7 @@ fn read_proc_status_memory(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
             found
         }
         Err(e) => {
-            trace!("Failed to read {}: {}", status_path, e);
+            trace!(path = %status_path, error = %e, "read_status_failed");
             false
         }
     }
@@ -703,7 +703,7 @@ fn read_statm_fallback(pid: u32, mem_info: &mut ProcMemInfo) -> bool {
             }
         }
         Err(e) => {
-            trace!("Failed to read {}: {}", statm_path, e);
+            trace!(path = %statm_path, error = %e, "read_statm_failed");
         }
     }
     false
@@ -723,7 +723,7 @@ pub fn read_cmdline(pid: u32) -> Option<String> {
         }
         Ok(_) => None,
         Err(e) => {
-            trace!("Failed to read {}: {}", cmdline_path, e);
+            trace!(path = %cmdline_path, error = %e, "read_cmdline_failed");
             None
         }
     }
@@ -735,7 +735,7 @@ pub fn read_exe(pid: u32) -> Option<String> {
     match std::fs::read_link(&exe_path) {
         Ok(target) => Some(target.to_string_lossy().into_owned()),
         Err(e) => {
-            trace!("Failed to read {}: {}", exe_path, e);
+            trace!(path = %exe_path, error = %e, "read_exe_failed");
             None
         }
     }
@@ -755,7 +755,7 @@ pub fn read_process_uid(pid: u32) -> Option<u32> {
             }
         }
     } else {
-        trace!("Failed to read {}: {}", status_path, "error");
+        trace!(path = %status_path, "read_status_for_uid_failed");
     }
     None
 }

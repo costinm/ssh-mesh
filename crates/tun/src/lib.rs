@@ -73,6 +73,9 @@ impl MeshTun {
     ///
     /// The caller must ensure that `fd` is a valid file descriptor for a TUN/VPN device.
     pub unsafe fn from_fd(fd: i32) -> Result<Self, anyhow::Error> {
+        if fd < 0 {
+            anyhow::bail!("invalid TUN file descriptor: {fd}");
+        }
         let config = MeshTunConfig {
             fd: Some(fd),
             ..MeshTunConfig::default()
@@ -179,6 +182,9 @@ impl MeshTun {
 
     fn open_tun_device(&self) -> Result<tun_rs::AsyncDevice, anyhow::Error> {
         if let Some(fd) = self.config.fd {
+            if fd < 0 {
+                anyhow::bail!("invalid TUN file descriptor: {fd}");
+            }
             return unsafe { tun_rs::AsyncDevice::from_fd(fd) }
                 .map_err(|error| anyhow::anyhow!("TUN FD error: {error}"));
         }

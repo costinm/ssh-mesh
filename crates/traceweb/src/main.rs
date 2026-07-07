@@ -23,6 +23,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (_log_buffer, _trace_guard) = mesh::local_trace::init("traceweb");
     let args = Cli::parse();
 
     match args.command.unwrap_or(Commands::Serve { base_dir: None }) {

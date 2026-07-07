@@ -401,7 +401,10 @@ impl LocalDiscovery {
     }
 
     fn default_node_store_dir() -> Result<PathBuf> {
-        Ok(mesh::paths::AppPaths::for_app("lmesh").files.join("nodes"))
+        Ok(std::env::current_dir()
+            .context("failed to resolve current working directory")?
+            .join("lmesh")
+            .join("nodes"))
     }
 }
 
@@ -737,5 +740,14 @@ mod tests {
     fn unique_test_dir() -> PathBuf {
         let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("lmesh-test-{}-{}", std::process::id(), counter))
+    }
+
+    #[test]
+    fn default_node_store_dir_is_cwd_relative() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            LocalDiscovery::default_node_store_dir().unwrap(),
+            cwd.join("lmesh").join("nodes")
+        );
     }
 }

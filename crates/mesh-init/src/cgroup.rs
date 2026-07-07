@@ -46,7 +46,7 @@ const MESH_SLICE_PATH: &str = "/sys/fs/cgroup/mesh.slice";
 /// would otherwise allow escaping `mesh.slice`.
 pub fn cgroup_path_for(name: &str) -> Result<String, CgroupError> {
     if let Err(reason) = crate::config::validate_cgroup_name(name) {
-        error!("rejecting invalid cgroup name {:?}: {}", name, reason);
+        error!(name = ?name, error = %reason, "invalid_cgroup_name_rejected");
         return Err(CgroupError::CgroupError(format!(
             "invalid cgroup name: {reason}"
         )));
@@ -64,7 +64,7 @@ pub fn create_cgroup(name: &str) -> Result<String, CgroupError> {
     // Ensure mesh.slice exists
     if !Path::new(MESH_SLICE_PATH).exists() {
         fs::create_dir_all(MESH_SLICE_PATH)?;
-        info!("Created {}", MESH_SLICE_PATH);
+        info!(path = %MESH_SLICE_PATH, "slice_created");
     }
 
     // Enable controllers in the root so mesh.slice can use them
@@ -76,7 +76,7 @@ pub fn create_cgroup(name: &str) -> Result<String, CgroupError> {
     let scope_path = cgroup_path_for(name)?;
     if !Path::new(&scope_path).exists() {
         fs::create_dir_all(&scope_path)?;
-        info!("Created cgroup {}", scope_path);
+        info!(path = %scope_path, "cgroup_created");
     }
 
     Ok(scope_path)
@@ -90,7 +90,7 @@ pub fn enable_controllers(path: &str) -> Result<(), CgroupError> {
     let available = match fs::read_to_string(&controllers_path) {
         Ok(s) => s,
         Err(e) => {
-            debug!("Could not read {}: {}", controllers_path, e);
+            debug!(path = %controllers_path, error = %e, "read_controllers_failed");
             return Ok(());
         }
     };
@@ -109,18 +109,19 @@ pub fn enable_controllers(path: &str) -> Result<(), CgroupError> {
     let cmd = to_enable.join(" ");
     match fs::write(&subtree_control_path, &cmd) {
         Ok(()) => {
-            info!("Enabled controllers [{}] in {}", cmd, subtree_control_path);
+            info!(controllers = %cmd, path = %subtree_control_path, "controllers_enabled");
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             error!(
-                "Permission denied writing to {}. Run as root.",
-                subtree_control_path
+                path = %subtree_control_path,
+                "enable_controllers_permission_denied"
             );
         }
         Err(e) => {
             debug!(
-                "Could not enable controllers in {}: {} (might have processes in this node)",
-                subtree_control_path, e
+                path = %subtree_control_path,
+                error = %e,
+                "enable_controllers_failed"
             );
         }
     }
@@ -149,10 +150,10 @@ pub fn set_limits(cgroup_path: &str, limits: &ResolvedResourceLimits) -> Result<
 pub fn move_to_cgroup(pid: u32, cgroup_path: &str) -> Result<(), CgroupError> {
     let procs_path = format!("{}/cgroup.procs", cgroup_path);
     fs::write(&procs_path, pid.to_string()).map_err(|e| {
-        error!("Failed to move PID {} to {}: {}", pid, cgroup_path, e);
+        error!(pid, path = %cgroup_path, error = %e, "move_to_cgroup_failed");
         CgroupError::Io(e)
     })?;
-    info!("Moved PID {} to cgroup {}", pid, cgroup_path);
+    info!(pid, path = %cgroup_path, "moved_to_cgroup");
     Ok(())
 }
 
@@ -161,9 +162,9 @@ pub fn freeze_cgroup(cgroup_path: &str, freeze: bool) -> Result<(), CgroupError>
     let val = if freeze { "1" } else { "0" };
     write_cgroup_file(cgroup_path, "cgroup.freeze", val)?;
     info!(
-        "{} cgroup {}",
-        if freeze { "Froze" } else { "Unfroze" },
-        cgroup_path
+        action = if freeze { "freeze" } else { "unfreeze" },
+        path = %cgroup_path,
+        "cgroup_frozen_state_changed"
     );
     Ok(())
 }
@@ -172,10 +173,10 @@ pub fn freeze_cgroup(cgroup_path: &str, freeze: bool) -> Result<(), CgroupError>
 pub fn remove_cgroup(cgroup_path: &str) -> Result<(), CgroupError> {
     if Path::new(cgroup_path).exists() {
         fs::remove_dir(cgroup_path).map_err(|e| {
-            debug!("Could not remove cgroup {}: {}", cgroup_path, e);
+            debug!(path = %cgroup_path, error = %e, "remove_cgroup_failed");
             CgroupError::Io(e)
         })?;
-        info!("Removed cgroup {}", cgroup_path);
+        info!(path = %cgroup_path, "cgroup_removed");
     }
     Ok(())
 }
@@ -187,10 +188,10 @@ pub fn set_oom_score(pid: u32, score: i32) -> Result<(), CgroupError> {
     }
     let path = format!("/proc/{}/oom_score_adj", pid);
     fs::write(&path, score.to_string()).map_err(|e| {
-        error!("Failed to set oom_score_adj for PID {}: {}", pid, e);
+        error!(pid, error = %e, "set_oom_score_adj_failed");
         CgroupError::Io(e)
     })?;
-    debug!("Set oom_score_adj={} for PID {}", score, pid);
+    debug!(pid, score, "oom_score_adj_set");
     Ok(())
 }
 

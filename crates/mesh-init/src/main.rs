@@ -137,10 +137,10 @@ async fn run(
     };
 
     info!(
-        "Starting mesh-init (PID {}, UID {}, mode={})",
-        std::process::id(),
-        unsafe { libc::getuid() },
-        if command.is_some() { "exec" } else { "daemon" }
+        pid = std::process::id(),
+        uid = unsafe { libc::getuid() },
+        mode = if command.is_some() { "exec" } else { "daemon" },
+        "starting_mesh_init"
     );
 
     let daemon = Daemon::new(config);
@@ -177,14 +177,14 @@ async fn run(
         };
 
         for init_cfg in init_configs {
-            info!("Running init setup service '{}'", init_cfg.name);
+            info!(service = %init_cfg.name, "running_init_setup_service");
             let name = init_cfg.name.clone();
             match daemon.start_service_with_config(init_cfg, None) {
                 Ok(_) => {
                     wait_for_service_exit(&daemon, &name).await;
                 }
                 Err(e) => {
-                    error!("Failed to start init setup service '{}': {}", name, e);
+                    error!(service = %name, error = %e, "start_init_setup_service_failed");
                 }
             }
         }
@@ -212,7 +212,7 @@ async fn run(
         cfg.activation.clear();
         cfg.source_path = None;
 
-        info!("Executing command: {} {:?}", cfg.command, cfg.args);
+        info!(command = %cfg.command, args = ?cfg.args, "executing_command");
         let _pid = daemon.start_service_with_config(cfg, None)?;
 
         // Wait for the main command to end
@@ -238,7 +238,7 @@ async fn run(
         let sched_clone = scheduler.clone();
         tokio::spawn(async move {
             if let Err(e) = sched_clone.check_jobs().await {
-                tracing::error!("JobScheduler failed to check jobs: {}", e);
+                tracing::error!(error = %e, "jobscheduler_failed_checking_jobs");
             }
         });
 

@@ -85,8 +85,10 @@ pub fn attach_mesh_tun(
     BufReader::new(stream).read_line(&mut response)?;
     if response.trim() == "ok" {
         info!(
-            "Attached service '{}' netns {} to mesh-tun via {}",
-            service_name, netns_path, socket_path
+            service = %service_name,
+            netns = %netns_path,
+            socket = %socket_path,
+            "attached_netns_to_meshtun"
         );
         return Ok(());
     }
@@ -179,14 +181,18 @@ fn start_pasta(
     let pid = child.id();
     if let Err(error) = crate::cgroup::move_to_cgroup(pid, cgroup_path) {
         warn!(
-            "Failed to move pasta sidecar PID {} for '{}' to cgroup {}: {}",
-            pid, service_name, cgroup_path, error
+            pid,
+            service = %service_name,
+            cgroup = %cgroup_path,
+            error = %error,
+            "move_pasta_sidecar_to_cgroup_failed"
         );
     }
 
     info!(
-        "Started pasta network sidecar for service '{}' with PID {}",
-        service_name, pid
+        service = %service_name,
+        pid,
+        "pasta_sidecar_started"
     );
     Ok(NetworkSidecar {
         backend: NetworkBackend::Pasta,

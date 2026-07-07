@@ -175,21 +175,22 @@ impl ResourceManager {
         running.store(true, std::sync::atomic::Ordering::SeqCst);
 
         tokio::spawn(async move {
-            info!("Resource manager started");
+            info!("resource_manager_started");
             while running.load(std::sync::atomic::Ordering::SeqCst) {
                 if let Some(pressure) = read_memory_pressure() {
                     let level = classify_pressure(&pressure);
                     if level > PressureLevel::None {
                         debug!(
-                            "Memory pressure: {} (some_avg10={:.1}%)",
-                            level, pressure.some_avg10
+                            level = %level,
+                            avg10 = pressure.some_avg10,
+                            "memory_pressure_detected"
                         );
                         evict_by_priority(&services, level);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
-            info!("Resource manager stopped");
+            info!("resource_manager_stopped");
         })
     }
 
@@ -210,7 +211,7 @@ impl ResourceManager {
         if let Some(pressure) = read_memory_pressure() {
             let level = classify_pressure(&pressure);
             if level >= PressureLevel::Critical {
-                warn!("Cannot start service: memory pressure is critical");
+                warn!("cannot_start_memory_pressure_critical");
                 return false;
             }
         }
@@ -224,16 +225,23 @@ impl ResourceManager {
 
             if total_needed > available {
                 warn!(
-                    "Cannot start '{}': memory.low admission failed. \
-                     committed={} + new={} = {} > available={}",
-                    config.name, committed, new_low, total_needed, available
+                    service = %config.name,
+                    committed,
+                    new = new_low,
+                    total = total_needed,
+                    available,
+                    "memory_low_admission_failed"
                 );
                 return false;
             }
 
             info!(
-                "Memory admission OK for '{}': committed={} + new={} = {} <= available={}",
-                config.name, committed, new_low, total_needed, available
+                service = %config.name,
+                committed,
+                new = new_low,
+                total = total_needed,
+                available,
+                "memory_admission_ok"
             );
         }
 
@@ -285,13 +293,15 @@ fn evict_by_priority(services: &Arc<Mutex<HashMap<String, ManagedProcess>>>, lev
                     PressureLevel::Low | PressureLevel::Medium => {
                         // Freeze
                         info!(
-                            "Freezing service '{}' (priority={}) due to {} pressure",
-                            name, proc.config.priority, level
+                            service = %name,
+                            priority = proc.config.priority,
+                            pressure = %level,
+                            "freezing_service_on_pressure"
                         );
                         if let Err(e) =
                             crate::process::freeze_process(pid, proc.cgroup_path.as_deref())
                         {
-                            error!("Failed to freeze '{}': {}", name, e);
+                            error!(service = %name, error = %e, "freeze_service_failed");
                         } else {
                             proc.state = ServiceState::Frozen;
                         }
@@ -303,8 +313,9 @@ fn evict_by_priority(services: &Arc<Mutex<HashMap<String, ManagedProcess>>>, lev
                     PressureLevel::Critical => {
                         // Stop
                         info!(
-                            "Stopping service '{}' (priority={}) due to critical pressure",
-                            name, proc.config.priority
+                            service = %name,
+                            priority = proc.config.priority,
+                            "stopping_service_on_critical_pressure"
                         );
                         let _ = crate::process::send_signal(pid, libc::SIGTERM);
                         proc.state = ServiceState::Stopping;

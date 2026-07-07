@@ -10,10 +10,7 @@
 
 use clap::Parser;
 use mesh9p::unpfs::{Export, Unpfs};
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser)]
 #[command(name = "unpfs", about = "9P2000.L filesystem server")]
@@ -33,7 +30,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_telemetry();
+    let (_log_buffer, _trace_guard) = mesh::local_trace::init("mesh9p");
 
     let args = Args::parse();
 
@@ -120,23 +117,3 @@ fn normalize_mountpoint(path: &Path) -> PathBuf {
     normalized
 }
 
-fn init_telemetry() {
-    let filter = tracing_subscriber::EnvFilter::from_default_env();
-    let log_path = std::env::var("MESH_LOG_FILE").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}/.run/mesh9p/mesh9p.log", home)
-    });
-
-    if let Some(parent) = std::path::Path::new(&log_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(move || file.try_clone().expect("clone mesh9p log file"))
-            .init();
-    } else {
-        tracing_subscriber::registry().with(filter).init();
-    }
-}

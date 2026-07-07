@@ -125,7 +125,7 @@ impl ControlServer {
             )
         })?;
 
-        info!("Control server listening on {}", self.socket_path);
+        info!(path = %self.socket_path, "control_server_listening");
 
         let current_uid = unsafe { libc::getuid() };
 
@@ -137,7 +137,7 @@ impl ControlServer {
                     match res {
                         Ok((stream, _)) => stream,
                         Err(e) => {
-                            error!("Accept error: {}", e);
+                            error!(error = %e, "control_accept_failed");
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             continue;
                         }
@@ -145,7 +145,7 @@ impl ControlServer {
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        info!("Control server stopping due to shutdown");
+                        info!("control_server_stopping");
                         break;
                     }
                     continue;
@@ -156,7 +156,7 @@ impl ControlServer {
             let peer_cred = match stream.peer_cred() {
                 Ok(cred) => cred,
                 Err(e) => {
-                    warn!("Failed to get peer credentials: {}", e);
+                    warn!(error = %e, "get_peer_credentials_failed");
                     continue;
                 }
             };
@@ -178,15 +178,13 @@ impl ControlServer {
             };
             if !is_authorized {
                 error!(
-                    "Rejected connection from UID {} (expected 0, {}, or {})",
                     peer_uid,
-                    current_uid,
-                    mesh::auth::DEFAULT_TRUSTED_SSHD_UID
+                    current_uid, "rejected_connection_unauthorized_uid"
                 );
                 continue;
             }
 
-            debug!("Accepted control connection from UID {}", peer_uid);
+            debug!(peer_uid, "control_connection_accepted");
 
             let daemon = self.daemon.clone();
             let slots = self.connection_slots.clone();
@@ -195,13 +193,13 @@ impl ControlServer {
             let permit = match slots.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("Control connection semaphore closed: {}", e);
+                    error!(error = %e, "connection_semaphore_closed");
                     continue;
                 }
             };
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(stream, daemon, peer_uid, peer_gid).await {
-                    error!("Control connection error: {}", e);
+                    error!(error = %e, "control_connection_error");
                 }
                 drop(permit);
             });
@@ -382,7 +380,7 @@ async fn handle_connection(
 
         let response = match parsed_result {
             Ok(request) => {
-                debug!("Received request: {:?}", request);
+                debug!(request = ?request, "request_received");
                 match request {
                     request @ (Request::StartTerminal { .. }
                     | Request::RegisterNamespace { .. }) => {
@@ -418,7 +416,7 @@ async fn handle_connection(
                 }
             }
             Err(e) => {
-                warn!("Invalid request: {}", e);
+                warn!(error = %e, "invalid_request");
                 Response::err(format!("invalid request: {}", e))
             }
         };
@@ -429,7 +427,7 @@ async fn handle_connection(
         stream.flush().await?;
     }
 
-    debug!("Control connection closed");
+    debug!("control_connection_closed");
     Ok(())
 }
 

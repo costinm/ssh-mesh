@@ -67,7 +67,9 @@ ExecStop = ["/bin/true"]
 ExecReload = ["/bin/true"]
 
 # Applies to: service lifecycle.
-# Supported values: oneshot (runs once at startup), exec (long-running daemon started at boot).
+# Supported values: oneshot (runs once at startup), exec (long-running daemon
+# started at boot; with [Socket] Accept=false, mesh-init passes the listening
+# fds through LISTEN_FDS/LISTEN_FDNAMES at startup).
 # If Type is omitted or empty, the service does not auto-start at boot and must be started via socket activation or an explicit start command.
 Type = "oneshot"
 

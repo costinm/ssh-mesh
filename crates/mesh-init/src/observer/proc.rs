@@ -137,7 +137,7 @@ impl ProcessObserver {
         }
 
         if watch_psi {
-            debug!("Starting PSI watcher");
+            debug!("psi_watcher_starting");
             self.psi_watcher.start(event_tx)?;
         }
 
@@ -147,10 +147,10 @@ impl ProcessObserver {
     /// Stop monitoring.
     #[instrument(skip(self))]
     pub fn stop(&self) -> Result<(), ObserverError> {
-        debug!("Stopping monitoring");
+        debug!("monitoring_stopping");
         self.running.store(false, Ordering::SeqCst);
 
-        debug!("Stopping PSI watcher");
+        debug!("psi_watcher_stopping");
         self.psi_watcher.stop()?;
 
         // Abort all spawned handles
@@ -159,23 +159,23 @@ impl ProcessObserver {
             handle.abort();
         }
 
-        info!("Monitoring stopped");
+        info!("monitoring_stopped");
         Ok(())
     }
 
     /// Close the monitor and release resources.
     #[instrument(skip(self))]
     pub fn close(&self) -> Result<(), ObserverError> {
-        debug!("Closing ProcessObserver");
+        debug!("process_observer_closing");
         self.stop()?;
-        info!("ProcessObserver closed successfully");
+        info!("process_observer_closed");
         Ok(())
     }
 
     /// Retrieve current process by PID.
     #[instrument(skip(self), fields(pid = pid))]
     pub fn get_process(&self, pid: u32) -> Option<ProcessInfo> {
-        trace!("Getting process by PID: {}", pid);
+        trace!(pid, "get_process_by_pid");
 
         read_process_info_from_proc(pid).ok()
     }
@@ -266,18 +266,16 @@ impl ProcessObserver {
         let high_path = format!("{}/memory.high", cgroup_path);
 
         let current_str = fs::read_to_string(&current_path).map_err(|e| {
-            let msg = format!("Failed to read {}: {}", current_path, e);
-            error!("{}", msg);
-            ObserverError::CgroupError(msg)
+            error!(path = %current_path, error = %e, "read_memory_current_failed");
+            ObserverError::CgroupError(format!("Failed to read {}: {}", current_path, e))
         })?;
 
         let current: u64 = current_str.trim().parse().map_err(|e| {
-            let msg = format!(
+            error!(path = %current_path, error = %e, "parse_memory_current_failed");
+            ObserverError::ParseError(format!(
                 "Failed to parse memory.current from {}: {}",
                 current_path, e
-            );
-            error!("{}", msg);
-            ObserverError::ParseError(msg)
+            ))
         })?;
 
         let target_str = if percentage < 0.0 {
@@ -286,37 +284,43 @@ impl ProcessObserver {
             let target = (current as f64 * percentage / 100.0) as u64;
             let s = target.to_string();
             info!(
-                "Calculated target memory: {} bytes ({}% of {})",
-                s, percentage, current
+                target_bytes = %s,
+                percentage,
+                current,
+                "calculated_target_memory"
             );
             s
         };
 
-        info!("Attempting to write {} to {}", target_str, high_path);
+        info!(val = %target_str, path = %high_path, "writing_memory_high");
         fs::write(&high_path, &target_str).map_err(|e| {
-            let msg = format!("Failed to write to {}: {}", high_path, e);
-            error!("{}", msg);
-            ObserverError::CgroupError(msg)
+            error!(path = %high_path, error = %e, "write_memory_high_failed");
+            ObserverError::CgroupError(format!("Failed to write to {}: {}", high_path, e))
         })?;
 
         info!(
-            "Successfully set {} memory.high to {} (requested {}% of current {})",
-            cgroup_path, target_str, percentage, current
+            cgroup = %cgroup_path,
+            val = %target_str,
+            percentage,
+            current,
+            "memory_high_set_success"
         );
 
         if interval_secs > 0 && percentage >= 0.0 {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-                info!("Interval expired. Resetting {} to max", high_path);
+                info!(path = %high_path, "memory_high_reset_interval_expired");
                 if let Err(e) = tokio::fs::write(&high_path, "max").await {
                     error!(
-                        "Failed to reset memory.high to max for {}: {}",
-                        high_path, e
+                        path = %high_path,
+                        error = %e,
+                        "reset_memory_high_failed"
                     );
                 } else {
                     info!(
-                        "Successfully reset {} to max after {}s",
-                        high_path, interval_secs
+                        path = %high_path,
+                        interval_secs,
+                        "reset_memory_high_success"
                     );
                 }
             });
@@ -409,13 +413,13 @@ impl ProcessObserver {
 
         if !std::path::Path::new(&target_cgroup_path).exists() {
             fs::create_dir_all(&target_cgroup_path)?;
-            info!("Created target cgroup: {}", target_cgroup_path);
+            info!(path = %target_cgroup_path, "cgroup_target_created");
         }
 
         // 4. Move the process
         let procs_path = format!("{}/cgroup.procs", target_cgroup_path);
         fs::write(&procs_path, pid.to_string())?;
-        info!("Moved process {} to cgroup {}", pid, target_cgroup_path);
+        info!(pid, path = %target_cgroup_path, "process_moved_to_cgroup");
 
         // Refresh process info in cache after move
         let _ = self.get_process(pid);
@@ -428,7 +432,7 @@ impl ProcessObserver {
         let path = format!("{}/{}", parent, name);
         if !std::path::Path::new(&path).exists() {
             fs::create_dir_all(&path)?;
-            info!("Created cgroup directory: {}", path);
+            info!(path = %path, "cgroup_dir_created");
         }
         // Try to enable controllers in the parent for this child to use
         let _ = self.enable_controllers(parent);
@@ -457,17 +461,18 @@ impl ProcessObserver {
                 if let Err(e) = fs::write(&subtree_control_path, &cmd) {
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
                         error!(
-                            "Permission denied writing to {}. Run as root.",
-                            subtree_control_path
+                            path = %subtree_control_path,
+                            "enable_controllers_permission_denied"
                         );
                     } else {
                         debug!(
-                            "Could not enable controllers in {}: {} (might have processes)",
-                            subtree_control_path, e
+                            path = %subtree_control_path,
+                            error = %e,
+                            "enable_controllers_failed"
                         );
                     }
                 } else {
-                    info!("Enabled controllers {} in {}", cmd, subtree_control_path);
+                    info!(controllers = %cmd, path = %subtree_control_path, "controllers_enabled");
                 }
             }
         }
@@ -487,11 +492,11 @@ impl ProcessObserver {
         let sig = if freeze { libc::SIGSTOP } else { libc::SIGCONT };
         let res = unsafe { libc::kill(pid as i32, sig) };
         if res == 0 {
-            info!("Successfully sent signal {} to process {}", sig, pid);
+            info!(pid, signal = sig, "signal_sent_to_process");
             Ok(())
         } else {
             let err = std::io::Error::last_os_error();
-            error!("Failed to freeze/unfreeze process {}: {}", pid, err);
+            error!(pid, error = %err, "freeze_unfreeze_process_failed");
             Err(ObserverError::Io(err))
         }
     }
@@ -501,11 +506,10 @@ impl ProcessObserver {
         let freeze_path = format!("{}/cgroup.freeze", cgroup_path);
         let val = if freeze { "1" } else { "0" };
         fs::write(&freeze_path, val).map_err(|e| {
-            let msg = format!("Failed to write to {}: {}", freeze_path, e);
-            error!("{}", msg);
-            ObserverError::CgroupError(msg)
+            error!(path = %freeze_path, error = %e, "write_freeze_failed");
+            ObserverError::CgroupError(format!("Failed to write to {}: {}", freeze_path, e))
         })?;
-        info!("Successfully set {} to {}", freeze_path, val);
+        info!(path = %freeze_path, val = %val, "freeze_value_set");
         Ok(())
     }
 

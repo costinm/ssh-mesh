@@ -64,7 +64,7 @@ pub fn register_inetd_permit(pid: u32, permit: tokio::sync::OwnedSemaphorePermit
 pub fn reclaim_inetd_permit(pid: u32) {
     if let Some(registry) = ACTIVE_INETD_PERMITS.get() {
         if registry.lock().remove(&pid).is_some() {
-            debug!("Reclaimed inetd permit for PID {}", pid);
+            debug!(pid, "inetd_permit_reclaimed");
         }
     }
 }
@@ -82,10 +82,7 @@ fn register_service_listener_fd(
     fd_name: Option<String>,
 ) {
     let Ok(fd_clone) = fd.try_clone() else {
-        warn!(
-            "Failed to clone activation listener fd for '{}'",
-            service_name
-        );
+        warn!(service = %service_name, "clone_activation_listener_fd_failed");
         return;
     };
     let registry = SERVICE_LISTENER_FDS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -102,7 +99,7 @@ fn register_service_listener_fd(
     }
 }
 
-fn service_listener_fds(service_name: &str) -> Vec<ActivationListenFd> {
+pub(crate) fn service_listener_fds(service_name: &str) -> Vec<ActivationListenFd> {
     let Some(registry) = SERVICE_LISTENER_FDS.get() else {
         return Vec::new();
     };
@@ -203,10 +200,7 @@ pub fn collect_systemd_fds() {
         std::env::remove_var("LISTEN_FDNAMES");
     }
 
-    info!(
-        "Detected systemd socket activation: LISTEN_PID={}, LISTEN_FDS={}",
-        listen_pid, listen_fds,
-    );
+    info!(listen_pid, listen_fds, "systemd_socket_activation_detected");
 
     const SD_LISTEN_FDS_START: i32 = 3;
     let pool = SYSTEMD_FDS.get_or_init(|| Mutex::new(VecDeque::new()));
@@ -220,16 +214,16 @@ pub fn collect_systemd_fds() {
         let identity = identify_fd(&owned);
         let fd_name = listen_fd_names.get(i).cloned().flatten();
         debug!(
-            "Systemd activation FD {} (raw_fd={}): {:?}, name={:?}",
-            i, raw_fd, identity, fd_name
+            index = i,
+            raw_fd,
+            identity = ?identity,
+            name = ?fd_name,
+            "systemd_activation_fd_processed"
         );
         pool.push_back((owned, identity, fd_name));
     }
 
-    info!(
-        "Collected {} systemd activation file descriptor(s)",
-        listen_fds
-    );
+    info!(count = listen_fds, "systemd_fds_collected");
 }
 
 /// Identify the type, address, and socket kind of a file descriptor.
@@ -381,7 +375,7 @@ fn get_peer_uid(fd: i32) -> Option<u32> {
     if ret == 0 {
         Some(cred.uid)
     } else {
-        warn!("Failed to get peer credentials for fd {}", fd);
+        warn!(fd, "get_peer_credentials_failed");
         None
     }
 }
@@ -460,8 +454,9 @@ async fn forward_accepted_fd(
     }
 
     debug!(
-        "Activation fd send to {} for '{}' failed; reconnecting",
-        activation_socket, service_name
+        socket = %activation_socket,
+        service = %service_name,
+        "activation_fd_send_failed_reconnecting"
     );
     *stream_cache = None;
     let mut stream =
@@ -480,8 +475,10 @@ async fn connect_or_start_activation_socket(
         Ok(stream) => Ok(stream),
         Err(first_error) => {
             debug!(
-                "Activation socket {} for '{}' not ready: {}",
-                activation_socket, service_name, first_error
+                socket = %activation_socket,
+                service = %service_name,
+                error = %first_error,
+                "activation_socket_not_ready_starting_target"
             );
             start_activation_socket_target(service_name, activation_socket, daemon)?;
             connect_activation_socket(activation_socket).await
@@ -589,8 +586,10 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
             // Check for pre-bound systemd socket activation FD
             if let Some(fd) = take_systemd_tcp_fd(port, act.datagram) {
                 info!(
-                    "Using systemd socket FD for '{}' TCP port {} (datagram={})",
-                    config.name, port, act.datagram
+                    service = %config.name,
+                    port,
+                    datagram = act.datagram,
+                    "using_systemd_tcp_activation_fd"
                 );
                 let daemon_clone = daemon.clone();
                 let name = config.name.clone();
@@ -626,7 +625,7 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
         if let Some(ref path) = act.socket {
             // Check for pre-bound systemd socket activation FD
             if let Some(fd) = take_systemd_uds_fd(path, act.datagram) {
-                info!("Using systemd socket FD for '{}' UDS {}", config.name, path);
+                info!(service = %config.name, path = %path, "using_systemd_uds_activation_fd");
                 let daemon_clone = daemon.clone();
                 let name = config.name.clone();
                 let wait = act.wait;
@@ -666,8 +665,9 @@ pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
         if let Some(vsock_port) = act.vsock_port {
             if act.datagram {
                 error!(
-                    "AF_VSOCK datagram activation for '{}' port {} is not supported",
-                    config.name, vsock_port
+                    service = %config.name,
+                    port = vsock_port,
+                    "vsock_datagram_activation_not_supported"
                 );
                 continue;
             }
@@ -703,19 +703,15 @@ async fn run_inet_listener(
     let addr = format!("{}:{}", bind_addr, port);
 
     info!(
-        "Starting {} activation listener for '{}' on {} (wait={})",
-        if datagram { "UDP" } else { "TCP" },
-        service_name,
-        addr,
-        wait
+        proto = if datagram { "UDP" } else { "TCP" },
+        service = %service_name,
+        address = %addr,
+        wait,
+        "starting_inet_listener"
     );
 
     if datagram && !wait {
-        error!(
-            "Service '{}' uses Accept=true with UDP datagram activation; \
-             datagram sockets cannot be accepted into an inetd-style client fd",
-            service_name
-        );
+        error!(service = %service_name, "udp_datagram_activation_accept_true_not_supported");
         return;
     }
 
@@ -726,12 +722,7 @@ async fn run_inet_listener(
             .get(&service_name)
             .is_some_and(|c| c.auth.is_some());
         if has_auth {
-            error!(
-                "Service '{}' has auth configured but uses listener activation, \
-                 which cannot enforce peer authentication. Refusing to start the \
-                 listener. Remove the auth config or use Accept=true.",
-                service_name
-            );
+            error!(service = %service_name, "listener_activation_auth_conflict");
             return;
         }
     }
@@ -740,11 +731,11 @@ async fn run_inet_listener(
         Ok(fd) => fd,
         Err(e) => {
             error!(
-                "Failed to bind {} activation port {} for '{}': {}",
-                if datagram { "UDP" } else { "TCP" },
+                proto = if datagram { "UDP" } else { "TCP" },
                 port,
-                service_name,
-                e
+                service = %service_name,
+                error = %e,
+                "bind_inet_socket_failed"
             );
             return;
         }
@@ -898,8 +889,11 @@ async fn run_vsock_listener(
 ) {
     let cid = cid.unwrap_or(VMADDR_CID_ANY);
     info!(
-        "Starting AF_VSOCK activation listener for '{}' on vsock:{}:{} (wait={})",
-        service_name, cid, port, wait
+        service = %service_name,
+        cid,
+        port,
+        wait,
+        "starting_vsock_listener"
     );
 
     if wait {
@@ -909,12 +903,7 @@ async fn run_vsock_listener(
             .get(&service_name)
             .is_some_and(|c| c.auth.is_some());
         if has_auth {
-            error!(
-                "Service '{}' has auth configured but uses listener activation, \
-                 which cannot enforce peer authentication. Refusing to start the \
-                 listener. Remove the auth config or use Accept=true.",
-                service_name
-            );
+            error!(service = %service_name, "listener_activation_auth_conflict");
             return;
         }
     }
@@ -923,8 +912,11 @@ async fn run_vsock_listener(
         Ok(fd) => fd,
         Err(e) => {
             error!(
-                "Failed to bind AF_VSOCK activation listener vsock:{}:{} for '{}': {}",
-                cid, port, service_name, e
+                cid,
+                port,
+                service = %service_name,
+                error = %e,
+                "bind_vsock_listener_failed"
             );
             return;
         }
@@ -1011,31 +1003,23 @@ async fn run_uds_listener(
     daemon: Arc<Daemon>,
 ) {
     info!(
-        "Starting {} activation listener for '{}' on {}",
-        if datagram {
-            "UDS datagram"
-        } else {
-            "UDS stream"
-        },
-        service_name,
-        path
+        proto = if datagram { "UDS datagram" } else { "UDS stream" },
+        service = %service_name,
+        path = %path,
+        "starting_uds_listener"
     );
     if datagram && !wait {
-        error!(
-            "Service '{}' uses Accept=true with Unix datagram activation; \
-             datagram sockets cannot be accepted into an inetd-style client fd",
-            service_name
-        );
+        error!(service = %service_name, "uds_datagram_activation_accept_true_not_supported");
         return;
     }
     if let Some(parent) = std::path::Path::new(&path).parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         error!(
-            "Failed to create UDS activation socket directory {} for '{}': {}",
-            parent.display(),
-            service_name,
-            e
+            directory = %parent.display(),
+            service = %service_name,
+            error = %e,
+            "create_uds_directory_failed"
         );
         return;
     }
@@ -1045,8 +1029,10 @@ async fn run_uds_listener(
         Ok(fd) => fd,
         Err(e) => {
             error!(
-                "Failed to bind UDS activation socket {} for '{}': {}",
-                path, service_name, e
+                path = %path,
+                service = %service_name,
+                error = %e,
+                "bind_unix_socket_failed"
             );
             return;
         }
@@ -1072,9 +1058,9 @@ async fn run_uds_listener(
                         // Don't fall back to UID 0 (root) — that would
                         // chown the socket to root. Leave ownership unchanged.
                         warn!(
-                            "Failed to resolve socket user '{}' for '{}'; \
-                             leaving user unchanged",
-                            user, service_name
+                            user = %user,
+                            service = %service_name,
+                            "resolve_socket_user_failed"
                         );
                         u32::MAX
                     }
@@ -1093,9 +1079,9 @@ async fn run_uds_listener(
                                 Some(n) => n,
                                 None => {
                                     warn!(
-                                        "Failed to resolve socket group '{}' for '{}'; \
-                                         leaving group unchanged",
-                                        g, service_name
+                                        group = %g,
+                                        service = %service_name,
+                                        "resolve_socket_group_failed"
                                     );
                                     u32::MAX
                                 }
@@ -1108,7 +1094,7 @@ async fn run_uds_listener(
                 libc::chown(c_path.as_ptr() as *const _, uid, gid);
             }
         } else {
-            warn!("Not running as root, cannot chown UDS socket '{}'", path);
+            warn!(path = %path, "cannot_chown_non_root");
         }
     } else if let Some(group) = socket_group
         && unsafe { libc::getuid() } == 0
@@ -1119,9 +1105,9 @@ async fn run_uds_listener(
                 Some(n) => n,
                 None => {
                     warn!(
-                        "Failed to resolve socket group '{}' for '{}'; \
-                         leaving group unchanged",
-                        group, service_name
+                        group = %group,
+                        service = %service_name,
+                        "resolve_socket_group_failed"
                     );
                     u32::MAX
                 }
@@ -1164,7 +1150,7 @@ async fn handle_listener(
     let async_fd = match AsyncFd::new(listener_fd) {
         Ok(afd) => afd,
         Err(e) => {
-            error!("Failed to register listener FD with tokio: {}", e);
+            error!(error = %e, "register_listener_fd_failed");
             return;
         }
     };
@@ -1174,12 +1160,12 @@ async fn handle_listener(
         let mut guard = match async_fd.readable().await {
             Ok(g) => g,
             Err(e) => {
-                error!("Listener wait error for {}: {}", service_name, e);
+                error!(service = %service_name, error = %e, "listener_wait_error");
                 break;
             }
         };
 
-        debug!("Activation connection ready for {}", service_name);
+        debug!(service = %service_name, "activation_connection_ready");
 
         if wait {
             // Accept=false: pass the listening FD to the child using systemd-style activation.
@@ -1197,10 +1183,7 @@ async fn handle_listener(
             let config_opt = daemon.configs.lock().get(&service_name).cloned();
             if let Some(mut config) = config_opt {
                 if config.auth.is_some() {
-                    warn!(
-                        "Auth configuration is ignored for listener activation on service '{}'",
-                        service_name
-                    );
+                    warn!(service = %service_name, "auth_ignored_for_listener_activation");
                 }
 
                 let context = daemon.take_activation_context(&service_name);
@@ -1214,7 +1197,7 @@ async fn handle_listener(
                 }
                 let passed_fd = Some(ActivationFd::Listen(fds));
                 if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
-                    error!("Failed to activate service {}: {}", service_name, e);
+                    error!(service = %service_name, error = %e, "activate_service_failed");
                 }
             }
 
@@ -1231,7 +1214,7 @@ async fn handle_listener(
                     guard.clear_ready();
                     continue;
                 }
-                error!("Accept error on {}: {}", service_name, err);
+                error!(service = %service_name, error = %err, "accept_failed");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
@@ -1252,8 +1235,9 @@ async fn handle_listener(
                     if let Some(peer_uid) = peer_uid {
                         if !auth.is_uid_authorized(peer_uid, current_uid) {
                             error!(
-                                "Rejected activation for '{}' from unauthorized UID {}",
-                                service_name, peer_uid
+                                service = %service_name,
+                                peer_uid,
+                                "activation_rejected_unauthorized_uid"
                             );
                             drop(client_owned);
                             continue;
@@ -1270,8 +1254,8 @@ async fn handle_listener(
                         }
                     } else {
                         error!(
-                            "Rejected activation for '{}': auth configured but peer UID unavailable (TCP?)",
-                            service_name
+                            service = %service_name,
+                            "activation_rejected_peer_uid_unavailable"
                         );
                         drop(client_owned);
                         continue;
@@ -1290,8 +1274,10 @@ async fn handle_listener(
                     .await
                     {
                         error!(
-                            "Failed to forward activated fd for {} to {}: {}",
-                            service_name, activation_socket, e
+                            service = %service_name,
+                            socket = %activation_socket,
+                            error = %e,
+                            "forward_activated_fd_failed"
                         );
                     }
                     continue;
@@ -1303,7 +1289,7 @@ async fn handle_listener(
                 let permit = match activation_semaphore().acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => {
-                        error!("Activation semaphore closed for '{}': {}", service_name, e);
+                        error!(service = %service_name, error = %e, "activation_semaphore_closed");
                         drop(client_owned);
                         continue;
                     }
@@ -1315,7 +1301,7 @@ async fn handle_listener(
                     Some(ActivationFd::Stdio(client_owned)),
                 ) {
                     Ok((pid, _)) => {
-                        debug!("Spawned activated instance PID {}", pid);
+                        debug!(pid, "spawned_activated_instance");
                         if let Some(ref tracked) = *daemon.tracked_child_pids.lock() {
                             tracked.lock().insert(pid);
                         }
@@ -1323,8 +1309,9 @@ async fn handle_listener(
                     }
                     Err(e) => {
                         error!(
-                            "Failed to spawn activated instance for {}: {}",
-                            service_name, e
+                            service = %service_name,
+                            error = %e,
+                            "spawn_activated_instance_failed"
                         );
                         drop(permit);
                     }

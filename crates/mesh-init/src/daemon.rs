@@ -312,6 +312,53 @@ fn should_restart_for_policy(policy: RestartPolicy, exit_code: i32) -> bool {
     }
 }
 
+fn is_exec_service(config: &AppConfig) -> bool {
+    config
+        .service_type
+        .as_deref()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("exec"))
+}
+
+fn start_exec_service_with_activation(daemon: Arc<Daemon>, config: AppConfig) {
+    let expected_listener_fds = config.activation.iter().filter(|act| act.wait).count();
+    if expected_listener_fds == 0 {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut attempts = 0;
+        let fds = loop {
+            let fds = crate::activation::service_listener_fds(&config.name);
+            if fds.len() >= expected_listener_fds || attempts >= 20 {
+                break fds;
+            }
+            attempts += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        if fds.is_empty() {
+            error!(
+                service = %config.name,
+                "autostart_activation_service_no_listener_fds"
+            );
+            return;
+        }
+
+        let mut config = config;
+        let config_name = config.name.clone();
+        let context = daemon.take_activation_context(&config.name);
+        apply_activation_context_env(&mut config, context);
+        let passed_fd = Some(crate::process::ActivationFd::Listen(fds));
+        if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
+            error!(
+                service = %config_name,
+                error = %e,
+                "autostart_activation_service_failed"
+            );
+        }
+    });
+}
+
 impl Daemon {
     /// Create a new daemon instance.
     pub fn new(config: DaemonConfig) -> Arc<Self> {
@@ -354,7 +401,7 @@ impl Daemon {
     /// 4. Start UDS control server
     /// 5. If PID 1, run zombie reaper
     pub async fn run(self: &Arc<Self>) -> Result<()> {
-        info!("mesh-init daemon starting");
+        info!("daemon_starting");
 
         self.start_background_tasks();
 
@@ -371,7 +418,7 @@ impl Daemon {
         // 1. Load configs
         let dirs: Vec<&str> = self.config.config_dirs.iter().map(|s| s.as_str()).collect();
         let loaded_configs = config::load_system_configs(&dirs);
-        info!("Loaded {} service config(s)", loaded_configs.len());
+        info!(count = loaded_configs.len(), "service_configs_loaded");
 
         {
             let mut configs = self.configs.lock();
@@ -409,6 +456,9 @@ impl Daemon {
         for cfg in init_configs.iter().chain(other_configs.iter()) {
             if !cfg.activation.is_empty() {
                 crate::activation::start_listeners(self.clone(), cfg);
+                if is_exec_service(cfg) {
+                    start_exec_service_with_activation(self.clone(), cfg.clone());
+                }
             } else {
                 let should_autostart = cfg
                     .service_type
@@ -417,13 +467,10 @@ impl Daemon {
                     .unwrap_or(false);
                 if should_autostart {
                     if let Err(e) = self.start_service_internal(&cfg.name) {
-                        error!("Failed to auto-start service '{}': {}", cfg.name, e);
+                        error!(service = %cfg.name, error = %e, "autostart_service_failed");
                     }
                 } else {
-                    debug!(
-                        "Service '{}' has no activation listeners and Type is omitted; not auto-starting",
-                        cfg.name
-                    );
+                    debug!(service = %cfg.name, "service_not_autostarted_no_listeners_no_type");
                 }
             }
         }
@@ -437,7 +484,7 @@ impl Daemon {
         match self.observer.start(true, true, Some(event_tx.clone())) {
             Ok(()) => {}
             Err(e) => {
-                warn!("failed to start mesh-init process observer: {}", e);
+                warn!(error = %e, "process_observer_start_failed");
                 return;
             }
         }
@@ -445,7 +492,7 @@ impl Daemon {
         let running = self.observer.running.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = observer::proc_netlink::run_netlink_listener(event_tx, running) {
-                debug!("process netlink listener stopped: {}", e);
+                debug!(error = %e, "netlink_listener_stopped");
             }
         });
 
@@ -671,8 +718,10 @@ impl Daemon {
                     proc.namespace_pid = target_pid.or(proc.namespace_pid);
                     proc.mesh_tun_attached = false;
                     info!(
-                        "Registered netns fd {} for service '{}' from peer UID {}",
-                        fd_num, name, peer_uid
+                        fd = fd_num,
+                        service = %name,
+                        peer_uid,
+                        "netns_registered"
                     );
                 }
                 NamespaceKind::User => {
@@ -680,8 +729,10 @@ impl Daemon {
                     proc.namespace_pid = target_pid.or(proc.namespace_pid);
                     proc.mesh_tun_attached = false;
                     info!(
-                        "Registered userns fd {} for service '{}' from peer UID {}",
-                        fd_num, name, peer_uid
+                        fd = fd_num,
+                        service = %name,
+                        peer_uid,
+                        "userns_registered"
                     );
                 }
             }
@@ -789,15 +840,15 @@ impl Daemon {
                                 new_cfg.group = None;
                             }
                             debug!(
-                                "Reloaded config for {} from {}",
-                                name,
-                                reload_path.display()
+                                service = %name,
+                                path = %reload_path.display(),
+                                "config_reloaded"
                             );
                             configs.insert(name.to_string(), new_cfg.clone());
                             new_cfg
                         }
                         Err(e) => {
-                            warn!("Failed to reload config for {}, using cached: {}", name, e);
+                            warn!(service = %name, error = %e, "reload_config_failed_using_cached");
                             cfg.clone()
                         }
                     }
@@ -828,9 +879,9 @@ impl Daemon {
                             }
 
                             info!(
-                                "Loaded on-demand config for '{}' from {}",
-                                name,
-                                service_path.display()
+                                service = %name,
+                                path = %service_path.display(),
+                                "on_demand_config_loaded"
                             );
                             configs.insert(name.to_string(), new_cfg.clone());
                             new_cfg
@@ -871,7 +922,7 @@ impl Daemon {
                 && proc.state == ServiceState::Running
             {
                 if proc.config != config {
-                    info!("Config for '{}' changed, will restart", name);
+                    info!(service = %name, "config_changed_will_restart");
                     should_restart = true;
                 } else {
                     return Response::ok_with_data(
@@ -1208,8 +1259,9 @@ impl Daemon {
         let total: usize = pending.values().map(|q| q.len()).sum();
         if total >= MAX_TOTAL_PENDING_CONTEXTS {
             warn!(
-                "Refusing activation context for '{}': total pending contexts already at cap {}",
-                name, MAX_TOTAL_PENDING_CONTEXTS
+                service = %name,
+                cap = MAX_TOTAL_PENDING_CONTEXTS,
+                "activation_context_refused_at_cap"
             );
             return Response::err(format!(
                 "pending activation context cap of {MAX_TOTAL_PENDING_CONTEXTS} reached"
@@ -1278,7 +1330,7 @@ impl Daemon {
             "ExecStop",
             config.timeout_stop_sec,
         ) {
-            error!("ExecStop failed for '{}': {}", name, e);
+            error!(service = %name, error = %e, "exec_stop_failed");
             return Response::err(e.to_string());
         }
 
@@ -1296,7 +1348,7 @@ impl Daemon {
             )
             .await
         {
-            error!("Failed to stop '{}': {}", name, e);
+            error!(service = %name, error = %e, "stop_service_failed");
             return Response::err(e.to_string());
         }
 
@@ -1315,7 +1367,7 @@ impl Daemon {
         }
         self.notify_service_exit(name);
 
-        info!("Stopped service '{}'", name);
+        info!(service = %name, "service_stopped");
         Response::ok()
     }
 
@@ -1342,7 +1394,7 @@ impl Daemon {
                 return Response::err(e.to_string());
             }
             proc.state = ServiceState::Frozen;
-            info!("Froze service '{}'", name);
+            info!(service = %name, "service_frozen");
         }
 
         Response::ok()
@@ -1371,7 +1423,7 @@ impl Daemon {
                 return Response::err(e.to_string());
             }
             proc.state = ServiceState::Running;
-            info!("Unfroze service '{}'", name);
+            info!(service = %name, "service_unfrozen");
         }
 
         Response::ok()
@@ -1520,14 +1572,14 @@ impl Daemon {
     }
 
     async fn handle_shutdown(&self) -> Response {
-        info!("Shutdown requested");
+        info!("shutdown_requested");
         self.shutdown().await;
         // Exit the process since the accept loop has no clean break mechanism
         std::process::exit(0);
     }
 
     fn handle_reload(&self) -> Response {
-        info!("Reloading all system configurations");
+        info!("reloading_configurations");
 
         // Reload from disk
         let dirs: Vec<&str> = self.config.config_dirs.iter().map(|s| s.as_str()).collect();
@@ -1558,7 +1610,7 @@ impl Daemon {
             };
 
             if is_changed {
-                info!("Config for '{}' changed or is new during reload", name);
+                info!(service = %name, "config_changed_or_new_during_reload");
                 configs.insert(name.clone(), new_cfg.clone());
                 changed += 1;
 
@@ -1587,7 +1639,7 @@ impl Daemon {
                 "ExecReload",
                 config.timeout_start_sec,
             ) {
-                warn!("ExecReload failed for '{}': {}", config.name, e);
+                warn!(service = %config.name, error = %e, "exec_reload_failed");
             }
         }
 
@@ -1615,8 +1667,10 @@ impl Daemon {
             for id in &ids {
                 if let Some(session) = terminals.remove(id) {
                     debug!(
-                        "Terminal session '{}' for '{}' exited with PID {}",
-                        id, session.name, pid
+                        session_id = %id,
+                        service = %session.name,
+                        pid,
+                        "terminal_session_exited"
                     );
                 }
             }
@@ -1624,8 +1678,9 @@ impl Daemon {
         };
         if !removed_terminals.is_empty() {
             debug!(
-                "Removed terminal sessions for PID {}: {:?}",
-                pid, removed_terminals
+                pid,
+                removed_sessions = ?removed_terminals,
+                "removed_terminal_sessions"
             );
         }
 
@@ -1633,8 +1688,10 @@ impl Daemon {
         for (name, proc) in services.iter_mut() {
             if proc.network_pid == Some(pid) {
                 info!(
-                    "Network sidecar for service '{}' (PID {}) exited with code {}",
-                    name, pid, exit_code
+                    service = %name,
+                    pid,
+                    exit_code,
+                    "network_sidecar_exited"
                 );
                 proc.network_pid = None;
                 if proc.pid.is_none() {
@@ -1648,8 +1705,11 @@ impl Daemon {
             if proc.pid == Some(pid) {
                 let intentionally_stopped = proc.target_state == ServiceState::Stopped;
                 info!(
-                    "Service '{}' (PID {}) exited with code {}. Intentional: {}",
-                    name, pid, exit_code, intentionally_stopped
+                    service = %name,
+                    pid,
+                    exit_code,
+                    intentional = intentionally_stopped,
+                    "service_exited"
                 );
 
                 proc.state = ServiceState::Stopped;
@@ -1691,8 +1751,10 @@ impl Daemon {
                     if let Some(max_retries) = proc.config.backoff.max_retries {
                         if proc.consecutive_failures > max_retries {
                             warn!(
-                                "Service '{}' crashed {} times, exceeding max_retries ({}). Marking as stopped.",
-                                name, proc.consecutive_failures, max_retries
+                                service = %name,
+                                crashes = proc.consecutive_failures,
+                                max_retries,
+                                "service_crash_limit_reached"
                             );
                             proc.target_state = ServiceState::Stopped;
                             if let Some(ref cg) = proc.cgroup_path.take() {
@@ -1703,11 +1765,14 @@ impl Daemon {
                     }
 
                     let backoff_secs = calculate_backoff(&proc.config, proc.consecutive_failures);
-                    let restart_delay_secs = restart_delay_with_jitter(name, backoff_secs.max(proc.config.restart_sec));
+                    let restart_delay_secs =
+                        restart_delay_with_jitter(name, backoff_secs.max(proc.config.restart_sec));
 
                     info!(
-                        "Service '{}' crashed. Scheduling restart #{} in {}s",
-                        name, proc.consecutive_failures, restart_delay_secs
+                        service = %name,
+                        crashes = proc.consecutive_failures,
+                        delay_secs = restart_delay_secs,
+                        "service_crash_scheduled_restart"
                     );
 
                     proc.next_restart_at = Some(
@@ -1721,7 +1786,7 @@ impl Daemon {
                 return;
             }
         }
-        debug!("Unmanaged child PID {} exited with code {}", pid, exit_code);
+        debug!(pid, exit_code, "unmanaged_child_exited");
     }
 
     fn check_restarts(&self) {
@@ -1756,7 +1821,9 @@ impl Daemon {
                         let mut check_watchdog = true;
                         // Grace period: don't check watchdog until started_at + watchdog_sec has passed
                         if let Some(started) = proc.started_at {
-                            if now.duration_since(started) < std::time::Duration::from_secs(watchdog_sec) {
+                            if now.duration_since(started)
+                                < std::time::Duration::from_secs(watchdog_sec)
+                            {
                                 check_watchdog = false;
                             }
                         }
@@ -1766,13 +1833,17 @@ impl Daemon {
                         }
 
                         if check_watchdog {
-                            let last_ping = proc.last_watchdog_ping.unwrap_or(proc.started_at.unwrap_or(now));
-                            if now.duration_since(last_ping) > std::time::Duration::from_secs(watchdog_sec) {
+                            let last_ping = proc
+                                .last_watchdog_ping
+                                .unwrap_or(proc.started_at.unwrap_or(now));
+                            if now.duration_since(last_ping)
+                                > std::time::Duration::from_secs(watchdog_sec)
+                            {
                                 warn!(
-                                    "Service '{}' watchdog timeout ({}s without health output matching '{}')",
-                                    name,
-                                    watchdog_sec,
-                                    proc.config.watchdog_match.as_deref().unwrap_or("active")
+                                    service = %name,
+                                    timeout_sec = watchdog_sec,
+                                    pattern = %proc.config.watchdog_match.as_deref().unwrap_or("active"),
+                                    "watchdog_timeout"
                                 );
                                 if let Some(pid) = proc.pid {
                                     let _ = process::send_signal(pid, libc::SIGKILL);
@@ -1783,9 +1854,13 @@ impl Daemon {
 
                     // --- Idle Termination Check ---
                     if let Some(idle_sec) = proc.config.idle_termination_sec {
-                        let metrics_idle = proc.last_active == Some(0) && proc.last_sess.unwrap_or(0) == 0;
-                        let stderr_idle = proc.last_stderr_at
-                            .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(idle_sec))
+                        let metrics_idle =
+                            proc.last_active == Some(0) && proc.last_sess.unwrap_or(0) == 0;
+                        let stderr_idle = proc
+                            .last_stderr_at
+                            .map(|t| {
+                                now.duration_since(t) >= std::time::Duration::from_secs(idle_sec)
+                            })
                             .unwrap_or(false);
 
                         if metrics_idle && stderr_idle {
@@ -1793,10 +1868,13 @@ impl Daemon {
                                 proc.idle_since = Some(now);
                             }
                             if let Some(idle_start) = proc.idle_since {
-                                if now.duration_since(idle_start) >= std::time::Duration::from_secs(idle_sec) {
+                                if now.duration_since(idle_start)
+                                    >= std::time::Duration::from_secs(idle_sec)
+                                {
                                     info!(
-                                        "Service '{}' idle for {}s (active=0, no output), terminating",
-                                        name, idle_sec
+                                        service = %name,
+                                        idle_sec,
+                                        "idle_termination_triggered"
                                     );
                                     proc.target_state = ServiceState::Stopped;
                                     if let Some(pid) = proc.pid {
@@ -1813,11 +1891,11 @@ impl Daemon {
         }
 
         for config in to_restart {
-            info!("Restarting service '{}'", config.name);
+            info!(service = %config.name, "restarting_service");
             if let Some(ref rm) = self.resource_manager
                 && !rm.can_start(&config)
             {
-                warn!("Insufficient resources for restarting '{}'", config.name);
+                warn!(service = %config.name, "insufficient_resources_for_restart");
                 let mut s = self.services.lock();
                 if let Some(proc) = s.get_mut(&config.name) {
                     proc.state = ServiceState::Stopped;
@@ -1834,7 +1912,7 @@ impl Daemon {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to restart '{}': {}", config.name, e);
+                    error!(service = %config.name, error = %e, "restart_service_failed");
                     let mut s = self.services.lock();
                     if let Some(proc) = s.get_mut(&config.name) {
                         proc.state = ServiceState::Stopped;
@@ -1886,14 +1964,15 @@ impl Daemon {
             Ok(path) => {
                 // Set limits
                 if let Err(e) = crate::cgroup::set_limits(&path, &config.resources) {
-                    warn!("Failed to set cgroup limits for '{}': {}", name, e);
+                    warn!(service = %name, error = %e, "set_cgroup_limits_failed");
                 }
                 Some(path)
             }
             Err(e) => {
                 warn!(
-                    "Failed to create cgroup for '{}': {} (proceeding without cgroup)",
-                    name, e
+                    service = %name,
+                    error = %e,
+                    "create_cgroup_failed"
                 );
                 None
             }
@@ -2014,13 +2093,14 @@ impl Daemon {
                 match process::open_pidfd(pid) {
                     Ok(fd) => proc.pidfd = Some(fd),
                     Err(e) => warn!(
-                        "open_pidfd for PID {} failed: {}; signals will use kill(2)",
-                        pid, e
+                        pid,
+                        error = %e,
+                        "open_pidfd_failed_using_kill"
                     ),
                 }
             }
         }
-        info!("Service '{}' started with PID {}", name, pid);
+        info!(service = %name, pid, "service_started");
 
         if let Some(stderr_pipe) = stderr {
             let services_clone = self.services.clone();
@@ -2042,7 +2122,7 @@ impl Daemon {
 
     /// Gracefully shut down all services.
     pub async fn shutdown(&self) {
-        info!("Shutting down all services");
+        info!("shutting_down_all_services");
 
         if let Some(ref rm) = self.resource_manager {
             rm.stop();
@@ -2063,7 +2143,7 @@ impl Daemon {
             };
 
             if let Some(pid) = pid {
-                debug!("Stopping service '{}' (PID {})", name, pid);
+                debug!(service = %name, pid, "stopping_service");
                 let (kill_signal, timeout_stop, send_sigkill, pidfd) = {
                     let mut services = self.services.lock();
                     match services.get_mut(&name) {
@@ -2091,7 +2171,7 @@ impl Daemon {
                 services.get(&name).and_then(|p| p.network_pid)
             };
             if let Some(pid) = network_pid {
-                debug!("Stopping network sidecar for '{}' (PID {})", name, pid);
+                debug!(service = %name, pid, "stopping_network_sidecar");
                 let _ = process::send_signal(pid, libc::SIGTERM);
             }
 
@@ -2108,7 +2188,7 @@ impl Daemon {
         // Clean up socket
         let _ = std::fs::remove_file(&self.config.socket_path);
         let _ = self.shutdown_tx.send(true);
-        info!("Daemon shutdown complete");
+        info!("daemon_shutdown_complete");
     }
 }
 
@@ -2180,7 +2260,7 @@ fn spawn_stderr_reader(
             if let Some(ref ready_match) = proc.config.ready_match {
                 if !proc.ready && line.contains(ready_match) {
                     proc.ready = true;
-                    info!("Service '{}' is ready (matched '{}')", name, ready_match);
+                    info!(service = %name, pattern = %ready_match, "service_ready");
                 }
             }
 
@@ -2710,20 +2790,26 @@ OOMScoreAdjust = -700
             config_dirs: vec![],
             socket_path: "/tmp/mesh-init-test-oneshot.sock".to_string(),
         });
-        
+
         let mut config = AppConfig::default();
         config.name = "oneshot-svc".to_string();
         config.oneshot = true;
         config.restart = RestartPolicy::No;
-        
+
         // 1. Exit with 0, Restart=No
         {
             let mut proc = ManagedProcess::new(config.clone());
             proc.state = ServiceState::Running;
             proc.target_state = ServiceState::Running;
             proc.pid = Some(9999);
-            daemon.services.lock().insert("oneshot-svc".to_string(), proc);
-            daemon.configs.lock().insert("oneshot-svc".to_string(), config.clone());
+            daemon
+                .services
+                .lock()
+                .insert("oneshot-svc".to_string(), proc);
+            daemon
+                .configs
+                .lock()
+                .insert("oneshot-svc".to_string(), config.clone());
 
             daemon.handle_child_exit(9999, 0);
 
@@ -2740,7 +2826,10 @@ OOMScoreAdjust = -700
             proc.state = ServiceState::Running;
             proc.target_state = ServiceState::Running;
             proc.pid = Some(9998);
-            daemon.services.lock().insert("oneshot-svc".to_string(), proc);
+            daemon
+                .services
+                .lock()
+                .insert("oneshot-svc".to_string(), proc);
 
             daemon.handle_child_exit(9998, 1);
 
@@ -2757,8 +2846,14 @@ OOMScoreAdjust = -700
             proc.state = ServiceState::Running;
             proc.target_state = ServiceState::Running;
             proc.pid = Some(9997);
-            daemon.services.lock().insert("oneshot-svc".to_string(), proc);
-            daemon.configs.lock().insert("oneshot-svc".to_string(), config_fail);
+            daemon
+                .services
+                .lock()
+                .insert("oneshot-svc".to_string(), proc);
+            daemon
+                .configs
+                .lock()
+                .insert("oneshot-svc".to_string(), config_fail);
 
             daemon.handle_child_exit(9997, 1);
 
@@ -2786,8 +2881,14 @@ OOMScoreAdjust = -700
         proc.state = ServiceState::Running;
         proc.target_state = ServiceState::Running;
         proc.pid = Some(9999);
-        daemon.services.lock().insert("restart-sec-svc".to_string(), proc);
-        daemon.configs.lock().insert("restart-sec-svc".to_string(), config.clone());
+        daemon
+            .services
+            .lock()
+            .insert("restart-sec-svc".to_string(), proc);
+        daemon
+            .configs
+            .lock()
+            .insert("restart-sec-svc".to_string(), config.clone());
 
         // First crash (ran for < 10s)
         daemon.handle_child_exit(9999, 1);
@@ -2795,8 +2896,14 @@ OOMScoreAdjust = -700
             let services = daemon.services.lock();
             let proc = services.get("restart-sec-svc").unwrap();
             assert_eq!(proc.consecutive_failures, 1);
-            let delay_dur = proc.next_restart_at.unwrap().duration_since(std::time::Instant::now());
-            assert!(delay_dur >= std::time::Duration::from_millis(4500) && delay_dur <= std::time::Duration::from_millis(6500));
+            let delay_dur = proc
+                .next_restart_at
+                .unwrap()
+                .duration_since(std::time::Instant::now());
+            assert!(
+                delay_dur >= std::time::Duration::from_millis(4500)
+                    && delay_dur <= std::time::Duration::from_millis(6500)
+            );
         }
 
         // Simulate restarting (updating state/pid, keep consecutive_failures=1)
@@ -2814,8 +2921,14 @@ OOMScoreAdjust = -700
             let services = daemon.services.lock();
             let proc = services.get("restart-sec-svc").unwrap();
             assert_eq!(proc.consecutive_failures, 2);
-            let delay_dur = proc.next_restart_at.unwrap().duration_since(std::time::Instant::now());
-            assert!(delay_dur >= std::time::Duration::from_millis(9500) && delay_dur <= std::time::Duration::from_millis(11500));
+            let delay_dur = proc
+                .next_restart_at
+                .unwrap()
+                .duration_since(std::time::Instant::now());
+            assert!(
+                delay_dur >= std::time::Duration::from_millis(9500)
+                    && delay_dur <= std::time::Duration::from_millis(11500)
+            );
         }
 
         // Simulate restarting, running for > 10s (successful run)
@@ -2834,8 +2947,14 @@ OOMScoreAdjust = -700
             let proc = services.get("restart-sec-svc").unwrap();
             // consecutive_failures should be reset to 1
             assert_eq!(proc.consecutive_failures, 1);
-            let delay_dur = proc.next_restart_at.unwrap().duration_since(std::time::Instant::now());
-            assert!(delay_dur >= std::time::Duration::from_millis(4500) && delay_dur <= std::time::Duration::from_millis(6500));
+            let delay_dur = proc
+                .next_restart_at
+                .unwrap()
+                .duration_since(std::time::Instant::now());
+            assert!(
+                delay_dur >= std::time::Duration::from_millis(4500)
+                    && delay_dur <= std::time::Duration::from_millis(6500)
+            );
         }
     }
 
@@ -2856,9 +2975,13 @@ OOMScoreAdjust = -700
         proc.target_state = ServiceState::Running;
         proc.pid = Some(9999);
         proc.started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3)); // already past startup grace period
-        proc.last_watchdog_ping = Some(std::time::Instant::now() - std::time::Duration::from_secs(3)); // watchdog expired!
+        proc.last_watchdog_ping =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3)); // watchdog expired!
 
-        daemon.services.lock().insert("watchdog-svc".to_string(), proc);
+        daemon
+            .services
+            .lock()
+            .insert("watchdog-svc".to_string(), proc);
 
         // Run check_restarts. This should detect the watchdog timeout and kill the process.
         daemon.check_restarts();

@@ -1,12 +1,9 @@
 # lmesh API
 
 `lmesh` exposes local mesh discovery control as newline-delimited JSON over a Unix
-domain socket. The socket is normally provided by mesh-init systemd-style socket
-activation at:
-
-```text
-/home/lmesh/run/lmesh/control.sock
-```
+domain socket. Under mesh-init it uses systemd-style socket activation and takes
+the activated listener fd. When started standalone without activation, it binds
+`./lmesh/mesh.sock` by default.
 
 The same methods can be called using flat JSONL or JSON-RPC 2.0. One request is sent per
 line and one response is returned per line.
@@ -31,6 +28,13 @@ Flat success responses use the mesh response shape:
 
 JSON-RPC success responses put the payload in `result`; errors use either the mesh
 `success:false,error` shape or JSON-RPC `error`, depending on the request format.
+
+## Environment
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LMESH_ANNOUNCE_INTERVAL_SECS` | `60` | Positive integer interval, in seconds, between automatic multicast announcements sent by the lmesh server. Invalid or zero values fall back to `60`. |
+| `LMESH_CONTROL_SOCKET` | `./lmesh/mesh.sock` | Standalone fallback UDS path used only when no activation listener is provided. Relative paths resolve against the working directory. |
 
 ## Lightweight MCP Methods
 
@@ -65,7 +69,7 @@ Node results contain:
 Discovered peers are persisted under:
 
 ```text
-/home/lmesh/files/nodes/<sha256(public_key)>.json
+./lmesh/nodes/<sha256(public_key)>.json
 ```
 
 Each file stores `public_key`, latest `address`, and up to 16 `announces`. Each
