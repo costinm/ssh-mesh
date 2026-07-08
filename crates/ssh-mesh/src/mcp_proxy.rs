@@ -41,13 +41,16 @@ async fn handle_mcp_json_rpc(Json(payload): Json<Value>) -> impl IntoResponse {
                     socket_path,
                     method_name,
                     params,
-                } => match crate::jsonl_proxy::call_json_rpc(&socket_path, &method_name, params)
-                    .await
-                    .and_then(crate::jsonl_proxy::jsonl_response_payload)
-                {
-                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
-                    Err(e) => mesh::protocol::Response::err(e.to_string()),
-                },
+                } => {
+                    let method_name = mesh::message::canonical_method_name(&method_name);
+                    match crate::jsonl_proxy::call_json_rpc(&socket_path, &method_name, params)
+                        .await
+                        .and_then(crate::jsonl_proxy::jsonl_response_payload)
+                    {
+                        Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                        Err(e) => mesh::protocol::Response::err(e.to_string()),
+                    }
+                }
             }
         },
     )

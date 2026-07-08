@@ -112,7 +112,13 @@ async fn proxy_mcp(
     }
 
     let socket = app_socket_path(&app, query.socket.as_deref());
-    if payload.get("method").and_then(Value::as_str) == Some("tools/call") {
+    if payload
+        .get("method")
+        .and_then(Value::as_str)
+        .map(mesh::message::canonical_method_name)
+        .as_deref()
+        == Some("tools/call")
+    {
         let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return (
@@ -121,11 +127,12 @@ async fn proxy_mcp(
             )
                 .into_response();
         };
+        let name = mesh::message::canonical_method_name(name);
         let arguments = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        return match crate::jsonl_proxy::call_json_rpc(&socket, name, arguments)
+        return match crate::jsonl_proxy::call_json_rpc(&socket, &name, arguments)
             .await
             .and_then(crate::jsonl_proxy::jsonl_response_payload)
         {
@@ -167,13 +174,16 @@ async fn proxy_mcp(
                     GenericMcpRequest::JsonlCall {
                         method_name,
                         params,
-                    } => match crate::jsonl_proxy::call_json_rpc(&socket, &method_name, params)
-                        .await
-                        .and_then(crate::jsonl_proxy::jsonl_response_payload)
-                    {
-                        Ok(value) => mesh::protocol::Response::ok_with_data(value),
-                        Err(e) => mesh::protocol::Response::err(e.to_string()),
-                    },
+                    } => {
+                        let method_name = mesh::message::canonical_method_name(&method_name);
+                        match crate::jsonl_proxy::call_json_rpc(&socket, &method_name, params)
+                            .await
+                            .and_then(crate::jsonl_proxy::jsonl_response_payload)
+                        {
+                            Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                            Err(e) => mesh::protocol::Response::err(e.to_string()),
+                        }
+                    }
                 }
             }
         },

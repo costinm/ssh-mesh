@@ -3,6 +3,7 @@ pub mod config;
 pub mod jobs;
 pub mod jsonl;
 pub mod local_trace;
+pub mod message;
 pub mod paths;
 pub mod protocol;
 pub mod server;
