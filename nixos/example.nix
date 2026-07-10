@@ -6,7 +6,7 @@
 #
 # and set package to:
 #
-#   ssh-mesh.packages.${pkgs.system}.ssh-mesh-full
+#   ssh-mesh.packages.${pkgs.system}.ssh-mesh
 
 {
   config,
@@ -20,7 +20,7 @@
 
   services.ssh-mesh = {
     enable = true;
-    package = sshMesh.packages.${pkgs.system}.ssh-mesh-full;
+    package = sshMesh.packages.${pkgs.system}.ssh-mesh;
     authorizedKeys = [
       # "ssh-ed25519 AAAA... your-key"
     ];

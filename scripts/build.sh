@@ -29,8 +29,8 @@ Default command:
 
 Fresh target/examples sequence:
   scripts/build.sh profile
-      Build/update the repo-local Nix profile with VM helpers, kernels, rootfs
-      assets, and hypervisors used by the examples.
+      Build/update the optional repo-local Linux VM profile with the standalone
+      custom kernel artifact and optional hypervisor tools used by VM examples.
 
   scripts/build.sh
       Build the Rust binaries and create target/dist artifacts.
@@ -176,7 +176,7 @@ configure_musl_toolchain() {
 add_nix_profile_deps() {
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
     shift || true
-    local deps="${*:-dev-tools nixos-install-tools}"
+    local deps="${*:-build-deps runtime-deps}"
     local dep
 
     target_profile="$(resolve_nix_profile "$target_profile")"
@@ -197,6 +197,22 @@ add_nix_profile_deps() {
 
 deps() {
     add_nix_profile_deps "$@"
+}
+
+add_nix_profile_package() {
+    local target_profile="$1"
+    local dep="$2"
+    local priority="${3:-5}"
+
+    target_profile="$(resolve_nix_profile "$target_profile")"
+    prepare_nix_profile_path "$target_profile"
+
+    if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "$dep"; then
+        echo "  ${dep}: already present"
+    else
+        echo "  ${dep}: nix profile add .#${dep} --priority ${priority}"
+        nix profile add ".#${dep}" --profile "${target_profile}" --priority "${priority}" || return $?
+    fi
 }
 
 ensure_musl_toolchain_profile() {
@@ -239,7 +255,7 @@ stage_opt_tree() {
     mkdir -p "$opt/ssh-mesh/bin" "$opt/initos/bin"
 
     copy_runtime_bins "$src" "$opt/ssh-mesh/bin" $EXAMPLE_BIN_TARGETS
-    cp -f linux/bin/vrun "$opt/ssh-mesh/bin/vrun"
+    cp -f bin/vrun "$opt/ssh-mesh/bin/vrun"
     ln -sf vrun "$opt/ssh-mesh/bin/initos-vrun"
     cp -f bin/run_bwrap.sh "$opt/ssh-mesh/bin/run_bwrap.sh"
     cp -f bin/run_podman.sh "$opt/ssh-mesh/bin/run_podman.sh"
@@ -395,30 +411,6 @@ dist() {
     stage_opt_tree "$release_dir" "$dest/opt" "$busybox"
     erofs "$dest" "$busybox" "bin/initos-init-vm" "$dest/opt"
 
-    local profile_path="${NIX_PROFILE:-$(default_nix_profile)}"
-    if [ -f "$profile_path/img/vmlinux-cloud" ]; then
-        cp -f "$profile_path/img/vmlinux-cloud" "$dest/img/vmlinux-cloud"
-    elif [ -f "$profile_path/img/bzImage" ]; then
-        cp -f "$profile_path/img/bzImage" "$dest/img/bzImage"
-    else
-        echo "Warning: no VM kernel found under $profile_path/img; run scripts/build.sh profile for VM examples" >&2
-    fi
-
-    local modules_src=""
-    if [ -f "$profile_path/img/modules-cloud.erofs" ]; then
-        modules_src="$profile_path/img/modules-cloud.erofs"
-    elif [ -f "$profile_path/img/modules-cloudfs.erofs" ]; then
-        modules_src="$profile_path/img/modules-cloudfs.erofs"
-    elif [ -f "$profile_path/img/modules.erofs" ]; then
-        modules_src="$profile_path/img/modules.erofs"
-    fi
-    if [ -n "$modules_src" ]; then
-        cp -f "$modules_src" "$dest/img/modules-cloud.erofs"
-        ln -sf modules-cloud.erofs "$dest/img/modules-cloudfs.erofs"
-    else
-        echo "Warning: no VM modules EROFS found under $profile_path/img; run scripts/build.sh profile for VM examples" >&2
-    fi
-
     echo "Dist completed at $dest"
 }
 
@@ -435,7 +427,7 @@ install() {
     
     echo "Copying scripts..."
     cp -r bin/* "$dest/bin/"
-    cp -f linux/bin/vrun "$dest/bin/vrun"
+    cp -f bin/vrun "$dest/bin/vrun"
     ln -sf vrun "$dest/bin/initos-vrun"
     chmod +x "$dest/bin/"*
 
@@ -588,40 +580,31 @@ EOF
 vm() {
     local profile="${1:-$PWD/target/vm/initos-vm}"
     echo "Building VM profile into $profile..."
-    nix build .#default -o "$profile"
+    nix build ./linux#default -o "$profile"
 }
 
 profile() {
     # Default NIX_PROFILE target path
     local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
 
+    echo "Adding missing Nix profile dependencies to: ${target_profile}"
+    target_profile="$(resolve_nix_profile "$target_profile")"
     prepare_nix_profile_path "$target_profile"
-
-    echo "Updating Nix profile: ${target_profile}"
-    if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "ssh-mesh"; then
-        echo "Upgrading ssh-mesh package in profile..."
-        nix profile upgrade --profile "${target_profile}" --all
+    if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "kernel-cloud"; then
+        echo "  kernel-cloud: already present"
     else
-        echo "Adding ssh-mesh package to profile..."
-        nix profile add . --profile "${target_profile}"
+        echo "  kernel-cloud: nix profile add ./linux#kernel-cloud"
+        nix profile add "./linux#kernel-cloud" --profile "${target_profile}" || return $?
     fi
-
-    # Build microvm runners and create their stamps
-    local microvm_work="target/vm/microvm-echo"
-    local profile_real=$(readlink -f "${target_profile}")
-    mkdir -p "${microvm_work}"
-    for hv in crosvm qemu cloud-hypervisor; do
-        local rlink="${microvm_work}/runner-${hv}"
-        local stamp="${microvm_work}/runner-${hv}.sha256"
-        local fhash
-        fhash=$(printf '%s\n' "${profile_real}" "${hv}" "$(sha256sum "tests/microvm-echo/flake.nix" 2>/dev/null | awk '{print $1}')" | sha256sum | awk '{print $1}')
-        if [ ! -L "${rlink}" ] || [ ! -f "${stamp}" ] || [ "$(cat "${stamp}" 2>/dev/null)" != "${fhash}" ]; then
-            rm -f "${rlink}"
-            echo "Building microvm runner for ${hv}..."
-            nix build ./tests/microvm-echo#runner-${hv} --override-input initosProfile "path:${profile_real}" -o "${rlink}"
-            printf '%s\n' "${fhash}" > "${stamp}"
+    if [ "${SSH_MESH_PROFILE_VM_TOOLS:-1}" != "0" ]; then
+        if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "vm-tools"; then
+            echo "  vm-tools: already present"
+        else
+            echo "  vm-tools: nix profile add ./vm-tools#default --priority 4"
+            nix profile add "./vm-tools#default" --profile "${target_profile}" --priority 4 || return $?
         fi
-    done
+    fi
+    prepend_nix_profile_path "$target_profile"
 }
 
 build() {
@@ -631,13 +614,10 @@ build() {
     echo "=== 1. Building release binaries with musl ==="
     rust
 
-    echo "=== 2. Assembling and upgrading local VM profile ==="
-    profile "${target_profile}"
-
-    echo "=== 3. Creating dist artifacts ==="
+    echo "=== 2. Creating dist artifacts ==="
     dist "$PWD/target/dist" "target/x86_64-unknown-linux-musl/release"
 
-    echo "=== 4. Refreshing example tree ==="
+    echo "=== 3. Refreshing example tree ==="
     stage_example_tree "$PWD/target/examples" "$PWD/target/dist/opt"
 }
 
@@ -672,7 +652,6 @@ test_cmd() {
             tests/test_traceweb.sh "$@"
             ;;
         vm_cloud_hypervisor_acpi_s5|vm_echo_latency|vm_microvm_echo|vm_qemu_echo|vm_vrun_cloud_hypervisor_echo|vm_vrun_crosvm_echo)
-            profile "${NIX_PROFILE:-$(default_nix_profile)}"
             export NIX_PROFILE="$(resolve_nix_profile "${NIX_PROFILE:-$(default_nix_profile)}")"
             export PATH="$NIX_PROFILE/bin:${PATH:-}"
             "tests/test_${name}.sh" "$@"

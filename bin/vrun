@@ -1,0 +1,1153 @@
+#!/bin/sh
+
+set -e
+
+# Start a VM using a virtio 'src' disk and minimal startup similar to Pods.
+#
+# A local disk image is sometimes required as cache and to keep Java
+# and other apps using fancy filesystem calls happy, virtiofs is not perfect.
+# 
+# New layout - based on contained apps (one dir per app without spreading all over like FHS):
+# 
+# TOP or SRC - the top level directory of the pod, default /home/$POD or `pwd`.
+# WORK - TOP/target/work
+# SHARE - WORK/share
+# NIX_PROFILE (TOP/target/nix/profiles) - a nix profile with the VMs, img/kernel, etc.
+# 
+#
+# Directory layout on host:
+#    WORK 
+#       - dir for sockets, etc 
+#      - WORK/share will have bind mounts that can be changed at runtime
+#      (default: user ${HOME/.cache/c/${POD}} )
+#    SRC - $HOME/apps/${POD} - source directory, configs
+#
+#    VIRT - kernel,  modules - read only (/opt/initos)
+#    IMGDIR - RW disks for the pod, rootfs and data dirs.
+# 
+# Layout inside container/VM:
+# 
+# /z - virtiofs shared dir
+# /x - main btrfs volume, can be used for data, etc.
+#      If a SRC image is not provided, /z/x is mounted. 
+# /x/cache - optional separate volume for cache, swap etc. Not backed up.
+# /z/home or /x/home mounted as /home 
+# /z/nix mounted as /nix with overlayfs (it is read-only host's nix)
+# 
+# Inside the home dir:
+# - .cache link to /x/cache/home/USER/.cache
+# 
+
+# Can be started with:
+# RC_SVCNAME=NAME supervise-daemon NAME --start /x/opt/virt/vrun -- start
+if [ -n "${RC_SVCNAME:-}" ]; then
+  # If running as a service (alpine init), set the pod name to the service name.
+  POD=${POD:-${RC_SVCNAME}}
+fi
+
+if [ -z "${POD:-}" ]; then
+  if [ -n "${SSH_MESH_VM_NODE:-}" ]; then
+    POD="${SSH_MESH_VM_NODE}"
+  fi
+fi
+
+# If the script is named vrun-devvm -> the VM will be devvm
+if [ -z "${POD:-}" ]; then
+  script_name=$(basename "$0")
+  case "${script_name}" in
+    vrun-?*) POD="${script_name#vrun-}" ;;
+  esac
+fi
+
+if [ -z "${POD:-}" ]; then
+  echo "POD must be set to the target container or VM name"
+  exit 1
+fi
+
+
+# Directory with hypervisor binaries, kernel, recovery
+if [ -z "${NIX_PROFILE:-}" ]; then
+    if [ -e "${PWD}/target/nix/profiles" ]; then
+        NIX_PROFILE="${PWD}/target/nix/profiles"
+    else
+      # vrun script in the nix profile (relative paths to bin/vrun)    
+      SCRIPT_DIR=$(dirname "$0")
+      if [ "$SCRIPT_DIR" = "." ] && command -v "$0" >/dev/null 2>&1; then
+          SCRIPT_DIR=$(dirname "$(command -v "$0")")
+      fi
+      NIX_PROFILE=$(dirname "$SCRIPT_DIR")
+    fi
+fi
+
+# Make sure the NIX_PROFILE is in the path
+if [ -d "${NIX_PROFILE}/bin" ]; then
+  case ":${PATH:-}:" in
+    *":${NIX_PROFILE}/bin:"*) ;;
+    *) export PATH="${NIX_PROFILE}/bin:${PATH:-}" ;;
+  esac
+fi
+
+# Base dir for the virt binaries.
+VIRT=${VIRT:-${NIX_PROFILE}}
+
+# Images - including RW disks
+IMGDIR=${IMGDIR:-/z/vol/images}
+
+# sockets, temp files
+WORK=${WORK:-/run/virt/${POD}}
+if [ -z "${VM_SHARE:-}" ]; then
+  SSH_MESH_VRUN_DEFAULT_VM_SHARE=1
+  VM_SHARE="${WORK}/share"
+fi
+
+SRC=${SRC:-${HOME}/apps/${POD}}
+
+mesh_vm_is_running() {
+  local pid_file="${WORK}/vm.pid"
+  local pid
+
+  [ -f "${pid_file}" ] || return 1
+  pid=$(cat "${pid_file}" 2>/dev/null || true)
+  [ -n "${pid}" ] || return 1
+  kill -0 "${pid}" 2>/dev/null
+}
+
+mesh_record_vm_pid() {
+  mkdir -p "${WORK}"
+  echo "$$" > "${WORK}/vm.pid"
+}
+
+mesh_path_is_mounted() {
+  local path="$1"
+
+  [ -e /proc/self/mountinfo ] || return 1
+  awk -v p="${path}" '$5 == p { found = 1 } END { exit found ? 0 : 1 }' \
+    /proc/self/mountinfo
+}
+
+mesh_umount_path() {
+  local path="$1"
+
+  mesh_path_is_mounted "${path}" || return 0
+  umount "${path}" 2>/dev/null || umount -l "${path}" 2>/dev/null || true
+}
+
+mesh_rm_path() {
+  local path="$1"
+
+  if mesh_path_is_mounted "${path}"; then
+    echo "warning: ${path} is still mounted; skipping recursive removal"
+    return 0
+  fi
+  rm -rf "${path}"
+}
+
+mesh_prepare_app_vm() {
+  [ "${SSH_MESH_VRUN_APP:-0}" != "0" ] || return 0
+
+  local node="${SSH_MESH_VM_NODE:-${POD}}"
+  local app_home
+  local root_dir
+  local template_dir
+  local state_dir
+  local state_home_dir
+  local shared_dir
+  local share_dir
+  local initos_pod_src
+  local launch_log
+
+  app_home="${SSH_MESH_APP_HOME:-${VRUN_APP_HOME:-${node}}}"
+  root_dir="${SSH_MESH_STATE_ROOT:-${VRUN_STATE_ROOT:-/src}}"
+  template_dir="${SSH_MESH_APP_TEMPLATE_DIR:-${VRUN_TEMPLATE_DIR:-${SRC:-}}}"
+  state_dir="${SSH_MESH_APP_STATE_DIR:-${VRUN_STATE_DIR:-${root_dir}/${node}}}"
+  state_home_dir="${SSH_MESH_APP_STATE_HOME:-${state_dir}/home/${app_home}}"
+  shared_dir="${SSH_MESH_SHARED_DIR:-${VRUN_SHARED_DIR:-${root_dir}/shared}}"
+  if [ "${WORK:-}" = "/run/virt/${POD}" ]; then
+    WORK="${state_dir}/vm"
+  else
+    WORK="${WORK:-${state_dir}/vm}"
+  fi
+  if [ "${SSH_MESH_VRUN_DEFAULT_VM_SHARE:-0}" = "1" ]; then
+    VM_SHARE="${WORK}/share"
+  fi
+  if [ "${SRC:-}" = "${HOME}/apps/${POD}" ] && [ ! -d "${SRC}" ]; then
+    SRC="${template_dir}"
+  else
+    SRC="${SRC:-${template_dir}}"
+  fi
+  share_dir="${VM_SHARE:-${WORK}/share}"
+  VM_SHARE="${share_dir}"
+
+  VIRT_KERNEL="${VIRT_KERNEL:-${SSH_MESH_APP_VM_KERNEL:-}}"
+  VIRT_ROOTFS="${VIRT_ROOTFS:-${SSH_MESH_APP_VM_ROOTFS:-}}"
+  VIRT_MODULES="${VIRT_MODULES:-${SSH_MESH_APP_VM_MODULES:-${SSH_MESH_VM_MODULES:-}}}"
+  VIRT_BUSYBOX="${VIRT_BUSYBOX:-/opt/busybox/bin/busybox}"
+  VIRT_INITOS_INIT_VM="${VIRT_INITOS_INIT_VM:-/opt/initos/bin/initos-init-vm}"
+  virt="${virt:-${SSH_MESH_VM_HYPERVISOR:-}}"
+  NO_NET="${NO_NET:-1}"
+  VSOCK_CID="${VSOCK_CID:-${SSH_MESH_VM_VSOCK_CID:-${SSH_MESH_APP_VM_VSOCK_CID:-}}}"
+  SSH_MESH_VSOCK_PORT="${SSH_MESH_VSOCK_PORT:-${SSH_MESH_VM_VSOCK_PORT:-${SSH_MESH_APP_VM_VSOCK_PORT:-}}}"
+  vm_mem="${vm_mem:-${SSH_MESH_APP_VM_QEMU_MEMORY:-${SSH_MESH_VM_MEMORY:-512M}}}"
+  vm_mem_mb="${vm_mem_mb:-${vm_mem}}"
+  case "${vm_mem}" in
+    *[!0-9]*) ;;
+    *) vm_mem="${vm_mem}M" ;;
+  esac
+  case "${vm_mem_mb}" in
+    *M) vm_mem_mb="${vm_mem_mb%M}" ;;
+    *[!0-9]*) vm_mem_mb="512" ;;
+  esac
+  vm_cpu="${vm_cpu:-${SSH_MESH_APP_VM_QEMU_CPUS:-${SSH_MESH_VM_CPUS:-1}}}"
+
+  mkdir -p \
+    "${state_home_dir}/etc/mesh-init" \
+    "${state_home_dir}/etc/ssh-mesh" \
+    "${state_home_dir}/run/mesh-init" \
+    "${state_home_dir}/run/ssh-mesh/mux" \
+    "${state_home_dir}/.ssh" \
+    "${shared_dir}" \
+    "${WORK}"
+
+  launch_log="${WORK}/launch.log"
+  if [ ! -t 1 ] && [ "${SSH_MESH_VRUN_LOG_REDIRECTED:-0}" = "0" ]; then
+    export SSH_MESH_VRUN_LOG_REDIRECTED=1
+    exec </dev/null >>"${launch_log}" 2>&1
+  fi
+
+  if mesh_vm_is_running; then
+    echo "${node} already running with PID $(cat "${WORK}/vm.pid")"
+    exit 0
+  fi
+  rm -f "${WORK}/vm.pid"
+
+  if [ -d "${template_dir}" ]; then
+    cp -R "${template_dir}/." "${state_home_dir}/"
+  fi
+  if [ -n "${NIX_PROFILE:-}" ] && [ -e "${NIX_PROFILE}" ]; then
+    ln -sfn "${NIX_PROFILE}" "${state_home_dir}/nix-profile"
+  fi
+
+  mesh_umount_path "${share_dir}/shared"
+  mesh_umount_path "${share_dir}/nix"
+  mesh_rm_path "${share_dir:?}/${node}"
+  mesh_rm_path "${share_dir}/initos"
+  mesh_rm_path "${share_dir}/shared"
+  mesh_rm_path "${share_dir}/nix"
+  mkdir -p "${share_dir}/${node}/home" "${share_dir}/initos"
+
+  cp -R "${state_home_dir}" "${share_dir}/${node}/home/${app_home}"
+
+  initos_pod_src="${SSH_MESH_APP_INITOS_POD:-${template_dir}/initos-pod}"
+  if [ -f "${initos_pod_src}" ]; then
+    cp "${initos_pod_src}" "${share_dir}/initos/initos-pod"
+  fi
+
+  if [ -d "${shared_dir}" ]; then
+    mkdir -p "${share_dir}/shared"
+    if ! mount --bind "${shared_dir}" "${share_dir}/shared" 2>/dev/null; then
+      rmdir "${share_dir}/shared" 2>/dev/null || true
+    fi
+  fi
+  if [ -d /nix ]; then
+    mkdir -p "${share_dir}/nix"
+    if mount --bind /nix "${share_dir}/nix" 2>/dev/null; then
+      mount -o remount,ro,bind "${share_dir}/nix" 2>/dev/null || true
+    else
+      rmdir "${share_dir}/nix" 2>/dev/null || true
+    fi
+  fi
+
+  echo "${node} kernel: ${VIRT_KERNEL}"
+  echo "${node} rootfs: ${VIRT_ROOTFS}"
+  echo "${node} src share: ${share_dir}"
+  echo "${node} HOME inside guest: /home/${app_home}"
+  echo "${node} persistent HOME source: ${state_home_dir}"
+}
+
+mesh_prepare_host_vm() {
+  [ "${SSH_MESH_VRUN_HOST:-0}" != "0" ] || return 0
+
+  local node="${SSH_MESH_VM_NODE:-${POD}}"
+  local root_dir
+  local template_dir
+  local artifact_dir
+  local state_dir
+  local share_dir
+  local initos_pod_src
+  local vm_artifact_dir
+
+  root_dir="${SSH_MESH_STATE_ROOT:-${VRUN_STATE_ROOT:-${PWD}/target/vrun}}"
+  template_dir="${SSH_MESH_HOST_TEMPLATE_DIR:-${VRUN_TEMPLATE_DIR:-${SRC:-}}}"
+  artifact_dir="${SSH_MESH_DIST_DIR:-${VRUN_DIST_DIR:-${PWD}/target/dist}}"
+  state_dir="${SSH_MESH_HOST_STATE_DIR:-${VRUN_STATE_DIR:-${root_dir}/${node}}}"
+  share_dir="${SSH_MESH_VM_SHARE_DIR:-${VRUN_SHARED_DIR:-${root_dir}}}"
+
+  if [ "${WORK:-}" = "/run/virt/${POD}" ]; then
+    WORK="${state_dir}/vm"
+  else
+    WORK="${WORK:-${state_dir}/vm}"
+  fi
+  VM_SHARE="${share_dir}"
+  if [ "${SRC:-}" = "${HOME}/apps/${POD}" ] && [ ! -d "${SRC}" ]; then
+    SRC="${template_dir}"
+  else
+    SRC="${SRC:-${template_dir}}"
+  fi
+
+  VIRT="${VIRT:-${NIX_PROFILE:-${artifact_dir}}}"
+  VIRT_KERNEL="${VIRT_KERNEL:-${SSH_MESH_HOST_VM_KERNEL:-}}"
+  VIRT_ROOTFS="${VIRT_ROOTFS:-${SSH_MESH_HOST_VM_ROOTFS:-${artifact_dir}/img/ssh-mesh.erofs}}"
+  VIRT_MODULES="${VIRT_MODULES:-${SSH_MESH_HOST_VM_MODULES:-}}"
+  virt="${virt:-${SSH_MESH_VM_HYPERVISOR:-}}"
+  NO_NET="${NO_NET:-}"
+  vm_ip="${vm_ip:-${SSH_MESH_VM_GUEST_IP:-10.0.2.15/24}}"
+  vm_gw="${vm_gw:-${SSH_MESH_VM_GUEST_GW:-10.0.2.2}}"
+  vm_mem="${vm_mem:-${SSH_MESH_VM_MEMORY:-1024M}}"
+  vm_mem_mb="${vm_mem_mb:-${vm_mem}}"
+  case "${vm_mem}" in
+    *[!0-9]*) ;;
+    *) vm_mem="${vm_mem}M" ;;
+  esac
+  case "${vm_mem_mb}" in
+    *M) vm_mem_mb="${vm_mem_mb%M}" ;;
+    *[!0-9]*) vm_mem_mb="1024" ;;
+  esac
+  vm_cpu="${vm_cpu:-${SSH_MESH_VM_CPUS:-2}}"
+  SSH_MESH_VM_NESTED_KVM="${SSH_MESH_VM_NESTED_KVM:-1}"
+  export SSH_MESH_VM_NESTED_KVM
+  SSH_MESH_VM_HOST_SSH_PORT="${SSH_MESH_VM_HOST_SSH_PORT:-18322}"
+  SSH_MESH_VM_GUEST_SSH_PORT="${SSH_MESH_VM_GUEST_SSH_PORT:-18322}"
+  SSH_MESH_VM_HOST_HTTP_PORT="${SSH_MESH_VM_HOST_HTTP_PORT:-18380}"
+  SSH_MESH_VM_GUEST_HTTP_PORT="${SSH_MESH_VM_GUEST_HTTP_PORT:-18380}"
+  export SSH_MESH_VM_HOST_SSH_PORT SSH_MESH_VM_GUEST_SSH_PORT
+  export SSH_MESH_VM_HOST_HTTP_PORT SSH_MESH_VM_GUEST_HTTP_PORT
+
+  mkdir -p \
+    "${state_dir}/vm" \
+    "${root_dir}/shared" \
+    "${root_dir}/${node}/home" \
+    "${root_dir}/initos" \
+    "${root_dir}/vm-artifacts"
+
+  if [ -d "${template_dir}/home" ]; then
+    for app_home in "${template_dir}/home/"*; do
+      [ -d "${app_home}" ] || continue
+      app_name=$(basename "${app_home}")
+      mkdir -p "${root_dir}/${node}/home/${app_name}"
+      cp -R "${app_home}/." "${root_dir}/${node}/home/${app_name}/"
+    done
+  fi
+
+  if [ -n "${NIX_PROFILE:-}" ] && [ -e "${NIX_PROFILE}" ]; then
+    ln -sfn "$(readlink -f "${NIX_PROFILE}")" "${root_dir}/${node}/nix-profile"
+  fi
+
+  initos_pod_src="${SSH_MESH_HOST_INITOS_POD:-${template_dir}/initos-pod}"
+  if [ -f "${initos_pod_src}" ]; then
+    cp "${initos_pod_src}" "${root_dir}/initos/initos-pod"
+  fi
+
+  vm_artifact_dir="${root_dir}/vm-artifacts"
+  if [ -f "${artifact_dir}/img/ssh-mesh.erofs" ]; then
+    cp -f "${artifact_dir}/img/ssh-mesh.erofs" "${vm_artifact_dir}/ssh-mesh.erofs"
+  fi
+
+  echo "${node} kernel: ${VIRT_KERNEL}"
+  echo "${node} rootfs: ${VIRT_ROOTFS}"
+  echo "${node} modules: ${VIRT_MODULES}"
+  echo "${node} src share: ${VM_SHARE}"
+  echo "${node} HOME inside guest: /home/system"
+  echo "${node} persistent HOME source: /src/${node}/home/system"
+  echo "${node} host forwards: 127.0.0.1:${SSH_MESH_VM_HOST_SSH_PORT}->${SSH_MESH_VM_GUEST_SSH_PORT}, 127.0.0.1:${SSH_MESH_VM_HOST_HTTP_PORT}->${SSH_MESH_VM_GUEST_HTTP_PORT}"
+  echo "${node} guest network: ${vm_ip} via ${vm_gw}"
+}
+
+
+# IMAGE and other parameters loaded from this file
+if [ -f ${SRC}/env ]; then 
+  . ${SRC}/env
+fi
+
+virt_first_file() {
+  for f in "$@"; do
+    if [ -f "${f}" ]; then
+      printf '%s\n' "${f}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+virt_resolve_layout() {
+  virt=${virt:-}
+  OPTS=${OPTS:-}
+  CMD_OPTS=${CMD_OPTS:-}
+  QDISKS=${QDISKS:-}
+  DISKS=${DISKS:-}
+  NETX=${NETX:-}
+  TIME=${TIME:-}
+  DEBUG=${DEBUG:-}
+  qemu_base=${qemu_base:-}
+  QEMU_UI=${QEMU_UI:-}
+  NO_NET=${NO_NET:-}
+  STDIO_ACTIVATION=${STDIO_ACTIVATION:-}
+  VSOCK_CID=${VSOCK_CID:-}
+  SSH_MESH_VSOCK_PORT=${SSH_MESH_VSOCK_PORT:-}
+
+  if [ -d "${VIRT}/opt/ssh-mesh-kernel" ]; then
+    VIRT_ROOT=${VIRT_ROOT:-${VIRT}}
+    VIRT_BIN=${VIRT_BIN:-${VIRT_ROOT}/bin}
+    VIRT_IMG=${VIRT_IMG:-${VIRT_ROOT}/opt/ssh-mesh-kernel}
+    VIRT_BOOT=${VIRT_BOOT:-${VIRT_ROOT}/opt/ssh-mesh-kernel}
+    VIRT_OPT=${VIRT_OPT:-${VIRT_ROOT}/opt}
+  elif [ -d "${VIRT}/img" ] || [ -d "${VIRT}/boot" ]; then
+    VIRT_ROOT=${VIRT_ROOT:-${VIRT}}
+    VIRT_BIN=${VIRT_BIN:-${VIRT_ROOT}/bin}
+    VIRT_IMG=${VIRT_IMG:-${VIRT_ROOT}/img}
+    VIRT_BOOT=${VIRT_BOOT:-${VIRT_ROOT}/boot}
+    VIRT_OPT=${VIRT_OPT:-${VIRT_ROOT}/opt}
+  else
+    VIRT_ROOT=${VIRT_ROOT:-${VIRT}}
+    VIRT_BIN=${VIRT_BIN:-${VIRT}}
+    VIRT_IMG=${VIRT_IMG:-${VIRT}}
+    VIRT_BOOT=${VIRT_BOOT:-${VIRT}}
+    VIRT_OPT=${VIRT_OPT:-${VIRT}}
+  fi
+
+  VIRT_KERNEL=${VIRT_KERNEL:-$(virt_first_file \
+    "${VIRT_IMG}/vmlinux-cloud" \
+    "${VIRT_IMG}/vmlinuz-cloud" \
+    "${VIRT_IMG}/bzImage" \
+    "${VIRT_ROOT}/vmlinux" \
+    "${VIRT_ROOT}/vmlinuz" \
+    "${VIRT}/vmlinux" \
+    "${VIRT}/vmlinuz" 2>/dev/null || true)}
+  VIRT_ROOTFS=${VIRT_ROOTFS:-$(virt_first_file \
+    "${VIRT_IMG}/ssh-mesh.erofs" \
+    "${VIRT_IMG}/initos.erofs" \
+    "${VIRT_ROOT}/initos.erofs" \
+    "${VIRT}/initos.erofs" 2>/dev/null || true)}
+  VIRT_MODULES=${VIRT_MODULES:-$(virt_first_file \
+    "${VIRT_IMG}/modules-cloud.erofs" \
+    "${VIRT_IMG}/modules-cloudfs.erofs" \
+    "${VIRT_ROOT}/modules-cloud.erofs" \
+    "${VIRT_ROOT}/modules-cloudfs.erofs" \
+    "${VIRT_ROOT}/modules.erofs" \
+    "${VIRT}/modules.erofs" 2>/dev/null || true)}
+  VIRT_BUSYBOX=${VIRT_BUSYBOX:-$(virt_first_file \
+    "${VIRT_OPT}/busybox/bin/busybox" \
+    "${VIRT_IMG}/busybox" \
+    "${VIRT_BIN}/busybox" \
+    "${VIRT}/busybox" 2>/dev/null || true)}
+  VIRT_INITOS_INIT_VM=${VIRT_INITOS_INIT_VM:-$(virt_first_file \
+    "${VIRT_OPT}/initos/bin/initos-init-vm" \
+    "${VIRT_BIN}/initos-init-vm" \
+    "${VIRT}/initos-init-vm" 2>/dev/null || true)}
+  VIRT_CLOUD_HYPERVISOR=${VIRT_CLOUD_HYPERVISOR:-$(virt_first_file \
+    "${VIRT_BIN}/cloud-hypervisor" \
+    "${VIRT}/cloud-hypervisor" 2>/dev/null || command -v cloud-hypervisor || true)}
+  VIRT_VIRTIOFSD=${VIRT_VIRTIOFSD:-$(virt_first_file \
+    "${VIRT_BIN}/virtiofsd" \
+    "${VIRT}/virtiofsd" 2>/dev/null || command -v virtiofsd || true)}
+  VIRT_QEMU=${VIRT_QEMU:-$(virt_first_file \
+    "${VIRT_BIN}/qemu-system-x86_64" \
+    "${VIRT}/qemu-system-x86_64" 2>/dev/null || command -v qemu-system-x86_64 || true)}
+  VIRT_CROSVM=${VIRT_CROSVM:-$(virt_first_file \
+    "${VIRT_BIN}/crosvm" \
+    "${VIRT}/crosvm" 2>/dev/null || command -v crosvm || true)}
+
+  [ -n "${VIRT_KERNEL}" ] || {
+    echo "Missing VM kernel. Set VIRT to a Nix VM profile or set VIRT_KERNEL." >&2
+    exit 1
+  }
+  [ -n "${VIRT_BUSYBOX}" ] || {
+    echo "Missing busybox. Set VIRT to a Nix VM profile or set VIRT_BUSYBOX." >&2
+    exit 1
+  }
+}
+
+virt_binary_available() {
+  local bin="$1"
+
+  [ -n "${bin}" ] || return 1
+  [ -x "${bin}" ] || command -v "${bin}" >/dev/null 2>&1
+}
+
+virt_kvm_available() {
+  [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]
+}
+
+virt_tap_available() {
+  [ -d "/sys/class/net/vm-${POD}" ]
+}
+
+virt_needs_unprivileged_net() {
+  [ -z "${NO_NET:-}" ] && ! virt_tap_available
+}
+
+virt_pick_default() {
+  if virt_kvm_available && ! virt_needs_unprivileged_net; then
+    if virt_binary_available "${VIRT_CROSVM:-}"; then
+      printf '%s\n' crosvm
+      return 0
+    fi
+    if [ "${SSH_MESH_VM_REQUIRE_NATIVE_VSOCK:-0}" = "0" ]; then
+      if virt_binary_available "${VIRT_CLOUD_HYPERVISOR:-}"; then
+        printf '%s\n' ch
+        return 0
+      fi
+    fi
+  fi
+
+  if virt_binary_available "${VIRT_QEMU:-}"; then
+    printf '%s\n' qemu
+    return 0
+  fi
+
+  if virt_kvm_available; then
+    if virt_binary_available "${VIRT_CROSVM:-}"; then
+      printf '%s\n' crosvm
+      return 0
+    fi
+    if [ "${SSH_MESH_VM_REQUIRE_NATIVE_VSOCK:-0}" = "0" ]; then
+      if virt_binary_available "${VIRT_CLOUD_HYPERVISOR:-}"; then
+        printf '%s\n' ch
+        return 0
+      fi
+    fi
+  fi
+
+  return 1
+}
+
+validate_pod_name() {
+  if [ -n "${NO_NET:-}" ]; then
+    return 0
+  fi
+  local tap="vm-${POD}"
+  tap_bytes=$(printf '%s' "${tap}" | wc -c | tr -d '[:space:]')
+  if [ "${tap_bytes}" -gt 15 ]; then
+    echo "POD is too long for the Cloud Hypervisor tap name '${tap}'." >&2
+    echo "Linux network interface names are limited to 15 bytes; use a POD name of 12 bytes or less." >&2
+    exit 1
+  fi
+}
+
+cleanup_pid_file() {
+  local pid_file="$1"
+  local pid
+  local n
+
+  [ -f "${pid_file}" ] || return 0
+  pid=$(cat "${pid_file}" 2>/dev/null || true)
+
+  if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+    kill "${pid}" 2>/dev/null || true
+    n=0
+    while [ "${n}" -lt 3 ] && kill -0 "${pid}" 2>/dev/null; do
+      sleep 1
+      n=$((n + 1))
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
+  fi
+
+  rm -f "${pid_file}"
+}
+
+vm_init() {
+  virt_resolve_layout
+  local share_dir="${VM_SHARE:-${WORK}/share}"
+
+  # if [ ! -d ${WORK}/share/lib/modules ]; then
+  #   # Loading Nvidia drivers from share modules doesn't work - using separate volumes.
+  #   # In the VM, this can be copied over - to avoid creating a separate image.
+  #   mkdir -p ${WORK}/share/lib/modules
+  #   mount -o bind /lib/modules ${WORK}/share/lib/modules
+  #   # TODO: additional bind mounts configured in the lib
+  # fi
+
+  # Config and binaries for startup - this sets up the tmpfs work dir
+  # On restart it will not re-create it.
+  if [ ! -d ${share_dir}/initos ]; then
+    echo "Creating ${share_dir}/initos and setting bind mounts"
+    mkdir -p ${share_dir}/initos
+    if [ -f ${SRC}/vm-init ]; then
+      ${SRC}/vm-init share
+    fi
+  fi
+
+  if [ -f ${SRC}/initos.env ]; then 
+    cp ${SRC}/initos.env ${share_dir}/initos/initos.env
+  fi
+  if [ -f ${SRC}/vm-init ]; then 
+    cp ${SRC}/vm-init ${share_dir}/initos/init
+  fi
+
+  if [ -f ${SRC}/initos-pod ]; then 
+    cp ${SRC}/initos-pod ${share_dir}/initos/initos-pod
+  fi 
+
+  mkdir -p ${share_dir}/initos ${share_dir}/bin \
+    ${share_dir}/opt/initos/bin ${share_dir}/opt/busybox/bin
+
+  if [ ! -e ${share_dir}/bin/sh ]; then
+    cp ${VIRT_BUSYBOX} ${share_dir}/bin
+    (cd ${share_dir}/bin && ln -s busybox sh)
+  fi
+  if [ ! -e ${share_dir}/opt/busybox/bin/sh ]; then
+    cp ${VIRT_BUSYBOX} ${share_dir}/opt/busybox/bin/busybox
+    (cd ${share_dir}/opt/busybox/bin && ln -s busybox sh)
+  fi
+}
+
+
+# Start a single Virtiofsd - should be mounted as /z - the init script will
+# take care of this and also detect if a rootfs is present.
+# Use bind mounts to manage the content.
+run_virtiofsd() {
+  local base=${1:-${WORK}}
+
+  dir=${VM_SHARE:-${base}/share}
+
+  [ -n "${VIRT_VIRTIOFSD:-}" ] || {
+    echo "Missing virtiofsd. Set VIRT to a Nix VM profile or set VIRT_VIRTIOFSD." >&2
+    exit 1
+  }
+
+  if [ -f ${WORK}/virtiofsd.pid ]; then 
+    kill -9 $(cat ${WORK}/virtiofsd.pid)  2>&1 || true
+    rm -f ${WORK}/virtiofsd.pid
+  fi
+
+  rm -f ${WORK}/virtiofs.sock || true
+
+  # Faster than virtio-9p or regular 9p/nfs
+  # FUSE messages over vhost-user socket
+  # DAX (using host buffers) not enabled.
+  # Keep startup lean for the default VM smoke path. The namespace sandbox and
+  # inode file-handle probes are configurable, but both are slow/noisy on the
+  # bind-mounted development filesystems used by these tests.
+  virtiofsd_opts="--socket-path=${WORK}/virtiofs.sock"
+  virtiofsd_opts="${virtiofsd_opts} --shared-dir=${dir}"
+  virtiofsd_opts="${virtiofsd_opts} --tag=${virtiofs_tag:-src}"
+  virtiofsd_opts="${virtiofsd_opts} --cache=${virtiofsd_cache:-auto}"
+  virtiofsd_opts="${virtiofsd_opts} --thread-pool-size=${virtiofsd_thread_pool_size:-0}"
+  virtiofsd_opts="${virtiofsd_opts} --sandbox ${virtiofsd_sandbox:-none}"
+  virtiofsd_opts="${virtiofsd_opts} --inode-file-handles=${virtiofsd_inode_file_handles:-never}"
+  virtiofsd_opts="${virtiofsd_opts} --log-level=${virtiofsd_log_level:-error}"
+  if [ "${virtiofsd_xattr:-0}" != "0" ]; then
+    virtiofsd_opts="${virtiofsd_opts} --xattr"
+  fi
+  if [ "${virtiofsd_allow_direct_io:-1}" != "0" ]; then
+    virtiofsd_opts="${virtiofsd_opts} --allow-direct-io"
+  fi
+  ${VIRT_VIRTIOFSD} ${virtiofsd_opts} > ${WORK}/virtiofs.log  2>&1 &
+      
+    # Default sandbox is namespace, doesn't work in chroot  
+    # --allow-mmap should only be used with exclusive access
+    #  --log-level debug \
+    # 
+
+    # Save the PID
+    echo $! > ${WORK}/virtiofsd.pid
+
+    n=0
+    while [ "${n}" -lt 100 ] && [ ! -S "${WORK}/virtiofs.sock" ]; do
+      sleep 0.05
+      n=$((n + 1))
+    done
+    if [ ! -S "${WORK}/virtiofs.sock" ]; then
+      echo "virtiofsd did not create ${WORK}/virtiofs.sock" >&2
+      cat "${WORK}/virtiofs.log" >&2 || true
+      exit 1
+    fi
+
+    return 0
+}
+
+# Testing: 
+# - DEBUG=init
+# - Run a command before swaproot, poweroff immediatly after.
+#          cmd=/bin/ls
+# - Run a command after pivot, poweroff after
+#      `CMD_OPTS=initos.cmd1="df"`
+# 
+# If set, will be added as a prefix to the command
+#TIME="time "
+#
+# Alpine kernel includes no filesystem - virtiofs is a module - so modules must be loaded
+# by the init. Debian has similar issues. Using kernel with 
+# core blk and fs built in.
+
+# Start will run run the pod (VM) in background, like a container.
+# 
+# Few env variables impact the startup:
+#  - DEBUG=init 
+chvirt() {
+  local p="$@"
+
+  validate_pod_name
+  vm_init
+
+  # OPTS - cloud-hypervisor/qemu options
+  # CMD_OPTS - kernel command line options
+  
+  [ -n "${VIRT_ROOTFS}" ] || {
+    echo "Missing rootfs image. Set VIRT to a Nix VM profile or set VIRT_ROOTFS." >&2
+    exit 1
+  }
+
+  # Use the immutable initos EROFS as root and virtiofs only as the host share.
+  run_virtiofsd ${WORK}  
+
+  OPTS="$OPTS --pvpanic"
+  OPTS="$OPTS --watchdog"
+  OPTS="$OPTS --seccomp true"
+  OPTS="$OPTS --api-socket=${WORK}/ch.sock"
+  OPTS="$OPTS --memory size=${vm_mem:-512M},shared=on"
+  OPTS="$OPTS --cpus boot=${vm_cpu:-1}"
+  if [ "${vm_balloon:-0}" != "0" ]; then
+    OPTS="$OPTS --balloon size=${vm_balloon},deflate_on_oom=on "
+  fi
+
+  local ch_disks="direct=off,image_type=raw,path=${VIRT_ROOTFS},readonly=on"
+  if [ -n "${VIRT_MODULES}" ]; then
+    ch_disks="${ch_disks} direct=off,image_type=raw,path=${VIRT_MODULES},readonly=on"
+    CMD_OPTS="$CMD_OPTS initos_modules=/dev/vdb"
+  fi
+  OPTS="$OPTS --disk ${ch_disks}"
+  OPTS="$OPTS --fs tag=src,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
+  OPTS="$OPTS --kernel ${VIRT_KERNEL}"
+  
+  # virtio-net is used for eth
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
+    OPTS="$OPTS --net tap=vm-${POD},iommu=on $NETX"
+  elif [ -z "${NO_NET}" ]; then
+    OPTS="$OPTS --net $NETX"
+  fi
+
+  if [ -n "${VSOCK_CID}" ]; then
+    OPTS="$OPTS --vsock cid=${VSOCK_CID},socket=${WORK}/vsock.sock"
+  fi
+  if [ -n "${SSH_MESH_VSOCK_PORT}" ]; then
+    CMD_OPTS="$CMD_OPTS SSH_MESH_VSOCK_PORT=${SSH_MESH_VSOCK_PORT}"
+  fi
+  
+  CMD_OPTS="$CMD_OPTS initos_host=${POD}"
+  CMD_OPTS="$CMD_OPTS net.ifnames=0"
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
+    CMD_OPTS="$CMD_OPTS initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
+  fi
+  
+  CMD_OPTS="$CMD_OPTS root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro"
+  CMD_OPTS="$CMD_OPTS trace_clock=global panic=1  panic_on_oops=1 reboot=acpi "
+  
+  DISKS=""
+
+  if [ -f ${IMGDIR}/${POD}-rootfs.img ] ; then
+      DISKS="${DISKS} --disk path=${IMGDIR}/${POD}-rootfs.img"
+      CMD_OPTS="${CMD_OPTS} initos_root=/dev/vda "
+  fi
+
+  # All disks under ${IMGDIR} with file name starting with ${POD} are added as additional disks.
+  EXTRA_DISKS=$(ls ${IMGDIR}/${POD}-data*.img 2>/dev/null || echo "")
+
+  for disk in $EXTRA_DISKS; do
+    if [ -f ${disk} ]; then
+      DISKS="${DISKS} --disk path=${disk}"
+    fi
+  done
+  
+  if [ -n "${EXTRA_DISKS}" ]; then
+    CMD_OPTS="${CMD_OPTS} initos_data=LABEL=X"
+  fi
+
+  if [ -f ${IMGDIR}/${POD}-cache.img ]; then
+    DISKS="${DISKS} --disk path=${IMGDIR}/${POD}-cache.img"
+    CMD_OPTS="${CMD_OPTS} initos_data=LABEL=CACHE"
+  fi
+
+  if [ -f ${IMGDIR}/sidecar.img ]; then
+    DISKS="${DISKS} --disk path=${IMGDIR}/sidecar.img,readonly=on"
+  fi
+  OPTS="$OPTS $DISKS"
+    
+  rm -f ${WORK}/ch.sock
+  rm -f ${WORK}/serial.socket
+  rm -f ${WORK}/vsock.sock
+  
+  CMD_OPTS="$CMD_OPTS initos_cmd=\"${p}\""
+  
+  if [ -n "${STDIO_ACTIVATION}" ]; then
+    OPTS="$OPTS --serial file=${WORK}/console.log --console off "
+    CMD_OPTS="$CMD_OPTS console=ttyS0 initos_mode=stdio "
+  elif [ -n "${VSOCK_CID}" ]; then
+    OPTS="$OPTS --serial off --console file=${WORK}/console.log "
+    CMD_OPTS="$CMD_OPTS console=hvc0 "
+  else
+    OPTS="$OPTS --serial off --console tty "
+    CMD_OPTS="$CMD_OPTS console=hvc0 "
+  fi
+  CMD_OPTS="$CMD_OPTS quiet"
+
+  mesh_record_vm_pid
+  exec ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
+}
+
+start() {
+  mesh_prepare_host_vm
+  mesh_prepare_app_vm
+  validate_pod_name
+  virt_resolve_layout
+
+  local selected_virt="${virt:-}"
+
+  if [ -z "${selected_virt}" ]; then
+    selected_virt="$(virt_pick_default || true)"
+    if [ -z "${selected_virt}" ]; then
+      echo "No hypervisor binary found (cloud-hypervisor, qemu, crosvm)." >&2
+      exit 1
+    fi
+  fi
+
+  case "${selected_virt}" in
+    ch|cloud-hypervisor)
+      chvirt "$@"
+      ;;
+    qemu|qemuvirt)
+      qemuvirt "$@"
+      ;;
+    crosvm|crosvmvirt)
+      crosvmvirt "$@"
+      ;;
+    *)
+      echo "Unknown hypervisor type: ${selected_virt}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+set -eu
+
+
+if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+  ACCEL="-enable-kvm -cpu host"
+else
+  ACCEL="-machine accel=tcg -cpu max"
+fi
+
+# Sanity check using qemu with kernel/image built using
+# scripts/build.sh kernel_cloud 
+# scripts/build.sh build_initos
+# 
+# Unlike tests/run_qemu.sh and tests/test_img.sh - this does not use
+# EFI and the host kernel.
+qemuvirt() {
+  local p="$@"
+  virt_resolve_layout
+  vm_init
+
+  KERNEL="${KERNEL:-${VIRT_KERNEL}}"
+  ROOTFS="${ROOTFS:-${VIRT_ROOTFS}}"
+ 
+  [ -n "${ROOTFS}" ] || {
+    echo "Missing rootfs image. Set VIRT to a Nix VM profile or set ROOTFS." >&2
+    exit 1
+  }
+
+  run_virtiofsd ${WORK}
+  
+  cmd="root=/dev/vda rootfstype=erofs rootwait loglevel=7"
+  cmd="${cmd} console=hvc0"
+  cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
+  cmd="${cmd} net.ifnames=0 panic=1"
+  if [ "${DEBUG:-}" = "init" ]; then
+    cmd="${cmd} debug_init initos_dbg=1"
+  fi
+  cmd="${cmd} initos_host=${POD}"
+  if [ -z "${NO_NET}" ]; then
+    cmd="${cmd} initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
+  fi
+  cmd="${cmd} trace_clock=global panic_on_oops=1 reboot=acpi"
+  cmd="${cmd} initos_cmd=\"${p}\""
+    
+  
+  qemu_mem="${vm_mem:-512M}"
+  qemu_cpu="${vm_cpu:-1}"
+
+  if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    qemu_nested=""
+    if [ "${SSH_MESH_VM_NESTED_KVM:-0}" != "0" ]; then
+      if grep -qm1 '\<vmx\>' /proc/cpuinfo 2>/dev/null; then
+        qemu_nested=",+vmx"
+      elif grep -qm1 '\<svm\>' /proc/cpuinfo 2>/dev/null; then
+        qemu_nested=",+svm"
+      fi
+    fi
+    qemu_accel="-enable-kvm -cpu host,+x2apic,-sgx${qemu_nested}"
+    qemu_machine="q35,accel=kvm:tcg,acpi=on,mem-merge=on"
+  else
+    qemu_accel="-cpu max"
+    qemu_machine="q35,accel=tcg,acpi=on,mem-merge=on"
+  fi
+
+  local qemu_net=""
+  if [ -z "${NO_NET}" ]; then
+    local qemu_hostfwd=""
+    if [ -n "${SSH_MESH_VM_HOST_SSH_PORT:-}" ]; then
+      qemu_hostfwd="${qemu_hostfwd},hostfwd=tcp:127.0.0.1:${SSH_MESH_VM_HOST_SSH_PORT}-:${SSH_MESH_VM_GUEST_SSH_PORT:-22}"
+    fi
+    if [ -n "${SSH_MESH_VM_HOST_HTTP_PORT:-}" ]; then
+      qemu_hostfwd="${qemu_hostfwd},hostfwd=tcp:127.0.0.1:${SSH_MESH_VM_HOST_HTTP_PORT}-:${SSH_MESH_VM_GUEST_HTTP_PORT:-80}"
+    fi
+    if [ -z "${qemu_hostfwd}" ]; then
+      qemu_hostfwd=",hostfwd=tcp::10022-:22"
+    fi
+    qemu_net="-netdev user,id=n1${qemu_hostfwd} -device virtio-net-pci,netdev=n1"
+  fi
+
+  local qemu_vsock=""
+  if [ -n "${VSOCK_CID}" ]; then
+    qemu_vsock="-device vhost-vsock-pci,guest-cid=${VSOCK_CID}"
+  fi
+
+  local qemu_console="-chardev stdio,id=console,signal=off -device virtconsole,chardev=console"
+  local qemu_serial="-serial none"
+  local qemu_stdio_transport=""
+  if [ -n "${STDIO_ACTIVATION}" ]; then
+    qemu_console="-chardev socket,id=meshstdio,fd=0 -device virtserialport,chardev=meshstdio,name=ssh-mesh.stdio"
+    qemu_serial="-serial file:${WORK}/console.log"
+    cmd="${cmd} initos_mode=stdio quiet loglevel=0"
+  elif [ -n "${VSOCK_CID}" ]; then
+    qemu_console="-chardev file,id=console,path=${WORK}/console.log -device virtconsole,chardev=console"
+    qemu_serial="-serial none"
+  fi
+
+  if [ -n "${SSH_MESH_VSOCK_PORT}" ]; then
+    cmd="${cmd} SSH_MESH_VSOCK_PORT=${SSH_MESH_VSOCK_PORT}"
+  fi
+
+  local qemu_modules=""
+  if [ -n "${VIRT_MODULES}" ]; then
+    qemu_modules="-drive id=vdb,format=raw,file=${VIRT_MODULES},if=none,aio=io_uring,discard=unmap,cache=none,read-only=on -device virtio-blk-pci,drive=vdb"
+    cmd="${cmd} initos_modules=/dev/vdb"
+  fi
+
+  local qemu_nix=""
+  if [ -d /nix ]; then
+    qemu_nix="-fsdev local,id=nix,path=/nix,security_model=none,readonly=on -device virtio-9p-pci,fsdev=nix,mount_tag=nix"
+  fi
+
+  mesh_record_vm_pid
+  exec ${VIRT_QEMU} \
+  -name "${POD}" \
+  -nodefaults \
+  -no-user-config \
+  -m "${qemu_mem}" \
+  -object "memory-backend-memfd,id=mem,size=${qemu_mem},share=on" \
+  -M "${qemu_machine}" \
+  -no-reboot \
+  -smp "${qemu_cpu}" \
+  ${qemu_accel} \
+  -nographic \
+  -sandbox on \
+  -kernel "${KERNEL}" \
+  -drive "id=vda,format=raw,file=${ROOTFS},if=none,aio=io_uring,discard=unmap,cache=none,read-only=on" \
+  -device virtio-blk-pci,drive=vda \
+  ${qemu_modules} \
+  -device virtio-rng-pci \
+  -device i8042 \
+  -numa node,memdev=mem \
+  -chardev "socket,id=virtfs0,path=${WORK}/virtiofs.sock" \
+  -device "vhost-user-fs-pci,chardev=virtfs0,tag=src" \
+  ${qemu_nix} \
+  -device virtio-serial-pci \
+  -chardev "socket,id=mesh,path=${WORK}/mesh.sock,server=on,wait=off" \
+  -device "virtserialport,chardev=mesh,name=org.ssh-mesh.control" \
+  ${qemu_net} \
+  ${qemu_vsock} \
+  ${qemu_serial} \
+  ${qemu_console} \
+  -append "${cmd}"
+  
+}
+
+crosvmvirt() {
+  local p="$@"
+  virt_resolve_layout
+  vm_init
+
+  KERNEL="${KERNEL:-${VIRT_KERNEL}}"
+  ROOTFS="${ROOTFS:-${VIRT_ROOTFS}}"
+
+  [ -n "${VIRT_CROSVM}" ] || {
+    echo "Missing crosvm. Set VIRT to a Nix VM profile or set VIRT_CROSVM." >&2
+    exit 1
+  }
+  [ -n "${ROOTFS}" ] || {
+    echo "Missing rootfs image. Set VIRT to a Nix VM profile or set ROOTFS." >&2
+    exit 1
+  }
+
+  run_virtiofsd ${WORK}
+
+  cmd="console=hvc0 reboot=k panic=1"
+  cmd="${cmd} root=/dev/vda rootfstype=erofs rootwait"
+  cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
+  cmd="${cmd} net.ifnames=0 initos_host=${POD}"
+  if [ "${DEBUG:-}" = "init" ]; then
+    cmd="${cmd} debug_init initos_dbg=1 loglevel=8 ignore_loglevel"
+  fi
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
+    cmd="${cmd} initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
+  fi
+  cmd="${cmd} initos_cmd=\"${p}\""
+
+  rm -f "${WORK}/crosvm.sock"
+
+  local crosvm_net=""
+  if [ -d "/sys/class/net/vm-${POD}" ]; then
+    crosvm_net="--net tap-name=vm-${POD}"
+  fi
+
+  local crosvm_vsock=""
+  if [ -n "${VSOCK_CID}" ]; then
+    crosvm_vsock="--vsock cid=${VSOCK_CID}"
+  fi
+  if [ -n "${SSH_MESH_VSOCK_PORT}" ]; then
+    cmd="${cmd} SSH_MESH_VSOCK_PORT=${SSH_MESH_VSOCK_PORT}"
+  fi
+
+  local crosvm_modules=""
+  if [ -n "${VIRT_MODULES}" ]; then
+    crosvm_modules="--block ${VIRT_MODULES},o_direct=false,ro=true"
+    cmd="${cmd} initos_modules=/dev/vdb"
+  fi
+
+  local crosvm_serial="hardware=virtio-console,type=stdout,console=true,stdin=true"
+  if [ -n "${VSOCK_CID}" ]; then
+    crosvm_serial="hardware=virtio-console,type=file,path=${WORK}/console.log,console=true"
+  fi
+
+  mesh_record_vm_pid
+  exec ${VIRT_CROSVM} --no-syslog run \
+    -m "${vm_mem_mb:-512}" \
+    -c "${vm_cpu:-1}" \
+    --serial "${crosvm_serial}" \
+    -p "${cmd}" \
+    --no-balloon \
+    -s "${WORK}/crosvm.sock" \
+    --block "${ROOTFS},o_direct=false,ro=true" \
+    ${crosvm_modules} \
+    --vhost-user "type=fs,socket=${WORK}/virtiofs.sock" \
+    ${crosvm_net} \
+    ${crosvm_vsock} \
+    --disable-sandbox \
+    "${KERNEL}"
+}
+
+layout() {
+  virt_resolve_layout
+
+  echo "VIRT_ROOT=${VIRT_ROOT}"
+  echo "VIRT_BIN=${VIRT_BIN}"
+  echo "VIRT_IMG=${VIRT_IMG}"
+  echo "VIRT_BOOT=${VIRT_BOOT}"
+  echo "VIRT_OPT=${VIRT_OPT}"
+  echo "VIRT_KERNEL=${VIRT_KERNEL}"
+  echo "VIRT_ROOTFS=${VIRT_ROOTFS}"
+  echo "VIRT_MODULES=${VIRT_MODULES}"
+  echo "VIRT_BUSYBOX=${VIRT_BUSYBOX}"
+  echo "VIRT_INITOS_INIT_VM=${VIRT_INITOS_INIT_VM}"
+  echo "VIRT_CLOUD_HYPERVISOR=${VIRT_CLOUD_HYPERVISOR}"
+  echo "VIRT_VIRTIOFSD=${VIRT_VIRTIOFSD}"
+  echo "VIRT_QEMU=${VIRT_QEMU}"
+  echo "VIRT_CROSVM=${VIRT_CROSVM}"
+}
+
+available() {
+  virt_resolve_layout >/dev/null
+
+  [ -n "${VIRT_KERNEL}" ] || return 1
+  [ -n "${VIRT_ROOTFS}" ] || return 1
+  [ -n "${VIRT_BUSYBOX}" ] || return 1
+
+  case "${1:-}" in
+    qemu|qemuvirt)
+      [ -n "${VIRT_QEMU}" ] || return 1
+      ;;
+    ch|cloud-hypervisor)
+      [ -n "${VIRT_CLOUD_HYPERVISOR}" ] || return 1
+      [ -n "${VIRT_VIRTIOFSD}" ] || return 1
+      ;;
+    crosvm|crosvmvirt)
+      [ -n "${VIRT_CROSVM}" ] || return 1
+      [ -n "${VIRT_VIRTIOFSD}" ] || return 1
+      ;;
+    *)
+      [ -n "${VIRT_QEMU}${VIRT_CLOUD_HYPERVISOR}${VIRT_CROSVM}" ] || return 1
+      ;;
+  esac
+}
+
+## Stop gracefully (vm_ctrl), expects the socket.
+stop() {
+  if [ -S "${WORK}/ch.sock" ]; then
+    ctrl shutdown-vmm 2>/dev/null || true
+  fi
+  cleanup_pid_file "${WORK}/vm.pid"
+  cleanup_pid_file "${WORK}/virtiofsd.pid"
+  cleanup_pid_file "${WORK}/virtiofs.sock.pid"
+  rm -f "${WORK}/ch.sock" "${WORK}/serial.socket" "${WORK}/virtiofs.sock"
+  rm -f "${WORK}/vsock.sock"
+  rm -f "${WORK}/crosvm.sock"
+}
+
+## Kill the VM process. Virtiofsd will terminate itself after VM dies.
+vmkill() {
+  cleanup_pid_file "${WORK}/vm.pid"
+  cleanup_pid_file "${WORK}/virtiofsd.pid"
+  cleanup_pid_file "${WORK}/virtiofs.sock.pid"
+  rm -f "${WORK}/ch.sock" "${WORK}/serial.socket" "${WORK}/virtiofs.sock"
+  rm -f "${WORK}/vsock.sock"
+  rm -f "${WORK}/crosvm.sock"
+}
+
+console() {
+  socat UNIX-CONNECT:${WORK}/serial.socket  -
+}
+
+# Get a console to the VM, using socat and screen.
+screen() {
+  socat UNIX-CONNECT:${WORK}/serial.socket pty,raw,link=${WORK}/pty0 &
+  screen ${WORK}/pty0
+}
+
+# Expose ch-remote control
+# add-disk path=...
+# remove-device _diskN
+ctrl() {
+  if command -v ch-remote >/dev/null 2>&1; then
+    ch_remote=ch-remote
+  elif [ -x "${VIRT}/bin/ch-remote" ]; then
+    ch_remote="${VIRT}/bin/ch-remote"
+  elif [ -x "${VIRT}/ch-remote" ]; then
+    ch_remote="${VIRT}/ch-remote"
+  elif [ -n "${VIRT_BIN:-}" ] && [ -x "${VIRT_BIN}/ch-remote" ]; then
+    ch_remote="${VIRT_BIN}/ch-remote"
+  else
+    echo "Missing ch-remote. Set VIRT to a Nix VM profile or add ch-remote to PATH." >&2
+    return 1
+  fi
+  "${ch_remote}" --api-socket ${WORK}/ch.sock "$@"
+}
+
+fix_perms() {
+    setcap cap_net_admin+ep /x/opt/virt/cloud-hypervisor
+}
+
+CMD=$1
+shift
+$CMD "$@"

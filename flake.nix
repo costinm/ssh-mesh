@@ -84,6 +84,9 @@
               mkdir -p "$out/share/ssh-mesh/nixos"
               cp ${./nixos/module.nix} "$out/share/ssh-mesh/nixos/module.nix"
               cp ${./nixos/example.nix} "$out/share/ssh-mesh/nixos/example.nix"
+              cp ${./bin/vrun} "$out/bin/vrun"
+              chmod +x "$out/bin/vrun"
+              ln -s vrun "$out/bin/initos-vrun"
             '';
           });
 
@@ -112,13 +115,20 @@
 
         build-deps = pkgs.symlinkJoin {
           name = "ssh-mesh-build-deps";
-          paths = [ musl-toolchain mesh-net-tools ];
+          paths = with pkgs; [
+            musl-toolchain
+            rustToolchain
+            pkg-config
+            curl
+            python3
+          ];
         };
 
-        mesh-net-tools = pkgs.symlinkJoin {
-          name = "ssh-mesh-net-tools";
+        runtime-deps = pkgs.symlinkJoin {
+          name = "ssh-mesh-runtime-deps";
           paths = with pkgs; [
             bubblewrap
+            busybox
             iperf3
             iproute2
             netcat
@@ -127,144 +137,30 @@
           ];
         };
 
-        dev-tools = pkgs.symlinkJoin {
-          name = "ssh-mesh-dev-tools";
-          paths = with pkgs; [
-            build-deps
-            rustToolchain
-            pkg-config
-            cargo-watch
-            cargo-edit
-            curl
-            netcat
-            jq
-            nixos-install-tools
-          ];
-        };
-
         # Aggregate: main runtime binaries built in a single cargo invocation.
-        ssh-mesh-full = mkPackage "ssh-mesh-full" mainCargoExtraArgs;
-
-        selectBins = pname: bins:
-          pkgs.runCommand pname { } ''
-            mkdir -p "$out/bin"
-            ${pkgs.lib.concatMapStringsSep "\n" (bin: ''
-              ln -s ${ssh-mesh-full}/bin/${bin} "$out/bin/${bin}"
-            '') bins}
-            mkdir -p "$out/share"
-            ln -s ${ssh-mesh-full}/share/ssh-mesh "$out/share/ssh-mesh"
-          '';
-
-        ssh-mesh  = selectBins "ssh-mesh"  [ "ssh-mesh" ];
-        mesh-init = selectBins "mesh-init" [ "mesh-init" ];
-        h2t       = selectBins "h2t"       [ "h2t" ];
-        meshkeys  = selectBins "meshkeys"  [ "meshkeys" ];
-        sshmc     = selectBins "sshmc"     [ "sshmc" ];
-        traceweb  = selectBins "traceweb"  [ "traceweb" ];
-        sftp-server = selectBins "sftp-server" [ "sftp-server" ];
-        mesh-tun = selectBins "mesh-tun" [ "mesh-tun" ];
+        ssh-mesh = mkPackage "ssh-mesh" mainCargoExtraArgs;
 
         # ── Docker image ──────────────────────────────────────────
 
         sshm = pkgs.dockerTools.buildLayeredImage {
           name = "ghcr.io/costinm/sshm";
           tag = "latest";
-          contents = [ ssh-mesh-full ];
+          contents = [ ssh-mesh ];
           config = {
-            Entrypoint = [ "${ssh-mesh-full}/bin/ssh-mesh" ];
+            Entrypoint = [ "${ssh-mesh}/bin/mesh-init" ];
             Env = [ "PATH=/bin:/usr/bin" ];
-          };
-        };
-
-        # ── EROFS VM Rootfs ───────────────────────────────────────
-
-        initos-erofs = pkgs.runCommand "ssh-mesh.erofs" {
-          nativeBuildInputs = [ pkgs.erofs-utils ];
-        } ''
-          bash ${./scripts/build.sh} erofs "$out" "${pkgs.pkgsStatic.busybox}/bin/busybox" "${./bin/initos-init-vm}" "${ssh-mesh-full}/bin"
-        '';
-
-        # ── Linux Kernel & VM ─────────────────────────────────────
-
-        kernelConfigSrc = pkgs.lib.cleanSourceWith {
-          src = ./linux;
-          filter = path: type:
-            let
-              rel = pkgs.lib.removePrefix "${toString ./linux}/" (toString path);
-            in
-            rel == "6.18" || pkgs.lib.hasPrefix "6.18/" rel
-            || rel == "fragments" || pkgs.lib.hasPrefix "fragments/" rel;
-        };
-
-        kernel-cloud = import ./linux/kernel-cloud.nix {
-          inherit pkgs;
-          src = kernelConfigSrc;
-        };
-
-        initos-vm = pkgs.runCommand "initos-vm" { } ''
-          mkdir -p "$out"/{bin,boot,img}
-
-          ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
-
-          for m in ${kernel-cloud}/img/modules-*.erofs; do
-            if [ -f "$m" ]; then
-              ln -s "$m" "$out/img/modules-cloud.erofs"
-            fi
-          done
-
-          ln -s ${pkgs.cloud-hypervisor}/bin/cloud-hypervisor "$out/bin/cloud-hypervisor"
-          ln -s ${pkgs.cloud-hypervisor}/bin/ch-remote "$out/bin/ch-remote"
-          ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
-          ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
-          ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
-          ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
-          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
-          ln -s ${pkgs.tmux}/bin/tmux "$out/bin/tmux"
-          ln -s ${pkgs.curl}/bin/curl "$out/bin/curl"
-          ln -s ${pkgs.bubblewrap}/bin/bwrap "$out/bin/bwrap"
-          
-          cp ${./linux/bin/vrun} "$out/bin/vrun"
-          chmod +x "$out/bin/vrun"
-          ln -s vrun "$out/bin/initos-vrun"
-        '';
-
-        initos-vm-image = pkgs.dockerTools.buildLayeredImage {
-          name = "ghcr.io/costinm/initos-vm";
-          tag = "latest";
-          contents = [
-            initos-vm
-            pkgs.bash
-            pkgs.coreutils
-          ];
-          config = {
-            Cmd = [ "${initos-vm}/bin/vrun" ];
-            Env = [
-              "PATH=/bin:/usr/bin"
-            ];
           };
         };
 
       in
       {
         packages = {
-            nixos-install-tools = pkgs.nixos-install-tools;
-            inherit ssh-mesh ssh-mesh-full mesh-init h2t meshkeys sshmc traceweb sftp-server mesh-tun sshm initos-erofs kernel-cloud initos-vm initos-vm-image musl-toolchain mesh-net-tools build-deps dev-tools;
-            default = ssh-mesh-full;
-        };
-
-        apps = {
-          vm-cloud = {
-            type = "app";
-            program = "${initos-vm}/bin/vrun";
-          };
-        };
-
-        devShells.default = craneLib.devShell {
-          packages = [ dev-tools ];
+            inherit ssh-mesh sshm musl-toolchain build-deps runtime-deps;
+            default = ssh-mesh;
         };
 
         checks = {
-          inherit ssh-mesh-full;
+          inherit ssh-mesh;
           # Run clippy
           ssh-mesh-clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
@@ -290,7 +186,7 @@
             ({ pkgs, ... }: {
               services.ssh-mesh = {
                 enable = true;
-                package = self.packages.x86_64-linux.ssh-mesh-full;
+                package = self.packages.x86_64-linux.ssh-mesh;
                 authorizedKeys = [
                   (builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub)
                 ];
@@ -319,7 +215,7 @@
             ({ pkgs, ... }: {
               services.ssh-mesh = {
                 enable = true;
-                package = self.packages.x86_64-linux.ssh-mesh-full;
+                package = self.packages.x86_64-linux.ssh-mesh;
                 authorizedKeys = [
                   (builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub)
                 ];

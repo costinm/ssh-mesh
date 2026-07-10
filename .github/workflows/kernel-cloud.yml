@@ -7,14 +7,12 @@ on:
       - master
     paths:
       - linux/**
-      - flake.nix
-      - flake.lock
+      - vm-tools/**
       - .github/workflows/kernel-cloud.yml
   pull_request:
     paths:
       - linux/**
-      - flake.nix
-      - flake.lock
+      - vm-tools/**
       - .github/workflows/kernel-cloud.yml
   workflow_dispatch:
 
@@ -35,14 +33,16 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build cloud kernel
-        run: nix build .#kernel-cloud -o result-kernel-cloud --print-build-logs
+        run: nix build ./linux#kernel-cloud -o result-kernel-cloud --print-build-logs
 
       - name: Check cloud kernel output
         run: |
-          test -f result-kernel-cloud/img/bzImage
-          test -f result-kernel-cloud/img/vmlinux
-          test -f result-kernel-cloud/img/config
-          find -L result-kernel-cloud/img -maxdepth 1 -type f -name 'modules-*.erofs' | grep -q .
+          kernel_dir=result-kernel-cloud/opt/ssh-mesh-kernel
+          test -f "$kernel_dir/bzImage"
+          test -f "$kernel_dir/vmlinux"
+          test -f "$kernel_dir/config"
+          test -f "$kernel_dir/busybox"
+          find -L "$kernel_dir" -maxdepth 1 -type f -name 'modules-*.erofs' | grep -q .
 
       - name: Package cloud kernel
         run: tar -C result-kernel-cloud -czf ssh-mesh-kernel-cloud.tar.gz .
@@ -52,21 +52,3 @@ jobs:
         with:
           name: ssh-mesh-kernel-cloud
           path: ssh-mesh-kernel-cloud.tar.gz
-
-      - name: Build initos VM image
-        run: nix build .#initos-vm-image -o result-initos-vm-image --print-build-logs
-
-      - name: Load initos VM image
-        run: docker load < result-initos-vm-image
-
-      - name: Log in to the Container registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: https://ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push initos VM image
-        if: github.event_name != 'pull_request'
-        run: docker push ghcr.io/costinm/initos-vm:latest

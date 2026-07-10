@@ -9,7 +9,7 @@ Pull IMAGE_REF, run nix-store --export inside the image, and import the exported
 closure into the host Nix store.
 
 IMAGE_REF must be a named image reference such as:
-  ghcr.io/costinm/initos-vm:latest
+  ghcr.io/costinm/sshm:latest
 
 Environment:
   ENGINE=podman|docker        Container engine. Auto-detected when unset.
