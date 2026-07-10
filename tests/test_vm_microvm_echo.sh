@@ -33,6 +33,12 @@ case "${MICROVM_HYPERVISOR}" in
     ;;
 esac
 
+if [[ ! -r "${PROFILE}/opt/ssh-mesh-kernel/vmlinux-cloud" ]] ||
+   [[ ! -r "${PROJECT_ROOT}/target/dist/img/ssh-mesh.erofs" ]]; then
+  echo "skipping microvm ${MICROVM_HYPERVISOR} test; optional VM profile, custom kernel, or rootfs is missing"
+  exit 0
+fi
+
 cleanup() {
   if [[ -n "${virtiofsd_pid:-}" ]] && kill -0 "${virtiofsd_pid}" 2>/dev/null; then
     kill "${virtiofsd_pid}" 2>/dev/null || true
@@ -61,17 +67,12 @@ esac
 EOF
 chmod 755 "${SHARE}/initos/initos-pod"
 
-if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
-  echo "Error: VM profile not found at ${PROFILE}. Run scripts/build.sh test vm_microvm_echo." >&2
-  exit 1
-fi
 PROFILE_REAL="$(readlink -f "${PROFILE}")"
 
 flake_hash="$(printf '%s\n' "${PROFILE_REAL}" "${MICROVM_HYPERVISOR}" "$(sha256sum "${FLAKE_DIR}/flake.nix" | awk '{print $1}')" | sha256sum | awk '{print $1}')"
 if [[ ! -x "${RUNNER_LINK}/bin/microvm-run" ]] || [[ ! -f "${STAMP}" ]] || [[ "$(cat "${STAMP}")" != "${flake_hash}" ]]; then
-  rm -f "${RUNNER_LINK}"
-  echo "Error: microvm runner not built." >&2; exit 1
-  printf '%s\n' "${flake_hash}" > "${STAMP}"
+  echo "skipping microvm ${MICROVM_HYPERVISOR} test; microvm runner is not built"
+  exit 0
 fi
 
 if [[ "${MICROVM_HYPERVISOR}" = "cloud-hypervisor" ]]; then

@@ -20,6 +20,20 @@ fi
 PROFILE="${PROFILE:-${NIX_PROFILE}}"
 SERIAL_LOG="${VM_STATE}/run/serial.log"
 PHASES="${VM_STATE}/run/phases.tsv"
+VRUN="${VRUN:-}"
+if [[ -z "${VRUN}" ]]; then
+  if [[ -x "${PROJECT_ROOT}/target/dist/opt/ssh-mesh/bin/initos-vrun" ]]; then
+    VRUN="${PROJECT_ROOT}/target/dist/opt/ssh-mesh/bin/initos-vrun"
+  elif command -v initos-vrun >/dev/null 2>&1; then
+    VRUN="$(command -v initos-vrun)"
+  fi
+fi
+
+if [[ -z "${VRUN}" ]] ||
+   ! PATH="${PROFILE}/bin:${PATH}" VIRT="${PROFILE}" VIRT_ROOTFS="${PROJECT_ROOT}/target/dist/img/ssh-mesh.erofs" "${VRUN}" available cloud-hypervisor; then
+  echo "skipping cloud-hypervisor VM test; vrun, optional VM profile, custom kernel, rootfs, cloud-hypervisor, or virtiofsd is missing"
+  exit 0
+fi
 
 now_ns() {
   date +%s%N
@@ -51,15 +65,11 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
-  echo "Error: VM profile not found at ${PROFILE}. Run scripts/build.sh test vm_vrun_cloud_hypervisor_echo." >&2
-  exit 1
-fi
-
 start_ns="$(now_ns)"
 env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
+  PATH="${PROFILE}/bin:${PATH}" VIRT="${PROFILE}" VIRT_ROOTFS="${PROJECT_ROOT}/target/dist/img/ssh-mesh.erofs" \
   vm_mem="${vm_mem:-512M}" vm_cpu="${vm_cpu:-1}" vm_balloon="${vm_balloon:-0}" NO_NET=1 SERIAL_LOG="${SERIAL_LOG}" \
-  "${PROFILE}/bin/initos-vrun" start > "${SERIAL_LOG}" 2>&1
+  "${VRUN}" start > "${SERIAL_LOG}" 2>&1
 launched_ns="$(now_ns)"
 
 deadline=$((SECONDS + ${TIMEOUT:-90}))
@@ -75,7 +85,7 @@ done
 
 if [[ "${printed}" != 1 ]]; then
   env POD="${POD}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
-    "${PROFILE}/bin/initos-vrun" vmkill 2>/dev/null || true
+    "${VRUN}" vmkill 2>/dev/null || true
   if [[ -f "${SERIAL_LOG}" ]]; then
     cat "${SERIAL_LOG}" >&2
   fi
@@ -94,7 +104,7 @@ if [[ -f "${pid_file}" ]]; then
   if kill -0 "${vm_pid}" 2>/dev/null; then
     echo "cloud-hypervisor did not exit after guest poweroff" >&2
     env POD="${POD}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
-      "${PROFILE}/bin/initos-vrun" vmkill 2>/dev/null || true
+      "${VRUN}" vmkill 2>/dev/null || true
     exit 1
   fi
   exit_ns="$(now_ns)"

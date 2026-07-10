@@ -112,11 +112,23 @@ export SSH_MESH_HOST3_VM_HOST_HTTP_PORT="${SSH_MESH_HOST3_VM_HOST_HTTP_PORT:-293
 need bwrap
 need curl
 need nc
-need qemu-system-x86_64
 need mesh-init
 need ssh-mesh
 need lmesh
 need h2t
+
+vrun="${example_bin_dir}/vrun"
+if [ ! -x "${vrun}" ] ||
+   ! VIRT="${NIX_PROFILE:-${root}/target/nix/profile}" VIRT_ROOTFS="${artifact_dir}/img/ssh-mesh.erofs" "${vrun}" available qemuvirt >/dev/null 2>&1; then
+  cat <<EOF
+skipping VM-heavy example suite; vrun, qemu, rootfs, or custom VM profile is missing
+
+Build optional VM assets with:
+  scripts/build.sh profile
+  scripts/build.sh
+EOF
+  exit 0
+fi
 
 if [ "${SSH_MESH_TEST_SKIP_PORT_CHECK:-0}" != "1" ]; then
   for port in 15101 15102 18222 18280 "${SSH_MESH_HOST3_VM_HOST_SSH_PORT}" "${SSH_MESH_HOST3_VM_HOST_HTTP_PORT}" 18422 18480 19002 19005 19102 19105; do

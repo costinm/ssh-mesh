@@ -19,6 +19,20 @@ if [[ -z "${NIX_PROFILE}" ]]; then
   NIX_PROFILE="${PROJECT_ROOT}/target/nix/profile"
 fi
 PROFILE="${PROFILE:-${NIX_PROFILE}}"
+VRUN="${VRUN:-}"
+if [[ -z "${VRUN}" ]]; then
+  if [[ -x "${PROJECT_ROOT}/target/dist/opt/ssh-mesh/bin/initos-vrun" ]]; then
+    VRUN="${PROJECT_ROOT}/target/dist/opt/ssh-mesh/bin/initos-vrun"
+  elif command -v initos-vrun >/dev/null 2>&1; then
+    VRUN="$(command -v initos-vrun)"
+  fi
+fi
+
+if [[ -z "${VRUN}" ]] ||
+   ! PATH="${PROFILE}/bin:${PATH}" VIRT="${PROFILE}" VIRT_ROOTFS="${PROJECT_ROOT}/target/dist/img/ssh-mesh.erofs" "${VRUN}" available crosvm; then
+  echo "skipping crosvm VM test; vrun, optional VM profile, custom kernel, rootfs, crosvm, or virtiofsd is missing"
+  exit 0
+fi
 
 rm -rf "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
 mkdir -p "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
@@ -40,14 +54,10 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
-  echo "Error: VM profile not found at ${PROFILE}. Run scripts/build.sh test vm_vrun_crosvm_echo." >&2
-  exit 1
-fi
-
 timeout --foreground "${TIMEOUT:-90}s" \
   env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
-  "${PROFILE}/bin/initos-vrun" crosvmvirt 2>&1 | tee "${LOG}"
+    PATH="${PROFILE}/bin:${PATH}" VIRT="${PROFILE}" VIRT_ROOTFS="${PROJECT_ROOT}/target/dist/img/ssh-mesh.erofs" \
+  "${VRUN}" crosvmvirt 2>&1 | tee "${LOG}"
 
 grep -q "hi from crosvm" "${LOG}"
 echo "crosvm one-shot echo test passed"

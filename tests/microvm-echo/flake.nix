@@ -16,8 +16,12 @@
     pkgs = nixpkgs.legacyPackages.${system};
     kernel = pkgs.runCommand "initos-microvm-kernel" { outputs = [ "out" "dev" ]; } ''
       mkdir -p "$out" "$dev"
-      ln -s "${initosProfile}/img/vmlinux-cloud" "$out/${pkgs.stdenv.hostPlatform.linux-kernel.target}"
-      ln -s "${initosProfile}/img/vmlinux-cloud" "$dev/vmlinux"
+      kernelDir="${initosProfile}/opt/ssh-mesh-kernel"
+      if [ ! -e "$kernelDir/vmlinux-cloud" ]; then
+        kernelDir="${initosProfile}/img"
+      fi
+      ln -s "$kernelDir/vmlinux-cloud" "$out/${pkgs.stdenv.hostPlatform.linux-kernel.target or "bzImage"}"
+      ln -s "$kernelDir/vmlinux-cloud" "$dev/vmlinux"
     '';
     emptyToplevel = pkgs.runCommand "initos-microvm-empty-toplevel" { } "mkdir -p $out";
     dummyInitrd = pkgs.writeText "dummy-initrd" " ";

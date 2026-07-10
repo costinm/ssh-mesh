@@ -25,6 +25,22 @@ if [[ -z "${NIX_PROFILE}" ]]; then
 fi
 PROFILE="${PROFILE:-${NIX_PROFILE}}"
 
+VRUN="${VRUN:-}"
+if [[ -z "${VRUN}" ]]; then
+  if [[ -x "${PROJECT_ROOT}/target/dist/opt/ssh-mesh/bin/initos-vrun" ]]; then
+    VRUN="${PROJECT_ROOT}/target/dist/opt/ssh-mesh/bin/initos-vrun"
+  elif command -v initos-vrun >/dev/null 2>&1; then
+    VRUN="$(command -v initos-vrun)"
+  fi
+fi
+ROOTFS="${ROOTFS:-${PROJECT_ROOT}/target/dist/img/ssh-mesh.erofs}"
+
+if [[ -z "${VRUN}" ]] ||
+   ! PATH="${PROFILE}/bin:${PATH}" VIRT="${PROFILE}" VIRT_ROOTFS="${ROOTFS}" "${VRUN}" available qemuvirt >/dev/null 2>&1; then
+  echo "skipping mesh-init root hardening VM test; vrun, optional VM profile, custom kernel, rootfs, or qemu is missing"
+  exit 0
+fi
+
 rm -rf "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
 mkdir -p "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}/bin" "${SRC}/initos"
 
@@ -312,9 +328,9 @@ fi
 
 run_direct_qemu_9p() {
   local virt_root="${VIRT:-${PROFILE}}"
-  local kernel="${VIRT_KERNEL:-${virt_root}/img/vmlinux-cloud}"
-  local rootfs="${VIRT_ROOTFS:-${virt_root}/img/ssh-mesh.erofs}"
-  local modules="${VIRT_MODULES:-${virt_root}/img/modules-cloud.erofs}"
+  local kernel="${VIRT_KERNEL:-${virt_root}/opt/ssh-mesh-kernel/vmlinux-cloud}"
+  local rootfs="${VIRT_ROOTFS:-${ROOTFS}}"
+  local modules="${VIRT_MODULES:-${virt_root}/opt/ssh-mesh-kernel/modules-cloud.erofs}"
   local qemu="${VIRT_QEMU:-$(command -v qemu-system-x86_64)}"
   local accel machine modules_args
 
@@ -367,7 +383,8 @@ run_direct_qemu_9p() {
 if command -v virtiofsd >/dev/null 2>&1 || [[ -x "${VIRT:-${PROFILE}}/bin/virtiofsd" || -x "${VIRT:-${PROFILE}}/virtiofsd" ]]; then
   timeout --foreground "${TIMEOUT:-120}s" \
     env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
-    "${PROFILE}/bin/initos-vrun" qemuvirt 2>&1 | tee "${LOG}"
+      PATH="${PROFILE}/bin:${PATH}" VIRT="${PROFILE}" VIRT_ROOTFS="${ROOTFS}" \
+    "${VRUN}" qemuvirt 2>&1 | tee "${LOG}"
 else
   run_direct_qemu_9p 2>&1 | tee "${LOG}"
 fi
