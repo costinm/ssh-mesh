@@ -4,16 +4,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
+  outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
+        lib = pkgs.lib;
         pkgs = import nixpkgs {
           inherit system;
         };
@@ -24,70 +20,124 @@
             let
               rel = pkgs.lib.removePrefix "${toString ./.}/" (toString path);
             in
-            rel == "6.18" || pkgs.lib.hasPrefix "6.18/" rel
+            rel == "base" || pkgs.lib.hasPrefix "base/" rel
             || rel == "fragments" || pkgs.lib.hasPrefix "fragments/" rel;
         };
 
-        kernel-cloud = import ./kernel-cloud.nix {
-          inherit pkgs;
-          src = kernelConfigSrc;
-        };
+        baseKernel = pkgs.linuxPackages_latest.kernel;
 
-        initos-vm = pkgs.runCommand "initos-vm" { } ''
-          mkdir -p "$out"/{bin,boot,img}
+        configBranch = "base";
+        configFragments = [
+          "common.fragment"
+          "builtins.fragment"
+          "filesystems.fragment"
+          "crypto.fragment"
+          "containers.fragment"
+          "net.fragment"
+          "cloud.fragment"
+          "virtio.fragment"
+        ];
 
-          ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
+        mergeFragmentCommands = lib.concatMapStringsSep "\n" (fragment: ''
+          "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${kernelConfigSrc}/fragments/${fragment}
+        '') configFragments;
 
-          for m in ${kernel-cloud}/img/modules-*.erofs; do
-            if [ -f "$m" ]; then
-              ln -s "$m" "$out/img/modules-cloud.erofs"
-            fi
-          done
+        mergedConfig = pkgs.runCommand "initos-kernel-cloud-config-${baseKernel.version}" {
+          nativeBuildInputs = with pkgs; [
+            bc
+            bison
+            flex
+            gnumake
+            openssl
+            perl
+            rust-bindgen-unwrapped
+            rustc-unwrapped
+            stdenv.cc
+            xz
+          ];
+          RUST_LIB_SRC = pkgs.rustPlatform.rustLibSrc;
+          KRUSTFLAGS = "--remap-path-prefix ${pkgs.rustPlatform.rustLibSrc}=/";
+        } ''
+          tar -xf ${baseKernel.src}
+          kernelSrc="$PWD/linux-${baseKernel.version}"
+          buildRoot="$PWD/build"
+          mergeRoot="$PWD/merge"
+          mkdir -p "$buildRoot" "$mergeRoot"
 
-          ln -s ${pkgs.cloud-hypervisor}/bin/cloud-hypervisor "$out/bin/cloud-hypervisor"
-          ln -s ${pkgs.cloud-hypervisor}/bin/ch-remote "$out/bin/ch-remote"
-          ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
-          ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
-          ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
-          ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
-          ln -s ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
-          ln -s ${pkgs.tmux}/bin/tmux "$out/bin/tmux"
-          ln -s ${pkgs.curl}/bin/curl "$out/bin/curl"
-          ln -s ${pkgs.bubblewrap}/bin/bwrap "$out/bin/bwrap"
-          
-          cp ${./bin/vrun} "$out/bin/vrun"
-          chmod +x "$out/bin/vrun"
-          ln -s vrun "$out/bin/initos-vrun"
+          install -m 0644 ${kernelConfigSrc}/${configBranch}/config/config.cloud-amd64 "$buildRoot/.config"
+          cd "$mergeRoot"
+          "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${kernelConfigSrc}/${configBranch}/config/config.cloud
+          ${mergeFragmentCommands}
+
+          make -C "$kernelSrc" O="$buildRoot" ARCH=x86 olddefconfig
+          cp "$buildRoot/.config" "$out"
         '';
 
-        initos-vm-image = pkgs.dockerTools.buildLayeredImage {
-          name = "ghcr.io/costinm/initos-vm";
-          tag = "latest";
-          contents = [
-            initos-vm
-            pkgs.bash
-            pkgs.coreutils
-          ];
+        kernel = pkgs.linuxKernel.manualConfig {
+          pname = "initos-kernel-cloud";
+          inherit (baseKernel) version src modDirVersion;
+          configfile = mergedConfig;
           config = {
-            Cmd = [ "${initos-vm}/bin/vrun" ];
-            Env = [
-              "PATH=/bin:/usr/bin"
-            ];
+            CONFIG_MODULES = "y";
+            CONFIG_RUST = "y";
           };
+          allowImportFromDerivation = true;
         };
+        kernelVmlinuxOutput = if kernel ? dev then kernel.dev else kernel;
+        kernelModulesOutput = if kernel ? modules then kernel.modules else kernel;
+
+        kernel-cloud = pkgs.runCommand "initos-kernel-cloud" {
+          nativeBuildInputs = [ pkgs.erofs-utils ];
+          passthru = {
+            inherit kernel mergedConfig;
+          };
+        } ''
+          kernel_dir="$out/opt/ssh-mesh-kernel"
+          mkdir -p "$kernel_dir"
+
+          if [ -f ${kernel}/bzImage ]; then
+            cp ${kernel}/bzImage "$kernel_dir/bzImage"
+          elif [ -f ${kernel}/vmlinuz ]; then
+            cp ${kernel}/vmlinuz "$kernel_dir/bzImage"
+          else
+            echo "ERROR: could not find built x86 kernel image in ${kernel}" >&2
+            find ${kernel} -maxdepth 2 -type f >&2
+            exit 1
+          fi
+          ln -s bzImage "$kernel_dir/vmlinux-cloud"
+
+          if [ -f ${kernelVmlinuxOutput}/vmlinux ]; then
+            cp ${kernelVmlinuxOutput}/vmlinux "$kernel_dir/vmlinux"
+          else
+            echo "ERROR: could not find built x86 vmlinux in ${kernelVmlinuxOutput}" >&2
+            find ${kernelVmlinuxOutput} -maxdepth 2 -type f >&2
+            exit 1
+          fi
+
+          if [ -f ${kernel}/System.map ]; then
+            cp ${kernel}/System.map "$kernel_dir/System.map"
+          fi
+
+          cp ${mergedConfig} "$kernel_dir/config"
+          cp ${pkgs.pkgsStatic.busybox}/bin/busybox "$kernel_dir/busybox"
+          chmod +x "$kernel_dir/busybox"
+
+          moduleDir=${kernelModulesOutput}/lib/modules/${kernel.modDirVersion}
+          if [ -d "$moduleDir" ]; then
+            (cd "$moduleDir" && mkfs.erofs -zlz4 "$kernel_dir/modules-${kernel.modDirVersion}.erofs" .)
+            ln -s "modules-${kernel.modDirVersion}.erofs" "$kernel_dir/modules-cloud.erofs"
+            ln -s modules-cloud.erofs "$kernel_dir/modules-cloudfs.erofs"
+          fi
+
+          echo "kernel-cloud:"
+          ls -lh "$kernel_dir"
+        '';
 
       in
       {
         packages = {
-          inherit kernel-cloud initos-vm initos-vm-image;
-          default = initos-vm;
-        };
-
-        apps = {
-          vm-cloud = {
-            type = "app";
-            program = "${initos-vm}/bin/vrun";
-          };
+          inherit kernel-cloud;
+          default = kernel-cloud;
         };
       }
     );

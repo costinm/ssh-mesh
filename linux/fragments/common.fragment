@@ -1,6 +1,10 @@
 # Extra modules and Components
 # DO NOT ADD DRM or EFI related modules
 
+# Rust for Linux support. Nixpkgs' kernel builder wires rustc, bindgen,
+# RUST_LIB_SRC, and KRUSTFLAGS when CONFIG_RUST=y is present.
+CONFIG_RUST=y
+
 # Memory Management (Highly Recommended for Open Modules)
 CONFIG_HMM_MIRROR=y
 CONFIG_DEVICE_PRIVATE=y
@@ -189,6 +193,3 @@ CONFIG_SYSFS=y
 
 CONFIG_DEVMEM=y
 CONFIG_UIO=y
-
-
-
