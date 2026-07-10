@@ -1,0 +1,29 @@
+[package]
+name = "dmesh-rs"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+embedded-svc = "0.28"
+esp-idf-svc = { version = "0.51", features = ["experimental"] }
+esp-idf-sys = { version = "0.36", features = ["binstart"] }
+log = "0.4"
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = true
+opt-level = "z"

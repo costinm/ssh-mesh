@@ -1,0 +1,35 @@
+# Rust ESP-IDF application defaults. Keep this small; the C firmware remains
+# the source of truth while components are translated incrementally.
+
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# CONFIG_XTAL_FREQ_26 is not set
+# CONFIG_XTAL_FREQ_40 is not set
+CONFIG_XTAL_FREQ_AUTO=y
+# CONFIG_ESP32_XTAL_FREQ_26 is not set
+# CONFIG_ESP32_XTAL_FREQ_40 is not set
+CONFIG_ESP32_XTAL_FREQ_AUTO=y
+# CONFIG_PARTITION_TABLE_SINGLE_APP is not set
+# CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/ws/rust/ssh-mesh/fw/esp32/rust/partitions_4mb_large_app.csv"
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+
+# Match the C build's IRAM tradeoff so the full mesh feature set has room on
+# classic ESP32 as Rust modules are added.
+# CONFIG_ESP_WIFI_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+# CONFIG_SPI_MASTER_ISR_IN_IRAM is not set
+# CONFIG_SPI_SLAVE_ISR_IN_IRAM is not set
+# CONFIG_ESP_SPI_BUS_LOCK_ISR_FUNCS_IN_IRAM is not set
+
+# BLE is needed for raw advertising/scanning and MeshCore/Nordic UART
+# emulation. Match the C firmware's Bluedroid/BTDM stack for now.
+CONFIG_BT_ENABLED=y
+# CONFIG_BT_NIMBLE_ENABLED is not set
+CONFIG_BT_BLE_ENABLED=y
+# CONFIG_BTDM_CTRL_MODE_BLE_ONLY is not set
+# CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY is not set
+CONFIG_BTDM_CTRL_MODE_BTDM=y
+CONFIG_BLUEDROID_ENABLED=y

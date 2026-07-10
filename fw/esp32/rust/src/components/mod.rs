@@ -1,0 +1,25 @@
+pub mod ble_bt;
+pub mod console;
+pub mod gpio;
+pub mod i2c;
+pub mod l3dmesh;
+pub mod lora;
+pub mod nan;
+pub mod nvs;
+pub mod settings;
+pub mod wifi;
+
+use crate::commands::CommandRegistry;
+
+use settings::SharedSettings;
+
+pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
+    console::register_commands(registry);
+    gpio::register_commands(registry);
+    i2c::register_commands(registry, settings.clone());
+    lora::register_commands(registry, settings.clone());
+    ble_bt::register_commands(registry);
+    nan::register_commands(registry);
+    nvs::register_commands(registry, settings);
+    wifi::register_commands(registry);
+}
