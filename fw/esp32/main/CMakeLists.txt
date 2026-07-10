@@ -1,0 +1,24 @@
+idf_component_register(SRCS
+        "wifi_sta_ap.c"
+        "main.c"
+        "ui.c"
+        "console.c"
+        INCLUDE_DIRS "."
+        REQUIRES
+            console
+            driver
+            esp-nan-aware
+            esp_driver_gpio
+            esp_driver_i2c
+            esp_driver_uart
+            esp_event
+            esp_netif
+            esp_pm
+            esp_wifi
+            fatfs
+            bt
+            l2lora
+            l3dmesh
+            nvs_flash
+            ssd1306
+        )
