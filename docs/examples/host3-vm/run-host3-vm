@@ -19,25 +19,22 @@ if [ -d "${NIX_PROFILE}/bin" ]; then
 fi
 export PATH="${artifact_dir}/opt/ssh-mesh/bin:${artifact_dir}/opt/busybox/bin:${PATH}"
 
-for f in \
-  "${artifact_dir}/img/vmlinux-cloud" \
-  "${artifact_dir}/img/ssh-mesh.erofs" \
-  "${artifact_dir}/img/modules-cloud.erofs" \
-  "${artifact_dir}/opt/ssh-mesh/bin/vrun"
-do
-  if [ ! -r "${f}" ]; then
-    cat >&2 <<EOF
-Host3-vm requires readable dist artifacts.
+rootfs="${artifact_dir}/img/ssh-mesh.erofs"
+vrun="${artifact_dir}/opt/ssh-mesh/bin/vrun"
 
-Missing: ${f}
+if [ ! -x "${vrun}" ] ||
+   ! VIRT="${NIX_PROFILE}" VIRT_ROOTFS="${rootfs}" "${vrun}" available qemuvirt >/dev/null 2>&1; then
+    cat >&2 <<EOF
+Host3-vm requires vrun, a readable rootfs, a detected VM kernel profile, and qemu.
 
 Build them with:
   ${workspace_dir}/scripts/build.sh profile
   ${workspace_dir}/scripts/build.sh
+
+Or set VIRT/VIRT_KERNEL/VIRT_ROOTFS for another kernel/rootfs profile.
 EOF
     exit 2
-  fi
-done
+fi
 
 export POD=host3-vm
 export SSH_MESH_VM_NODE=host3-vm
@@ -53,4 +50,4 @@ export SSH_MESH_VM_GUEST_GW="${SSH_MESH_HOST3_VM_GUEST_GW:-${SSH_MESH_VM_GUEST_G
 export SSH_MESH_VM_MEMORY="${SSH_MESH_HOST3_VM_QEMU_MEMORY:-${SSH_MESH_VM_MEMORY:-1024M}}"
 export SSH_MESH_VM_CPUS="${SSH_MESH_HOST3_VM_QEMU_CPUS:-${SSH_MESH_VM_CPUS:-2}}"
 
-exec "${artifact_dir}/opt/ssh-mesh/bin/vrun" start "$@"
+exec "${vrun}" start "$@"

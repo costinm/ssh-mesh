@@ -275,9 +275,11 @@ scripts/build.sh
 docs/examples/start_all.sh
 ```
 
-`profile` builds the repo-local Nix profile with the VM kernel/rootfs assets and
-hypervisors. It defaults to `target/nix/profile`. The default `scripts/build.sh` command builds the musl
-Rust binaries and creates `target/dist/opt` plus `target/dist/img`.
+`profile` builds the optional repo-local Linux VM profile with the custom
+kernel, module image, and hypervisors. It defaults to `target/nix/profile`.
+The default `scripts/build.sh` command builds the musl Rust binaries and creates
+`target/dist/opt` plus `target/dist/img`; VM artifacts are copied from the
+optional profile only when it is present.
 
 ## Start All Nodes
 
@@ -288,14 +290,15 @@ cd docs/examples
 
 Press `Ctrl-C` to stop all nodes and their child services.
 
-After `scripts/build.sh profile`, `scripts/build.sh` copies the VM kernel into
-`target/dist/img` and builds `target/dist/img/ssh-mesh.erofs` from
-`target/dist/opt`. The example launchers use those dist artifacts directly:
+After `scripts/build.sh profile`, `scripts/build.sh` copies the optional VM
+kernel and modules into `target/dist/img` and builds
+`target/dist/img/ssh-mesh.erofs` from `target/dist/opt`. VM example launchers
+use those dist artifacts directly:
 
 ```text
 target/dist/opt
-target/dist/img/vmlinux-cloud
 target/dist/img/ssh-mesh.erofs
+target/nix/profile/opt/ssh-mesh-kernel
 ```
 
 After config-only edits, reload the relevant running daemon instead of

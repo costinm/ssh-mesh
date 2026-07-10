@@ -3,9 +3,8 @@
 Host3-vm is a QEMU VM launched from the repo-local dist artifacts:
 
 ```text
-target/dist/img/vmlinux-cloud
 target/dist/img/ssh-mesh.erofs
-target/dist/img/modules-cloud.erofs
+target/nix/profile/opt/ssh-mesh-kernel
 target/dist/opt
 ```
 

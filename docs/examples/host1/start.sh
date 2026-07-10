@@ -24,7 +24,7 @@ mkdir -p \
 
 rm -rf "${root_dir}/shared/app2" "${root_dir}/shared/app2-vsock"
 
-for artifact in vmlinux-cloud ssh-mesh.erofs modules-cloud.erofs; do
+for artifact in ssh-mesh.erofs; do
   if [ -r "${target_dir}/dist/img/${artifact}" ]; then
     cp -f "${target_dir}/dist/img/${artifact}" "${root_dir}/vm-artifacts/${artifact}"
   fi

@@ -48,7 +48,6 @@ need() {
 }
 
 need bwrap
-need qemu-system-x86_64
 need setsid
 
 mkdir -p "${log_dir}" "${run_dir}" "${root_dir}/shared"
@@ -67,29 +66,34 @@ fi
 need mesh-init
 need ssh-mesh
 
-kernel="${artifact_dir}/img/vmlinux-cloud"
 rootfs="${artifact_dir}/img/ssh-mesh.erofs"
-modules="${artifact_dir}/img/modules-cloud.erofs"
+vm_available=1
+vrun="${staged_opt}/ssh-mesh/bin/vrun"
 
-if [ ! -r "${kernel}" ] || [ ! -r "${rootfs}" ] || [ ! -r "${modules}" ]; then
+if [ ! -x "${vrun}" ] ||
+   ! VIRT="${NIX_PROFILE}" VIRT_ROOTFS="${rootfs}" "${vrun}" available qemuvirt >/dev/null 2>&1; then
+  vm_available=0
+fi
+
+if [ "${SSH_MESH_EXAMPLES_REQUIRE_VM:-0}" = "1" ] && [ "${vm_available}" != "1" ]; then
   cat >&2 <<EOF
-Host3-vm requires readable dist VM artifacts.
+Host3-vm requires vrun, a readable rootfs, a detected VM kernel profile, and qemu.
 
-Build it with:
+Build optional VM assets with:
   ${workspace_dir}/scripts/build.sh profile
   ${workspace_dir}/scripts/build.sh
 EOF
   exit 2
 fi
 
-vm_artifact_dir="${root_dir}/vm-artifacts"
-mkdir -p "${vm_artifact_dir}"
-cp -f "${kernel}" "${vm_artifact_dir}/vmlinux-cloud"
-cp -f "${rootfs}" "${vm_artifact_dir}/ssh-mesh.erofs"
-cp -f "${modules}" "${vm_artifact_dir}/modules-cloud.erofs"
-export SSH_MESH_APP_VM_KERNEL="/tmp/mesh/state/vm-artifacts/vmlinux-cloud"
-export SSH_MESH_APP_VM_ROOTFS="/tmp/mesh/state/vm-artifacts/ssh-mesh.erofs"
-export SSH_MESH_APP_VM_MODULES="/tmp/mesh/state/vm-artifacts/modules-cloud.erofs"
+if [ "${vm_available}" = "1" ]; then
+  vm_artifact_dir="${root_dir}/vm-artifacts"
+  mkdir -p "${vm_artifact_dir}"
+  cp -f "${rootfs}" "${vm_artifact_dir}/ssh-mesh.erofs"
+  export SSH_MESH_APP_VM_ROOTFS="/tmp/mesh/state/vm-artifacts/ssh-mesh.erofs"
+else
+  echo "vrun VM profile/rootfs or qemu unavailable; skipping host3-vm and VM app examples" >&2
+fi
 
 vm_host_ssh_port="${SSH_MESH_HOST3_VM_HOST_SSH_PORT:-18322}"
 vm_host_http_port="${SSH_MESH_HOST3_VM_HOST_HTTP_PORT:-18380}"
@@ -262,7 +266,9 @@ start_node() {
 
 start_node host1
 start_node host2
-start_node host3-vm "${examples_dir}/host3-vm/run-host3-vm"
+if [ "${vm_available}" = "1" ]; then
+  start_node host3-vm "${examples_dir}/host3-vm/run-host3-vm"
+fi
 
 cat <<EOF
 
@@ -273,16 +279,16 @@ State root:
 
 Logs:
   ${log_dir}/host2.log
-  ${log_dir}/host3-vm.log
+  $([ "${vm_available}" = "1" ] && printf '%s\n' "${log_dir}/host3-vm.log")
   ${log_dir}/host1.log
 
 Fixed listeners:
   host2: ssh 127.0.0.1:18222, http 127.0.0.1:18280
-  host3-vm: vrun/qemu hostfwd ssh 127.0.0.1:${vm_host_ssh_port}, http 127.0.0.1:${vm_host_http_port}
+  $([ "${vm_available}" = "1" ] && printf '%s\n' "host3-vm: vrun/qemu hostfwd ssh 127.0.0.1:${vm_host_ssh_port}, http 127.0.0.1:${vm_host_http_port}")
   host1: ssh 127.0.0.1:18422, http 127.0.0.1:18480
   mesh9p host1 export: tcp 127.0.0.1:15101
   mesh9p host2 export: tcp 127.0.0.1:15102
-  mesh9p host3-vm export: tcp 15103 inside the guest
+  $([ "${vm_available}" = "1" ] && printf '%s\n' "mesh9p host3-vm export: tcp 15103 inside the guest")
 
 Trusted UDS sockets:
   ${root_dir}/shared/app1-bwrap/trusted.sock  (activated by host1 mesh-init)
