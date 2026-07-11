@@ -22,6 +22,7 @@ impl CommandRequest {
         }
     }
 
+    #[allow(dead_code)]
     pub fn arg_pair(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.args.insert(key.into(), value.into());
         self
@@ -104,7 +105,7 @@ impl CommandRegistry {
                 .into_iter()
                 .map(|(name, help)| format!("{name}: {help}"))
                 .collect::<Vec<_>>()
-                .join(" | ");
+                .join("\n");
             return CommandResponse::ok(help);
         }
 

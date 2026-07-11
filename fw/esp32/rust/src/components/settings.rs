@@ -34,15 +34,28 @@ impl Settings {
             nvs,
             cache: BTreeMap::new(),
             known_keys: vec![
+                "button.enabled",
+                "button.gpio",
                 "i2c.port",
                 "i2c.sda",
                 "i2c.scl",
                 "i2c.freq",
+                "identity.meshtastic",
+                "identity.meshcore",
+                "identity.node",
+                "identity.pubkey",
+                "identity.raw",
+                "log.depth",
+                "local_msg.depth",
                 "lora.freq",
                 "lora.beacon",
+                "lora.enabled",
                 "lora.bw",
+                "lora.channel_hash",
                 "lora.crc",
+                "lora.hop_limit",
                 "lora.preamble",
+                "lora.portnum",
                 "lora.spi_host",
                 "lora.sck",
                 "lora.miso",
@@ -54,6 +67,12 @@ impl Settings {
                 "lora.cr",
                 "lora.sync_word",
                 "lora.tx_power",
+                "msg.depth",
+                "nan.backend",
+                "nan.channel",
+                "nan.enabled",
+                "nan.role",
+                "nan.service",
             ],
         }
     }
@@ -88,6 +107,11 @@ impl Settings {
             nvs.set_str(key, value)?;
         }
         self.cache.insert(key.to_string(), value.to_string());
+        super::telemetry::record_log(format!(
+            "ev=nvs.set key={} value={}",
+            key,
+            crate::commands::protocol::quote_text_value(value)
+        ));
         Ok(())
     }
 

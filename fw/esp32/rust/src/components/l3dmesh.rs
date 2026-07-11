@@ -73,6 +73,7 @@ impl L3Mesh {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn in_messages(&self) -> u32 {
         self.in_messages
     }

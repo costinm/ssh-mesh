@@ -2,14 +2,19 @@ use anyhow::{anyhow, Result};
 
 use super::{CommandRequest, CommandResponse, CommandStatus};
 
+#[allow(dead_code)]
 pub const BINARY_MAGIC: &[u8; 4] = b"DM01";
 
 /// Text command format shared by console and line-oriented transports.
 ///
+/// Keep this firmware text protocol in sync with the service-side text stream
+/// conventions in `crates/mesh/src/message.rs`: one newline-terminated record,
+/// record type as the first token, and structured fields as `key=value`.
+///
 /// Format:
 /// `command key=value flag payload=hex:001122`
 pub fn parse_text(line: &str) -> Result<CommandRequest> {
-    let mut parts = line.split_whitespace();
+    let mut parts = split_text_tokens(line)?.into_iter();
     let name = parts
         .next()
         .ok_or_else(|| anyhow!("empty command"))?
@@ -31,19 +36,60 @@ pub fn parse_text(line: &str) -> Result<CommandRequest> {
     Ok(request)
 }
 
+fn split_text_tokens(line: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted => quoted = false,
+            '"' if current.is_empty() || current.ends_with('=') => quoted = true,
+            '\\' if quoted => {
+                let Some(escaped) = chars.next() else {
+                    return Err(anyhow!("unterminated text escape"));
+                };
+                current.push(match escaped {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    tokens.push(core::mem::take(&mut current));
+                }
+            }
+            ch => current.push(ch),
+        }
+    }
+    if quoted {
+        return Err(anyhow!("unterminated quoted text value"));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
 pub fn format_text(response: &CommandResponse) -> String {
-    let status = match response.status {
-        CommandStatus::Ok => "ok",
-        CommandStatus::Error => "error",
-    };
-    if response.payload.is_empty() {
-        format!("{status} {}\n", response.message)
-    } else {
-        format!(
-            "{status} {} payload=hex:{}\n",
-            response.message,
-            encode_hex(&response.payload)
-        )
+    match response.status {
+        CommandStatus::Ok => {
+            let mut out = response.message.clone();
+            if !response.payload.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str("data=");
+                out.push_str(&encode_hex(&response.payload));
+            }
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out
+        }
+        CommandStatus::Error => format!("error message={}\n", quote_text_value(&response.message)),
     }
 }
 
@@ -51,6 +97,7 @@ pub fn format_text(response: &CommandResponse) -> String {
 ///
 /// Layout: `DM01 | name_len:u8 | argc:u8 | payload_len:u16-le | name |
 /// key_len:u8 value_len:u8 key value ... | payload`.
+#[allow(dead_code)]
 pub fn encode_binary(request: &CommandRequest) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(BINARY_MAGIC);
@@ -68,6 +115,7 @@ pub fn encode_binary(request: &CommandRequest) -> Vec<u8> {
     out
 }
 
+#[allow(dead_code)]
 pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
     if input.len() < 8 || &input[0..4] != BINARY_MAGIC {
         return Err(anyhow!("invalid binary command magic"));
@@ -123,6 +171,37 @@ fn encode_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+pub fn escape_value(value: &str) -> String {
+    quote_text_value(value)
+}
+
+pub fn quote_text_value(value: &str) -> String {
+    if is_bare_text_value(value) {
+        return value.to_string();
+    }
+    let mut out = String::new();
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn is_bare_text_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\'' | b'\\' | b'='))
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>> {

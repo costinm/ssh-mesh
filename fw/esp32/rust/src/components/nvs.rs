@@ -28,7 +28,13 @@ impl CommandHandler for NvsCommand {
     }
 
     fn help(&self) -> &'static str {
-        "namespace name=NAME | set key=KEY value=VALUE | get key=KEY | list"
+        match self.name {
+            "namespace" => "namespace",
+            "set" => "set key=KEY value=VALUE",
+            "get" => "get key=KEY",
+            "list" => "list",
+            _ => "nvs",
+        }
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
