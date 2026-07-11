@@ -12,6 +12,31 @@ In many cases H2C is overkill - many apps can just expose
 an MCP-like JSON-RPC or plain JSON over stdin/stdout or UDS. In this case the mesh proxy can handle HTTP2 or SSH forwarding, with headers and metadata exposed as either env variables or in the json sent to the app.
 The app will not include a HTTP or H2 library, keeping deps small.
 
+## Line Protocol Selection
+
+`mesh::message::LineProtocolSession` provides the shared connection-level
+protocol selector for line-capable control sockets and stdio services. The
+first byte of the first packet selects the protocol for the whole connection:
+
+- `{` selects JSON / JSON-RPC lines.
+- An ASCII letter selects the shared text-record protocol.
+- `0x00` is reserved for the SSH mux-control binary protocol.
+
+The text protocol is logfmt-style: one newline-terminated record, record kind
+as the first token, then `key=value` fields. Values with whitespace or shell
+separators are double-quoted with backslash escapes. Examples:
+
+```text
+status name=ssh-mesh
+response name=ssh-mesh state=running pid=42 success=true
+event type=lora.rx rssi=-71 data_b64=AQID
+error message="service not found"
+```
+
+Firmware implementations may use only the text protocol, while host services
+should use `LineProtocolSession` so JSON, text, and future binary selection stay
+consistent.
+
 If HTTP is needed, it belongs in `ssh-mesh` or the application itself. The `mesh` crate intentionally avoids Axum/Hyper/http dependencies and only provides the activation, peer-checked stream, JSONL, and telemetry primitives.
 
 If the app is exposing HTTP over TCP without TLS - ideally localhost

@@ -116,4 +116,3 @@ fn normalize_mountpoint(path: &Path) -> PathBuf {
     }
     normalized
 }
-

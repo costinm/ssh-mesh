@@ -803,13 +803,7 @@ impl SshHandler {
                     let Some(stream) = listener_side.take() else {
                         break;
                     };
-                    if listener.on_session(
-                        client_id,
-                        &user,
-                        command.as_deref(),
-                        &env,
-                        stream,
-                    ) {
+                    if listener.on_session(client_id, &user, command.as_deref(), &env, stream) {
                         accepted = true;
                         break;
                     } else {

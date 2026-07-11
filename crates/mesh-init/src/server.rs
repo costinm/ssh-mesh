@@ -210,151 +210,9 @@ impl ControlServer {
 
 /// Handle a single control connection.
 ///
-/// Reads JSON lines from the stream, dispatches each to the daemon,
-/// and writes back JSON responses.
-enum ProtocolFormat {
-    Json(mesh::jsonl::ProtocolFormat),
-    TextCommand,
-}
-
-fn parse_incoming(trimmed: &str) -> (ProtocolFormat, Result<Request, String>) {
-    if !trimmed.starts_with('{') {
-        let parsed = parse_text_command(trimmed);
-        (
-            ProtocolFormat::TextCommand,
-            parsed.map_err(|e| e.to_string()),
-        )
-    } else {
-        let (format, parsed) = mesh::jsonl::parse_request::<Request>(trimmed);
-        (ProtocolFormat::Json(format), parsed)
-    }
-}
-
-fn parse_text_command(line: &str) -> Result<Request> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.is_empty() {
-        anyhow::bail!("Empty command");
-    }
-
-    match tokens[0] {
-        "status" => Ok(Request::Status {
-            name: tokens.get(1).map(|s| s.to_string()),
-        }),
-        "start" => {
-            let name = tokens
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
-            Ok(Request::Start {
-                name: name.to_string(),
-                args: tokens[2..].iter().map(|s| s.to_string()).collect(),
-                env: std::collections::HashMap::new(),
-                context: None,
-            })
-        }
-        "stop" => {
-            let name = tokens
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
-            let mut signal = None;
-            let mut i = 2;
-            while i < tokens.len() {
-                if tokens[i] == "--signal" && i + 1 < tokens.len() {
-                    signal = Some(tokens[i + 1].parse()?);
-                    break;
-                }
-                i += 1;
-            }
-            Ok(Request::Stop {
-                name: name.to_string(),
-                signal,
-            })
-        }
-        "freeze" => {
-            let name = tokens
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
-            Ok(Request::Freeze {
-                name: name.to_string(),
-            })
-        }
-        "unfreeze" => {
-            let name = tokens
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("Missing service name"))?;
-            Ok(Request::Unfreeze {
-                name: name.to_string(),
-            })
-        }
-        "reload" => Ok(Request::Reload),
-        "shutdown" => Ok(Request::Shutdown),
-        cmd => anyhow::bail!("Unsupported CLI command: {}", cmd),
-    }
-}
-
-fn format_text_success(data: &Option<serde_json::Value>) -> String {
-    let Some(data) = data else {
-        return "OK".to_string();
-    };
-
-    if let Some(obj) = data.as_object() {
-        let mut lines = Vec::new();
-        for (k, v) in obj {
-            let v_str = match v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                other => other.to_string(),
-            };
-            lines.push(format!("{}: {}", k, v_str));
-        }
-        lines.join("\n")
-    } else if let Some(arr) = data.as_array() {
-        let mut lines = Vec::new();
-        for item in arr {
-            if let Some(obj) = item.as_object() {
-                let name = obj
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("unknown");
-                let state = obj
-                    .get("state")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("unknown");
-                if let Some(pid) = obj.get("pid").and_then(|p| p.as_u64()) {
-                    lines.push(format!("{}: {} (PID {})", name, state, pid));
-                } else {
-                    lines.push(format!("{}: {}", name, state));
-                }
-            } else {
-                lines.push(item.to_string());
-            }
-        }
-        lines.join("\n")
-    } else {
-        data.to_string()
-    }
-}
-
-fn format_response(response: Response, format: &ProtocolFormat) -> Result<String> {
-    match format {
-        ProtocolFormat::Json(format) => mesh::jsonl::format_response(response, format),
-        ProtocolFormat::TextCommand => {
-            if response.success {
-                Ok(format_text_success(&response.data))
-            } else {
-                Ok(format!(
-                    "Error: {}",
-                    response.error.as_deref().unwrap_or("Unknown error")
-                ))
-            }
-        }
-    }
-}
-
-/// Handle a single control connection.
-///
-/// Reads JSON or text command lines from the stream, dispatches each to the daemon,
-/// and writes back formatted responses.
+/// Protocol selection is owned by `mesh::message::LineProtocolSession`: the
+/// first byte of the first packet selects JSON, text, or binary for the whole
+/// connection. mesh-init only reads/writes the socket and dispatches requests.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     daemon: Arc<Daemon>,
@@ -363,6 +221,7 @@ async fn handle_connection(
 ) -> Result<()> {
     let mut stream = stream;
     let mut line = String::new();
+    let mut protocol = mesh::message::LineProtocolSession::new();
 
     loop {
         line.clear();
@@ -376,7 +235,7 @@ async fn handle_connection(
             continue;
         }
 
-        let (format, parsed_result) = parse_incoming(trimmed);
+        let (_format, parsed_result) = protocol.parse_request_line(trimmed);
 
         let response = match parsed_result {
             Ok(request) => {
@@ -390,7 +249,7 @@ async fn handle_connection(
                         let response = daemon
                             .handle_request_with_fds(request, fds, peer_uid, peer_gid)
                             .await;
-                        let response_str = format_response(response, &format)?;
+                        let response_str = protocol.format_response(response)?;
                         std_stream.write_all(response_str.as_bytes())?;
                         std_stream.write_all(b"\n")?;
                         std_stream.flush()?;
@@ -400,7 +259,7 @@ async fn handle_connection(
                     }
                     Request::Shutdown => {
                         let response = Response::ok();
-                        let response_str = format_response(response, &format)?;
+                        let response_str = protocol.format_response(response)?;
                         stream.write_all(response_str.as_bytes()).await?;
                         stream.write_all(b"\n").await?;
                         stream.flush().await?;
@@ -421,7 +280,7 @@ async fn handle_connection(
             }
         };
 
-        let response_str = format_response(response, &format)?;
+        let response_str = protocol.format_response(response)?;
         stream.write_all(response_str.as_bytes()).await?;
         stream.write_all(b"\n").await?;
         stream.flush().await?;
@@ -573,9 +432,10 @@ mod tests {
     #[test]
     fn test_parse_incoming_flat_json() {
         let trimmed = r#"{"method":"status","name":"x","id":"req-id"}"#;
-        let (format, parsed) = parse_incoming(trimmed);
+        let mut session = mesh::message::LineProtocolSession::new();
+        let (format, parsed) = session.parse_request_line(trimmed);
         assert!(
-            matches!(format, ProtocolFormat::Json(mesh::jsonl::ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) }) if s == "req-id")
+            matches!(format, mesh::message::LineProtocolFormat::Json(mesh::jsonl::ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) }) if s == "req-id")
         );
         let req = parsed.unwrap();
         match req {
@@ -587,9 +447,10 @@ mod tests {
     #[test]
     fn test_parse_incoming_jsonrpc() {
         let trimmed = r#"{"jsonrpc":"2.0","method":"status","params":{"name":"x"},"id":100}"#;
-        let (format, parsed) = parse_incoming(trimmed);
+        let mut session = mesh::message::LineProtocolSession::new();
+        let (format, parsed) = session.parse_request_line(trimmed);
         assert!(
-            matches!(format, ProtocolFormat::Json(mesh::jsonl::ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) }) if n.as_i64() == Some(100))
+            matches!(format, mesh::message::LineProtocolFormat::Json(mesh::jsonl::ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) }) if n.as_i64() == Some(100))
         );
         let req = parsed.unwrap();
         match req {
@@ -600,12 +461,20 @@ mod tests {
 
     #[test]
     fn test_parse_incoming_text() {
-        let trimmed = "status x";
-        let (format, parsed) = parse_incoming(trimmed);
-        assert!(matches!(format, ProtocolFormat::TextCommand));
+        let trimmed = "status name=x";
+        let mut session = mesh::message::LineProtocolSession::new();
+        let (format, parsed) = session.parse_request_line(trimmed);
+        assert!(matches!(format, mesh::message::LineProtocolFormat::Text));
         let req = parsed.unwrap();
         match req {
             Request::Status { name } => assert_eq!(name, Some("x".to_string())),
+            _ => panic!("Expected status request"),
+        }
+
+        let trimmed = "status name=\"quoted service\"";
+        let (_, parsed) = session.parse_request_line(trimmed);
+        match parsed.unwrap() {
+            Request::Status { name } => assert_eq!(name, Some("quoted service".to_string())),
             _ => panic!("Expected status request"),
         }
     }
@@ -613,10 +482,11 @@ mod tests {
     #[test]
     fn test_format_response_jsonrpc() {
         let response = Response::ok_with_data(serde_json::json!({"pid": 42}));
-        let format = ProtocolFormat::Json(mesh::jsonl::ProtocolFormat::JsonRpc {
-            id: Some(serde_json::json!(100)),
-        });
-        let formatted = format_response(response, &format).unwrap();
+        let format =
+            mesh::message::LineProtocolFormat::Json(mesh::jsonl::ProtocolFormat::JsonRpc {
+                id: Some(serde_json::json!(100)),
+            });
+        let formatted = mesh::message::format_protocol_response(response, &format).unwrap();
         let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
         assert_eq!(val["jsonrpc"], "2.0");
         assert_eq!(val["result"]["pid"], 42);
@@ -626,9 +496,12 @@ mod tests {
     #[test]
     fn test_format_response_text() {
         let response = Response::ok_with_data(serde_json::json!({"pid": 42, "state": "running"}));
-        let format = ProtocolFormat::TextCommand;
-        let formatted = format_response(response, &format).unwrap();
-        assert!(formatted.contains("pid: 42"));
-        assert!(formatted.contains("state: running"));
+        let format = mesh::message::LineProtocolFormat::Text;
+        let formatted = mesh::message::format_protocol_response(response, &format).unwrap();
+        assert_eq!(formatted, "response pid=42 state=running success=true");
+
+        let response = Response::err("bad service");
+        let formatted = mesh::message::format_protocol_response(response, &format).unwrap();
+        assert_eq!(formatted, r#"error message="bad service""#);
     }
 }

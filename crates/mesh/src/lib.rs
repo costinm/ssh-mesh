@@ -11,14 +11,23 @@ pub mod tun;
 
 use std::sync::Arc;
 
-/// A handler trait or structure for incoming lines-based protocol, usually json.
+/// A handler trait or structure for incoming lines-based protocol.
 /// Typically implemented by the user of the library.
 #[async_trait::async_trait]
 pub trait LineHandler: Send + Sync + 'static {
     async fn handle_line(&self, line: &str) -> Result<Option<String>, anyhow::Error>;
 }
 
-/// Parse JSON lines from stdin/stdout.
+/// A handler for the shared mesh text-record protocol.
+#[async_trait::async_trait]
+pub trait TextRecordHandler: Send + Sync + 'static {
+    async fn handle_text_record(
+        &self,
+        record: message::TextRecord,
+    ) -> Result<Option<message::TextRecord>, anyhow::Error>;
+}
+
+/// Parse newline-delimited lines from stdin/stdout.
 pub async fn run_stdin_loop<H: LineHandler>(handler: Arc<H>) -> Result<(), anyhow::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -41,6 +50,39 @@ pub async fn run_stdin_loop<H: LineHandler>(handler: Arc<H>) -> Result<(), anyho
 
         if let Some(response) = handler.handle_line(trimmed).await? {
             stdout.write_all(response.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse shared text protocol records from stdin/stdout.
+pub async fn run_text_stdin_loop<H: TextRecordHandler>(
+    handler: Arc<H>,
+) -> Result<(), anyhow::Error> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut reader = tokio::io::BufReader::new(stdin);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let record = message::TextRecord::parse(trimmed)?;
+        if let Some(response) = handler.handle_text_record(record).await? {
+            stdout.write_all(response.format().as_bytes()).await?;
             stdout.write_all(b"\n").await?;
             stdout.flush().await?;
         }

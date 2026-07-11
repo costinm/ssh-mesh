@@ -49,6 +49,28 @@ pub struct LogEntry {
     pub fields: Option<serde_json::Value>,
 }
 
+impl LogEntry {
+    pub fn to_text_record(&self) -> crate::message::TextRecord {
+        let mut record = crate::message::TextRecord::new("trace")
+            .field("ts", &self.timestamp)
+            .field("level", &self.level)
+            .field("target", &self.target)
+            .field("message", &self.message);
+        if let Some(fields) = self.fields.as_ref().and_then(serde_json::Value::as_object) {
+            for (key, value) in fields {
+                record
+                    .fields
+                    .insert(key.clone(), crate::message::text_value_from_json(value));
+            }
+        }
+        record
+    }
+
+    pub fn to_text_line(&self) -> String {
+        self.to_text_record().format()
+    }
+}
+
 /// Request body for setting trace level, using EnvFilter patterns, i.e. comma separated
 /// list of "(topic=level,)*default"
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -821,5 +843,23 @@ mod tests {
             "log file missing level: {}",
             contents
         );
+    }
+
+    #[test]
+    fn log_entry_formats_as_text_record() {
+        let entry = LogEntry {
+            timestamp: "2026-07-10T00:00:00Z".to_string(),
+            level: "info".to_string(),
+            target: "mesh_test".to_string(),
+            message: "hello trace".to_string(),
+            fields: Some(serde_json::json!({"answer": 42, "ok": true})),
+        };
+
+        let line = entry.to_text_line();
+        assert!(line.starts_with("trace "));
+        assert!(line.contains("level=info"));
+        assert!(line.contains(r#"message="hello trace""#));
+        assert!(line.contains("answer=42"));
+        assert!(line.contains("ok=true"));
     }
 }

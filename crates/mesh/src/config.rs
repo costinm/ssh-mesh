@@ -666,7 +666,10 @@ fn parse_duration_secs(value: Option<&str>, field: &str) -> Result<Option<u64>, 
     Ok(Some((parsed * multiplier).ceil() as u64))
 }
 
-fn parse_duration_from_value(value: Option<&serde_json::Value>, field: &str) -> Result<Option<u64>, ConfigError> {
+fn parse_duration_from_value(
+    value: Option<&serde_json::Value>,
+    field: &str,
+) -> Result<Option<u64>, ConfigError> {
     let Some(val) = value else {
         return Ok(None);
     };
@@ -678,16 +681,20 @@ fn parse_duration_from_value(value: Option<&serde_json::Value>, field: &str) -> 
                 if f >= 0.0 && f.is_finite() {
                     Ok(Some(f.ceil() as u64))
                 } else {
-                    Err(ConfigError::Invalid(format!("{field} must be a non-negative number")))
+                    Err(ConfigError::Invalid(format!(
+                        "{field} must be a non-negative number"
+                    )))
                 }
             } else {
-                Err(ConfigError::Invalid(format!("{field} must be a valid number")))
+                Err(ConfigError::Invalid(format!(
+                    "{field} must be a valid number"
+                )))
             }
         }
-        serde_json::Value::String(s) => {
-            parse_duration_secs(Some(s.as_str()), field)
-        }
-        _ => Err(ConfigError::Invalid(format!("{field} must be a number or a duration string"))),
+        serde_json::Value::String(s) => parse_duration_secs(Some(s.as_str()), field),
+        _ => Err(ConfigError::Invalid(format!(
+            "{field} must be a number or a duration string"
+        ))),
     }
 }
 
@@ -1051,10 +1058,14 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         }
     }
 
-    if let Some(t) = file.service.service_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        if !t.eq_ignore_ascii_case("oneshot")
-            && !t.eq_ignore_ascii_case("exec")
-        {
+    if let Some(t) = file
+        .service
+        .service_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !t.eq_ignore_ascii_case("oneshot") && !t.eq_ignore_ascii_case("exec") {
             return Err(ConfigError::Invalid(format!(
                 "unsupported Type '{}'; supported values are: oneshot, exec",
                 t
@@ -1068,8 +1079,10 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         parse_duration_secs(file.service.restart_sec.as_deref(), "RestartSec")?.unwrap_or(1);
     let watchdog_sec =
         parse_duration_from_value(file.service.watchdog_sec.as_ref(), "WatchdogSec")?;
-    let idle_termination_sec =
-        parse_duration_from_value(file.service.idle_termination_sec.as_ref(), "IdleTerminationSec")?;
+    let idle_termination_sec = parse_duration_from_value(
+        file.service.idle_termination_sec.as_ref(),
+        "IdleTerminationSec",
+    )?;
     let timeout_start_sec =
         parse_duration_secs(file.service.timeout_start_sec.as_deref(), "TimeoutStartSec")?;
     let timeout_stop_sec =
@@ -1436,39 +1449,63 @@ AllowDangerousEnv = ["PATH", "LD_LIBRARY_PATH"]
     #[test]
     fn test_service_type_validation() {
         // Valid types
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"oneshot\"",
-            Some("t1")
-        ).is_ok());
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"exec\"",
-            Some("t2")
-        ).is_ok());
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"Exec\"",
-            Some("t3")
-        ).is_ok());
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"oneshot\"",
+                Some("t1")
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"exec\"",
+                Some("t2")
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"Exec\"",
+                Some("t3")
+            )
+            .is_ok()
+        );
 
         // Invalid types
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"simple\"",
-            Some("t4")
-        ).is_err());
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"forking\"",
-            Some("t5")
-        ).is_err());
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"notify\"",
-            Some("t6")
-        ).is_err());
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"dbus\"",
-            Some("t7")
-        ).is_err());
-        assert!(parse_service(
-            "[Service]\nExecStart = \"/bin/true\"\nType = \"\"",
-            Some("t8")
-        ).is_ok()); // empty type is omitted/ignored and is OK
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"simple\"",
+                Some("t4")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"forking\"",
+                Some("t5")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"notify\"",
+                Some("t6")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"dbus\"",
+                Some("t7")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_service(
+                "[Service]\nExecStart = \"/bin/true\"\nType = \"\"",
+                Some("t8")
+            )
+            .is_ok()
+        ); // empty type is omitted/ignored and is OK
     }
 }

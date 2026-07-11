@@ -1,6 +1,12 @@
 # `mesh-init` — UDS Control Protocol API
 
-`mesh-init` exposes its control interface over a Unix Domain Socket (UDS) located at `/run/mesh/mesh-init/mesh.sock` on root-run systems. The endpoint currently accepts line JSON, JSON-RPC-shaped requests, and fd-passing requests; the path is protocol-neutral so future encodings can reuse it.
+`mesh-init` exposes its control interface over a Unix Domain Socket (UDS) located at `/run/mesh/mesh-init/mesh.sock` on root-run systems. The endpoint uses the shared `mesh::message::LineProtocolSession` selector: the first byte of the first packet selects the protocol for the whole connection.
+
+* `{` selects line JSON or JSON-RPC-shaped requests.
+* An ASCII letter selects the shared text-record protocol (`kind key=value`).
+* `0x00` is reserved for the SSH mux-control binary protocol.
+
+The endpoint does not re-detect protocol per line.
 
 Clients can interact using flat JSON structures where the `method` field defines the action. The protocol supports standard control requests as well as file descriptor-passing requests via Unix domain socket ancillary data (`SCM_RIGHTS`).
 
@@ -16,6 +22,13 @@ Every request returns a single JSON object line with the following shape:
   "error": "Error message string if success is false",
   "data": { ... } // Optional key-value payload returned by the method
 }
+```
+
+For text-selected connections, responses use logfmt-style records:
+
+```text
+response name=ssh-mesh state=running pid=42 success=true
+error message="service not found"
 ```
 
 ---
