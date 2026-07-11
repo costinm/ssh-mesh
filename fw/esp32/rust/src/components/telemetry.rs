@@ -164,7 +164,7 @@ impl TelemetryCommand {
         {
             reset();
         }
-        Ok(CommandResponse::ok(stats_text()))
+        Ok(CommandResponse::ok(stats_text(&self.settings)))
     }
 
     fn logs(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -311,13 +311,13 @@ pub fn record_local_packet(
     }
 }
 
-pub fn stats_text() -> String {
+pub fn stats_text(settings: &SharedSettings) -> String {
     let state = telemetry().lock().unwrap();
     let lora = LORA_COUNTER.snapshot();
     let ble = BLE_COUNTER.snapshot();
     let wifi = WIFI_COUNTER.snapshot();
     format!(
-        "stats lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} ble_rx={} ble_rx_bytes={} ble_tx={} ble_tx_bytes={} wifi_rx={} wifi_rx_bytes={} wifi_tx={} wifi_tx_bytes={} logs={} messages={} local_messages={}",
+        "stats lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} ble_rx={} ble_rx_bytes={} ble_tx={} ble_tx_bytes={} wifi_rx={} wifi_rx_bytes={} wifi_tx={} wifi_tx_bytes={} logs={} messages={} local_messages={} {}",
         lora.rx_packets,
         lora.rx_bytes,
         lora.tx_packets,
@@ -332,8 +332,14 @@ pub fn stats_text() -> String {
         wifi.tx_bytes,
         state.logs.len(),
         state.messages.len(),
-        state.local_messages.len()
+        state.local_messages.len(),
+        super::battery::stats_fields(settings)
     )
+}
+
+pub fn pending_message_count() -> u8 {
+    let state = telemetry().lock().unwrap();
+    state.messages.len().min(u8::MAX as usize) as u8
 }
 
 fn logs_text(count: usize) -> String {

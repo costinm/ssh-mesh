@@ -34,6 +34,13 @@ impl Settings {
             nvs,
             cache: BTreeMap::new(),
             known_keys: vec![
+                "battery.enabled",
+                "battery.pin",
+                "battery.divider",
+                "battery.mult",
+                "battery.ref_mv",
+                "battery.min_mv",
+                "battery.max_mv",
                 "button.enabled",
                 "button.gpio",
                 "i2c.port",

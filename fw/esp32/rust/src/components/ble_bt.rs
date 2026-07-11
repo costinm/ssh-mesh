@@ -13,7 +13,7 @@ use esp_idf_sys as sys;
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 use crate::transports::dispatch_text_line;
 
-use super::frames::hex_bytes;
+use super::frames::{decode_frame, hex_bytes};
 use super::l3dmesh::{Frame, Transport};
 use super::settings::{parse_bool, parse_i32};
 use super::telemetry::{self, Direction};
@@ -65,14 +65,7 @@ static mut GATT_HANDLES: [u16; GATT_IDX_NB] = [0; GATT_IDX_NB];
 static mut GATT_DB: MaybeUninit<[sys::esp_gatts_attr_db_t; GATT_IDX_NB]> = MaybeUninit::uninit();
 
 pub const DMESH_BLE_SERVICE_UUID16: u16 = 0xfd5d;
-const DMESH_ADV_MAGIC: [u8; 2] = *b"DM";
-const DMESH_ADV_VERSION: u8 = 1;
-const DMESH_EVENT_GENERIC: u8 = 0;
-const DMESH_EVENT_LORA_RX: u8 = 1;
-const DMESH_EVENT_IDLE_HELLO: u8 = 2;
-const DMESH_EVENT_WAKE_REQUEST: u8 = 3;
-const DMESH_EVENT_PAYLOAD_PENDING: u8 = 4;
-const DMESH_MAX_PREFIX: usize = 5;
+const DMESH_MAX_PREFIX: usize = 14;
 const BLE_MODE_OFF: u8 = 0;
 const BLE_MODE_LISTEN: u8 = 1;
 const BLE_MODE_ANNOUNCE: u8 = 2;
@@ -194,16 +187,6 @@ pub enum DmeshBleEvent {
 }
 
 impl DmeshBleEvent {
-    fn code(self) -> u8 {
-        match self {
-            Self::Generic => DMESH_EVENT_GENERIC,
-            Self::LoraRx => DMESH_EVENT_LORA_RX,
-            Self::IdleHello => DMESH_EVENT_IDLE_HELLO,
-            Self::WakeRequest => DMESH_EVENT_WAKE_REQUEST,
-            Self::PayloadPending => DMESH_EVENT_PAYLOAD_PENDING,
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::Generic => "generic",
@@ -211,16 +194,6 @@ impl DmeshBleEvent {
             Self::IdleHello => "idle_hello",
             Self::WakeRequest => "wake_request",
             Self::PayloadPending => "payload_pending",
-        }
-    }
-
-    fn from_code(code: u8) -> Self {
-        match code {
-            DMESH_EVENT_LORA_RX => Self::LoraRx,
-            DMESH_EVENT_IDLE_HELLO => Self::IdleHello,
-            DMESH_EVENT_WAKE_REQUEST => Self::WakeRequest,
-            DMESH_EVENT_PAYLOAD_PENDING => Self::PayloadPending,
-            _ => Self::Generic,
         }
     }
 }
@@ -619,25 +592,20 @@ fn start_scan_params(duration: u32, active: bool) -> Result<()> {
 }
 
 fn dmesh_adv_data(
-    event: DmeshBleEvent,
+    _event: DmeshBleEvent,
     packet: &[u8],
-    metrics: Option<(i32, f32)>,
+    _metrics: Option<(i32, f32)>,
 ) -> Result<Vec<u8>> {
-    let mac = ble_mac()?;
-    let hash = fnv1a32(packet);
-    let (rssi, snr) = metrics.unwrap_or((0, 0.0));
+    let (source, packet_id) = dmesh_adv_ids(packet);
+    let pending = telemetry::pending_message_count();
+    let battery = battery_level();
     let prefix_len = packet.len().min(DMESH_MAX_PREFIX);
-    let mut service = Vec::with_capacity(2 + 19 + prefix_len);
+    let mut service = Vec::with_capacity(2 + 10 + prefix_len);
     service.extend_from_slice(&DMESH_BLE_SERVICE_UUID16.to_le_bytes());
-    service.extend_from_slice(&DMESH_ADV_MAGIC);
-    service.push(DMESH_ADV_VERSION);
-    service.push(0);
-    service.push(event.code());
-    service.extend_from_slice(&mac);
-    service.extend_from_slice(&(packet.len().min(u16::MAX as usize) as u16).to_le_bytes());
-    service.extend_from_slice(&hash.to_le_bytes());
-    service.push(rssi.clamp(i8::MIN as i32, i8::MAX as i32) as i8 as u8);
-    service.push((snr * 4.0).round().clamp(i8::MIN as f32, i8::MAX as f32) as i8 as u8);
+    service.extend_from_slice(&source.to_le_bytes());
+    service.extend_from_slice(&packet_id.to_le_bytes());
+    service.push(pending);
+    service.push(battery);
     service.extend_from_slice(&packet[..prefix_len]);
 
     let mut adv = Vec::with_capacity(31);
@@ -651,27 +619,30 @@ fn dmesh_adv_data(
     Ok(adv)
 }
 
+fn dmesh_adv_ids(packet: &[u8]) -> (u32, u32) {
+    decode_frame(packet)
+        .ok()
+        .and_then(|decoded| decoded.meshtastic)
+        .map(|header| (header.from, header.id))
+        .unwrap_or((0, 0))
+}
+
+fn battery_level() -> u8 {
+    super::battery::battery_level_default()
+}
+
 #[derive(Debug)]
 struct DmeshAnnouncement {
-    event: u8,
-    mac: [u8; 6],
-    payload_len: u16,
-    payload_hash: u32,
-    rssi: i8,
-    snr: f32,
+    source: u32,
+    packet_id: u32,
+    pending: u8,
+    battery: u8,
     prefix: Vec<u8>,
 }
 
 impl DmeshAnnouncement {
-    fn event_name(&self) -> &'static str {
-        DmeshBleEvent::from_code(self.event).name()
-    }
-
-    fn needs_connectable_response(&self) -> bool {
-        matches!(
-            DmeshBleEvent::from_code(self.event),
-            DmeshBleEvent::WakeRequest | DmeshBleEvent::PayloadPending
-        )
+    fn dedupe_key(&self) -> u32 {
+        self.source.rotate_left(13) ^ self.packet_id
     }
 }
 
@@ -686,49 +657,23 @@ fn parse_dmesh_adv(adv: &[u8]) -> Option<DmeshAnnouncement> {
         let data_start = i + 2;
         let data_end = (i + 1 + len).min(adv.len());
         let data = adv.get(data_start..data_end)?;
-        if typ == 0x16 && data.len() >= 21 {
+        if typ == 0x16 && data.len() >= 12 {
             let uuid = u16::from_le_bytes([data[0], data[1]]);
-            if uuid == DMESH_BLE_SERVICE_UUID16
-                && data[2..4] == DMESH_ADV_MAGIC
-                && data[4] == DMESH_ADV_VERSION
-            {
-                let mut mac = [0_u8; 6];
-                mac.copy_from_slice(&data[7..13]);
-                let payload_len = u16::from_le_bytes([data[13], data[14]]);
-                let payload_hash = u32::from_le_bytes([data[15], data[16], data[17], data[18]]);
-                let rssi = data[19] as i8;
-                let snr = data[20] as i8 as f32 / 4.0;
+            if uuid == DMESH_BLE_SERVICE_UUID16 {
+                let source = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+                let packet_id = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
                 return Some(DmeshAnnouncement {
-                    event: data[6],
-                    mac,
-                    payload_len,
-                    payload_hash,
-                    rssi,
-                    snr,
-                    prefix: data[21..].to_vec(),
+                    source,
+                    packet_id,
+                    pending: data[10],
+                    battery: data[11],
+                    prefix: data[12..].to_vec(),
                 });
             }
         }
         i += len + 1;
     }
     None
-}
-
-fn ble_mac() -> Result<[u8; 6]> {
-    let mut mac = [0_u8; 6];
-    unsafe {
-        esp_ok(sys::esp_read_mac(
-            mac.as_mut_ptr(),
-            sys::esp_mac_type_t_ESP_MAC_BT,
-        ))?;
-    }
-    Ok(mac)
-}
-
-fn fnv1a32(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(0x811c_9dc5_u32, |acc, byte| {
-        acc.wrapping_mul(16777619) ^ *byte as u32
-    })
 }
 
 unsafe extern "C" fn gap_cb(
@@ -772,25 +717,17 @@ unsafe extern "C" fn gap_cb(
             if let Some(announce) = parse_dmesh_adv(adv) {
                 BLE_ANNOUNCE_RX.fetch_add(1, Ordering::Relaxed);
                 telemetry::count_packet("ble", Direction::Rx, adv.len());
-                if matches!(
-                    DmeshBleEvent::from_code(announce.event),
-                    DmeshBleEvent::WakeRequest
-                ) {
-                    BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
-                }
                 let first_seen = BLE_LAST_ANNOUNCE_HASH
-                    .swap(announce.payload_hash, Ordering::Relaxed)
-                    != announce.payload_hash;
+                    .swap(announce.dedupe_key(), Ordering::Relaxed)
+                    != announce.dedupe_key();
                 if first_seen {
                     let line = format!(
-                        "event type=ble.announce_rx event={} addr={} mac={} len={} hash=0x{:08x} rssi={} snr={} prefix={}",
-                        announce.event_name(),
+                        "event type=ble.announce_rx addr={} src=0x{:08x} n={} pending={} battery={} prefix={}",
                         format_mac(&result.bda),
-                        format_mac(&announce.mac),
-                        announce.payload_len,
-                        announce.payload_hash,
-                        announce.rssi,
-                        announce.snr,
+                        announce.source,
+                        announce.packet_id,
+                        announce.pending,
+                        announce.battery,
                         hex_bytes(&announce.prefix)
                     );
                     telemetry::record_log(line);
@@ -804,20 +741,6 @@ unsafe extern "C" fn gap_cb(
                             format_mac(&result.bda)
                         ),
                     );
-                }
-                if announce.needs_connectable_response() {
-                    let response = dmesh_adv_data(DmeshBleEvent::IdleHello, &[], None);
-                    if let Ok(response) = response {
-                        if start_raw_adv(&response).is_ok() {
-                            BLE_MODE.store(BLE_MODE_CONNECTABLE, Ordering::Relaxed);
-                            BLE_PENDING_SWITCHES.fetch_add(1, Ordering::Relaxed);
-                            let line = format!(
-                                "event type=ble.mode mode=connectable source=announce_rx event={}",
-                                announce.event_name()
-                            );
-                            telemetry::record_log(line);
-                        }
-                    }
                 }
             } else {
                 telemetry::record_packet(

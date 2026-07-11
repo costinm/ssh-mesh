@@ -15,6 +15,16 @@ may run permanently, periodically or may be included in another app.
 The primitive operations - start, announce and callbacks - are very 
 simple and can be exposed as JSON commands over UDS or JNI/native.
 
+`lmesh::radio_protocol` also owns the DMesh BLE/NAN `DM` v1 wire format used by
+Android and firmware-adjacent tests. Keep hardware access outside this module:
+Android Java owns Android BLE/WiFi Aware permissions and callbacks, while
+future mesh-init Linux support should own `wpa_supplicant` and BLE adapter
+control and call the shared protocol helpers.
+
+Local adapters should use message/pubsub style boundaries with text command
+metadata, raw byte payloads, and optional FDs. CBOR is a good future fit for
+structured binary frames; protobuf is not planned.
+
 ## TODO
 
 - add the actual signature
@@ -24,7 +34,5 @@ simple and can be exposed as JSON commands over UDS or JNI/native.
 - any info should be in the certificate
 - include current list of public and mesh IPs, if any.
 - save valid announcements to files, load from files, GC and timestamp if not updated in 1 day.
-
-
 
 

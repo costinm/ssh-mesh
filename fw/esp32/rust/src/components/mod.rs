@@ -1,3 +1,4 @@
+pub mod battery;
 pub mod ble_bt;
 pub mod button;
 pub mod console;
@@ -18,6 +19,7 @@ use crate::commands::CommandRegistry;
 use settings::SharedSettings;
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
+    battery::register_commands(registry, settings.clone());
     button::register_commands(registry, settings.clone());
     console::register_commands(registry);
     gpio::register_commands(registry);

@@ -26,6 +26,8 @@ use tokio::sync::RwLock;
 
 use tracing::{debug, error, info, instrument, warn};
 
+pub mod radio_protocol;
+
 const MULTICAST_PORT: u16 = 5227;
 const MULTICAST_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
 const MULTICAST_IPV6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);

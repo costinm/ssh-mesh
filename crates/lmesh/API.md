@@ -103,3 +103,25 @@ The multicast wire announcement is JSON:
 ```json
 {"public_key":"base64url-spki","metadata":{"key":"value"}}
 ```
+
+## Radio Wire Protocol
+
+`lmesh::radio_protocol` owns the shared DMesh BLE/NAN `DM` v1 frame format. It
+is a library API, not a JSONL method. Android and future `mesh-init` hardware
+adapters should use it for frame encoding, parsing, dedupe, and message metadata
+while keeping platform-specific BLE, NAN, and `wpa_supplicant` control outside
+the protocol module.
+
+JNI or local adapter boundaries should stay message-oriented: text method/args
+for routing and metadata, raw bytes for payload frames, and an FD slot where
+needed. CBOR is the intended future structured binary format when JSON/text is
+too verbose; protobuf is not planned for this path.
+
+Public helpers:
+
+| Helper | Purpose |
+| --- | --- |
+| `DMESH_BLE_SERVICE_UUID16` | DMesh BLE service UUID16, `0xFD5D`. |
+| `build_ble_service_data` / `parse_ble_service_data` | BLE service-data wake and payload-hint frames. |
+| `build_nan_service_info` / `parse_nan_service_info` | WiFi Aware/NAN service-specific info frames. |
+| `build_nan_followup` / `parse_nan_followup` | WiFi Aware/NAN follow-up message frames. |
