@@ -70,6 +70,37 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     registry.register(LoraCommand::new("loradump", settings));
 }
 
+pub fn sleep_radio(settings: &SharedSettings) -> Result<()> {
+    BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
+    notify_lora_rx_task();
+    let state = LoraState::load(settings)?;
+    let _guard = lora_spi_lock().lock().unwrap();
+    let mut radio = Radio::open(&state.config)?;
+    radio.sleep()
+}
+
+pub fn send_text(settings: &SharedSettings, text: &str, hop_limit: u8) -> Result<String> {
+    send_payload(
+        settings,
+        text.as_bytes(),
+        FrameKind::Meshtastic,
+        Some(hop_limit),
+        None,
+        2000,
+    )
+}
+
+pub fn send_raw_text(settings: &SharedSettings, text: &str) -> Result<String> {
+    send_payload(
+        settings,
+        text.as_bytes(),
+        FrameKind::Raw,
+        Some(0),
+        None,
+        2000,
+    )
+}
+
 pub fn transport(settings: SharedSettings) -> LoraTransport {
     LoraTransport::new(settings)
 }
@@ -129,7 +160,31 @@ pub fn start_background_rx(settings: SharedSettings) -> Result<Option<thread::Jo
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) enum LoraChip {
+    Sx127x,
+    Sx1262,
+}
+
+impl LoraChip {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "sx127x" | "sx1276" | "sx1278" | "rf95" => Ok(Self::Sx127x),
+            "sx1262" | "sx126x" => Ok(Self::Sx1262),
+            _ => bail!("unsupported LoRa chip {value}"),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Sx127x => "sx127x",
+            Self::Sx1262 => "sx1262",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct LoraConfig {
+    pub(crate) chip: LoraChip,
     pub frequency_hz: u32,
     pub bandwidth_hz: u32,
     pub beacon: bool,
@@ -140,6 +195,7 @@ pub struct LoraConfig {
     pub cs: i32,
     pub rst: i32,
     pub dio0: i32,
+    pub busy: i32,
     pub sf: i32,
     pub cr: i32,
     pub sync_word: i32,
@@ -151,6 +207,7 @@ pub struct LoraConfig {
 impl Default for LoraConfig {
     fn default() -> Self {
         Self {
+            chip: LoraChip::Sx127x,
             frequency_hz: DEFAULT_FREQUENCY_HZ,
             bandwidth_hz: DEFAULT_BANDWIDTH_HZ,
             beacon: true,
@@ -161,6 +218,7 @@ impl Default for LoraConfig {
             cs: 18,
             rst: 14,
             dio0: 26,
+            busy: -1,
             sf: 10,
             cr: 5,
             sync_word: 0x2b,
@@ -193,6 +251,12 @@ impl LoraState {
         let settings = settings.borrow();
         Ok(Self {
             config: LoraConfig {
+                chip: settings
+                    .get_str("lora.chip")?
+                    .as_deref()
+                    .map(LoraChip::parse)
+                    .transpose()?
+                    .unwrap_or(defaults.chip),
                 frequency_hz: settings.get_i32("lora.freq", defaults.frequency_hz as i32)? as u32,
                 bandwidth_hz: settings.get_i32("lora.bw", defaults.bandwidth_hz as i32)? as u32,
                 beacon: settings.get_bool("lora.beacon", defaults.beacon)?,
@@ -203,6 +267,7 @@ impl LoraState {
                 cs: settings.get_i32("lora.cs", defaults.cs)?,
                 rst: settings.get_i32("lora.rst", defaults.rst)?,
                 dio0: settings.get_i32("lora.dio0", defaults.dio0)?,
+                busy: settings.get_i32("lora.busy", defaults.busy)?,
                 sf: settings.get_i32("lora.sf", defaults.sf)?,
                 cr: settings.get_i32("lora.cr", defaults.cr)?,
                 sync_word: settings.get_i32("lora.sync_word", defaults.sync_word)?,
@@ -225,8 +290,8 @@ impl CommandHandler for LoraCommand {
 
     fn help(&self) -> &'static str {
         match self.name {
-            "lora" => "lora preset=medium_fast|medium_slow freq=913125000 bw=250000 sf=9 cr=5 sync_word=0x2b rx=true|false apply=true",
-            "loraprobe" => "loraprobe sck=5,18 miso=19 mosi=27 cs=18,5 rst=14,23 dio0=26 save=true",
+            "lora" => "lora board=heltec_v3 | chip=sx127x|sx1262 preset=medium_fast|medium_slow freq=913125000 bw=250000 sf=9 cr=5 sync_word=0x2b rx=true|false sleep=true|false apply=true",
+            "loraprobe" => "loraprobe chip=sx127x|sx1262 sck=5,18,9 miso=19,11 mosi=27,10 cs=18,5,8 rst=14,23,12 dio0=26,14 busy=-1,13 save=true",
             "lorasend" => "lorasend text=hello | data=hex:0102 | format=raw",
             "loralisten" => "loralisten ms=5000 count=4 local_only=true",
             "loradump" => "loradump",
@@ -248,6 +313,15 @@ impl CommandHandler for LoraCommand {
 
 impl LoraCommand {
     fn configure(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        if request
+            .arg("sleep")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            sleep_radio(&self.settings)?;
+            return Ok(CommandResponse::ok("lora sleep=true"));
+        }
         let rx_request = request.arg("rx").map(parse_bool).transpose()?;
         if let Some(false) = rx_request {
             BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
@@ -262,6 +336,29 @@ impl LoraCommand {
             settings.set_i32("lora.cr", preset.cr)?;
             settings.set_bool("lora.crc", true)?;
             settings.set_i32("lora.preamble", 16)?;
+        }
+        if let Some(board) = request.arg("board") {
+            match board.to_ascii_lowercase().as_str() {
+                "heltec_v3" | "heltec-v3" | "wb32laf" => {
+                    let mut settings = self.settings.borrow_mut();
+                    settings.set_str("lora.chip", LoraChip::Sx1262.as_str())?;
+                    settings.set_i32("lora.spi_host", sys::spi_host_device_t_SPI2_HOST as i32)?;
+                    settings.set_i32("lora.sck", 9)?;
+                    settings.set_i32("lora.miso", 11)?;
+                    settings.set_i32("lora.mosi", 10)?;
+                    settings.set_i32("lora.cs", 8)?;
+                    settings.set_i32("lora.rst", 12)?;
+                    settings.set_i32("lora.dio0", 14)?;
+                    settings.set_i32("lora.busy", 13)?;
+                    settings.set_i32("lora.tx_power", 17)?;
+                }
+                _ => bail!("unsupported LoRa board {board}"),
+            }
+        }
+        if let Some(chip) = request.arg("chip") {
+            self.settings
+                .borrow_mut()
+                .set_str("lora.chip", LoraChip::parse(chip)?.as_str())?;
         }
         if let Some(freq) = request.arg_i32("freq")? {
             self.settings
@@ -290,6 +387,7 @@ impl LoraCommand {
             ("cs", "lora.cs"),
             ("rst", "lora.rst"),
             ("dio0", "lora.dio0"),
+            ("busy", "lora.busy"),
             ("sf", "lora.sf"),
             ("cr", "lora.cr"),
             ("sync_word", "lora.sync_word"),
@@ -300,6 +398,7 @@ impl LoraCommand {
                 let value = parse_i32(value)?;
                 match arg {
                     "sck" | "miso" | "mosi" | "cs" | "rst" | "dio0" => validate_pin(value)?,
+                    "busy" => validate_optional_pin(value)?,
                     "sf" => validate_sf(value)?,
                     "cr" => validate_cr(value)?,
                     "sync_word" => validate_u8(value)?,
@@ -319,7 +418,7 @@ impl LoraCommand {
             .unwrap_or(false)
         {
             let _guard = lora_spi_lock().lock().unwrap();
-            let mut radio = Sx127x::open(&state.config)?;
+            let mut radio = Radio::open(&state.config)?;
             radio.configure_radio()?;
         }
         if let Some(true) = rx_request {
@@ -335,7 +434,8 @@ impl LoraCommand {
             )));
         }
         Ok(CommandResponse::ok(format!(
-            "lora freq={} bw={} sf={} cr={} sync_word=0x{:02x} crc={} preamble={} tx_power={} spi_host={} sck={} miso={} mosi={} cs={} rst={} dio0={}",
+            "lora chip={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} crc={} preamble={} tx_power={} spi_host={} sck={} miso={} mosi={} cs={} rst={} dio0={} busy={}",
+            state.config.chip.as_str(),
             state.config.frequency_hz,
             state.config.bandwidth_hz,
             state.config.sf,
@@ -350,19 +450,22 @@ impl LoraCommand {
             state.config.mosi,
             state.config.cs,
             state.config.rst,
-            state.config.dio0
+            state.config.dio0,
+            state.config.busy
         )))
     }
 
     fn probe(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         let state = LoraState::load(&self.settings)?;
         let host_candidates = parse_i32_list(request.arg("spi_host"), state.config.spi_host)?;
+        let chip_candidates = parse_chip_list(request.arg("chip"), state.config.chip)?;
         let sck_candidates = parse_pin_list(request.arg("sck"), state.config.sck)?;
         let miso_candidates = parse_pin_list(request.arg("miso"), state.config.miso)?;
         let mosi_candidates = parse_pin_list(request.arg("mosi"), state.config.mosi)?;
         let cs_candidates = parse_pin_list(request.arg("cs"), state.config.cs)?;
         let rst_candidates = parse_pin_list(request.arg("rst"), state.config.rst)?;
         let dio0_candidates = parse_pin_list(request.arg("dio0"), state.config.dio0)?;
+        let busy_candidates = parse_optional_pin_list(request.arg("busy"), state.config.busy)?;
 
         let save = request
             .arg("save")
@@ -371,40 +474,52 @@ impl LoraCommand {
             .unwrap_or(false);
         let mut attempts = Vec::new();
 
-        for host in &host_candidates {
-            for sck in &sck_candidates {
-                for miso in &miso_candidates {
-                    for mosi in &mosi_candidates {
-                        for cs in &cs_candidates {
-                            for rst in &rst_candidates {
-                                for dio0 in &dio0_candidates {
-                                    if has_duplicate_pins(&[*sck, *miso, *mosi, *cs, *rst, *dio0]) {
-                                        continue;
-                                    }
-                                    let mut config = state.config.clone();
-                                    config.spi_host = *host;
-                                    config.sck = *sck;
-                                    config.miso = *miso;
-                                    config.mosi = *mosi;
-                                    config.cs = *cs;
-                                    config.rst = *rst;
-                                    config.dio0 = *dio0;
-                                    let result = probe_lora(&config);
-                                    attempts.push(format!(
-                                        "host={host},sck={sck},miso={miso},mosi={mosi},cs={cs},rst={rst},dio0={dio0}:{result}"
+        for chip in &chip_candidates {
+            for host in &host_candidates {
+                for sck in &sck_candidates {
+                    for miso in &miso_candidates {
+                        for mosi in &mosi_candidates {
+                            for cs in &cs_candidates {
+                                for rst in &rst_candidates {
+                                    for dio0 in &dio0_candidates {
+                                        for busy in &busy_candidates {
+                                            if has_duplicate_pins(&[
+                                                *sck, *miso, *mosi, *cs, *rst, *dio0, *busy,
+                                            ]) {
+                                                continue;
+                                            }
+                                            let mut config = state.config.clone();
+                                            config.chip = *chip;
+                                            config.spi_host = *host;
+                                            config.sck = *sck;
+                                            config.miso = *miso;
+                                            config.mosi = *mosi;
+                                            config.cs = *cs;
+                                            config.rst = *rst;
+                                            config.dio0 = *dio0;
+                                            config.busy = *busy;
+                                            let result = probe_lora(&config);
+                                            attempts.push(format!(
+                                        "chip={},host={host},sck={sck},miso={miso},mosi={mosi},cs={cs},rst={rst},dio0={dio0},busy={busy}:{result}",
+                                        chip.as_str()
                                     ));
-                                    if result.starts_with("ready") && save {
-                                        let mut settings = self.settings.borrow_mut();
-                                        settings.set_i32("lora.spi_host", *host)?;
-                                        settings.set_i32("lora.sck", *sck)?;
-                                        settings.set_i32("lora.miso", *miso)?;
-                                        settings.set_i32("lora.mosi", *mosi)?;
-                                        settings.set_i32("lora.cs", *cs)?;
-                                        settings.set_i32("lora.rst", *rst)?;
-                                        settings.set_i32("lora.dio0", *dio0)?;
-                                        return Ok(CommandResponse::ok(format!(
-                                            "loraprobe matched host={host} sck={sck} miso={miso} mosi={mosi} cs={cs} rst={rst} dio0={dio0} saved=true"
+                                            if result.starts_with("ready") && save {
+                                                let mut settings = self.settings.borrow_mut();
+                                                settings.set_str("lora.chip", chip.as_str())?;
+                                                settings.set_i32("lora.spi_host", *host)?;
+                                                settings.set_i32("lora.sck", *sck)?;
+                                                settings.set_i32("lora.miso", *miso)?;
+                                                settings.set_i32("lora.mosi", *mosi)?;
+                                                settings.set_i32("lora.cs", *cs)?;
+                                                settings.set_i32("lora.rst", *rst)?;
+                                                settings.set_i32("lora.dio0", *dio0)?;
+                                                settings.set_i32("lora.busy", *busy)?;
+                                                return Ok(CommandResponse::ok(format!(
+                                            "loraprobe matched chip={} host={host} sck={sck} miso={miso} mosi={mosi} cs={cs} rst={rst} dio0={dio0} busy={busy} saved=true",
+                                            chip.as_str()
                                         )));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -428,13 +543,6 @@ impl LoraCommand {
             .map(FrameKind::parse)
             .transpose()?
             .unwrap_or(FrameKind::Meshtastic);
-        let sender = meshtastic_sender_node()?;
-        let packet_id = LORA_PACKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let channel = self
-            .settings
-            .borrow()
-            .get_i32("lora.channel_hash", MESHTASTIC_DEFAULT_CHANNEL_HASH as i32)?
-            .clamp(0, u8::MAX as i32) as u8;
         let portnum = request
             .arg_i32("portnum")?
             .or_else(|| {
@@ -447,71 +555,34 @@ impl LoraCommand {
         if !(0..=511).contains(&portnum) {
             bail!("Meshtastic portnum out of private/reserved range: {portnum}");
         }
-        let hop_limit = self
-            .settings
-            .borrow()
-            .get_i32("lora.hop_limit", MESHTASTIC_DEFAULT_HOP_LIMIT as i32)?
-            .clamp(0, 7) as u8;
-        let packet = match kind {
-            FrameKind::Meshtastic => encode_meshtastic_frame(
-                &encode_meshtastic_data(portnum as u32, &payload)?,
-                sender,
-                packet_id,
-                channel,
-                hop_limit,
-            )?,
-            FrameKind::Raw => payload.clone(),
-        };
-        if packet.len() > 255 {
-            bail!("LoRa payload too large: {}", packet.len());
-        }
         let timeout_ms = parse_arg_or(request, "timeout", 2000)? as u32;
-        let state = LoraState::load(&self.settings)?;
-        let _guard = lora_spi_lock().lock().unwrap();
-        let mut radio = Sx127x::open(&state.config)?;
-        radio.configure_radio()?;
-        let background_rx = BACKGROUND_RX_RUNNING.load(Ordering::Relaxed);
-        if background_rx {
-            set_lora_irq_enabled(state.config.dio0, false)?;
-        }
-        let send_result = radio.send_packet(&packet, timeout_ms);
-        if background_rx {
-            let rx_result = radio.start_rx();
-            let irq_result = set_lora_irq_enabled(state.config.dio0, true);
-            send_result?;
-            rx_result?;
-            irq_result?;
-        } else {
-            send_result?;
-        }
-        telemetry::count_packet("lora", Direction::Tx, packet.len());
-        telemetry::record_log(format!(
-            "ev=lora.tx t=lora src={} dst={} n={} len={} data_len={} rf={}",
-            format_meshtastic_node(sender),
-            if kind == FrameKind::Meshtastic {
-                format_meshtastic_node(super::frames::MESHTASTIC_BROADCAST)
-            } else {
-                "-".to_string()
-            },
-            packet_id,
-            packet.len(),
-            payload.len(),
-            compact_rf(&state.config)
-        ));
-        Ok(CommandResponse::ok(format!(
-            "lorasend src={} dst={} n={} len={} data_len={} rf={}{}",
-            format_meshtastic_node(sender),
-            if kind == FrameKind::Meshtastic {
-                format_meshtastic_node(super::frames::MESHTASTIC_BROADCAST)
-            } else {
-                "-".to_string()
-            },
-            packet_id,
-            packet.len(),
-            payload.len(),
-            compact_rf(&state.config),
-            if kind == FrameKind::Raw { " f=raw" } else { "" }
-        )))
+        let hop_limit = request
+            .arg_i32("hop_limit")?
+            .or(request.arg_i32("hop")?)
+            .or_else(|| {
+                if request
+                    .arg("forward")
+                    .map(parse_bool)
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false)
+                {
+                    Some(1)
+                } else {
+                    None
+                }
+            })
+            .map(|hop| hop.clamp(0, 7) as u8);
+        let response = send_payload(
+            &self.settings,
+            &payload,
+            kind,
+            hop_limit,
+            Some(portnum as u32),
+            timeout_ms,
+        )?;
+        Ok(CommandResponse::ok(response))
     }
 
     fn listen(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -526,7 +597,7 @@ impl LoraCommand {
         let state = LoraState::load(&self.settings)?;
         let local_node = meshtastic_sender_node().ok();
         let _guard = lora_spi_lock().lock().unwrap();
-        let mut radio = Sx127x::open(&state.config)?;
+        let mut radio = Radio::open(&state.config)?;
         radio.configure_radio()?;
         radio.start_rx()?;
 
@@ -603,19 +674,8 @@ impl LoraCommand {
     fn dump(&mut self, _request: &CommandRequest) -> Result<CommandResponse> {
         let state = LoraState::load(&self.settings)?;
         let _guard = lora_spi_lock().lock().unwrap();
-        let mut radio = Sx127x::open(&state.config)?;
-        let mut regs = Vec::new();
-        let mut values = [0_u8; 0x50];
-        for reg in 0x00_u8..=0x4f {
-            let value = radio.read_reg(reg)?;
-            values[reg as usize] = value;
-            regs.push(format!("{reg:02x}:{value:02x}"));
-        }
-        Ok(CommandResponse::ok(format!(
-            "loradump {} regs={}",
-            decode_registers(&values),
-            regs.join(" ")
-        )))
+        let mut radio = Radio::open(&state.config)?;
+        Ok(CommandResponse::ok(format!("loradump {}", radio.dump()?)))
     }
 }
 
@@ -668,7 +728,7 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
     );
     {
         let _guard = lora_spi_lock().lock().unwrap();
-        let mut radio = Sx127x::open(&config)?;
+        let mut radio = Radio::open(&config)?;
         radio.configure_radio()?;
         radio.start_rx()?;
     }
@@ -723,7 +783,7 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
 
 fn poll_background_packet(config: &LoraConfig) -> Result<Option<Packet>> {
     let _guard = lora_spi_lock().lock().unwrap();
-    let mut radio = Sx127x::open_no_reset(config)?;
+    let mut radio = Radio::open_no_reset(config)?;
     let packet = radio.poll_packet()?;
     radio.start_rx()?;
     Ok(packet)
@@ -871,6 +931,7 @@ unsafe extern "C" fn lora_dio0_isr(_arg: *mut core::ffi::c_void) {
 }
 
 fn forward_rx_packet(packet: &Packet) {
+    super::mode::observe_ping("lora", &packet.data);
     match super::ble_bt::announce_lora_packet(&packet.data, packet.rssi, packet.snr) {
         Ok(()) => {
             let line = format!("ev=lora.fwd t=ble len={} ok=true", packet.data.len());
@@ -958,6 +1019,69 @@ struct Sx127x {
     config: LoraConfig,
     host: sys::spi_host_device_t,
     handle: sys::spi_device_handle_t,
+}
+
+enum Radio {
+    Sx127x(Sx127x),
+    Sx1262(Sx1262),
+}
+
+impl Radio {
+    fn open(config: &LoraConfig) -> Result<Self> {
+        match config.chip {
+            LoraChip::Sx127x => Ok(Self::Sx127x(Sx127x::open(config)?)),
+            LoraChip::Sx1262 => Ok(Self::Sx1262(Sx1262::open(config)?)),
+        }
+    }
+
+    fn open_no_reset(config: &LoraConfig) -> Result<Self> {
+        match config.chip {
+            LoraChip::Sx127x => Ok(Self::Sx127x(Sx127x::open_no_reset(config)?)),
+            LoraChip::Sx1262 => Ok(Self::Sx1262(Sx1262::open_no_reset(config)?)),
+        }
+    }
+
+    fn configure_radio(&mut self) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.configure_radio(),
+            Self::Sx1262(radio) => radio.configure_radio(),
+        }
+    }
+
+    fn send_packet(&mut self, payload: &[u8], timeout_ms: u32) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.send_packet(payload, timeout_ms),
+            Self::Sx1262(radio) => radio.send_packet(payload, timeout_ms),
+        }
+    }
+
+    fn start_rx(&mut self) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.start_rx(),
+            Self::Sx1262(radio) => radio.start_rx(),
+        }
+    }
+
+    fn sleep(&mut self) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.sleep(),
+            Self::Sx1262(radio) => radio.sleep(),
+        }
+    }
+
+    fn poll_packet(&mut self) -> Result<Option<Packet>> {
+        match self {
+            Self::Sx127x(radio) => radio.poll_packet(),
+            Self::Sx1262(radio) => radio.poll_packet(),
+        }
+    }
+
+    fn dump(&mut self) -> Result<String> {
+        match self {
+            Self::Sx127x(radio) => radio.dump(),
+            Self::Sx1262(radio) => radio.dump(),
+        }
+    }
 }
 
 impl Sx127x {
@@ -1158,6 +1282,10 @@ impl Sx127x {
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_RX_CONTINUOUS)
     }
 
+    fn sleep(&mut self) -> Result<()> {
+        self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_SLEEP)
+    }
+
     fn poll_packet(&mut self) -> Result<Option<Packet>> {
         let irq = self.read_reg(REG_IRQ_FLAGS)?;
         if irq & IRQ_RX_DONE == 0 {
@@ -1177,6 +1305,21 @@ impl Sx127x {
         let snr = (self.read_reg(REG_PKT_SNR_VALUE)? as i8) as f32 / 4.0;
         let rssi = self.read_reg(REG_PKT_RSSI_VALUE)? as i32 - 164;
         Ok(Some(Packet { data, rssi, snr }))
+    }
+
+    fn dump(&mut self) -> Result<String> {
+        let mut regs = Vec::new();
+        let mut values = [0_u8; 0x50];
+        for reg in 0x00_u8..=0x4f {
+            let value = self.read_reg(reg)?;
+            values[reg as usize] = value;
+            regs.push(format!("{reg:02x}:{value:02x}"));
+        }
+        Ok(format!(
+            "chip=sx127x {} regs={}",
+            decode_registers(&values),
+            regs.join(" ")
+        ))
     }
 
     fn read_reg(&mut self, reg: u8) -> Result<u8> {
@@ -1217,13 +1360,13 @@ pub struct WakePacket {
 }
 
 pub fn prepare_deep_sleep_rx(config: &LoraConfig) -> Result<()> {
-    let mut radio = Sx127x::open(config)?;
+    let mut radio = Radio::open(config)?;
     radio.configure_radio()?;
     radio.start_rx()
 }
 
 pub fn read_wake_packet_no_reset(config: &LoraConfig) -> Result<Option<WakePacket>> {
-    let mut radio = Sx127x::open_no_reset(config)?;
+    let mut radio = Radio::open_no_reset(config)?;
     Ok(radio.poll_packet()?.map(|packet| WakePacket {
         data: packet.data,
         rssi: packet.rssi,
@@ -1242,21 +1385,435 @@ impl Drop for Sx127x {
     }
 }
 
+const SX126X_CMD_SET_SLEEP: u8 = 0x84;
+const SX126X_CMD_SET_STANDBY: u8 = 0x80;
+const SX126X_CMD_SET_TX: u8 = 0x83;
+const SX126X_CMD_SET_RX: u8 = 0x82;
+const SX126X_CMD_SET_PACKET_TYPE: u8 = 0x8a;
+const SX126X_CMD_GET_PACKET_TYPE: u8 = 0x11;
+const SX126X_CMD_SET_RF_FREQUENCY: u8 = 0x86;
+const SX126X_CMD_SET_PA_CONFIG: u8 = 0x95;
+const SX126X_CMD_SET_TX_PARAMS: u8 = 0x8e;
+const SX126X_CMD_SET_BUFFER_BASE_ADDRESS: u8 = 0x8f;
+const SX126X_CMD_SET_MODULATION_PARAMS: u8 = 0x8b;
+const SX126X_CMD_SET_PACKET_PARAMS: u8 = 0x8c;
+const SX126X_CMD_SET_DIO_IRQ_PARAMS: u8 = 0x08;
+const SX126X_CMD_GET_IRQ_STATUS: u8 = 0x12;
+const SX126X_CMD_CLEAR_IRQ_STATUS: u8 = 0x02;
+const SX126X_CMD_SET_DIO2_AS_RF_SWITCH: u8 = 0x9d;
+const SX126X_CMD_SET_DIO3_AS_TCXO_CTRL: u8 = 0x97;
+const SX126X_CMD_GET_STATUS: u8 = 0xc0;
+const SX126X_CMD_GET_RX_BUFFER_STATUS: u8 = 0x13;
+const SX126X_CMD_GET_PACKET_STATUS: u8 = 0x14;
+const SX126X_CMD_WRITE_BUFFER: u8 = 0x0e;
+const SX126X_CMD_READ_BUFFER: u8 = 0x1e;
+
+const SX126X_PACKET_TYPE_LORA: u8 = 0x01;
+const SX126X_STANDBY_RC: u8 = 0x00;
+const SX126X_RAMP_200_US: u8 = 0x04;
+const SX126X_IRQ_TX_DONE: u16 = 0x0001;
+const SX126X_IRQ_RX_DONE: u16 = 0x0002;
+const SX126X_IRQ_CRC_ERR: u16 = 0x0040;
+const SX126X_IRQ_TIMEOUT: u16 = 0x0200;
+
+struct Sx1262 {
+    config: LoraConfig,
+    host: sys::spi_host_device_t,
+    handle: sys::spi_device_handle_t,
+}
+
+impl Sx1262 {
+    fn open(config: &LoraConfig) -> Result<Self> {
+        Self::open_inner(config, true)
+    }
+
+    fn open_no_reset(config: &LoraConfig) -> Result<Self> {
+        Self::open_inner(config, false)
+    }
+
+    fn open_inner(config: &LoraConfig, reset: bool) -> Result<Self> {
+        validate_config(config)?;
+        let host = spi_host(config.spi_host)?;
+        unsafe {
+            let _ = sys::spi_bus_free(host);
+        }
+
+        let mut bus = sys::spi_bus_config_t::default();
+        bus.sclk_io_num = config.sck;
+        bus.max_transfer_sz = 512;
+        unsafe {
+            bus.__bindgen_anon_1.mosi_io_num = config.mosi;
+            bus.__bindgen_anon_2.miso_io_num = config.miso;
+            bus.__bindgen_anon_3.quadwp_io_num = sys::gpio_num_t_GPIO_NUM_NC;
+            bus.__bindgen_anon_4.quadhd_io_num = sys::gpio_num_t_GPIO_NUM_NC;
+            esp_ok(sys::spi_bus_initialize(
+                host,
+                &bus,
+                sys::spi_common_dma_t_SPI_DMA_DISABLED,
+            ))?;
+        }
+
+        let mut dev = sys::spi_device_interface_config_t::default();
+        dev.clock_speed_hz = 1_000_000;
+        dev.mode = 0;
+        dev.spics_io_num = sys::gpio_num_t_GPIO_NUM_NC;
+        dev.queue_size = 1;
+
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            esp_ok(sys::spi_bus_add_device(host, &dev, &mut handle))?;
+            esp_ok(sys::gpio_set_direction(
+                config.cs,
+                sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+            ))?;
+            esp_ok(sys::gpio_set_level(config.cs, 1))?;
+            esp_ok(sys::gpio_set_direction(
+                config.rst,
+                sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+            ))?;
+            esp_ok(sys::gpio_set_direction(
+                config.dio0,
+                sys::gpio_mode_t_GPIO_MODE_INPUT,
+            ))?;
+            esp_ok(sys::gpio_set_direction(
+                config.busy,
+                sys::gpio_mode_t_GPIO_MODE_INPUT,
+            ))?;
+        }
+
+        let mut radio = Self {
+            config: *config,
+            host,
+            handle,
+        };
+        if reset {
+            radio.reset()?;
+        }
+        radio.set_standby()?;
+        let status = radio.status()?;
+        if status == 0x00 || status == 0xff {
+            bail!("unexpected SX1262 status 0x{status:02x}");
+        }
+        Ok(radio)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        unsafe {
+            esp_ok(sys::gpio_set_level(self.config.rst, 0))?;
+        }
+        thread::sleep(Duration::from_millis(10));
+        unsafe {
+            esp_ok(sys::gpio_set_level(self.config.rst, 1))?;
+        }
+        thread::sleep(Duration::from_millis(20));
+        self.wait_while_busy(Duration::from_millis(500))
+    }
+
+    fn configure_radio(&mut self) -> Result<()> {
+        self.set_standby()?;
+        self.command(SX126X_CMD_SET_DIO2_AS_RF_SWITCH, &[0x01])?;
+        self.command(SX126X_CMD_SET_DIO3_AS_TCXO_CTRL, &[0x02, 0x00, 0x03, 0x20])?;
+        thread::sleep(Duration::from_millis(5));
+        self.command(SX126X_CMD_SET_PACKET_TYPE, &[SX126X_PACKET_TYPE_LORA])?;
+        self.set_frequency(self.config.frequency_hz)?;
+        self.command(SX126X_CMD_SET_PA_CONFIG, &[0x04, 0x07, 0x00, 0x01])?;
+        self.command(
+            SX126X_CMD_SET_TX_PARAMS,
+            &[
+                self.config.tx_power.clamp(-9, 22) as i8 as u8,
+                SX126X_RAMP_200_US,
+            ],
+        )?;
+        self.command(SX126X_CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x80])?;
+        self.set_modulation_params()?;
+        self.set_packet_params(255)?;
+        self.set_irq_mask(
+            SX126X_IRQ_TX_DONE | SX126X_IRQ_RX_DONE | SX126X_IRQ_CRC_ERR | SX126X_IRQ_TIMEOUT,
+        )?;
+        self.clear_irq(0xffff)?;
+        Ok(())
+    }
+
+    fn set_standby(&mut self) -> Result<()> {
+        self.command(SX126X_CMD_SET_STANDBY, &[SX126X_STANDBY_RC])
+    }
+
+    fn set_frequency(&mut self, hz: u32) -> Result<()> {
+        let rf = ((hz as u64) << 25) / 32_000_000_u64;
+        self.command(
+            SX126X_CMD_SET_RF_FREQUENCY,
+            &[
+                (rf >> 24) as u8,
+                (rf >> 16) as u8,
+                (rf >> 8) as u8,
+                rf as u8,
+            ],
+        )
+    }
+
+    fn set_modulation_params(&mut self) -> Result<()> {
+        let bw = match self.config.bandwidth_hz {
+            7_800 => 0x00,
+            10_400 => 0x08,
+            15_600 => 0x01,
+            20_800 => 0x09,
+            31_250 => 0x02,
+            41_700 => 0x0a,
+            62_500 => 0x03,
+            125_000 => 0x04,
+            250_000 => 0x05,
+            500_000 => 0x06,
+            hz => bail!("unsupported SX1262 LoRa bandwidth {hz}"),
+        };
+        let cr = (self.config.cr - 4).clamp(1, 4) as u8;
+        let ldro = if symbol_time_ms(self.config.bandwidth_hz, self.config.sf) >= 16 {
+            1
+        } else {
+            0
+        };
+        self.command(
+            SX126X_CMD_SET_MODULATION_PARAMS,
+            &[self.config.sf as u8, bw, cr, ldro],
+        )
+    }
+
+    fn set_packet_params(&mut self, payload_len: u8) -> Result<()> {
+        self.command(
+            SX126X_CMD_SET_PACKET_PARAMS,
+            &[
+                (self.config.preamble >> 8) as u8,
+                self.config.preamble as u8,
+                0x00,
+                payload_len,
+                if self.config.crc { 0x01 } else { 0x00 },
+                0x00,
+            ],
+        )
+    }
+
+    fn set_irq_mask(&mut self, mask: u16) -> Result<()> {
+        let dio1 = mask;
+        self.command(
+            SX126X_CMD_SET_DIO_IRQ_PARAMS,
+            &[
+                (mask >> 8) as u8,
+                mask as u8,
+                (dio1 >> 8) as u8,
+                dio1 as u8,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+
+    fn send_packet(&mut self, payload: &[u8], timeout_ms: u32) -> Result<()> {
+        if payload.len() > 255 {
+            bail!("SX1262 payload too large: {}", payload.len());
+        }
+        self.set_standby()?;
+        self.set_packet_params(payload.len() as u8)?;
+        self.write_buffer(0, payload)?;
+        self.clear_irq(0xffff)?;
+        let timeout = sx126x_timeout(timeout_ms);
+        self.command(
+            SX126X_CMD_SET_TX,
+            &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
+        )?;
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        while Instant::now() < deadline {
+            let irq = self.irq_status()?;
+            if irq & SX126X_IRQ_TX_DONE != 0 {
+                self.clear_irq(irq)?;
+                self.set_standby()?;
+                return Ok(());
+            }
+            if irq & SX126X_IRQ_TIMEOUT != 0 {
+                self.clear_irq(irq)?;
+                bail!("SX1262 TX timeout");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        bail!("SX1262 TX timeout");
+    }
+
+    fn start_rx(&mut self) -> Result<()> {
+        self.set_standby()?;
+        self.set_packet_params(255)?;
+        self.clear_irq(0xffff)?;
+        self.command(SX126X_CMD_SET_RX, &[0xff, 0xff, 0xff])
+    }
+
+    fn sleep(&mut self) -> Result<()> {
+        self.command(SX126X_CMD_SET_SLEEP, &[0x00])
+    }
+
+    fn poll_packet(&mut self) -> Result<Option<Packet>> {
+        let irq = self.irq_status()?;
+        if irq & SX126X_IRQ_RX_DONE == 0 {
+            return Ok(None);
+        }
+        self.clear_irq(irq)?;
+        if irq & SX126X_IRQ_CRC_ERR != 0 {
+            return Ok(None);
+        }
+        let (len, offset) = self.rx_buffer_status()?;
+        let data = self.read_buffer(offset, len)?;
+        let (rssi, snr) = self.packet_status()?;
+        Ok(Some(Packet { data, rssi, snr }))
+    }
+
+    fn dump(&mut self) -> Result<String> {
+        let status = self.status()?;
+        let packet_type = self.read_u8(SX126X_CMD_GET_PACKET_TYPE)?;
+        let irq = self.irq_status()?;
+        Ok(format!(
+            "chip=sx1262 status=0x{status:02x} packet_type=0x{packet_type:02x} irq=0x{irq:04x} busy={} dio1={}",
+            self.config.busy, self.config.dio0
+        ))
+    }
+
+    fn status(&mut self) -> Result<u8> {
+        self.read_u8(SX126X_CMD_GET_STATUS)
+    }
+
+    fn irq_status(&mut self) -> Result<u16> {
+        let data = self.read(SX126X_CMD_GET_IRQ_STATUS, &[], 2)?;
+        Ok(((data[0] as u16) << 8) | data[1] as u16)
+    }
+
+    fn clear_irq(&mut self, mask: u16) -> Result<()> {
+        self.command(
+            SX126X_CMD_CLEAR_IRQ_STATUS,
+            &[(mask >> 8) as u8, mask as u8],
+        )
+    }
+
+    fn rx_buffer_status(&mut self) -> Result<(usize, u8)> {
+        let data = self.read(SX126X_CMD_GET_RX_BUFFER_STATUS, &[], 2)?;
+        Ok((data[0] as usize, data[1]))
+    }
+
+    fn packet_status(&mut self) -> Result<(i32, f32)> {
+        let data = self.read(SX126X_CMD_GET_PACKET_STATUS, &[], 3)?;
+        let rssi = -(data[0] as i32) / 2;
+        let snr = (data[1] as i8) as f32 / 4.0;
+        Ok((rssi, snr))
+    }
+
+    fn write_buffer(&mut self, offset: u8, payload: &[u8]) -> Result<()> {
+        let mut data = Vec::with_capacity(payload.len() + 1);
+        data.push(offset);
+        data.extend_from_slice(payload);
+        self.command(SX126X_CMD_WRITE_BUFFER, &data)
+    }
+
+    fn read_buffer(&mut self, offset: u8, len: usize) -> Result<Vec<u8>> {
+        self.read(SX126X_CMD_READ_BUFFER, &[offset], len)
+    }
+
+    fn read_u8(&mut self, opcode: u8) -> Result<u8> {
+        Ok(self.read(opcode, &[], 1)?[0])
+    }
+
+    fn command(&mut self, opcode: u8, data: &[u8]) -> Result<()> {
+        self.wait_while_busy(Duration::from_millis(500))?;
+        let mut tx = Vec::with_capacity(data.len() + 1);
+        tx.push(opcode);
+        tx.extend_from_slice(data);
+        let mut rx = vec![0_u8; tx.len()];
+        self.spi(&tx, &mut rx)?;
+        self.wait_while_busy(Duration::from_millis(500))
+    }
+
+    fn read(&mut self, opcode: u8, args: &[u8], len: usize) -> Result<Vec<u8>> {
+        self.wait_while_busy(Duration::from_millis(500))?;
+        let mut tx = Vec::with_capacity(args.len() + len + 2);
+        tx.push(opcode);
+        tx.extend_from_slice(args);
+        tx.push(0);
+        tx.resize(args.len() + len + 2, 0);
+        let mut rx = vec![0_u8; tx.len()];
+        self.spi(&tx, &mut rx)?;
+        self.wait_while_busy(Duration::from_millis(500))?;
+        Ok(rx[(args.len() + 2)..].to_vec())
+    }
+
+    fn wait_while_busy(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let level = unsafe { sys::gpio_get_level(self.config.busy) };
+            if level == 0 {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        bail!("SX1262 busy timeout gpio={}", self.config.busy)
+    }
+
+    fn spi(&mut self, tx: &[u8], rx: &mut [u8]) -> Result<()> {
+        if tx.len() != rx.len() {
+            bail!("spi tx/rx length mismatch");
+        }
+        let mut transaction = sys::spi_transaction_t::default();
+        transaction.length = tx.len() * 8;
+        unsafe {
+            transaction.__bindgen_anon_1.tx_buffer = tx.as_ptr() as *const _;
+            transaction.__bindgen_anon_2.rx_buffer = rx.as_mut_ptr() as *mut _;
+            esp_ok(sys::gpio_set_level(self.config.cs, 0))?;
+            let ret = sys::spi_device_transmit(self.handle, &mut transaction);
+            let cs_ret = sys::gpio_set_level(self.config.cs, 1);
+            esp_ok(ret)?;
+            esp_ok(cs_ret)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Sx1262 {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.handle.is_null() {
+                let _ = sys::spi_bus_remove_device(self.handle);
+            }
+            let _ = sys::spi_bus_free(self.host);
+        }
+    }
+}
+
+fn sx126x_timeout(timeout_ms: u32) -> u32 {
+    let units = ((timeout_ms as u64) * 1000 / 15).clamp(1, 0x00ff_ffff);
+    units as u32
+}
+
+fn symbol_time_ms(bw: u32, sf: i32) -> u32 {
+    (((1_u32 << sf.clamp(6, 12)) as u64) * 1000 / bw.max(1) as u64) as u32
+}
+
 fn probe_lora(config: &LoraConfig) -> String {
     match probe_lora_ready(config) {
-        Ok(version) => format!("ready(version=0x{version:02x})"),
+        Ok(value) => match config.chip {
+            LoraChip::Sx127x => format!("ready(chip=sx127x,version=0x{value:02x})"),
+            LoraChip::Sx1262 => format!("ready(chip=sx1262,status=0x{value:02x})"),
+        },
         Err(err) => format!("err:{err}"),
     }
 }
 
 fn probe_lora_ready(config: &LoraConfig) -> Result<u8> {
     let _guard = lora_spi_lock().lock().unwrap();
-    let mut radio = Sx127x::open(config)?;
-    let version = radio.read_reg(REG_VERSION)?;
-    if version == SX127X_VERSION {
-        Ok(version)
-    } else {
-        bail!("unexpected SX127x version 0x{version:02x}")
+    match Radio::open(config)? {
+        Radio::Sx127x(mut radio) => {
+            let version = radio.read_reg(REG_VERSION)?;
+            if version == SX127X_VERSION {
+                Ok(version)
+            } else {
+                bail!("unexpected SX127x version 0x{version:02x}")
+            }
+        }
+        Radio::Sx1262(mut radio) => radio.status(),
     }
 }
 
@@ -1332,6 +1889,97 @@ fn parse_payload(request: &CommandRequest) -> Result<Vec<u8>> {
     bail!("lorasend requires data=hex:... or text=...");
 }
 
+fn send_payload(
+    settings: &SharedSettings,
+    payload: &[u8],
+    kind: FrameKind,
+    hop_limit: Option<u8>,
+    portnum: Option<u32>,
+    timeout_ms: u32,
+) -> Result<String> {
+    let sender = meshtastic_sender_node()?;
+    let packet_id = LORA_PACKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let channel = settings
+        .borrow()
+        .get_i32("lora.channel_hash", MESHTASTIC_DEFAULT_CHANNEL_HASH as i32)?
+        .clamp(0, u8::MAX as i32) as u8;
+    let portnum = match portnum {
+        Some(portnum) => portnum,
+        None => settings
+            .borrow()
+            .get_i32("lora.portnum", MESHTASTIC_DEFAULT_PORTNUM as i32)?
+            .clamp(0, 511) as u32,
+    };
+    let hop_limit = match hop_limit {
+        Some(hop_limit) => hop_limit.clamp(0, 7),
+        None => settings
+            .borrow()
+            .get_i32("lora.hop_limit", MESHTASTIC_DEFAULT_HOP_LIMIT as i32)?
+            .clamp(0, 7) as u8,
+    };
+    let packet = match kind {
+        FrameKind::Meshtastic => encode_meshtastic_frame(
+            &encode_meshtastic_data(portnum, payload)?,
+            sender,
+            packet_id,
+            channel,
+            hop_limit,
+        )?,
+        FrameKind::Raw => payload.to_vec(),
+    };
+    if packet.len() > 255 {
+        bail!("LoRa payload too large: {}", packet.len());
+    }
+    let state = LoraState::load(settings)?;
+    let _guard = lora_spi_lock().lock().unwrap();
+    let mut radio = Radio::open(&state.config)?;
+    radio.configure_radio()?;
+    let background_rx = BACKGROUND_RX_RUNNING.load(Ordering::Relaxed);
+    if background_rx {
+        set_lora_irq_enabled(state.config.dio0, false)?;
+    }
+    let send_result = radio.send_packet(&packet, timeout_ms);
+    if background_rx {
+        let rx_result = radio.start_rx();
+        let irq_result = set_lora_irq_enabled(state.config.dio0, true);
+        send_result?;
+        rx_result?;
+        irq_result?;
+    } else {
+        send_result?;
+    }
+    telemetry::count_packet("lora", Direction::Tx, packet.len());
+    telemetry::record_log(format!(
+        "ev=lora.tx t=lora src={} dst={} n={} hop={} len={} data_len={} rf={}",
+        format_meshtastic_node(sender),
+        if kind == FrameKind::Meshtastic {
+            format_meshtastic_node(super::frames::MESHTASTIC_BROADCAST)
+        } else {
+            "-".to_string()
+        },
+        packet_id,
+        hop_limit,
+        packet.len(),
+        payload.len(),
+        compact_rf(&state.config)
+    ));
+    Ok(format!(
+        "lorasend src={} dst={} n={} hop={} len={} data_len={} rf={}{}",
+        format_meshtastic_node(sender),
+        if kind == FrameKind::Meshtastic {
+            format_meshtastic_node(super::frames::MESHTASTIC_BROADCAST)
+        } else {
+            "-".to_string()
+        },
+        packet_id,
+        hop_limit,
+        packet.len(),
+        payload.len(),
+        compact_rf(&state.config),
+        if kind == FrameKind::Raw { " f=raw" } else { "" }
+    ))
+}
+
 fn compact_rf(config: &LoraConfig) -> String {
     format!(
         "{}/{}/{}/{}",
@@ -1404,6 +2052,24 @@ fn parse_pin_list(value: Option<&str>, default: i32) -> Result<Vec<i32>> {
     Ok(values)
 }
 
+fn parse_optional_pin_list(value: Option<&str>, default: i32) -> Result<Vec<i32>> {
+    let values = parse_i32_list(value, default)?;
+    for pin in &values {
+        validate_optional_pin(*pin)?;
+    }
+    Ok(values)
+}
+
+fn parse_chip_list(value: Option<&str>, default: LoraChip) -> Result<Vec<LoraChip>> {
+    match value {
+        Some(value) => value
+            .split(',')
+            .map(|item| LoraChip::parse(item.trim()))
+            .collect(),
+        None => Ok(vec![default]),
+    }
+}
+
 fn parse_i32_list(value: Option<&str>, default: i32) -> Result<Vec<i32>> {
     match value {
         Some(value) => value
@@ -1424,6 +2090,9 @@ fn parse_arg_or(request: &CommandRequest, key: &str, default: i32) -> Result<i32
 
 fn has_duplicate_pins(pins: &[i32]) -> bool {
     for (idx, pin) in pins.iter().enumerate() {
+        if *pin < 0 {
+            continue;
+        }
         if pins[idx + 1..].contains(pin) {
             return true;
         }
@@ -1451,6 +2120,10 @@ fn validate_config(config: &LoraConfig) -> Result<()> {
     ] {
         validate_pin(pin)?;
     }
+    validate_optional_pin(config.busy)?;
+    if matches!(config.chip, LoraChip::Sx1262) && config.busy < 0 {
+        bail!("SX1262 requires busy GPIO");
+    }
     validate_sf(config.sf)?;
     validate_cr(config.cr)?;
     validate_bandwidth(config.bandwidth_hz)?;
@@ -1465,6 +2138,14 @@ fn validate_pin(pin: i32) -> Result<()> {
         return Err(anyhow!("invalid ESP32 GPIO pin {pin}"));
     }
     Ok(())
+}
+
+fn validate_optional_pin(pin: i32) -> Result<()> {
+    if pin == -1 {
+        Ok(())
+    } else {
+        validate_pin(pin)
+    }
 }
 
 fn validate_sf(sf: i32) -> Result<()> {

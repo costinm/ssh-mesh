@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 pub mod protocol;
 
 pub type CommandArgs = BTreeMap<String, String>;
+const DEFAULT_HELP_MAX_BYTES: usize = 900;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest {
@@ -100,13 +101,7 @@ impl CommandRegistry {
 
     pub fn dispatch(&mut self, request: &CommandRequest) -> CommandResponse {
         if request.name == "help" {
-            let help = self
-                .help()
-                .into_iter()
-                .map(|(name, help)| format!("{name}: {help}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return CommandResponse::ok(help);
+            return CommandResponse::ok(self.help_text(request));
         }
 
         match self
@@ -121,10 +116,49 @@ impl CommandRegistry {
         }
     }
 
-    pub fn help(&self) -> Vec<(&'static str, &'static str)> {
-        self.handlers
-            .iter()
-            .map(|handler| (handler.name(), handler.help()))
-            .collect()
+    fn help_text(&self, request: &CommandRequest) -> String {
+        if let Some(name) = request.arg("command").or_else(|| request.arg("cmd")) {
+            return self
+                .handlers
+                .iter()
+                .find(|handler| handler.name() == name)
+                .map(|handler| format!("{}: {}", handler.name(), handler.help()))
+                .unwrap_or_else(|| format!("unknown command: {name}"));
+        }
+
+        let max_bytes = request
+            .arg_i32("max_bytes")
+            .ok()
+            .flatten()
+            .unwrap_or(DEFAULT_HELP_MAX_BYTES as i32)
+            .clamp(160, 4096) as usize;
+        let mut out = String::new();
+        let mut count = 0_usize;
+        let mut more = false;
+        for handler in &self.handlers {
+            let line = format!("{}: {}\n", handler.name(), short_help(handler.help()));
+            if out.len() + line.len() > max_bytes {
+                more = true;
+                break;
+            }
+            out.push_str(&line);
+            count += 1;
+        }
+        if more {
+            out.push_str(&format!(
+                "help more=true shown={} total={} hint=\"help command=wifi\"\n",
+                count,
+                self.handlers.len()
+            ));
+        }
+        out
     }
+}
+
+fn short_help(help: &'static str) -> &'static str {
+    help.split('|')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(help)
 }

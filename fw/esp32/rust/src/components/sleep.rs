@@ -8,15 +8,16 @@ use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::lora::{self, LoraConfig};
+use super::lora::{self, LoraChip, LoraConfig};
 use super::settings::{parse_bool, SharedSettings};
 use super::telemetry;
 
 const RTC_MAGIC: u32 = 0x4453_4c50;
-const RTC_VERSION: u16 = 1;
+const RTC_VERSION: u16 = 2;
 const FLAG_WIFI: u32 = 1 << 0;
 const FLAG_SERIAL: u32 = 1 << 1;
 const FLAG_BLE: u32 = 1 << 2;
+const FLAG_LORA: u32 = 1 << 3;
 const DEFAULT_WAKE_MS: u32 = 5_000;
 const DEFAULT_FORWARD_MS: u32 = 1_000;
 const LIGHT_PS_NONE: u8 = 0;
@@ -26,6 +27,7 @@ const LIGHT_PS_MAX: u8 = 2;
 static LIGHT_SLEEP_ENABLED: AtomicBool = AtomicBool::new(false);
 static LIGHT_WIFI: AtomicBool = AtomicBool::new(false);
 static LIGHT_BLE: AtomicBool = AtomicBool::new(false);
+static LIGHT_BLE_SCAN: AtomicBool = AtomicBool::new(false);
 static LIGHT_RAW: AtomicBool = AtomicBool::new(false);
 static LIGHT_NAN: AtomicBool = AtomicBool::new(false);
 static LIGHT_SERIAL: AtomicBool = AtomicBool::new(false);
@@ -41,6 +43,7 @@ unsafe extern "C" {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct RtcLoraConfig {
+    chip: i32,
     frequency_hz: u32,
     bandwidth_hz: u32,
     spi_host: i32,
@@ -50,6 +53,7 @@ struct RtcLoraConfig {
     cs: i32,
     rst: i32,
     dio0: i32,
+    busy: i32,
     sf: i32,
     cr: i32,
     sync_word: i32,
@@ -98,6 +102,7 @@ impl RtcSleepState {
             _pad0: 0,
             last_packet_hash: 0,
             lora: RtcLoraConfig {
+                chip: 0,
                 frequency_hz: 0,
                 bandwidth_hz: 0,
                 spi_host: 0,
@@ -107,6 +112,7 @@ impl RtcSleepState {
                 cs: 0,
                 rst: 0,
                 dio0: 0,
+                busy: -1,
                 sf: 0,
                 cr: 0,
                 sync_word: 0,
@@ -149,7 +155,8 @@ pub fn handle_deep_sleep_wake() -> Result<()> {
         return Ok(());
     }
 
-    let lora_wake = cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_EXT1
+    let lora_wake = state.flags & FLAG_LORA != 0
+        && cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_EXT1
         && ext1_mask & (1_u64 << state.lora.dio0) != 0;
     let timer_wake = cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_TIMER;
     if !lora_wake && !timer_wake {
@@ -209,10 +216,13 @@ impl CommandHandler for SleepCommand {
     }
 
     fn help(&self) -> &'static str {
-        "sleep status=true | sleep mode=deep wake_ms=5000 active_ms=1000 ble=true wifi=true serial=true start=true | sleep mode=light start=true stop=true wifi=true ble=true raw=true nan=false ps=min|max|none channel=6 wake_ms=0 serial=true"
+        "sleep status=true | sleep profile=ble_adv|active | sleep mode=deep wake_ms=5000 active_ms=1000 ble=true wifi=true serial=true start=true | sleep mode=light start=true stop=true wifi=true ble=true ble_scan=false raw=true nan=false ps=min|max|none channel=6 wake_ms=0 serial=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        if let Some(profile) = request.arg("profile") {
+            return apply_profile(&self.settings, request, profile);
+        }
         if request.arg("status").is_some()
             || (request.arg("start").is_none() && request.arg("stop").is_none())
         {
@@ -245,6 +255,15 @@ impl CommandHandler for SleepCommand {
             .unwrap_or(DEFAULT_FORWARD_MS);
         let mut flags = 0_u32;
         if request
+            .arg("lora")
+            .or_else(|| request.arg("lora_listen"))
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(true)
+        {
+            flags |= FLAG_LORA;
+        }
+        if request
             .arg("wifi")
             .map(parse_bool)
             .transpose()?
@@ -269,12 +288,157 @@ impl CommandHandler for SleepCommand {
             flags |= FLAG_SERIAL;
         }
         let mut state = new_state(config, wake_ms, forward_ms, flags);
-        lora::prepare_deep_sleep_rx(&config)?;
+        if flags & FLAG_LORA != 0 {
+            lora::prepare_deep_sleep_rx(&config)?;
+        }
         state = update_checksum(state);
         write_state(state);
         enter_deep_sleep_with_state(state)?;
         Ok(CommandResponse::ok("sleep rejected"))
     }
+}
+
+fn apply_profile(
+    settings: &SharedSettings,
+    request: &CommandRequest,
+    profile: &str,
+) -> Result<CommandResponse> {
+    match profile {
+        "ble_adv" | "ble-advertise" | "ble_connectable" => {
+            if request
+                .arg("lora_sleep")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(true)
+            {
+                lora::sleep_radio(settings)?;
+            }
+            start_light_sleep_profile(
+                settings,
+                LightSleepProfile {
+                    ble: true,
+                    ble_scan: false,
+                    wifi: false,
+                    raw: false,
+                    nan: false,
+                    serial: false,
+                    channel: 6,
+                    wake_ms: 0,
+                    ps: "max",
+                },
+            )?;
+            super::ble_bt::set_advertising_interval_ms(1000, 1200);
+            super::ble_bt::start_connectable_advertising()?;
+            Ok(CommandResponse::ok(format!(
+                "{} {}",
+                "sleep profile=ble_adv lora_sleep=true",
+                status_text()
+            )))
+        }
+        "active" | "awake" | "play" => {
+            stop_light_sleep()?;
+            super::ble_bt::disable_controller_sleep()?;
+            super::ble_bt::start_listen_mode()?;
+            Ok(CommandResponse::ok(format!(
+                "sleep profile=active {}",
+                status_text()
+            )))
+        }
+        _ => bail!("unsupported sleep profile {profile}"),
+    }
+}
+
+pub fn enter_companion_deep_sleep(
+    settings: &SharedSettings,
+    lora_listen: bool,
+    wake_ms: u32,
+    active_ms: u32,
+) -> Result<()> {
+    let mut flags = 0;
+    if lora_listen {
+        flags |= FLAG_LORA | FLAG_BLE;
+    }
+    let config = lora::load_config(settings)?;
+    let mut state = new_state(config, wake_ms, active_ms, flags);
+    if lora_listen {
+        lora::prepare_deep_sleep_rx(&state.lora.to_config())?;
+    } else {
+        let _ = lora::sleep_radio(settings);
+    }
+    state = update_checksum(state);
+    write_state(state);
+    enter_deep_sleep_with_state(state)
+}
+
+struct LightSleepProfile {
+    ble: bool,
+    ble_scan: bool,
+    wifi: bool,
+    raw: bool,
+    nan: bool,
+    serial: bool,
+    channel: u8,
+    wake_ms: u32,
+    ps: &'static str,
+}
+
+fn start_light_sleep_profile(settings: &SharedSettings, profile: LightSleepProfile) -> Result<()> {
+    let ps_code = parse_ps(profile.ps)?;
+
+    configure_pm(true)?;
+    configure_light_wake_sources(settings, profile.wake_ms, profile.serial)?;
+    if profile.ble {
+        if profile.ble_scan {
+            super::ble_bt::start_listen_mode()?;
+        } else {
+            super::ble_bt::start_connectable_advertising()?;
+        }
+        if let Err(err) = super::ble_bt::enable_controller_sleep() {
+            telemetry::record_log(format!(
+                "ev=sleep.err mode=light target=ble_sleep err={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        }
+    } else {
+        super::ble_bt::stop_radio_activity();
+    }
+    if profile.wifi || profile.raw {
+        if profile.raw {
+            super::wifi::start_raw_monitor_mode(profile.channel, "action")?;
+        } else {
+            super::wifi::ensure_raw_wifi_started(profile.channel)?;
+        }
+        super::wifi::set_power_save(profile.ps)?;
+    } else {
+        let _ = super::wifi::stop_raw_monitor();
+    }
+    if profile.nan {
+        telemetry::record_log("ev=sleep.light nan=requested action=skip reason=no_helper");
+    }
+
+    LIGHT_SLEEP_ENABLED.store(true, Ordering::Relaxed);
+    LIGHT_WIFI.store(profile.wifi, Ordering::Relaxed);
+    LIGHT_BLE.store(profile.ble, Ordering::Relaxed);
+    LIGHT_BLE_SCAN.store(profile.ble_scan, Ordering::Relaxed);
+    LIGHT_RAW.store(profile.raw, Ordering::Relaxed);
+    LIGHT_NAN.store(profile.nan, Ordering::Relaxed);
+    LIGHT_SERIAL.store(profile.serial, Ordering::Relaxed);
+    LIGHT_CHANNEL.store(profile.channel, Ordering::Relaxed);
+    LIGHT_WAKE_MS.store(profile.wake_ms, Ordering::Relaxed);
+    LIGHT_PS.store(ps_code, Ordering::Relaxed);
+    telemetry::record_log(format!(
+        "ev=sleep.light on=true wifi={} ble={} ble_scan={} raw={} nan={} ps={} ch={} wake_ms={} serial={}",
+        profile.wifi,
+        profile.ble,
+        profile.ble_scan,
+        profile.raw,
+        profile.nan,
+        profile.ps,
+        profile.channel,
+        profile.wake_ms,
+        profile.serial
+    ));
+    Ok(())
 }
 
 fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Result<()> {
@@ -301,6 +465,11 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
         .map(parse_bool)
         .transpose()?
         .unwrap_or(true);
+    let ble_scan = request
+        .arg("ble_scan")
+        .map(parse_bool)
+        .transpose()?
+        .unwrap_or(false);
     let raw = request
         .arg("raw")
         .map(parse_bool)
@@ -322,13 +491,19 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
     configure_pm(true)?;
     configure_light_wake_sources(settings, wake_ms, serial)?;
     if ble {
-        super::ble_bt::start_listen_mode()?;
+        if ble_scan {
+            super::ble_bt::start_listen_mode()?;
+        } else {
+            super::ble_bt::start_connectable_advertising()?;
+        }
         if let Err(err) = super::ble_bt::enable_controller_sleep() {
             telemetry::record_log(format!(
                 "ev=sleep.err mode=light target=ble_sleep err={}",
                 crate::commands::protocol::escape_value(&err.to_string())
             ));
         }
+    } else {
+        super::ble_bt::stop_radio_activity();
     }
     if wifi || raw {
         if raw {
@@ -337,6 +512,8 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
             super::wifi::ensure_raw_wifi_started(channel)?;
         }
         super::wifi::set_power_save(ps)?;
+    } else {
+        let _ = super::wifi::stop_raw_monitor();
     }
     if nan {
         telemetry::record_log("ev=sleep.light nan=requested action=skip reason=no_helper");
@@ -345,6 +522,7 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
     LIGHT_SLEEP_ENABLED.store(true, Ordering::Relaxed);
     LIGHT_WIFI.store(wifi, Ordering::Relaxed);
     LIGHT_BLE.store(ble, Ordering::Relaxed);
+    LIGHT_BLE_SCAN.store(ble_scan, Ordering::Relaxed);
     LIGHT_RAW.store(raw, Ordering::Relaxed);
     LIGHT_NAN.store(nan, Ordering::Relaxed);
     LIGHT_SERIAL.store(serial, Ordering::Relaxed);
@@ -352,8 +530,8 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
     LIGHT_WAKE_MS.store(wake_ms, Ordering::Relaxed);
     LIGHT_PS.store(ps_code, Ordering::Relaxed);
     telemetry::record_log(format!(
-        "ev=sleep.light on=true wifi={} ble={} raw={} nan={} ps={} ch={} wake_ms={} serial={}",
-        wifi, ble, raw, nan, ps, channel, wake_ms, serial
+        "ev=sleep.light on=true wifi={} ble={} ble_scan={} raw={} nan={} ps={} ch={} wake_ms={} serial={}",
+        wifi, ble, ble_scan, raw, nan, ps, channel, wake_ms, serial
     ));
     Ok(())
 }
@@ -368,6 +546,7 @@ fn stop_light_sleep() -> Result<()> {
     LIGHT_SLEEP_ENABLED.store(false, Ordering::Relaxed);
     LIGHT_WIFI.store(false, Ordering::Relaxed);
     LIGHT_BLE.store(false, Ordering::Relaxed);
+    LIGHT_BLE_SCAN.store(false, Ordering::Relaxed);
     LIGHT_RAW.store(false, Ordering::Relaxed);
     LIGHT_NAN.store(false, Ordering::Relaxed);
     LIGHT_SERIAL.store(false, Ordering::Relaxed);
@@ -378,7 +557,11 @@ fn stop_light_sleep() -> Result<()> {
 
 fn configure_pm(light_sleep_enable: bool) -> Result<()> {
     let max_freq_mhz = cpu_freq_mhz().max(80);
-    let min_freq_mhz = xtal_freq_mhz().clamp(1, max_freq_mhz);
+    let min_freq_mhz = if light_sleep_enable {
+        xtal_freq_mhz().clamp(1, max_freq_mhz)
+    } else {
+        max_freq_mhz
+    };
     let config = sys::esp_pm_config_t {
         max_freq_mhz: max_freq_mhz as i32,
         min_freq_mhz: min_freq_mhz as i32,
@@ -454,7 +637,7 @@ fn status_text() -> String {
         unsafe { sys::esp_pm_get_configuration((&mut pm as *mut sys::esp_pm_config_t).cast()) }
             == sys::ESP_OK;
     format!(
-        "sleep rtc_valid={} cause={} ext1_mask=0x{:x} rtc_bytes={} flags=0x{:x} wake_ms={} forward_ms={} wake_count={} last_len={} last_hash=0x{:08x} light={} pm={} max={} min={} wifi={} ble={} raw={} nan={} serial={} ch={} ps={} wifi_ps={} light_wake_ms={}",
+        "sleep rtc_valid={} cause={} ext1_mask=0x{:x} rtc_bytes={} flags=0x{:x} wake_ms={} forward_ms={} wake_count={} last_len={} last_hash=0x{:08x} light={} pm={} max={} min={} wifi={} ble={} ble_scan={} raw={} nan={} serial={} ch={} ps={} wifi_ps={} light_wake_ms={}",
         valid,
         wake_cause_name(cause),
         ext1_mask,
@@ -471,6 +654,7 @@ fn status_text() -> String {
         if pm_ok { pm.min_freq_mhz } else { 0 },
         LIGHT_WIFI.load(Ordering::Relaxed),
         LIGHT_BLE.load(Ordering::Relaxed),
+        LIGHT_BLE_SCAN.load(Ordering::Relaxed),
         LIGHT_RAW.load(Ordering::Relaxed),
         LIGHT_NAN.load(Ordering::Relaxed),
         LIGHT_SERIAL.load(Ordering::Relaxed),
@@ -483,7 +667,9 @@ fn status_text() -> String {
 
 fn enter_deep_sleep_with_state(state: RtcSleepState) -> Result<()> {
     let config = state.lora.to_config();
-    lora::prepare_deep_sleep_rx(&config)?;
+    if state.flags & FLAG_LORA != 0 {
+        lora::prepare_deep_sleep_rx(&config)?;
+    }
     configure_wake_sources(&state)?;
     telemetry::record_log(format!(
         "event type=sleep.enter mode=deep wake_ms={} active_ms={} flags=0x{:x} dio0={}",
@@ -503,17 +689,29 @@ fn configure_wake_sources(state: &RtcSleepState) -> Result<()> {
                 state.wake_ms as u64 * 1000,
             ))?;
         }
+        if let Some(pin) = super::button::configured_gpio() {
+            if sys::rtc_gpio_is_valid_gpio(pin) {
+                esp_ok(sys::esp_sleep_enable_ext0_wakeup(pin as sys::gpio_num_t, 0))?;
+            } else {
+                telemetry::record_log(format!(
+                    "event type=sleep.wake_source source=button gpio={} status=invalid_rtc",
+                    pin
+                ));
+            }
+        }
         esp_ok(sys::esp_sleep_pd_config(
             sys::esp_sleep_pd_domain_t_ESP_PD_DOMAIN_RTC_PERIPH,
             sys::esp_sleep_pd_option_t_ESP_PD_OPTION_ON,
         ))?;
-        if !sys::rtc_gpio_is_valid_gpio(state.lora.dio0) {
-            bail!("lora.dio0={} is not RTC-capable", state.lora.dio0);
+        if state.flags & FLAG_LORA != 0 {
+            if !sys::rtc_gpio_is_valid_gpio(state.lora.dio0) {
+                bail!("lora.dio0={} is not RTC-capable", state.lora.dio0);
+            }
+            esp_ok(sys::esp_sleep_enable_ext1_wakeup(
+                1_u64 << state.lora.dio0,
+                sys::esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_HIGH,
+            ))?;
         }
-        esp_ok(sys::esp_sleep_enable_ext1_wakeup(
-            1_u64 << state.lora.dio0,
-            sys::esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_HIGH,
-        ))?;
         let _ = sys::rtc_gpio_isolate(sys::gpio_num_t_GPIO_NUM_12);
     }
     Ok(())
@@ -611,6 +809,10 @@ impl RtcLoraConfig {
     fn from_config(config: LoraConfig) -> Self {
         Self {
             frequency_hz: config.frequency_hz,
+            chip: match config.chip {
+                LoraChip::Sx127x => 0,
+                LoraChip::Sx1262 => 1,
+            },
             bandwidth_hz: config.bandwidth_hz,
             spi_host: config.spi_host,
             sck: config.sck,
@@ -619,6 +821,7 @@ impl RtcLoraConfig {
             cs: config.cs,
             rst: config.rst,
             dio0: config.dio0,
+            busy: config.busy,
             sf: config.sf,
             cr: config.cr,
             sync_word: config.sync_word,
@@ -632,6 +835,11 @@ impl RtcLoraConfig {
 
     fn to_config(self) -> LoraConfig {
         LoraConfig {
+            chip: if self.chip == 1 {
+                LoraChip::Sx1262
+            } else {
+                LoraChip::Sx127x
+            },
             frequency_hz: self.frequency_hz,
             bandwidth_hz: self.bandwidth_hz,
             beacon: self.beacon != 0,
@@ -642,6 +850,7 @@ impl RtcLoraConfig {
             cs: self.cs,
             rst: self.rst,
             dio0: self.dio0,
+            busy: self.busy,
             sf: self.sf,
             cr: self.cr,
             sync_word: self.sync_word,

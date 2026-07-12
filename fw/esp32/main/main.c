@@ -102,8 +102,13 @@ void app_main(void) {
     // Not OLED yet.
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF);
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
+    /*
+     * ESP-IDF 5.4 tracks RTC memory power-domain references internally.
+     * Forcing RTC slow/fast memory off at startup can underflow those refs on
+     * ESP32-D0WDQ6 before the app reaches its console/radio initialization.
+     * Leave the memory domains at the IDF defaults and only force RTC_PERIPH
+     * above for wake/interrupt behavior.
+     */
 
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "dmsh", &status.light_sleep_pm_lock));
 

@@ -6,7 +6,7 @@ pub const MESHTASTIC_BROADCAST: u32 = u32::MAX;
 // xor("MediumFast") ^ xor(psk), 0 psk (unencrypted) -> 0x1D
 pub const MESHTASTIC_DEFAULT_CHANNEL_HASH: u8 = 0x1d;
 
-pub const MESHTASTIC_DEFAULT_HOP_LIMIT: u8 = 3;
+pub const MESHTASTIC_DEFAULT_HOP_LIMIT: u8 = 0;
 pub const MESHTASTIC_DEFAULT_PORTNUM: u32 = 256;
 const MESHTASTIC_DATA_PAYLOAD_MAX: usize = 233;
 

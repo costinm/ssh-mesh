@@ -12,10 +12,16 @@ use super::telemetry;
 
 const DEFAULT_BUTTON_GPIO: i32 = 0;
 const BUTTON_DEBOUNCE_MS: u64 = 250;
+const BUTTON_LONG_PRESS_MS: u32 = 2_500;
 
 static BUTTON_ENABLED: AtomicBool = AtomicBool::new(false);
 static BUTTON_GPIO: AtomicI32 = AtomicI32::new(DEFAULT_BUTTON_GPIO);
 static BUTTON_PRESSES: AtomicU32 = AtomicU32::new(0);
+static BUTTON_CYCLE_PENDING: AtomicU32 = AtomicU32::new(0);
+static BUTTON_LEVEL_HELD: AtomicBool = AtomicBool::new(false);
+static BUTTON_LEVEL_LONG_REPORTED: AtomicBool = AtomicBool::new(false);
+static BUTTON_LEVEL_START_MS: AtomicU32 = AtomicU32::new(0);
+static BUTTON_LONG_PENDING: AtomicU32 = AtomicU32::new(0);
 static BUTTON_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(std::ptr::null_mut());
 static GPIO_ISR_SERVICE_READY: AtomicBool = AtomicBool::new(false);
 
@@ -44,6 +50,52 @@ pub fn configure_light_wake(settings: &SharedSettings) -> Result<Option<i32>> {
     Ok(Some(pin))
 }
 
+pub fn take_cycle_presses() -> u32 {
+    BUTTON_CYCLE_PENDING.swap(0, Ordering::Relaxed)
+}
+
+pub fn take_long_presses() -> u32 {
+    BUTTON_LONG_PENDING.swap(0, Ordering::Relaxed)
+}
+
+pub fn configured_gpio() -> Option<i32> {
+    if BUTTON_ENABLED.load(Ordering::Relaxed) {
+        Some(BUTTON_GPIO.load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
+pub fn poll_level_press() {
+    if !BUTTON_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let pin = BUTTON_GPIO.load(Ordering::Relaxed);
+    let pressed = unsafe { sys::gpio_get_level(pin as sys::gpio_num_t) == 0 };
+    let now = now_ms();
+    if pressed {
+        if !BUTTON_LEVEL_HELD.swap(true, Ordering::Relaxed) {
+            BUTTON_LEVEL_START_MS.store(now, Ordering::Relaxed);
+            BUTTON_LEVEL_LONG_REPORTED.store(false, Ordering::Relaxed);
+            super::ble_bt::open_companion_active_window(10_000);
+            telemetry::record_log(format!("ev=button.down gpio={} source=level", pin));
+            record_button_press("short", false);
+        } else {
+            let start = BUTTON_LEVEL_START_MS.load(Ordering::Relaxed);
+            let elapsed = now.wrapping_sub(start);
+            if elapsed >= BUTTON_LONG_PRESS_MS
+                && !BUTTON_LEVEL_LONG_REPORTED.swap(true, Ordering::Relaxed)
+            {
+                record_button_press("long", true);
+            }
+        }
+    } else {
+        BUTTON_LEVEL_HELD.swap(false, Ordering::Relaxed);
+        BUTTON_LEVEL_HELD.store(false, Ordering::Relaxed);
+        BUTTON_LEVEL_LONG_REPORTED.store(false, Ordering::Relaxed);
+    }
+}
+
 fn init_from_settings(settings: &SharedSettings) -> Result<()> {
     let settings = settings.borrow();
     let enabled = settings.get_bool("button.enabled", true)?;
@@ -60,33 +112,17 @@ fn init_from_settings(settings: &SharedSettings) -> Result<()> {
 }
 
 fn configure_button(pin: i32) -> Result<()> {
-    start_button_task()?;
     unsafe {
         let config = sys::gpio_config_t {
             pin_bit_mask: 1_u64 << pin,
             mode: sys::gpio_mode_t_GPIO_MODE_INPUT,
             pull_up_en: sys::gpio_pullup_t_GPIO_PULLUP_ENABLE,
             pull_down_en: sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
-            intr_type: sys::gpio_int_type_t_GPIO_INTR_NEGEDGE,
+            intr_type: sys::gpio_int_type_t_GPIO_INTR_DISABLE,
         };
         esp_ok(sys::gpio_config(&config))?;
-        if !GPIO_ISR_SERVICE_READY.load(Ordering::Relaxed) {
-            let install = sys::gpio_install_isr_service(0);
-            if install != sys::ESP_OK && install != sys::ESP_ERR_INVALID_STATE {
-                esp_ok(install)?;
-            }
-            GPIO_ISR_SERVICE_READY.store(true, Ordering::Relaxed);
-        }
         let _ = sys::gpio_isr_handler_remove(pin);
-        esp_ok(sys::gpio_set_intr_type(
-            pin,
-            sys::gpio_int_type_t_GPIO_INTR_NEGEDGE,
-        ))?;
-        esp_ok(sys::gpio_isr_handler_add(
-            pin,
-            Some(button_isr),
-            std::ptr::null_mut(),
-        ))?;
+        let _ = sys::gpio_intr_disable(pin as sys::gpio_num_t);
     }
     Ok(())
 }
@@ -140,12 +176,37 @@ unsafe extern "C" fn button_task(_arg: *mut core::ffi::c_void) {
             continue;
         }
         last = Instant::now();
-        let total = BUTTON_PRESSES.fetch_add(1, Ordering::Relaxed) + 1;
-        let pin = BUTTON_GPIO.load(Ordering::Relaxed);
-        let line = format!("ev=button.press gpio={} n={}", pin, total);
+        super::ble_bt::open_companion_active_window(10_000);
+        telemetry::record_log("ev=button.edge source=isr".to_string());
+    }
+}
+
+fn record_button_press(source: &str, long_press: bool) {
+    let total = BUTTON_PRESSES.fetch_add(1, Ordering::Relaxed) + 1;
+    let pin = BUTTON_GPIO.load(Ordering::Relaxed);
+    let line = format!("ev=button.press gpio={} n={} source={}", pin, total, source);
+    telemetry::record_log(line.clone());
+    telemetry::emit_console(&line);
+    super::ble_bt::open_companion_active_window(10_000);
+    if super::ble_bt::confirm_pairing_request() {
+        let line = "ev=button.pairing accepted=true".to_string();
+        telemetry::record_log(line.clone());
+        telemetry::emit_console(&line);
+    } else if long_press {
+        BUTTON_LONG_PENDING.fetch_add(1, Ordering::Relaxed);
+        let line = "ev=button.long action=serial".to_string();
+        telemetry::record_log(line.clone());
+        telemetry::emit_console(&line);
+    } else {
+        BUTTON_CYCLE_PENDING.fetch_add(1, Ordering::Relaxed);
+        let line = "ev=button.pairing ignored=true reason=no_request".to_string();
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);
     }
+}
+
+fn now_ms() -> u32 {
+    (unsafe { sys::esp_timer_get_time() } / 1000) as u32
 }
 
 struct ButtonCommand {
@@ -158,10 +219,18 @@ impl CommandHandler for ButtonCommand {
     }
 
     fn help(&self) -> &'static str {
-        "button status=true | button gpio=0 enabled=true save=true"
+        "button status=true | button gpio=0 enabled=true save=true | button pairing=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        if let Some(pairing) = request.arg("pairing") {
+            super::ble_bt::open_companion_active_window(10_000);
+            if parse_bool(pairing)? {
+                super::ble_bt::confirm_pairing_request();
+            } else {
+                super::ble_bt::open_pairing_window(0);
+            }
+        }
         if let Some(enabled) = request.arg("enabled").or_else(|| request.arg("enable")) {
             BUTTON_ENABLED.store(parse_bool(enabled)?, Ordering::Relaxed);
         }

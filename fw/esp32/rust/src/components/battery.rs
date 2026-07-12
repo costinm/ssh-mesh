@@ -1,3 +1,6 @@
+use std::io::{self, Write};
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Result};
 use esp_idf_sys as sys;
 
@@ -14,7 +17,10 @@ const UNKNOWN_LEVEL: u8 = 255;
 const ADC_MAX_RAW: f32 = 4095.0;
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
-    registry.register(BatteryCommand { settings });
+    registry.register(BatteryCommand {
+        settings: settings.clone(),
+    });
+    registry.register(AdcProbeCommand { settings });
 }
 
 pub fn battery_level_default() -> u8 {
@@ -34,6 +40,10 @@ pub fn stats_fields(settings: &SharedSettings) -> String {
 }
 
 struct BatteryCommand {
+    settings: SharedSettings,
+}
+
+struct AdcProbeCommand {
     settings: SharedSettings,
 }
 
@@ -101,6 +111,65 @@ impl CommandHandler for BatteryCommand {
     }
 }
 
+impl CommandHandler for AdcProbeCommand {
+    fn name(&self) -> &'static str {
+        "adcprobe"
+    }
+
+    fn help(&self) -> &'static str {
+        "adcprobe pins=34,35,36,39 interval_ms=1000 count=1 ref_mv=3300; count=0 streams until UART key"
+    }
+
+    fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        let pins = parse_pins(request.arg("pins").unwrap_or("34,35,36,39"))?;
+        let interval_ms = request
+            .arg_i32("interval_ms")?
+            .or(request.arg_i32("ms")?)
+            .unwrap_or(1000)
+            .clamp(10, 60_000) as u64;
+        let count = request
+            .arg_i32("count")?
+            .or(request.arg_i32("repeat")?)
+            .unwrap_or(1)
+            .max(0) as u32;
+        let ref_mv = request
+            .arg_i32("ref_mv")?
+            .unwrap_or(
+                self.settings
+                    .borrow()
+                    .get_i32("battery.ref_mv", DEFAULT_REF_MV as i32)?,
+            )
+            .clamp(1, 5000) as u32;
+
+        if count == 0 {
+            let mut sample = 0_u32;
+            loop {
+                sample = sample.saturating_add(1);
+                let line = adc_sample_line(sample, &pins, ref_mv);
+                println!("{line}");
+                let _ = io::stdout().flush();
+                if wait_for_key_or_timeout(interval_ms) {
+                    return Ok(CommandResponse::ok(format!(
+                        "adcprobe stopped=true samples={sample}"
+                    )));
+                }
+            }
+        }
+
+        let mut out = String::new();
+        for sample in 1..=count {
+            if sample > 1 {
+                std::thread::sleep(Duration::from_millis(interval_ms));
+            }
+            out.push_str(&adc_sample_line(sample, &pins, ref_mv));
+            if sample < count {
+                out.push('\n');
+            }
+        }
+        Ok(CommandResponse::ok(out))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BatteryConfig {
     enabled: bool,
@@ -160,20 +229,28 @@ fn read_battery_with_config(config: BatteryConfig) -> Result<BatteryReading> {
     if config.full_mv <= config.empty_mv {
         bail!("battery max_mv must be greater than min_mv");
     }
+    let (unit, channel, raw, adc_mv) = read_adc_pin(config.pin, config.ref_mv)
+        .map_err(|err| anyhow!("battery ADC GPIO{}: {err}", config.pin))?;
+    let battery_mv = (adc_mv as f32 * config.divider).round() as u32;
+    let percent = battery_percent(battery_mv, config.empty_mv, config.full_mv);
+    Ok(BatteryReading {
+        unit,
+        channel,
+        raw,
+        adc_mv,
+        battery_mv,
+        percent,
+    })
+}
+
+fn read_adc_pin(pin: i32, ref_mv: u32) -> Result<(sys::adc_unit_t, sys::adc_channel_t, i32, u32)> {
     let mut unit = sys::adc_unit_t_ADC_UNIT_1;
     let mut channel = sys::adc_channel_t_ADC_CHANNEL_0;
     unsafe {
-        esp_ok(sys::adc_oneshot_io_to_channel(
-            config.pin,
-            &mut unit,
-            &mut channel,
-        ))?;
+        esp_ok(sys::adc_oneshot_io_to_channel(pin, &mut unit, &mut channel))?;
     }
     if unit != sys::adc_unit_t_ADC_UNIT_1 {
-        bail!(
-            "battery ADC GPIO{} maps to ADC2; ADC2 conflicts with Wi-Fi on ESP32",
-            config.pin
-        );
+        bail!("GPIO{pin} maps to ADC2; ADC2 conflicts with Wi-Fi on ESP32");
     }
 
     let mut handle = std::ptr::null_mut();
@@ -200,18 +277,34 @@ fn read_battery_with_config(config: BatteryConfig) -> Result<BatteryReading> {
         })();
         let _ = sys::adc_oneshot_del_unit(handle);
         let raw = result?;
-        let adc_mv = ((raw.max(0) as f32 / ADC_MAX_RAW) * config.ref_mv as f32).round() as u32;
-        let battery_mv = (adc_mv as f32 * config.divider).round() as u32;
-        let percent = battery_percent(battery_mv, config.empty_mv, config.full_mv);
-        Ok(BatteryReading {
-            unit,
-            channel,
-            raw,
-            adc_mv,
-            battery_mv,
-            percent,
-        })
+        Ok((unit, channel, raw, raw_to_mv(raw, ref_mv)))
     }
+}
+
+fn adc_sample_line(sample: u32, pins: &[i32], ref_mv: u32) -> String {
+    let mut out = format!("adcprobe sample={sample} ref_mv={ref_mv}");
+    for pin in pins {
+        match read_adc_pin(*pin, ref_mv) {
+            Ok((unit, channel, raw, mv)) => {
+                out.push_str(&format!(
+                    " gpio{pin}_unit={} gpio{pin}_channel={} gpio{pin}_raw={raw} gpio{pin}_mv={mv}",
+                    unit + 1,
+                    channel
+                ));
+            }
+            Err(err) => {
+                out.push_str(&format!(
+                    " gpio{pin}_error={}",
+                    crate::commands::protocol::quote_text_value(&err.to_string())
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn raw_to_mv(raw: i32, ref_mv: u32) -> u32 {
+    ((raw.max(0) as f32 / ADC_MAX_RAW) * ref_mv as f32).round() as u32
 }
 
 fn battery_percent(mv: u32, empty_mv: u32, full_mv: u32) -> u8 {
@@ -227,6 +320,45 @@ fn parse_f32(value: &str) -> Result<f32> {
     value
         .parse::<f32>()
         .map_err(|err| anyhow!("invalid float {value}: {err}"))
+}
+
+fn parse_pins(value: &str) -> Result<Vec<i32>> {
+    let mut pins = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let pin = part
+            .parse::<i32>()
+            .map_err(|err| anyhow!("invalid GPIO pin {part}: {err}"))?;
+        pins.push(pin);
+    }
+    if pins.is_empty() {
+        bail!("adcprobe requires at least one pin");
+    }
+    Ok(pins)
+}
+
+fn wait_for_key_or_timeout(interval_ms: u64) -> bool {
+    let mut waited = 0_u64;
+    while waited < interval_ms {
+        if uart0_has_input() {
+            return true;
+        }
+        let step = (interval_ms - waited).min(50);
+        std::thread::sleep(Duration::from_millis(step));
+        waited += step;
+    }
+    false
+}
+
+fn uart0_has_input() -> bool {
+    let mut byte = [0_u8; 1];
+    let read = unsafe {
+        sys::uart_read_bytes(sys::uart_port_t_UART_NUM_0, byte.as_mut_ptr().cast(), 1, 0)
+    };
+    read > 0
 }
 
 fn esp_ok(ret: sys::esp_err_t) -> Result<()> {

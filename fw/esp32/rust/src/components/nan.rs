@@ -449,7 +449,7 @@ impl Transport for NanTransport {
 }
 
 fn start_official_nan(channel: u8, role: NanRole, service: &str) -> Result<()> {
-    if sys::SOC_WIFI_NAN_SUPPORT == 0 {
+    if !official_nan_supported() {
         bail!("official NAN is not supported by this ESP-IDF target");
     }
     ensure_official_wifi_initialized()?;
@@ -658,6 +658,7 @@ unsafe extern "C" fn official_nan_event(
             let evt = unsafe { &*(event_data as *const sys::wifi_event_nan_svc_match_t) };
             NAN_OFFICIAL_RX_MATCH.fetch_add(1, Ordering::Relaxed);
             let ssi = unsafe { evt.ssi.as_slice(evt.ssi_len as usize) };
+            super::mode::observe_ping("nan", ssi);
             {
                 let mut peer = nan_peer().lock().unwrap();
                 *peer = Some(OfficialPeer {
@@ -820,7 +821,7 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
     })
 }
 
-fn stop_nan() -> Result<()> {
+pub fn stop_nan() -> Result<()> {
     if NAN_OFFICIAL_RUNNING.load(Ordering::Relaxed) {
         let pub_id = NAN_OFFICIAL_PUB_ID.swap(0, Ordering::Relaxed);
         let sub_id = NAN_OFFICIAL_SUB_ID.swap(0, Ordering::Relaxed);
@@ -1030,10 +1031,23 @@ fn stats() -> String {
 }
 
 fn support_name() -> &'static str {
-    if sys::SOC_WIFI_NAN_SUPPORT != 0 {
+    if official_nan_supported() {
         "official"
     } else {
         "raw"
+    }
+}
+
+fn official_nan_supported() -> bool {
+    #[cfg(target_feature = "esp32s3ops")]
+    {
+        // ESP-IDF 5.4 bindings declare NAN APIs for ESP32-S3, but the linked
+        // S3 Wi-Fi libraries do not export the corresponding symbols.
+        false
+    }
+    #[cfg(not(target_feature = "esp32s3ops"))]
+    {
+        sys::CONFIG_ESP_WIFI_NAN_ENABLE != 0
     }
 }
 

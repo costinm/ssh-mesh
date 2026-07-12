@@ -9,8 +9,9 @@ resolver = "2"
 [dependencies]
 anyhow = "1"
 embedded-svc = "0.28"
-esp-idf-svc = { version = "0.51", features = ["experimental"] }
-esp-idf-sys = { version = "0.36", features = ["binstart"] }
+esp-idf-svc = { version = "0.51", default-features = false, features = ["std", "experimental"] }
+esp-idf-sys = { version = "0.36", default-features = false, features = ["std"] }
+libc = "0.2"
 log = "0.4"
 
 [build-dependencies]

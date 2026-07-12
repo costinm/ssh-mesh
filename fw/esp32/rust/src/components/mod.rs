@@ -7,6 +7,7 @@ pub mod gpio;
 pub mod i2c;
 pub mod l3dmesh;
 pub mod lora;
+pub mod mode;
 pub mod nan;
 pub mod nvs;
 pub mod settings;
@@ -25,7 +26,8 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     gpio::register_commands(registry);
     i2c::register_commands(registry, settings.clone());
     lora::register_commands(registry, settings.clone());
-    ble_bt::register_commands(registry);
+    mode::register_commands(registry, settings.clone());
+    ble_bt::register_commands(registry, settings.clone());
     nan::register_commands(registry, settings.clone());
     sleep::register_commands(registry, settings.clone());
     telemetry::register_commands(registry, settings.clone());

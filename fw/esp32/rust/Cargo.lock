@@ -367,6 +367,7 @@ dependencies = [
  "embuild",
  "esp-idf-svc",
  "esp-idf-sys",
+ "libc",
  "log",
 ]
 

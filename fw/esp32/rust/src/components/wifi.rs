@@ -398,7 +398,7 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
     }
 }
 
-fn stop_raw_monitor() -> Result<()> {
+pub fn stop_raw_monitor() -> Result<()> {
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
     }
@@ -515,6 +515,8 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
     }
     RAW_RX_LAST_LEN.store(copy_len as u32, Ordering::Relaxed);
     if let Some(payload) = dmesh_vendor_payload(frame) {
+        telemetry::record_companion_packet("wifi", payload);
+        super::mode::observe_ping("wifi_raw", payload);
         let line = format!(
             "event type=wifi.raw_rx source=dmesh_vendor len={} rssi={}",
             payload.len(),
