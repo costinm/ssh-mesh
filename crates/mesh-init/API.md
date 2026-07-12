@@ -10,6 +10,12 @@ The endpoint does not re-detect protocol per line.
 
 Clients can interact using flat JSON structures where the `method` field defines the action. The protocol supports standard control requests as well as file descriptor-passing requests via Unix domain socket ancillary data (`SCM_RIGHTS`).
 
+`resources/tools.json` is the hand-maintained public command catalog for UI,
+CLI, and ssh-mesh generic MCP proxy clients. It is intentionally curated rather
+than generated from `mesh::protocol::Request`, so it may hide or simplify
+internal methods. Keep it in sync with this document when the exposed command
+surface changes.
+
 ---
 
 ## Response Structure

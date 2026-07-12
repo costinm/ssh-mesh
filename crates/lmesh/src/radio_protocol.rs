@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 pub const DMESH_BLE_SERVICE_UUID16: u16 = 0xfd5d;
 const DMESH_MAGIC: [u8; 2] = *b"DM";
 const DMESH_VERSION: u8 = 1;
-const DMESH_MAX_PREFIX: usize = 5;
+const BLE_MAX_PREFIX: usize = 17;
 const BLE_DEDUPE_TTL: Duration = Duration::from_secs(10);
 const NAN_DEDUPE_TTL: Duration = Duration::from_secs(30);
 
@@ -125,28 +125,78 @@ pub fn build_ble_service_data(
     snr_q4: i32,
 ) -> Result<Vec<u8>> {
     let device_id = checked_device_id(device_id)?;
-    let prefix_len = payload.len().min(DMESH_MAX_PREFIX);
-    let mut out = Vec::with_capacity(21 + prefix_len);
-    out.extend_from_slice(&DMESH_MAGIC);
-    out.push(DMESH_VERSION);
-    out.push(0);
-    out.push(event.code());
-    out.extend_from_slice(device_id);
-    out.extend_from_slice(&(payload.len().min(u16::MAX as usize) as u16).to_le_bytes());
-    out.extend_from_slice(&fnv1a32(payload).to_le_bytes());
-    out.push(rssi.clamp(i8::MIN as i32, i8::MAX as i32) as i8 as u8);
-    out.push(snr_q4.clamp(i8::MIN as i32, i8::MAX as i32) as i8 as u8);
-    out.extend_from_slice(&payload[..prefix_len]);
+    let source = u32::from_le_bytes([device_id[0], device_id[1], device_id[2], device_id[3]]);
+    let pending = event.code();
+    let battery = if snr_q4 > 0 {
+        snr_q4.clamp(0, u8::MAX as i32) as u8
+    } else {
+        rssi.clamp(0, u8::MAX as i32) as u8
+    };
+    build_ble_esp32_service_data(source, fnv1a32(payload), pending, battery, payload)
+}
+
+/// Build the current ESP32 DMesh BLE service-data layout.
+pub fn build_ble_esp32_service_data(
+    source: u32,
+    packet_id: u32,
+    pending: u8,
+    battery: u8,
+    packet: &[u8],
+) -> Result<Vec<u8>> {
+    let prefix_len = packet.len().min(BLE_MAX_PREFIX);
+    let mut out = Vec::with_capacity(12 + prefix_len);
+    out.extend_from_slice(&DMESH_BLE_SERVICE_UUID16.to_le_bytes());
+    out.extend_from_slice(&source.to_le_bytes());
+    out.extend_from_slice(&packet_id.to_le_bytes());
+    out.push(pending);
+    out.push(battery);
+    out.extend_from_slice(&packet[..prefix_len]);
     Ok(out)
 }
 
 pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Result<Value> {
-    if data.len() < 21 {
+    let data =
+        if data.len() >= 12 && u16::from_le_bytes([data[0], data[1]]) == DMESH_BLE_SERVICE_UUID16 {
+            &data[2..]
+        } else {
+            data
+        };
+    if data.len() >= 19 && data[0..2] == DMESH_MAGIC && data[2] == DMESH_VERSION {
+        return parse_legacy_ble_service_data(data, scan_rssi, address);
+    }
+    if data.len() < 10 {
         bail!("DMesh BLE service data too short: {}", data.len());
     }
-    if data[0..2] != DMESH_MAGIC || data[2] != DMESH_VERSION {
-        bail!("not a DMesh BLE v1 service data payload");
-    }
+    let source = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let packet_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let pending = data[8];
+    let battery = data[9];
+    let prefix = &data[10..];
+    let key = format!("{source:08x}:{packet_id:08x}");
+    let duplicate = BLE_DEDUPE
+        .get_or_init(|| Mutex::new(Dedupe::default()))
+        .lock()
+        .map(|mut dedupe| dedupe.check(key, BLE_DEDUPE_TTL))
+        .unwrap_or(false);
+    Ok(json!({
+        "protocol": "dmesh_ble",
+        "layout": "esp32_service_data",
+        "service_uuid16": format!("0x{:04x}", DMESH_BLE_SERVICE_UUID16),
+        "src": source,
+        "src_hex": format!("0x{source:08x}"),
+        "packet_id": packet_id,
+        "packet_id_hex": format!("0x{packet_id:08x}"),
+        "pending": pending,
+        "battery": battery,
+        "prefix": hex_bytes(prefix),
+        "scan_rssi": scan_rssi,
+        "address": address,
+        "duplicate": duplicate,
+        "connectable_response": pending > 0,
+    }))
+}
+
+fn parse_legacy_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Result<Value> {
     let event = BleEvent::from_code(data[4]);
     let mut device_id = [0_u8; 6];
     device_id.copy_from_slice(&data[5..11]);
@@ -169,6 +219,7 @@ pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Res
         .unwrap_or(false);
     Ok(json!({
         "protocol": "dmesh_ble",
+        "layout": "legacy_dm_v1",
         "version": DMESH_VERSION,
         "event": event.name(),
         "event_code": event.code(),
@@ -372,16 +423,19 @@ mod tests {
 
     #[test]
     fn ble_service_data_round_trips() {
-        let id = [1, 2, 3, 4, 5, 6];
-        let data = build_ble_service_data(BleEvent::LoraRx, &id, b"abcdef", -70, 6).unwrap();
-        assert_eq!(&data[0..3], b"DM\x01");
-        assert_eq!(data[4], BLE_EVENT_LORA_RX);
-        assert_eq!(data.len(), 24);
+        let data = build_ble_esp32_service_data(0x11223344, 0xaabbccdd, 2, 91, b"abcdef").unwrap();
+        assert_eq!(
+            u16::from_le_bytes([data[0], data[1]]),
+            DMESH_BLE_SERVICE_UUID16
+        );
+        assert_eq!(data.len(), 18);
         let parsed = parse_ble_service_data(&data, -62, "aa:bb").unwrap();
-        assert_eq!(parsed["event"], "lora_rx");
-        assert_eq!(parsed["device_id"], "010203040506");
-        assert_eq!(parsed["payload_len"], 6);
-        assert_eq!(parsed["prefix"], "6162636465");
+        assert_eq!(parsed["layout"], "esp32_service_data");
+        assert_eq!(parsed["src"], 0x11223344_u32);
+        assert_eq!(parsed["packet_id"], 0xaabbccdd_u32);
+        assert_eq!(parsed["pending"], 2);
+        assert_eq!(parsed["battery"], 91);
+        assert_eq!(parsed["prefix"], "616263646566");
     }
 
     #[test]

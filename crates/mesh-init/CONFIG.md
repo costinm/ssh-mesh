@@ -81,12 +81,19 @@ Systemd-compatible fields:
 - `CapabilityBoundingSet`, `AmbientCapabilities` (string or string list):
   common Linux capability names. Supported names are `CAP_CHOWN`,
   `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_KILL`, `CAP_SETGID`, `CAP_SETUID`,
-  `CAP_SETPCAP`, `CAP_NET_BIND_SERVICE`, `CAP_NET_ADMIN`, and
+  `CAP_SETPCAP`, `CAP_NET_BIND_SERVICE`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, and
   `CAP_SYS_ADMIN`. `CapabilityBoundingSet = []` explicitly drops all supported
   capabilities; omitting the field leaves the bounding set unchanged.
 
 Unsupported hardening values or capability names are logged with `WARN` and
 fail only that service start. mesh-init continues running.
+
+Before spawning a service, mesh-init creates `/run/mesh/<service-name>/`, sets
+mode `0777`, and when running as root changes ownership to the service
+`User`/`Group`. This directory is the default place for service-owned UDS
+control sockets and runtime files. Socket servers must still perform
+peer-credential authorization; the directory permission is for reachability and
+socket lifecycle, not authorization.
 
 - `AllowDangerousEnv` (array of strings, default `[]`): dangerous
   caller-supplied environment variables this service accepts. Exact names and

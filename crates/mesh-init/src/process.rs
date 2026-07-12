@@ -6,6 +6,8 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -24,6 +26,7 @@ const CAP_SETUID: i32 = 7;
 const CAP_SETPCAP: i32 = 8;
 const CAP_NET_BIND_SERVICE: i32 = 10;
 const CAP_NET_ADMIN: i32 = 12;
+const CAP_NET_RAW: i32 = 13;
 const CAP_SYS_ADMIN: i32 = 21;
 const CAP_LAST_SUPPORTED: i32 = 40;
 
@@ -216,6 +219,7 @@ fn cap_name_to_number(name: &str) -> Option<i32> {
         "SETPCAP" => Some(CAP_SETPCAP),
         "NET_BIND_SERVICE" => Some(CAP_NET_BIND_SERVICE),
         "NET_ADMIN" => Some(CAP_NET_ADMIN),
+        "NET_RAW" => Some(CAP_NET_RAW),
         "SYS_ADMIN" => Some(CAP_SYS_ADMIN),
         _ => None,
     }
@@ -505,6 +509,60 @@ fn cap_mask(caps: &[i32], word: usize) -> u32 {
             mask
         }
     })
+}
+
+fn service_runtime_dir(name: &str) -> PathBuf {
+    Path::new("/run/mesh").join(name)
+}
+
+fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL byte")
+    })?;
+    let rc = unsafe { libc::chown(path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_service_runtime_dir(config: &AppConfig) -> Result<(), ProcessError> {
+    let dir = service_runtime_dir(&config.name);
+    let uid = config.uid.unwrap_or(0);
+    let gid = config.gid.unwrap_or(0);
+    let prepare = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+        if unsafe { libc::geteuid() } == 0 {
+            chown_path(&dir, uid, gid)?;
+        }
+        Ok(())
+    };
+
+    match prepare() {
+        Ok(()) => {
+            debug!(
+                service = %config.name,
+                path = %dir.display(),
+                uid,
+                gid,
+                mode = "0777",
+                "service_runtime_dir_ready"
+            );
+            Ok(())
+        }
+        Err(error) if unsafe { libc::geteuid() } != 0 => {
+            warn!(
+                service = %config.name,
+                path = %dir.display(),
+                error = %error,
+                "service_runtime_dir_prepare_skipped_non_root"
+            );
+            Ok(())
+        }
+        Err(error) => Err(ProcessError::Io(error)),
+    }
 }
 
 unsafe fn apply_capset(caps: &[i32], include_setpcap: bool) -> std::io::Result<()> {
@@ -857,6 +915,8 @@ pub fn spawn_process(
         args = ?config.args,
         "spawning_service"
     );
+
+    prepare_service_runtime_dir(config)?;
 
     let mut cmd = std::process::Command::new(&config.command);
     cmd.args(&config.args);
@@ -1507,6 +1567,14 @@ mod tests {
     }
 
     #[test]
+    fn service_runtime_dir_uses_service_name_under_run_mesh() {
+        assert_eq!(
+            service_runtime_dir("lmesh-radio-build"),
+            PathBuf::from("/run/mesh/lmesh-radio-build")
+        );
+    }
+
+    #[test]
     fn sandbox_plan_accepts_common_hardening_fields() {
         let mut config = test_config("sandbox-plan");
         config.private_tmp = true;
@@ -1570,6 +1638,24 @@ mod tests {
             Some(vec!["CAP_SETPCAP".to_string(), "CAP_NET_ADMIN".to_string()]);
         let err = build_sandbox_plan(&config).unwrap_err();
         assert!(err.to_string().contains("subset"));
+    }
+
+    #[test]
+    fn sandbox_plan_accepts_net_raw_for_radio_services() {
+        let mut config = test_config("radio-caps");
+        config.capability_bounding_set = Some(vec![
+            "CAP_SETPCAP".to_string(),
+            "CAP_NET_ADMIN".to_string(),
+            "CAP_NET_RAW".to_string(),
+        ]);
+        config.ambient_capabilities = vec!["CAP_NET_ADMIN".to_string(), "CAP_NET_RAW".to_string()];
+
+        let plan = build_sandbox_plan(&config).unwrap();
+        assert_eq!(
+            plan.bounding_caps.as_ref().unwrap(),
+            &vec![CAP_SETPCAP, CAP_NET_ADMIN, CAP_NET_RAW]
+        );
+        assert_eq!(plan.ambient_caps, vec![CAP_NET_ADMIN, CAP_NET_RAW]);
     }
 
     #[test]

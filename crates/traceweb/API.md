@@ -30,6 +30,10 @@ place the payload in `result`.
 
 All traceweb JSONL connections also support the shared mesh MCP-compatible methods:
 
+The `tools/list` command catalog is the hand-maintained
+`resources/tools.json`. Keep it in sync with this document when the public
+command surface changes; do not generate it from Rust code.
+
 | Method | Result |
 | --- | --- |
 | `initialize` | Protocol version, server info, and `tools`/`resources` capabilities. |

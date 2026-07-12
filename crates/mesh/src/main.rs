@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::IoSlice;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -110,6 +110,14 @@ enum Command {
     /// Send an arbitrary JSON-RPC method to an app.
     Jsonrpc {
         method: String,
+        #[clap(long)]
+        params: Option<String>,
+    },
+    /// Print this app's curated tools.json command catalog.
+    Tools,
+    /// Call a named tool through the app's MCP-compatible JSONL surface.
+    Tool {
+        name: String,
         #[clap(long)]
         params: Option<String>,
     },
@@ -240,6 +248,29 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&response)?);
             return Ok(());
         }
+        Command::Tools => {
+            let tools = read_tools_catalog(&args.app)?;
+            println!("{}", serde_json::to_string_pretty(&tools)?);
+            return Ok(());
+        }
+        Command::Tool { name, params } => {
+            let params = match params {
+                Some(params) => serde_json::from_str(&params)?,
+                None => json!({}),
+            };
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": params,
+                },
+            });
+            let response = send_value(&socket_path, &request).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(());
+        }
     };
 
     let response = send_request(&socket_path, &request).await?;
@@ -296,6 +327,28 @@ fn get_socket_path(app: &str) -> String {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+fn read_tools_catalog(app: &str) -> Result<Value> {
+    let paths = mesh::paths::AppPaths::for_app(app);
+    let resource_dirs = paths.resource_dirs();
+    for dir in &resource_dirs {
+        let path = dir.join("tools.json");
+        if path.is_file() {
+            let data = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            return serde_json::from_str(&data)
+                .with_context(|| format!("failed to parse {}", path.display()));
+        }
+    }
+    anyhow::bail!(
+        "tools.json not found for {app}; checked {}",
+        resource_dirs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 async fn send_request(socket_path: &str, request: &Request) -> Result<Response> {

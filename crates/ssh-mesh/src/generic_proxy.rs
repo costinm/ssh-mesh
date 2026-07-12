@@ -7,8 +7,36 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use crate::{AppState, handlers::Assets};
+
+type BridgeFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
+type BridgeHandler = Arc<dyn Fn(String, String, Value) -> BridgeFuture + Send + Sync>;
+
+static GENERIC_PROXY_BRIDGE: std::sync::OnceLock<BridgeHandler> = std::sync::OnceLock::new();
+
+/// Register an optional in-process proxy bridge.
+///
+/// Android uses this to route web-admin commands into the Java `MsgMux` instead
+/// of attempting to connect to Linux UDS paths. Normal Linux deployments leave
+/// this unset and continue to use `/_m/proxy/*/:app` over UDS.
+pub fn set_generic_proxy_bridge<F, Fut>(handler: F) -> bool
+where
+    F: Fn(String, String, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value, String>> + Send + 'static,
+{
+    GENERIC_PROXY_BRIDGE
+        .set(Arc::new(move |app, method, params| {
+            Box::pin(handler(app, method, params))
+        }))
+        .is_ok()
+}
+
+async fn call_bridge(app: &str, method: &str, params: Value) -> Option<Result<Value, String>> {
+    let bridge = GENERIC_PROXY_BRIDGE.get()?.clone();
+    Some(bridge(app.to_string(), method.to_string(), params).await)
+}
 
 #[derive(Debug, Deserialize)]
 struct ProxyQuery {
@@ -46,6 +74,18 @@ async fn proxy_jsonl(
     Query(query): Query<ProxyQuery>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let method = payload
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("status")
+        .to_string();
+    if let Some(result) = call_bridge(&app, &method, payload.clone()).await {
+        return match result {
+            Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        };
+    }
+
     let socket = app_socket_path(&app, query.socket.as_deref());
     match crate::jsonl_proxy::call_jsonl_value(&socket, payload)
         .await
@@ -73,6 +113,12 @@ async fn proxy_json_rpc(
             .into_response();
     };
     let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+    if let Some(result) = call_bridge(&app, method, params.clone()).await {
+        return match result {
+            Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        };
+    }
     let socket = app_socket_path(&app, query.socket.as_deref());
     match crate::jsonl_proxy::call_json_rpc(&socket, method, params)
         .await
@@ -132,6 +178,35 @@ async fn proxy_mcp(
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if let Some(result) = call_bridge(&app, &name, arguments.clone()).await {
+            return match result {
+                Ok(value) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(Value::Null),
+                        "result": {
+                            "content": [{ "type": "text", "text": value.to_string() }],
+                            "structuredContent": value,
+                            "isError": false
+                        }
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(Value::Null),
+                        "result": {
+                            "content": [{ "type": "text", "text": e }],
+                            "isError": true
+                        }
+                    })),
+                )
+                    .into_response(),
+            };
+        }
         return match crate::jsonl_proxy::call_json_rpc(&socket, &name, arguments)
             .await
             .and_then(crate::jsonl_proxy::jsonl_response_payload)
@@ -168,6 +243,7 @@ async fn proxy_mcp(
         &line,
         &registry,
         move |request| {
+            let app = app.clone();
             let socket = socket.clone();
             async move {
                 match request {
@@ -176,6 +252,13 @@ async fn proxy_mcp(
                         params,
                     } => {
                         let method_name = mesh::message::canonical_method_name(&method_name);
+                        if let Some(result) = call_bridge(&app, &method_name, params.clone()).await
+                        {
+                            return match result {
+                                Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                                Err(e) => mesh::protocol::Response::err(e),
+                            };
+                        }
                         match crate::jsonl_proxy::call_json_rpc(&socket, &method_name, params)
                             .await
                             .and_then(crate::jsonl_proxy::jsonl_response_payload)

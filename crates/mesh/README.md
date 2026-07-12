@@ -39,6 +39,24 @@ consistent.
 
 If HTTP is needed, it belongs in `ssh-mesh` or the application itself. The `mesh` crate intentionally avoids Axum/Hyper/http dependencies and only provides the activation, peer-checked stream, JSONL, and telemetry primitives.
 
+## Tools Catalogs
+
+Services that expose a mesh JSONL/JSON-RPC command surface should keep a
+hand-maintained `resources/tools.json` next to the crate. The catalog is used by
+`tools/list`, ssh-mesh web/admin pages, and the `mesh` CLI:
+
+```sh
+mesh lmesh tools
+mesh lmesh tool nodes
+mesh lmesh tool announce --params '{"metadata":{"role":"dev"}}'
+```
+
+The catalog is intentionally curated, not generated from code. It may hide or
+simplify internal methods, but it should be updated together with the crate's
+`API.md` when the public command surface changes. During local development,
+`MESH_RES_DIR` can point at a crate's `resources/` directory; packaged runs use
+the normal `MESH_OPT_BASE`/`MESH_APP_OPT` resource lookup.
+
 If the app is exposing HTTP over TCP without TLS - ideally localhost
 is used, and normal port forwarding by the mesh proxy, with H2 or SSH
 or Wireguard providing secure transport - can be used. Note that the 

@@ -85,6 +85,12 @@ Group = "1000"
 # Directory used as cwd before exec.
 WorkingDirectory = "/tmp"
 
+# Applies to: every service spawn.
+# mesh-init creates /run/mesh/<service-name>/ before starting the service,
+# sets mode 0777, and chowns it to User/Group when running as root. Use this
+# for service-owned UDS sockets and runtime files; UDS peer credentials remain
+# the authorization boundary.
+
 # Applies to: service restart policy.
 # Supported values: no, always, on-success, on-failure, on-abnormal, on-abort.
 Restart = "on-failure"
@@ -209,9 +215,10 @@ InaccessiblePaths = ["/root"]
 # Enforced for common capability names. Unsupported names warn and fail this
 # service start. Supported common names: CAP_CHOWN, CAP_DAC_OVERRIDE,
 # CAP_FOWNER, CAP_KILL, CAP_SETGID, CAP_SETUID, CAP_SETPCAP,
-# CAP_NET_BIND_SERVICE, CAP_NET_ADMIN, CAP_SYS_ADMIN. An explicit empty list
-# drops all supported capabilities; omitting the field leaves them unchanged.
-CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE", "CAP_SETPCAP"]
+# CAP_NET_BIND_SERVICE, CAP_NET_ADMIN, CAP_NET_RAW, CAP_SYS_ADMIN. An explicit
+# empty list drops all supported capabilities; omitting the field leaves them
+# unchanged.
+CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE", "CAP_NET_RAW", "CAP_SETPCAP"]
 
 # Applies to: Linux ambient capabilities.
 # Enforced for the same common names as CapabilityBoundingSet. When used with a

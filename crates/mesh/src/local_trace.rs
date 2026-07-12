@@ -15,6 +15,7 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -761,6 +762,14 @@ fn build_file_writer(
 
     let dir = parent;
     let file_name = log_path.file_name()?.to_string_lossy();
+    if let Err(e) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        tracing::warn!(
+            path = ?log_path,
+            error = %e,
+            "log file could not be opened; file logging disabled"
+        );
+        return None;
+    }
     let appender = tracing_appender::rolling::never(dir, file_name.as_ref());
     Some(tracing_appender::non_blocking(appender))
 }

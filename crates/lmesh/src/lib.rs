@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 
 use tracing::{debug, error, info, instrument, warn};
 
+pub mod radio;
 pub mod radio_protocol;
 
 const MULTICAST_PORT: u16 = 5227;
@@ -540,17 +541,109 @@ pub enum Request {
         #[serde(default)]
         metadata: Option<HashMap<String, String>>,
     },
+    /// Return Linux radio and helper status.
+    #[serde(rename = "status")]
+    Status,
+    /// Return configured local, remote, serial, and future radio adapters.
+    #[serde(rename = "radios.list")]
+    RadiosList,
+    /// Return recently observed neighbors.
+    #[serde(rename = "neighbors")]
+    Neighbors {
+        #[serde(default)]
+        seen_within_sec: Option<u64>,
+    },
+    /// Fan out a discovery ping over one medium or all configured media.
+    #[serde(rename = "discovery.ping")]
+    DiscoveryPing {
+        #[serde(default)]
+        medium: Option<String>,
+    },
+    /// Return recent radio/backend message history.
+    #[serde(rename = "messages.history")]
+    MessagesHistory {
+        #[serde(default)]
+        keys: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Request a BLE scan through raw Linux HCI sockets.
+    #[serde(rename = "ble.scan")]
+    BleScan {
+        #[serde(default)]
+        dev_id: Option<u16>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Enable or disable BLE advertising through raw Linux HCI sockets.
+    #[serde(rename = "ble.adv")]
+    BleAdv {
+        #[serde(default)]
+        dev_id: Option<u16>,
+        #[serde(default)]
+        on: Option<bool>,
+        #[serde(default)]
+        payload: Option<String>,
+    },
+    /// Probe/attach NAN through wpa_supplicant control.
+    #[serde(rename = "wifi.nan.start")]
+    WifiNanStart {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+    },
+    /// Stop NAN publish/subscribe sessions through wpa_supplicant control.
+    #[serde(rename = "wifi.nan.stop")]
+    WifiNanStop {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+    },
+    /// Start NAN publish through wpa_supplicant control.
+    #[serde(rename = "wifi.nan.adv")]
+    WifiNanAdv {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+    },
+    /// Start NAN subscribe through wpa_supplicant control.
+    #[serde(rename = "wifi.nan.sub")]
+    WifiNanSub {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+    },
+    /// Send a NAN follow-up ping through wpa_supplicant control.
+    #[serde(rename = "wifi.nan.ping")]
+    WifiNanPing {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        peer: Option<String>,
+        #[serde(default)]
+        payload: Option<String>,
+    },
 }
 
 /// Reusable lmesh command service.
 pub struct LmeshService {
     discovery: Arc<LocalDiscovery>,
+    radio: radio::RadioService,
 }
 
 impl LmeshService {
     /// Create a service around an initialized discovery instance.
     pub fn new(discovery: Arc<LocalDiscovery>) -> Self {
-        Self { discovery }
+        Self {
+            discovery,
+            radio: radio::RadioService::from_environment(),
+        }
     }
 
     /// Return the local public key used for announcements.
@@ -583,6 +676,51 @@ impl LmeshService {
                     Err(e) => mesh::protocol::Response::err(e.to_string()),
                 }
             }
+            Request::Status => mesh::protocol::Response::ok_with_data(self.radio.status()),
+            Request::RadiosList => mesh::protocol::Response::ok_with_data(self.radio.list_radios()),
+            Request::Neighbors { seen_within_sec } => {
+                mesh::protocol::Response::ok_with_data(self.radio.neighbors(seen_within_sec))
+            }
+            Request::DiscoveryPing { medium } => {
+                mesh::protocol::Response::ok_with_data(self.radio.discovery_ping(medium))
+            }
+            Request::MessagesHistory { keys, limit } => {
+                mesh::protocol::Response::ok_with_data(self.radio.history(keys, limit))
+            }
+            Request::BleScan { dev_id, reason } => match self.radio.ble_scan(dev_id, reason) {
+                Ok(data) => mesh::protocol::Response::ok_with_data(data),
+                Err(e) => mesh::protocol::Response::err(e.to_string()),
+            },
+            Request::BleAdv {
+                dev_id,
+                on,
+                payload,
+            } => match self.radio.ble_adv(dev_id, on, payload) {
+                Ok(data) => mesh::protocol::Response::ok_with_data(data),
+                Err(e) => mesh::protocol::Response::err(e.to_string()),
+            },
+            Request::WifiNanStart { iface, ctrl_dir } => {
+                mesh::protocol::Response::ok_with_data(self.radio.nan_start(iface, ctrl_dir))
+            }
+            Request::WifiNanStop { iface, ctrl_dir } => {
+                mesh::protocol::Response::ok_with_data(self.radio.nan_stop(iface, ctrl_dir))
+            }
+            Request::WifiNanAdv { iface, ctrl_dir } => match self.radio.nan_adv(iface, ctrl_dir) {
+                Ok(data) => mesh::protocol::Response::ok_with_data(data),
+                Err(e) => mesh::protocol::Response::err(e.to_string()),
+            },
+            Request::WifiNanSub { iface, ctrl_dir } => {
+                mesh::protocol::Response::ok_with_data(self.radio.nan_sub(iface, ctrl_dir))
+            }
+            Request::WifiNanPing {
+                iface,
+                ctrl_dir,
+                peer,
+                payload,
+            } => match self.radio.nan_ping(iface, ctrl_dir, peer, payload) {
+                Ok(data) => mesh::protocol::Response::ok_with_data(data),
+                Err(e) => mesh::protocol::Response::err(e.to_string()),
+            },
         }
     }
 }

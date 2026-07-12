@@ -33,6 +33,11 @@ Base route: `POST /_m/mcp/`
 This endpoint uses the same `mesh::jsonl` lightweight MCP dispatcher over HTTP JSON. It
 supports:
 
+The `tools/list` command catalog is the hand-maintained
+`resources/tools.json`. Component catalogs live beside their crates and may be
+served by the generic app proxy. Keep catalogs curated and in sync with API docs;
+do not generate them from code.
+
 | Method | Result |
 | --- | --- |
 | `initialize` | Protocol version, server info, and `tools`/`resources` capabilities. |
