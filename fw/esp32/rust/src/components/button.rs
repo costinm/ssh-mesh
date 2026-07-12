@@ -13,6 +13,7 @@ use super::telemetry;
 const DEFAULT_BUTTON_GPIO: i32 = 0;
 const BUTTON_DEBOUNCE_MS: u64 = 250;
 const BUTTON_LONG_PRESS_MS: u32 = 2_500;
+const BOOT_SAMPLE_MS: u64 = 100;
 
 static BUTTON_ENABLED: AtomicBool = AtomicBool::new(false);
 static BUTTON_GPIO: AtomicI32 = AtomicI32::new(DEFAULT_BUTTON_GPIO);
@@ -64,6 +65,40 @@ pub fn configured_gpio() -> Option<i32> {
     } else {
         None
     }
+}
+
+pub fn is_pressed() -> bool {
+    if !BUTTON_ENABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let pin = BUTTON_GPIO.load(Ordering::Relaxed);
+    unsafe { sys::gpio_get_level(pin as sys::gpio_num_t) == 0 }
+}
+
+pub fn detect_boot_long_press(window_ms: u32, hold_ms: u32) -> bool {
+    if !BUTTON_ENABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let pin = BUTTON_GPIO.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_millis(window_ms as u64);
+    let mut pressed_since: Option<Instant> = None;
+    while Instant::now() < deadline {
+        let pressed = unsafe { sys::gpio_get_level(pin as sys::gpio_num_t) == 0 };
+        if pressed {
+            let start = *pressed_since.get_or_insert_with(Instant::now);
+            if start.elapsed() >= Duration::from_millis(hold_ms as u64) {
+                telemetry::record_log(format!(
+                    "ev=button.boot_long gpio={} hold_ms={}",
+                    pin, hold_ms
+                ));
+                return true;
+            }
+        } else {
+            pressed_since = None;
+        }
+        std::thread::sleep(Duration::from_millis(BOOT_SAMPLE_MS));
+    }
+    false
 }
 
 pub fn poll_level_press() {

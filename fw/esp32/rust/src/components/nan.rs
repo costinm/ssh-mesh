@@ -1,7 +1,11 @@
+#[cfg(not(target_feature = "esp32s3ops"))]
 use std::ffi::{c_char, CString};
+#[cfg(not(target_feature = "esp32s3ops"))]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
+#[cfg(not(target_feature = "esp32s3ops"))]
 use std::sync::{Mutex, OnceLock};
+#[cfg(not(target_feature = "esp32s3ops"))]
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -148,14 +152,17 @@ impl NanRole {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(not(target_feature = "esp32s3ops"))]
 struct OfficialPeer {
     peer_inst_id: u8,
     own_inst_id: u8,
     mac: [u8; 6],
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 static NAN_PEER: OnceLock<Mutex<Option<OfficialPeer>>> = OnceLock::new();
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn nan_peer() -> &'static Mutex<Option<OfficialPeer>> {
     NAN_PEER.get_or_init(|| Mutex::new(None))
 }
@@ -448,6 +455,12 @@ impl Transport for NanTransport {
     }
 }
 
+#[cfg(target_feature = "esp32s3ops")]
+fn start_official_nan(_channel: u8, _role: NanRole, _service: &str) -> Result<()> {
+    bail!("official NAN is not compiled for ESP32-S3; use nan.backend=raw")
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn start_official_nan(channel: u8, role: NanRole, service: &str) -> Result<()> {
     if !official_nan_supported() {
         bail!("official NAN is not supported by this ESP-IDF target");
@@ -532,6 +545,7 @@ fn start_official_nan(channel: u8, role: NanRole, service: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn ensure_official_wifi_initialized() -> Result<()> {
     unsafe {
         esp_ok_allow_invalid_state(sys::esp_netif_init())?;
@@ -553,6 +567,7 @@ fn ensure_official_wifi_initialized() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn wifi_init_config_default() -> sys::wifi_init_config_t {
     sys::wifi_init_config_t {
         osi_funcs: ptr::addr_of_mut!(sys::g_wifi_osi_funcs),
@@ -584,6 +599,7 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
     }
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn register_official_events() -> Result<()> {
     if NAN_EVENTS_REGISTERED.swap(true, Ordering::SeqCst) {
         return Ok(());
@@ -624,6 +640,7 @@ fn register_official_events() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn wait_for_official_ready(timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -635,6 +652,7 @@ fn wait_for_official_ready(timeout: Duration) -> Result<()> {
     bail!("timed out waiting for WIFI_EVENT_NAN_STARTED");
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 unsafe extern "C" fn official_nan_event(
     _arg: *mut core::ffi::c_void,
     _base: sys::esp_event_base_t,
@@ -728,14 +746,27 @@ unsafe extern "C" fn official_nan_event(
     }
 }
 
+#[cfg(target_feature = "esp32s3ops")]
+fn official_send_hello() -> Result<()> {
+    bail!("official NAN is not compiled for ESP32-S3; use nan.backend=raw")
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn official_send_hello() -> Result<()> {
     official_send_message(DMESH_MSG_HELLO, b"")
 }
 
+#[cfg(target_feature = "esp32s3ops")]
+fn official_send_text(_payload: &[u8]) -> Result<()> {
+    bail!("official NAN is not compiled for ESP32-S3; use nan.backend=raw")
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn official_send_text(payload: &[u8]) -> Result<()> {
     official_send_message(DMESH_MSG_PACKET_CHUNK, payload)
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn official_send_message(msg_type: u8, payload: &[u8]) -> Result<()> {
     let peer = nan_peer().lock().unwrap().clone().ok_or_else(|| {
         anyhow!("no NAN peer known; wait for nan.match/nan.replied/nan.followup_rx")
@@ -747,8 +778,12 @@ fn official_send_message(msg_type: u8, payload: &[u8]) -> Result<()> {
     fup.peer_mac.copy_from_slice(&peer.mac);
     fup.ssi_len = body.len() as u16;
     fup.ssi = body.as_ptr() as *mut u8;
+    let mut followup_context = 0u32;
     unsafe {
-        esp_ok(sys::esp_nan_internal_send_followup(&fup))?;
+        esp_ok(sys::esp_nan_internal_send_followup(
+            &fup,
+            &mut followup_context,
+        ))?;
     }
     NAN_OFFICIAL_TX_FUP.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet("nan", Direction::Tx, &body, "event=followup");
@@ -761,6 +796,7 @@ fn official_send_message(msg_type: u8, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn dmesh_service_info(role: u8) -> Result<Vec<u8>> {
     let id = station_mac()?;
     let mut out = Vec::with_capacity(21);
@@ -775,6 +811,7 @@ fn dmesh_service_info(role: u8) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn dmesh_followup(msg_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
     let payload_len = payload.len().min(231);
     let id = station_mac()?;
@@ -800,6 +837,7 @@ fn checked_service_name(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+#[cfg(not(target_feature = "esp32s3ops"))]
 fn copy_cstr_to_array<const N: usize>(value: &str, dest: &mut [c_char; N]) -> Result<()> {
     let cstr = CString::new(value)?;
     let bytes = cstr.as_bytes_with_nul();
@@ -822,32 +860,44 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
 }
 
 pub fn stop_nan() -> Result<()> {
-    if NAN_OFFICIAL_RUNNING.load(Ordering::Relaxed) {
-        let pub_id = NAN_OFFICIAL_PUB_ID.swap(0, Ordering::Relaxed);
-        let sub_id = NAN_OFFICIAL_SUB_ID.swap(0, Ordering::Relaxed);
-        unsafe {
-            if pub_id != 0 {
-                let cfg = sys::wifi_nan_publish_cfg_t::default();
-                let mut cancel_id = pub_id;
-                let _ = sys::esp_nan_internal_publish_service(&cfg, &mut cancel_id, true);
-            }
-            if sub_id != 0 {
-                let cfg = sys::wifi_nan_subscribe_cfg_t::default();
-                let mut cancel_id = sub_id;
-                let _ = sys::esp_nan_internal_subscribe_service(&cfg, &mut cancel_id, true);
-            }
-            let _ = sys::esp_wifi_stop();
-        }
-        NAN_OFFICIAL_RUNNING.store(false, Ordering::Relaxed);
-        NAN_OFFICIAL_READY.store(false, Ordering::Relaxed);
-        let mut peer = nan_peer().lock().unwrap();
-        *peer = None;
-    }
+    stop_official_nan();
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
     }
     NAN_RUNNING.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+fn stop_official_nan() {
+    NAN_OFFICIAL_RUNNING.store(false, Ordering::Relaxed);
+    NAN_OFFICIAL_READY.store(false, Ordering::Relaxed);
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
+fn stop_official_nan() {
+    if !NAN_OFFICIAL_RUNNING.load(Ordering::Relaxed) {
+        return;
+    }
+    let pub_id = NAN_OFFICIAL_PUB_ID.swap(0, Ordering::Relaxed);
+    let sub_id = NAN_OFFICIAL_SUB_ID.swap(0, Ordering::Relaxed);
+    unsafe {
+        if pub_id != 0 {
+            let cfg = sys::wifi_nan_publish_cfg_t::default();
+            let mut cancel_id = pub_id;
+            let _ = sys::esp_nan_internal_publish_service(&cfg, &mut cancel_id, true);
+        }
+        if sub_id != 0 {
+            let cfg = sys::wifi_nan_subscribe_cfg_t::default();
+            let mut cancel_id = sub_id;
+            let _ = sys::esp_nan_internal_subscribe_service(&cfg, &mut cancel_id, true);
+        }
+        let _ = sys::esp_wifi_stop();
+    }
+    NAN_OFFICIAL_RUNNING.store(false, Ordering::Relaxed);
+    NAN_OFFICIAL_READY.store(false, Ordering::Relaxed);
+    let mut peer = nan_peer().lock().unwrap();
+    *peer = None;
 }
 
 fn raw_tx(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
@@ -1041,7 +1091,7 @@ fn support_name() -> &'static str {
 fn official_nan_supported() -> bool {
     #[cfg(target_feature = "esp32s3ops")]
     {
-        // ESP-IDF 5.4 bindings declare NAN APIs for ESP32-S3, but the linked
+        // ESP-IDF 5.5 bindings declare NAN APIs for ESP32-S3, but the linked
         // S3 Wi-Fi libraries do not export the corresponding symbols.
         false
     }

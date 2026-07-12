@@ -336,12 +336,9 @@ pub fn poll_text_commands(registry: &mut CommandRegistry) {
             "event type=ble.companion save=true response={}",
             crate::commands::protocol::escape_value(response.trim())
         ));
-        let response = dispatch_text_line(
-            registry,
-            "sleep mode=light start=true ble=true ble_scan=false wifi=false raw=false nan=false ps=max serial=false",
-        );
+        let response = dispatch_text_line(registry, "mode companion=true save=true");
         telemetry::record_log(format!(
-            "event type=ble.companion light_sleep=true response={}",
+            "event type=ble.companion mode=companion response={}",
             crate::commands::protocol::escape_value(response.trim())
         ));
     }
@@ -426,6 +423,27 @@ pub fn request_pairing(request_timeout_ms: u32, confirm_timeout_ms: u32) {
         format_mac(&addr)
     ));
     let _ = start_connectable_idle();
+}
+
+pub fn start_pairing_recovery(settings: &SharedSettings) -> Result<usize> {
+    let mut radio = RadioCommand::with_settings("ble", settings.clone());
+    radio.ensure_ble()?;
+    start_gatt()?;
+    wait_gatt_service_ready(Duration::from_millis(1_000))?;
+    let removed = reset_pairing_state();
+    {
+        let mut settings = settings.borrow_mut();
+        settings.set_str("mode", "infra")?;
+        settings.set_bool("ble.comp", false)?;
+        settings.set_str("ble.peer", "")?;
+    }
+    open_pairing_window(86_400_000);
+    start_connectable_idle()?;
+    telemetry::record_log(format!(
+        "event type=ble.pairing_recovery active=true bonds_removed={}",
+        removed
+    ));
+    Ok(removed)
 }
 
 pub fn confirm_pairing_request() -> bool {

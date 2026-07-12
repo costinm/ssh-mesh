@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use embedded_svc::wifi::{
@@ -26,6 +28,9 @@ const RAW_FILTER_ACTION: u32 = 2;
 const RAW_FILTER_BEACON: u32 = 3;
 const RAW_FILTER_PROBE_REQ: u32 = 4;
 const RAW_FILTER_PROBE_RESP: u32 = 5;
+const RAW_COMMAND_QUEUE_MAX: usize = 8;
+const RAW_COMMAND_MAX_LEN: usize = 512;
+const RAW_BROADCAST: [u8; 6] = [0xff; 6];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static RAW_FILTER_MODE: AtomicU32 = AtomicU32::new(RAW_FILTER_MGMT);
@@ -44,8 +49,28 @@ static RAW_RX_DROPPED: AtomicU32 = AtomicU32::new(0);
 static RAW_RX_LAST_LEN: AtomicU32 = AtomicU32::new(0);
 static RAW_RX_LAST_RSSI: AtomicI32 = AtomicI32::new(0);
 static RAW_TX_TOTAL: AtomicU32 = AtomicU32::new(0);
+static RAW_CMD_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
+static RAW_CMD_DROPPED: AtomicU32 = AtomicU32::new(0);
 static RAW_WIFI_INIT: AtomicBool = AtomicBool::new(false);
+static RAW_LAST_COMMAND_PEER: [AtomicU8; 6] = [
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+];
+static RAW_LAST_COMMAND_PEER_VALID: AtomicBool = AtomicBool::new(false);
 static mut RAW_RX_LAST: [u8; 256] = [0; 256];
+
+#[derive(Clone, Debug)]
+pub struct RawWifiCommand {
+    pub source: [u8; 6],
+    pub text: String,
+    pub rssi: i32,
+}
+
+static RAW_COMMAND_QUEUE: OnceLock<Mutex<VecDeque<RawWifiCommand>>> = OnceLock::new();
 
 pub fn register_commands(registry: &mut CommandRegistry) {
     registry.register(WifiCommand::default());
@@ -53,11 +78,37 @@ pub fn register_commands(registry: &mut CommandRegistry) {
 
 pub fn forward_management_packet(packet: &[u8]) -> Result<()> {
     ensure_raw_wifi_started(6)?;
-    let frame = vendor_action_frame(packet)?;
+    let frame = vendor_action_frame(RAW_BROADCAST, packet)?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet("wifi", Direction::Tx, packet, "source=lora_forward");
     Ok(())
+}
+
+pub fn send_vendor_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
+    ensure_raw_wifi_started(6)?;
+    let frame = vendor_action_frame(destination, payload)?;
+    raw_tx_frame(&frame, true)?;
+    RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    telemetry::record_packet(
+        "wifi",
+        Direction::Tx,
+        payload,
+        format!(
+            "source=raw_command_response dst={}",
+            format_mac(destination)
+        ),
+    );
+    Ok(())
+}
+
+pub fn send_to_last_command_peer(payload: &[u8]) -> Result<()> {
+    let peer = last_command_peer().context("no raw wifi command peer known")?;
+    send_vendor_payload_to(peer, payload)
+}
+
+pub fn take_raw_command() -> Option<RawWifiCommand> {
+    raw_command_queue().lock().ok()?.pop_front()
 }
 
 pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
@@ -444,14 +495,14 @@ fn raw_tx_frame(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
     }
 }
 
-fn vendor_action_frame(payload: &[u8]) -> Result<Vec<u8>> {
+fn vendor_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
     let mac = station_mac()?;
     let body_len = payload.len().min(1400);
     let mut frame = Vec::with_capacity(24 + 5 + body_len);
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&destination);
     frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&destination);
     frame.extend_from_slice(&[0x00, 0x00]);
     frame.extend_from_slice(&[0x7f, 0x50, 0x6f, 0x9a, 0x42]);
     frame.extend_from_slice(&payload[..body_len]);
@@ -517,6 +568,9 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
     if let Some(payload) = dmesh_vendor_payload(frame) {
         telemetry::record_companion_packet("wifi", payload);
         super::mode::observe_ping("wifi_raw", payload);
+        if !payload.starts_with(b"dmesh.ping") {
+            enqueue_raw_command(frame, payload, rssi);
+        }
         let line = format!(
             "event type=wifi.raw_rx source=dmesh_vendor len={} rssi={}",
             payload.len(),
@@ -580,11 +634,80 @@ fn dmesh_vendor_payload(frame: &[u8]) -> Option<&[u8]> {
     }
 }
 
+fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32) {
+    if payload.len() > RAW_COMMAND_MAX_LEN {
+        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let Ok(text) = core::str::from_utf8(payload) else {
+        return;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let Some(source) = frame_address(frame, FRAME_ADDR2) else {
+        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    set_last_command_peer(source);
+    let Ok(mut queue) = raw_command_queue().lock() else {
+        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if queue.len() >= RAW_COMMAND_QUEUE_MAX {
+        queue.pop_front();
+        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    queue.push_back(RawWifiCommand {
+        source,
+        text: text.to_string(),
+        rssi,
+    });
+    RAW_CMD_RX_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+fn raw_command_queue() -> &'static Mutex<VecDeque<RawWifiCommand>> {
+    RAW_COMMAND_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(RAW_COMMAND_QUEUE_MAX)))
+}
+
+fn frame_address(frame: &[u8], offset: usize) -> Option<[u8; 6]> {
+    frame.get(offset..offset + 6)?.try_into().ok()
+}
+
+fn set_last_command_peer(peer: [u8; 6]) {
+    for (idx, byte) in peer.iter().enumerate() {
+        RAW_LAST_COMMAND_PEER[idx].store(*byte, Ordering::Relaxed);
+    }
+    RAW_LAST_COMMAND_PEER_VALID.store(true, Ordering::Release);
+}
+
+fn last_command_peer() -> Option<[u8; 6]> {
+    if !RAW_LAST_COMMAND_PEER_VALID.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut peer = [0_u8; 6];
+    for (idx, byte) in peer.iter_mut().enumerate() {
+        *byte = RAW_LAST_COMMAND_PEER[idx].load(Ordering::Relaxed);
+    }
+    Some(peer)
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 fn raw_stats() -> String {
     let last_len = RAW_RX_LAST_LEN.load(Ordering::Relaxed) as usize;
     let last = unsafe { &RAW_RX_LAST[..last_len.min(256)] };
+    let peer = last_command_peer()
+        .map(format_mac)
+        .unwrap_or_else(|| "none".to_string());
     format!(
-        "raw_monitor={} filter={} bssid_filter={} rx={} matched={} dropped={} tx={} last_len={} last_rssi={} last={}",
+        "raw_monitor={} filter={} bssid_filter={} rx={} matched={} dropped={} tx={} cmd_rx={} cmd_dropped={} last_peer={} last_len={} last_rssi={} last={}",
         RAW_MONITOR_RUNNING.load(Ordering::Relaxed),
         raw_filter_name(),
         RAW_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
@@ -592,6 +715,9 @@ fn raw_stats() -> String {
         RAW_RX_MATCHED.load(Ordering::Relaxed),
         RAW_RX_DROPPED.load(Ordering::Relaxed),
         RAW_TX_TOTAL.load(Ordering::Relaxed),
+        RAW_CMD_RX_TOTAL.load(Ordering::Relaxed),
+        RAW_CMD_DROPPED.load(Ordering::Relaxed),
+        peer,
         last_len,
         RAW_RX_LAST_RSSI.load(Ordering::Relaxed),
         hex_bytes(last)

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use esp_idf_svc::log::EspLogger;
 use std::ffi::c_char;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod commands;
 mod components;
@@ -9,6 +9,10 @@ mod transports;
 
 use commands::CommandRegistry;
 use components::l3dmesh::L3Mesh;
+
+const BOOT_ACTIVE_WINDOW_MS: u32 = 10_000;
+const BOOT_PAIRING_HOLD_MS: u32 = 3_000;
+const BOOT_POLL_MS: u64 = 100;
 
 fn main() {
     if let Err(err) = run() {
@@ -33,6 +37,7 @@ fn run() -> Result<()> {
     EspLogger::initialize_default();
     quiet_runtime_logs();
 
+    let wake_cause = unsafe { esp_idf_sys::esp_sleep_get_wakeup_cause() };
     rom_print(b"dm-rs boot step=wake\n\0");
     if let Err(err) = components::sleep::handle_deep_sleep_wake() {
         components::telemetry::record_log(format!(
@@ -63,8 +68,16 @@ fn run() -> Result<()> {
         .max(0) as u32;
     components::ble_bt::configure_companion_advertising(2_000, 1_000);
     components::ble_bt::configure_companion_active_window(companion_active_ms);
+    rom_print(b"dm-rs boot step=boot_window\n\0");
+    let pairing_recovery = run_boot_active_window(wake_cause, &settings, &mut registry);
     rom_print(b"dm-rs boot step=mode\n\0");
-    components::mode::init(&settings);
+    if pairing_recovery {
+        components::mode::set_infra(&settings, false, "pairing_recovery")?;
+    } else if is_real_boot(wake_cause) || is_button_wake(wake_cause) {
+        components::mode::init_after_boot_window(&settings);
+    } else {
+        components::mode::init(&settings);
+    }
 
     rom_print(b"dm-rs boot step=mesh\n\0");
     let mut mesh = L3Mesh::new();
@@ -95,6 +108,7 @@ fn run() -> Result<()> {
     loop {
         components::mode::poll(&settings);
         components::ble_bt::poll_text_commands(&mut registry);
+        poll_raw_wifi_commands(&mut registry);
         components::button::poll_level_press();
         if components::button::take_long_presses() > 0 {
             serial_enabled = true;
@@ -136,6 +150,109 @@ fn run() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(250));
             }
             _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn run_boot_active_window(
+    wake_cause: esp_idf_sys::esp_sleep_source_t,
+    settings: &components::settings::SharedSettings,
+    registry: &mut CommandRegistry,
+) -> bool {
+    if !is_real_boot(wake_cause) && !is_button_wake(wake_cause) {
+        return false;
+    }
+
+    let probe_long_press = is_real_boot(wake_cause);
+    let _ = components::ble_bt::set_advertising_interval_ms(1_000, 1_000);
+    if let Err(err) = components::ble_bt::start_connectable_advertising() {
+        components::telemetry::record_log(format!(
+            "event type=boot_window ble=false msg={}",
+            commands::protocol::escape_value(&err.to_string())
+        ));
+    }
+    components::telemetry::record_log(format!(
+        "event type=boot_window start=true cause={} probe_long_press={} window_ms={}",
+        wake_cause_name(wake_cause),
+        probe_long_press,
+        BOOT_ACTIVE_WINDOW_MS
+    ));
+
+    let deadline = Instant::now() + Duration::from_millis(BOOT_ACTIVE_WINDOW_MS as u64);
+    let mut pressed_since: Option<Instant> = None;
+    while Instant::now() < deadline {
+        components::ble_bt::poll_text_commands(registry);
+        if probe_long_press {
+            if components::button::is_pressed() {
+                let start = *pressed_since.get_or_insert_with(Instant::now);
+                if start.elapsed() >= Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64) {
+                    match components::ble_bt::start_pairing_recovery(settings) {
+                        Ok(removed) => {
+                            components::telemetry::record_log(format!(
+                                "event type=boot_window pairing_recovery=true bonds_removed={}",
+                                removed
+                            ));
+                        }
+                        Err(err) => {
+                            components::telemetry::record_log(format!(
+                                "event type=boot_window pairing_recovery=false msg={}",
+                                commands::protocol::escape_value(&err.to_string())
+                            ));
+                        }
+                    }
+                    return true;
+                }
+            } else {
+                pressed_since = None;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(BOOT_POLL_MS));
+    }
+    components::telemetry::record_log("event type=boot_window done=true".to_string());
+    false
+}
+
+fn is_real_boot(cause: esp_idf_sys::esp_sleep_source_t) -> bool {
+    cause == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UNDEFINED
+}
+
+fn is_button_wake(cause: esp_idf_sys::esp_sleep_source_t) -> bool {
+    cause == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_EXT0
+}
+
+fn wake_cause_name(cause: esp_idf_sys::esp_sleep_source_t) -> &'static str {
+    match cause {
+        x if x == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UNDEFINED => "undefined",
+        x if x == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_EXT0 => "ext0",
+        x if x == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_EXT1 => "ext1",
+        x if x == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_TIMER => "timer",
+        x if x == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO => "gpio",
+        x if x == esp_idf_sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART => "uart",
+        _ => "other",
+    }
+}
+
+fn poll_raw_wifi_commands(registry: &mut CommandRegistry) {
+    while let Some(command) = components::wifi::take_raw_command() {
+        components::telemetry::record_log(format!(
+            "event type=wifi.raw_command source={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} len={} rssi={}",
+            command.source[0],
+            command.source[1],
+            command.source[2],
+            command.source[3],
+            command.source[4],
+            command.source[5],
+            command.text.len(),
+            command.rssi
+        ));
+        let response = transports::dispatch_text_line(registry, &command.text);
+        if let Err(err) =
+            components::wifi::send_vendor_payload_to(command.source, response.as_bytes())
+        {
+            components::telemetry::record_log(format!(
+                "event type=wifi.raw_response ok=false msg={}",
+                commands::protocol::escape_value(&err.to_string())
+            ));
         }
     }
 }

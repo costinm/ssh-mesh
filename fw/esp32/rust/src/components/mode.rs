@@ -12,7 +12,7 @@ const MODE_COMPANION: u8 = 0;
 const MODE_INFRA: u8 = 1;
 const DEFAULT_ADV_MS: u32 = 1_000;
 const DEFAULT_WINDOW_MS: u32 = 60_000;
-const DEFAULT_BOOT_WINDOW_MS: u32 = 30_000;
+const DEFAULT_BOOT_WINDOW_MS: u32 = 10_000;
 const DEFAULT_ACTIVE_MS: u32 = 60_000;
 const PING_PREFIX: &[u8] = b"dmesh.ping";
 
@@ -38,8 +38,56 @@ pub fn init(settings: &SharedSettings) {
             "boot",
         );
     } else {
+        if let Err(err) = start_infra_radios(settings, "boot") {
+            telemetry::record_log(format!(
+                "event type=mode.infra_start ok=false reason=boot msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        }
         telemetry::record_log("event type=mode active=infra".to_string());
     }
+}
+
+pub fn init_after_boot_window(settings: &SharedSettings) {
+    let mode = configured_mode(settings);
+    PRODUCT_MODE.store(mode, Ordering::Relaxed);
+    if mode == MODE_COMPANION {
+        if super::ble_bt::gatt_connected() {
+            let _ = enter_companion_advertising(
+                settings,
+                get_u32(settings, "cm.active_ms", DEFAULT_ACTIVE_MS),
+                get_u32(settings, "cm.adv_ms", DEFAULT_ADV_MS),
+                "boot_connected",
+            );
+        } else if let Err(err) = enter_companion_sleep(settings) {
+            telemetry::record_log(format!(
+                "event type=mode.sleep ok=false reason=boot_window_done msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        }
+    } else {
+        COMPANION_ADVERTISING.store(false, Ordering::Relaxed);
+        COMPANION_DEADLINE_MS.store(0, Ordering::Relaxed);
+        if let Err(err) = start_infra_radios(settings, "boot_window_done") {
+            telemetry::record_log(format!(
+                "event type=mode.infra_start ok=false reason=boot_window_done msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        }
+        telemetry::record_log("event type=mode active=infra reason=boot_window_done".to_string());
+    }
+}
+
+pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) -> Result<()> {
+    PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
+    COMPANION_ADVERTISING.store(false, Ordering::Relaxed);
+    COMPANION_DEADLINE_MS.store(0, Ordering::Relaxed);
+    if save {
+        settings.borrow_mut().set_str("mode", "infra")?;
+    }
+    start_infra_radios(settings, reason)?;
+    telemetry::record_log(format!("event type=mode active=infra reason={}", reason));
+    Ok(())
 }
 
 pub fn poll(settings: &SharedSettings) {
@@ -172,6 +220,19 @@ fn enter_companion_sleep(settings: &SharedSettings) -> Result<()> {
     super::sleep::enter_companion_deep_sleep(settings, lora_listen, 0, DEFAULT_ACTIVE_MS)
 }
 
+fn start_infra_radios(settings: &SharedSettings, reason: &'static str) -> Result<()> {
+    let channel = get_u32(settings, "raw.ch", 6).clamp(1, 13) as u8;
+    super::wifi::start_raw_monitor_mode(channel, "action")?;
+    // TODO(raw-security): raw Wi-Fi commands are intentionally unauthenticated
+    // during bring-up. Add mesh-owner public-key authentication and payload
+    // encryption before this is used outside local testing.
+    telemetry::record_log(format!(
+        "event type=mode.infra_start raw_wifi=true channel={} reason={}",
+        channel, reason
+    ));
+    Ok(())
+}
+
 fn send_status_ping(settings: &SharedSettings, source: &'static str) -> Result<()> {
     if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_COMPANION {
         bail!("companion firmware does not send ping");
@@ -210,11 +271,7 @@ fn configured_mode(settings: &SharedSettings) -> u8 {
     if matches!(from_mode.as_deref(), Some("companion")) {
         return MODE_COMPANION;
     }
-    if settings.borrow().get_bool("ble.comp", true).unwrap_or(true) {
-        MODE_COMPANION
-    } else {
-        MODE_INFRA
-    }
+    MODE_INFRA
 }
 
 fn get_u32(settings: &SharedSettings, key: &str, default: u32) -> u32 {
@@ -260,9 +317,14 @@ impl CommandHandler for ModeCommand {
             .transpose()?
             .unwrap_or(false)
         {
-            PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
             if save_requested(request) {
-                self.settings.borrow_mut().set_str("mode", "infra")?;
+                let mut settings = self.settings.borrow_mut();
+                settings.set_str("mode", "infra")?;
+                settings.set_bool("ble.comp", false)?;
+                drop(settings);
+                set_infra(&self.settings, false, "command")?;
+            } else {
+                set_infra(&self.settings, false, "command")?;
             }
             return Ok(CommandResponse::ok(status_text()));
         }
