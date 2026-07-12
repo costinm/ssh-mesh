@@ -1,0 +1,102 @@
+[
+  {
+    "name": "discover",
+    "title": "Discover Sources",
+    "group": "Trace Sources",
+    "description": "List trace producer sockets visible to traceweb.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "sources",
+    "title": "Connected Sources",
+    "group": "Trace Sources",
+    "description": "List trace sources currently connected to traceweb.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "connect_source",
+    "title": "Connect Source",
+    "group": "Trace Sources",
+    "description": "Connect traceweb to a trace producer socket.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Name"
+        },
+        "path": {
+          "type": ["string", "null"],
+          "title": "Socket path",
+          "description": "Optional full socket path. If omitted, traceweb uses the default trace socket directory."
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "disconnect_source",
+    "title": "Disconnect Source",
+    "group": "Trace Sources",
+    "description": "Disconnect a trace source by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Name"
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "set_source_level",
+    "title": "Set Source Level",
+    "group": "Trace Control",
+    "description": "Set trace filtering level for a connected producer.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Name"
+        },
+        "level": {
+          "type": "string",
+          "title": "Level",
+          "enum": ["trace", "debug", "info", "warn", "error"]
+        }
+      },
+      "required": ["name", "level"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "subscribe",
+    "title": "Subscribe",
+    "group": "Trace Control",
+    "description": "Stream trace_entry notifications on the same JSONL connection.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sources": {
+          "type": ["array", "null"],
+          "title": "Sources",
+          "description": "Optional source names to include."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+]

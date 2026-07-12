@@ -1,0 +1,27 @@
+[
+  {
+    "name": "jsonl_call",
+    "title": "JSONL Call",
+    "group": "Proxy",
+    "description": "Send a JSON-RPC request to a component Unix socket and return the unwrapped result.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "socket_path": {
+          "type": "string",
+          "title": "Socket path"
+        },
+        "method_name": {
+          "type": "string",
+          "title": "Method"
+        },
+        "params": {
+          "type": ["object", "null"],
+          "title": "Params"
+        }
+      },
+      "required": ["socket_path", "method_name"],
+      "additionalProperties": false
+    }
+  }
+]

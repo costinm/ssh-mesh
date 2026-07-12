@@ -1,0 +1,225 @@
+[
+  {
+    "name": "status",
+    "title": "Status",
+    "group": "Services",
+    "description": "Query status for one service or all loaded services.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": ["string", "null"],
+          "title": "Service name"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "start",
+    "title": "Start Service",
+    "group": "Services",
+    "description": "Start a configured service by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Service name"
+        },
+        "args": {
+          "type": "array",
+          "title": "Arguments"
+        },
+        "env": {
+          "type": "object",
+          "title": "Environment"
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "stop",
+    "title": "Stop Service",
+    "group": "Services",
+    "description": "Gracefully terminate or signal a running service.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Service name"
+        },
+        "signal": {
+          "type": ["integer", "null"],
+          "title": "Signal"
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "freeze",
+    "title": "Freeze Service",
+    "group": "Services",
+    "description": "Suspend a running service.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Service name"
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "unfreeze",
+    "title": "Unfreeze Service",
+    "group": "Services",
+    "description": "Resume a frozen service.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Service name"
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "reload",
+    "title": "Reload Config",
+    "group": "Services",
+    "description": "Reload service configuration from disk.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "processes",
+    "title": "List Processes",
+    "group": "Observer",
+    "description": "List observed processes from mesh-init's process observer.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "process",
+    "title": "Get Process",
+    "group": "Observer",
+    "description": "Return detailed information for one process.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "title": "PID",
+          "minimum": 0
+        }
+      },
+      "required": ["pid"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cgroups",
+    "title": "List CGroups",
+    "group": "Observer",
+    "description": "Return all observed cgroups.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cgroup",
+    "title": "Get CGroup",
+    "group": "Observer",
+    "description": "Return detailed information for one cgroup path.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "title": "Path"
+        }
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "pressure",
+    "title": "Pressure",
+    "group": "Observer",
+    "description": "Return pressure watch state.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cgroup_high",
+    "title": "Set memory.high",
+    "group": "Observer",
+    "description": "Set memory.high for a cgroup based on current memory usage.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "title": "Path"
+        },
+        "percentage": {
+          "type": "number",
+          "title": "Percentage"
+        },
+        "interval": {
+          "type": "integer",
+          "title": "Reset interval seconds",
+          "minimum": 0
+        }
+      },
+      "required": ["path", "percentage", "interval"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "move_process",
+    "title": "Move Process",
+    "group": "Observer",
+    "description": "Move a process to a named cgroup.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "title": "PID",
+          "minimum": 0
+        },
+        "cgroup_name": {
+          "type": ["string", "null"],
+          "title": "CGroup name"
+        }
+      },
+      "required": ["pid"],
+      "additionalProperties": false
+    }
+  }
+]

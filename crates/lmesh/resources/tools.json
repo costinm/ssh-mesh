@@ -1,0 +1,376 @@
+[
+  {
+    "name": "nodes",
+    "title": "List Nodes",
+    "group": "Discovery",
+    "description": "List currently discovered local mesh nodes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_node",
+    "title": "Get Node",
+    "group": "Discovery",
+    "description": "Return one discovered node by public key.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "public_key": {
+          "type": "string",
+          "title": "Public key",
+          "description": "Base64url-encoded P-256 public key."
+        }
+      },
+      "required": ["public_key"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "announce",
+    "title": "Announce",
+    "group": "Discovery",
+    "description": "Send a multicast local mesh announcement.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "type": ["object", "null"],
+          "title": "Metadata",
+          "description": "Optional string key/value metadata."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "status",
+    "title": "Status",
+    "group": "Radio",
+    "description": "Return mesh, interface, radio, and neighbor status when provided by the active adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "radios.list",
+    "title": "List Radios",
+    "group": "Radio",
+    "description": "List configured host, serial, remote UDS, and future Android radio adapters.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "neighbors",
+    "title": "Neighbors",
+    "group": "Discovery",
+    "description": "Return recently observed neighbors from normalized radio messages.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "seen_within_sec": {
+          "type": "integer",
+          "title": "Seen within seconds",
+          "description": "Only include neighbors observed within this window.",
+          "default": 21600,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "discovery.ping",
+    "title": "Ping All Media",
+    "group": "Discovery",
+    "description": "Queue a discovery ping intent for one medium or all configured media.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "medium": {
+          "type": "string",
+          "title": "Medium",
+          "description": "Radio medium to ping, or all.",
+          "default": "all"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "messages.history",
+    "title": "Message History",
+    "group": "Radio",
+    "description": "Return recent message, radio, and service notifications when provided by the active adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "keys": {
+          "type": "string",
+          "title": "Keys",
+          "description": "Comma-separated method prefixes to include.",
+          "default": "messages,net,wifi,BLE,N"
+        },
+        "limit": {
+          "type": "integer",
+          "title": "Limit",
+          "description": "Maximum number of events to return.",
+          "default": 40,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.scan",
+    "title": "Wi-Fi Scan",
+    "group": "Radio",
+    "description": "Request a Wi-Fi scan through the local hardware adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "title": "Reason",
+          "default": "web"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.adv",
+    "title": "Wi-Fi Advertise",
+    "group": "Radio",
+    "description": "Enable or disable Wi-Fi service advertisement through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "on": {
+          "type": "boolean",
+          "title": "On",
+          "default": true
+        },
+        "p2p": {
+          "type": "boolean",
+          "title": "P2P",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.con.start",
+    "title": "Start Wi-Fi Discovery",
+    "group": "Radio",
+    "description": "Start Wi-Fi Direct/service discovery through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sd": {
+          "type": "boolean",
+          "title": "Service discovery",
+          "default": true
+        },
+        "wait": {
+          "type": "integer",
+          "title": "Wait seconds",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.con.stop",
+    "title": "Stop Wi-Fi Discovery",
+    "group": "Radio",
+    "description": "Stop Wi-Fi Direct/service discovery through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.nan.start",
+    "title": "Attach NAN",
+    "group": "NAN",
+    "description": "Attach to Wi-Fi Aware/NAN through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "ctrl_dir": {
+          "type": "string",
+          "title": "WPA control dir",
+          "default": "/run/ssh-mesh-wpa"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.nan.stop",
+    "title": "Detach NAN",
+    "group": "NAN",
+    "description": "Detach from Wi-Fi Aware/NAN through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "ctrl_dir": {
+          "type": "string",
+          "title": "WPA control dir",
+          "default": "/run/ssh-mesh-wpa"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.nan.ping",
+    "title": "NAN Ping",
+    "group": "NAN",
+    "description": "Send a NAN ping/probe message through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "peer": {
+          "type": "string",
+          "title": "Peer",
+          "description": "Optional peer identifier."
+        },
+        "payload": {
+          "type": "string",
+          "title": "Payload",
+          "default": "ping"
+        },
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "ctrl_dir": {
+          "type": "string",
+          "title": "WPA control dir",
+          "default": "/run/ssh-mesh-wpa"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.nan.adv",
+    "title": "Publish NAN",
+    "group": "NAN",
+    "description": "Start NAN publish/advertise through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "ctrl_dir": {
+          "type": "string",
+          "title": "WPA control dir",
+          "default": "/run/ssh-mesh-wpa"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.nan.sub",
+    "title": "Subscribe NAN",
+    "group": "NAN",
+    "description": "Start NAN subscribe/discovery through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "ctrl_dir": {
+          "type": "string",
+          "title": "WPA control dir",
+          "default": "/run/ssh-mesh-wpa"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ble.scan",
+    "title": "BLE Scan",
+    "group": "BLE",
+    "description": "Request a BLE scan through the local adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "title": "Reason",
+          "default": "web"
+        },
+        "dev_id": {
+          "type": "integer",
+          "title": "HCI device id",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ble.adv",
+    "title": "BLE Advertise",
+    "group": "BLE",
+    "description": "Enable or disable DMesh BLE service-data advertisements through raw Linux HCI sockets.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "on": {
+          "type": "boolean",
+          "title": "On",
+          "default": true
+        },
+        "dev_id": {
+          "type": "integer",
+          "title": "HCI device id",
+          "default": 0,
+          "minimum": 0
+        },
+        "payload": {
+          "type": "string",
+          "title": "Payload",
+          "default": "lmesh"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+]
