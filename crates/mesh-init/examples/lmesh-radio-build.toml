@@ -1,0 +1,57 @@
+# Build-user lmesh radio service with ambient radio capabilities.
+#
+# Service name from filename: lmesh-radio-build
+# Runtime dir: /run/mesh/lmesh-radio-build
+# mesh-init creates /run/mesh/lmesh-radio-build and chowns it to User/Group.
+
+[Service]
+Type = "exec"
+
+# mesh-init should be started with PATH containing the lmesh build/profile bin.
+# For direct repo testing, target/debug/lmesh or
+# target/x86_64-unknown-linux-musl/debug/lmesh are typical candidates for PATH.
+ExecStart = "lmesh"
+
+# Symlink to the build target
+WorkingDirectory = "target"
+
+# Avoid root. Normally should be 'net' - but for testing use the dev user ( I use 'build' )
+User = "build"
+Group = "build"
+# For access to USB on deb-like. May need adjustments.
+SupplementaryGroups = ["plugdev"]
+
+# It could also be on-demand if only handling eth.
+Restart = "always"
+RestartSec = "1s"
+KillMode = "control-group"
+
+TimeoutStopSec = "2s"
+
+NoNewPrivileges = false
+
+CapabilityBoundingSet = [
+  "CAP_SETPCAP",
+  "CAP_NET_ADMIN",
+  "CAP_NET_RAW",
+]
+AmbientCapabilities = [
+  "CAP_NET_ADMIN",
+  "CAP_NET_RAW",
+]
+
+StandardOutput = "inherit"
+StandardError = "inherit"
+
+[Environment]
+RUST_LOG = "info,lmesh=debug"
+HOME = "lmesh-radio-build/home"
+MESH_HOME = "lmesh-radio-build/mesh"
+MESH_LOG_FILE = "lmesh-radio-build/log/lmesh.log"
+MESH_LOG_DIR = "lmesh-radio-build/log"
+
+# Special name with build - separate from the 'main' one.
+LMESH_CONTROL_SOCKET = "/run/mesh/lmesh-radio-build/mesh.sock"
+
+LMESH_WIFI_IFACE = "wlan1"
+LMESH_WPA_CTRL_DIR = "/run/mesh/wpa-supplicant-nan"

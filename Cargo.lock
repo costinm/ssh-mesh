@@ -2138,6 +2138,7 @@ name = "lmesh"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "libc",
  "mesh",
  "p256",
  "rand 0.10.1",
@@ -2145,6 +2146,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+ "toml",
  "tracing",
 ]
 

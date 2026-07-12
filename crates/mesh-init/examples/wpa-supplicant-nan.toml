@@ -1,0 +1,36 @@
+# Build-user repo WPA supplicant for lmesh NAN/USD tests.
+#
+# Service name from filename: wpa-supplicant-nan
+# Control dir: /run/mesh/wpa-supplicant-nan
+# mesh-init creates /run/mesh/wpa-supplicant-nan and chowns it to User/Group.
+
+[Service]
+Type = "exec"
+# mesh-init should be started with PATH containing the NAN-enabled
+# wpa_supplicant build, for example from .#radio-deps.
+# Keep wpa-supplicant-nan.conf in WorkingDirectory or replace -c with your
+# deployed config path.
+ExecStart = "wpa_supplicant -i wlan1 -D nl80211 -c wpa-supplicant-nan.conf -s"
+WorkingDirectory = "target"
+User = "build"
+Group = "plugdev"
+SupplementaryGroups = ["plugdev"]
+Restart = "always"
+RestartSec = "1s"
+KillMode = "control-group"
+TimeoutStopSec = "5s"
+NoNewPrivileges = false
+CapabilityBoundingSet = [
+  "CAP_SETPCAP",
+  "CAP_NET_ADMIN",
+  "CAP_NET_RAW",
+]
+AmbientCapabilities = [
+  "CAP_NET_ADMIN",
+  "CAP_NET_RAW",
+]
+StandardOutput = "inherit"
+StandardError = "inherit"
+
+[Environment]
+RUST_LOG = "info"
