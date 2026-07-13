@@ -28,9 +28,11 @@ const RAW_FILTER_ACTION: u32 = 2;
 const RAW_FILTER_BEACON: u32 = 3;
 const RAW_FILTER_PROBE_REQ: u32 = 4;
 const RAW_FILTER_PROBE_RESP: u32 = 5;
+const RAW_FILTER_DATA: u32 = 6;
 const RAW_COMMAND_QUEUE_MAX: usize = 8;
 const RAW_COMMAND_MAX_LEN: usize = 512;
 const RAW_BROADCAST: [u8; 6] = [0xff; 6];
+const DMESH_VENDOR_MARKER: [u8; 5] = [0x7f, 0x50, 0x6f, 0x9a, 0x42];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static RAW_FILTER_MODE: AtomicU32 = AtomicU32::new(RAW_FILTER_MGMT);
@@ -113,11 +115,12 @@ pub fn take_raw_command() -> Option<RawWifiCommand> {
 }
 
 pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
-    RAW_FILTER_MODE.store(parse_raw_filter(filter)?, Ordering::Relaxed);
+    let filter_mode = parse_raw_filter(filter)?;
+    RAW_FILTER_MODE.store(filter_mode, Ordering::Relaxed);
     ensure_raw_wifi_started(channel.clamp(1, 13))?;
     unsafe {
         let mut promisc_filter = sys::wifi_promiscuous_filter_t {
-            filter_mask: sys::WIFI_PROMIS_FILTER_MASK_MGMT,
+            filter_mask: promiscuous_filter_mask(filter_mode),
         };
         esp_ok(sys::esp_wifi_set_promiscuous(false))?;
         esp_ok(sys::esp_wifi_set_promiscuous_rx_cb(Some(raw_wifi_cb)))?;
@@ -182,7 +185,7 @@ impl CommandHandler for WifiCommand {
     }
 
     fn help(&self) -> &'static str {
-        "wifi ssid=SSID psk=PSK timeout=MS | wifi ap=true ssid=SSID psk=PSK channel=6 | wifi scan=true | wifi raw_monitor=true filter=mgmt|action|beacon|probe_req|probe_resp bssid=aa:bb:... | wifi raw=hex:... | wifi raw_stats=true"
+        "wifi ssid=SSID psk=PSK timeout=MS | wifi ap=true ssid=SSID psk=PSK channel=6 | wifi scan=true | wifi raw_monitor=true filter=mgmt|action|data|all bssid=aa:bb:... | wifi raw=hex:... | wifi raw_data=TEXT | wifi raw_stats=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -220,6 +223,30 @@ impl CommandHandler for WifiCommand {
             return Ok(CommandResponse::ok(format!(
                 "wifi raw sent bytes={} {}",
                 bytes.len(),
+                raw_stats()
+            )));
+        }
+        if let Some(payload) = request.arg("raw_data") {
+            let channel = request
+                .arg("channel")
+                .map(parse_i32)
+                .transpose()?
+                .unwrap_or(6)
+                .clamp(1, 13) as u8;
+            let destination = request
+                .arg("dst")
+                .or_else(|| request.arg("destination"))
+                .map(parse_mac)
+                .transpose()?
+                .unwrap_or(RAW_BROADCAST);
+            ensure_raw_wifi_started(channel)?;
+            let frame = multicast_data_frame(destination, payload.as_bytes())?;
+            raw_tx_frame(&frame, true)?;
+            RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+            telemetry::record_packet("wifi", Direction::Tx, payload.as_bytes(), "raw_data=true");
+            return Ok(CommandResponse::ok(format!(
+                "wifi raw_data sent bytes={} {}",
+                frame.len(),
                 raw_stats()
             )));
         }
@@ -506,7 +533,24 @@ fn vendor_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> 
     frame.extend_from_slice(&mac);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&[0x7f, 0x50, 0x6f, 0x9a, 0x42]);
+    frame.extend_from_slice(&DMESH_VENDOR_MARKER);
+    frame.extend_from_slice(&payload[..body_len]);
+    Ok(frame)
+}
+
+fn multicast_data_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
+    if destination[0] & 0x01 == 0 {
+        bail!("raw_data destination must be multicast or broadcast");
+    }
+    let mac = station_mac()?;
+    let body_len = payload.len().min(1400);
+    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER.len() + body_len);
+    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&mac);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&DMESH_VENDOR_MARKER);
     frame.extend_from_slice(&payload[..body_len]);
     Ok(frame)
 }
@@ -526,7 +570,10 @@ unsafe extern "C" fn raw_wifi_cb(
     buf: *mut core::ffi::c_void,
     type_: sys::wifi_promiscuous_pkt_type_t,
 ) {
-    if type_ != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_MGMT || buf.is_null() {
+    if buf.is_null()
+        || (type_ != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_MGMT
+            && type_ != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_DATA)
+    {
         RAW_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -593,6 +640,7 @@ fn matches_raw_filter(frame: &[u8]) -> bool {
         RAW_FILTER_BEACON => frame_subtype(frame) == 8,
         RAW_FILTER_PROBE_REQ => frame_subtype(frame) == 4,
         RAW_FILTER_PROBE_RESP => frame_subtype(frame) == 5,
+        RAW_FILTER_DATA => frame_type(frame) == 2,
         _ => true,
     }
 }
@@ -625,12 +673,13 @@ fn frame_has_bssid(frame: &[u8]) -> bool {
 }
 
 fn dmesh_vendor_payload(frame: &[u8]) -> Option<&[u8]> {
-    const VENDOR_ACTION: [u8; 5] = [0x7f, 0x50, 0x6f, 0x9a, 0x42];
-    if frame.len() <= 29 || frame_subtype(frame) != 13 {
+    if frame.len() <= 24 + DMESH_VENDOR_MARKER.len() {
         return None;
     }
-    if frame[24..29] == VENDOR_ACTION {
-        Some(&frame[29..])
+    if (frame_type(frame) == 2 || frame_subtype(frame) == 13)
+        && frame[24..29] == DMESH_VENDOR_MARKER
+    {
+        Some(&frame[24 + DMESH_VENDOR_MARKER.len()..])
     } else {
         None
     }
@@ -731,6 +780,7 @@ fn parse_raw_filter(value: &str) -> Result<u32> {
         "all" => Ok(RAW_FILTER_ALL),
         "mgmt" | "management" => Ok(RAW_FILTER_MGMT),
         "action" => Ok(RAW_FILTER_ACTION),
+        "data" => Ok(RAW_FILTER_DATA),
         "beacon" => Ok(RAW_FILTER_BEACON),
         "probe_req" | "probe-request" => Ok(RAW_FILTER_PROBE_REQ),
         "probe_resp" | "probe-response" => Ok(RAW_FILTER_PROBE_RESP),
@@ -743,10 +793,19 @@ fn raw_filter_name() -> &'static str {
         RAW_FILTER_ALL => "all",
         RAW_FILTER_MGMT => "mgmt",
         RAW_FILTER_ACTION => "action",
+        RAW_FILTER_DATA => "data",
         RAW_FILTER_BEACON => "beacon",
         RAW_FILTER_PROBE_REQ => "probe_req",
         RAW_FILTER_PROBE_RESP => "probe_resp",
         _ => "unknown",
+    }
+}
+
+fn promiscuous_filter_mask(filter_mode: u32) -> u32 {
+    match filter_mode {
+        RAW_FILTER_ALL => sys::WIFI_PROMIS_FILTER_MASK_MGMT | sys::WIFI_PROMIS_FILTER_MASK_DATA,
+        RAW_FILTER_DATA => sys::WIFI_PROMIS_FILTER_MASK_DATA,
+        _ => sys::WIFI_PROMIS_FILTER_MASK_MGMT,
     }
 }
 

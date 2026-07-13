@@ -17,6 +17,9 @@ log = "0.4"
 [build-dependencies]
 embuild = "0.33"
 
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["native"]
+
 [profile.release]
 codegen-units = 1
 debug = false
