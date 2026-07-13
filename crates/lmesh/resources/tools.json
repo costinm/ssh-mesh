@@ -130,6 +130,87 @@
     }
   },
   {
+    "name": "wifi.raw.listen",
+    "title": "Listen Raw Wi-Fi",
+    "group": "Radio",
+    "description": "Start a direct AF_PACKET listener for ESP32 DMesh vendor action frames.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "ctrl_dir": {
+          "type": "string",
+          "title": "WPA control dir",
+          "default": "/run/ssh-mesh-wpa"
+        },
+        "channel": {
+          "type": "integer",
+          "title": "Channel",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 13
+        },
+        "listen_sec": {
+          "type": "integer",
+          "title": "Listen seconds",
+          "default": 60,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.raw.send",
+    "title": "Send Raw Wi-Fi",
+    "group": "Radio",
+    "description": "Send an ESP32-compatible DMesh vendor action frame carrying a text command payload.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "ctrl_dir": {
+          "type": "string",
+          "title": "WPA control dir",
+          "default": "/run/ssh-mesh-wpa"
+        },
+        "channel": {
+          "type": "integer",
+          "title": "Channel",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 13
+        },
+        "listen_sec": {
+          "type": "integer",
+          "title": "Listen seconds",
+          "default": 60,
+          "minimum": 1
+        },
+        "destination": {
+          "type": "string",
+          "title": "Destination MAC",
+          "description": "Optional destination MAC. Defaults to broadcast."
+        },
+        "payload": {
+          "type": "string",
+          "title": "Payload",
+          "description": "Command or payload bytes encoded as UTF-8 text."
+        }
+      },
+      "required": ["payload"],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "wifi.scan",
     "title": "Wi-Fi Scan",
     "group": "Radio",

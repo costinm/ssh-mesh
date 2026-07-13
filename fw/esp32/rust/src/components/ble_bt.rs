@@ -78,7 +78,7 @@ static BLE_COMPANION_ACTIVE_CHANGED: AtomicBool = AtomicBool::new(false);
 static BLE_ADV_INT_MIN: AtomicU32 = AtomicU32::new(0x20);
 static BLE_ADV_INT_MAX: AtomicU32 = AtomicU32::new(0x40);
 #[cfg(target_feature = "esp32s3ops")]
-const BLE_EXT_ADV_INSTANCE: u8 = 2;
+const BLE_EXT_ADV_INSTANCE: u8 = 0;
 #[cfg(target_feature = "esp32s3ops")]
 static BLE_EXT_ADV_ADDR_DONE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_feature = "esp32s3ops")]
@@ -177,30 +177,11 @@ unsafe fn ble_gap_stop_scanning() -> sys::esp_err_t {
 }
 
 unsafe fn ble_gap_stop_advertising() -> sys::esp_err_t {
-    #[cfg(target_feature = "esp32s3ops")]
-    {
-        let instance = BLE_EXT_ADV_INSTANCE;
-        sys::esp_ble_gap_ext_adv_stop(1, &instance)
-    }
-    #[cfg(not(target_feature = "esp32s3ops"))]
-    {
-        sys::esp_ble_gap_stop_advertising()
-    }
+    sys::esp_ble_gap_stop_advertising()
 }
 
 unsafe fn ble_gap_config_adv_data_raw(raw_data: *mut u8, raw_data_len: u32) -> sys::esp_err_t {
-    #[cfg(target_feature = "esp32s3ops")]
-    {
-        sys::esp_ble_gap_config_ext_adv_data_raw(
-            BLE_EXT_ADV_INSTANCE,
-            raw_data_len as u16,
-            raw_data as *const u8,
-        )
-    }
-    #[cfg(not(target_feature = "esp32s3ops"))]
-    {
-        sys::esp_ble_gap_config_adv_data_raw(raw_data, raw_data_len)
-    }
+    sys::esp_ble_gap_config_adv_data_raw(raw_data, raw_data_len)
 }
 
 unsafe fn ble_gap_set_scan_params(params: *mut sys::esp_ble_scan_params_t) -> sys::esp_err_t {
@@ -239,32 +220,17 @@ unsafe fn ble_gap_start_scanning(duration: u32) -> sys::esp_err_t {
 }
 
 unsafe fn ble_gap_start_advertising(params: *mut sys::esp_ble_adv_params_t) -> sys::esp_err_t {
-    #[cfg(target_feature = "esp32s3ops")]
-    {
-        let _ = params;
-        BLE_EXT_ADV_START_DONE.store(false, Ordering::Relaxed);
-        BLE_EXT_ADV_START_STATUS.store(0xffff, Ordering::Relaxed);
-        let ext_adv = sys::esp_ble_gap_ext_adv_t {
-            instance: BLE_EXT_ADV_INSTANCE,
-            duration: 0,
-            max_events: 0,
-        };
-        sys::esp_ble_gap_ext_adv_start(1, &ext_adv)
-    }
-    #[cfg(not(target_feature = "esp32s3ops"))]
-    {
-        sys::esp_ble_gap_start_advertising(params)
-    }
+    sys::esp_ble_gap_start_advertising(params)
 }
 
 #[cfg(target_feature = "esp32s3ops")]
 fn ext_adv_params() -> sys::esp_ble_gap_ext_adv_params_t {
     sys::esp_ble_gap_ext_adv_params_t {
-        type_: sys::ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY_IND as u16,
+        type_: sys::ESP_BLE_GAP_SET_EXT_ADV_PROP_CONNECTABLE as u16,
         interval_min: BLE_ADV_INT_MIN.load(Ordering::Relaxed),
         interval_max: BLE_ADV_INT_MAX.load(Ordering::Relaxed),
         channel_map: sys::esp_ble_adv_channel_t_ADV_CHNL_ALL,
-        own_addr_type: sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_RANDOM,
+        own_addr_type: sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_PUBLIC,
         peer_addr_type: sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_PUBLIC,
         peer_addr: [0; 6],
         filter_policy: sys::esp_ble_adv_filter_t_ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
@@ -272,7 +238,7 @@ fn ext_adv_params() -> sys::esp_ble_gap_ext_adv_params_t {
         primary_phy: sys::ESP_BLE_GAP_PHY_1M as u8,
         max_skip: 0,
         secondary_phy: sys::ESP_BLE_GAP_PHY_1M as u8,
-        sid: 2,
+        sid: 0,
         scan_req_notif: false,
     }
 }
@@ -308,6 +274,14 @@ fn wait_ext_adv_stage(
         }
     }
     bail!("{label} timeout")
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+unsafe fn request_ext_adv_params() -> sys::esp_err_t {
+    BLE_EXT_ADV_PARAMS_DONE.store(false, Ordering::Relaxed);
+    BLE_EXT_ADV_PARAMS_STATUS.store(0xffff, Ordering::Relaxed);
+    let params = ext_adv_params();
+    sys::esp_ble_gap_ext_adv_set_params(BLE_EXT_ADV_INSTANCE, &params)
 }
 
 fn wait_legacy_adv_started(timeout: Duration) -> Result<()> {
@@ -421,8 +395,12 @@ pub fn disable_controller_sleep() -> Result<()> {
 
 pub fn stop_radio_activity() {
     unsafe {
-        let _ = ble_gap_stop_scanning();
-        let _ = ble_gap_stop_advertising();
+        if BLE_SCAN_STARTED.load(Ordering::Relaxed) {
+            let _ = ble_gap_stop_scanning();
+        }
+        if BLE_ADV_STARTED.load(Ordering::Relaxed) {
+            let _ = ble_gap_stop_advertising();
+        }
     }
     BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
     BLE_ADV_STARTED.store(false, Ordering::Relaxed);
@@ -1124,6 +1102,12 @@ impl RadioCommand {
         }
         if self.bt.is_none() {
             let peripherals = Peripherals::take()?;
+            unsafe {
+                sys::esp_log_level_set(
+                    b"*\0".as_ptr().cast(),
+                    sys::esp_log_level_t_ESP_LOG_VERBOSE,
+                );
+            }
             self.bt = Some(BtDriver::<Ble>::new(peripherals.modem, None)?);
             let name = CString::new("DMesh")?;
             unsafe {
@@ -1198,75 +1182,42 @@ fn start_raw_adv(data: &[u8]) -> Result<()> {
         core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         PENDING_ADV_LEN = data.len();
         BLE_ADV_PENDING.store(true, Ordering::Relaxed);
-        BLE_SCAN_STOPPING.store(true, Ordering::Relaxed);
-        let stop_ret = ble_gap_stop_scanning();
-        if stop_ret == sys::ESP_OK || stop_ret == sys::ESP_ERR_INVALID_STATE {
-            sys::vTaskDelay(duration_to_ticks(Duration::from_millis(120)));
-            if BLE_ADV_PENDING.swap(false, Ordering::Relaxed) {
-                BLE_SCAN_STOPPING.store(false, Ordering::Relaxed);
-                return configure_raw_adv(data);
+        if BLE_SCAN_STARTED.load(Ordering::Relaxed) {
+            BLE_SCAN_STOPPING.store(true, Ordering::Relaxed);
+            let stop_ret = ble_gap_stop_scanning();
+            if stop_ret == sys::ESP_OK || stop_ret == sys::ESP_ERR_INVALID_STATE {
+                sys::vTaskDelay(duration_to_ticks(Duration::from_millis(120)));
+                if BLE_ADV_PENDING.swap(false, Ordering::Relaxed) {
+                    BLE_SCAN_STOPPING.store(false, Ordering::Relaxed);
+                    return configure_raw_adv(data);
+                }
+                return Ok(());
             }
-            return Ok(());
+            BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
+            BLE_SCAN_STOPPING.store(false, Ordering::Relaxed);
+            BLE_ADV_PENDING.store(false, Ordering::Relaxed);
         }
-        BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
-        BLE_SCAN_STOPPING.store(false, Ordering::Relaxed);
-        BLE_ADV_PENDING.store(false, Ordering::Relaxed);
     }
+    BLE_ADV_PENDING.store(false, Ordering::Relaxed);
     configure_raw_adv(data)
 }
 
 fn configure_raw_adv(data: &[u8]) -> Result<()> {
     unsafe {
+        // Bluedroid on ESP32-S3 can report the controller as actively advertising
+        // before our local state sees an ADV_START event. Force the controller to
+        // a known stopped state before changing advertising data/parameters.
         esp_ok_allow_invalid_state(ble_gap_stop_advertising())?;
+        sys::vTaskDelay(duration_to_ticks(Duration::from_millis(250)));
         BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
         BLE_ADV_STARTED.store(false, Ordering::Relaxed);
         let ptr = core::ptr::addr_of_mut!(RAW_ADV_DATA) as *mut u8;
         core::ptr::write_bytes(ptr, 0, 31);
         core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         RAW_ADV_LEN = data.len();
-        #[cfg(target_feature = "esp32s3ops")]
-        {
-            BLE_EXT_ADV_PARAMS_DONE.store(false, Ordering::Relaxed);
-            BLE_EXT_ADV_PARAMS_STATUS.store(0xffff, Ordering::Relaxed);
-            BLE_EXT_ADV_ADDR_DONE.store(false, Ordering::Relaxed);
-            BLE_EXT_ADV_ADDR_STATUS.store(0xffff, Ordering::Relaxed);
-            BLE_EXT_ADV_DATA_DONE.store(false, Ordering::Relaxed);
-            BLE_EXT_ADV_DATA_STATUS.store(0xffff, Ordering::Relaxed);
-            let params = ext_adv_params();
-            esp_ok(sys::esp_ble_gap_ext_adv_set_params(BLE_EXT_ADV_INSTANCE, &params))?;
-            wait_ext_adv_stage(
-                "ext_adv_params",
-                &BLE_EXT_ADV_PARAMS_DONE,
-                &BLE_EXT_ADV_PARAMS_STATUS,
-                Duration::from_millis(500),
-            )?;
-            let mut rand_addr = ext_adv_random_addr();
-            esp_ok(sys::esp_ble_gap_ext_adv_set_rand_addr(
-                BLE_EXT_ADV_INSTANCE,
-                rand_addr.as_mut_ptr(),
-            ))?;
-            wait_ext_adv_stage(
-                "ext_adv_rand_addr",
-                &BLE_EXT_ADV_ADDR_DONE,
-                &BLE_EXT_ADV_ADDR_STATUS,
-                Duration::from_millis(500),
-            )?;
-        }
         esp_ok(ble_gap_config_adv_data_raw(ptr, RAW_ADV_LEN as u32))?;
-        #[cfg(target_feature = "esp32s3ops")]
-        {
-            wait_ext_adv_stage(
-                "ext_adv_data",
-                &BLE_EXT_ADV_DATA_DONE,
-                &BLE_EXT_ADV_DATA_STATUS,
-                Duration::from_millis(500),
-            )?;
-        }
         sys::vTaskDelay(duration_to_ticks(Duration::from_millis(30)));
     }
-    #[cfg(target_feature = "esp32s3ops")]
-    start_ble_advertising()?;
-    #[cfg(not(target_feature = "esp32s3ops"))]
     wait_legacy_adv_started(Duration::from_millis(1_000))?;
     Ok(())
 }
@@ -1286,17 +1237,7 @@ fn start_ble_advertising() -> Result<()> {
         BLE_ADV_START_DONE.store(false, Ordering::Relaxed);
         BLE_ADV_START_STATUS.store(0xffff, Ordering::Relaxed);
         esp_ok(ble_gap_start_advertising(&mut params))?;
-        #[cfg(target_feature = "esp32s3ops")]
-        {
-            wait_ext_adv_stage(
-                "ext_adv_start",
-                &BLE_EXT_ADV_START_DONE,
-                &BLE_EXT_ADV_START_STATUS,
-                Duration::from_millis(500),
-            )?;
-        }
     }
-    #[cfg(target_feature = "esp32s3ops")]
     BLE_ADV_STARTED.store(true, Ordering::Relaxed);
     Ok(())
 }

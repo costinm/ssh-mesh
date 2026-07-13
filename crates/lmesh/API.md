@@ -91,6 +91,8 @@ command surface changes; do not generate it from Rust code.
 | `neighbors` | `seen_within_sec: integer = 21600` | Returns the normalized neighbor table from recent radio messages. |
 | `discovery.ping` | `medium: string = "all"` | Pings matching configured media. ESP serial radios are opened at their configured baud, sent shared mesh text, and reply/log lines are normalized through `mesh::message`; other media record the fanout intent for their adapters. |
 | `messages.history` | `keys: string = "messages,net,wifi,BLE,N"`, `limit: integer = 40` | Returns recent radio method results recorded by this process. |
+| `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60` | Uses wpa_supplicant control to set P2P listen channel and start a listen window, then starts a direct `AF_PACKET` listener for ESP32 DMesh vendor action frames using action bytes `7f:50:6f:9a:42`. Records received payloads as `wifi.raw.rx` events in `messages.history`. Requires `CAP_NET_RAW`; a monitor-mode interface may be needed for 802.11 management frames. |
+| `wifi.raw.send` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `destination: mac = ff:ff:ff:ff:ff:ff`, `payload: string` | Uses wpa_supplicant control to set P2P listen channel and start a listen window, then sends an ESP32-compatible raw DMesh vendor action frame with the same layout used by firmware `wifi raw`/direct command receive. Requires `CAP_NET_RAW` and an interface/driver mode that accepts 802.11 frame injection. |
 | `ble.scan` | `dev_id: integer = 0`, `reason: string = "jsonl"` | Enables passive LE scanning through raw Linux HCI sockets. Requires `CAP_NET_RAW`. |
 | `ble.adv` | `dev_id: integer = 0`, `on: bool = true`, `payload: string = "lmesh"` | Enables or disables BLE advertising with DMesh service UUID `0xFD5D` and current DMesh service-data layout. Requires `CAP_NET_RAW`. |
 | `wifi.nan.start` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR` | Brings the interface up through native rtnetlink, then probes the WPA control socket with `STATUS` and `DRIVER_FLAGS2`. |
@@ -180,6 +182,17 @@ Public helpers:
 | `build_ble_service_data` / `parse_ble_service_data` | BLE service-data wake and payload-hint frames. |
 | `build_nan_service_info` / `parse_nan_service_info` | WiFi Aware/NAN service-specific info frames. |
 | `build_nan_followup` / `parse_nan_followup` | WiFi Aware/NAN follow-up message frames. |
+
+The direct ESP32 Wi-Fi command path currently uses vendor-specific 802.11 action
+frames, not NAN. Firmware builds frames as:
+
+```text
+fc=d0:00 duration=00:00 addr1=<destination> addr2=<station_mac> addr3=<destination> seq=00:00
+body=7f 50 6f 9a 42 <payload bytes>
+```
+
+`wifi.raw.listen` accepts bare 802.11 frames and radiotap-prefixed monitor
+captures, then extracts payloads with that body prefix.
 
 ## Real-Hardware Radio Setup
 

@@ -567,6 +567,33 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
+    /// Listen for ESP32-compatible raw DMesh Wi-Fi action frames.
+    #[serde(rename = "wifi.raw.listen")]
+    WifiRawListen {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        listen_sec: Option<u64>,
+    },
+    /// Send an ESP32-compatible raw DMesh Wi-Fi action frame.
+    #[serde(rename = "wifi.raw.send")]
+    WifiRawSend {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        listen_sec: Option<u64>,
+        #[serde(default)]
+        destination: Option<String>,
+        payload: String,
+    },
     /// Request a BLE scan through raw Linux HCI sockets.
     #[serde(rename = "ble.scan")]
     BleScan {
@@ -687,6 +714,30 @@ impl LmeshService {
             Request::MessagesHistory { keys, limit } => {
                 mesh::protocol::Response::ok_with_data(self.radio.history(keys, limit))
             }
+            Request::WifiRawListen {
+                iface,
+                ctrl_dir,
+                channel,
+                listen_sec,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio
+                    .wifi_raw_listen(iface, ctrl_dir, channel, listen_sec),
+            ),
+            Request::WifiRawSend {
+                iface,
+                ctrl_dir,
+                channel,
+                listen_sec,
+                destination,
+                payload,
+            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_send(
+                iface,
+                ctrl_dir,
+                channel,
+                listen_sec,
+                destination,
+                payload,
+            )),
             Request::BleScan { dev_id, reason } => match self.radio.ble_scan(dev_id, reason) {
                 Ok(data) => mesh::protocol::Response::ok_with_data(data),
                 Err(e) => mesh::protocol::Response::err(e.to_string()),

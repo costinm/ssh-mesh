@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, bail};
 use mesh::message::{
-    FIELD_CTRL_DIR, FIELD_IFACE, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD,
+    FIELD_CTRL_DIR, FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD,
     FIELD_RADIO_ID, FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec, TextRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
@@ -20,7 +20,32 @@ const DEFAULT_WIFI_IFACE: &str = "wlan1";
 const DEFAULT_WPA_CTRL_DIR: &str = "/run/ssh-mesh-wpa";
 const DEFAULT_WPA_SERVICE_NAME: &str = "dmesh";
 const DEFAULT_HCI_DEV: u16 = 0;
+const DEFAULT_RAW_WIFI_CHANNEL: u8 = 6;
+const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
 const MAX_HISTORY: usize = 128;
+const ETH_P_ALL: u16 = 0x0003;
+const NETLINK_GENERIC: libc::c_int = 16;
+const GENL_ID_CTRL: u16 = 16;
+const CTRL_CMD_GETFAMILY: u8 = 3;
+const CTRL_ATTR_FAMILY_ID: u16 = 1;
+const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+const NL80211_GENL_VERSION: u8 = 1;
+const NL80211_CMD_REGISTER_FRAME: u8 = 58;
+const NL80211_CMD_FRAME: u8 = 59;
+const NL80211_ATTR_IFINDEX: u16 = 3;
+const NL80211_ATTR_WIPHY_FREQ: u16 = 38;
+const NL80211_ATTR_FRAME: u16 = 51;
+const NL80211_ATTR_DURATION: u16 = 87;
+const NL80211_ATTR_FRAME_MATCH: u16 = 91;
+const NL80211_ATTR_FRAME_TYPE: u16 = 101;
+const NL80211_ATTR_OFFCHANNEL_TX_OK: u16 = 108;
+const DMESH_VENDOR_ACTION: [u8; 5] = [0x7f, 0x50, 0x6f, 0x9a, 0x42];
+const IEEE80211_ADDR1: usize = 4;
+const IEEE80211_ADDR2: usize = 10;
+const IEEE80211_ADDR3: usize = 16;
+const IEEE80211_BODY: usize = 24;
+const IEEE80211_ACTION_FRAME_TYPE: u16 = 0x00d0;
+const RAW_WIFI_BROADCAST: [u8; 6] = [0xff; 6];
 const AF_BLUETOOTH: libc::c_int = 31;
 const BTPROTO_HCI: libc::c_int = 1;
 const HCI_CHANNEL_RAW: u16 = 0;
@@ -41,6 +66,7 @@ const IFF_UP: u32 = 0x1;
 pub struct RadioService {
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
     radios: Arc<Vec<RadioAdapter>>,
+    raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RadioService {
@@ -49,6 +75,7 @@ impl RadioService {
         Self {
             history: Arc::new(Mutex::new(VecDeque::new())),
             radios: Arc::new(load_radio_adapters()),
+            raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -174,6 +201,166 @@ impl RadioService {
             "radios": selected,
             "serial": serial_results,
         })
+    }
+
+    /// Start a direct AF_PACKET listener for ESP32 DMesh vendor action frames.
+    pub fn wifi_raw_listen(
+        &self,
+        iface: Option<String>,
+        ctrl_dir: Option<String>,
+        channel: Option<u8>,
+        listen_sec: Option<u64>,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
+        let channel = raw_wifi_channel(channel);
+        let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
+        let wpa_channel = prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec);
+        {
+            let mut listeners = self
+                .raw_wifi_listeners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !listeners.insert(iface.clone()) {
+                return json!({
+                    "ok": true,
+                    "backend": "linux_af_packet",
+                    "iface": iface,
+                    "ctrl_dir": ctrl_dir,
+                    "channel": channel,
+                    "listen_sec": listen_sec,
+                    "wpa_channel": wpa_channel,
+                    "already_running": true,
+                });
+            }
+        }
+
+        match RawWifiSocket::open(&iface) {
+            Ok(socket) => {
+                let history = self.history.clone();
+                let listeners = self.raw_wifi_listeners.clone();
+                let iface_for_thread = iface.clone();
+                std::thread::spawn(move || {
+                    raw_wifi_receive_loop(socket, &iface_for_thread, history);
+                    listeners
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&iface_for_thread);
+                });
+                let result = json!({
+                    "ok": true,
+                    "backend": "linux_af_packet",
+                    "iface": iface,
+                    "ctrl_dir": ctrl_dir,
+                    "channel": channel,
+                    "listen_sec": listen_sec,
+                    "wpa_channel": wpa_channel,
+                    "note": "listener records ESP32 DMesh vendor action frames visible on this interface; monitor-mode interfaces may deliver radiotap-prefixed 802.11 frames",
+                });
+                self.record_message(
+                    "wifi.raw.listen",
+                    "host-wifi",
+                    MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
+                        .field(FIELD_MEDIUM, "wifi")
+                        .field(FIELD_IFACE, &iface)
+                        .field(FIELD_STATUS, "listening"),
+                );
+                self.record("wifi.raw.listen", result.clone());
+                result
+            }
+            Err(error) => {
+                self.raw_wifi_listeners
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&iface);
+                json!({
+                    "ok": false,
+                    "backend": "linux_af_packet",
+                    "iface": iface,
+                    "error": error.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Send an ESP32-compatible DMesh vendor action frame.
+    pub fn wifi_raw_send(
+        &self,
+        iface: Option<String>,
+        ctrl_dir: Option<String>,
+        channel: Option<u8>,
+        listen_sec: Option<u64>,
+        destination: Option<String>,
+        payload: String,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
+        let channel = raw_wifi_channel(channel);
+        let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
+        let wpa_channel = prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec);
+        let destination = parse_mac(destination.as_deref()).unwrap_or(RAW_WIFI_BROADCAST);
+        let socket = match RawWifiSocket::open(&iface) {
+            Ok(socket) => socket,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "backend": "linux_af_packet",
+                    "iface": iface,
+                    "error": error.to_string(),
+                });
+            }
+        };
+        let source = match iface_mac(&iface) {
+            Ok(source) => source,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "backend": "linux_af_packet",
+                    "iface": iface,
+                    "error": error.to_string(),
+                });
+            }
+        };
+        let frame = build_dmesh_vendor_action_frame(destination, source, payload.as_bytes());
+        let result = match socket.send(&frame) {
+            Ok(written) if written == frame.len() => json!({
+                "ok": true,
+                "backend": "linux_af_packet",
+                "iface": iface,
+                "ctrl_dir": ctrl_dir,
+                "channel": channel,
+                "listen_sec": listen_sec,
+                "wpa_channel": wpa_channel,
+                "destination": colon_mac(&destination),
+                "source": colon_mac(&source),
+                "payload_len": payload.len(),
+                "frame_len": frame.len(),
+            }),
+            Ok(written) => json!({
+                "ok": false,
+                "backend": "linux_af_packet",
+                "iface": iface,
+                "error": format!("short raw frame write: wrote {written}, expected {}", frame.len()),
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "backend": "linux_af_packet",
+                "iface": iface,
+                "error": error.to_string(),
+            }),
+        };
+        self.record_message(
+            "wifi.raw.tx",
+            "host-wifi",
+            MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
+                .field(FIELD_MEDIUM, "wifi")
+                .field(FIELD_IFACE, &iface)
+                .field(mesh::message::FIELD_PEER, colon_mac(&destination))
+                .field(FIELD_LEN, payload.len())
+                .field(FIELD_PAYLOAD, payload),
+        );
+        self.record("wifi.raw.tx", result.clone());
+        result
     }
 
     fn ping_serial_radio(&self, radio: &RadioAdapter) -> Value {
@@ -774,6 +961,304 @@ impl Drop for HciSocket {
     }
 }
 
+struct RawWifiSocket {
+    fd: RawFd,
+}
+
+impl RawWifiSocket {
+    fn open(iface: &str) -> Result<Self> {
+        let iface_c = std::ffi::CString::new(iface.as_bytes())
+            .map_err(|_| anyhow::anyhow!("interface name contains NUL byte: {iface:?}"))?;
+        let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
+        if ifindex == 0 {
+            bail!(
+                "if_nametoindex({iface}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                (ETH_P_ALL as i32).to_be(),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open AF_PACKET raw socket; CAP_NET_RAW is usually required");
+        }
+        let addr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as libc::sa_family_t,
+            sll_protocol: ETH_P_ALL.to_be(),
+            sll_ifindex: ifindex as i32,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 0,
+            sll_addr: [0; 8],
+        };
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error).with_context(|| format!("failed to bind AF_PACKET to {iface}"));
+        }
+        Ok(Self { fd })
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read =
+            unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        if read < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(read as usize)
+        }
+    }
+
+    fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = unsafe {
+            libc::send(
+                self.fd,
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+                0,
+            )
+        };
+        if written < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(written as usize)
+        }
+    }
+}
+
+impl Drop for RawWifiSocket {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn raw_wifi_receive_loop(
+    socket: RawWifiSocket,
+    iface: &str,
+    history: Arc<Mutex<VecDeque<RadioEvent>>>,
+) {
+    let mut buf = [0_u8; 4096];
+    loop {
+        match socket.recv(&mut buf) {
+            Ok(0) => continue,
+            Ok(len) => {
+                let packet = &buf[..len];
+                if let Some(frame) = ieee80211_frame(packet) {
+                    if let Some(value) = parse_dmesh_vendor_action(frame, iface) {
+                        let message = mesh_message_from_raw_wifi(&value, iface);
+                        push_radio_event(
+                            &history,
+                            RadioEvent {
+                                ts_millis: now_millis(),
+                                key: "wifi.raw.rx".to_string(),
+                                source: iface.to_string(),
+                                value,
+                                message: Some(message),
+                            },
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                push_radio_event(
+                    &history,
+                    RadioEvent {
+                        ts_millis: now_millis(),
+                        key: "wifi.raw.listen.error".to_string(),
+                        source: iface.to_string(),
+                        value: json!({ "ok": false, "iface": iface, "error": error.to_string() }),
+                        message: None,
+                    },
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn ieee80211_frame(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < IEEE80211_BODY {
+        return None;
+    }
+    if is_management_action(packet) {
+        return Some(packet);
+    }
+    let radiotap_len = radiotap_len(packet)?;
+    let frame = packet.get(radiotap_len..)?;
+    is_management_action(frame).then_some(frame)
+}
+
+fn radiotap_len(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 8 || packet[0] != 0 {
+        return None;
+    }
+    let len = u16::from_le_bytes([packet[2], packet[3]]) as usize;
+    (len >= 8 && len < packet.len()).then_some(len)
+}
+
+fn is_management_action(frame: &[u8]) -> bool {
+    frame.len() >= IEEE80211_BODY && frame_type(frame) == 0 && frame_subtype(frame) == 13
+}
+
+fn parse_dmesh_vendor_action(frame: &[u8], iface: &str) -> Option<Value> {
+    if frame.len() <= IEEE80211_BODY + DMESH_VENDOR_ACTION.len() {
+        return None;
+    }
+    let body = &frame[IEEE80211_BODY..];
+    if !body.starts_with(&DMESH_VENDOR_ACTION) {
+        return None;
+    }
+    let payload = &body[DMESH_VENDOR_ACTION.len()..];
+    let source = mac_at(frame, IEEE80211_ADDR2)?;
+    let destination = mac_at(frame, IEEE80211_ADDR1)?;
+    let bssid = mac_at(frame, IEEE80211_ADDR3)?;
+    Some(json!({
+        "protocol": "dmesh_wifi_raw",
+        "layout": "vendor_action",
+        "backend": "linux_af_packet",
+        "iface": iface,
+        "category": body[0],
+        "oui": hex_bytes(&body[1..4]),
+        "vendor_type": body[4],
+        "source": colon_mac(&source),
+        "destination": colon_mac(&destination),
+        "bssid": colon_mac(&bssid),
+        "payload_len": payload.len(),
+        "payload": hex_bytes(payload),
+        "payload_text": String::from_utf8_lossy(payload).trim(),
+    }))
+}
+
+fn build_dmesh_vendor_action_frame(
+    destination: [u8; 6],
+    source: [u8; 6],
+    payload: &[u8],
+) -> Vec<u8> {
+    let body_len = payload.len().min(1400);
+    let mut frame = Vec::with_capacity(IEEE80211_BODY + DMESH_VENDOR_ACTION.len() + body_len);
+    frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&DMESH_VENDOR_ACTION);
+    frame.extend_from_slice(&payload[..body_len]);
+    frame
+}
+
+fn mesh_message_from_raw_wifi(value: &Value, iface: &str) -> MeshMessage {
+    let mut message = MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
+        .field(FIELD_MEDIUM, "wifi")
+        .field(FIELD_IFACE, iface);
+    for (field, key) in [
+        (FIELD_NODE, "source"),
+        (mesh::message::FIELD_PEER, "destination"),
+        (FIELD_LEN, "payload_len"),
+        (FIELD_PAYLOAD, "payload_text"),
+    ] {
+        if let Some(value) = value.get(key) {
+            message = message.field(field, json_scalar_string(value));
+        }
+    }
+    message
+}
+
+fn push_radio_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, event: RadioEvent) {
+    let mut history = history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    history.push_back(event);
+    while history.len() > MAX_HISTORY {
+        history.pop_front();
+    }
+}
+
+fn mac_at(frame: &[u8], offset: usize) -> Option<[u8; 6]> {
+    let mut out = [0_u8; 6];
+    out.copy_from_slice(frame.get(offset..offset + 6)?);
+    Some(out)
+}
+
+fn iface_mac(iface: &str) -> Result<[u8; 6]> {
+    let iface_c = std::ffi::CString::new(iface.as_bytes())
+        .map_err(|_| anyhow::anyhow!("interface name contains NUL byte: {iface:?}"))?;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to open ioctl socket");
+    }
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name_bytes = iface_c.as_bytes_with_nul();
+    if name_bytes.len() > request.ifr_name.len() {
+        unsafe {
+            libc::close(fd);
+        }
+        bail!("interface name too long: {iface}");
+    }
+    for (idx, byte) in name_bytes.iter().enumerate() {
+        request.ifr_name[idx] = *byte as libc::c_char;
+    }
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR as libc::c_int, &mut request) };
+    let error = std::io::Error::last_os_error();
+    unsafe {
+        libc::close(fd);
+    }
+    if rc < 0 {
+        return Err(error).with_context(|| format!("failed to read hardware address for {iface}"));
+    }
+    let mut out = [0_u8; 6];
+    unsafe {
+        let data = request.ifr_ifru.ifru_hwaddr.sa_data;
+        for (idx, slot) in out.iter_mut().enumerate() {
+            *slot = data[idx] as u8;
+        }
+    }
+    Ok(out)
+}
+
+fn parse_mac(value: Option<&str>) -> Option<[u8; 6]> {
+    let value = value?;
+    let compact = value.replace([':', '-'], "");
+    if compact.len() != 12 {
+        return None;
+    }
+    let mut out = [0_u8; 6];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&compact[idx * 2..idx * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn frame_type(frame: &[u8]) -> u8 {
+    (frame.first().copied().unwrap_or(0) & 0x0c) >> 2
+}
+
+fn frame_subtype(frame: &[u8]) -> u8 {
+    frame.first().copied().unwrap_or(0) >> 4
+}
+
+fn json_scalar_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
 fn adv_data(service_data: &[u8]) -> Result<Vec<u8>> {
     let field_len = 1 + service_data.len();
     if field_len > 0x1f {
@@ -1040,6 +1525,25 @@ fn wpa_ctrl_dir(value: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_WPA_CTRL_DIR.to_string())
 }
 
+fn raw_wifi_channel(value: Option<u8>) -> u8 {
+    value.unwrap_or(DEFAULT_RAW_WIFI_CHANNEL).clamp(1, 13)
+}
+
+fn prepare_raw_wifi_channel(iface: &str, ctrl_dir: &str, channel: u8, listen_sec: u64) -> Value {
+    let set_channel = wpa_raw_command(
+        iface,
+        ctrl_dir,
+        &format!("P2P_SET listen_channel {channel}"),
+    );
+    let disallow_freq = wpa_raw_command(iface, ctrl_dir, "P2P_SET disallow_freq ");
+    let listen = wpa_raw_command(iface, ctrl_dir, &format!("P2P_LISTEN {listen_sec}"));
+    json!({
+        "set_channel": command_result_json(set_channel),
+        "disallow_freq": command_result_json(disallow_freq),
+        "listen": command_result_json(listen),
+    })
+}
+
 fn process_caps() -> Value {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let caps = status
@@ -1131,5 +1635,33 @@ mod tests {
             [0, 17, 34, 51, 68, 85]
         );
         assert!(parse_device_id(Some("0011")).is_none());
+    }
+
+    #[test]
+    fn raw_wifi_vendor_action_round_trips() {
+        let dst = [0xff; 6];
+        let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
+        let frame = build_dmesh_vendor_action_frame(dst, src, b"stats");
+
+        assert_eq!(&frame[..4], &[0xd0, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            &frame[IEEE80211_BODY..IEEE80211_BODY + 5],
+            &DMESH_VENDOR_ACTION
+        );
+
+        let parsed = parse_dmesh_vendor_action(&frame, "wlan-test").unwrap();
+        assert_eq!(parsed["protocol"], "dmesh_wifi_raw");
+        assert_eq!(parsed["source"], "02:00:00:aa:bb:cc");
+        assert_eq!(parsed["destination"], "ff:ff:ff:ff:ff:ff");
+        assert_eq!(parsed["payload_text"], "stats");
+    }
+
+    #[test]
+    fn raw_wifi_accepts_radiotap_prefix() {
+        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping");
+        let mut packet = vec![0, 0, 8, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(&frame);
+
+        assert_eq!(ieee80211_frame(&packet).unwrap(), frame.as_slice());
     }
 }
