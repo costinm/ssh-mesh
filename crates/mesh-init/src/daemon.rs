@@ -397,9 +397,9 @@ impl Daemon {
     ///
     /// 1. Load system configs
     /// 2. Start resource manager
-    /// 3. Auto-start system services
-    /// 4. Start UDS control server
-    /// 5. If PID 1, run zombie reaper
+    /// 3. Start child manager
+    /// 4. Auto-start system services
+    /// 5. Start UDS control server
     pub async fn run(self: &Arc<Self>) -> Result<()> {
         info!("daemon_starting");
 
@@ -434,7 +434,11 @@ impl Daemon {
 
         self.start_process_observer();
 
-        // 3. Auto-start system services or start activation listeners.
+        // 3. Spawn child process manager before autostart so non-PID1 runs
+        // can register service PIDs for SIGCHLD reaping.
+        self.start_child_manager();
+
+        // 4. Auto-start system services or start activation listeners.
         // init-* services run first (sorted by priority), then the rest.
         let startup_configs: Vec<AppConfig> = self.configs.lock().values().cloned().collect();
         let mut init_configs: Vec<AppConfig> = Vec::new();
@@ -474,9 +478,6 @@ impl Daemon {
                 }
             }
         }
-
-        // 4. Spawn child process manager (zombie reaper + restarts)
-        self.start_child_manager();
     }
 
     fn start_process_observer(&self) {
@@ -1803,13 +1804,11 @@ impl Daemon {
                     if let Some(next_at) = proc.next_restart_at {
                         if now >= next_at {
                             to_restart.push(proc.config.clone());
-                            proc.state = ServiceState::Starting;
                             proc.next_restart_at = None;
                         }
                     } else {
                         // Immediate restart (should only occur if just loaded without backoff)
                         to_restart.push(proc.config.clone());
-                        proc.state = ServiceState::Starting;
                     }
                 }
             }

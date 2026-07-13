@@ -133,7 +133,7 @@
     "name": "wifi.raw.listen",
     "title": "Listen Raw Wi-Fi",
     "group": "Radio",
-    "description": "Start a direct AF_PACKET listener for ESP32 DMesh vendor action frames.",
+    "description": "Register an nl80211 listener for ESP32 DMesh vendor action frames.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -159,6 +159,13 @@
           "title": "Listen seconds",
           "default": 60,
           "minimum": 1
+        },
+        "rx_variant": {
+          "type": "string",
+          "title": "RX variant",
+          "description": "Receive backend to use.",
+          "enum": ["nl80211", "monitor"],
+          "default": "nl80211"
         }
       },
       "additionalProperties": false
@@ -168,7 +175,7 @@
     "name": "wifi.raw.send",
     "title": "Send Raw Wi-Fi",
     "group": "Radio",
-    "description": "Send an ESP32-compatible DMesh vendor action frame carrying a text command payload.",
+    "description": "Send an ESP32-compatible DMesh vendor action frame through nl80211.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -199,6 +206,35 @@
           "type": "string",
           "title": "Destination MAC",
           "description": "Optional destination MAC. Defaults to broadcast."
+        },
+        "tx_variant": {
+          "type": "string",
+          "title": "TX variant",
+          "description": "nl80211 FRAME request shape to try.",
+          "enum": [
+            "standard",
+            "zero_duration",
+            "no_duration",
+            "no_offchannel",
+            "minimal",
+            "dont_wait_ack",
+            "dont_wait_no_duration",
+            "dont_wait_minimal",
+            "dont_wait_no_cck",
+            "no_cck",
+            "no_freq",
+            "monitor",
+            "multicast_data",
+            "roc",
+            "pyroute2"
+          ],
+          "default": "standard"
+        },
+        "tx_duration_ms": {
+          "type": "integer",
+          "title": "TX duration milliseconds",
+          "description": "Optional nl80211 frame wait/off-channel duration. Defaults to listen_sec * 1000.",
+          "minimum": 0
         },
         "payload": {
           "type": "string",

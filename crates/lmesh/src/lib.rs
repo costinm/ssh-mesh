@@ -578,6 +578,8 @@ pub enum Request {
         channel: Option<u8>,
         #[serde(default)]
         listen_sec: Option<u64>,
+        #[serde(default)]
+        rx_variant: Option<String>,
     },
     /// Send an ESP32-compatible raw DMesh Wi-Fi action frame.
     #[serde(rename = "wifi.raw.send")]
@@ -592,6 +594,10 @@ pub enum Request {
         listen_sec: Option<u64>,
         #[serde(default)]
         destination: Option<String>,
+        #[serde(default)]
+        tx_variant: Option<String>,
+        #[serde(default)]
+        tx_duration_ms: Option<u32>,
         payload: String,
     },
     /// Request a BLE scan through raw Linux HCI sockets.
@@ -719,16 +725,18 @@ impl LmeshService {
                 ctrl_dir,
                 channel,
                 listen_sec,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio
-                    .wifi_raw_listen(iface, ctrl_dir, channel, listen_sec),
-            ),
+                rx_variant,
+            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_listen(
+                iface, ctrl_dir, channel, listen_sec, rx_variant,
+            )),
             Request::WifiRawSend {
                 iface,
                 ctrl_dir,
                 channel,
                 listen_sec,
                 destination,
+                tx_variant,
+                tx_duration_ms,
                 payload,
             } => mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_send(
                 iface,
@@ -736,6 +744,8 @@ impl LmeshService {
                 channel,
                 listen_sec,
                 destination,
+                tx_variant,
+                tx_duration_ms,
                 payload,
             )),
             Request::BleScan { dev_id, reason } => match self.radio.ble_scan(dev_id, reason) {

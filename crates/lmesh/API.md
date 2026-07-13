@@ -91,8 +91,8 @@ command surface changes; do not generate it from Rust code.
 | `neighbors` | `seen_within_sec: integer = 21600` | Returns the normalized neighbor table from recent radio messages. |
 | `discovery.ping` | `medium: string = "all"` | Pings matching configured media. ESP serial radios are opened at their configured baud, sent shared mesh text, and reply/log lines are normalized through `mesh::message`; other media record the fanout intent for their adapters. |
 | `messages.history` | `keys: string = "messages,net,wifi,BLE,N"`, `limit: integer = 40` | Returns recent radio method results recorded by this process. |
-| `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60` | Uses wpa_supplicant control to set P2P listen channel and start a listen window, then starts a direct `AF_PACKET` listener for ESP32 DMesh vendor action frames using action bytes `7f:50:6f:9a:42`. Records received payloads as `wifi.raw.rx` events in `messages.history`. Requires `CAP_NET_RAW`; a monitor-mode interface may be needed for 802.11 management frames. |
-| `wifi.raw.send` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `destination: mac = ff:ff:ff:ff:ff:ff`, `payload: string` | Uses wpa_supplicant control to set P2P listen channel and start a listen window, then sends an ESP32-compatible raw DMesh vendor action frame with the same layout used by firmware `wifi raw`/direct command receive. Requires `CAP_NET_RAW` and an interface/driver mode that accepts 802.11 frame injection. |
+| `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `rx_variant: string = "nl80211"` | Uses wpa_supplicant control to set P2P listen channel and start a listen window. `nl80211` registers an action-frame match for ESP32 DMesh vendor action bytes `7f:50:6f:9a:42`; `monitor` captures radiotap monitor frames and parses both action and multicast data frames with that marker. Records received payloads as `wifi.raw.rx` events in `messages.history`. Requires `CAP_NET_ADMIN`/`CAP_NET_RAW`. |
+| `wifi.raw.send` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `destination: mac = ff:ff:ff:ff:ff:ff`, `tx_variant: string = "standard"`, `tx_duration_ms: integer \| null`, `payload: string` | Sends an ESP32-compatible DMesh frame. nl80211 variants probe action-frame `FRAME` TX; `pyroute2` matches the common `ifindex/freq/duration/frame` shape; `roc` first issues `REMAIN_ON_CHANNEL` on the same nl80211 socket and skips the wpa_supplicant P2P listen command; `monitor` injects an action frame through AF_PACKET monitor mode; `multicast_data` injects a non-QoS multicast data frame through AF_PACKET monitor mode and defaults `destination` to `01:00:5e:44:4d:01`. Requires `CAP_NET_ADMIN`/`CAP_NET_RAW`. |
 | `ble.scan` | `dev_id: integer = 0`, `reason: string = "jsonl"` | Enables passive LE scanning through raw Linux HCI sockets. Requires `CAP_NET_RAW`. |
 | `ble.adv` | `dev_id: integer = 0`, `on: bool = true`, `payload: string = "lmesh"` | Enables or disables BLE advertising with DMesh service UUID `0xFD5D` and current DMesh service-data layout. Requires `CAP_NET_RAW`. |
 | `wifi.nan.start` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR` | Brings the interface up through native rtnetlink, then probes the WPA control socket with `STATUS` and `DRIVER_FLAGS2`. |
@@ -191,8 +191,13 @@ fc=d0:00 duration=00:00 addr1=<destination> addr2=<station_mac> addr3=<destinati
 body=7f 50 6f 9a 42 <payload bytes>
 ```
 
-`wifi.raw.listen` accepts bare 802.11 frames and radiotap-prefixed monitor
-captures, then extracts payloads with that body prefix.
+`wifi.raw.listen rx_variant=nl80211` receives nl80211 `FRAME` notifications
+after registering an action-frame match for that body prefix.
+
+`wifi.raw.send tx_variant=multicast_data` uses the same five-byte body marker,
+but places it in the payload of a non-QoS data frame with frame control
+`08:00`. Multicast and broadcast destinations avoid normal unicast MAC ACK and
+retry behavior.
 
 ## Real-Hardware Radio Setup
 

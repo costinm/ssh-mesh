@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,11 +26,16 @@ const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
 const MAX_HISTORY: usize = 128;
 const ETH_P_ALL: u16 = 0x0003;
 const NETLINK_GENERIC: libc::c_int = 16;
+const NETLINK_EXT_ACK: libc::c_int = 11;
 const GENL_ID_CTRL: u16 = 16;
 const CTRL_CMD_GETFAMILY: u8 = 3;
 const CTRL_ATTR_FAMILY_ID: u16 = 1;
 const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+const NLMSGERR_ATTR_MSG: u16 = 1;
+const NLMSGERR_ATTR_OFFS: u16 = 2;
+const NLMSGERR_ATTR_MISS_TYPE: u16 = 5;
 const NL80211_GENL_VERSION: u8 = 1;
+const NL80211_CMD_REMAIN_ON_CHANNEL: u8 = 55;
 const NL80211_CMD_REGISTER_FRAME: u8 = 58;
 const NL80211_CMD_FRAME: u8 = 59;
 const NL80211_ATTR_IFINDEX: u16 = 3;
@@ -39,6 +45,8 @@ const NL80211_ATTR_DURATION: u16 = 87;
 const NL80211_ATTR_FRAME_MATCH: u16 = 91;
 const NL80211_ATTR_FRAME_TYPE: u16 = 101;
 const NL80211_ATTR_OFFCHANNEL_TX_OK: u16 = 108;
+const NL80211_ATTR_TX_NO_CCK_RATE: u16 = 135;
+const NL80211_ATTR_DONT_WAIT_FOR_ACK: u16 = 142;
 const DMESH_VENDOR_ACTION: [u8; 5] = [0x7f, 0x50, 0x6f, 0x9a, 0x42];
 const IEEE80211_ADDR1: usize = 4;
 const IEEE80211_ADDR2: usize = 10;
@@ -46,6 +54,7 @@ const IEEE80211_ADDR3: usize = 16;
 const IEEE80211_BODY: usize = 24;
 const IEEE80211_ACTION_FRAME_TYPE: u16 = 0x00d0;
 const RAW_WIFI_BROADCAST: [u8; 6] = [0xff; 6];
+const RAW_WIFI_MULTICAST: [u8; 6] = [0x01, 0x00, 0x5e, 0x44, 0x4d, 0x01];
 const AF_BLUETOOTH: libc::c_int = 31;
 const BTPROTO_HCI: libc::c_int = 1;
 const HCI_CHANNEL_RAW: u16 = 0;
@@ -203,60 +212,110 @@ impl RadioService {
         })
     }
 
-    /// Start a direct AF_PACKET listener for ESP32 DMesh vendor action frames.
+    /// Start a direct nl80211 listener for ESP32 DMesh vendor action frames.
     pub fn wifi_raw_listen(
         &self,
         iface: Option<String>,
         ctrl_dir: Option<String>,
         channel: Option<u8>,
         listen_sec: Option<u64>,
+        rx_variant: Option<String>,
     ) -> Value {
         let iface = wifi_iface(iface);
         let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
         let channel = raw_wifi_channel(channel);
         let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
         let wpa_channel = prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec);
+        let rx_variant = rx_variant.unwrap_or_else(|| "nl80211".to_string());
+        let listener_key = format!("{iface}:{rx_variant}");
         {
             let mut listeners = self
                 .raw_wifi_listeners
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !listeners.insert(iface.clone()) {
+            if !listeners.insert(listener_key.clone()) {
                 return json!({
                     "ok": true,
-                    "backend": "linux_af_packet",
+                    "backend": "linux_nl80211",
                     "iface": iface,
                     "ctrl_dir": ctrl_dir,
                     "channel": channel,
                     "listen_sec": listen_sec,
+                    "rx_variant": rx_variant,
                     "wpa_channel": wpa_channel,
                     "already_running": true,
                 });
             }
         }
 
-        match RawWifiSocket::open(&iface) {
-            Ok(socket) => {
+        let listen_result = if rx_variant == "monitor" {
+            let monitor_iface = format!("{iface}mon");
+            ensure_monitor_iface(&iface, &monitor_iface, channel).and_then(|setup| {
+                let socket = MonitorRxSocket::open(&monitor_iface)?;
                 let history = self.history.clone();
                 let listeners = self.raw_wifi_listeners.clone();
                 let iface_for_thread = iface.clone();
+                let monitor_for_thread = monitor_iface.clone();
+                let listener_key_for_thread = listener_key.clone();
                 std::thread::spawn(move || {
-                    raw_wifi_receive_loop(socket, &iface_for_thread, history);
+                    monitor_receive_loop(socket, &iface_for_thread, &monitor_for_thread, history);
                     listeners
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&iface_for_thread);
+                        .remove(&listener_key_for_thread);
                 });
-                let result = json!({
+                Ok(json!({
                     "ok": true,
-                    "backend": "linux_af_packet",
+                    "backend": "linux_af_packet_monitor",
                     "iface": iface,
+                    "monitor_iface": monitor_iface,
                     "ctrl_dir": ctrl_dir,
                     "channel": channel,
                     "listen_sec": listen_sec,
+                    "rx_variant": rx_variant,
+                    "monitor": setup,
                     "wpa_channel": wpa_channel,
-                    "note": "listener records ESP32 DMesh vendor action frames visible on this interface; monitor-mode interfaces may deliver radiotap-prefixed 802.11 frames",
-                });
+                    "note": "monitor listener records DMesh action and multicast data frames visible on this interface",
+                }))
+            })
+        } else if rx_variant == "nl80211" {
+            Nl80211Socket::open()
+                .and_then(|socket| {
+                    socket.register_dmesh_action(ifindex(&iface)?)?;
+                    Ok(socket)
+                })
+                .map(|socket| {
+                    let history = self.history.clone();
+                    let listeners = self.raw_wifi_listeners.clone();
+                    let iface_for_thread = iface.clone();
+                    let listener_key_for_thread = listener_key.clone();
+                    std::thread::spawn(move || {
+                        nl80211_receive_loop(socket, &iface_for_thread, history);
+                        listeners
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&listener_key_for_thread);
+                    });
+                    json!({
+                        "ok": true,
+                        "backend": "linux_nl80211",
+                        "iface": iface,
+                        "ctrl_dir": ctrl_dir,
+                        "channel": channel,
+                        "listen_sec": listen_sec,
+                        "rx_variant": rx_variant,
+                        "wpa_channel": wpa_channel,
+                        "note": "listener records ESP32 DMesh vendor action frames visible on this interface",
+                    })
+                })
+        } else {
+            Err(anyhow::anyhow!(
+                "unknown rx_variant {rx_variant:?}; expected nl80211 or monitor"
+            ))
+        };
+
+        match listen_result {
+            Ok(result) => {
                 self.record_message(
                     "wifi.raw.listen",
                     "host-wifi",
@@ -272,12 +331,12 @@ impl RadioService {
                 self.raw_wifi_listeners
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&iface);
+                    .remove(&listener_key);
                 json!({
                     "ok": false,
-                    "backend": "linux_af_packet",
+                    "backend": "linux_nl80211",
                     "iface": iface,
-                    "error": error.to_string(),
+                    "error": format!("{error:#}"),
                 })
             }
         }
@@ -291,63 +350,127 @@ impl RadioService {
         channel: Option<u8>,
         listen_sec: Option<u64>,
         destination: Option<String>,
+        tx_variant: Option<String>,
+        tx_duration_ms: Option<u32>,
         payload: String,
     ) -> Value {
         let iface = wifi_iface(iface);
         let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
         let channel = raw_wifi_channel(channel);
         let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
-        let wpa_channel = prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec);
-        let destination = parse_mac(destination.as_deref()).unwrap_or(RAW_WIFI_BROADCAST);
-        let socket = match RawWifiSocket::open(&iface) {
-            Ok(socket) => socket,
-            Err(error) => {
-                return json!({
-                    "ok": false,
-                    "backend": "linux_af_packet",
-                    "iface": iface,
-                    "error": error.to_string(),
-                });
-            }
+        let tx_options =
+            match RawWifiTxOptions::from_variant(tx_variant.as_deref(), listen_sec, tx_duration_ms)
+            {
+                Ok(options) => options,
+                Err(error) => {
+                    return json!({
+                        "ok": false,
+                        "backend": "linux_nl80211",
+                        "iface": iface,
+                        "error": error.to_string(),
+                    });
+                }
+            };
+        let wpa_channel = if tx_options.variant == "roc" {
+            json!({
+                "skipped": true,
+                "reason": "tx_variant=roc owns nl80211 remain-on-channel directly",
+            })
+        } else {
+            prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec)
         };
+        let destination = parse_mac(destination.as_deref()).unwrap_or_else(|| {
+            if tx_options.variant == "multicast_data" {
+                RAW_WIFI_MULTICAST
+            } else {
+                RAW_WIFI_BROADCAST
+            }
+        });
         let source = match iface_mac(&iface) {
             Ok(source) => source,
             Err(error) => {
                 return json!({
                     "ok": false,
-                    "backend": "linux_af_packet",
+                    "backend": "linux_nl80211",
                     "iface": iface,
-                    "error": error.to_string(),
+                    "error": format!("{error:#}"),
                 });
             }
         };
-        let frame = build_dmesh_vendor_action_frame(destination, source, payload.as_bytes());
-        let result = match socket.send(&frame) {
-            Ok(written) if written == frame.len() => json!({
-                "ok": true,
-                "backend": "linux_af_packet",
-                "iface": iface,
-                "ctrl_dir": ctrl_dir,
-                "channel": channel,
+        let frame = if tx_options.variant == "multicast_data" {
+            build_dmesh_multicast_data_frame(destination, source, payload.as_bytes())
+        } else {
+            build_dmesh_vendor_action_frame(destination, source, payload.as_bytes())
+        };
+        let result = if tx_options.variant == "monitor" || tx_options.variant == "multicast_data" {
+            match send_monitor_frame(&iface, channel, &frame) {
+                Ok(monitor) => json!({
+                    "ok": true,
+                    "backend": "linux_af_packet_monitor",
+                    "tx_variant": tx_options.variant,
+                    "tx_options": tx_options.as_json(),
+                    "monitor": monitor,
+                    "iface": iface,
+                    "ctrl_dir": ctrl_dir,
+                    "channel": channel,
                 "listen_sec": listen_sec,
+                "tx_duration_ms": tx_duration_ms,
                 "wpa_channel": wpa_channel,
-                "destination": colon_mac(&destination),
-                "source": colon_mac(&source),
-                "payload_len": payload.len(),
-                "frame_len": frame.len(),
-            }),
-            Ok(written) => json!({
-                "ok": false,
-                "backend": "linux_af_packet",
-                "iface": iface,
-                "error": format!("short raw frame write: wrote {written}, expected {}", frame.len()),
-            }),
-            Err(error) => json!({
-                "ok": false,
-                "backend": "linux_af_packet",
-                "iface": iface,
-                "error": error.to_string(),
-            }),
+                    "destination": colon_mac(&destination),
+                    "source": colon_mac(&source),
+                    "payload_len": payload.len(),
+                    "frame_len": frame.len(),
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "backend": "linux_af_packet_monitor",
+                    "tx_variant": tx_options.variant,
+                    "tx_options": tx_options.as_json(),
+                    "iface": iface,
+                    "error": format!("{error:#}"),
+                }),
+            }
+        } else {
+            match Nl80211Socket::open().and_then(|socket| {
+                if tx_options.variant == "roc" {
+                    socket.remain_on_channel(
+                        ifindex(&iface)?,
+                        channel_to_freq(channel),
+                        tx_options.duration_ms.unwrap_or(10),
+                    )?;
+                }
+                socket.send_frame(
+                    ifindex(&iface)?,
+                    channel_to_freq(channel),
+                    &tx_options,
+                    &frame,
+                )
+            }) {
+                Ok(()) => json!({
+                    "ok": true,
+                    "backend": "linux_nl80211",
+                    "tx_variant": tx_options.variant,
+                    "tx_options": tx_options.as_json(),
+                    "iface": iface,
+                    "ctrl_dir": ctrl_dir,
+                    "channel": channel,
+                    "listen_sec": listen_sec,
+                    "tx_duration_ms": tx_duration_ms,
+                    "wpa_channel": wpa_channel,
+                    "destination": colon_mac(&destination),
+                    "source": colon_mac(&source),
+                    "payload_len": payload.len(),
+                    "frame_len": frame.len(),
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "backend": "linux_nl80211",
+                    "tx_variant": tx_options.variant,
+                    "tx_options": tx_options.as_json(),
+                    "iface": iface,
+                    "error": format!("{error:#}"),
+                }),
+            }
         };
         self.record_message(
             "wifi.raw.tx",
@@ -961,21 +1084,428 @@ impl Drop for HciSocket {
     }
 }
 
-struct RawWifiSocket {
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GenlMsgHdr {
+    cmd: u8,
+    version: u8,
+    reserved: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NlAttrHdr {
+    nla_len: u16,
+    nla_type: u16,
+}
+
+struct Nl80211Socket {
+    fd: RawFd,
+    family_id: u16,
+}
+
+#[derive(Clone)]
+struct RawWifiTxOptions {
+    variant: String,
+    include_freq: bool,
+    duration_ms: Option<u32>,
+    offchannel_tx_ok: bool,
+    dont_wait_for_ack: bool,
+    tx_no_cck_rate: bool,
+}
+
+impl RawWifiTxOptions {
+    fn from_variant(
+        variant: Option<&str>,
+        listen_sec: u64,
+        tx_duration_ms: Option<u32>,
+    ) -> Result<Self> {
+        let variant = variant.unwrap_or("standard").trim();
+        let duration_ms = tx_duration_ms
+            .unwrap_or_else(|| listen_sec.saturating_mul(1000).min(u32::MAX as u64) as u32);
+        let options = match variant {
+            "" | "standard" => Self {
+                variant: "standard".to_string(),
+                include_freq: true,
+                duration_ms: Some(duration_ms),
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
+            "zero_duration" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: Some(0),
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
+            "no_duration" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: None,
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
+            "no_offchannel" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: Some(duration_ms),
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
+            "minimal" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
+            "dont_wait_ack" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: Some(duration_ms),
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
+            "dont_wait_no_duration" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: None,
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
+            "dont_wait_minimal" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
+            "dont_wait_no_cck" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: None,
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: true,
+            },
+            "no_cck" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: Some(duration_ms),
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: true,
+            },
+            "no_freq" => Self {
+                variant: variant.to_string(),
+                include_freq: false,
+                duration_ms: Some(duration_ms),
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
+            "monitor" => Self {
+                variant: variant.to_string(),
+                include_freq: false,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
+            "multicast_data" => Self {
+                variant: variant.to_string(),
+                include_freq: false,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
+            "roc" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: Some(tx_duration_ms.unwrap_or(10)),
+                offchannel_tx_ok: true,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
+            "pyroute2" => Self {
+                variant: variant.to_string(),
+                include_freq: true,
+                duration_ms: Some(duration_ms),
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
+            other => bail!(
+                "unknown tx_variant {other:?}; expected standard, zero_duration, no_duration, no_offchannel, minimal, dont_wait_ack, dont_wait_no_duration, dont_wait_minimal, dont_wait_no_cck, no_cck, no_freq, monitor, multicast_data, roc, or pyroute2"
+            ),
+        };
+        Ok(options)
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "include_freq": self.include_freq,
+            "duration_ms": self.duration_ms,
+            "offchannel_tx_ok": self.offchannel_tx_ok,
+            "dont_wait_for_ack": self.dont_wait_for_ack,
+            "tx_no_cck_rate": self.tx_no_cck_rate,
+        })
+    }
+}
+
+impl Nl80211Socket {
+    fn open() -> Result<Self> {
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                NETLINK_GENERIC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open NETLINK_GENERIC socket");
+        }
+        let enable: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_NETLINK,
+                NETLINK_EXT_ACK,
+                &enable as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of_val(&enable) as libc::socklen_t,
+            );
+        }
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        addr.nl_pid = 0;
+        addr.nl_groups = 0;
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error).context("failed to bind NETLINK_GENERIC socket");
+        }
+        let mut socket = Self { fd, family_id: 0 };
+        let family_id = socket.resolve_family("nl80211")?;
+        socket.family_id = family_id;
+        Ok(socket)
+    }
+
+    fn resolve_family(&self, name: &str) -> Result<u16> {
+        let mut payload = genl_payload(CTRL_CMD_GETFAMILY, 2);
+        let mut name_bytes = name.as_bytes().to_vec();
+        name_bytes.push(0);
+        append_attr(&mut payload, CTRL_ATTR_FAMILY_NAME, &name_bytes);
+        self.send_genl(GENL_ID_CTRL, libc::NLM_F_REQUEST as u16, 1, &payload)?;
+        let response = self.recv_netlink()?;
+        let attrs = genl_attrs(&response)?;
+        for (kind, value) in attrs {
+            if kind == CTRL_ATTR_FAMILY_ID && value.len() >= 2 {
+                return Ok(u16::from_ne_bytes([value[0], value[1]]));
+            }
+        }
+        bail!("nl80211 generic netlink family id not found")
+    }
+
+    fn register_dmesh_action(&self, ifindex: u32) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_REGISTER_FRAME, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        append_attr(
+            &mut payload,
+            NL80211_ATTR_FRAME_TYPE,
+            &IEEE80211_ACTION_FRAME_TYPE.to_ne_bytes(),
+        );
+        append_attr(&mut payload, NL80211_ATTR_FRAME_MATCH, &DMESH_VENDOR_ACTION);
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            2,
+            &payload,
+        )?;
+        self.recv_ack()
+            .context("failed to register DMesh action frame match")
+    }
+
+    fn remain_on_channel(&self, ifindex: u32, freq: u32, duration_ms: u32) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_REMAIN_ON_CHANNEL, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
+        append_attr(
+            &mut payload,
+            NL80211_ATTR_DURATION,
+            &duration_ms.to_ne_bytes(),
+        );
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            4,
+            &payload,
+        )?;
+        self.recv_ack()
+            .context("nl80211 remain-on-channel failed")?;
+        let settle_ms = duration_ms.saturating_div(2).clamp(1, 20);
+        std::thread::sleep(Duration::from_millis(settle_ms as u64));
+        Ok(())
+    }
+
+    fn send_frame(
+        &self,
+        ifindex: u32,
+        freq: u32,
+        options: &RawWifiTxOptions,
+        frame: &[u8],
+    ) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_FRAME, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        if options.include_freq {
+            append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
+        }
+        if let Some(duration_ms) = options.duration_ms {
+            append_attr(
+                &mut payload,
+                NL80211_ATTR_DURATION,
+                &duration_ms.to_ne_bytes(),
+            );
+        }
+        append_attr(&mut payload, NL80211_ATTR_FRAME, frame);
+        if options.offchannel_tx_ok {
+            append_attr(&mut payload, NL80211_ATTR_OFFCHANNEL_TX_OK, &[]);
+        }
+        if options.dont_wait_for_ack {
+            append_attr(&mut payload, NL80211_ATTR_DONT_WAIT_FOR_ACK, &[]);
+        }
+        if options.tx_no_cck_rate {
+            append_attr(&mut payload, NL80211_ATTR_TX_NO_CCK_RATE, &[]);
+        }
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            3,
+            &payload,
+        )?;
+        self.recv_ack().context("nl80211 frame TX failed")
+    }
+
+    fn recv_frame(&self) -> Result<Vec<u8>> {
+        loop {
+            let response = self.recv_netlink()?;
+            let Some(header) = genl_header(&response) else {
+                continue;
+            };
+            if header.cmd != NL80211_CMD_FRAME {
+                continue;
+            }
+            for (kind, value) in genl_attrs(&response)? {
+                if kind == NL80211_ATTR_FRAME {
+                    return Ok(value.to_vec());
+                }
+            }
+        }
+    }
+
+    fn send_genl(&self, nlmsg_type: u16, flags: u16, seq: u32, payload: &[u8]) -> Result<()> {
+        let header = libc::nlmsghdr {
+            nlmsg_len: (std::mem::size_of::<libc::nlmsghdr>() + payload.len()) as u32,
+            nlmsg_type,
+            nlmsg_flags: flags,
+            nlmsg_seq: seq,
+            nlmsg_pid: 0,
+        };
+        let mut request = Vec::with_capacity(header.nlmsg_len as usize);
+        append_struct(&mut request, &header);
+        request.extend_from_slice(payload);
+        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        kernel.nl_pid = 0;
+        kernel.nl_groups = 0;
+        let written = unsafe {
+            libc::sendto(
+                self.fd,
+                request.as_ptr() as *const libc::c_void,
+                request.len(),
+                0,
+                &kernel as *const libc::sockaddr_nl as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if written < 0 {
+            let os_error = std::io::Error::last_os_error();
+            bail!(
+                "failed to send netlink request type={} len={} flags=0x{:x}: {}",
+                nlmsg_type,
+                request.len(),
+                flags,
+                os_error
+            );
+        }
+        Ok(())
+    }
+
+    fn recv_netlink(&self) -> Result<Vec<u8>> {
+        let mut buf = vec![0_u8; 65536];
+        let read =
+            unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        if read < 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to receive netlink reply");
+        }
+        buf.truncate(read as usize);
+        if let Some(error) = netlink_error(&buf) {
+            bail!(
+                "netlink error: {}{}",
+                std::io::Error::from_raw_os_error(error),
+                netlink_extack_message(&buf)
+            );
+        }
+        Ok(buf)
+    }
+
+    fn recv_ack(&self) -> Result<()> {
+        let response = self.recv_netlink()?;
+        if netlink_is_ack(&response) {
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Nl80211Socket {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+struct MonitorTxSocket {
     fd: RawFd,
 }
 
-impl RawWifiSocket {
+struct MonitorRxSocket {
+    fd: RawFd,
+}
+
+impl MonitorTxSocket {
     fn open(iface: &str) -> Result<Self> {
-        let iface_c = std::ffi::CString::new(iface.as_bytes())
-            .map_err(|_| anyhow::anyhow!("interface name contains NUL byte: {iface:?}"))?;
-        let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
-        if ifindex == 0 {
-            bail!(
-                "if_nametoindex({iface}) failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        let ifindex = ifindex(iface)?;
         let fd = unsafe {
             libc::socket(
                 libc::AF_PACKET,
@@ -985,7 +1515,64 @@ impl RawWifiSocket {
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error())
-                .context("failed to open AF_PACKET raw socket; CAP_NET_RAW is usually required");
+                .context("failed to open AF_PACKET raw socket for monitor TX");
+        }
+        let addr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as libc::sa_family_t,
+            sll_protocol: ETH_P_ALL.to_be(),
+            sll_ifindex: ifindex as i32,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 0,
+            sll_addr: [0; 8],
+        };
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error).with_context(|| format!("failed to bind AF_PACKET to {iface}"));
+        }
+        Ok(Self { fd })
+    }
+
+    fn send(&self, packet: &[u8]) -> Result<usize> {
+        let written = unsafe {
+            libc::send(
+                self.fd,
+                packet.as_ptr() as *const libc::c_void,
+                packet.len(),
+                0,
+            )
+        };
+        if written < 0 {
+            Err(std::io::Error::last_os_error()).context("failed to send monitor frame")
+        } else {
+            Ok(written as usize)
+        }
+    }
+}
+
+impl MonitorRxSocket {
+    fn open(iface: &str) -> Result<Self> {
+        let ifindex = ifindex(iface)?;
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                (ETH_P_ALL as i32).to_be(),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open AF_PACKET raw socket for monitor RX");
         }
         let addr = libc::sockaddr_ll {
             sll_family: libc::AF_PACKET as libc::sa_family_t,
@@ -1022,25 +1609,9 @@ impl RawWifiSocket {
             Ok(read as usize)
         }
     }
-
-    fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
-        let written = unsafe {
-            libc::send(
-                self.fd,
-                bytes.as_ptr() as *const libc::c_void,
-                bytes.len(),
-                0,
-            )
-        };
-        if written < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(written as usize)
-        }
-    }
 }
 
-impl Drop for RawWifiSocket {
+impl Drop for MonitorTxSocket {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);
@@ -1048,31 +1619,304 @@ impl Drop for RawWifiSocket {
     }
 }
 
-fn raw_wifi_receive_loop(
-    socket: RawWifiSocket,
+impl Drop for MonitorRxSocket {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn send_monitor_frame(iface: &str, channel: u8, frame: &[u8]) -> Result<Value> {
+    let monitor_iface = format!("{iface}mon");
+    let setup = ensure_monitor_iface(iface, &monitor_iface, channel)?;
+    let packet = build_radiotap_packet(frame);
+    let socket = MonitorTxSocket::open(&monitor_iface)?;
+    let written = socket.send(&packet)?;
+    if written != packet.len() {
+        bail!(
+            "short monitor frame write: wrote {written}, expected {}",
+            packet.len()
+        );
+    }
+    Ok(json!({
+        "iface": monitor_iface,
+        "packet_len": packet.len(),
+        "setup": setup,
+    }))
+}
+
+fn ensure_monitor_iface(base_iface: &str, monitor_iface: &str, channel: u8) -> Result<Value> {
+    let mut steps = Vec::new();
+    if ifindex(monitor_iface).is_err() {
+        steps.push(run_command(
+            "iw",
+            &[
+                "dev",
+                base_iface,
+                "interface",
+                "add",
+                monitor_iface,
+                "type",
+                "monitor",
+            ],
+        ));
+    }
+    steps.push(run_command("ip", &["link", "set", monitor_iface, "up"]));
+    steps.push(run_command(
+        "iw",
+        &["dev", monitor_iface, "set", "channel", &channel.to_string()],
+    ));
+    let failed = steps
+        .iter()
+        .filter(|step| {
+            if step.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                return false;
+            }
+            let is_channel_busy = step
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| args.iter().any(|arg| arg.as_str() == Some("channel")))
+                .unwrap_or(false)
+                && step
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .map(|stderr| stderr.contains("Device or resource busy"))
+                    .unwrap_or(false);
+            !is_channel_busy
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        bail!(
+            "failed to prepare monitor interface {monitor_iface}: {}",
+            json!(failed)
+        );
+    }
+    Ok(json!(steps))
+}
+
+fn run_command(program: &str, args: &[&str]) -> Value {
+    match Command::new(program).args(args).output() {
+        Ok(output) => json!({
+            "program": program,
+            "args": args,
+            "ok": output.status.success(),
+            "status": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+        }),
+        Err(error) => json!({
+            "program": program,
+            "args": args,
+            "ok": false,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn build_radiotap_packet(frame: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(8 + frame.len());
+    packet.extend_from_slice(&[0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    packet.extend_from_slice(frame);
+    packet
+}
+
+fn genl_payload(cmd: u8, version: u8) -> Vec<u8> {
+    let mut payload = Vec::new();
+    append_struct(
+        &mut payload,
+        &GenlMsgHdr {
+            cmd,
+            version,
+            reserved: 0,
+        },
+    );
+    payload
+}
+
+fn append_attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
+    let len = std::mem::size_of::<NlAttrHdr>() + value.len();
+    append_struct(
+        out,
+        &NlAttrHdr {
+            nla_len: len as u16,
+            nla_type: kind,
+        },
+    );
+    out.extend_from_slice(value);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+}
+
+fn netlink_payload(response: &[u8]) -> Result<&[u8]> {
+    if response.len() < std::mem::size_of::<libc::nlmsghdr>() {
+        bail!("short netlink message");
+    }
+    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
+    let len = header.nlmsg_len as usize;
+    if len < std::mem::size_of::<libc::nlmsghdr>() || len > response.len() {
+        bail!("invalid netlink message length {len}");
+    }
+    Ok(&response[std::mem::size_of::<libc::nlmsghdr>()..len])
+}
+
+fn genl_header(response: &[u8]) -> Option<GenlMsgHdr> {
+    let payload = netlink_payload(response).ok()?;
+    if payload.len() < std::mem::size_of::<GenlMsgHdr>() {
+        return None;
+    }
+    Some(unsafe { std::ptr::read_unaligned(payload.as_ptr() as *const GenlMsgHdr) })
+}
+
+fn genl_attrs(response: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+    let payload = netlink_payload(response)?;
+    if payload.len() < std::mem::size_of::<GenlMsgHdr>() {
+        bail!("short generic netlink message");
+    }
+    parse_attrs(&payload[std::mem::size_of::<GenlMsgHdr>()..])
+}
+
+fn parse_attrs(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+    let mut attrs = Vec::new();
+    while bytes.len() >= std::mem::size_of::<NlAttrHdr>() {
+        let header = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const NlAttrHdr) };
+        let len = header.nla_len as usize;
+        if len < std::mem::size_of::<NlAttrHdr>() || len > bytes.len() {
+            break;
+        }
+        attrs.push((
+            header.nla_type,
+            &bytes[std::mem::size_of::<NlAttrHdr>()..len],
+        ));
+        let aligned = (len + 3) & !3;
+        if aligned > bytes.len() {
+            break;
+        }
+        bytes = &bytes[aligned..];
+    }
+    Ok(attrs)
+}
+
+fn netlink_error(response: &[u8]) -> Option<i32> {
+    if response.len() < std::mem::size_of::<libc::nlmsghdr>() + 4 {
+        return None;
+    }
+    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
+    if header.nlmsg_type != NLMSG_ERROR {
+        return None;
+    }
+    let offset = std::mem::size_of::<libc::nlmsghdr>();
+    let error = unsafe { std::ptr::read_unaligned(response[offset..].as_ptr() as *const i32) };
+    (error < 0).then_some(-error)
+}
+
+fn netlink_extack_message(response: &[u8]) -> String {
+    let Some(attrs) = netlink_extack_attrs(response) else {
+        return String::new();
+    };
+    let mut details = Vec::new();
+    for (kind, value) in attrs {
+        match kind {
+            NLMSGERR_ATTR_MSG => {
+                let text = String::from_utf8_lossy(trim_nul(value)).trim().to_string();
+                if !text.is_empty() {
+                    details.push(format!("msg={text:?}"));
+                }
+            }
+            NLMSGERR_ATTR_OFFS if value.len() >= 4 => {
+                let offset = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                details.push(format!("offset={offset}"));
+            }
+            NLMSGERR_ATTR_MISS_TYPE if value.len() >= 4 => {
+                let attr = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                details.push(format!("missing_attr={attr}"));
+            }
+            _ => {}
+        }
+    }
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    }
+}
+
+fn netlink_extack_attrs(response: &[u8]) -> Option<Vec<(u16, &[u8])>> {
+    let header_len = std::mem::size_of::<libc::nlmsghdr>();
+    let error_len = std::mem::size_of::<i32>();
+    if response.len() < header_len + error_len + header_len {
+        return None;
+    }
+    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
+    if header.nlmsg_type != NLMSG_ERROR {
+        return None;
+    }
+    let original_offset = header_len + error_len;
+    let original = unsafe {
+        std::ptr::read_unaligned(response[original_offset..].as_ptr() as *const libc::nlmsghdr)
+    };
+    let full_original_error_len = nlmsg_align(error_len + original.nlmsg_len as usize);
+    let compact_error_len = nlmsg_align(error_len + header_len);
+    for ext_offset in [
+        header_len + full_original_error_len,
+        header_len + compact_error_len,
+    ] {
+        if ext_offset < response.len()
+            && let Ok(attrs) = parse_attrs(&response[ext_offset..])
+            && !attrs.is_empty()
+        {
+            return Some(attrs);
+        }
+    }
+    None
+}
+
+fn trim_nul(value: &[u8]) -> &[u8] {
+    match value.iter().position(|byte| *byte == 0) {
+        Some(pos) => &value[..pos],
+        None => value,
+    }
+}
+
+fn nlmsg_align(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+fn netlink_is_ack(response: &[u8]) -> bool {
+    if response.len() < std::mem::size_of::<libc::nlmsghdr>() + 4 {
+        return false;
+    }
+    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
+    if header.nlmsg_type != NLMSG_ERROR {
+        return false;
+    }
+    let offset = std::mem::size_of::<libc::nlmsghdr>();
+    let error = unsafe { std::ptr::read_unaligned(response[offset..].as_ptr() as *const i32) };
+    error == 0
+}
+
+fn nl80211_receive_loop(
+    socket: Nl80211Socket,
     iface: &str,
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
 ) {
-    let mut buf = [0_u8; 4096];
     loop {
-        match socket.recv(&mut buf) {
-            Ok(0) => continue,
-            Ok(len) => {
-                let packet = &buf[..len];
-                if let Some(frame) = ieee80211_frame(packet) {
-                    if let Some(value) = parse_dmesh_vendor_action(frame, iface) {
-                        let message = mesh_message_from_raw_wifi(&value, iface);
-                        push_radio_event(
-                            &history,
-                            RadioEvent {
-                                ts_millis: now_millis(),
-                                key: "wifi.raw.rx".to_string(),
-                                source: iface.to_string(),
-                                value,
-                                message: Some(message),
-                            },
-                        );
-                    }
+        match socket.recv_frame() {
+            Ok(frame) => {
+                if let Some(value) = parse_dmesh_vendor_action(&frame, iface) {
+                    let message = mesh_message_from_raw_wifi(&value, iface);
+                    push_radio_event(
+                        &history,
+                        RadioEvent {
+                            ts_millis: now_millis(),
+                            key: "wifi.raw.rx".to_string(),
+                            source: iface.to_string(),
+                            value,
+                            message: Some(message),
+                        },
+                    );
                 }
             }
             Err(error) => {
@@ -1092,16 +1936,66 @@ fn raw_wifi_receive_loop(
     }
 }
 
+fn monitor_receive_loop(
+    socket: MonitorRxSocket,
+    iface: &str,
+    monitor_iface: &str,
+    history: Arc<Mutex<VecDeque<RadioEvent>>>,
+) {
+    let mut buf = [0_u8; 4096];
+    loop {
+        match socket.recv(&mut buf) {
+            Ok(0) => continue,
+            Ok(len) => {
+                let packet = &buf[..len];
+                if let Some(frame) = ieee80211_frame(packet)
+                    && let Some(value) = parse_dmesh_wifi_frame(frame, iface, "linux_af_packet_monitor")
+                {
+                    let message = mesh_message_from_raw_wifi(&value, iface);
+                    push_radio_event(
+                        &history,
+                        RadioEvent {
+                            ts_millis: now_millis(),
+                            key: "wifi.raw.rx".to_string(),
+                            source: monitor_iface.to_string(),
+                            value,
+                            message: Some(message),
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                push_radio_event(
+                    &history,
+                    RadioEvent {
+                        ts_millis: now_millis(),
+                        key: "wifi.raw.listen.error".to_string(),
+                        source: monitor_iface.to_string(),
+                        value: json!({
+                            "ok": false,
+                            "iface": iface,
+                            "monitor_iface": monitor_iface,
+                            "error": error.to_string()
+                        }),
+                        message: None,
+                    },
+                );
+                break;
+            }
+        }
+    }
+}
+
 fn ieee80211_frame(packet: &[u8]) -> Option<&[u8]> {
     if packet.len() < IEEE80211_BODY {
         return None;
     }
-    if is_management_action(packet) {
+    if is_dmesh_candidate_frame(packet) {
         return Some(packet);
     }
     let radiotap_len = radiotap_len(packet)?;
     let frame = packet.get(radiotap_len..)?;
-    is_management_action(frame).then_some(frame)
+    is_dmesh_candidate_frame(frame).then_some(frame)
 }
 
 fn radiotap_len(packet: &[u8]) -> Option<usize> {
@@ -1112,11 +2006,16 @@ fn radiotap_len(packet: &[u8]) -> Option<usize> {
     (len >= 8 && len < packet.len()).then_some(len)
 }
 
-fn is_management_action(frame: &[u8]) -> bool {
-    frame.len() >= IEEE80211_BODY && frame_type(frame) == 0 && frame_subtype(frame) == 13
+fn is_dmesh_candidate_frame(frame: &[u8]) -> bool {
+    frame.len() >= IEEE80211_BODY
+        && ((frame_type(frame) == 0 && frame_subtype(frame) == 13) || frame_type(frame) == 2)
 }
 
 fn parse_dmesh_vendor_action(frame: &[u8], iface: &str) -> Option<Value> {
+    parse_dmesh_wifi_frame(frame, iface, "linux_nl80211")
+}
+
+fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Value> {
     if frame.len() <= IEEE80211_BODY + DMESH_VENDOR_ACTION.len() {
         return None;
     }
@@ -1128,14 +2027,18 @@ fn parse_dmesh_vendor_action(frame: &[u8], iface: &str) -> Option<Value> {
     let source = mac_at(frame, IEEE80211_ADDR2)?;
     let destination = mac_at(frame, IEEE80211_ADDR1)?;
     let bssid = mac_at(frame, IEEE80211_ADDR3)?;
+    let layout = if frame_type(frame) == 2 {
+        "multicast_data"
+    } else {
+        "vendor_action"
+    };
     Some(json!({
         "protocol": "dmesh_wifi_raw",
-        "layout": "vendor_action",
-        "backend": "linux_af_packet",
+        "layout": layout,
+        "backend": backend,
         "iface": iface,
-        "category": body[0],
-        "oui": hex_bytes(&body[1..4]),
-        "vendor_type": body[4],
+        "frame_type": frame_type(frame),
+        "frame_subtype": frame_subtype(frame),
         "source": colon_mac(&source),
         "destination": colon_mac(&destination),
         "bssid": colon_mac(&bssid),
@@ -1153,6 +2056,23 @@ fn build_dmesh_vendor_action_frame(
     let body_len = payload.len().min(1400);
     let mut frame = Vec::with_capacity(IEEE80211_BODY + DMESH_VENDOR_ACTION.len() + body_len);
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&DMESH_VENDOR_ACTION);
+    frame.extend_from_slice(&payload[..body_len]);
+    frame
+}
+
+fn build_dmesh_multicast_data_frame(
+    destination: [u8; 6],
+    source: [u8; 6],
+    payload: &[u8],
+) -> Vec<u8> {
+    let body_len = payload.len().min(1400);
+    let mut frame = Vec::with_capacity(IEEE80211_BODY + DMESH_VENDOR_ACTION.len() + body_len);
+    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&source);
     frame.extend_from_slice(&destination);
@@ -1193,6 +2113,27 @@ fn mac_at(frame: &[u8], offset: usize) -> Option<[u8; 6]> {
     let mut out = [0_u8; 6];
     out.copy_from_slice(frame.get(offset..offset + 6)?);
     Some(out)
+}
+
+fn ifindex(iface: &str) -> Result<u32> {
+    let iface_c = std::ffi::CString::new(iface.as_bytes())
+        .map_err(|_| anyhow::anyhow!("interface name contains NUL byte: {iface:?}"))?;
+    let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
+    if ifindex == 0 {
+        bail!(
+            "if_nametoindex({iface}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(ifindex)
+}
+
+fn channel_to_freq(channel: u8) -> u32 {
+    if channel == 14 {
+        2484
+    } else {
+        2407 + (channel as u32 * 5)
+    }
 }
 
 fn iface_mac(iface: &str) -> Result<[u8; 6]> {
@@ -1244,10 +2185,12 @@ fn parse_mac(value: Option<&str>) -> Option<[u8; 6]> {
     Some(out)
 }
 
+#[cfg(test)]
 fn frame_type(frame: &[u8]) -> u8 {
     (frame.first().copied().unwrap_or(0) & 0x0c) >> 2
 }
 
+#[cfg(test)]
 fn frame_subtype(frame: &[u8]) -> u8 {
     frame.first().copied().unwrap_or(0) >> 4
 }
@@ -1663,5 +2606,26 @@ mod tests {
         packet.extend_from_slice(&frame);
 
         assert_eq!(ieee80211_frame(&packet).unwrap(), frame.as_slice());
+    }
+
+    #[test]
+    fn raw_wifi_multicast_data_frame_has_dmesh_body() {
+        let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
+        let frame = build_dmesh_multicast_data_frame(RAW_WIFI_MULTICAST, src, b"stats");
+
+        assert_eq!(&frame[..4], &[0x08, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            &frame[IEEE80211_ADDR1..IEEE80211_ADDR1 + 6],
+            &RAW_WIFI_MULTICAST
+        );
+        assert_eq!(&frame[IEEE80211_ADDR2..IEEE80211_ADDR2 + 6], &src);
+        assert_eq!(
+            &frame[IEEE80211_BODY..IEEE80211_BODY + DMESH_VENDOR_ACTION.len()],
+            &DMESH_VENDOR_ACTION
+        );
+        assert_eq!(
+            &frame[IEEE80211_BODY + DMESH_VENDOR_ACTION.len()..],
+            b"stats"
+        );
     }
 }

@@ -653,22 +653,6 @@ MeshGID = 1000
 
     #[test]
     fn test_parse_lmesh_radio_examples() {
-        let root = parse_service(
-            include_str!("../examples/lmesh-radio-root.toml"),
-            Some("lmesh-radio-root"),
-        )
-        .unwrap();
-        assert_eq!(root.name, "lmesh-radio-root");
-        assert_eq!(root.user.as_deref(), Some("root"));
-        assert_eq!(
-            root.env.get("LMESH_CONTROL_SOCKET").unwrap(),
-            "/run/mesh/lmesh-radio-root/mesh.sock"
-        );
-        assert_eq!(
-            root.env.get("LMESH_WPA_CTRL_DIR").unwrap(),
-            "/run/mesh/wpa-supplicant-nan"
-        );
-
         let build = parse_service(
             include_str!("../examples/lmesh-radio-build.toml"),
             Some("lmesh-radio-build"),
