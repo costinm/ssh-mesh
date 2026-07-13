@@ -10,9 +10,12 @@ ESP_IDF_VERSION="${ESP_IDF_VERSION:-v5.5.4}"
 
 export XDG_CACHE_HOME="${REPO_ROOT}/target/nix/cache"
 export NIX_CONFIG="${NIX_CONFIG:-experimental-features = nix-command flakes}"
+# Force repo-local ESP paths. Inheriting a previously sourced ESP-IDF
+# environment can silently mix target/esp32 and target/esp32-5.5 toolchains.
 export IDF_TOOLS_PATH="${ESP_ROOT}/espressif"
 export CARGO_HOME="${ESP_ROOT}/cargo"
 export RUSTUP_HOME="${ESP_ROOT}/rustup"
+unset IDF_PYTHON_ENV_PATH
 RUST_ESP_TOOLCHAIN_BIN="${RUSTUP_HOME}/toolchains/esp/bin"
 ESP_HOME="${ESP_ROOT}/home"
 
@@ -66,11 +69,12 @@ else
 fi
 
 export REPO_ROOT="${REPO_ROOT:-$(cd "${_esp_env_dir}/../.." && pwd)}"
-export ESP_ROOT="${ESP_ROOT:-${REPO_ROOT}/target/esp32-5.5}"
-export IDF_PATH="${IDF_PATH:-${ESP_ROOT}/esp-idf}"
-export IDF_TOOLS_PATH="${IDF_TOOLS_PATH:-${ESP_ROOT}/espressif}"
-export CARGO_HOME="${CARGO_HOME:-${ESP_ROOT}/cargo}"
-export RUSTUP_HOME="${RUSTUP_HOME:-${ESP_ROOT}/rustup}"
+export ESP_ROOT="${REPO_ROOT}/target/esp32-5.5"
+export IDF_PATH="${ESP_ROOT}/esp-idf"
+export IDF_TOOLS_PATH="${ESP_ROOT}/espressif"
+export CARGO_HOME="${ESP_ROOT}/cargo"
+export RUSTUP_HOME="${ESP_ROOT}/rustup"
+unset IDF_PYTHON_ENV_PATH
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${REPO_ROOT}/target/cache}"
 export NIX_PROFILE="${NIX_PROFILE:-${REPO_ROOT}/target/nix/profile}"
 export RUST_ESP_TOOLCHAIN_BIN="${RUST_ESP_TOOLCHAIN_BIN:-${RUSTUP_HOME}/toolchains/esp/bin}"
@@ -103,7 +107,7 @@ fi
 
 _esp_path_force_prepend "/nix/var/nix/profiles/default/bin"
 _esp_path_force_prepend "${NIX_PROFILE}/bin"
-_esp_path_force_prepend "${CARGO_HOME}/bin"
+_esp_path_force_prepend "${IDF_TOOLS_PATH}/python_env/idf5.5_py3.13_env/bin"
 _esp_path_force_prepend "${RUST_ESP_TOOLCHAIN_BIN}"
 export PATH
 
@@ -125,12 +129,13 @@ export REPO_ROOT="${REPO_ROOT:-$(cd "${_fw_esp32_env_dir}/../.." && pwd)}"
 if [ -f "${REPO_ROOT}/target/esp32-5.5/env.sh" ]; then
     . "${REPO_ROOT}/target/esp32-5.5/env.sh"
 else
-    export ESP_ROOT="${ESP_ROOT:-${REPO_ROOT}/target/esp32-5.5}"
-    export IDF_PATH="${IDF_PATH:-${ESP_ROOT}/esp-idf}"
-    export IDF_TOOLS_PATH="${IDF_TOOLS_PATH:-${ESP_ROOT}/espressif}"
-    export CARGO_HOME="${CARGO_HOME:-${ESP_ROOT}/cargo}"
-    export RUSTUP_HOME="${RUSTUP_HOME:-${ESP_ROOT}/rustup}"
-    export RUST_ESP_TOOLCHAIN_BIN="${RUST_ESP_TOOLCHAIN_BIN:-${RUSTUP_HOME}/toolchains/esp/bin}"
+    export ESP_ROOT="${REPO_ROOT}/target/esp32-5.5"
+    export IDF_PATH="${ESP_ROOT}/esp-idf"
+    export IDF_TOOLS_PATH="${ESP_ROOT}/espressif"
+    export CARGO_HOME="${ESP_ROOT}/cargo"
+    export RUSTUP_HOME="${ESP_ROOT}/rustup"
+    export RUST_ESP_TOOLCHAIN_BIN="${RUSTUP_HOME}/toolchains/esp/bin"
+    unset IDF_PYTHON_ENV_PATH
 fi
 
 unset _fw_esp32_env_dir

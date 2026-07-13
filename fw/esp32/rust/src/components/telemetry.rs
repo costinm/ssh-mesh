@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::io::{self, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -607,8 +606,20 @@ fn companion_ack_text(seq: u64, hash: u32) -> String {
 }
 
 pub fn emit_console(line: &str) {
-    print!("\n{line}\ndm-rs> ");
-    let _ = io::stdout().flush();
+    uart_write("\n");
+    uart_write(line);
+    uart_write("\ndm-rs> ");
+}
+
+fn uart_write(text: &str) {
+    unsafe {
+        let bytes = text.as_bytes();
+        let _ = esp_idf_sys::uart_write_bytes(
+            esp_idf_sys::uart_port_t_UART_NUM_0,
+            bytes.as_ptr() as *const core::ffi::c_void,
+            bytes.len(),
+        );
+    }
 }
 
 fn reset() {

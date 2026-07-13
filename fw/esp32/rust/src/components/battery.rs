@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -146,8 +145,8 @@ impl CommandHandler for AdcProbeCommand {
             loop {
                 sample = sample.saturating_add(1);
                 let line = adc_sample_line(sample, &pins, ref_mv);
-                println!("{line}");
-                let _ = io::stdout().flush();
+                uart_write(&line);
+                uart_write("\n");
                 if wait_for_key_or_timeout(interval_ms) {
                     return Ok(CommandResponse::ok(format!(
                         "adcprobe stopped=true samples={sample}"
@@ -167,6 +166,17 @@ impl CommandHandler for AdcProbeCommand {
             }
         }
         Ok(CommandResponse::ok(out))
+    }
+}
+
+fn uart_write(text: &str) {
+    unsafe {
+        let bytes = text.as_bytes();
+        let _ = sys::uart_write_bytes(
+            sys::uart_port_t_UART_NUM_0,
+            bytes.as_ptr() as *const core::ffi::c_void,
+            bytes.len(),
+        );
     }
 }
 

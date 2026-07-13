@@ -1111,7 +1111,7 @@ impl Sx127x {
             esp_ok(sys::spi_bus_initialize(
                 host,
                 &bus,
-                sys::spi_common_dma_t_SPI_DMA_DISABLED,
+                sys::spi_common_dma_t_SPI_DMA_CH_AUTO,
             ))?;
         }
 
@@ -1449,7 +1449,7 @@ impl Sx1262 {
             esp_ok(sys::spi_bus_initialize(
                 host,
                 &bus,
-                sys::spi_common_dma_t_SPI_DMA_DISABLED,
+                sys::spi_common_dma_t_SPI_DMA_CH_AUTO,
             ))?;
         }
 

@@ -16,7 +16,7 @@ const DEFAULT_BOOT_WINDOW_MS: u32 = 10_000;
 const DEFAULT_ACTIVE_MS: u32 = 60_000;
 const PING_PREFIX: &[u8] = b"dmesh.ping";
 
-static PRODUCT_MODE: AtomicU8 = AtomicU8::new(MODE_COMPANION);
+static PRODUCT_MODE: AtomicU8 = AtomicU8::new(MODE_INFRA);
 static COMPANION_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static COMPANION_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
 static PING_RESPONSE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -48,11 +48,22 @@ pub fn init(settings: &SharedSettings) {
     }
 }
 
-pub fn init_after_boot_window(settings: &SharedSettings) {
+pub fn configured_companion(settings: &SharedSettings) -> bool {
+    configured_mode(settings) == MODE_COMPANION
+}
+
+pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
     let mode = configured_mode(settings);
     PRODUCT_MODE.store(mode, Ordering::Relaxed);
     if mode == MODE_COMPANION {
-        if super::ble_bt::gatt_connected() {
+        if button_wake {
+            let _ = enter_companion_advertising(
+                settings,
+                get_u32(settings, "cm.win_ms", DEFAULT_WINDOW_MS),
+                get_u32(settings, "cm.adv_ms", DEFAULT_ADV_MS),
+                "button_wake",
+            );
+        } else if super::ble_bt::gatt_connected() {
             let _ = enter_companion_advertising(
                 settings,
                 get_u32(settings, "cm.active_ms", DEFAULT_ACTIVE_MS),
@@ -88,6 +99,19 @@ pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) ->
     start_infra_radios(settings, reason)?;
     telemetry::record_log(format!("event type=mode active=infra reason={}", reason));
     Ok(())
+}
+
+pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
+    PRODUCT_MODE.store(MODE_COMPANION, Ordering::Relaxed);
+    COMPANION_ADVERTISING.store(true, Ordering::Relaxed);
+    COMPANION_DEADLINE_MS.store(now_ms().wrapping_add(window_ms), Ordering::Relaxed);
+    super::nan::stop_nan().ok();
+    super::wifi::stop_raw_monitor().ok();
+    super::lora::sleep_radio(settings).ok();
+    telemetry::record_log(format!(
+        "event type=mode active=companion state=pairing_recovery window_ms={}",
+        window_ms
+    ));
 }
 
 pub fn poll(settings: &SharedSettings) {

@@ -75,6 +75,12 @@ pub fn is_pressed() -> bool {
     unsafe { sys::gpio_get_level(pin as sys::gpio_num_t) == 0 }
 }
 
+pub fn suppress_until_release() {
+    BUTTON_LEVEL_HELD.store(true, Ordering::Relaxed);
+    BUTTON_LEVEL_LONG_REPORTED.store(true, Ordering::Relaxed);
+    BUTTON_LEVEL_START_MS.store(now_ms(), Ordering::Relaxed);
+}
+
 pub fn detect_boot_long_press(window_ms: u32, hold_ms: u32) -> bool {
     if !BUTTON_ENABLED.load(Ordering::Relaxed) {
         return false;
@@ -223,18 +229,14 @@ fn record_button_press(source: &str, long_press: bool) {
     telemetry::record_log(line.clone());
     telemetry::emit_console(&line);
     super::ble_bt::open_companion_active_window(10_000);
-    if super::ble_bt::confirm_pairing_request() {
-        let line = "ev=button.pairing accepted=true".to_string();
-        telemetry::record_log(line.clone());
-        telemetry::emit_console(&line);
-    } else if long_press {
+    if long_press {
         BUTTON_LONG_PENDING.fetch_add(1, Ordering::Relaxed);
         let line = "ev=button.long action=serial".to_string();
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);
     } else {
         BUTTON_CYCLE_PENDING.fetch_add(1, Ordering::Relaxed);
-        let line = "ev=button.pairing ignored=true reason=no_request".to_string();
+        let line = "ev=button.short action=cycle".to_string();
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);
     }
@@ -254,18 +256,10 @@ impl CommandHandler for ButtonCommand {
     }
 
     fn help(&self) -> &'static str {
-        "button status=true | button gpio=0 enabled=true save=true | button pairing=true"
+        "button status=true | button gpio=0 enabled=true save=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
-        if let Some(pairing) = request.arg("pairing") {
-            super::ble_bt::open_companion_active_window(10_000);
-            if parse_bool(pairing)? {
-                super::ble_bt::confirm_pairing_request();
-            } else {
-                super::ble_bt::open_pairing_window(0);
-            }
-        }
         if let Some(enabled) = request.arg("enabled").or_else(|| request.arg("enable")) {
             BUTTON_ENABLED.store(parse_bool(enabled)?, Ordering::Relaxed);
         }

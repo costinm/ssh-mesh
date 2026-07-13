@@ -102,6 +102,7 @@ pub fn send_vendor_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn send_to_last_command_peer(payload: &[u8]) -> Result<()> {
     let peer = last_command_peer().context("no raw wifi command peer known")?;
     send_vendor_payload_to(peer, payload)
@@ -452,6 +453,7 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
 pub fn stop_raw_monitor() -> Result<()> {
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
+        esp_ok_allow_invalid_state(sys::esp_wifi_stop())?;
     }
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
     Ok(())

@@ -15,7 +15,6 @@ use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandRe
 use crate::transports::dispatch_text_line;
 
 use super::frames::{decode_frame, hex_bytes};
-use super::l3dmesh::{Frame, Transport};
 use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
@@ -58,6 +57,8 @@ static BLE_GATT_CCC_HANDLE: AtomicU32 = AtomicU32::new(0);
 static BLE_GATT_DB_READY: AtomicBool = AtomicBool::new(false);
 static BLE_TEXT_QUEUE: OnceLock<Mutex<VecDeque<Vec<u8>>>> = OnceLock::new();
 static BLE_ADV_PENDING: AtomicBool = AtomicBool::new(false);
+static BLE_ADV_START_DONE: AtomicBool = AtomicBool::new(false);
+static BLE_ADV_START_STATUS: AtomicU32 = AtomicU32::new(0xffff);
 static BLE_SECURITY_CONFIGURED: AtomicBool = AtomicBool::new(false);
 static BLE_COMPANION_ENABLED: AtomicBool = AtomicBool::new(false);
 static BLE_COMPANION_SAVE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -76,6 +77,24 @@ static BLE_COMPANION_ACTIVE_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
 static BLE_COMPANION_ACTIVE_CHANGED: AtomicBool = AtomicBool::new(false);
 static BLE_ADV_INT_MIN: AtomicU32 = AtomicU32::new(0x20);
 static BLE_ADV_INT_MAX: AtomicU32 = AtomicU32::new(0x40);
+#[cfg(target_feature = "esp32s3ops")]
+const BLE_EXT_ADV_INSTANCE: u8 = 2;
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_ADDR_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_ADDR_STATUS: AtomicU32 = AtomicU32::new(0xffff);
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_PARAMS_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_PARAMS_STATUS: AtomicU32 = AtomicU32::new(0xffff);
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_DATA_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_DATA_STATUS: AtomicU32 = AtomicU32::new(0xffff);
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_START_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_feature = "esp32s3ops")]
+static BLE_EXT_ADV_START_STATUS: AtomicU32 = AtomicU32::new(0xffff);
 static BLE_CONNECTED_ADDR: [AtomicU8; 6] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -109,11 +128,17 @@ static mut GATT_HANDLES: [u16; GATT_IDX_NB] = [0; GATT_IDX_NB];
 static mut GATT_DB: MaybeUninit<[sys::esp_gatts_attr_db_t; GATT_IDX_NB]> = MaybeUninit::uninit();
 
 pub const DMESH_BLE_SERVICE_UUID16: u16 = 0xfd5d;
-const DMESH_MAX_PREFIX: usize = 14;
+pub const DMESH_BLE_PAIRING_UUID: [u8; 16] = [
+    0x01, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
+];
+pub const DMESH_BLE_OPERATIONAL_UUID: [u8; 16] = [
+    0x02, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
+];
 const BLE_MODE_OFF: u8 = 0;
 const BLE_MODE_LISTEN: u8 = 1;
 const BLE_MODE_ANNOUNCE: u8 = 2;
 const BLE_MODE_CONNECTABLE: u8 = 3;
+pub const PAIRING_RECOVERY_WINDOW_MS: u32 = 300_000;
 const GATT_APP_ID: u16 = 0x6e40;
 const GATT_IDX_SVC: usize = 0;
 const GATT_IDX_RX_VAL: usize = 2;
@@ -124,14 +149,14 @@ const GATT_IDX_NB: usize = 6;
 const UUID_PRI_SERVICE: u16 = sys::ESP_GATT_UUID_PRI_SERVICE as u16;
 const UUID_CHAR_DECLARE: u16 = sys::ESP_GATT_UUID_CHAR_DECLARE as u16;
 const UUID_CLIENT_CONFIG: u16 = sys::ESP_GATT_UUID_CHAR_CLIENT_CONFIG as u16;
-const NORDIC_SERVICE_UUID: [u8; 16] = [
-    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e,
+pub const DMESH_GATT_SERVICE_UUID: [u8; 16] = [
+    0x03, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
 ];
-const NORDIC_RX_UUID: [u8; 16] = [
-    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e,
+pub const DMESH_GATT_RX_UUID: [u8; 16] = [
+    0x04, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
 ];
-const NORDIC_TX_UUID: [u8; 16] = [
-    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e,
+pub const DMESH_GATT_TX_UUID: [u8; 16] = [
+    0x05, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
 ];
 static mut RX_VALUE: [u8; 512] = [0; 512];
 static mut TX_VALUE: [u8; 512] = [0; 512];
@@ -143,7 +168,7 @@ static mut CHAR_PROP_NOTIFY: u8 = sys::ESP_GATT_CHAR_PROP_BIT_NOTIFY as u8;
 unsafe fn ble_gap_stop_scanning() -> sys::esp_err_t {
     #[cfg(target_feature = "esp32s3ops")]
     {
-        sys::ESP_ERR_NOT_SUPPORTED
+        sys::esp_ble_gap_stop_ext_scan()
     }
     #[cfg(not(target_feature = "esp32s3ops"))]
     {
@@ -154,7 +179,8 @@ unsafe fn ble_gap_stop_scanning() -> sys::esp_err_t {
 unsafe fn ble_gap_stop_advertising() -> sys::esp_err_t {
     #[cfg(target_feature = "esp32s3ops")]
     {
-        sys::ESP_ERR_NOT_SUPPORTED
+        let instance = BLE_EXT_ADV_INSTANCE;
+        sys::esp_ble_gap_ext_adv_stop(1, &instance)
     }
     #[cfg(not(target_feature = "esp32s3ops"))]
     {
@@ -165,8 +191,11 @@ unsafe fn ble_gap_stop_advertising() -> sys::esp_err_t {
 unsafe fn ble_gap_config_adv_data_raw(raw_data: *mut u8, raw_data_len: u32) -> sys::esp_err_t {
     #[cfg(target_feature = "esp32s3ops")]
     {
-        let _ = (raw_data, raw_data_len);
-        sys::ESP_ERR_NOT_SUPPORTED
+        sys::esp_ble_gap_config_ext_adv_data_raw(
+            BLE_EXT_ADV_INSTANCE,
+            raw_data_len as u16,
+            raw_data as *const u8,
+        )
     }
     #[cfg(not(target_feature = "esp32s3ops"))]
     {
@@ -177,8 +206,20 @@ unsafe fn ble_gap_config_adv_data_raw(raw_data: *mut u8, raw_data_len: u32) -> s
 unsafe fn ble_gap_set_scan_params(params: *mut sys::esp_ble_scan_params_t) -> sys::esp_err_t {
     #[cfg(target_feature = "esp32s3ops")]
     {
-        let _ = params;
-        sys::ESP_ERR_NOT_SUPPORTED
+        let params = &*params;
+        let ext = sys::esp_ble_ext_scan_params_t {
+            own_addr_type: params.own_addr_type,
+            filter_policy: params.scan_filter_policy,
+            scan_duplicate: params.scan_duplicate,
+            cfg_mask: sys::ESP_BLE_GAP_PHY_1M_PREF_MASK as u8,
+            uncoded_cfg: sys::esp_ble_ext_scan_cfg_t {
+                scan_type: params.scan_type,
+                scan_interval: params.scan_interval,
+                scan_window: params.scan_window,
+            },
+            coded_cfg: sys::esp_ble_ext_scan_cfg_t::default(),
+        };
+        sys::esp_ble_gap_set_ext_scan_params(&ext)
     }
     #[cfg(not(target_feature = "esp32s3ops"))]
     {
@@ -189,8 +230,7 @@ unsafe fn ble_gap_set_scan_params(params: *mut sys::esp_ble_scan_params_t) -> sy
 unsafe fn ble_gap_start_scanning(duration: u32) -> sys::esp_err_t {
     #[cfg(target_feature = "esp32s3ops")]
     {
-        let _ = duration;
-        sys::ESP_ERR_NOT_SUPPORTED
+        sys::esp_ble_gap_start_ext_scan(duration, 0)
     }
     #[cfg(not(target_feature = "esp32s3ops"))]
     {
@@ -202,12 +242,89 @@ unsafe fn ble_gap_start_advertising(params: *mut sys::esp_ble_adv_params_t) -> s
     #[cfg(target_feature = "esp32s3ops")]
     {
         let _ = params;
-        sys::ESP_ERR_NOT_SUPPORTED
+        BLE_EXT_ADV_START_DONE.store(false, Ordering::Relaxed);
+        BLE_EXT_ADV_START_STATUS.store(0xffff, Ordering::Relaxed);
+        let ext_adv = sys::esp_ble_gap_ext_adv_t {
+            instance: BLE_EXT_ADV_INSTANCE,
+            duration: 0,
+            max_events: 0,
+        };
+        sys::esp_ble_gap_ext_adv_start(1, &ext_adv)
     }
     #[cfg(not(target_feature = "esp32s3ops"))]
     {
         sys::esp_ble_gap_start_advertising(params)
     }
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+fn ext_adv_params() -> sys::esp_ble_gap_ext_adv_params_t {
+    sys::esp_ble_gap_ext_adv_params_t {
+        type_: sys::ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY_IND as u16,
+        interval_min: BLE_ADV_INT_MIN.load(Ordering::Relaxed),
+        interval_max: BLE_ADV_INT_MAX.load(Ordering::Relaxed),
+        channel_map: sys::esp_ble_adv_channel_t_ADV_CHNL_ALL,
+        own_addr_type: sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_RANDOM,
+        peer_addr_type: sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_PUBLIC,
+        peer_addr: [0; 6],
+        filter_policy: sys::esp_ble_adv_filter_t_ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+        tx_power: sys::EXT_ADV_TX_PWR_NO_PREFERENCE as i8,
+        primary_phy: sys::ESP_BLE_GAP_PHY_1M as u8,
+        max_skip: 0,
+        secondary_phy: sys::ESP_BLE_GAP_PHY_1M as u8,
+        sid: 2,
+        scan_req_notif: false,
+    }
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+fn ext_adv_random_addr() -> [u8; 6] {
+    let mut addr = [0_u8; 6];
+    let ret = unsafe { sys::esp_ble_gap_addr_create_static(addr.as_mut_ptr()) };
+    if ret == sys::ESP_OK {
+        return addr;
+    }
+    [0xc0, 0xde, 0x5d, 0x00, 0x00, 0x01]
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+fn wait_ext_adv_stage(
+    label: &'static str,
+    done: &AtomicBool,
+    status: &AtomicU32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if done.load(Ordering::Relaxed) {
+            let status = status.load(Ordering::Relaxed);
+            if status == 0 {
+                return Ok(());
+            }
+            bail!("{label} status=0x{status:x}");
+        }
+        unsafe {
+            sys::vTaskDelay(duration_to_ticks(Duration::from_millis(10)));
+        }
+    }
+    bail!("{label} timeout")
+}
+
+fn wait_legacy_adv_started(timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if BLE_ADV_START_DONE.load(Ordering::Relaxed) {
+            let status = BLE_ADV_START_STATUS.load(Ordering::Relaxed);
+            if status == 0 {
+                return Ok(());
+            }
+            bail!("legacy_adv_start status=0x{status:x}");
+        }
+        unsafe {
+            sys::vTaskDelay(duration_to_ticks(Duration::from_millis(10)));
+        }
+    }
+    bail!("legacy_adv_start timeout")
 }
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
@@ -228,12 +345,48 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     registry.register(RadioCommand::with_settings("ble", settings));
 }
 
-pub fn ble_transport() -> RadioTransport {
-    RadioTransport::new("ble")
+pub fn advertised_identity() -> String {
+    format!(
+        "mac={} adv_uuid={} pair_uuid={} gatt_service={} gatt_rx={} gatt_tx={}",
+        public_bt_address_string(),
+        uuid128_string(&DMESH_BLE_OPERATIONAL_UUID),
+        uuid128_string(&DMESH_BLE_PAIRING_UUID),
+        uuid128_string(&DMESH_GATT_SERVICE_UUID),
+        uuid128_string(&DMESH_GATT_RX_UUID),
+        uuid128_string(&DMESH_GATT_TX_UUID)
+    )
 }
 
-pub fn bt_transport() -> RadioTransport {
-    RadioTransport::new("bt")
+pub fn uuid128_string(uuid: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        uuid[15],
+        uuid[14],
+        uuid[13],
+        uuid[12],
+        uuid[11],
+        uuid[10],
+        uuid[9],
+        uuid[8],
+        uuid[7],
+        uuid[6],
+        uuid[5],
+        uuid[4],
+        uuid[3],
+        uuid[2],
+        uuid[1],
+        uuid[0]
+    )
+}
+
+fn public_bt_address_string() -> String {
+    let mut mac = [0_u8; 6];
+    let ret = unsafe { sys::esp_read_mac(mac.as_mut_ptr(), sys::esp_mac_type_t_ESP_MAC_BT) };
+    if ret == sys::ESP_OK {
+        format_mac(&mac)
+    } else {
+        format!("unavailable err={ret}")
+    }
 }
 
 pub fn forward_packet_for_window(packet: &[u8], window_ms: u32) -> Result<bool> {
@@ -332,15 +485,19 @@ pub fn poll_text_commands(registry: &mut CommandRegistry) {
         let peer = paired_addr_string();
         let command = format!("ble companion=true save=true peer={peer}");
         let response = dispatch_text_line(registry, &command);
-        telemetry::record_log(format!(
+        let line = format!(
             "event type=ble.companion save=true response={}",
             crate::commands::protocol::escape_value(response.trim())
-        ));
+        );
+        telemetry::record_log(line.clone());
+        telemetry::emit_console(&line);
         let response = dispatch_text_line(registry, "mode companion=true save=true");
-        telemetry::record_log(format!(
+        let line = format!(
             "event type=ble.companion mode=companion response={}",
             crate::commands::protocol::escape_value(response.trim())
-        ));
+        );
+        telemetry::record_log(line.clone());
+        telemetry::emit_console(&line);
     }
     if BLE_PENDING_NOTIFY.load(Ordering::Relaxed) && companion_link_ready() {
         notify_companion_pending();
@@ -403,7 +560,13 @@ pub fn open_pairing_window(timeout_ms: u32) {
         "event type=ble.pairing state=open timeout_ms={}",
         timeout_ms
     ));
-    let _ = start_connectable_idle();
+    if let Err(err) = start_pairable_advertising() {
+        telemetry::record_log(format!(
+            "event type=ble.pairing advertise=false msg={}",
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+        let _ = start_connectable_idle();
+    }
 }
 
 pub fn request_pairing(request_timeout_ms: u32, confirm_timeout_ms: u32) {
@@ -426,6 +589,9 @@ pub fn request_pairing(request_timeout_ms: u32, confirm_timeout_ms: u32) {
 }
 
 pub fn start_pairing_recovery(settings: &SharedSettings) -> Result<usize> {
+    super::nan::stop_nan().ok();
+    super::wifi::stop_raw_monitor().ok();
+    super::lora::sleep_radio(settings).ok();
     let mut radio = RadioCommand::with_settings("ble", settings.clone());
     radio.ensure_ble()?;
     start_gatt()?;
@@ -437,8 +603,15 @@ pub fn start_pairing_recovery(settings: &SharedSettings) -> Result<usize> {
         settings.set_bool("ble.comp", false)?;
         settings.set_str("ble.peer", "")?;
     }
-    open_pairing_window(86_400_000);
-    start_connectable_idle()?;
+    open_pairing_window(PAIRING_RECOVERY_WINDOW_MS);
+    if !BLE_ADV_STARTED.load(Ordering::Relaxed) {
+        bail!("pairing recovery advertising did not start");
+    }
+    telemetry::emit_console(&format!(
+        "event type=ble.pairing_recovery advertise=true bonds_removed={} {}",
+        removed,
+        advertised_identity()
+    ));
     telemetry::record_log(format!(
         "event type=ble.pairing_recovery active=true bonds_removed={}",
         removed
@@ -569,7 +742,7 @@ impl CommandHandler for RadioCommand {
     }
 
     fn help(&self) -> &'static str {
-        "ble start=true|stop=true|mode=listen|gatt|announce|connectable|pairable=true|advertise=true payload=hex:... event=generic|lora_rx|wake_request|payload_pending|announce=hex:...|send=hex:...|raw_adv=hex:...|scan=true filter=dmesh|all scan_stop=true filter_uuid16=0xfd5d filter_addr=aa:bb:...|companion=true save=true pairing=true|request|confirm timeout_ms=60000 confirm_ms=60000 fixed_pin=1234 reset_pairing=true stats=true"
+        "ble start=true|stop=true|mode=listen|gatt|announce|connectable|pairable=true|advertise=true payload=hex:... event=generic|lora_rx|wake_request|payload_pending|announce=hex:...|send=hex:...|raw_adv=hex:...|scan=true filter=dmesh|all scan_stop=true filter_uuid16=0xfd5d(legacy) filter_addr=aa:bb:...|companion=true save=true pairing=true|request|confirm timeout_ms=60000 confirm_ms=60000 fixed_pin=1234 pairing_recovery=true reset_pairing=true stats=true bonds=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -639,6 +812,23 @@ impl CommandHandler for RadioCommand {
                 BLE_FILTER_ADDR_ENABLED.store(true, Ordering::Relaxed);
             }
         }
+        if request
+            .arg("pairing_recovery")
+            .or_else(|| request.arg("recovery"))
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let Some(settings) = &self.settings else {
+                bail!("pairing_recovery requires settings");
+            };
+            let removed = start_pairing_recovery(settings)?;
+            return Ok(CommandResponse::ok(format!(
+                "ble pairing_recovery=true bonds_removed={} {}",
+                removed,
+                ble_stats()
+            )));
+        }
         if let Some(companion) = request.arg("companion") {
             let enabled = parse_bool(companion)?;
             BLE_COMPANION_ENABLED.store(enabled, Ordering::Relaxed);
@@ -655,6 +845,32 @@ impl CommandHandler for RadioCommand {
                         settings.set_str("ble.peer", peer)?;
                     }
                 }
+            }
+            if enabled
+                && matches!(
+                    request.arg("pairing"),
+                    Some("request" | "true" | "1" | "yes" | "on")
+                )
+            {
+                let request_timeout_ms = request
+                    .arg_i32("timeout_ms")?
+                    .or(request.arg_i32("request_ms")?)
+                    .or(request.arg_i32("ms")?)
+                    .unwrap_or(120_000)
+                    .clamp(1_000, 300_000) as u32;
+                let confirm_timeout_ms = request
+                    .arg_i32("confirm_timeout_ms")?
+                    .or(request.arg_i32("confirm_ms")?)
+                    .unwrap_or(60_000)
+                    .clamp(1_000, 300_000) as u32;
+                self.ensure_ble()?;
+                start_gatt()?;
+                request_pairing(request_timeout_ms, confirm_timeout_ms);
+                open_pairing_window(request_timeout_ms);
+                return Ok(CommandResponse::ok(format!(
+                    "ble companion=true pairing=open {}",
+                    ble_stats()
+                )));
             }
             if enabled {
                 start_companion_runtime()?;
@@ -705,6 +921,7 @@ impl CommandHandler for RadioCommand {
                     self.ensure_ble()?;
                     start_gatt()?;
                     request_pairing(request_timeout_ms, confirm_timeout_ms);
+                    open_pairing_window(request_timeout_ms);
                     return Ok(CommandResponse::ok(ble_stats()));
                 }
                 "confirm" | "accept" => {
@@ -756,6 +973,9 @@ impl CommandHandler for RadioCommand {
         if request.arg("stats").is_some() {
             return Ok(CommandResponse::ok(ble_stats()));
         }
+        if request.arg("bonds").is_some() || request.arg("paired").is_some() {
+            return Ok(CommandResponse::ok(ble_bond_status(self.settings.as_ref())));
+        }
         if request.arg("scan_stop").is_some() {
             unsafe {
                 let _ = ble_gap_stop_scanning();
@@ -785,7 +1005,7 @@ impl CommandHandler for RadioCommand {
         {
             self.ensure_ble()?;
             start_gatt()?;
-            start_connectable_idle()?;
+            start_pairable_advertising()?;
             return Ok(CommandResponse::ok(format!(
                 "ble pairable started {}",
                 ble_stats()
@@ -899,16 +1119,13 @@ fn parse_event(value: &str) -> Result<DmeshBleEvent> {
 
 impl RadioCommand {
     fn ensure_ble(&mut self) -> Result<()> {
-        if legacy_ble_gap_unavailable() {
-            bail!("legacy BLE GAP is not available on this target");
-        }
         if BLE_STARTED.load(Ordering::Relaxed) {
             return Ok(());
         }
         if self.bt.is_none() {
             let peripherals = Peripherals::take()?;
             self.bt = Some(BtDriver::<Ble>::new(peripherals.modem, None)?);
-            let name = CString::new("MeshCore")?;
+            let name = CString::new("DMesh")?;
             unsafe {
                 esp_ok(sys::esp_ble_gap_register_callback(Some(gap_cb)))?;
                 esp_ok(sys::esp_ble_gatts_register_callback(Some(gatts_cb)))?;
@@ -971,44 +1188,6 @@ fn wait_gatt_service_ready(timeout: Duration) -> Result<()> {
     bail!("BLE GATT service not ready")
 }
 
-pub struct RadioTransport {
-    name: &'static str,
-    sent_frames: u32,
-}
-
-impl RadioTransport {
-    fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            sent_frames: 0,
-        }
-    }
-}
-
-impl Transport for RadioTransport {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn send(&mut self, frame: &Frame<'_>, from_interface: i32) -> Result<()> {
-        self.sent_frames = self.sent_frames.saturating_add(1);
-        telemetry::record_packet(
-            self.name,
-            Direction::Tx,
-            frame.payload(),
-            format!("source=l3mesh from={from_interface}"),
-        );
-        log::info!(
-            "{} send: from={} len={} total={}",
-            self.name,
-            from_interface,
-            frame.payload().len(),
-            self.sent_frames
-        );
-        Ok(())
-    }
-}
-
 fn start_raw_adv(data: &[u8]) -> Result<()> {
     if data.len() > 31 {
         bail!("BLE legacy advertising data is limited to 31 bytes");
@@ -1021,7 +1200,7 @@ fn start_raw_adv(data: &[u8]) -> Result<()> {
         BLE_ADV_PENDING.store(true, Ordering::Relaxed);
         BLE_SCAN_STOPPING.store(true, Ordering::Relaxed);
         let stop_ret = ble_gap_stop_scanning();
-        if stop_ret == sys::ESP_OK {
+        if stop_ret == sys::ESP_OK || stop_ret == sys::ESP_ERR_INVALID_STATE {
             sys::vTaskDelay(duration_to_ticks(Duration::from_millis(120)));
             if BLE_ADV_PENDING.swap(false, Ordering::Relaxed) {
                 BLE_SCAN_STOPPING.store(false, Ordering::Relaxed);
@@ -1038,17 +1217,57 @@ fn start_raw_adv(data: &[u8]) -> Result<()> {
 
 fn configure_raw_adv(data: &[u8]) -> Result<()> {
     unsafe {
-        let _ = ble_gap_stop_advertising();
+        esp_ok_allow_invalid_state(ble_gap_stop_advertising())?;
         BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
         BLE_ADV_STARTED.store(false, Ordering::Relaxed);
         let ptr = core::ptr::addr_of_mut!(RAW_ADV_DATA) as *mut u8;
         core::ptr::write_bytes(ptr, 0, 31);
         core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         RAW_ADV_LEN = data.len();
+        #[cfg(target_feature = "esp32s3ops")]
+        {
+            BLE_EXT_ADV_PARAMS_DONE.store(false, Ordering::Relaxed);
+            BLE_EXT_ADV_PARAMS_STATUS.store(0xffff, Ordering::Relaxed);
+            BLE_EXT_ADV_ADDR_DONE.store(false, Ordering::Relaxed);
+            BLE_EXT_ADV_ADDR_STATUS.store(0xffff, Ordering::Relaxed);
+            BLE_EXT_ADV_DATA_DONE.store(false, Ordering::Relaxed);
+            BLE_EXT_ADV_DATA_STATUS.store(0xffff, Ordering::Relaxed);
+            let params = ext_adv_params();
+            esp_ok(sys::esp_ble_gap_ext_adv_set_params(BLE_EXT_ADV_INSTANCE, &params))?;
+            wait_ext_adv_stage(
+                "ext_adv_params",
+                &BLE_EXT_ADV_PARAMS_DONE,
+                &BLE_EXT_ADV_PARAMS_STATUS,
+                Duration::from_millis(500),
+            )?;
+            let mut rand_addr = ext_adv_random_addr();
+            esp_ok(sys::esp_ble_gap_ext_adv_set_rand_addr(
+                BLE_EXT_ADV_INSTANCE,
+                rand_addr.as_mut_ptr(),
+            ))?;
+            wait_ext_adv_stage(
+                "ext_adv_rand_addr",
+                &BLE_EXT_ADV_ADDR_DONE,
+                &BLE_EXT_ADV_ADDR_STATUS,
+                Duration::from_millis(500),
+            )?;
+        }
         esp_ok(ble_gap_config_adv_data_raw(ptr, RAW_ADV_LEN as u32))?;
+        #[cfg(target_feature = "esp32s3ops")]
+        {
+            wait_ext_adv_stage(
+                "ext_adv_data",
+                &BLE_EXT_ADV_DATA_DONE,
+                &BLE_EXT_ADV_DATA_STATUS,
+                Duration::from_millis(500),
+            )?;
+        }
         sys::vTaskDelay(duration_to_ticks(Duration::from_millis(30)));
     }
+    #[cfg(target_feature = "esp32s3ops")]
     start_ble_advertising()?;
+    #[cfg(not(target_feature = "esp32s3ops"))]
+    wait_legacy_adv_started(Duration::from_millis(1_000))?;
     Ok(())
 }
 
@@ -1064,14 +1283,48 @@ fn start_ble_advertising() -> Result<()> {
         adv_filter_policy: sys::esp_ble_adv_filter_t_ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
     };
     unsafe {
+        BLE_ADV_START_DONE.store(false, Ordering::Relaxed);
+        BLE_ADV_START_STATUS.store(0xffff, Ordering::Relaxed);
         esp_ok(ble_gap_start_advertising(&mut params))?;
+        #[cfg(target_feature = "esp32s3ops")]
+        {
+            wait_ext_adv_stage(
+                "ext_adv_start",
+                &BLE_EXT_ADV_START_DONE,
+                &BLE_EXT_ADV_START_STATUS,
+                Duration::from_millis(500),
+            )?;
+        }
     }
+    #[cfg(target_feature = "esp32s3ops")]
     BLE_ADV_STARTED.store(true, Ordering::Relaxed);
     Ok(())
 }
 
 fn start_connectable_idle() -> Result<()> {
     announce_packet(DmeshBleEvent::IdleHello, &[], None)
+}
+
+fn start_pairable_advertising() -> Result<()> {
+    start_gatt()?;
+    wait_gatt_service_ready(Duration::from_millis(1_000))?;
+    let mut adv = Vec::with_capacity(28);
+    adv.extend_from_slice(&[0x02, 0x01, 0x06]);
+    adv.push((DMESH_BLE_PAIRING_UUID.len() + 1) as u8);
+    adv.push(0x07);
+    adv.extend_from_slice(&DMESH_BLE_PAIRING_UUID);
+    adv.extend_from_slice(&[0x06, 0x08, b'D', b'M', b'e', b's', b'h']);
+    start_raw_adv(&adv)?;
+    BLE_MODE.store(BLE_MODE_CONNECTABLE, Ordering::Relaxed);
+    let line = format!(
+        "event type=ble.pairing state=advertising uuid={} name=DMesh adv_raw={} {}",
+        uuid128_string(&DMESH_BLE_PAIRING_UUID),
+        hex_bytes(&adv),
+        advertised_identity()
+    );
+    telemetry::record_log(line.clone());
+    telemetry::emit_console(&line);
+    Ok(())
 }
 
 fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
@@ -1113,7 +1366,7 @@ fn start_scan_params(duration: u32, active: bool) -> Result<()> {
         scan_duplicate: sys::esp_ble_scan_duplicate_t_BLE_SCAN_DUPLICATE_DISABLE,
     };
     unsafe {
-        let _ = ble_gap_stop_advertising();
+        esp_ok_allow_invalid_state(ble_gap_stop_advertising())?;
         BLE_ADV_STARTED.store(false, Ordering::Relaxed);
         esp_ok(ble_gap_set_scan_params(&mut params))?;
         esp_ok(ble_gap_start_scanning(duration))?;
@@ -1131,9 +1384,9 @@ fn dmesh_adv_data(
     let (source, packet_id) = dmesh_adv_ids(packet);
     let pending = telemetry::pending_message_count();
     let battery = battery_level();
-    let prefix_len = packet.len().min(DMESH_MAX_PREFIX);
-    let mut service = Vec::with_capacity(2 + 10 + prefix_len);
-    service.extend_from_slice(&DMESH_BLE_SERVICE_UUID16.to_le_bytes());
+    let prefix_len = 0usize;
+    let mut service = Vec::with_capacity(16 + 10 + prefix_len);
+    service.extend_from_slice(&DMESH_BLE_OPERATIONAL_UUID);
     service.extend_from_slice(&source.to_le_bytes());
     service.extend_from_slice(&packet_id.to_le_bytes());
     service.push(pending);
@@ -1143,7 +1396,7 @@ fn dmesh_adv_data(
     let mut adv = Vec::with_capacity(31);
     adv.extend_from_slice(&[0x02, 0x01, 0x06]);
     adv.push((service.len() + 1).min(0xff) as u8);
-    adv.push(0x16);
+    adv.push(0x21);
     adv.extend_from_slice(&service);
     if adv.len() > 31 {
         bail!("DMesh BLE announcement exceeded legacy advertising limit");
@@ -1280,7 +1533,7 @@ fn start_companion_wake_scan() -> Result<()> {
     radio.ensure_ble()?;
     start_gatt()?;
     BLE_FILTER_DMESH.store(true, Ordering::Relaxed);
-    BLE_FILTER_UUID16.store(DMESH_BLE_SERVICE_UUID16 as u32, Ordering::Relaxed);
+    BLE_FILTER_UUID16.store(0, Ordering::Relaxed);
     BLE_FILTER_ADDR_ENABLED.store(false, Ordering::Relaxed);
     start_scan_params(0, true)?;
     BLE_MODE.store(BLE_MODE_LISTEN, Ordering::Relaxed);
@@ -1438,6 +1691,16 @@ fn parse_dmesh_adv(adv: &[u8]) -> Option<DmeshAnnouncement> {
                     prefix: data[12..].to_vec(),
                 });
             }
+        } else if typ == 0x21 && data.len() >= 26 && data[..16] == DMESH_BLE_OPERATIONAL_UUID[..] {
+            let source = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+            let packet_id = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+            return Some(DmeshAnnouncement {
+                source,
+                packet_id,
+                pending: data[24],
+                battery: data[25],
+                prefix: data[26..].to_vec(),
+            });
         }
         i += len + 1;
     }
@@ -1458,11 +1721,13 @@ unsafe extern "C" fn gap_cb(
         unsafe {
             let _ = sys::esp_ble_gap_security_rsp(req.bd_addr.as_ptr() as *mut u8, accept);
         }
-        telemetry::record_log(format!(
+        let line = format!(
             "event type=ble.security request=true accept={} pairing_open={}",
             accept,
             pairing_open()
-        ));
+        );
+        telemetry::record_log(line.clone());
+        telemetry::emit_console(&line);
         return;
     }
     if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_NC_REQ_EVT && !param.is_null() {
@@ -1471,10 +1736,12 @@ unsafe extern "C" fn gap_cb(
         unsafe {
             let _ = sys::esp_ble_confirm_reply(notif.bd_addr.as_ptr() as *mut u8, accept);
         }
-        telemetry::record_log(format!(
+        let line = format!(
             "event type=ble.security numeric_compare accept={}",
             accept
-        ));
+        );
+        telemetry::record_log(line.clone());
+        telemetry::emit_console(&line);
         return;
     }
     if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_AUTH_CMPL_EVT && !param.is_null() {
@@ -1489,22 +1756,105 @@ unsafe extern "C" fn gap_cb(
             }
             BLE_PAIRING_DEADLINE_MS.store(0, Ordering::Relaxed);
             BLE_PAIRING_ACCEPTED.store(false, Ordering::Relaxed);
-            telemetry::record_log(format!(
+            let line = format!(
                 "event type=ble.security auth=ok pairing={} peer={}",
                 pairing_accepted,
                 format_mac(&auth.bd_addr),
-            ));
+            );
+            telemetry::record_log(line.clone());
+            telemetry::emit_console(&line);
         } else {
             BLE_GATT_AUTHENTICATED.store(false, Ordering::Relaxed);
-            telemetry::record_log(format!(
+            let line = format!(
                 "event type=ble.security auth=fail reason={}",
                 auth.fail_reason
+            );
+            telemetry::record_log(line.clone());
+            telemetry::emit_console(&line);
+        }
+        return;
+    }
+    #[cfg(target_feature = "esp32s3ops")]
+    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_EXT_ADV_SET_RAND_ADDR_COMPLETE_EVT
+        && !param.is_null()
+    {
+        let addr = unsafe { (*param).ext_adv_set_rand_addr };
+        BLE_EXT_ADV_ADDR_STATUS.store(addr.status as u32, Ordering::Relaxed);
+        BLE_EXT_ADV_ADDR_DONE.store(true, Ordering::Relaxed);
+        telemetry::emit_console(&format!(
+            "event type=ble.ext_adv_rand_addr status={} instance={}",
+            addr.status, addr.instance
+        ));
+        return;
+    }
+    #[cfg(target_feature = "esp32s3ops")]
+    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_EXT_ADV_DATA_SET_COMPLETE_EVT
+        && !param.is_null()
+    {
+        let data = unsafe { (*param).ext_adv_data_set };
+        BLE_EXT_ADV_DATA_STATUS.store(data.status as u32, Ordering::Relaxed);
+        BLE_EXT_ADV_DATA_DONE.store(true, Ordering::Relaxed);
+        telemetry::emit_console(&format!(
+            "event type=ble.ext_adv_data status={} instance={}",
+            data.status, data.instance
+        ));
+        return;
+    }
+    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT {
+        if let Err(err) = start_ble_advertising() {
+            BLE_ADV_STARTED.store(false, Ordering::Relaxed);
+            BLE_ADV_START_DONE.store(true, Ordering::Relaxed);
+            BLE_ADV_START_STATUS.store(0xffff, Ordering::Relaxed);
+            telemetry::record_log(format!(
+                "event type=ble.error component=legacy_adv_start message={}",
+                crate::commands::protocol::escape_value(&err.to_string())
             ));
         }
         return;
     }
-    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT {
-        let _ = start_ble_advertising();
+    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_START_COMPLETE_EVT && !param.is_null()
+    {
+        let start = unsafe { (*param).adv_start_cmpl };
+        BLE_ADV_START_STATUS.store(start.status as u32, Ordering::Relaxed);
+        BLE_ADV_START_DONE.store(true, Ordering::Relaxed);
+        BLE_ADV_STARTED.store(start.status == 0, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=ble.legacy_adv_start status={}",
+            start.status
+        ));
+        return;
+    }
+    #[cfg(target_feature = "esp32s3ops")]
+    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_EXT_ADV_SET_PARAMS_COMPLETE_EVT
+        && !param.is_null()
+    {
+        let params = unsafe { (*param).ext_adv_set_params };
+        BLE_EXT_ADV_PARAMS_STATUS.store(params.status as u32, Ordering::Relaxed);
+        BLE_EXT_ADV_PARAMS_DONE.store(true, Ordering::Relaxed);
+        telemetry::emit_console(&format!(
+            "event type=ble.ext_adv_params status={} instance={}",
+            params.status, params.instance
+        ));
+        return;
+    }
+    #[cfg(target_feature = "esp32s3ops")]
+    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_EXT_ADV_START_COMPLETE_EVT
+        && !param.is_null()
+    {
+        let start = unsafe { (*param).ext_adv_start };
+        BLE_EXT_ADV_START_STATUS.store(start.status as u32, Ordering::Relaxed);
+        BLE_EXT_ADV_START_DONE.store(true, Ordering::Relaxed);
+        telemetry::emit_console(&format!(
+            "event type=ble.ext_adv_start status={} instance_num={}",
+            start.status, start.instance_num
+        ));
+        return;
+    }
+    #[cfg(target_feature = "esp32s3ops")]
+    if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_EXT_ADV_REPORT_EVT && !param.is_null() {
+        let report = unsafe { (*param).ext_adv_report.params };
+        let len = (report.adv_data_len as usize).min(report.adv_data.len());
+        handle_ble_scan_report(&report.addr, report.rssi as i32, &report.adv_data[..len]);
         return;
     }
     if event == sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_SCAN_RESULT_EVT && !param.is_null() {
@@ -1535,91 +1885,87 @@ unsafe extern "C" fn gap_cb(
         let len =
             (result.adv_data_len as usize + result.scan_rsp_len as usize).min(result.ble_adv.len());
         let adv = &result.ble_adv[..len];
-        let companion_wake_match = BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
-            && BLE_COMPANION_ADV_STATE.load(Ordering::Relaxed)
-            && !BLE_GATT_CONNECTED.load(Ordering::Relaxed);
-        if companion_wake_match {
-            BLE_SCAN_MATCHED.fetch_add(1, Ordering::Relaxed);
-            BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
-            BLE_PENDING_SWITCHES.fetch_add(1, Ordering::Relaxed);
-            open_companion_active_window(
-                BLE_COMPANION_ACTIVE_MS.load(Ordering::Relaxed).max(1_000),
-            );
-            telemetry::record_log(format!(
-                "event type=ble.companion wake_request=true addr={} rssi={} parser=any",
-                format_mac(&result.bda),
-                result.rssi
-            ));
-        }
-        if matches_ble_filter(&result.bda, adv) {
-            BLE_SCAN_MATCHED.fetch_add(1, Ordering::Relaxed);
-            if let Some(announce) = parse_dmesh_adv(adv) {
-                BLE_ANNOUNCE_RX.fetch_add(1, Ordering::Relaxed);
-                telemetry::count_packet("ble", Direction::Rx, adv.len());
-                if BLE_MODE.load(Ordering::Relaxed) == BLE_MODE_LISTEN
-                    && !BLE_GATT_CONNECTED.load(Ordering::Relaxed)
-                {
-                    BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
-                    BLE_PENDING_SWITCHES.fetch_add(1, Ordering::Relaxed);
-                    let _ = start_connectable_idle();
-                    telemetry::record_log(format!(
-                        "event type=ble.wake_request action=connectable addr={} src=0x{:08x}",
-                        format_mac(&result.bda),
-                        announce.source
-                    ));
-                }
-                if BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
-                    && BLE_COMPANION_ADV_STATE.load(Ordering::Relaxed)
-                    && !BLE_GATT_CONNECTED.load(Ordering::Relaxed)
-                {
-                    BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
-                    BLE_PENDING_SWITCHES.fetch_add(1, Ordering::Relaxed);
-                    open_companion_active_window(
-                        BLE_COMPANION_ACTIVE_MS.load(Ordering::Relaxed).max(1_000),
-                    );
-                    telemetry::record_log(format!(
-                        "event type=ble.companion wake_request=true addr={} src=0x{:08x}",
-                        format_mac(&result.bda),
-                        announce.source
-                    ));
-                }
-                let first_seen = BLE_LAST_ANNOUNCE_HASH
-                    .swap(announce.dedupe_key(), Ordering::Relaxed)
-                    != announce.dedupe_key();
-                if first_seen {
-                    let line = format!(
-                        "event type=ble.announce_rx addr={} src=0x{:08x} n={} pending={} battery={} prefix={}",
-                        format_mac(&result.bda),
-                        announce.source,
-                        announce.packet_id,
-                        announce.pending,
-                        announce.battery,
-                        hex_bytes(&announce.prefix)
-                    );
-                    telemetry::record_log(line);
-                    telemetry::record_packet_sample(
-                        "ble",
-                        Direction::Rx,
-                        adv,
-                        format!(
-                            "source=scan rssi={} addr={}",
-                            result.rssi,
-                            format_mac(&result.bda)
-                        ),
-                    );
-                }
-            } else {
-                telemetry::record_packet(
+        handle_ble_scan_report(&result.bda, result.rssi, adv);
+    }
+}
+
+fn handle_ble_scan_report(addr: &[u8; 6], rssi: i32, adv: &[u8]) {
+    BLE_SCAN_REPORTS.fetch_add(1, Ordering::Relaxed);
+    BLE_SCAN_LAST_RSSI.store(rssi, Ordering::Relaxed);
+    let companion_wake_match = BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
+        && BLE_COMPANION_ADV_STATE.load(Ordering::Relaxed)
+        && !BLE_GATT_CONNECTED.load(Ordering::Relaxed);
+    if companion_wake_match {
+        BLE_SCAN_MATCHED.fetch_add(1, Ordering::Relaxed);
+        BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
+        BLE_PENDING_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        open_companion_active_window(BLE_COMPANION_ACTIVE_MS.load(Ordering::Relaxed).max(1_000));
+        telemetry::record_log(format!(
+            "event type=ble.companion wake_request=true addr={} rssi={} parser=any",
+            format_mac(addr),
+            rssi
+        ));
+    }
+    if matches_ble_filter(addr, adv) {
+        BLE_SCAN_MATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(announce) = parse_dmesh_adv(adv) {
+            BLE_ANNOUNCE_RX.fetch_add(1, Ordering::Relaxed);
+            telemetry::count_packet("ble", Direction::Rx, adv.len());
+            if BLE_MODE.load(Ordering::Relaxed) == BLE_MODE_LISTEN
+                && !BLE_GATT_CONNECTED.load(Ordering::Relaxed)
+            {
+                BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
+                BLE_PENDING_SWITCHES.fetch_add(1, Ordering::Relaxed);
+                let _ = start_connectable_idle();
+                telemetry::record_log(format!(
+                    "event type=ble.wake_request action=connectable addr={} src=0x{:08x}",
+                    format_mac(addr),
+                    announce.source
+                ));
+            }
+            if BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
+                && BLE_COMPANION_ADV_STATE.load(Ordering::Relaxed)
+                && !BLE_GATT_CONNECTED.load(Ordering::Relaxed)
+            {
+                BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
+                BLE_PENDING_SWITCHES.fetch_add(1, Ordering::Relaxed);
+                open_companion_active_window(
+                    BLE_COMPANION_ACTIVE_MS.load(Ordering::Relaxed).max(1_000),
+                );
+                telemetry::record_log(format!(
+                    "event type=ble.companion wake_request=true addr={} src=0x{:08x}",
+                    format_mac(addr),
+                    announce.source
+                ));
+            }
+            let first_seen = BLE_LAST_ANNOUNCE_HASH
+                .swap(announce.dedupe_key(), Ordering::Relaxed)
+                != announce.dedupe_key();
+            if first_seen {
+                let line = format!(
+                    "event type=ble.announce_rx addr={} src=0x{:08x} n={} pending={} battery={} prefix={}",
+                    format_mac(addr),
+                    announce.source,
+                    announce.packet_id,
+                    announce.pending,
+                    announce.battery,
+                    hex_bytes(&announce.prefix)
+                );
+                telemetry::record_log(line);
+                telemetry::record_packet_sample(
                     "ble",
                     Direction::Rx,
                     adv,
-                    format!(
-                        "source=scan rssi={} addr={}",
-                        result.rssi,
-                        format_mac(&result.bda)
-                    ),
+                    format!("source=scan rssi={} addr={}", rssi, format_mac(addr)),
                 );
             }
+        } else {
+            telemetry::record_packet(
+                "ble",
+                Direction::Rx,
+                adv,
+                format!("source=scan rssi={} addr={}", rssi, format_mac(addr)),
+            );
         }
     }
 }
@@ -1692,6 +2038,49 @@ fn ble_stats() -> String {
     )
 }
 
+fn ble_bond_status(settings: Option<&SharedSettings>) -> String {
+    let count = unsafe { sys::esp_ble_get_bond_device_num() }.max(0) as usize;
+    let mut bonds = Vec::new();
+    if count > 0 {
+        let mut devices = vec![sys::esp_ble_bond_dev_t::default(); count.min(16)];
+        let mut dev_num = devices.len() as i32;
+        let ok = unsafe { sys::esp_ble_get_bond_device_list(&mut dev_num, devices.as_mut_ptr()) }
+            == sys::ESP_OK;
+        if ok {
+            for device in devices.iter().take(dev_num.max(0) as usize) {
+                bonds.push(format_mac(&device.bd_addr));
+            }
+        }
+    }
+    let (saved_mode, saved_companion, saved_peer) = settings
+        .map(|settings| {
+            let settings = settings.borrow();
+            (
+                settings.get_str("mode").ok().flatten().unwrap_or_default(),
+                settings
+                    .get_bool("ble.comp", false)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| "err".to_string()),
+                settings.get_str("ble.peer").ok().flatten().unwrap_or_default(),
+            )
+        })
+        .unwrap_or_else(|| ("".to_string(), "".to_string(), "".to_string()));
+    format!(
+        "ble bonds={} bonded={} connected={} connected_peer={} paired_peer={} auth={} companion={} save_pending={} saved_mode={} saved_ble_comp={} saved_peer={}",
+        count,
+        if bonds.is_empty() { "none".to_string() } else { bonds.join(",") },
+        BLE_GATT_CONNECTED.load(Ordering::Relaxed),
+        format_mac(&connected_addr()),
+        paired_addr_string(),
+        BLE_GATT_AUTHENTICATED.load(Ordering::Relaxed),
+        BLE_COMPANION_ENABLED.load(Ordering::Relaxed),
+        BLE_COMPANION_SAVE_PENDING.load(Ordering::Relaxed),
+        crate::commands::protocol::quote_text_value(&saved_mode),
+        saved_companion,
+        crate::commands::protocol::quote_text_value(&saved_peer)
+    )
+}
+
 fn ble_mode_name() -> &'static str {
     match BLE_MODE.load(Ordering::Relaxed) {
         BLE_MODE_LISTEN => "listen",
@@ -1761,8 +2150,14 @@ unsafe extern "C" fn gatts_cb(
                     );
                 }
             }
-            let line = "event type=ble.gatt state=connected".to_string();
-            telemetry::record_log(line);
+            let line = format!(
+                "event type=ble.gatt state=connected peer={} pairing_open={} companion={}",
+                format_mac(&connect.remote_bda),
+                pairing_open(),
+                BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
+            );
+            telemetry::record_log(line.clone());
+            telemetry::emit_console(&line);
         }
         x if x == sys::esp_gatts_cb_event_t_ESP_GATTS_DISCONNECT_EVT => {
             let disconnect = unsafe { (*param).disconnect };
@@ -1773,7 +2168,8 @@ unsafe extern "C" fn gatts_cb(
                 "event type=ble.gatt state=disconnected reason={}",
                 disconnect.reason as u32
             );
-            telemetry::record_log(line);
+            telemetry::record_log(line.clone());
+            telemetry::emit_console(&line);
             if restart_advertising_after_disconnect() {
                 unsafe {
                     let mut params = default_adv_params();
@@ -1789,7 +2185,7 @@ unsafe extern "C" fn gatts_cb(
             let data = unsafe { core::slice::from_raw_parts(write.value, write.len as usize) };
             if write.handle as u32 == BLE_GATT_CCC_HANDLE.load(Ordering::Relaxed) && data.len() >= 2
             {
-                telemetry::record_log(format!(
+                let line = format!(
                     "event type=ble.gatt_write target=ccc handle={} len={} need_rsp={} prep={} value={:02x}{:02x}",
                     write.handle,
                     write.len,
@@ -1797,22 +2193,26 @@ unsafe extern "C" fn gatts_cb(
                     write.is_prep,
                     data[0],
                     data[1]
-                ));
+                );
+                telemetry::record_log(line.clone());
+                telemetry::emit_console(&line);
                 BLE_GATT_NOTIFY_ENABLED.store(data[0] & 0x01 != 0, Ordering::Relaxed);
                 if data[0] & 0x01 != 0 {
                     notify_companion_pending();
                 }
             } else if write.handle as u32 == BLE_GATT_RX_HANDLE.load(Ordering::Relaxed) {
-                telemetry::record_log(format!(
+                let line = format!(
                     "event type=ble.gatt_write target=rx handle={} len={} need_rsp={} prep={}",
                     write.handle, write.len, write.need_rsp, write.is_prep
-                ));
+                );
+                telemetry::record_log(line.clone());
+                telemetry::emit_console(&line);
                 let response = handle_gatt_rx(data);
                 if !response.is_empty() {
                     send_gatt(&response);
                 }
             } else {
-                telemetry::record_log(format!(
+                let line = format!(
                     "event type=ble.gatt_write target=unknown handle={} len={} need_rsp={} prep={} rx_handle={} ccc_handle={}",
                     write.handle,
                     write.len,
@@ -1820,7 +2220,9 @@ unsafe extern "C" fn gatts_cb(
                     write.is_prep,
                     BLE_GATT_RX_HANDLE.load(Ordering::Relaxed),
                     BLE_GATT_CCC_HANDLE.load(Ordering::Relaxed)
-                ));
+                );
+                telemetry::record_log(line.clone());
+                telemetry::emit_console(&line);
             }
             if write.need_rsp {
                 unsafe {
@@ -2020,7 +2422,7 @@ fn gatt_db() -> [sys::esp_gatts_attr_db_t; GATT_IDX_NB] {
             sys::ESP_GATT_PERM_READ as u16,
             16,
             16,
-            ptr128(&NORDIC_SERVICE_UUID),
+            ptr128(&DMESH_GATT_SERVICE_UUID),
         ),
         attr(
             sys::ESP_GATT_AUTO_RSP as u8,
@@ -2034,7 +2436,7 @@ fn gatt_db() -> [sys::esp_gatts_attr_db_t; GATT_IDX_NB] {
         attr(
             sys::ESP_GATT_RSP_BY_APP as u8,
             sys::ESP_UUID_LEN_128 as u16,
-            ptr128(&NORDIC_RX_UUID),
+            ptr128(&DMESH_GATT_RX_UUID),
             sys::ESP_GATT_PERM_WRITE as u16,
             512,
             0,
@@ -2052,7 +2454,7 @@ fn gatt_db() -> [sys::esp_gatts_attr_db_t; GATT_IDX_NB] {
         attr(
             sys::ESP_GATT_AUTO_RSP as u8,
             sys::ESP_UUID_LEN_128 as u16,
-            ptr128(&NORDIC_TX_UUID),
+            ptr128(&DMESH_GATT_TX_UUID),
             sys::ESP_GATT_PERM_READ as u16,
             512,
             0,
@@ -2136,12 +2538,16 @@ fn format_mac(mac: &[u8; 6]) -> String {
         .join(":")
 }
 
-fn legacy_ble_gap_unavailable() -> bool {
-    cfg!(target_feature = "esp32s3ops")
-}
-
 fn esp_ok(ret: sys::esp_err_t) -> Result<()> {
     if ret == sys::ESP_OK {
+        Ok(())
+    } else {
+        bail!("esp_err=0x{ret:x}")
+    }
+}
+
+fn esp_ok_allow_invalid_state(ret: sys::esp_err_t) -> Result<()> {
+    if ret == sys::ESP_OK || ret == sys::ESP_ERR_INVALID_STATE {
         Ok(())
     } else {
         bail!("esp_err=0x{ret:x}")

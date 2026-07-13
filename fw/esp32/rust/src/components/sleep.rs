@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -675,7 +674,6 @@ fn enter_deep_sleep_with_state(state: RtcSleepState) -> Result<()> {
         "event type=sleep.enter mode=deep wake_ms={} active_ms={} flags=0x{:x} dio0={}",
         state.wake_ms, state.forward_ms, state.flags, state.lora.dio0
     ));
-    let _ = io::stdout().flush();
     unsafe {
         sys::esp_deep_sleep_start();
     }

@@ -16,7 +16,8 @@ const BOOT_POLL_MS: u64 = 100;
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("event type=system.error phase=main message={err}");
+        let _ = err;
+        rom_print(b"event type=system.error phase=main\n\0");
     }
 }
 
@@ -24,8 +25,8 @@ fn main() {
 pub extern "C" fn app_main() {
     rom_print(b"dm-rs boot step=app_main\n\0");
     if let Err(err) = run() {
+        let _ = err;
         rom_print(b"dm-rs boot step=app_error\n\0");
-        eprintln!("event type=system.error phase=app_main message={err}");
     }
 }
 
@@ -69,33 +70,47 @@ fn run() -> Result<()> {
     components::ble_bt::configure_companion_advertising(2_000, 1_000);
     components::ble_bt::configure_companion_active_window(companion_active_ms);
     rom_print(b"dm-rs boot step=boot_window\n\0");
-    let pairing_recovery = run_boot_active_window(wake_cause, &settings, &mut registry);
+    let pairing_recovery = run_boot_active_window(wake_cause, &mut registry);
     rom_print(b"dm-rs boot step=mode\n\0");
     if pairing_recovery {
-        components::mode::set_infra(&settings, false, "pairing_recovery")?;
+        match components::ble_bt::start_pairing_recovery(&settings) {
+            Ok(removed) => {
+                components::telemetry::record_log(format!(
+                    "event type=boot_window pairing_recovery=true bonds_removed={}",
+                    removed
+                ));
+            }
+            Err(err) => {
+                components::telemetry::record_log(format!(
+                    "event type=boot_window pairing_recovery=false msg={}",
+                    commands::protocol::escape_value(&err.to_string())
+                ));
+            }
+        }
+        components::mode::enter_pairing_recovery(
+            &settings,
+            components::ble_bt::PAIRING_RECOVERY_WINDOW_MS,
+        );
     } else if is_real_boot(wake_cause) || is_button_wake(wake_cause) {
-        components::mode::init_after_boot_window(&settings);
+        components::mode::init_after_boot_window(&settings, is_button_wake(wake_cause));
     } else {
         components::mode::init(&settings);
     }
 
-    rom_print(b"dm-rs boot step=mesh\n\0");
-    let mut mesh = L3Mesh::new();
-    #[cfg(not(target_feature = "esp32s3ops"))]
-    {
-        rom_print(b"dm-rs boot step=mesh_ble\n\0");
-        mesh.add_transport(components::ble_bt::ble_transport());
-        rom_print(b"dm-rs boot step=mesh_bt\n\0");
-        mesh.add_transport(components::ble_bt::bt_transport());
+    if pairing_recovery {
+        rom_print(b"dm-rs boot step=mesh_skip_pairing\n\0");
+        components::telemetry::record_log(
+            "event type=mesh.start skipped=true reason=pairing_recovery",
+        );
+    } else {
+        rom_print(b"dm-rs boot step=mesh\n\0");
+        let mut mesh = L3Mesh::new();
+        rom_print(b"dm-rs boot step=mesh_ble_local_only\n\0");
+        rom_print(b"dm-rs boot step=mesh_lora\n\0");
+        mesh.add_transport(components::lora::transport(settings.clone()));
+        rom_print(b"dm-rs boot step=mesh_nan\n\0");
+        mesh.add_transport(components::nan::transport());
     }
-    #[cfg(target_feature = "esp32s3ops")]
-    {
-        rom_print(b"dm-rs boot step=mesh_ble_skip\n\0");
-    }
-    rom_print(b"dm-rs boot step=mesh_lora\n\0");
-    mesh.add_transport(components::lora::transport(settings.clone()));
-    rom_print(b"dm-rs boot step=mesh_nan\n\0");
-    mesh.add_transport(components::nan::transport());
 
     let mut serial_enabled = true;
     let ready = "event type=system.ready app=dmesh-rs";
@@ -156,60 +171,106 @@ fn run() -> Result<()> {
 
 fn run_boot_active_window(
     wake_cause: esp_idf_sys::esp_sleep_source_t,
-    settings: &components::settings::SharedSettings,
     registry: &mut CommandRegistry,
 ) -> bool {
-    if !is_real_boot(wake_cause) && !is_button_wake(wake_cause) {
+    if !is_real_boot(wake_cause) {
         return false;
     }
 
-    let probe_long_press = is_real_boot(wake_cause);
-    let _ = components::ble_bt::set_advertising_interval_ms(1_000, 1_000);
-    if let Err(err) = components::ble_bt::start_connectable_advertising() {
-        components::telemetry::record_log(format!(
-            "event type=boot_window ble=false msg={}",
-            commands::protocol::escape_value(&err.to_string())
-        ));
-    }
+    let boot_pressed = components::button::is_pressed();
+    let probe_long_press = true;
+    components::telemetry::record_log(
+        "event type=boot_window barrier=true action=watch_prg_and_console",
+    );
+    uart_write("event type=boot_window barrier=true action=watch_prg_and_console\n");
     components::telemetry::record_log(format!(
         "event type=boot_window start=true cause={} probe_long_press={} window_ms={}",
         wake_cause_name(wake_cause),
         probe_long_press,
         BOOT_ACTIVE_WINDOW_MS
     ));
+    uart_write(&format!(
+        "event type=boot_window start=true cause={} probe_long_press={} gpio={} pressed={}\n",
+        wake_cause_name(wake_cause),
+        probe_long_press,
+        components::button::configured_gpio()
+            .map(|pin| pin.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        boot_pressed
+    ));
 
     let deadline = Instant::now() + Duration::from_millis(BOOT_ACTIVE_WINDOW_MS as u64);
     let mut pressed_since: Option<Instant> = None;
+    let mut pairing_recovery_requested = false;
+    let mut line = Vec::new();
+    uart_write("dm-rs> ");
     while Instant::now() < deadline {
-        components::ble_bt::poll_text_commands(registry);
+        poll_boot_console(registry, &mut line);
         if probe_long_press {
             if components::button::is_pressed() {
-                let start = *pressed_since.get_or_insert_with(Instant::now);
-                if start.elapsed() >= Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64) {
-                    match components::ble_bt::start_pairing_recovery(settings) {
-                        Ok(removed) => {
-                            components::telemetry::record_log(format!(
-                                "event type=boot_window pairing_recovery=true bonds_removed={}",
-                                removed
-                            ));
-                        }
-                        Err(err) => {
-                            components::telemetry::record_log(format!(
-                                "event type=boot_window pairing_recovery=false msg={}",
-                                commands::protocol::escape_value(&err.to_string())
-                            ));
-                        }
+                let start = match pressed_since {
+                    Some(start) => start,
+                    None => {
+                        let start = Instant::now();
+                        pressed_since = Some(start);
+                        uart_write("event type=boot_window button_down=true\n");
+                        start
                     }
-                    return true;
+                };
+                if !pairing_recovery_requested
+                    && start.elapsed() >= Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64)
+                {
+                    pairing_recovery_requested = true;
+                    uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
+                    components::button::suppress_until_release();
+                    components::telemetry::record_log(
+                        "event type=boot_window long_press=true pending=pairing_recovery",
+                    );
                 }
             } else {
+                if let Some(start) = pressed_since.take() {
+                    uart_write(&format!(
+                        "event type=boot_window button_up=true held_ms={}\n",
+                        start.elapsed().as_millis()
+                    ));
+                }
                 pressed_since = None;
             }
         }
         std::thread::sleep(Duration::from_millis(BOOT_POLL_MS));
     }
-    components::telemetry::record_log("event type=boot_window done=true".to_string());
-    false
+    components::telemetry::record_log(format!(
+        "event type=boot_window done=true pairing_recovery={}",
+        pairing_recovery_requested
+    ));
+    pairing_recovery_requested
+}
+
+fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) {
+    let mut buf = [0_u8; 128];
+    match uart_read(&mut buf) {
+        read if read > 0 => {
+            let read = read as usize;
+            for byte in &buf[..read] {
+                if *byte == b'\n' || *byte == b'\r' {
+                    let command = core::str::from_utf8(line).unwrap_or("").trim();
+                    if !command.is_empty() {
+                        let response = transports::dispatch_text_line(registry, command);
+                        uart_write(&response);
+                    }
+                    line.clear();
+                    uart_write("dm-rs> ");
+                } else {
+                    line.push(*byte);
+                }
+            }
+        }
+        -1 => {
+            log::warn!("boot console read failed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        _ => {}
+    }
 }
 
 fn is_real_boot(cause: esp_idf_sys::esp_sleep_source_t) -> bool {
