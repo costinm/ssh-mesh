@@ -11,14 +11,18 @@ use super::telemetry;
 const MODE_COMPANION: u8 = 0;
 const MODE_INFRA: u8 = 1;
 const DEFAULT_ADV_MS: u32 = 1_000;
-const DEFAULT_WINDOW_MS: u32 = 60_000;
+const DEFAULT_PENDING_ADV_MS: u32 = 1_500;
+const DEFAULT_WINDOW_MS: u32 = 10_000;
 const DEFAULT_BOOT_WINDOW_MS: u32 = 10_000;
-const DEFAULT_ACTIVE_MS: u32 = 60_000;
+const DEFAULT_ACTIVE_MS: u32 = 5_000;
+const DEFAULT_PENDING_WINDOW_MS: u32 = 30_000;
+const DEFAULT_WAKE_MS: u32 = 30_000;
 const PING_PREFIX: &[u8] = b"dmesh.ping";
 
 static PRODUCT_MODE: AtomicU8 = AtomicU8::new(MODE_INFRA);
 static COMPANION_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static COMPANION_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+static COMPANION_PENDING_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static PING_RESPONSE_PENDING: AtomicBool = AtomicBool::new(false);
 static PING_RX: AtomicU32 = AtomicU32::new(0);
 static PING_TX: AtomicU32 = AtomicU32::new(0);
@@ -78,6 +82,7 @@ pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
         }
     } else {
         COMPANION_ADVERTISING.store(false, Ordering::Relaxed);
+        COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
         COMPANION_DEADLINE_MS.store(0, Ordering::Relaxed);
         if let Err(err) = start_infra_radios(settings, "boot_window_done") {
             telemetry::record_log(format!(
@@ -92,6 +97,7 @@ pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
 pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) -> Result<()> {
     PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
     COMPANION_ADVERTISING.store(false, Ordering::Relaxed);
+    COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
     COMPANION_DEADLINE_MS.store(0, Ordering::Relaxed);
     if save {
         settings.borrow_mut().set_str("mode", "infra")?;
@@ -104,6 +110,7 @@ pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) ->
 pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
     PRODUCT_MODE.store(MODE_COMPANION, Ordering::Relaxed);
     COMPANION_ADVERTISING.store(true, Ordering::Relaxed);
+    COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
     COMPANION_DEADLINE_MS.store(now_ms().wrapping_add(window_ms), Ordering::Relaxed);
     super::nan::stop_nan().ok();
     super::wifi::stop_raw_monitor().ok();
@@ -131,6 +138,7 @@ pub fn poll(settings: &SharedSettings) {
         return;
     }
     if super::ble_bt::gatt_connected() {
+        COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
         COMPANION_DEADLINE_MS.store(
             now_ms().wrapping_add(get_u32(settings, "cm.active_ms", DEFAULT_ACTIVE_MS)),
             Ordering::Relaxed,
@@ -207,6 +215,19 @@ pub fn observe_ping(transport: &'static str, payload: &[u8]) {
     }
 }
 
+pub fn status_pong_text(settings: &SharedSettings, source: &'static str) -> String {
+    let mut payload = format!(
+        "dmesh.pong type=status reply=true source={} uptime_ms={} {}",
+        source,
+        now_ms(),
+        telemetry::stats_text(settings)
+    );
+    if payload.len() > 220 {
+        payload.truncate(220);
+    }
+    payload
+}
+
 fn enter_companion_advertising(
     settings: &SharedSettings,
     window_ms: u32,
@@ -214,10 +235,25 @@ fn enter_companion_advertising(
     reason: &'static str,
 ) -> Result<()> {
     PRODUCT_MODE.store(MODE_COMPANION, Ordering::Relaxed);
+    if reason != "pending" {
+        COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
+    }
     super::nan::stop_nan().ok();
     super::wifi::stop_raw_monitor().ok();
     super::lora::sleep_radio(settings).ok();
     super::ble_bt::set_advertising_interval_ms(adv_ms, adv_ms);
+    if let Err(err) = super::sleep::enable_companion_idle_pm(settings) {
+        telemetry::record_log(format!(
+            "event type=mode.companion_pm ok=false msg={}",
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+    }
+    if let Err(err) = super::ble_bt::enable_controller_sleep() {
+        telemetry::record_log(format!(
+            "event type=mode.companion_ble_sleep ok=false msg={}",
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+    }
     super::ble_bt::start_connectable_advertising()?;
     super::ble_bt::open_companion_active_window(window_ms);
     COMPANION_ADVERTISING.store(true, Ordering::Relaxed);
@@ -232,21 +268,39 @@ fn enter_companion_advertising(
 fn enter_companion_sleep(settings: &SharedSettings) -> Result<()> {
     PRODUCT_MODE.store(MODE_COMPANION, Ordering::Relaxed);
     let lora_listen = get_bool(settings, "cm.lora", false);
+    let pending = telemetry::pending_message_count();
+    if pending > 0 && !COMPANION_PENDING_ADVERTISING.swap(true, Ordering::Relaxed) {
+        let window_ms = get_u32(settings, "cm.pending_ms", DEFAULT_PENDING_WINDOW_MS);
+        let adv_ms = get_u32(settings, "cm.pending_adv_ms", DEFAULT_PENDING_ADV_MS);
+        telemetry::record_log(format!(
+            "event type=mode active=companion state=pending_advertising pending={} window_ms={} adv_ms={}",
+            pending, window_ms, adv_ms
+        ));
+        return enter_companion_advertising(settings, window_ms, adv_ms, "pending");
+    }
+
     super::nan::stop_nan().ok();
     super::wifi::stop_raw_monitor().ok();
     super::ble_bt::stop_radio_activity();
     COMPANION_ADVERTISING.store(false, Ordering::Relaxed);
+    COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
     COMPANION_DEADLINE_MS.store(0, Ordering::Relaxed);
+    let wake_ms = get_u32(settings, "cm.wake_ms", DEFAULT_WAKE_MS);
+    let active_ms = if lora_listen {
+        get_u32(settings, "cm.active_ms", DEFAULT_ACTIVE_MS)
+    } else {
+        0
+    };
     telemetry::record_log(format!(
-        "event type=mode active=companion state=deep_sleep lora_listen={}",
-        lora_listen
+        "event type=mode active=companion state=deep_sleep lora_listen={} wake_ms={} active_ms={} pending={}",
+        lora_listen, wake_ms, active_ms, pending
     ));
-    super::sleep::enter_companion_deep_sleep(settings, lora_listen, 0, DEFAULT_ACTIVE_MS)
+    super::sleep::enter_companion_deep_sleep(settings, lora_listen, wake_ms, active_ms)
 }
 
 fn start_infra_radios(settings: &SharedSettings, reason: &'static str) -> Result<()> {
     let channel = get_u32(settings, "raw.ch", 6).clamp(1, 13) as u8;
-    super::wifi::start_raw_monitor_mode(channel, "action")?;
+    super::wifi::start_raw_monitor_mode(channel, "dmesh")?;
     // TODO(raw-security): raw Wi-Fi commands are intentionally unauthenticated
     // during bring-up. Add mesh-owner public-key authentication and payload
     // encryption before this is used outside local testing.
@@ -254,6 +308,30 @@ fn start_infra_radios(settings: &SharedSettings, reason: &'static str) -> Result
         "event type=mode.infra_start raw_wifi=true channel={} reason={}",
         channel, reason
     ));
+    telemetry::record_log(format!(
+        "event type=mode.infra_radio medium=wifi status=rx channel={} filter=dmesh reason={}",
+        channel, reason
+    ));
+    telemetry::record_log(format!(
+        "event type=mode.infra_radio medium=lora reason={} {}",
+        reason,
+        super::lora::status_text(settings)
+    ));
+    match super::lora::start_background_rx(settings.clone()) {
+        Ok(Some(_)) => telemetry::record_log(format!(
+            "event type=mode.infra_radio medium=lora rx=true reason={}",
+            reason
+        )),
+        Ok(None) => telemetry::record_log(format!(
+            "event type=mode.infra_radio medium=lora rx=false reason={} status=unavailable_or_running",
+            reason
+        )),
+        Err(err) => telemetry::record_log(format!(
+            "event type=mode.infra_radio medium=lora rx=false reason={} msg={}",
+            reason,
+            crate::commands::protocol::escape_value(&err.to_string())
+        )),
+    }
     Ok(())
 }
 
@@ -261,13 +339,16 @@ fn send_status_ping(settings: &SharedSettings, source: &'static str) -> Result<(
     if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_COMPANION {
         bail!("companion firmware does not send ping");
     }
-    let mut payload = format!(
-        "dmesh.ping type=status reply={} source={} uptime_ms={} {}",
-        if source == "rx" { "true" } else { "false" },
-        source,
-        now_ms(),
-        telemetry::stats_text(settings)
-    );
+    let mut payload = if source == "rx" {
+        status_pong_text(settings, source)
+    } else {
+        format!(
+            "dmesh.ping type=status reply=false source={} uptime_ms={} {}",
+            source,
+            now_ms(),
+            telemetry::stats_text(settings)
+        )
+    };
     if payload.len() > 180 {
         payload.truncate(180);
     }
@@ -289,11 +370,8 @@ fn send_status_ping(settings: &SharedSettings, source: &'static str) -> Result<(
 
 fn configured_mode(settings: &SharedSettings) -> u8 {
     let from_mode = settings.borrow().get_str("mode").ok().flatten();
-    if matches!(from_mode.as_deref(), Some("infra")) {
-        return MODE_INFRA;
-    }
     if matches!(from_mode.as_deref(), Some("companion")) {
-        return MODE_COMPANION;
+        telemetry::record_log("event type=mode.startup saved=companion action=ignore start=infra");
     }
     MODE_INFRA
 }
@@ -331,7 +409,7 @@ impl CommandHandler for ModeCommand {
     }
 
     fn help(&self) -> &'static str {
-        "mode status=true | mode companion=true|infra=true save=true | mode advertise=true window_ms=60000 adv_ms=1000 | mode active=true ms=60000 | mode sleep=true | mode lora_sleep_listen=true save=true | mode raw_wifi=true channel=6 | mode ping=true"
+        "mode status=true | mode companion=true|infra=true save=true | mode advertise=true window_ms=10000 adv_ms=1000 | mode active=true ms=5000 | mode sleep=true | mode lora_sleep_listen=true save=true | mode raw_wifi=true channel=6 | mode ping=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -388,7 +466,7 @@ impl CommandHandler for ModeCommand {
             .unwrap_or(false)
         {
             let channel = request.arg_i32("channel")?.unwrap_or(6).clamp(1, 13) as u8;
-            super::wifi::start_raw_monitor_mode(channel, "action")?;
+            super::wifi::start_raw_monitor_mode(channel, "dmesh")?;
             return Ok(CommandResponse::ok(format!(
                 "mode raw_wifi=true channel={} {}",
                 channel,
@@ -479,9 +557,11 @@ fn save_requested(request: &CommandRequest) -> bool {
 
 fn status_text() -> String {
     format!(
-        "mode active={} companion_advertising={} deadline_ms={} ping_rx={} ping_tx={}",
+        "mode active={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={}",
         mode_name(),
         COMPANION_ADVERTISING.load(Ordering::Relaxed),
+        COMPANION_PENDING_ADVERTISING.load(Ordering::Relaxed),
+        telemetry::pending_message_count(),
         COMPANION_DEADLINE_MS.load(Ordering::Relaxed),
         PING_RX.load(Ordering::Relaxed),
         PING_TX.load(Ordering::Relaxed)

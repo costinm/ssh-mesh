@@ -13,6 +13,7 @@ pub mod nvs;
 pub mod settings;
 pub mod sleep;
 pub mod telemetry;
+pub mod wake;
 pub mod wifi;
 
 use crate::commands::CommandRegistry;

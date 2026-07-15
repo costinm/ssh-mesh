@@ -5,6 +5,10 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
+#if CONFIG_IDF_TARGET_ESP32
+#include "esp_bt.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "host/ble_gap.h"
@@ -298,6 +302,9 @@ int32_t dmesh_nimble_start_advertising(const uint8_t *adv, uint8_t adv_len,
 
 int32_t dmesh_nimble_stop_advertising(void) {
     s_adv_wanted = false;
+    if (!s_started || !s_synced) {
+        return 0;
+    }
     ble_gap_adv_stop();
     return 0;
 }
@@ -324,4 +331,20 @@ uint16_t dmesh_nimble_tx_handle(void) {
 
 uint16_t dmesh_nimble_rx_handle(void) {
     return s_rx_handle;
+}
+
+int32_t dmesh_nimble_enable_sleep(void) {
+#if CONFIG_IDF_TARGET_ESP32
+    return esp_bt_sleep_enable();
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+int32_t dmesh_nimble_disable_sleep(void) {
+#if CONFIG_IDF_TARGET_ESP32
+    return esp_bt_sleep_disable();
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }

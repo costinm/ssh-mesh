@@ -647,9 +647,23 @@ fn wait_for_official_ready(timeout: Duration) -> Result<()> {
         if NAN_OFFICIAL_READY.load(Ordering::Relaxed) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        task_delay(Duration::from_millis(50));
     }
     bail!("timed out waiting for WIFI_EVENT_NAN_STARTED");
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
+fn task_delay(timeout: Duration) {
+    unsafe {
+        sys::vTaskDelay(duration_to_ticks(timeout).max(1));
+    }
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
+fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
+    let hz = sys::configTICK_RATE_HZ as u128;
+    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
+    ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
 }
 
 #[cfg(not(target_feature = "esp32s3ops"))]

@@ -6,5 +6,8 @@ fn main() {
     )
     .expect("copy partitions_4mb_large_app.csv");
     println!("cargo:rerun-if-changed=partitions_4mb_large_app.csv");
+    println!("cargo:rerun-if-changed=native/dmesh_nimble/dmesh_nimble.c");
+    println!("cargo:rerun-if-changed=native/dmesh_nimble/include/dmesh_nimble.h");
+    println!("cargo:rerun-if-changed=native/dmesh_nimble/CMakeLists.txt");
     embuild::espidf::sysenv::output();
 }

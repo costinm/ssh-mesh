@@ -15,6 +15,8 @@ int32_t dmesh_nimble_notify(const uint8_t *data, uint16_t len);
 int32_t dmesh_nimble_clear_bonds(void);
 uint16_t dmesh_nimble_tx_handle(void);
 uint16_t dmesh_nimble_rx_handle(void);
+int32_t dmesh_nimble_enable_sleep(void);
+int32_t dmesh_nimble_disable_sleep(void);
 
 void dmesh_nimble_on_ready(const uint8_t *addr, uint8_t addr_type);
 void dmesh_nimble_on_connect(uint16_t conn_handle, const uint8_t *addr,

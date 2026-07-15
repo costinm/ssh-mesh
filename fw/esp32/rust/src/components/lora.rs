@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -51,7 +51,10 @@ const MODE_SLEEP: u8 = 0x00;
 const MODE_STDBY: u8 = 0x01;
 const MODE_TX: u8 = 0x03;
 const MODE_RX_CONTINUOUS: u8 = 0x05;
+const MODE_CAD: u8 = 0x07;
 
+const IRQ_CAD_DETECTED: u8 = 0x01;
+const IRQ_CAD_DONE: u8 = 0x04;
 const IRQ_TX_DONE: u8 = 0x08;
 const IRQ_PAYLOAD_CRC_ERROR: u8 = 0x20;
 const IRQ_RX_DONE: u8 = 0x40;
@@ -62,12 +65,58 @@ static LORA_PACKET_COUNTER: AtomicU32 = AtomicU32::new(1);
 static LORA_RX_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(std::ptr::null_mut());
 static LORA_SPI_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+static LORA_CAD_RX_ENABLED: AtomicBool = AtomicBool::new(true);
+static LORA_CAD_TX_ENABLED: AtomicBool = AtomicBool::new(true);
+static LORA_CAD_INTERVAL_MS: AtomicU32 = AtomicU32::new(2_000);
+static LORA_CAD_RX_WINDOW_MS: AtomicU32 = AtomicU32::new(1_000);
+static LORA_CAD_TX_TRIES: AtomicU32 = AtomicU32::new(4);
+static LORA_CAD_SAMPLES: AtomicU32 = AtomicU32::new(0);
+static LORA_CAD_DETECTED: AtomicU32 = AtomicU32::new(0);
+const NVS_LORA_CAD_RX: &str = "lora.cad_rx";
+const NVS_LORA_CAD_TX: &str = "lora.cad_tx";
+const NVS_LORA_CAD_INT_MS: &str = "lora.cad_int";
+const NVS_LORA_CAD_RX_MS: &str = "lora.cad_rx_ms";
+const NVS_LORA_CAD_TX_N: &str = "lora.cad_tx_n";
+
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
+    load_cad_settings(&settings);
     registry.register(LoraCommand::new("lora", settings.clone()));
     registry.register(LoraCommand::new("loraprobe", settings.clone()));
     registry.register(LoraCommand::new("lorasend", settings.clone()));
     registry.register(LoraCommand::new("loralisten", settings.clone()));
     registry.register(LoraCommand::new("loradump", settings));
+}
+
+/// Load CAD-related NVS settings into the module atomics. Settings that
+/// are absent fall back to the current static defaults (`cad_rx=true`,
+/// `cad_tx=true`, 2 s/1 s/RX intervals, 4 TX retries). Called once at
+/// boot and again after the `lora cad_rx=...` command updates NVS.
+pub fn load_cad_settings(settings: &SharedSettings) {
+    let s = settings.borrow();
+    LORA_CAD_RX_ENABLED.store(
+        s.get_bool(NVS_LORA_CAD_RX, true).unwrap_or(true),
+        Ordering::Relaxed,
+    );
+    LORA_CAD_TX_ENABLED.store(
+        s.get_bool(NVS_LORA_CAD_TX, true).unwrap_or(true),
+        Ordering::Relaxed,
+    );
+    LORA_CAD_INTERVAL_MS.store(
+        s.get_i32(NVS_LORA_CAD_INT_MS, 2_000)
+            .unwrap_or(2_000)
+            .max(5) as u32,
+        Ordering::Relaxed,
+    );
+    LORA_CAD_RX_WINDOW_MS.store(
+        s.get_i32(NVS_LORA_CAD_RX_MS, 1_000)
+            .unwrap_or(1_000)
+            .max(50) as u32,
+        Ordering::Relaxed,
+    );
+    LORA_CAD_TX_TRIES.store(
+        s.get_i32(NVS_LORA_CAD_TX_N, 4).unwrap_or(4).clamp(0, 16) as u32,
+        Ordering::Relaxed,
+    );
 }
 
 pub fn sleep_radio(settings: &SharedSettings) -> Result<()> {
@@ -196,6 +245,16 @@ pub struct LoraConfig {
     pub rst: i32,
     pub dio0: i32,
     pub busy: i32,
+    pub board_power_pin: i32,
+    pub board_power_level: i32,
+    pub sx1262_dio2_rf_switch: bool,
+    pub sx1262_tcxo_mv: i32,
+    pub sx1262_pa_duty: i32,
+    pub sx1262_pa_hp: i32,
+    pub sx1262_pa_device: i32,
+    pub sx1262_pa_lut: i32,
+    pub sx1262_rx_timeout_ms: i32,
+    pub sx1262_sync_word: i32,
     pub sf: i32,
     pub cr: i32,
     pub sync_word: i32,
@@ -219,6 +278,16 @@ impl Default for LoraConfig {
             rst: 14,
             dio0: 26,
             busy: -1,
+            board_power_pin: -1,
+            board_power_level: 1,
+            sx1262_dio2_rf_switch: false,
+            sx1262_tcxo_mv: 0,
+            sx1262_pa_duty: 4,
+            sx1262_pa_hp: 7,
+            sx1262_pa_device: 0,
+            sx1262_pa_lut: 1,
+            sx1262_rx_timeout_ms: 0,
+            sx1262_sync_word: -1,
             sf: 10,
             cr: 5,
             sync_word: 0x2b,
@@ -268,6 +337,18 @@ impl LoraState {
                 rst: settings.get_i32("lora.rst", defaults.rst)?,
                 dio0: settings.get_i32("lora.dio0", defaults.dio0)?,
                 busy: settings.get_i32("lora.busy", defaults.busy)?,
+                board_power_pin: settings.get_i32("lora.pwrpin", defaults.board_power_pin)?,
+                board_power_level: settings.get_i32("lora.pwrlvl", defaults.board_power_level)?,
+                sx1262_dio2_rf_switch: settings
+                    .get_bool("lora.dio2rf", defaults.sx1262_dio2_rf_switch)?,
+                sx1262_tcxo_mv: settings.get_i32("lora.tcxo_mv", defaults.sx1262_tcxo_mv)?,
+                sx1262_pa_duty: settings.get_i32("lora.pa_duty", defaults.sx1262_pa_duty)?,
+                sx1262_pa_hp: settings.get_i32("lora.pa_hp", defaults.sx1262_pa_hp)?,
+                sx1262_pa_device: settings.get_i32("lora.pa_dev", defaults.sx1262_pa_device)?,
+                sx1262_pa_lut: settings.get_i32("lora.pa_lut", defaults.sx1262_pa_lut)?,
+                sx1262_rx_timeout_ms: settings
+                    .get_i32("lora.rx_timeout", defaults.sx1262_rx_timeout_ms)?,
+                sx1262_sync_word: settings.get_i32("lora.sx_sync", defaults.sx1262_sync_word)?,
                 sf: settings.get_i32("lora.sf", defaults.sf)?,
                 cr: settings.get_i32("lora.cr", defaults.cr)?,
                 sync_word: settings.get_i32("lora.sync_word", defaults.sync_word)?,
@@ -283,6 +364,10 @@ pub fn load_config(settings: &SharedSettings) -> Result<LoraConfig> {
     Ok(LoraState::load(settings)?.config)
 }
 
+pub fn status_text(settings: &SharedSettings) -> String {
+    lora_status_text(settings)
+}
+
 impl CommandHandler for LoraCommand {
     fn name(&self) -> &'static str {
         self.name
@@ -290,7 +375,7 @@ impl CommandHandler for LoraCommand {
 
     fn help(&self) -> &'static str {
         match self.name {
-            "lora" => "lora board=heltec_v3 | chip=sx127x|sx1262 preset=medium_fast|medium_slow freq=913125000 bw=250000 sf=9 cr=5 sync_word=0x2b rx=true|false sleep=true|false apply=true",
+            "lora" => "lora board=heltec_v3 | chip=sx127x|sx1262 preset=medium_fast|medium_slow freq=913125000 bw=250000 sf=9 cr=5 sync_word=0x2b sx_sync=0x24b4 tcxo_mv=1800 dio2rf=true pwrpin=36 pwrlvl=0 rx=true|false sleep=true|false cad=true cad_timeout=50 cad_rx=true|false cad_tx=true|false cad_interval_ms=2000 cad_rx_ms=1000 cad_tx_tries=4 status=true apply=true",
             "loraprobe" => "loraprobe chip=sx127x|sx1262 sck=5,18,9 miso=19,11 mosi=27,10 cs=18,5,8 rst=14,23,12 dio0=26,14 busy=-1,13 save=true",
             "lorasend" => "lorasend text=hello | data=hex:0102 | format=raw",
             "loralisten" => "loralisten ms=5000 count=4 local_only=true",
@@ -322,11 +407,66 @@ impl LoraCommand {
             sleep_radio(&self.settings)?;
             return Ok(CommandResponse::ok("lora sleep=true"));
         }
+        if request
+            .arg("cad")
+            .or_else(|| request.arg("channel_active"))
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let timeout_ms = request
+                .arg_i32("cad_timeout")?
+                .or(request.arg_i32("timeout")?)
+                .unwrap_or(0)
+                .max(0) as u32;
+            return self.cad_probe(timeout_ms);
+        }
         let rx_request = request.arg("rx").map(parse_bool).transpose()?;
         if let Some(false) = rx_request {
             BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
             notify_lora_rx_task();
             return Ok(CommandResponse::ok("lora rx=false"));
+        }
+        // CAD-related settings. Updates NVS and the runtime atomics in
+        // one shot so a single `lora cad_rx=false` takes effect
+        // immediately without needing an `apply`/restart cycle.
+        let mut cad_dirty = false;
+        if let Some(value) = request.arg("cad_rx") {
+            let enabled = parse_bool(value)?;
+            self.settings
+                .borrow_mut()
+                .set_bool(NVS_LORA_CAD_RX, enabled)?;
+            LORA_CAD_RX_ENABLED.store(enabled, Ordering::Relaxed);
+            cad_dirty = true;
+        }
+        if let Some(value) = request.arg("cad_tx") {
+            let enabled = parse_bool(value)?;
+            self.settings
+                .borrow_mut()
+                .set_bool(NVS_LORA_CAD_TX, enabled)?;
+            LORA_CAD_TX_ENABLED.store(enabled, Ordering::Relaxed);
+            cad_dirty = true;
+        }
+        if let Some(value) = request.arg_i32("cad_interval_ms")? {
+            let v = value.max(5);
+            self.settings.borrow_mut().set_i32(NVS_LORA_CAD_INT_MS, v)?;
+            LORA_CAD_INTERVAL_MS.store(v as u32, Ordering::Relaxed);
+            cad_dirty = true;
+        }
+        if let Some(value) = request.arg_i32("cad_rx_ms")? {
+            let v = value.max(50);
+            self.settings.borrow_mut().set_i32(NVS_LORA_CAD_RX_MS, v)?;
+            LORA_CAD_RX_WINDOW_MS.store(v as u32, Ordering::Relaxed);
+            cad_dirty = true;
+        }
+        if let Some(value) = request.arg_i32("cad_tx_tries")? {
+            let v = value.clamp(0, 16);
+            self.settings.borrow_mut().set_i32(NVS_LORA_CAD_TX_N, v)?;
+            LORA_CAD_TX_TRIES.store(v as u32, Ordering::Relaxed);
+            cad_dirty = true;
+        }
+        if cad_dirty {
+            return Ok(CommandResponse::ok(cad_status_text()));
         }
         if let Some(preset) = request.arg("preset") {
             let preset = LoraPreset::parse(preset)?;
@@ -350,6 +490,15 @@ impl LoraCommand {
                     settings.set_i32("lora.rst", 12)?;
                     settings.set_i32("lora.dio0", 14)?;
                     settings.set_i32("lora.busy", 13)?;
+                    settings.set_i32("lora.pwrpin", 36)?;
+                    settings.set_i32("lora.pwrlvl", 0)?;
+                    settings.set_bool("lora.dio2rf", true)?;
+                    settings.set_i32("lora.tcxo_mv", 1800)?;
+                    settings.set_i32("lora.pa_duty", 4)?;
+                    settings.set_i32("lora.pa_hp", 7)?;
+                    settings.set_i32("lora.pa_dev", 0)?;
+                    settings.set_i32("lora.pa_lut", 1)?;
+                    settings.set_i32("lora.rx_timeout", 0)?;
                     settings.set_i32("lora.tx_power", 17)?;
                 }
                 _ => bail!("unsupported LoRa board {board}"),
@@ -380,6 +529,17 @@ impl LoraCommand {
                 .set_bool("lora.crc", parse_bool(crc)?)?;
         }
         for (arg, key) in [
+            ("dio2rf", "lora.dio2rf"),
+            ("rf_switch", "lora.dio2rf"),
+            ("dio2_rf_switch", "lora.dio2rf"),
+        ] {
+            if let Some(value) = request.arg(arg) {
+                self.settings
+                    .borrow_mut()
+                    .set_bool(key, parse_bool(value)?)?;
+            }
+        }
+        for (arg, key) in [
             ("spi_host", "lora.spi_host"),
             ("sck", "lora.sck"),
             ("miso", "lora.miso"),
@@ -388,22 +548,42 @@ impl LoraCommand {
             ("rst", "lora.rst"),
             ("dio0", "lora.dio0"),
             ("busy", "lora.busy"),
+            ("pwrpin", "lora.pwrpin"),
+            ("power_pin", "lora.pwrpin"),
+            ("pwrlvl", "lora.pwrlvl"),
+            ("power_level", "lora.pwrlvl"),
             ("sf", "lora.sf"),
             ("cr", "lora.cr"),
             ("sync_word", "lora.sync_word"),
             ("preamble", "lora.preamble"),
             ("tx_power", "lora.tx_power"),
+            ("tcxo_mv", "lora.tcxo_mv"),
+            ("pa_duty", "lora.pa_duty"),
+            ("pa_hp", "lora.pa_hp"),
+            ("pa_dev", "lora.pa_dev"),
+            ("pa_lut", "lora.pa_lut"),
+            ("rx_timeout", "lora.rx_timeout"),
+            ("sx_sync", "lora.sx_sync"),
+            ("sx1262_sync", "lora.sx_sync"),
         ] {
             if let Some(value) = request.arg(arg) {
                 let value = parse_i32(value)?;
                 match arg {
                     "sck" | "miso" | "mosi" | "cs" | "rst" | "dio0" => validate_pin(value)?,
-                    "busy" => validate_optional_pin(value)?,
+                    "busy" | "pwrpin" | "power_pin" => validate_optional_pin(value)?,
+                    "pwrlvl" | "power_level" => validate_range("power_level", value, 0, 1)?,
                     "sf" => validate_sf(value)?,
                     "cr" => validate_cr(value)?,
                     "sync_word" => validate_u8(value)?,
                     "preamble" => validate_range("preamble", value, 6, 65535)?,
                     "tx_power" => validate_range("tx_power", value, 2, 20)?,
+                    "tcxo_mv" => validate_range("tcxo_mv", value, 0, 3300)?,
+                    "pa_duty" => validate_range("pa_duty", value, 0, 7)?,
+                    "pa_hp" => validate_range("pa_hp", value, 0, 7)?,
+                    "pa_dev" => validate_range("pa_dev", value, 0, 1)?,
+                    "pa_lut" => validate_range("pa_lut", value, 0, 1)?,
+                    "rx_timeout" => validate_range("rx_timeout", value, 0, 60_000)?,
+                    "sx_sync" | "sx1262_sync" => validate_range("sx_sync", value, -1, 65535)?,
                     _ => {}
                 }
                 self.settings.borrow_mut().set_i32(key, value)?;
@@ -411,48 +591,48 @@ impl LoraCommand {
         }
 
         let state = LoraState::load(&self.settings)?;
-        if request
+        let apply_requested = request
             .arg("apply")
             .map(parse_bool)
             .transpose()?
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let restart_rx_after_apply = apply_requested
+            && BACKGROUND_RX_RUNNING.load(Ordering::Relaxed)
+            && !matches!(rx_request, Some(false));
+        if restart_rx_after_apply {
+            BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
+            notify_lora_rx_task();
+            task_delay(Duration::from_millis(75));
+        }
+        if apply_requested {
             let _guard = lora_spi_lock().lock().unwrap();
             let mut radio = Radio::open(&state.config)?;
             radio.configure_radio()?;
         }
-        if let Some(true) = rx_request {
+        if request
+            .arg("status")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(CommandResponse::ok(lora_status_text(&self.settings)));
+        }
+        if matches!(rx_request, Some(true)) || restart_rx_after_apply {
             let started = start_background_rx(self.settings.clone())?.is_some();
+            let state = LoraState::load(&self.settings)?;
             return Ok(CommandResponse::ok(format!(
-                "lora rx=true started={} freq={} bw={} sf={} cr={} sync_word=0x{:02x}",
+                "lora rx=true started={} chip={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} sx_sync=0x{:04x}",
                 started,
+                state.config.chip.as_str(),
                 state.config.frequency_hz,
                 state.config.bandwidth_hz,
                 state.config.sf,
                 state.config.cr,
-                state.config.sync_word
+                state.config.sync_word,
+                sx1262_sync_word(&state.config)
             )));
         }
-        Ok(CommandResponse::ok(format!(
-            "lora chip={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} crc={} preamble={} tx_power={} spi_host={} sck={} miso={} mosi={} cs={} rst={} dio0={} busy={}",
-            state.config.chip.as_str(),
-            state.config.frequency_hz,
-            state.config.bandwidth_hz,
-            state.config.sf,
-            state.config.cr,
-            state.config.sync_word,
-            state.config.crc,
-            state.config.preamble,
-            state.config.tx_power,
-            state.config.spi_host,
-            state.config.sck,
-            state.config.miso,
-            state.config.mosi,
-            state.config.cs,
-            state.config.rst,
-            state.config.dio0,
-            state.config.busy
-        )))
+        Ok(CommandResponse::ok(lora_status_text(&self.settings)))
     }
 
     fn probe(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -585,6 +765,36 @@ impl LoraCommand {
         Ok(CommandResponse::ok(response))
     }
 
+    fn cad_probe(&mut self, timeout_ms: u32) -> Result<CommandResponse> {
+        let was_rx_running = BACKGROUND_RX_RUNNING.load(Ordering::Relaxed);
+        if was_rx_running {
+            BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
+            notify_lora_rx_task();
+            task_delay(Duration::from_millis(75));
+        }
+
+        let state = LoraState::load(&self.settings)?;
+        let _guard = lora_spi_lock().lock().unwrap();
+        let mut radio = Radio::open_no_reset(&state.config)?;
+        radio.configure_radio()?;
+        let timeout = if timeout_ms == 0 {
+            sx127x_cad_timeout(&state.config)
+        } else {
+            Duration::from_millis(timeout_ms as u64)
+        };
+        let active = radio.is_channel_active(timeout)?;
+        if was_rx_running {
+            BACKGROUND_RX_RUNNING.store(true, Ordering::Relaxed);
+            notify_lora_rx_task();
+        }
+        Ok(CommandResponse::ok(format!(
+            "lora cad=true active={} timeout_ms={} chip={}",
+            active,
+            timeout.as_millis(),
+            state.config.chip.as_str()
+        )))
+    }
+
     fn listen(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         let ms = parse_arg_or(request, "ms", 5000)?.max(1) as u32;
         let max_packets = parse_arg_or(request, "count", 4)?.clamp(1, 16) as usize;
@@ -662,7 +872,7 @@ impl LoraCommand {
                     hex_bytes(decoded.payload)
                 ));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            task_delay(Duration::from_millis(20));
         }
         Ok(CommandResponse::ok(format!(
             "loralisten n={} {}",
@@ -674,7 +884,7 @@ impl LoraCommand {
     fn dump(&mut self, _request: &CommandRequest) -> Result<CommandResponse> {
         let state = LoraState::load(&self.settings)?;
         let _guard = lora_spi_lock().lock().unwrap();
-        let mut radio = Radio::open(&state.config)?;
+        let mut radio = Radio::open_no_reset(&state.config)?;
         Ok(CommandResponse::ok(format!("loradump {}", radio.dump()?)))
     }
 }
@@ -726,33 +936,65 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
         unsafe { sys::xTaskGetCurrentTaskHandle() },
         Ordering::SeqCst,
     );
+    let cad_rx = LORA_CAD_RX_ENABLED.load(Ordering::Relaxed);
+    if cad_rx && matches!(config.chip, LoraChip::Sx1262) {
+        let result = run_sx1262_duty_cycle_background_rx(&config, local_node);
+        unsafe {
+            let _ = sys::gpio_isr_handler_remove(config.dio0);
+            let _ = set_lora_irq_enabled(config.dio0, false);
+        }
+        LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+        return result;
+    }
+    if cad_rx {
+        let result = run_cad_background_rx(&config, local_node);
+        unsafe {
+            let _ = sys::gpio_isr_handler_remove(config.dio0);
+            let _ = set_lora_irq_enabled(config.dio0, false);
+        }
+        LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+        return result;
+    }
+    let result = run_continuous_background_rx(&config, local_node);
+    unsafe {
+        let _ = sys::gpio_isr_handler_remove(config.dio0);
+        let _ = set_lora_irq_enabled(config.dio0, false);
+    }
+    LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+    result
+}
+
+/// Legacy receive loop: keep the radio in `RX_CONTINUOUS` and wait for
+/// `IRQ_RX_DONE` via the DIO0 GPIO ISR. Highest current; only used when
+/// `lora.cad_rx=false`.
+fn run_continuous_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result<()> {
     {
         let _guard = lora_spi_lock().lock().unwrap();
-        let mut radio = Radio::open(&config)?;
+        let mut radio = Radio::open(config)?;
         radio.configure_radio()?;
         radio.start_rx()?;
     }
     configure_dio0_interrupt(config.dio0)?;
-    let started = format!(
-        "ev=lora.rx_start rf={} sync=0x{:02x} cs={} rst={} dio0={}",
-        compact_rf(&config),
+    telemetry::record_log(format!(
+        "ev=lora.rx_start mode=continuous rf={} sync=0x{:02x} cs={} rst={} dio0={}",
+        compact_rf(config),
         config.sync_word,
         config.cs,
         config.rst,
         config.dio0
-    );
-    telemetry::record_log(started);
+    ));
 
     while BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
-        let notified = wait_for_lora_irq(Duration::from_secs(30));
+        let notified = wait_for_lora_irq(background_poll_interval(config));
         if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
             break;
         }
         match notified {
-            true => match poll_background_packet(&config) {
+            true => match poll_background_packet(config) {
                 Ok(Some(packet)) => {
                     record_background_packet(&packet, "background", local_node);
                     forward_rx_packet(&packet);
+                    rearm_background_rx(config)?;
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -761,32 +1003,238 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
                         crate::commands::protocol::escape_value(&err.to_string())
                     );
                     telemetry::record_log(line);
-                    thread::sleep(Duration::from_millis(1000));
+                    task_delay(Duration::from_millis(1000));
                 }
             },
             false => {
                 // A long timeout is a missed-IRQ recovery path, not the normal RX mechanism.
-                if let Ok(Some(packet)) = poll_background_packet(&config) {
+                if let Ok(Some(packet)) = poll_background_packet(config) {
                     record_background_packet(&packet, "background-timeout", local_node);
                     forward_rx_packet(&packet);
+                    rearm_background_rx(config)?;
                 }
             }
         }
     }
-    unsafe {
-        let _ = sys::gpio_isr_handler_remove(config.dio0);
-        let _ = set_lora_irq_enabled(config.dio0, false);
+    Ok(())
+}
+
+/// SX126x hardware duty-cycle receive loop, matching Meshtastic's
+/// `startReceiveDutyCycleAuto()` shape. The radio alternates RX and sleep
+/// internally via `SetRxDutyCycle`; the ESP task only wakes for DIO IRQs,
+/// stop requests, or a long missed-IRQ recovery timeout.
+fn run_sx1262_duty_cycle_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result<()> {
+    let duty = {
+        let _guard = lora_spi_lock().lock().unwrap();
+        let mut radio = Radio::open(config)?;
+        radio.configure_radio()?;
+        radio.start_background_rx_mode()?
+    };
+    configure_dio0_interrupt(config.dio0)?;
+    telemetry::record_log(format!(
+        "ev=lora.rx_start mode=sx126x_duty rf={} sync=0x{:02x} cs={} rst={} dio0={} rx_us={} sleep_us={} preamble={} min_symbols=8",
+        compact_rf(config),
+        config.sync_word,
+        config.cs,
+        config.rst,
+        config.dio0,
+        duty.rx_us,
+        duty.sleep_us,
+        config.preamble
+    ));
+
+    while BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
+        let notified = wait_for_lora_irq(Duration::from_secs(30));
+        if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
+        match poll_background_packet(config) {
+            Ok(Some(packet)) => {
+                record_background_packet(
+                    &packet,
+                    if notified {
+                        "sx126x-duty"
+                    } else {
+                        "sx126x-duty-timeout"
+                    },
+                    local_node,
+                );
+                forward_rx_packet(&packet);
+                rearm_background_rx(config)?;
+            }
+            Ok(None) => {
+                if notified {
+                    rearm_background_rx(config)?;
+                }
+            }
+            Err(err) => {
+                telemetry::record_log(format!(
+                    "ev=lora.err c=sx126x_duty_rx msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+                task_delay(Duration::from_millis(1000));
+                rearm_background_rx(config)?;
+            }
+        }
     }
-    LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+    Ok(())
+}
+
+/// Battery-aware receive loop: channel-activity-detected duty cycling.
+///
+/// Between scans the radio is held in `SLEEP` (~0.2 uA on SX127x, similar
+/// on SX1262). On each cycle we issue one CAD probe (a few symbol-times);
+/// if preamble activity is detected we immediately start a short RX
+/// window and wait for `IRQ_RX_DONE`. Either way the radio goes back to
+/// SLEEP and the task sleeps for `lora.cad_interval_ms` (default 2 s).
+///
+/// The radio is the dominant ESP32 current source while awake
+/// (SX127x `RX_CONTINUOUS` ~11 mA, SX1262 ~5-7 mA). CAD-RX keeps the
+/// modem awake for only a fraction of each cycle: at SF9/250 kHz a
+/// CAD scan takes ~8 ms, so a 2 s interval produces a typical duty
+/// cycle well below 1 %.
+fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result<()> {
+    {
+        let _guard = lora_spi_lock().lock().unwrap();
+        let mut radio = Radio::open(config)?;
+        radio.configure_radio()?;
+        // Start in sleep so the loop body always sees a known low-power state.
+        let _ = radio.sleep();
+    }
+    configure_dio0_interrupt(config.dio0)?;
+    let cad_timeout = sx127x_cad_timeout(config);
+    let configured_cad_interval =
+        Duration::from_millis(LORA_CAD_INTERVAL_MS.load(Ordering::Relaxed) as u64);
+    let cad_interval = cad_receive_interval(config, configured_cad_interval);
+    let cad_rx_window = Duration::from_millis(LORA_CAD_RX_WINDOW_MS.load(Ordering::Relaxed) as u64);
+    telemetry::record_log(format!(
+        "ev=lora.rx_start mode=cad rf={} sync=0x{:02x} cs={} rst={} dio0={} cad_interval_ms={} cad_configured_ms={} cad_rx_window_ms={}",
+        compact_rf(config),
+        config.sync_word,
+        config.cs,
+        config.rst,
+        config.dio0,
+        cad_interval.as_millis(),
+        configured_cad_interval.as_millis(),
+        cad_rx_window.as_millis()
+    ));
+
+    while BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
+        // --- CAD phase ---
+        let active = {
+            let _guard = lora_spi_lock().lock().unwrap();
+            let mut radio = Radio::open_no_reset(config)?;
+            LORA_CAD_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            match radio.is_channel_active(cad_timeout) {
+                Ok(active) => active,
+                Err(err) => {
+                    telemetry::record_log(format!(
+                        "ev=lora.cad c=rx err={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                    false
+                }
+            }
+        };
+        if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if active {
+            LORA_CAD_DETECTED.fetch_add(1, Ordering::Relaxed);
+            // --- RX window: arm RX and wait on the DIO0 ISR for RX_DONE ---
+            {
+                let _guard = lora_spi_lock().lock().unwrap();
+                let mut radio = Radio::open_no_reset(config)?;
+                if let Err(err) = radio.start_rx() {
+                    telemetry::record_log(format!(
+                        "ev=lora.cad c=start_rx err={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                    let _ = radio.sleep();
+                    continue;
+                }
+            }
+            let rx_deadline = Instant::now() + cad_rx_window;
+            while BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) && Instant::now() < rx_deadline {
+                let remaining = rx_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || !wait_for_lora_irq(remaining) {
+                    break;
+                }
+                match poll_background_packet(config) {
+                    Ok(Some(packet)) => {
+                        record_background_packet(&packet, "cad", local_node);
+                        forward_rx_packet(&packet);
+                        break;
+                    }
+                    Ok(None) => {
+                        let _ = rearm_background_rx(config);
+                    }
+                    Err(err) => {
+                        telemetry::record_log(format!(
+                            "ev=lora.err c=cad_rx msg={}",
+                            crate::commands::protocol::escape_value(&err.to_string())
+                        ));
+                        let _ = rearm_background_rx(config);
+                    }
+                }
+            }
+            // Radio is in RX/STDBY here; we put it to sleep below. For
+            // SX127x `poll_background_packet` already restarts RX, but
+            // we want to leave it sleeping, so force a sleep.
+            {
+                let _guard = lora_spi_lock().lock().unwrap();
+                let mut radio = Radio::open_no_reset(config)?;
+                let _ = radio.sleep();
+            }
+        }
+
+        if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // --- Idle phase: keep radio in SLEEP between CAD cycles ---
+        // The wait doubles as a task delay; `wait_for_lora_irq` returns
+        // early if any task notification arrives (e.g. a `sleep_radio`
+        // request or an out-of-band `notify_lora_rx_task`).
+        let _ = wait_for_lora_irq(cad_interval);
+    }
     Ok(())
 }
 
 fn poll_background_packet(config: &LoraConfig) -> Result<Option<Packet>> {
     let _guard = lora_spi_lock().lock().unwrap();
     let mut radio = Radio::open_no_reset(config)?;
-    let packet = radio.poll_packet()?;
-    radio.start_rx()?;
-    Ok(packet)
+    radio.poll_packet()
+}
+
+fn rearm_background_rx(config: &LoraConfig) -> Result<()> {
+    let _guard = lora_spi_lock().lock().unwrap();
+    let mut radio = Radio::open_no_reset(config)?;
+    radio.start_background_rx_mode()?;
+    Ok(())
+}
+
+fn background_poll_interval(config: &LoraConfig) -> Duration {
+    match config.chip {
+        LoraChip::Sx1262 => Duration::from_millis(250),
+        LoraChip::Sx127x => Duration::from_secs(30),
+    }
+}
+
+/// Compact text summary of the current CAD parameters used by both
+/// `lora cad_rx=true` and the periodic `lora status=true` output.
+fn cad_status_text() -> String {
+    format!(
+        "lora cad_rx={} cad_tx={} cad_interval_ms={} cad_rx_window_ms={} cad_tx_tries={} cad_samples={} cad_detected={}",
+        LORA_CAD_RX_ENABLED.load(Ordering::Relaxed),
+        LORA_CAD_TX_ENABLED.load(Ordering::Relaxed),
+        LORA_CAD_INTERVAL_MS.load(Ordering::Relaxed),
+        LORA_CAD_RX_WINDOW_MS.load(Ordering::Relaxed),
+        LORA_CAD_TX_TRIES.load(Ordering::Relaxed),
+        LORA_CAD_SAMPLES.load(Ordering::Relaxed),
+        LORA_CAD_DETECTED.load(Ordering::Relaxed)
+    )
 }
 
 fn record_background_packet(packet: &Packet, source: &str, local_node: Option<u32>) {
@@ -918,6 +1366,12 @@ fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
     let hz = sys::configTICK_RATE_HZ as u128;
     let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
     ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
+}
+
+fn task_delay(timeout: Duration) {
+    unsafe {
+        sys::vTaskDelay(duration_to_ticks(timeout).max(1));
+    }
 }
 
 unsafe extern "C" fn lora_dio0_isr(_arg: *mut core::ffi::c_void) {
@@ -1062,6 +1516,61 @@ impl Radio {
         }
     }
 
+    fn start_background_rx_mode(&mut self) -> Result<RxDutyCycle> {
+        if LORA_CAD_RX_ENABLED.load(Ordering::Relaxed) {
+            if let Self::Sx1262(radio) = self {
+                return radio.start_rx_duty_cycle_auto();
+            }
+        }
+        self.start_rx()?;
+        Ok(RxDutyCycle {
+            rx_us: 0,
+            sleep_us: 0,
+        })
+    }
+
+    fn is_channel_active(&mut self, timeout: Duration) -> Result<bool> {
+        match self {
+            Self::Sx127x(radio) => radio.is_channel_active(timeout),
+            Self::Sx1262(radio) => radio.is_channel_active(timeout),
+        }
+    }
+
+    /// Perform up to `max_tries` CAD scans with exponential backoff.
+    /// Returns `Ok(())` once the channel reads clear (CAD detected no
+    /// signal) or returns `Err` if all attempts report activity. CAD
+    /// errors are logged and treated as "channel clear" so a transient
+    /// radio issue does not block the caller's TX indefinitely.
+    fn ensure_channel_clear(&mut self, timeout: Duration, max_tries: u32) -> Result<()> {
+        if max_tries == 0 {
+            return Ok(());
+        }
+        let mut backoff_ms: u64 = 10;
+        for attempt in 0..max_tries {
+            LORA_CAD_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            match self.is_channel_active(timeout) {
+                Ok(false) => return Ok(()),
+                Ok(true) => {
+                    LORA_CAD_DETECTED.fetch_add(1, Ordering::Relaxed);
+                    if attempt + 1 >= max_tries {
+                        bail!("LoRa channel busy after {max_tries} CAD attempts");
+                    }
+                    task_delay(Duration::from_millis(backoff_ms));
+                    backoff_ms = backoff_ms.saturating_mul(2).min(200);
+                    continue;
+                }
+                Err(err) => {
+                    telemetry::record_log(format!(
+                        "ev=lora.cad c=tx err={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn sleep(&mut self) -> Result<()> {
         match self {
             Self::Sx127x(radio) => radio.sleep(),
@@ -1124,6 +1633,7 @@ impl Sx127x {
         let mut handle = std::ptr::null_mut();
         unsafe {
             esp_ok(sys::spi_bus_add_device(host, &dev, &mut handle))?;
+            configure_board_power(config)?;
             esp_ok(sys::gpio_set_direction(
                 config.cs,
                 sys::gpio_mode_t_GPIO_MODE_OUTPUT,
@@ -1158,11 +1668,11 @@ impl Sx127x {
         unsafe {
             esp_ok(sys::gpio_set_level(self.config.rst, 0))?;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        task_delay(Duration::from_millis(10));
         unsafe {
             esp_ok(sys::gpio_set_level(self.config.rst, 1))?;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        task_delay(Duration::from_millis(10));
         Ok(())
     }
 
@@ -1270,7 +1780,7 @@ impl Sx127x {
                 self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(5));
+            task_delay(Duration::from_millis(5));
         }
         bail!("LoRa TX timeout");
     }
@@ -1280,6 +1790,26 @@ impl Sx127x {
         self.write_reg(REG_IRQ_FLAGS, 0xff)?;
         self.write_reg(REG_DIO_MAPPING_1, 0x00)?;
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_RX_CONTINUOUS)
+    }
+
+    fn is_channel_active(&mut self, timeout: Duration) -> Result<bool> {
+        self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
+        self.write_reg(REG_IRQ_FLAGS, 0xff)?;
+        self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_CAD)?;
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let irq = self.read_reg(REG_IRQ_FLAGS)?;
+            if irq & IRQ_CAD_DONE != 0 {
+                self.write_reg(REG_IRQ_FLAGS, irq)?;
+                self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
+                return Ok(irq & IRQ_CAD_DETECTED != 0);
+            }
+            task_delay(Duration::from_millis(1));
+        }
+
+        self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
+        bail!("SX127x CAD timeout after {} ms", timeout.as_millis())
     }
 
     fn sleep(&mut self) -> Result<()> {
@@ -1389,6 +1919,7 @@ const SX126X_CMD_SET_SLEEP: u8 = 0x84;
 const SX126X_CMD_SET_STANDBY: u8 = 0x80;
 const SX126X_CMD_SET_TX: u8 = 0x83;
 const SX126X_CMD_SET_RX: u8 = 0x82;
+const SX126X_CMD_SET_RX_DUTY_CYCLE: u8 = 0x94;
 const SX126X_CMD_SET_PACKET_TYPE: u8 = 0x8a;
 const SX126X_CMD_GET_PACKET_TYPE: u8 = 0x11;
 const SX126X_CMD_SET_RF_FREQUENCY: u8 = 0x86;
@@ -1402,11 +1933,16 @@ const SX126X_CMD_GET_IRQ_STATUS: u8 = 0x12;
 const SX126X_CMD_CLEAR_IRQ_STATUS: u8 = 0x02;
 const SX126X_CMD_SET_DIO2_AS_RF_SWITCH: u8 = 0x9d;
 const SX126X_CMD_SET_DIO3_AS_TCXO_CTRL: u8 = 0x97;
+const SX126X_CMD_SET_REGULATOR_MODE: u8 = 0x96;
+const SX126X_CMD_WRITE_REGISTER: u8 = 0x0d;
+const SX126X_CMD_READ_REGISTER: u8 = 0x1d;
 const SX126X_CMD_GET_STATUS: u8 = 0xc0;
 const SX126X_CMD_GET_RX_BUFFER_STATUS: u8 = 0x13;
 const SX126X_CMD_GET_PACKET_STATUS: u8 = 0x14;
 const SX126X_CMD_WRITE_BUFFER: u8 = 0x0e;
 const SX126X_CMD_READ_BUFFER: u8 = 0x1e;
+const SX126X_CMD_SET_CAD_PARAMS: u8 = 0x88;
+const SX126X_CMD_SET_CAD: u8 = 0xc5;
 
 const SX126X_PACKET_TYPE_LORA: u8 = 0x01;
 const SX126X_STANDBY_RC: u8 = 0x00;
@@ -1414,7 +1950,19 @@ const SX126X_RAMP_200_US: u8 = 0x04;
 const SX126X_IRQ_TX_DONE: u16 = 0x0001;
 const SX126X_IRQ_RX_DONE: u16 = 0x0002;
 const SX126X_IRQ_CRC_ERR: u16 = 0x0040;
+const SX126X_IRQ_CAD_DONE: u16 = 0x0080;
+const SX126X_IRQ_CAD_DETECTED: u16 = 0x0100;
 const SX126X_IRQ_TIMEOUT: u16 = 0x0200;
+const SX126X_REG_SYNC_WORD: u16 = 0x0740;
+const SX126X_REG_OCP: u16 = 0x08e7;
+const SX126X_REG_RX_GAIN: u16 = 0x08ac;
+const SX126X_REG_RX_SENSITIVITY: u16 = 0x08b5;
+
+#[derive(Clone, Copy, Debug)]
+struct RxDutyCycle {
+    rx_us: u32,
+    sleep_us: u32,
+}
 
 struct Sx1262 {
     config: LoraConfig,
@@ -1462,6 +2010,7 @@ impl Sx1262 {
         let mut handle = std::ptr::null_mut();
         unsafe {
             esp_ok(sys::spi_bus_add_device(host, &dev, &mut handle))?;
+            configure_board_power(config)?;
             esp_ok(sys::gpio_set_direction(
                 config.cs,
                 sys::gpio_mode_t_GPIO_MODE_OUTPUT,
@@ -1488,8 +2037,8 @@ impl Sx1262 {
         };
         if reset {
             radio.reset()?;
+            radio.set_standby()?;
         }
-        radio.set_standby()?;
         let status = radio.status()?;
         if status == 0x00 || status == 0xff {
             bail!("unexpected SX1262 status 0x{status:02x}");
@@ -1501,22 +2050,35 @@ impl Sx1262 {
         unsafe {
             esp_ok(sys::gpio_set_level(self.config.rst, 0))?;
         }
-        thread::sleep(Duration::from_millis(10));
+        task_delay(Duration::from_millis(10));
         unsafe {
             esp_ok(sys::gpio_set_level(self.config.rst, 1))?;
         }
-        thread::sleep(Duration::from_millis(20));
+        task_delay(Duration::from_millis(20));
         self.wait_while_busy(Duration::from_millis(500))
     }
 
     fn configure_radio(&mut self) -> Result<()> {
         self.set_standby()?;
-        self.command(SX126X_CMD_SET_DIO2_AS_RF_SWITCH, &[0x01])?;
-        self.command(SX126X_CMD_SET_DIO3_AS_TCXO_CTRL, &[0x02, 0x00, 0x03, 0x20])?;
-        thread::sleep(Duration::from_millis(5));
+        self.command(SX126X_CMD_SET_REGULATOR_MODE, &[0x01])?;
+        if self.config.sx1262_dio2_rf_switch {
+            self.command(SX126X_CMD_SET_DIO2_AS_RF_SWITCH, &[0x01])?;
+        }
+        if self.config.sx1262_tcxo_mv > 0 {
+            self.set_tcxo(self.config.sx1262_tcxo_mv)?;
+            task_delay(Duration::from_millis(5));
+        }
         self.command(SX126X_CMD_SET_PACKET_TYPE, &[SX126X_PACKET_TYPE_LORA])?;
         self.set_frequency(self.config.frequency_hz)?;
-        self.command(SX126X_CMD_SET_PA_CONFIG, &[0x04, 0x07, 0x00, 0x01])?;
+        self.command(
+            SX126X_CMD_SET_PA_CONFIG,
+            &[
+                self.config.sx1262_pa_duty as u8,
+                self.config.sx1262_pa_hp as u8,
+                self.config.sx1262_pa_device as u8,
+                self.config.sx1262_pa_lut as u8,
+            ],
+        )?;
         self.command(
             SX126X_CMD_SET_TX_PARAMS,
             &[
@@ -1524,9 +2086,13 @@ impl Sx1262 {
                 SX126X_RAMP_200_US,
             ],
         )?;
+        self.set_current_limit_140ma()?;
         self.command(SX126X_CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x80])?;
         self.set_modulation_params()?;
+        self.set_sync_word(sx1262_sync_word(&self.config))?;
         self.set_packet_params(255)?;
+        self.set_rx_boosted_gain(true)?;
+        self.apply_rx_sensitivity_patch()?;
         self.set_irq_mask(
             SX126X_IRQ_TX_DONE | SX126X_IRQ_RX_DONE | SX126X_IRQ_CRC_ERR | SX126X_IRQ_TIMEOUT,
         )?;
@@ -1549,6 +2115,45 @@ impl Sx1262 {
                 rf as u8,
             ],
         )
+    }
+
+    fn set_tcxo(&mut self, millivolts: i32) -> Result<()> {
+        let voltage = match millivolts {
+            0 => return Ok(()),
+            1500 => 0x00,
+            1600 => 0x01,
+            1700 => 0x02,
+            1800 => 0x03,
+            2200 => 0x04,
+            2400 => 0x05,
+            2700 => 0x06,
+            3000 => 0x07,
+            value => bail!("unsupported SX1262 TCXO voltage {value}mV"),
+        };
+        self.command(
+            SX126X_CMD_SET_DIO3_AS_TCXO_CTRL,
+            &[voltage, 0x00, 0x03, 0x20],
+        )
+    }
+
+    fn set_sync_word(&mut self, sync_word: u16) -> Result<()> {
+        self.write_register(
+            SX126X_REG_SYNC_WORD,
+            &[(sync_word >> 8) as u8, sync_word as u8],
+        )
+    }
+
+    fn set_current_limit_140ma(&mut self) -> Result<()> {
+        self.write_register(SX126X_REG_OCP, &[0x38])
+    }
+
+    fn set_rx_boosted_gain(&mut self, boosted: bool) -> Result<()> {
+        self.write_register(SX126X_REG_RX_GAIN, &[if boosted { 0x96 } else { 0x94 }])
+    }
+
+    fn apply_rx_sensitivity_patch(&mut self) -> Result<()> {
+        let value = self.read_register(SX126X_REG_RX_SENSITIVITY, 1)?[0] | 0x01;
+        self.write_register(SX126X_REG_RX_SENSITIVITY, &[value])
     }
 
     fn set_modulation_params(&mut self) -> Result<()> {
@@ -1634,7 +2239,7 @@ impl Sx1262 {
                 self.clear_irq(irq)?;
                 bail!("SX1262 TX timeout");
             }
-            thread::sleep(Duration::from_millis(5));
+            task_delay(Duration::from_millis(5));
         }
         bail!("SX1262 TX timeout");
     }
@@ -1643,11 +2248,112 @@ impl Sx1262 {
         self.set_standby()?;
         self.set_packet_params(255)?;
         self.clear_irq(0xffff)?;
-        self.command(SX126X_CMD_SET_RX, &[0xff, 0xff, 0xff])
+        let timeout = sx126x_rx_timeout(self.config.sx1262_rx_timeout_ms);
+        self.command(
+            SX126X_CMD_SET_RX,
+            &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
+        )
+    }
+
+    fn start_rx_duty_cycle_auto(&mut self) -> Result<RxDutyCycle> {
+        const MIN_SYMBOLS: u32 = 8;
+        let symbol_us = symbol_time_us(self.config.bandwidth_hz, self.config.sf);
+        let preamble_symbols = self.config.preamble.max(MIN_SYMBOLS as i32 + 1) as u32;
+        let rx_us = symbol_us
+            .saturating_mul(MIN_SYMBOLS)
+            .saturating_add(2_000)
+            .max(1_000);
+        let sleep_symbols = preamble_symbols.saturating_sub(MIN_SYMBOLS).max(1);
+        let sleep_us = symbol_us
+            .saturating_mul(sleep_symbols)
+            .saturating_add(sx1262_transition_us(self.config.sx1262_tcxo_mv));
+        if sleep_us < sx1262_transition_us(self.config.sx1262_tcxo_mv).saturating_add(1_016) {
+            self.start_rx()?;
+            return Ok(RxDutyCycle {
+                rx_us: 0,
+                sleep_us: 0,
+            });
+        }
+        self.start_rx_duty_cycle(rx_us, sleep_us)?;
+        Ok(RxDutyCycle { rx_us, sleep_us })
+    }
+
+    fn start_rx_duty_cycle(&mut self, rx_us: u32, sleep_us: u32) -> Result<()> {
+        self.set_standby()?;
+        self.set_packet_params(255)?;
+        // Map packet completion/error to DIO1. Do not map RX timeout: in
+        // duty-cycle mode timeout is an internal cadence event and would wake
+        // the ESP task continuously.
+        self.set_irq_mask(SX126X_IRQ_RX_DONE | SX126X_IRQ_CRC_ERR)?;
+        self.clear_irq(0xffff)?;
+        let transition_us = sx1262_transition_us(self.config.sx1262_tcxo_mv);
+        let adjusted_sleep_us = sleep_us
+            .checked_sub(transition_us)
+            .context("SX1262 duty-cycle sleep period is shorter than transition time")?;
+        let rx_raw = sx126x_duty_cycle_period(rx_us)?;
+        let sleep_raw = sx126x_duty_cycle_period(adjusted_sleep_us)?;
+        self.command(
+            SX126X_CMD_SET_RX_DUTY_CYCLE,
+            &[
+                (rx_raw >> 16) as u8,
+                (rx_raw >> 8) as u8,
+                rx_raw as u8,
+                (sleep_raw >> 16) as u8,
+                (sleep_raw >> 8) as u8,
+                sleep_raw as u8,
+            ],
+        )
     }
 
     fn sleep(&mut self) -> Result<()> {
         self.command(SX126X_CMD_SET_SLEEP, &[0x00])
+    }
+
+    /// Detect LoRa activity via a single Channel Activity Detection
+    /// (CAD) cycle. The radio is placed in CAD-only mode (`CadExitMode = 0`),
+    /// polls `IRQ_CAD_DONE`, and returns whether a preamble was seen.
+    /// Radio is left in STDBY on return.
+    fn is_channel_active(&mut self, timeout: Duration) -> Result<bool> {
+        self.set_standby()?;
+        self.set_cad_params()?;
+        self.clear_irq(0xffff)?;
+        self.command(SX126X_CMD_SET_CAD, &[])?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let irq = self.irq_status()?;
+            if irq & SX126X_IRQ_CAD_DONE != 0 {
+                let detected = irq & SX126X_IRQ_CAD_DETECTED != 0;
+                self.clear_irq(irq)?;
+                self.set_standby()?;
+                return Ok(detected);
+            }
+            task_delay(Duration::from_millis(1));
+        }
+        self.set_standby()?;
+        bail!("SX1262 CAD timeout after {} ms", timeout.as_millis())
+    }
+
+    /// Configure `SetCadParams` based on the configured spreading factor.
+    /// `CadDetPeak` follows the Semtech calibration table for SX126x:
+    ///   SF6..SF8 -> 0x40, SF9 -> 0x44, SF10 -> 0x46, SF11/12 -> 0x50.
+    /// `CadExitMode = 0` keeps the radio in STDBY after CAD so the caller
+    /// can decide whether to enter RX.
+    fn set_cad_params(&mut self) -> Result<()> {
+        let peak = match self.config.sf {
+            6 => 0x40_u8,
+            7 => 0x40,
+            8 => 0x40,
+            9 => 0x44,
+            10 => 0x46,
+            11 => 0x50,
+            12 => 0x50,
+            _ => 0x44,
+        };
+        // CadDetMin, CadExitMode (0=CAD-only), CadTimeout (3 bytes, unused in CAD-only mode)
+        self.command(
+            SX126X_CMD_SET_CAD_PARAMS,
+            &[peak, 0x10, 0x00, 0x00, 0x00, 0x00],
+        )
     }
 
     fn poll_packet(&mut self) -> Result<Option<Packet>> {
@@ -1669,9 +2375,33 @@ impl Sx1262 {
         let status = self.status()?;
         let packet_type = self.read_u8(SX126X_CMD_GET_PACKET_TYPE)?;
         let irq = self.irq_status()?;
+        let sync = self.read_register(SX126X_REG_SYNC_WORD, 2)?;
+        let sync = ((sync[0] as u16) << 8) | sync[1] as u16;
+        let ocp = self.read_register(SX126X_REG_OCP, 1)?[0];
+        let rx_gain = self.read_register(SX126X_REG_RX_GAIN, 1)?[0];
+        let rx_sensitivity = self.read_register(SX126X_REG_RX_SENSITIVITY, 1)?[0];
+        let busy_level = unsafe { sys::gpio_get_level(self.config.busy) };
+        let dio_level = unsafe { sys::gpio_get_level(self.config.dio0) };
+        let pwr_level = if self.config.board_power_pin >= 0 {
+            unsafe { sys::gpio_get_level(self.config.board_power_pin) }
+        } else {
+            -1
+        };
         Ok(format!(
-            "chip=sx1262 status=0x{status:02x} packet_type=0x{packet_type:02x} irq=0x{irq:04x} busy={} dio1={}",
-            self.config.busy, self.config.dio0
+            "chip=sx1262 status=0x{status:02x} packet_type=0x{packet_type:02x} irq=0x{irq:04x} sync=0x{sync:04x} busy_gpio={} busy_level={} dio1_gpio={} dio1_level={} pwrpin={} pwrlvl={} dio2rf={} tcxo_mv={} pa={},{},{},{} rx_timeout={} ocp=0x{ocp:02x} rx_gain=0x{rx_gain:02x} rx_sens=0x{rx_sensitivity:02x}",
+            self.config.busy,
+            busy_level,
+            self.config.dio0,
+            dio_level,
+            self.config.board_power_pin,
+            pwr_level,
+            self.config.sx1262_dio2_rf_switch,
+            self.config.sx1262_tcxo_mv,
+            self.config.sx1262_pa_duty,
+            self.config.sx1262_pa_hp,
+            self.config.sx1262_pa_device,
+            self.config.sx1262_pa_lut,
+            self.config.sx1262_rx_timeout_ms
         ))
     }
 
@@ -1714,6 +2444,22 @@ impl Sx1262 {
         self.read(SX126X_CMD_READ_BUFFER, &[offset], len)
     }
 
+    fn write_register(&mut self, address: u16, data: &[u8]) -> Result<()> {
+        let mut payload = Vec::with_capacity(data.len() + 2);
+        payload.push((address >> 8) as u8);
+        payload.push(address as u8);
+        payload.extend_from_slice(data);
+        self.command(SX126X_CMD_WRITE_REGISTER, &payload)
+    }
+
+    fn read_register(&mut self, address: u16, len: usize) -> Result<Vec<u8>> {
+        self.read(
+            SX126X_CMD_READ_REGISTER,
+            &[(address >> 8) as u8, address as u8],
+            len,
+        )
+    }
+
     fn read_u8(&mut self, opcode: u8) -> Result<u8> {
         Ok(self.read(opcode, &[], 1)?[0])
     }
@@ -1748,7 +2494,7 @@ impl Sx1262 {
             if level == 0 {
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(1));
+            task_delay(Duration::from_millis(1));
         }
         bail!("SX1262 busy timeout gpio={}", self.config.busy)
     }
@@ -1788,8 +2534,108 @@ fn sx126x_timeout(timeout_ms: u32) -> u32 {
     units as u32
 }
 
+fn sx126x_rx_timeout(timeout_ms: i32) -> u32 {
+    if timeout_ms <= 0 {
+        0x00ff_ffff
+    } else {
+        sx126x_timeout(timeout_ms as u32)
+    }
+}
+
+fn sx126x_duty_cycle_period(period_us: u32) -> Result<u32> {
+    let raw = ((period_us as u64) * 8 / 125) as u32;
+    if raw == 0 || raw > 0x00ff_ffff {
+        bail!("SX1262 duty-cycle period out of range: {period_us}us");
+    }
+    Ok(raw)
+}
+
+fn sx1262_transition_us(tcxo_mv: i32) -> u32 {
+    let tcxo_delay_us = if tcxo_mv > 0 { 5_000 } else { 0 };
+    tcxo_delay_us + 1_000
+}
+
+fn sx127x_cad_timeout(config: &LoraConfig) -> Duration {
+    let symbol = symbol_time_ms(config.bandwidth_hz, config.sf).max(1);
+    Duration::from_millis((symbol as u64).saturating_mul(4).saturating_add(10))
+}
+
+fn cad_receive_interval(config: &LoraConfig, configured: Duration) -> Duration {
+    if !matches!(config.chip, LoraChip::Sx127x) {
+        return configured;
+    }
+    // SX127x CAD has to overlap the transmit preamble and leave enough
+    // symbols to switch into RX before the header. With the default
+    // MEDIUM_FAST profile (SF9/250 kHz, preamble 16), the full LoRa
+    // preamble is about 41 ms, so a 20 ms cadence is the practical upper
+    // bound for reliable detection. Longer configured intervals are treated
+    // as battery hints, but capped here when CAD-RX is actually enabled.
+    let symbol_us = symbol_time_us(config.bandwidth_hz, config.sf).max(1);
+    let preamble_symbols_x4 = (config.preamble.max(6) as u64)
+        .saturating_mul(4)
+        .saturating_add(17);
+    let preamble_us = preamble_symbols_x4.saturating_mul(symbol_us as u64) / 4;
+    let cap_ms = (preamble_us / 2_000).clamp(5, u64::MAX);
+    configured.min(Duration::from_millis(cap_ms))
+}
+
+fn sx1262_sync_word(config: &LoraConfig) -> u16 {
+    if config.sx1262_sync_word >= 0 {
+        return config.sx1262_sync_word.clamp(0, 0xffff) as u16;
+    }
+    let sync_word = config.sync_word.clamp(0, 0xff) as u16;
+    let control_bits = 0x44_u16;
+    ((sync_word & 0xf0) << 8)
+        | (((control_bits & 0xf0) >> 4) << 8)
+        | ((sync_word & 0x0f) << 4)
+        | (control_bits & 0x0f)
+}
+
 fn symbol_time_ms(bw: u32, sf: i32) -> u32 {
     (((1_u32 << sf.clamp(6, 12)) as u64) * 1000 / bw.max(1) as u64) as u32
+}
+
+fn symbol_time_us(bw: u32, sf: i32) -> u32 {
+    (((1_u32 << sf.clamp(6, 12)) as u64) * 1_000_000 / bw.max(1) as u64) as u32
+}
+
+fn lora_status_text(settings: &SharedSettings) -> String {
+    let Ok(state) = LoraState::load(settings) else {
+        return "lora status=false error=config".to_string();
+    };
+    let probe = probe_lora_no_reset(&state.config);
+    format!(
+        "lora status=true chip={} rx_running={} probe={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} sx_sync=0x{:04x} crc={} preamble={} tx_power={} spi_host={} sck={} miso={} mosi={} cs={} rst={} dio0={} busy={} pwrpin={} pwrlvl={} dio2rf={} tcxo_mv={} pa_duty={} pa_hp={} pa_dev={} pa_lut={} rx_timeout={}",
+        state.config.chip.as_str(),
+        BACKGROUND_RX_RUNNING.load(Ordering::Relaxed),
+        crate::commands::protocol::quote_text_value(&probe),
+        state.config.frequency_hz,
+        state.config.bandwidth_hz,
+        state.config.sf,
+        state.config.cr,
+        state.config.sync_word,
+        sx1262_sync_word(&state.config),
+        state.config.crc,
+        state.config.preamble,
+        state.config.tx_power,
+        state.config.spi_host,
+        state.config.sck,
+        state.config.miso,
+        state.config.mosi,
+        state.config.cs,
+        state.config.rst,
+        state.config.dio0,
+        state.config.busy,
+        state.config.board_power_pin,
+        state.config.board_power_level,
+        state.config.sx1262_dio2_rf_switch,
+        state.config.sx1262_tcxo_mv,
+        state.config.sx1262_pa_duty,
+        state.config.sx1262_pa_hp,
+        state.config.sx1262_pa_device,
+        state.config.sx1262_pa_lut,
+        state.config.sx1262_rx_timeout_ms
+    ) + " " + &cad_status_text()
 }
 
 fn probe_lora(config: &LoraConfig) -> String {
@@ -1800,6 +2646,42 @@ fn probe_lora(config: &LoraConfig) -> String {
         },
         Err(err) => format!("err:{err}"),
     }
+}
+
+fn probe_lora_no_reset(config: &LoraConfig) -> String {
+    let _guard = lora_spi_lock().lock().unwrap();
+    let result = match Radio::open_no_reset(config) {
+        Ok(Radio::Sx127x(mut radio)) => radio.read_reg(REG_VERSION),
+        Ok(Radio::Sx1262(mut radio)) => radio.status(),
+        Err(err) => return format!("err:{err}"),
+    };
+    match result {
+        Ok(value) => match config.chip {
+            LoraChip::Sx127x => format!("ready(chip=sx127x,version=0x{value:02x})"),
+            LoraChip::Sx1262 => format!("ready(chip=sx1262,status=0x{value:02x})"),
+        },
+        Err(err) => format!("err:{err}"),
+    }
+}
+
+fn configure_board_power(config: &LoraConfig) -> Result<()> {
+    if config.board_power_pin < 0 {
+        return Ok(());
+    }
+    validate_optional_pin(config.board_power_pin)?;
+    validate_range("board_power_level", config.board_power_level, 0, 1)?;
+    unsafe {
+        esp_ok(sys::gpio_set_direction(
+            config.board_power_pin,
+            sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+        ))?;
+        esp_ok(sys::gpio_set_level(
+            config.board_power_pin,
+            config.board_power_level as u32,
+        ))?;
+    }
+    task_delay(Duration::from_millis(5));
+    Ok(())
 }
 
 fn probe_lora_ready(config: &LoraConfig) -> Result<u8> {
@@ -1938,12 +2820,23 @@ fn send_payload(
     if background_rx {
         set_lora_irq_enabled(state.config.dio0, false)?;
     }
+    let cad_tx = LORA_CAD_TX_ENABLED.load(Ordering::Relaxed);
+    let cad_tx_tries = LORA_CAD_TX_TRIES.load(Ordering::Relaxed);
+    if cad_tx {
+        let cad_timeout = sx127x_cad_timeout(&state.config);
+        radio.ensure_channel_clear(cad_timeout, cad_tx_tries)?;
+    }
     let send_result = radio.send_packet(&packet, timeout_ms);
     if background_rx {
-        let rx_result = radio.start_rx();
-        let irq_result = set_lora_irq_enabled(state.config.dio0, true);
         send_result?;
-        rx_result?;
+        if LORA_CAD_RX_ENABLED.load(Ordering::Relaxed)
+            && matches!(state.config.chip, LoraChip::Sx1262)
+        {
+            radio.start_background_rx_mode()?;
+        } else {
+            radio.start_rx()?;
+        }
+        let irq_result = set_lora_irq_enabled(state.config.dio0, true);
         irq_result?;
     } else {
         send_result?;
@@ -2121,6 +3014,8 @@ fn validate_config(config: &LoraConfig) -> Result<()> {
         validate_pin(pin)?;
     }
     validate_optional_pin(config.busy)?;
+    validate_optional_pin(config.board_power_pin)?;
+    validate_range("board_power_level", config.board_power_level, 0, 1)?;
     if matches!(config.chip, LoraChip::Sx1262) && config.busy < 0 {
         bail!("SX1262 requires busy GPIO");
     }
@@ -2130,6 +3025,13 @@ fn validate_config(config: &LoraConfig) -> Result<()> {
     validate_u8(config.sync_word)?;
     validate_range("preamble", config.preamble, 6, 65535)?;
     validate_range("tx_power", config.tx_power, 2, 20)?;
+    validate_range("tcxo_mv", config.sx1262_tcxo_mv, 0, 3300)?;
+    validate_range("pa_duty", config.sx1262_pa_duty, 0, 7)?;
+    validate_range("pa_hp", config.sx1262_pa_hp, 0, 7)?;
+    validate_range("pa_dev", config.sx1262_pa_device, 0, 1)?;
+    validate_range("pa_lut", config.sx1262_pa_lut, 0, 1)?;
+    validate_range("rx_timeout", config.sx1262_rx_timeout_ms, 0, 60_000)?;
+    validate_range("sx_sync", config.sx1262_sync_word, -1, 65_535)?;
     Ok(())
 }
 

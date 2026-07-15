@@ -52,7 +52,7 @@ impl CommandHandler for BatteryCommand {
     }
 
     fn help(&self) -> &'static str {
-        "battery status=true | battery enabled=true pin=35 divider=2.2 ref_mv=3300 min_mv=3300 max_mv=4200 save=true"
+        "battery status=true | battery enabled=true pin=35 divider=2.2 ctrl_pin=-1 ctrl_level=1 ref_mv=3300 min_mv=3300 max_mv=4200 save=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -76,6 +76,19 @@ impl CommandHandler for BatteryCommand {
             {
                 settings.set_str("battery.divider", divider)?;
             }
+            if let Some(ctrl_pin) = request
+                .arg_i32("ctrl_pin")?
+                .or(request.arg_i32("ctrl")?)
+                .or(request.arg_i32("enable_pin")?)
+            {
+                settings.set_i32("battery.ctrl", ctrl_pin)?;
+            }
+            if let Some(ctrl_level) = request
+                .arg_i32("ctrl_level")?
+                .or(request.arg_i32("enable_level")?)
+            {
+                settings.set_i32("battery.ctl_lvl", if ctrl_level == 0 { 0 } else { 1 })?;
+            }
             if let Some(ref_mv) = request.arg_i32("ref_mv")? {
                 settings.set_i32("battery.ref_mv", ref_mv)?;
             }
@@ -96,9 +109,11 @@ impl CommandHandler for BatteryCommand {
         }
         let reading = read_battery_with_config(config)?;
         Ok(CommandResponse::ok(format!(
-            "battery enabled=true pin={} divider={} ref_mv={} unit={} channel={} raw={} adc_mv={} mv={} level={}",
+            "battery enabled=true pin={} divider={} ctrl_pin={} ctrl_level={} ref_mv={} unit={} channel={} raw={} adc_mv={} mv={} level={}",
             config.pin,
             config.divider,
+            config.ctrl_pin,
+            config.ctrl_level,
             config.ref_mv,
             reading.unit + 1,
             reading.channel,
@@ -158,7 +173,7 @@ impl CommandHandler for AdcProbeCommand {
         let mut out = String::new();
         for sample in 1..=count {
             if sample > 1 {
-                std::thread::sleep(Duration::from_millis(interval_ms));
+                task_delay(Duration::from_millis(interval_ms));
             }
             out.push_str(&adc_sample_line(sample, &pins, ref_mv));
             if sample < count {
@@ -185,6 +200,8 @@ struct BatteryConfig {
     enabled: bool,
     pin: i32,
     divider: f32,
+    ctrl_pin: i32,
+    ctrl_level: i32,
     ref_mv: u32,
     empty_mv: u32,
     full_mv: u32,
@@ -203,6 +220,8 @@ impl BatteryConfig {
             enabled: settings.get_bool("battery.enabled", true)?,
             pin: settings.get_i32("battery.pin", DEFAULT_BATTERY_PIN)?,
             divider,
+            ctrl_pin: settings.get_i32("battery.ctrl", -1)?,
+            ctrl_level: settings.get_i32("battery.ctl_lvl", 1)?.clamp(0, 1),
             ref_mv: settings.get_i32("battery.ref_mv", DEFAULT_REF_MV as i32)? as u32,
             empty_mv: settings.get_i32("battery.min_mv", DEFAULT_EMPTY_MV as i32)? as u32,
             full_mv: settings.get_i32("battery.max_mv", DEFAULT_FULL_MV as i32)? as u32,
@@ -216,6 +235,8 @@ impl Default for BatteryConfig {
             enabled: true,
             pin: DEFAULT_BATTERY_PIN,
             divider: DEFAULT_DIVIDER,
+            ctrl_pin: -1,
+            ctrl_level: 1,
             ref_mv: DEFAULT_REF_MV,
             empty_mv: DEFAULT_EMPTY_MV,
             full_mv: DEFAULT_FULL_MV,
@@ -239,8 +260,11 @@ fn read_battery_with_config(config: BatteryConfig) -> Result<BatteryReading> {
     if config.full_mv <= config.empty_mv {
         bail!("battery max_mv must be greater than min_mv");
     }
-    let (unit, channel, raw, adc_mv) = read_adc_pin(config.pin, config.ref_mv)
-        .map_err(|err| anyhow!("battery ADC GPIO{}: {err}", config.pin))?;
+    battery_adc_enable(config)?;
+    let result = read_adc_pin(config.pin, config.ref_mv)
+        .map_err(|err| anyhow!("battery ADC GPIO{}: {err}", config.pin));
+    let _ = battery_adc_disable(config);
+    let (unit, channel, raw, adc_mv) = result?;
     let battery_mv = (adc_mv as f32 * config.divider).round() as u32;
     let percent = battery_percent(battery_mv, config.empty_mv, config.full_mv);
     Ok(BatteryReading {
@@ -251,6 +275,35 @@ fn read_battery_with_config(config: BatteryConfig) -> Result<BatteryReading> {
         battery_mv,
         percent,
     })
+}
+
+fn battery_adc_enable(config: BatteryConfig) -> Result<()> {
+    if config.ctrl_pin < 0 {
+        return Ok(());
+    }
+    set_output_level(config.ctrl_pin, config.ctrl_level)?;
+    task_delay(Duration::from_millis(10));
+    Ok(())
+}
+
+fn battery_adc_disable(config: BatteryConfig) -> Result<()> {
+    if config.ctrl_pin < 0 {
+        return Ok(());
+    }
+    set_output_level(config.ctrl_pin, if config.ctrl_level == 0 { 1 } else { 0 })
+}
+
+fn set_output_level(pin: i32, level: i32) -> Result<()> {
+    unsafe {
+        let gpio = pin as sys::gpio_num_t;
+        esp_ok(sys::gpio_reset_pin(gpio))?;
+        esp_ok(sys::gpio_set_direction(
+            gpio,
+            sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+        ))?;
+        esp_ok(sys::gpio_set_level(gpio, if level == 0 { 0 } else { 1 }))?;
+    }
+    Ok(())
 }
 
 fn read_adc_pin(pin: i32, ref_mv: u32) -> Result<(sys::adc_unit_t, sys::adc_channel_t, i32, u32)> {
@@ -357,10 +410,22 @@ fn wait_for_key_or_timeout(interval_ms: u64) -> bool {
             return true;
         }
         let step = (interval_ms - waited).min(50);
-        std::thread::sleep(Duration::from_millis(step));
+        task_delay(Duration::from_millis(step));
         waited += step;
     }
     false
+}
+
+fn task_delay(timeout: Duration) {
+    unsafe {
+        sys::vTaskDelay(duration_to_ticks(timeout).max(1));
+    }
+}
+
+fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
+    let hz = sys::configTICK_RATE_HZ as u128;
+    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
+    ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
 }
 
 fn uart0_has_input() -> bool {

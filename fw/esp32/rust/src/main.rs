@@ -1,6 +1,7 @@
 use anyhow::Result;
 use esp_idf_svc::log::EspLogger;
-use std::ffi::c_char;
+use std::ffi::{c_char, CString};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{Duration, Instant};
 
 mod commands;
@@ -13,6 +14,11 @@ use components::l3dmesh::L3Mesh;
 const BOOT_ACTIVE_WINDOW_MS: u32 = 10_000;
 const BOOT_PAIRING_HOLD_MS: u32 = 3_000;
 const BOOT_POLL_MS: u64 = 100;
+const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
+static UART0_EVENT_QUEUE: AtomicPtr<esp_idf_sys::QueueDefinition> =
+    AtomicPtr::new(core::ptr::null_mut());
+static UART0_EVENT_TASK: AtomicPtr<esp_idf_sys::tskTaskControlBlock> =
+    AtomicPtr::new(core::ptr::null_mut());
 
 fn main() {
     if let Err(err) = run() {
@@ -33,6 +39,7 @@ pub extern "C" fn app_main() {
 fn run() -> Result<()> {
     rom_print(b"dm-rs boot step=link_patches\n\0");
     esp_idf_sys::link_patches();
+    components::wake::register_main_task();
     init_console_uart();
     rom_print(b"dm-rs boot step=logger\n\0");
     EspLogger::initialize_default();
@@ -64,10 +71,10 @@ fn run() -> Result<()> {
     }
     let companion_active_ms = settings
         .borrow()
-        .get_i32("cm.active_ms", 60_000)
-        .unwrap_or(60_000)
+        .get_i32("cm.active_ms", 5_000)
+        .unwrap_or(5_000)
         .max(0) as u32;
-    components::ble_bt::configure_companion_advertising(2_000, 1_000);
+    components::ble_bt::configure_companion_advertising(30_000, 5_000);
     components::ble_bt::configure_companion_active_window(companion_active_ms);
     rom_print(b"dm-rs boot step=boot_window\n\0");
     let pairing_recovery = run_boot_active_window(wake_cause, &mut registry);
@@ -121,10 +128,10 @@ fn run() -> Result<()> {
         uart_write("dm-rs> ");
     }
     loop {
+        components::telemetry::record_main_loop();
         components::mode::poll(&settings);
         components::ble_bt::poll_text_commands(&mut registry);
-        poll_raw_wifi_commands(&mut registry);
-        components::button::poll_level_press();
+        poll_raw_wifi_commands(&mut registry, &settings);
         if components::button::take_long_presses() > 0 {
             serial_enabled = true;
             components::mode::mark_companion_active(&settings, companion_active_ms);
@@ -137,20 +144,50 @@ fn run() -> Result<()> {
                 uart_write("dm-rs> ");
             }
         }
-        let mut buf = [0_u8; 128];
-        match uart_read(&mut buf) {
+        drain_uart_console(
+            &mut registry,
+            &settings,
+            &mut serial_enabled,
+            companion_active_ms,
+            &mut line,
+        );
+        match wait_for_firmware_activity(Duration::from_millis(MAIN_HOUSEKEEPING_POLL_MS)) {
+            UartWait::Data => {}
+            UartWait::Timeout => {
+                components::telemetry::record_uart_timeout();
+            }
+            UartWait::Error => {
+                components::telemetry::record_uart_error();
+                log::warn!("console event wait failed");
+                task_delay(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+fn drain_uart_console(
+    registry: &mut CommandRegistry,
+    settings: &components::settings::SharedSettings,
+    serial_enabled: &mut bool,
+    companion_active_ms: u32,
+    line: &mut Vec<u8>,
+) {
+    let mut buf = [0_u8; 128];
+    loop {
+        match uart_read(&mut buf, Duration::from_millis(0)) {
             read if read > 0 => {
-                if !serial_enabled {
-                    serial_enabled = true;
+                components::telemetry::record_uart_read(read as usize);
+                if !*serial_enabled {
+                    *serial_enabled = true;
                     uart_write("dm-rs> ");
                 }
-                components::mode::mark_companion_active(&settings, companion_active_ms);
+                components::mode::mark_companion_active(settings, companion_active_ms);
                 let read = read as usize;
                 for byte in &buf[..read] {
                     if *byte == b'\n' || *byte == b'\r' {
-                        let command = core::str::from_utf8(&line).unwrap_or("").trim();
+                        let command = core::str::from_utf8(line).unwrap_or("").trim();
                         if !command.is_empty() {
-                            let response = transports::dispatch_text_line(&mut registry, command);
+                            let response = transports::dispatch_text_line(registry, command);
                             uart_write(&response);
                         }
                         line.clear();
@@ -161,12 +198,18 @@ fn run() -> Result<()> {
                 }
             }
             -1 => {
-                log::warn!("console read failed");
-                std::thread::sleep(Duration::from_millis(250));
+                components::telemetry::record_uart_error();
+                break;
             }
-            _ => std::thread::sleep(Duration::from_millis(20)),
+            _ => break,
         }
     }
+}
+
+enum UartWait {
+    Data,
+    Timeout,
+    Error,
 }
 
 fn run_boot_active_window(
@@ -201,7 +244,6 @@ fn run_boot_active_window(
 
     let deadline = Instant::now() + Duration::from_millis(BOOT_ACTIVE_WINDOW_MS as u64);
     let mut pressed_since: Option<Instant> = None;
-    let mut pairing_recovery_requested = false;
     let mut line = Vec::new();
     uart_write("dm-rs> ");
     while Instant::now() < deadline {
@@ -217,15 +259,16 @@ fn run_boot_active_window(
                         start
                     }
                 };
-                if !pairing_recovery_requested
-                    && start.elapsed() >= Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64)
-                {
-                    pairing_recovery_requested = true;
+                if start.elapsed() >= Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64) {
                     uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
                     components::button::suppress_until_release();
                     components::telemetry::record_log(
                         "event type=boot_window long_press=true pending=pairing_recovery",
                     );
+                    components::telemetry::record_log(
+                        "event type=boot_window done=true pairing_recovery=true immediate=true",
+                    );
+                    return true;
                 }
             } else {
                 if let Some(start) = pressed_since.take() {
@@ -237,18 +280,18 @@ fn run_boot_active_window(
                 pressed_since = None;
             }
         }
-        std::thread::sleep(Duration::from_millis(BOOT_POLL_MS));
+        task_delay(Duration::from_millis(BOOT_POLL_MS));
     }
     components::telemetry::record_log(format!(
         "event type=boot_window done=true pairing_recovery={}",
-        pairing_recovery_requested
+        false
     ));
-    pairing_recovery_requested
+    false
 }
 
 fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) {
     let mut buf = [0_u8; 128];
-    match uart_read(&mut buf) {
+    match uart_read(&mut buf, Duration::from_millis(0)) {
         read if read > 0 => {
             let read = read as usize;
             for byte in &buf[..read] {
@@ -267,7 +310,7 @@ fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) {
         }
         -1 => {
             log::warn!("boot console read failed");
-            std::thread::sleep(Duration::from_millis(20));
+            task_delay(Duration::from_millis(20));
         }
         _ => {}
     }
@@ -293,8 +336,13 @@ fn wake_cause_name(cause: esp_idf_sys::esp_sleep_source_t) -> &'static str {
     }
 }
 
-fn poll_raw_wifi_commands(registry: &mut CommandRegistry) {
+fn poll_raw_wifi_commands(
+    registry: &mut CommandRegistry,
+    settings: &components::settings::SharedSettings,
+) {
+    components::telemetry::record_raw_poll();
     while let Some(command) = components::wifi::take_raw_command() {
+        components::telemetry::record_raw_command();
         components::telemetry::record_log(format!(
             "event type=wifi.raw_command source={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} len={} rssi={}",
             command.source[0],
@@ -306,7 +354,11 @@ fn poll_raw_wifi_commands(registry: &mut CommandRegistry) {
             command.text.len(),
             command.rssi
         ));
-        let response = transports::dispatch_text_line(registry, &command.text);
+        let response = if command.text.starts_with("dmesh.ping") {
+            components::mode::status_pong_text(settings, "wifi_raw")
+        } else {
+            transports::dispatch_text_line(registry, &command.text)
+        };
         if let Err(err) =
             components::wifi::send_vendor_payload_to(command.source, response.as_bytes())
         {
@@ -339,9 +391,13 @@ fn init_console_uart() {
             esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_DEFAULT;
 
         let _ = esp_idf_sys::uart_param_config(UART0, &config);
-        let install =
-            esp_idf_sys::uart_driver_install(UART0, 1024, 1024, 0, core::ptr::null_mut(), 0);
+        let mut queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
+        let install = esp_idf_sys::uart_driver_install(UART0, 2048, 1024, 16, &mut queue, 0);
         if install == esp_idf_sys::ESP_OK || install == esp_idf_sys::ESP_ERR_INVALID_STATE {
+            if install == esp_idf_sys::ESP_OK && !queue.is_null() {
+                UART0_EVENT_QUEUE.store(queue, Ordering::Relaxed);
+                start_uart_event_task(queue);
+            }
             esp_idf_sys::esp_vfs_dev_uart_use_driver(UART0_VFS);
             esp_idf_sys::esp_vfs_dev_uart_port_set_rx_line_endings(
                 UART0_VFS,
@@ -355,15 +411,94 @@ fn init_console_uart() {
     }
 }
 
-fn uart_read(buf: &mut [u8]) -> i32 {
+fn start_uart_event_task(queue: esp_idf_sys::QueueHandle_t) {
+    if !UART0_EVENT_TASK.load(Ordering::SeqCst).is_null() {
+        return;
+    }
+    let Ok(name) = CString::new("uart_evt") else {
+        return;
+    };
+    let mut task = core::ptr::null_mut();
+    let ret = unsafe {
+        esp_idf_sys::xTaskCreatePinnedToCore(
+            Some(uart_event_task),
+            name.as_ptr(),
+            3072,
+            queue.cast(),
+            5,
+            &mut task,
+            0,
+        )
+    };
+    if ret == 1 && !task.is_null() {
+        UART0_EVENT_TASK.store(task, Ordering::SeqCst);
+    }
+}
+
+unsafe extern "C" fn uart_event_task(arg: *mut core::ffi::c_void) {
+    let queue = arg.cast::<esp_idf_sys::QueueDefinition>();
+    let mut event = esp_idf_sys::uart_event_t::default();
+    loop {
+        let ok = unsafe {
+            esp_idf_sys::xQueueReceive(
+                queue,
+                (&mut event as *mut esp_idf_sys::uart_event_t).cast(),
+                esp_idf_sys::TickType_t::MAX,
+            )
+        };
+        if ok != 1 {
+            continue;
+        }
+        if event.type_ == esp_idf_sys::uart_event_type_t_UART_FIFO_OVF
+            || event.type_ == esp_idf_sys::uart_event_type_t_UART_BUFFER_FULL
+        {
+            unsafe {
+                let _ = esp_idf_sys::uart_flush_input(esp_idf_sys::uart_port_t_UART_NUM_0);
+            }
+        }
+        components::wake::notify();
+    }
+}
+
+fn wait_for_firmware_activity(timeout: Duration) -> UartWait {
+    let mut pending = 0_usize;
+    let ret = unsafe {
+        esp_idf_sys::uart_get_buffered_data_len(esp_idf_sys::uart_port_t_UART_NUM_0, &mut pending)
+    };
+    if ret == esp_idf_sys::ESP_OK && pending > 0 {
+        return UartWait::Data;
+    }
+    if components::wake::wait(timeout) {
+        UartWait::Data
+    } else {
+        UartWait::Timeout
+    }
+}
+
+fn uart_read(buf: &mut [u8], timeout: Duration) -> i32 {
     unsafe {
         esp_idf_sys::uart_read_bytes(
             esp_idf_sys::uart_port_t_UART_NUM_0,
             buf.as_mut_ptr() as *mut core::ffi::c_void,
             buf.len() as u32,
-            2,
+            duration_to_ticks(timeout),
         )
     }
+}
+
+fn task_delay(timeout: Duration) {
+    unsafe {
+        esp_idf_sys::vTaskDelay(duration_to_ticks(timeout));
+    }
+}
+
+fn duration_to_ticks(timeout: Duration) -> esp_idf_sys::TickType_t {
+    if timeout.is_zero() {
+        return 0;
+    }
+    let hz = esp_idf_sys::configTICK_RATE_HZ as u128;
+    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
+    ticks.max(1).min(esp_idf_sys::TickType_t::MAX as u128) as esp_idf_sys::TickType_t
 }
 
 fn uart_write(text: &str) {

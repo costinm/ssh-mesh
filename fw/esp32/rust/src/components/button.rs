@@ -13,6 +13,9 @@ use super::telemetry;
 const DEFAULT_BUTTON_GPIO: i32 = 0;
 const BUTTON_DEBOUNCE_MS: u64 = 250;
 const BUTTON_LONG_PRESS_MS: u32 = 2_500;
+const BUTTON_DOUBLE_CLICK_MS: u32 = 500;
+const BUTTON_CLASSIFY_MAX_MS: u32 = 3_500;
+const BUTTON_CLASSIFY_SAMPLE_MS: u64 = 25;
 const BOOT_SAMPLE_MS: u64 = 100;
 
 static BUTTON_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -102,9 +105,23 @@ pub fn detect_boot_long_press(window_ms: u32, hold_ms: u32) -> bool {
         } else {
             pressed_since = None;
         }
-        std::thread::sleep(Duration::from_millis(BOOT_SAMPLE_MS));
+        task_delay(Duration::from_millis(BOOT_SAMPLE_MS));
     }
     false
+}
+
+#[allow(dead_code)]
+fn task_delay(timeout: Duration) {
+    unsafe {
+        sys::vTaskDelay(duration_to_ticks(timeout).max(1));
+    }
+}
+
+#[allow(dead_code)]
+fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
+    let hz = sys::configTICK_RATE_HZ as u128;
+    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
+    ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
 }
 
 pub fn poll_level_press() {
@@ -159,11 +176,28 @@ fn configure_button(pin: i32) -> Result<()> {
             mode: sys::gpio_mode_t_GPIO_MODE_INPUT,
             pull_up_en: sys::gpio_pullup_t_GPIO_PULLUP_ENABLE,
             pull_down_en: sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
-            intr_type: sys::gpio_int_type_t_GPIO_INTR_DISABLE,
+            intr_type: sys::gpio_int_type_t_GPIO_INTR_ANYEDGE,
         };
         esp_ok(sys::gpio_config(&config))?;
         let _ = sys::gpio_isr_handler_remove(pin);
         let _ = sys::gpio_intr_disable(pin as sys::gpio_num_t);
+        if !GPIO_ISR_SERVICE_READY.load(Ordering::SeqCst) {
+            let ret = sys::gpio_install_isr_service(0);
+            if ret == sys::ESP_OK || ret == sys::ESP_ERR_INVALID_STATE {
+                GPIO_ISR_SERVICE_READY.store(true, Ordering::SeqCst);
+            } else {
+                esp_ok(ret)?;
+            }
+        }
+    }
+    start_button_task()?;
+    unsafe {
+        esp_ok(sys::gpio_isr_handler_add(
+            pin as sys::gpio_num_t,
+            Some(button_isr),
+            std::ptr::null_mut(),
+        ))?;
+        esp_ok(sys::gpio_intr_enable(pin as sys::gpio_num_t))?;
     }
     Ok(())
 }
@@ -193,6 +227,10 @@ fn start_button_task() -> Result<()> {
 }
 
 unsafe extern "C" fn button_isr(_arg: *mut core::ffi::c_void) {
+    let pin = BUTTON_GPIO.load(Ordering::SeqCst);
+    unsafe {
+        let _ = sys::gpio_intr_disable(pin as sys::gpio_num_t);
+    }
     let task = BUTTON_TASK.load(Ordering::SeqCst);
     if !task.is_null() {
         let mut woken = 0;
@@ -214,11 +252,13 @@ unsafe extern "C" fn button_task(_arg: *mut core::ffi::c_void) {
     loop {
         let count = unsafe { sys::ulTaskGenericNotifyTake(0, 1, sys::TickType_t::MAX) };
         if count == 0 || last.elapsed() < Duration::from_millis(BUTTON_DEBOUNCE_MS) {
+            reenable_button_interrupt();
             continue;
         }
         last = Instant::now();
-        super::ble_bt::open_companion_active_window(10_000);
         telemetry::record_log("ev=button.edge source=isr".to_string());
+        classify_button_press();
+        reenable_button_interrupt();
     }
 }
 
@@ -239,6 +279,81 @@ fn record_button_press(source: &str, long_press: bool) {
         let line = "ev=button.short action=cycle".to_string();
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);
+    }
+    super::wake::notify();
+}
+
+fn record_button_double() {
+    let total = BUTTON_PRESSES.fetch_add(1, Ordering::Relaxed) + 1;
+    let pin = BUTTON_GPIO.load(Ordering::Relaxed);
+    let line = format!("ev=button.press gpio={} n={} source=double", pin, total);
+    telemetry::record_log(line.clone());
+    telemetry::emit_console(&line);
+    super::ble_bt::open_companion_active_window(10_000);
+    BUTTON_CYCLE_PENDING.fetch_add(1, Ordering::Relaxed);
+    let line = "ev=button.double action=cycle".to_string();
+    telemetry::record_log(line.clone());
+    telemetry::emit_console(&line);
+    super::wake::notify();
+}
+
+fn classify_button_press() {
+    let start = now_ms();
+    let mut press_start: Option<u32> = None;
+    let mut clicks = 0_u32;
+    let mut release_deadline = start.wrapping_add(BUTTON_CLASSIFY_MAX_MS);
+    loop {
+        let now = now_ms();
+        let pressed = is_pressed();
+        if pressed {
+            if press_start.is_none() {
+                press_start = Some(now);
+            }
+            let held_ms = now.wrapping_sub(press_start.unwrap_or(now));
+            if held_ms >= BUTTON_LONG_PRESS_MS {
+                record_button_press("long", true);
+                wait_for_release();
+                return;
+            }
+        } else if let Some(down_at) = press_start.take() {
+            let held_ms = now.wrapping_sub(down_at);
+            if held_ms >= BUTTON_LONG_PRESS_MS {
+                record_button_press("long", true);
+                return;
+            }
+            clicks = clicks.saturating_add(1);
+            if clicks >= 2 {
+                record_button_double();
+                return;
+            }
+            release_deadline = now.wrapping_add(BUTTON_DOUBLE_CLICK_MS);
+        } else if clicks == 1 && release_deadline.wrapping_sub(now) >= i32::MAX as u32 {
+            record_button_press("short", false);
+            return;
+        }
+        if now.wrapping_sub(start) >= BUTTON_CLASSIFY_MAX_MS {
+            if clicks == 1 {
+                record_button_press("short", false);
+            }
+            return;
+        }
+        task_delay(Duration::from_millis(BUTTON_CLASSIFY_SAMPLE_MS));
+    }
+}
+
+fn wait_for_release() {
+    while is_pressed() {
+        task_delay(Duration::from_millis(BUTTON_CLASSIFY_SAMPLE_MS));
+    }
+}
+
+fn reenable_button_interrupt() {
+    if !BUTTON_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let pin = BUTTON_GPIO.load(Ordering::Relaxed);
+    unsafe {
+        let _ = sys::gpio_intr_enable(pin as sys::gpio_num_t);
     }
 }
 

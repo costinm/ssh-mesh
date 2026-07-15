@@ -28,6 +28,8 @@ extern "C" {
     fn dmesh_nimble_clear_bonds() -> c_int;
     fn dmesh_nimble_tx_handle() -> c_ushort;
     fn dmesh_nimble_rx_handle() -> c_ushort;
+    fn dmesh_nimble_enable_sleep() -> c_int;
+    fn dmesh_nimble_disable_sleep() -> c_int;
 }
 
 static BLE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -178,7 +180,7 @@ pub fn forward_packet_for_window(packet: &[u8], window_ms: u32) -> Result<bool> 
     send_gatt(packet);
     let deadline = Instant::now() + Duration::from_millis(window_ms as u64);
     while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
+        task_delay(Duration::from_millis(100));
     }
     Ok(true)
 }
@@ -192,16 +194,34 @@ pub fn start_listen_mode() -> Result<()> {
 }
 
 pub fn enable_controller_sleep() -> Result<()> {
+    if !BLE_STARTED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let rc = unsafe { dmesh_nimble_enable_sleep() };
+    if rc != 0 {
+        bail!("nimble controller sleep enable rc={rc}");
+    }
+    telemetry::record_log("event type=ble.controller_sleep enabled=true");
     Ok(())
 }
 
 pub fn disable_controller_sleep() -> Result<()> {
+    if !BLE_STARTED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let rc = unsafe { dmesh_nimble_disable_sleep() };
+    if rc != 0 {
+        bail!("nimble controller sleep disable rc={rc}");
+    }
+    telemetry::record_log("event type=ble.controller_sleep enabled=false");
     Ok(())
 }
 
 pub fn stop_radio_activity() {
-    unsafe {
-        let _ = dmesh_nimble_stop_advertising();
+    if BLE_STARTED.load(Ordering::Relaxed) {
+        unsafe {
+            let _ = dmesh_nimble_stop_advertising();
+        }
     }
     BLE_ADV_STARTED.store(false, Ordering::Relaxed);
     BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
@@ -903,9 +923,21 @@ fn wait_gatt_service_ready(timeout: Duration) -> Result<()> {
         {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        task_delay(Duration::from_millis(20));
     }
     bail!("BLE NimBLE GATT service not ready")
+}
+
+fn task_delay(timeout: Duration) {
+    unsafe {
+        sys::vTaskDelay(duration_to_ticks(timeout).max(1));
+    }
+}
+
+fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
+    let hz = sys::configTICK_RATE_HZ as u128;
+    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
+    ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
 }
 
 fn start_raw_adv(data: &[u8]) -> Result<()> {
@@ -1250,6 +1282,7 @@ fn queue_ble_text(data: &[u8]) {
         let _ = queue.pop_front();
     }
     queue.push_back(data.to_vec());
+    super::wake::notify();
 }
 
 fn normalize_ble_text(data: &[u8]) -> Vec<u8> {
@@ -1473,6 +1506,7 @@ pub unsafe extern "C" fn dmesh_nimble_on_connect(
     );
     telemetry::record_log(line.clone());
     telemetry::emit_console(&line);
+    super::wake::notify();
 }
 
 #[no_mangle]
@@ -1483,6 +1517,7 @@ pub unsafe extern "C" fn dmesh_nimble_on_disconnect(reason: c_ushort) {
     let line = format!("event type=ble.gatt state=disconnected reason={}", reason);
     telemetry::record_log(line.clone());
     telemetry::emit_console(&line);
+    super::wake::notify();
 }
 
 #[no_mangle]
@@ -1497,6 +1532,7 @@ pub unsafe extern "C" fn dmesh_nimble_on_subscribe(attr_handle: c_ushort, notify
     if notify != 0 {
         notify_companion_pending();
     }
+    super::wake::notify();
 }
 
 #[no_mangle]

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ffi::CStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -127,6 +128,13 @@ struct CounterSnapshot {
 static LORA_COUNTER: AtomicCounter = AtomicCounter::new();
 static BLE_COUNTER: AtomicCounter = AtomicCounter::new();
 static WIFI_COUNTER: AtomicCounter = AtomicCounter::new();
+static MAIN_LOOP_COUNTER: AtomicU32 = AtomicU32::new(0);
+static MAIN_UART_READ_COUNTER: AtomicU32 = AtomicU32::new(0);
+static MAIN_UART_BYTE_COUNTER: AtomicU32 = AtomicU32::new(0);
+static MAIN_UART_TIMEOUT_COUNTER: AtomicU32 = AtomicU32::new(0);
+static MAIN_UART_ERROR_COUNTER: AtomicU32 = AtomicU32::new(0);
+static MAIN_RAW_POLL_COUNTER: AtomicU32 = AtomicU32::new(0);
+static MAIN_RAW_COMMAND_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 struct TelemetryCommand {
     name: &'static str,
@@ -357,7 +365,7 @@ pub fn stats_text(settings: &SharedSettings) -> String {
     let ble = BLE_COUNTER.snapshot();
     let wifi = WIFI_COUNTER.snapshot();
     format!(
-        "stats lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} ble_rx={} ble_rx_bytes={} ble_tx={} ble_tx_bytes={} wifi_rx={} wifi_rx_bytes={} wifi_tx={} wifi_tx_bytes={} logs={} messages={} local_messages={} companion={} {}",
+        "stats lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} ble_rx={} ble_rx_bytes={} ble_tx={} ble_tx_bytes={} wifi_rx={} wifi_rx_bytes={} wifi_tx={} wifi_tx_bytes={} logs={} messages={} local_messages={} companion={} main_loops={} main_uart_reads={} main_uart_bytes={} main_uart_timeouts={} main_uart_errors={} main_raw_polls={} main_raw_cmds={} {} {} {}",
         lora.rx_packets,
         lora.rx_bytes,
         lora.tx_packets,
@@ -374,8 +382,128 @@ pub fn stats_text(settings: &SharedSettings) -> String {
         state.messages.len(),
         state.local_messages.len(),
         state.companion_messages.len(),
+        MAIN_LOOP_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_READ_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_BYTE_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_TIMEOUT_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_ERROR_COUNTER.load(Ordering::Relaxed),
+        MAIN_RAW_POLL_COUNTER.load(Ordering::Relaxed),
+        MAIN_RAW_COMMAND_COUNTER.load(Ordering::Relaxed),
+        super::wake::stats_fields(),
+        runtime_stats_text(),
         super::battery::stats_fields(settings)
     )
+}
+
+fn runtime_stats_text() -> String {
+    const MAX_TASKS: usize = 24;
+    let mut tasks = [esp_idf_sys::TaskStatus_t::default(); MAX_TASKS];
+    let mut reported_runtime = 0_u32;
+    let count = unsafe {
+        esp_idf_sys::uxTaskGetSystemState(
+            tasks.as_mut_ptr(),
+            tasks.len() as esp_idf_sys::UBaseType_t,
+            &mut reported_runtime,
+        )
+    } as usize;
+    if count == 0 {
+        return "rt_tasks=0 rt_total=0 rt_reported=0 rt_idle=0 rt_idle_pct=0 rt_top=none rt_top_runtime=0 rt_top_pct=0".to_string();
+    }
+
+    let mut total_runtime = 0_u32;
+    let mut idle_runtime = 0_u32;
+    let mut top_name = "none".to_string();
+    let mut top_runtime = 0_u32;
+    for task in tasks.iter().take(count.min(MAX_TASKS)) {
+        let name = task_name(task.pcTaskName);
+        total_runtime = total_runtime.saturating_add(task.ulRunTimeCounter);
+        if is_idle_task_name(&name) {
+            idle_runtime = idle_runtime.saturating_add(task.ulRunTimeCounter);
+        } else if task.ulRunTimeCounter > top_runtime {
+            top_runtime = task.ulRunTimeCounter;
+            top_name = sanitize_task_name(&name);
+        }
+    }
+    if total_runtime == 0 {
+        return format!(
+            "rt_tasks={} rt_total=0 rt_reported={} rt_idle=0 rt_idle_pct=0 rt_top=none rt_top_runtime=0 rt_top_pct=0",
+            count, reported_runtime
+        );
+    }
+
+    format!(
+        "rt_tasks={} rt_total={} rt_reported={} rt_idle={} rt_idle_pct={} rt_top={} rt_top_runtime={} rt_top_pct={}",
+        count,
+        total_runtime,
+        reported_runtime,
+        idle_runtime,
+        pct_u32(idle_runtime, total_runtime),
+        top_name,
+        top_runtime,
+        pct_u32(top_runtime, total_runtime)
+    )
+}
+
+fn task_name(name: *const core::ffi::c_char) -> String {
+    if name.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn is_idle_task_name(name: &str) -> bool {
+    name.starts_with("IDLE")
+}
+
+fn sanitize_task_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(24));
+    for ch in name.chars().take(24) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn pct_u32(part: u32, total: u32) -> u32 {
+    if total == 0 {
+        0
+    } else {
+        ((part as u64) * 100 / (total as u64)) as u32
+    }
+}
+
+pub fn record_main_loop() {
+    MAIN_LOOP_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_uart_read(bytes: usize) {
+    MAIN_UART_READ_COUNTER.fetch_add(1, Ordering::Relaxed);
+    MAIN_UART_BYTE_COUNTER.fetch_add(bytes.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+}
+
+pub fn record_uart_timeout() {
+    MAIN_UART_TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_uart_error() {
+    MAIN_UART_ERROR_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_raw_poll() {
+    MAIN_RAW_POLL_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_raw_command() {
+    MAIN_RAW_COMMAND_COUNTER.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn pending_message_count() -> u8 {
@@ -626,6 +754,14 @@ fn reset() {
     LORA_COUNTER.reset();
     BLE_COUNTER.reset();
     WIFI_COUNTER.reset();
+    MAIN_LOOP_COUNTER.store(0, Ordering::Relaxed);
+    MAIN_UART_READ_COUNTER.store(0, Ordering::Relaxed);
+    MAIN_UART_BYTE_COUNTER.store(0, Ordering::Relaxed);
+    MAIN_UART_TIMEOUT_COUNTER.store(0, Ordering::Relaxed);
+    MAIN_UART_ERROR_COUNTER.store(0, Ordering::Relaxed);
+    MAIN_RAW_POLL_COUNTER.store(0, Ordering::Relaxed);
+    MAIN_RAW_COMMAND_COUNTER.store(0, Ordering::Relaxed);
+    super::wake::reset_stats();
     let mut state = telemetry().lock().unwrap();
     state.messages.clear();
     state.local_messages.clear();

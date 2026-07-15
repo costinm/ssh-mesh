@@ -1,16 +1,10 @@
 use std::collections::VecDeque;
-use std::convert::TryInto;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use embedded_svc::wifi::{
-    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
-};
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -29,10 +23,19 @@ const RAW_FILTER_BEACON: u32 = 3;
 const RAW_FILTER_PROBE_REQ: u32 = 4;
 const RAW_FILTER_PROBE_RESP: u32 = 5;
 const RAW_FILTER_DATA: u32 = 6;
+const RAW_FILTER_DMESH: u32 = 7;
+const RAW_FILTER_DMESH_DATA: u32 = 8;
 const RAW_COMMAND_QUEUE_MAX: usize = 8;
 const RAW_COMMAND_MAX_LEN: usize = 512;
 const RAW_BROADCAST: [u8; 6] = [0xff; 6];
-const DMESH_VENDOR_MARKER: [u8; 5] = [0x7f, 0x50, 0x6f, 0x9a, 0x42];
+// lmesh discovery uses ff02::5227, whose Ethernet/Wi-Fi multicast mapping is
+// 33:33:00:00:52:27. Directed device traffic uses the peer MAC with the
+// multicast bit set.
+const LMESH_IPV6_DISCOVERY_MULTICAST: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x52, 0x27];
+const DMESH_ESPNOW_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
+const DMESH_ESPNOW_TYPE: u8 = 0x04;
+const DMESH_VENDOR_MARKER_LEN: usize = 9;
+const DMESH_FIXED_MESH_DST4: [u8; 4] = [0xff; 4];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static RAW_FILTER_MODE: AtomicU32 = AtomicU32::new(RAW_FILTER_MGMT);
@@ -54,6 +57,9 @@ static RAW_TX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_DROPPED: AtomicU32 = AtomicU32::new(0);
 static RAW_WIFI_INIT: AtomicBool = AtomicBool::new(false);
+static WIFI_NETIF_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
+static WIFI_NETIF_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
+static WIFI_NETIF_RX_LAST_LEN: AtomicU32 = AtomicU32::new(0);
 static RAW_LAST_COMMAND_PEER: [AtomicU8; 6] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -64,6 +70,9 @@ static RAW_LAST_COMMAND_PEER: [AtomicU8; 6] = [
 ];
 static RAW_LAST_COMMAND_PEER_VALID: AtomicBool = AtomicBool::new(false);
 static mut RAW_RX_LAST: [u8; 256] = [0; 256];
+static mut WIFI_NETIF_RX_LAST: [u8; 256] = [0; 256];
+static mut WIFI_STA_NETIF: *mut sys::esp_netif_t = std::ptr::null_mut();
+static mut WIFI_AP_NETIF: *mut sys::esp_netif_t = std::ptr::null_mut();
 
 #[derive(Clone, Debug)]
 pub struct RawWifiCommand {
@@ -115,16 +124,58 @@ pub fn take_raw_command() -> Option<RawWifiCommand> {
 }
 
 pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
+    start_raw_only(channel, filter)
+}
+
+pub fn start_light_sleep_test_mode(mode: &str, channel: u8) -> Result<()> {
+    let channel = channel.clamp(1, 13);
+    match mode {
+        "raw" | "mgmt" | "prom" | "prom_mgmt" => start_raw_only(channel, "dmesh"),
+        "raw_data" | "data" | "prom_data" => start_raw_only(channel, "dmesh_data"),
+        "sta" | "unconnected_sta" | "idle_sta" => {
+            ensure_raw_wifi_started(channel)?;
+            unsafe {
+                esp_ok(sys::esp_wifi_set_promiscuous(false))?;
+            }
+            Ok(())
+        }
+        "ap" | "softap" | "open_ap" => start_light_sleep_test_ap(channel, 2_000),
+        _ => bail!("unsupported wifi light sleep test mode={mode}"),
+    }
+}
+
+pub fn start_light_sleep_test_ap(channel: u8, beacon_ms: u32) -> Result<()> {
+    let ssid = default_direct_ssid()?;
+    let beacon_tu = beacon_ms_to_tu(beacon_ms);
+    low_level_start_ap_with_beacon_tu(&ssid, "", channel, beacon_tu)
+}
+
+fn start_raw_only(channel: u8, filter: &str) -> Result<()> {
     let filter_mode = parse_raw_filter(filter)?;
     RAW_FILTER_MODE.store(filter_mode, Ordering::Relaxed);
     ensure_raw_wifi_started(channel.clamp(1, 13))?;
+    start_raw_after_wifi(channel, filter)
+}
+
+fn start_raw_after_wifi(channel: u8, filter: &str) -> Result<()> {
+    let filter_mode = parse_raw_filter(filter)?;
+    RAW_FILTER_MODE.store(filter_mode, Ordering::Relaxed);
     unsafe {
         let mut promisc_filter = sys::wifi_promiscuous_filter_t {
             filter_mask: promiscuous_filter_mask(filter_mode),
         };
+        let _ = sys::esp_wifi_set_channel(
+            channel.clamp(1, 13),
+            sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+        );
         esp_ok(sys::esp_wifi_set_promiscuous(false))?;
         esp_ok(sys::esp_wifi_set_promiscuous_rx_cb(Some(raw_wifi_cb)))?;
         esp_ok(sys::esp_wifi_set_promiscuous_filter(&mut promisc_filter))?;
+        // ESP-IDF's control filter only selects 802.11 control subtypes; it
+        // cannot match the DMesh body key. Keep control frames disabled and
+        // apply the DMesh mesh-dst4 filter in the RX parser below.
+        let ctrl_filter = sys::wifi_promiscuous_filter_t { filter_mask: 0 };
+        esp_ok(sys::esp_wifi_set_promiscuous_ctrl_filter(&ctrl_filter))?;
         esp_ok(sys::esp_wifi_set_promiscuous(true))?;
     }
     RAW_MONITOR_RUNNING.store(true, Ordering::Relaxed);
@@ -157,18 +208,23 @@ pub fn power_save_name() -> &'static str {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WifiMode {
-    Stopped,
-    Sta,
-    Ap,
+    Off,
+    StaIdle,
+    Raw,
+    RawData,
+    RawSta,
+    RawStaData,
+    RawAp,
+    RawApData,
+    RawApSta,
+    RawApStaData,
 }
 
 impl Default for WifiMode {
     fn default() -> Self {
-        Self::Stopped
+        Self::Off
     }
 }
-
-type WifiDriver = BlockingWifi<EspWifi<'static>>;
 
 #[derive(Default)]
 struct WifiCommand {
@@ -176,7 +232,6 @@ struct WifiCommand {
     ssid: Option<String>,
     psk: Option<String>,
     timeout_ms: u32,
-    wifi: Option<WifiDriver>,
 }
 
 impl CommandHandler for WifiCommand {
@@ -185,7 +240,7 @@ impl CommandHandler for WifiCommand {
     }
 
     fn help(&self) -> &'static str {
-        "wifi ssid=SSID psk=PSK timeout=MS | wifi ap=true ssid=SSID psk=PSK channel=6 | wifi scan=true | wifi raw_monitor=true filter=mgmt|action|data|all bssid=aa:bb:... | wifi raw=hex:... | wifi raw_data=TEXT | wifi raw_stats=true"
+        "wifi mode=off|sta_idle|raw|raw_data|raw_sta|raw_sta_data|raw_ap|raw_ap_data|raw_ap_sta|raw_ap_sta_data channel=6 filter=dmesh ssid=SSID psk=PSK timeout=MS | wifi scan=true | wifi raw=hex:... | wifi raw_action=TEXT | wifi raw_data=TEXT | wifi raw_stats=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -196,6 +251,25 @@ impl CommandHandler for WifiCommand {
         }
         if request.arg("raw_stats").is_some() {
             return Ok(CommandResponse::ok(raw_stats()));
+        }
+        if request.arg("netif_stats").is_some() {
+            return Ok(CommandResponse::ok(netif_probe_stats()));
+        }
+        if request
+            .arg("netif_probe")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let iface = request
+                .arg("iface")
+                .or_else(|| request.arg("if"))
+                .unwrap_or("sta");
+            start_netif_probe(iface)?;
+            return Ok(CommandResponse::ok(format!(
+                "wifi netif_probe started {}",
+                netif_probe_stats()
+            )));
         }
         if request
             .arg("raw_monitor")
@@ -217,7 +291,7 @@ impl CommandHandler for WifiCommand {
                 .transpose()?
                 .unwrap_or(6)
                 .clamp(1, 13) as u8;
-            ensure_raw_wifi_started(channel)?;
+            prepare_raw_tx(channel)?;
             let bytes = parse_bytes(raw)?;
             raw_tx(&bytes, request)?;
             return Ok(CommandResponse::ok(format!(
@@ -238,14 +312,65 @@ impl CommandHandler for WifiCommand {
                 .or_else(|| request.arg("destination"))
                 .map(parse_mac)
                 .transpose()?
-                .unwrap_or(RAW_BROADCAST);
-            ensure_raw_wifi_started(channel)?;
-            let frame = multicast_data_frame(destination, payload.as_bytes())?;
+                .unwrap_or(LMESH_IPV6_DISCOVERY_MULTICAST);
+            let source = request
+                .arg("src")
+                .or_else(|| request.arg("source_mac"))
+                .map(parse_mac)
+                .transpose()?;
+            let bssid = request
+                .arg("bssid")
+                .or_else(|| request.arg("ap_bssid"))
+                .map(parse_mac)
+                .transpose()?;
+            let to_ap = request
+                .arg("to_ap")
+                .or_else(|| request.arg("tods"))
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(false);
+            prepare_raw_tx(channel)?;
+            let frame = match (bssid, to_ap) {
+                (Some(bssid), true) => {
+                    dmesh_sta_to_ap_data_frame(destination, source, bssid, payload.as_bytes())?
+                }
+                (Some(bssid), false) => {
+                    dmesh_ap_to_sta_data_frame(destination, bssid, payload.as_bytes())?
+                }
+                (None, _) => dmesh_data_frame(destination, source, payload.as_bytes())?,
+            };
             raw_tx_frame(&frame, true)?;
             RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
             telemetry::record_packet("wifi", Direction::Tx, payload.as_bytes(), "raw_data=true");
             return Ok(CommandResponse::ok(format!(
                 "wifi raw_data sent bytes={} {}",
+                frame.len(),
+                raw_stats()
+            )));
+        }
+        if let Some(payload) = request
+            .arg("raw_action")
+            .or_else(|| request.arg("raw_payload"))
+        {
+            let channel = request
+                .arg("channel")
+                .map(parse_i32)
+                .transpose()?
+                .unwrap_or(6)
+                .clamp(1, 13) as u8;
+            let destination = request
+                .arg("dst")
+                .or_else(|| request.arg("destination"))
+                .map(parse_mac)
+                .transpose()?
+                .unwrap_or(RAW_BROADCAST);
+            prepare_raw_tx(channel)?;
+            let frame = vendor_action_frame(destination, payload.as_bytes())?;
+            raw_tx_frame(&frame, true)?;
+            RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+            telemetry::record_packet("wifi", Direction::Tx, payload.as_bytes(), "raw_action=true");
+            return Ok(CommandResponse::ok(format!(
+                "wifi raw_action sent bytes={} {}",
                 frame.len(),
                 raw_stats()
             )));
@@ -260,6 +385,9 @@ impl CommandHandler for WifiCommand {
         }
         if request.arg("scan").is_some() {
             return self.scan();
+        }
+        if let Some(mode) = request.arg("mode") {
+            return self.start_mode(request, mode);
         }
 
         if let Some(timeout) = request.arg_i32("timeout")? {
@@ -276,106 +404,301 @@ impl CommandHandler for WifiCommand {
             self.start_sta(request)
         } else {
             Ok(CommandResponse::ok(format!(
-                "wifi mode={:?} ssid={} timeout_ms={}",
+                "wifi mode={:?} ssid={} timeout_ms={} {}",
                 self.mode,
                 self.ssid.as_deref().unwrap_or(""),
-                self.timeout_ms
+                self.timeout_ms,
+                wifi_net_status()
             )))
         }
     }
 }
 
 impl WifiCommand {
-    fn driver(&mut self) -> Result<&mut WifiDriver> {
-        if self.wifi.is_none() {
-            let peripherals = Peripherals::take()?;
-            let sys_loop = EspSystemEventLoop::take()?;
-            let wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), None)?;
-            self.wifi = Some(BlockingWifi::wrap(wifi, sys_loop)?);
+    fn start_mode(&mut self, request: &CommandRequest, mode: &str) -> Result<CommandResponse> {
+        let channel = command_channel(request, 6)?;
+        match mode {
+            "off" | "stop" | "stopped" => {
+                self.stop()?;
+                Ok(CommandResponse::ok("wifi mode=Off"))
+            }
+            "raw" => {
+                start_raw_only(channel, mode_filter_name(request, "dmesh"))?;
+                self.mode = WifiMode::Raw;
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=Raw channel={} {} {}",
+                    channel,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "raw_data" | "data_raw" => {
+                start_raw_only(channel, mode_filter_name(request, "dmesh_data"))?;
+                self.mode = WifiMode::RawData;
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=RawData sta=unassociated channel={} {} {}",
+                    channel,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "sta_idle" | "idle_sta" | "sta_only" | "station_idle" => {
+                let ssid = request.arg("ssid").unwrap_or("DMesh-Idle");
+                validate_wifi_string("ssid", ssid, 32)?;
+                low_level_start_sta_idle(ssid, channel)?;
+                self.mode = WifiMode::StaIdle;
+                self.ssid = Some(ssid.to_string());
+                self.psk = None;
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=StaIdle ssid={} channel={} connect=false {} {}",
+                    ssid,
+                    channel,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "raw_sta" | "sta_raw" => {
+                let ssid = request
+                    .arg("ssid")
+                    .context("wifi raw_sta requires ssid=...")?;
+                let psk = request.arg("psk").unwrap_or("");
+                let timeout_ms = self.command_timeout(request)?;
+                validate_wifi_string("ssid", ssid, 32)?;
+                validate_wifi_string("psk", psk, 64)?;
+                low_level_start_sta(ssid, psk, channel)?;
+                start_raw_after_wifi(channel, mode_filter_name(request, "dmesh"))?;
+                if timeout_ms > 0 {
+                    task_delay(Duration::from_millis(timeout_ms as u64));
+                }
+                self.mode = WifiMode::RawSta;
+                self.ssid = Some(ssid.to_string());
+                self.psk = Some(psk.to_string());
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=RawSta ssid={} channel={} timeout_ms={} {} {}",
+                    ssid,
+                    channel,
+                    timeout_ms,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "raw_sta_data" | "sta_raw_data" | "raw_data_sta" | "data_raw_sta" => {
+                if let Some(ssid) = request.arg("ssid") {
+                    let psk = request.arg("psk").unwrap_or("");
+                    let timeout_ms = self.command_timeout(request)?;
+                    validate_wifi_string("ssid", ssid, 32)?;
+                    validate_wifi_string("psk", psk, 64)?;
+                    low_level_start_sta(ssid, psk, channel)?;
+                    start_raw_after_wifi(channel, mode_filter_name(request, "dmesh_data"))?;
+                    if timeout_ms > 0 {
+                        task_delay(Duration::from_millis(timeout_ms as u64));
+                    }
+                    self.mode = WifiMode::RawStaData;
+                    self.ssid = Some(ssid.to_string());
+                    self.psk = Some(psk.to_string());
+                    Ok(CommandResponse::ok(format!(
+                        "wifi mode=RawStaData ssid={} channel={} timeout_ms={} {} {}",
+                        ssid,
+                        channel,
+                        timeout_ms,
+                        wifi_net_status(),
+                        raw_stats()
+                    )))
+                } else {
+                    start_raw_only(channel, mode_filter_name(request, "dmesh_data"))?;
+                    self.mode = WifiMode::RawStaData;
+                    Ok(CommandResponse::ok(format!(
+                        "wifi mode=RawStaData sta=unassociated channel={} {} {}",
+                        channel,
+                        wifi_net_status(),
+                        raw_stats()
+                    )))
+                }
+            }
+            "fake_sta" | "sta_fake" | "raw_fake_sta" | "fake_sta_raw" => {
+                let bssid = request
+                    .arg("bssid")
+                    .or_else(|| request.arg("ap_bssid"))
+                    .map(parse_mac)
+                    .transpose()?
+                    .context("wifi fake_sta requires bssid=xx:xx:xx:xx:xx:xx")?;
+                let ssid = request.arg("ssid").unwrap_or("DMesh-Fake");
+                let psk = request.arg("psk").unwrap_or("");
+                validate_wifi_string("ssid", ssid, 32)?;
+                validate_wifi_string("psk", psk, 64)?;
+                low_level_start_fake_sta(ssid, psk, bssid, channel)?;
+                start_raw_after_wifi(channel, mode_filter_name(request, "dmesh"))?;
+                self.mode = WifiMode::RawSta;
+                self.ssid = Some(ssid.to_string());
+                self.psk = Some(psk.to_string());
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=FakeSta ssid={} bssid={} channel={} connect=false {} {}",
+                    ssid,
+                    format_mac(bssid),
+                    channel,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "raw_ap" | "ap_raw" => {
+                let (ssid, psk) = self.ap_identity(request)?;
+                let beacon_tu = command_beacon_tu(request)?;
+                low_level_start_ap_with_beacon_tu(&ssid, &psk, channel, beacon_tu)?;
+                start_raw_after_wifi(channel, mode_filter_name(request, "dmesh"))?;
+                self.mode = WifiMode::RawAp;
+                self.ssid = Some(ssid.clone());
+                self.psk = Some(psk.clone());
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=RawAp ssid={} channel={} beacon_tu={} auth={} {} {}",
+                    ssid,
+                    channel,
+                    beacon_tu,
+                    if psk.is_empty() { "open" } else { "wpa2" },
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "raw_ap_data" | "ap_raw_data" | "raw_data_ap" | "data_raw_ap" => {
+                let (ssid, psk) = self.ap_identity(request)?;
+                let beacon_tu = command_beacon_tu(request)?;
+                low_level_start_ap_with_beacon_tu(&ssid, &psk, channel, beacon_tu)?;
+                start_raw_after_wifi(channel, mode_filter_name(request, "dmesh_data"))?;
+                self.mode = WifiMode::RawApData;
+                self.ssid = Some(ssid.clone());
+                self.psk = Some(psk.clone());
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=RawApData ssid={} channel={} beacon_tu={} auth={} {} {}",
+                    ssid,
+                    channel,
+                    beacon_tu,
+                    if psk.is_empty() { "open" } else { "wpa2" },
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "raw_ap_sta" | "raw_sta_ap" | "ap_sta_raw" | "sta_ap_raw" => {
+                let (ap_ssid, ap_psk) = self.ap_identity(request)?;
+                let sta_ssid = request
+                    .arg("sta_ssid")
+                    .or_else(|| request.arg("join_ssid"))
+                    .or_else(|| request.arg("ssid"))
+                    .context("wifi raw_ap_sta requires ssid=... or sta_ssid=...")?;
+                let sta_psk = request
+                    .arg("sta_psk")
+                    .or_else(|| request.arg("join_psk"))
+                    .or_else(|| request.arg("psk"))
+                    .unwrap_or("");
+                let timeout_ms = self.command_timeout(request)?;
+                validate_wifi_string("ssid", sta_ssid, 32)?;
+                validate_wifi_string("psk", sta_psk, 64)?;
+                low_level_start_ap_sta(&ap_ssid, &ap_psk, sta_ssid, sta_psk, channel)?;
+                start_raw_after_wifi(channel, mode_filter_name(request, "dmesh"))?;
+                if timeout_ms > 0 {
+                    task_delay(Duration::from_millis(timeout_ms as u64));
+                }
+                self.mode = WifiMode::RawApSta;
+                self.ssid = Some(ap_ssid.clone());
+                self.psk = Some(ap_psk.clone());
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=RawApSta ap_ssid={} sta_ssid={} channel={} timeout_ms={} {} {}",
+                    ap_ssid,
+                    sta_ssid,
+                    channel,
+                    timeout_ms,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "raw_ap_sta_data" | "raw_sta_ap_data" | "ap_sta_raw_data" | "sta_ap_raw_data" => {
+                let (ap_ssid, ap_psk) = self.ap_identity(request)?;
+                let sta_ssid = request
+                    .arg("sta_ssid")
+                    .or_else(|| request.arg("join_ssid"))
+                    .or_else(|| request.arg("ssid"))
+                    .context("wifi raw_ap_sta_data requires ssid=... or sta_ssid=...")?;
+                let sta_psk = request
+                    .arg("sta_psk")
+                    .or_else(|| request.arg("join_psk"))
+                    .or_else(|| request.arg("psk"))
+                    .unwrap_or("");
+                let timeout_ms = self.command_timeout(request)?;
+                validate_wifi_string("ssid", sta_ssid, 32)?;
+                validate_wifi_string("psk", sta_psk, 64)?;
+                low_level_start_ap_sta(&ap_ssid, &ap_psk, sta_ssid, sta_psk, channel)?;
+                start_raw_after_wifi(channel, mode_filter_name(request, "dmesh_data"))?;
+                if timeout_ms > 0 {
+                    task_delay(Duration::from_millis(timeout_ms as u64));
+                }
+                self.mode = WifiMode::RawApStaData;
+                self.ssid = Some(ap_ssid.clone());
+                self.psk = Some(ap_psk.clone());
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=RawApStaData ap_ssid={} sta_ssid={} channel={} timeout_ms={} {} {}",
+                    ap_ssid,
+                    sta_ssid,
+                    channel,
+                    timeout_ms,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "sta" => self.start_sta(request),
+            "ap" => self.start_ap(request),
+            _ => bail!("unsupported wifi mode={mode}"),
         }
-        Ok(self.wifi.as_mut().expect("wifi initialized"))
     }
 
     fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         let ssid = request.arg("ssid").context("wifi sta requires ssid=...")?;
         let psk = request.arg("psk").unwrap_or("");
+        let channel = command_channel(request, 6)?;
         validate_wifi_string("ssid", ssid, 32)?;
         validate_wifi_string("psk", psk, 64)?;
         self.ssid = Some(ssid.to_string());
         self.psk = Some(psk.to_string());
 
-        let timeout_ms = self.timeout_ms;
-        let wifi = self.driver()?;
-        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: ssid.try_into().map_err(|_| anyhow!("ssid too long"))?,
-            password: psk.try_into().map_err(|_| anyhow!("psk too long"))?,
-            auth_method: if psk.is_empty() {
-                AuthMethod::None
-            } else {
-                AuthMethod::WPA2Personal
-            },
-            ..Default::default()
-        }))?;
-        wifi.start()?;
-        wifi.connect()?;
+        let timeout_ms = self.command_timeout(request)?;
+        low_level_start_sta(ssid, psk, channel)?;
+        start_raw_after_wifi(channel, raw_filter_name())?;
         if timeout_ms > 0 {
-            let _ = wifi.wait_netif_up();
+            task_delay(Duration::from_millis(timeout_ms as u64));
         }
-        self.mode = WifiMode::Sta;
+        self.mode = WifiMode::RawSta;
         Ok(CommandResponse::ok(format!(
-            "wifi mode=Sta ssid={} timeout_ms={}",
+            "wifi mode=RawSta ssid={} channel={} timeout_ms={} {}",
             self.ssid.as_deref().unwrap_or(""),
-            timeout_ms
+            channel,
+            timeout_ms,
+            wifi_net_status()
         )))
     }
 
     fn start_ap(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
-        let ssid = request.arg("ssid").unwrap_or("dmesh");
-        let psk = request.arg("psk").unwrap_or("");
-        let channel = request
-            .arg("channel")
-            .map(parse_i32)
-            .transpose()?
-            .unwrap_or(6)
-            .clamp(1, 13) as u8;
-        validate_wifi_string("ssid", ssid, 32)?;
-        validate_wifi_string("psk", psk, 64)?;
-        if !psk.is_empty() && psk.len() < 8 {
-            bail!("AP psk must be empty or at least 8 bytes");
-        }
-        self.ssid = Some(ssid.to_string());
-        self.psk = Some(psk.to_string());
+        let (ssid, psk) = self.ap_identity(request)?;
+        let channel = command_channel(request, 6)?;
+        self.ssid = Some(ssid.clone());
+        self.psk = Some(psk.clone());
 
-        let wifi = self.driver()?;
-        wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
-            ssid: ssid.try_into().map_err(|_| anyhow!("ssid too long"))?,
-            password: psk.try_into().map_err(|_| anyhow!("psk too long"))?,
-            channel,
-            auth_method: if psk.is_empty() {
-                AuthMethod::None
-            } else {
-                AuthMethod::WPA2Personal
-            },
-            ..Default::default()
-        }))?;
-        wifi.start()?;
-        self.mode = WifiMode::Ap;
+        let beacon_tu = command_beacon_tu(request)?;
+        low_level_start_ap_with_beacon_tu(&ssid, &psk, channel, beacon_tu)?;
+        start_raw_after_wifi(channel, raw_filter_name())?;
+        self.mode = WifiMode::RawAp;
         Ok(CommandResponse::ok(format!(
-            "wifi mode=Ap ssid={} channel={}",
+            "wifi mode=RawAp ssid={} channel={} beacon_tu={} auth={} {}",
             self.ssid.as_deref().unwrap_or(""),
-            channel
+            channel,
+            beacon_tu,
+            if psk.is_empty() { "open" } else { "wpa2" },
+            wifi_net_status()
         )))
     }
 
     fn scan(&mut self) -> Result<CommandResponse> {
-        let wifi = self.driver()?;
-        wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
-        wifi.start()?;
-        let aps = wifi.scan()?;
+        let aps = low_level_scan()?;
         let summary = aps
             .iter()
             .take(16)
-            .map(|ap| format!("{}:{}:ch{}", ap.ssid, ap.signal_strength, ap.channel))
+            .map(|ap| format!("{}:{}:ch{}:auth{}", ap.ssid, ap.rssi, ap.channel, ap.auth))
             .collect::<Vec<_>>()
             .join(",");
         Ok(CommandResponse::ok(format!(
@@ -386,20 +709,20 @@ impl WifiCommand {
     }
 
     fn start_raw_monitor(&mut self, request: &CommandRequest) -> Result<()> {
-        let channel = request
-            .arg("channel")
-            .map(parse_i32)
-            .transpose()?
-            .unwrap_or(6)
-            .clamp(1, 13) as u8;
-        start_raw_monitor_mode(channel, raw_filter_name())
+        let channel = command_channel(request, 6)?;
+        start_raw_only(channel, mode_filter_name(request, "dmesh"))?;
+        self.mode = WifiMode::Raw;
+        Ok(())
     }
 
     fn configure_raw_filter(&mut self, request: &CommandRequest) -> Result<()> {
         if let Some(filter) = request.arg("filter").or_else(|| request.arg("raw_filter")) {
             RAW_FILTER_MODE.store(parse_raw_filter(filter)?, Ordering::Relaxed);
         }
-        if let Some(bssid) = request.arg("bssid").or_else(|| request.arg("raw_bssid")) {
+        if let Some(bssid) = request
+            .arg("raw_bssid")
+            .or_else(|| request.arg("bssid_filter"))
+        {
             if bssid == "none" || bssid == "false" {
                 RAW_FILTER_BSSID_ENABLED.store(false, Ordering::Relaxed);
             } else {
@@ -414,19 +737,85 @@ impl WifiCommand {
     }
 
     fn stop(&mut self) -> Result<()> {
-        if let Some(wifi) = self.wifi.as_mut() {
-            let _ = wifi.disconnect();
-            let _ = wifi.stop();
-        }
-        self.mode = WifiMode::Stopped;
+        low_level_stop_wifi()?;
+        self.mode = WifiMode::Off;
         Ok(())
+    }
+
+    fn command_timeout(&mut self, request: &CommandRequest) -> Result<u32> {
+        if let Some(timeout) = request.arg_i32("timeout")? {
+            self.timeout_ms = timeout.max(0) as u32;
+        }
+        Ok(self.timeout_ms)
+    }
+
+    fn ap_identity(&self, request: &CommandRequest) -> Result<(String, String)> {
+        let ssid = if let Some(ssid) = request.arg("ap_ssid").or_else(|| request.arg("ssid")) {
+            ssid.to_string()
+        } else {
+            default_direct_ssid()?
+        };
+        let psk = request
+            .arg("ap_psk")
+            .or_else(|| request.arg("psk"))
+            .unwrap_or("")
+            .to_string();
+        validate_wifi_string("ssid", &ssid, 32)?;
+        validate_wifi_string("psk", &psk, 64)?;
+        if !psk.is_empty() && psk.len() < 8 {
+            bail!("AP psk must be empty or at least 8 bytes");
+        }
+        Ok((ssid, psk))
     }
 }
 
+fn command_channel(request: &CommandRequest, default: u8) -> Result<u8> {
+    Ok(request
+        .arg("channel")
+        .map(parse_i32)
+        .transpose()?
+        .unwrap_or(default as i32)
+        .clamp(1, 13) as u8)
+}
+
+fn mode_filter_name<'a>(request: &'a CommandRequest, default: &'a str) -> &'a str {
+    request
+        .arg("filter")
+        .or_else(|| request.arg("raw_filter"))
+        .unwrap_or(default)
+}
+
+#[derive(Debug)]
+struct ScanAp {
+    ssid: String,
+    rssi: i8,
+    channel: u8,
+    auth: &'static str,
+}
+
 pub fn ensure_raw_wifi_started(channel: u8) -> Result<()> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        esp_ok_allow_invalid_state(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
+        esp_ok_allow_invalid_state(sys::esp_wifi_start())?;
+        esp_ok(sys::esp_wifi_set_channel(
+            channel.max(1),
+            sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+        ))?;
+    }
+    Ok(())
+}
+
+fn ensure_low_level_wifi() -> Result<()> {
     unsafe {
         esp_ok_allow_invalid_state(sys::esp_netif_init())?;
         esp_ok_allow_invalid_state(sys::esp_event_loop_create_default())?;
+        if WIFI_STA_NETIF.is_null() {
+            WIFI_STA_NETIF = sys::esp_netif_create_default_wifi_sta();
+        }
+        if WIFI_AP_NETIF.is_null() {
+            WIFI_AP_NETIF = sys::esp_netif_create_default_wifi_ap();
+        }
         if !RAW_WIFI_INIT.swap(true, Ordering::SeqCst) {
             let mut cfg = wifi_init_config_default();
             let ret = sys::esp_wifi_init(&mut cfg);
@@ -436,12 +825,264 @@ pub fn ensure_raw_wifi_started(channel: u8) -> Result<()> {
             }
             let _ = sys::esp_wifi_set_storage(sys::wifi_storage_t_WIFI_STORAGE_RAM);
         }
-        esp_ok_allow_invalid_state(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
-        esp_ok_allow_invalid_state(sys::esp_wifi_start())?;
-        esp_ok(sys::esp_wifi_set_channel(
-            channel.max(1),
+    }
+    Ok(())
+}
+
+fn low_level_start_ap(ssid: &str, psk: &str, channel: u8) -> Result<()> {
+    low_level_start_ap_with_beacon_tu(ssid, psk, channel, 100)
+}
+
+fn low_level_start_ap_with_beacon_tu(
+    ssid: &str,
+    psk: &str,
+    channel: u8,
+    beacon_tu: u16,
+) -> Result<()> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        let _ = sys::esp_wifi_stop();
+        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_AP))?;
+        let mut ap = sys::wifi_ap_config_t::default();
+        copy_cstr_bytes(&mut ap.ssid, ssid.as_bytes());
+        copy_cstr_bytes(&mut ap.password, psk.as_bytes());
+        ap.ssid_len = ssid.len().min(ap.ssid.len()) as u8;
+        ap.channel = channel;
+        ap.authmode = if psk.is_empty() {
+            sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+        } else {
+            sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+        };
+        ap.max_connection = 4;
+        ap.beacon_interval = beacon_tu;
+        let mut conf = sys::wifi_config_t { ap };
+        esp_ok(sys::esp_wifi_set_config(
+            sys::wifi_interface_t_WIFI_IF_AP,
+            &mut conf,
+        ))?;
+        esp_ok(sys::esp_wifi_start())?;
+        if !WIFI_AP_NETIF.is_null() {
+            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_AP_NETIF);
+        }
+    }
+    Ok(())
+}
+
+fn beacon_ms_to_tu(beacon_ms: u32) -> u16 {
+    // ESP-IDF stores SoftAP beacon_interval in 1024 us time units. Keep the
+    // test helper in the common documented range while allowing a 2 s beacon.
+    let tu = ((beacon_ms as u64 * 1000) / 1024).clamp(100, 60_000);
+    tu as u16
+}
+
+fn command_beacon_tu(request: &CommandRequest) -> Result<u16> {
+    let beacon_ms = request
+        .arg("beacon_ms")
+        .or_else(|| request.arg("beacon"))
+        .map(parse_i32)
+        .transpose()?
+        .unwrap_or(102);
+    Ok(beacon_ms_to_tu(beacon_ms.max(1) as u32))
+}
+
+fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        let _ = sys::esp_wifi_disconnect();
+        let _ = sys::esp_wifi_stop();
+        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
+        let mut sta = sys::wifi_sta_config_t::default();
+        copy_cstr_bytes(&mut sta.ssid, ssid.as_bytes());
+        copy_cstr_bytes(&mut sta.password, psk.as_bytes());
+        sta.channel = channel;
+        sta.threshold.authmode = if psk.is_empty() {
+            sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+        } else {
+            sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+        };
+        let mut conf = sys::wifi_config_t { sta };
+        esp_ok(sys::esp_wifi_set_config(
+            sys::wifi_interface_t_WIFI_IF_STA,
+            &mut conf,
+        ))?;
+        esp_ok(sys::esp_wifi_start())?;
+        esp_ok(sys::esp_wifi_connect())?;
+        if !WIFI_STA_NETIF.is_null() {
+            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
+        }
+    }
+    Ok(())
+}
+
+fn low_level_start_sta_idle(ssid: &str, channel: u8) -> Result<()> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        let _ = sys::esp_wifi_disconnect();
+        let _ = sys::esp_wifi_set_promiscuous(false);
+        let _ = sys::esp_wifi_stop();
+        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
+        let mut sta = sys::wifi_sta_config_t::default();
+        copy_cstr_bytes(&mut sta.ssid, ssid.as_bytes());
+        sta.channel = channel;
+        sta.threshold.authmode = sys::wifi_auth_mode_t_WIFI_AUTH_OPEN;
+        let mut conf = sys::wifi_config_t { sta };
+        esp_ok(sys::esp_wifi_set_config(
+            sys::wifi_interface_t_WIFI_IF_STA,
+            &mut conf,
+        ))?;
+        esp_ok(sys::esp_wifi_start())?;
+        esp_ok_allow_invalid_state(sys::esp_wifi_set_channel(
+            channel.clamp(1, 13),
             sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
         ))?;
+        if !WIFI_STA_NETIF.is_null() {
+            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
+        }
+    }
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+fn low_level_start_fake_sta(ssid: &str, psk: &str, bssid: [u8; 6], channel: u8) -> Result<()> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        let _ = sys::esp_wifi_disconnect();
+        let _ = sys::esp_wifi_stop();
+        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
+        let mut sta = sys::wifi_sta_config_t::default();
+        copy_cstr_bytes(&mut sta.ssid, ssid.as_bytes());
+        copy_cstr_bytes(&mut sta.password, psk.as_bytes());
+        sta.bssid_set = true;
+        sta.bssid.copy_from_slice(&bssid);
+        sta.channel = channel;
+        sta.threshold.authmode = if psk.is_empty() {
+            sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+        } else {
+            sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+        };
+        let mut conf = sys::wifi_config_t { sta };
+        esp_ok(sys::esp_wifi_set_config(
+            sys::wifi_interface_t_WIFI_IF_STA,
+            &mut conf,
+        ))?;
+        esp_ok(sys::esp_wifi_start())?;
+        esp_ok_allow_invalid_state(sys::esp_wifi_set_channel(
+            channel.clamp(1, 13),
+            sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+        ))?;
+        if !WIFI_STA_NETIF.is_null() {
+            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
+        }
+    }
+    Ok(())
+}
+
+fn low_level_start_ap_sta(
+    ap_ssid: &str,
+    ap_psk: &str,
+    sta_ssid: &str,
+    sta_psk: &str,
+    channel: u8,
+) -> Result<()> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        let _ = sys::esp_wifi_disconnect();
+        let _ = sys::esp_wifi_stop();
+        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_APSTA))?;
+
+        let mut ap = sys::wifi_ap_config_t::default();
+        copy_cstr_bytes(&mut ap.ssid, ap_ssid.as_bytes());
+        copy_cstr_bytes(&mut ap.password, ap_psk.as_bytes());
+        ap.ssid_len = ap_ssid.len().min(ap.ssid.len()) as u8;
+        ap.channel = channel;
+        ap.authmode = if ap_psk.is_empty() {
+            sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+        } else {
+            sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+        };
+        ap.max_connection = 4;
+        ap.beacon_interval = 100;
+        let mut ap_conf = sys::wifi_config_t { ap };
+        esp_ok(sys::esp_wifi_set_config(
+            sys::wifi_interface_t_WIFI_IF_AP,
+            &mut ap_conf,
+        ))?;
+
+        let mut sta = sys::wifi_sta_config_t::default();
+        copy_cstr_bytes(&mut sta.ssid, sta_ssid.as_bytes());
+        copy_cstr_bytes(&mut sta.password, sta_psk.as_bytes());
+        sta.channel = channel;
+        sta.threshold.authmode = if sta_psk.is_empty() {
+            sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+        } else {
+            sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+        };
+        let mut sta_conf = sys::wifi_config_t { sta };
+        esp_ok(sys::esp_wifi_set_config(
+            sys::wifi_interface_t_WIFI_IF_STA,
+            &mut sta_conf,
+        ))?;
+
+        esp_ok(sys::esp_wifi_start())?;
+        esp_ok(sys::esp_wifi_connect())?;
+        if !WIFI_AP_NETIF.is_null() {
+            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_AP_NETIF);
+        }
+        if !WIFI_STA_NETIF.is_null() {
+            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
+        }
+    }
+    Ok(())
+}
+
+fn low_level_scan() -> Result<Vec<ScanAp>> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        let _ = sys::esp_wifi_stop();
+        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
+        esp_ok(sys::esp_wifi_start())?;
+        esp_ok(sys::esp_wifi_scan_start(std::ptr::null(), true))?;
+        let mut total = 0_u16;
+        esp_ok(sys::esp_wifi_scan_get_ap_num(&mut total))?;
+        let mut records = vec![sys::wifi_ap_record_t::default(); total.min(32) as usize];
+        let mut count = records.len() as u16;
+        if count > 0 {
+            esp_ok(sys::esp_wifi_scan_get_ap_records(
+                &mut count,
+                records.as_mut_ptr(),
+            ))?;
+        }
+        records.truncate(count as usize);
+        Ok(records
+            .iter()
+            .map(|record| ScanAp {
+                ssid: ssid_from_bytes(&record.ssid),
+                rssi: record.rssi,
+                channel: record.primary,
+                auth: auth_name(record.authmode),
+            })
+            .collect())
+    }
+}
+
+fn low_level_stop_wifi() -> Result<()> {
+    unsafe {
+        let _ = sys::esp_wifi_disconnect();
+        let _ = sys::esp_wifi_stop();
+        let _ = sys::esp_wifi_set_promiscuous(false);
+        let _ = sys::esp_wifi_internal_reg_rxcb(sys::wifi_interface_t_WIFI_IF_STA, None);
+    }
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+fn prepare_raw_tx(channel: u8) -> Result<()> {
+    let mut mode = sys::wifi_mode_t_WIFI_MODE_NULL;
+    let ret = unsafe { sys::esp_wifi_get_mode(&mut mode) };
+    if ret != sys::ESP_OK || mode == sys::wifi_mode_t_WIFI_MODE_NULL {
+        ensure_raw_wifi_started(channel)?;
     }
     Ok(())
 }
@@ -514,9 +1155,10 @@ fn raw_tx(bytes: &[u8], request: &CommandRequest) -> Result<()> {
 }
 
 fn raw_tx_frame(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
+    let iface = raw_tx_interface();
     unsafe {
         esp_ok(sys::esp_wifi_80211_tx(
-            sys::wifi_interface_t_WIFI_IF_STA,
+            iface,
             bytes.as_ptr() as *const _,
             bytes.len() as i32,
             en_sys_seq,
@@ -524,35 +1166,161 @@ fn raw_tx_frame(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
     }
 }
 
+fn raw_tx_interface() -> sys::wifi_interface_t {
+    let mut mode = sys::wifi_mode_t_WIFI_MODE_NULL;
+    let ret = unsafe { sys::esp_wifi_get_mode(&mut mode) };
+    if ret == sys::ESP_OK && mode == sys::wifi_mode_t_WIFI_MODE_AP {
+        sys::wifi_interface_t_WIFI_IF_AP
+    } else {
+        sys::wifi_interface_t_WIFI_IF_STA
+    }
+}
+
+fn start_netif_probe(iface: &str) -> Result<()> {
+    ensure_low_level_wifi()?;
+    let (netif, wifi_if) = match iface {
+        "ap" | "softap" => (unsafe { WIFI_AP_NETIF }, sys::wifi_interface_t_WIFI_IF_AP),
+        "sta" | "station" => (unsafe { WIFI_STA_NETIF }, sys::wifi_interface_t_WIFI_IF_STA),
+        _ => bail!("unsupported netif_probe iface={iface}"),
+    };
+    if netif.is_null() {
+        bail!("{iface} netif is not initialized");
+    }
+    unsafe {
+        let driver = sys::esp_netif_get_io_driver(netif) as sys::wifi_netif_driver_t;
+        if driver.is_null() {
+            bail!("{iface} netif has no wifi io driver");
+        }
+        esp_ok(sys::esp_wifi_register_if_rxcb(
+            driver,
+            Some(wifi_netif_probe_cb),
+            netif as *mut core::ffi::c_void,
+        ))?;
+    }
+    WIFI_NETIF_PROBE_RUNNING.store(true, Ordering::Relaxed);
+    let line = format!("event type=wifi.netif_probe iface={iface} wifi_if={wifi_if}");
+    telemetry::emit_console(&line);
+    telemetry::record_log(line);
+    Ok(())
+}
+
+unsafe extern "C" fn wifi_netif_probe_cb(
+    _esp_netif: *mut sys::esp_netif_t,
+    buffer: *mut core::ffi::c_void,
+    len: usize,
+    eb: *mut core::ffi::c_void,
+) -> sys::esp_err_t {
+    WIFI_NETIF_RX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !buffer.is_null() && len > 0 {
+        let copy_len = len.min(256);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buffer as *const u8,
+                core::ptr::addr_of_mut!(WIFI_NETIF_RX_LAST) as *mut u8,
+                copy_len,
+            );
+        }
+        WIFI_NETIF_RX_LAST_LEN.store(copy_len as u32, Ordering::Relaxed);
+        let frame = unsafe { core::slice::from_raw_parts(buffer as *const u8, copy_len) };
+        let line = format!(
+            "event type=wifi.netif_rx len={} sample_len={} sample={}",
+            len,
+            copy_len,
+            hex_bytes(frame)
+        );
+        telemetry::emit_console(&line);
+        telemetry::record_log(line);
+    }
+    unsafe {
+        let free_ptr = if !eb.is_null() { eb } else { buffer };
+        if !free_ptr.is_null() {
+            sys::esp_wifi_internal_free_rx_buffer(free_ptr);
+        }
+    }
+    sys::ESP_OK
+}
+
 fn vendor_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
     let mac = station_mac()?;
     let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(24 + 5 + body_len);
+    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&mac);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&DMESH_VENDOR_MARKER);
+    frame.extend_from_slice(&dmesh_vendor_marker(destination));
     frame.extend_from_slice(&payload[..body_len]);
     Ok(frame)
 }
 
-fn multicast_data_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
-    if destination[0] & 0x01 == 0 {
-        bail!("raw_data destination must be multicast or broadcast");
-    }
-    let mac = station_mac()?;
+fn dmesh_data_frame(
+    destination: [u8; 6],
+    source: Option<[u8; 6]>,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let mac = source.map(Ok).unwrap_or_else(station_mac)?;
     let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER.len() + body_len);
+    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
     frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&mac);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&DMESH_VENDOR_MARKER);
+    frame.extend_from_slice(&dmesh_vendor_marker(destination));
     frame.extend_from_slice(&payload[..body_len]);
     Ok(frame)
+}
+
+fn dmesh_sta_to_ap_data_frame(
+    destination: [u8; 6],
+    source: Option<[u8; 6]>,
+    bssid: [u8; 6],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let source = source.map(Ok).unwrap_or_else(station_mac)?;
+    let body_len = payload.len().min(1400);
+    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
+    frame.extend_from_slice(&[0x08, 0x01, 0x00, 0x00]);
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&dmesh_vendor_marker(destination));
+    frame.extend_from_slice(&payload[..body_len]);
+    Ok(frame)
+}
+
+fn dmesh_ap_to_sta_data_frame(
+    destination: [u8; 6],
+    bssid: [u8; 6],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let body_len = payload.len().min(1400);
+    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
+    frame.extend_from_slice(&[0x08, 0x02, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&dmesh_vendor_marker(destination));
+    frame.extend_from_slice(&payload[..body_len]);
+    Ok(frame)
+}
+
+fn dmesh_vendor_marker(destination: [u8; 6]) -> [u8; DMESH_VENDOR_MARKER_LEN] {
+    let mut marker = [0_u8; DMESH_VENDOR_MARKER_LEN];
+    marker[..DMESH_ESPNOW_PREFIX.len()].copy_from_slice(&DMESH_ESPNOW_PREFIX);
+    marker[4..8].copy_from_slice(&destination[2..6]);
+    marker[8] = DMESH_ESPNOW_TYPE;
+    marker
+}
+
+fn device_multicast_mac() -> Result<[u8; 6]> {
+    let mut mac = station_mac()?;
+    mac[0] |= 0x01;
+    mac[0] &= !0x02;
+    Ok(mac)
 }
 
 fn station_mac() -> Result<[u8; 6]> {
@@ -561,6 +1329,17 @@ fn station_mac() -> Result<[u8; 6]> {
         esp_ok(sys::esp_read_mac(
             mac.as_mut_ptr(),
             sys::esp_mac_type_t_ESP_MAC_WIFI_STA,
+        ))?;
+    }
+    Ok(mac)
+}
+
+fn ap_mac() -> Result<[u8; 6]> {
+    let mut mac = [0_u8; 6];
+    unsafe {
+        esp_ok(sys::esp_read_mac(
+            mac.as_mut_ptr(),
+            sys::esp_mac_type_t_ESP_MAC_WIFI_SOFTAP,
         ))?;
     }
     Ok(mac)
@@ -597,6 +1376,19 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
     if !matches_raw_filter(frame) {
         return;
     }
+    let dmesh_payload = dmesh_vendor_payload(frame);
+    if matches!(
+        RAW_FILTER_MODE.load(Ordering::Relaxed),
+        RAW_FILTER_ALL
+            | RAW_FILTER_ACTION
+            | RAW_FILTER_DATA
+            | RAW_FILTER_DMESH
+            | RAW_FILTER_DMESH_DATA
+    ) && dmesh_payload.is_none()
+    {
+        RAW_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     RAW_RX_MATCHED.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet(
         "wifi",
@@ -614,17 +1406,28 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
         );
     }
     RAW_RX_LAST_LEN.store(copy_len as u32, Ordering::Relaxed);
-    if let Some(payload) = dmesh_vendor_payload(frame) {
+    if let Some(payload) = dmesh_payload {
         telemetry::record_companion_packet("wifi", payload);
         super::mode::observe_ping("wifi_raw", payload);
-        if !payload.starts_with(b"dmesh.ping") {
-            enqueue_raw_command(frame, payload, rssi);
-        }
+        enqueue_raw_command(frame, payload, rssi);
+        let dst = frame_address(frame, FRAME_ADDR1)
+            .map(format_mac)
+            .unwrap_or_else(|| "none".to_string());
+        let src = frame_address(frame, FRAME_ADDR2)
+            .map(format_mac)
+            .unwrap_or_else(|| "none".to_string());
+        let destination = raw_destination_name(frame);
+        let payload_b64 = base64_standard(payload);
         let line = format!(
-            "event type=wifi.raw_rx source=dmesh_vendor len={} rssi={}",
+            "event type=wifi.raw_frame source=dmesh_vendor destination={} src={} dst={} len={} rssi={} payload_b64={}",
+            destination,
+            src,
+            dst,
             payload.len(),
-            rssi
+            rssi,
+            payload_b64
         );
+        telemetry::emit_console(&line);
         telemetry::record_log(line);
     }
 }
@@ -641,6 +1444,10 @@ fn matches_raw_filter(frame: &[u8]) -> bool {
         RAW_FILTER_PROBE_REQ => frame_subtype(frame) == 4,
         RAW_FILTER_PROBE_RESP => frame_subtype(frame) == 5,
         RAW_FILTER_DATA => frame_type(frame) == 2,
+        RAW_FILTER_DMESH => frame_type(frame) == 0 && frame_subtype(frame) == 13,
+        RAW_FILTER_DMESH_DATA => {
+            frame_type(frame) == 2 || (frame_type(frame) == 0 && frame_subtype(frame) == 13)
+        }
         _ => true,
     }
 }
@@ -673,16 +1480,138 @@ fn frame_has_bssid(frame: &[u8]) -> bool {
 }
 
 fn dmesh_vendor_payload(frame: &[u8]) -> Option<&[u8]> {
-    if frame.len() <= 24 + DMESH_VENDOR_MARKER.len() {
+    if frame.len() <= 24 + DMESH_VENDOR_MARKER_LEN {
         return None;
     }
-    if (frame_type(frame) == 2 || frame_subtype(frame) == 13)
-        && frame[24..29] == DMESH_VENDOR_MARKER
-    {
-        Some(&frame[24 + DMESH_VENDOR_MARKER.len()..])
-    } else {
-        None
+    if frame_type(frame) == 2 {
+        if !frame_matches_dmesh_data_destination(frame) {
+            return None;
+        }
+        let header = dmesh_vendor_header(&frame[24..])?;
+        if !mesh_dst4_allowed(header.mesh_dst4) {
+            return None;
+        }
+        let payload_start = 24 + header.len;
+        let payload_end = frame.len().saturating_sub(4).max(payload_start);
+        return Some(&frame[payload_start..payload_end]);
+    } else if frame_subtype(frame) != 13 {
+        return None;
     }
+    let header = dmesh_vendor_header(&frame[24..])?;
+    if !mesh_dst4_allowed(header.mesh_dst4) {
+        return None;
+    }
+    let payload_start = 24 + header.len;
+    Some(&frame[payload_start..])
+}
+
+#[derive(Clone, Copy)]
+struct DmeshVendorHeader {
+    len: usize,
+    mesh_dst4: [u8; 4],
+}
+
+fn dmesh_vendor_header(body: &[u8]) -> Option<DmeshVendorHeader> {
+    if body.len() >= DMESH_VENDOR_MARKER_LEN
+        && body[..DMESH_ESPNOW_PREFIX.len()] == DMESH_ESPNOW_PREFIX
+        && body[8] == DMESH_ESPNOW_TYPE
+    {
+        return Some(DmeshVendorHeader {
+            len: DMESH_VENDOR_MARKER_LEN,
+            mesh_dst4: [body[4], body[5], body[6], body[7]],
+        });
+    }
+    None
+}
+
+fn mesh_dst4_allowed(key: [u8; 4]) -> bool {
+    if key == DMESH_FIXED_MESH_DST4 || key == mesh_dst4(LMESH_IPV6_DISCOVERY_MULTICAST) {
+        return true;
+    }
+    if station_mac()
+        .map(|mac| key == mesh_dst4(mac))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    ap_mac().map(|mac| key == mesh_dst4(mac)).unwrap_or(false)
+}
+
+fn mesh_dst4(destination: [u8; 6]) -> [u8; 4] {
+    [
+        destination[2],
+        destination[3],
+        destination[4],
+        destination[5],
+    ]
+}
+
+fn frame_matches_dmesh_data_destination(frame: &[u8]) -> bool {
+    let Some(destination) = frame_address(frame, FRAME_ADDR1) else {
+        return false;
+    };
+    if destination == LMESH_IPV6_DISCOVERY_MULTICAST {
+        return true;
+    }
+    if station_mac().map(|mac| destination == mac).unwrap_or(false) {
+        return true;
+    }
+    if ap_mac().map(|mac| destination == mac).unwrap_or(false) {
+        return true;
+    }
+    device_multicast_mac()
+        .map(|mac| destination == mac)
+        .unwrap_or(false)
+}
+
+fn raw_destination_name(frame: &[u8]) -> &'static str {
+    let Some(destination) = frame_address(frame, FRAME_ADDR1) else {
+        return "unknown";
+    };
+    if destination == LMESH_IPV6_DISCOVERY_MULTICAST {
+        return "ff02_5227";
+    }
+    if station_mac().map(|mac| destination == mac).unwrap_or(false) {
+        return "device_unicast";
+    }
+    if ap_mac().map(|mac| destination == mac).unwrap_or(false) {
+        return "ap_unicast";
+    }
+    if device_multicast_mac()
+        .map(|mac| destination == mac)
+        .unwrap_or(false)
+    {
+        return "device_multicast";
+    }
+    "other"
+}
+
+fn base64_standard(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut chunks = data.chunks_exact(3);
+    for chunk in &mut chunks {
+        let word = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
+        out.push(TABLE[((word >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((word >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((word >> 6) & 0x3f) as usize] as char);
+        out.push(TABLE[(word & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    if rem.len() == 1 {
+        let word = (rem[0] as u32) << 16;
+        out.push(TABLE[((word >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((word >> 12) & 0x3f) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem.len() == 2 {
+        let word = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+        out.push(TABLE[((word >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((word >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((word >> 6) & 0x3f) as usize] as char);
+        out.push('=');
+    }
+    out
 }
 
 fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32) {
@@ -716,6 +1645,7 @@ fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32) {
         rssi,
     });
     RAW_CMD_RX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    super::wake::notify();
 }
 
 fn raw_command_queue() -> &'static Mutex<VecDeque<RawWifiCommand>> {
@@ -775,12 +1705,26 @@ fn raw_stats() -> String {
     )
 }
 
+fn netif_probe_stats() -> String {
+    let last_len = WIFI_NETIF_RX_LAST_LEN.load(Ordering::Relaxed) as usize;
+    let last = unsafe { &WIFI_NETIF_RX_LAST[..last_len.min(256)] };
+    format!(
+        "netif_probe={} netif_rx={} netif_last_len={} netif_last={}",
+        WIFI_NETIF_PROBE_RUNNING.load(Ordering::Relaxed),
+        WIFI_NETIF_RX_TOTAL.load(Ordering::Relaxed),
+        last_len,
+        hex_bytes(last)
+    )
+}
+
 fn parse_raw_filter(value: &str) -> Result<u32> {
     match value {
         "all" => Ok(RAW_FILTER_ALL),
         "mgmt" | "management" => Ok(RAW_FILTER_MGMT),
         "action" => Ok(RAW_FILTER_ACTION),
         "data" => Ok(RAW_FILTER_DATA),
+        "dmesh" | "mesh" => Ok(RAW_FILTER_DMESH),
+        "dmesh_data" | "mesh_data" | "dmesh+data" | "mesh+data" => Ok(RAW_FILTER_DMESH_DATA),
         "beacon" => Ok(RAW_FILTER_BEACON),
         "probe_req" | "probe-request" => Ok(RAW_FILTER_PROBE_REQ),
         "probe_resp" | "probe-response" => Ok(RAW_FILTER_PROBE_RESP),
@@ -794,6 +1738,8 @@ fn raw_filter_name() -> &'static str {
         RAW_FILTER_MGMT => "mgmt",
         RAW_FILTER_ACTION => "action",
         RAW_FILTER_DATA => "data",
+        RAW_FILTER_DMESH => "dmesh",
+        RAW_FILTER_DMESH_DATA => "dmesh_data",
         RAW_FILTER_BEACON => "beacon",
         RAW_FILTER_PROBE_REQ => "probe_req",
         RAW_FILTER_PROBE_RESP => "probe_resp",
@@ -803,7 +1749,10 @@ fn raw_filter_name() -> &'static str {
 
 fn promiscuous_filter_mask(filter_mode: u32) -> u32 {
     match filter_mode {
-        RAW_FILTER_ALL => sys::WIFI_PROMIS_FILTER_MASK_MGMT | sys::WIFI_PROMIS_FILTER_MASK_DATA,
+        RAW_FILTER_ALL | RAW_FILTER_DMESH_DATA => {
+            sys::WIFI_PROMIS_FILTER_MASK_MGMT | sys::WIFI_PROMIS_FILTER_MASK_DATA
+        }
+        RAW_FILTER_DMESH => sys::WIFI_PROMIS_FILTER_MASK_MGMT,
         RAW_FILTER_DATA => sys::WIFI_PROMIS_FILTER_MASK_DATA,
         _ => sys::WIFI_PROMIS_FILTER_MASK_MGMT,
     }
@@ -819,6 +1768,101 @@ fn parse_mac(value: &str) -> Result<[u8; 6]> {
         mac[idx] = u8::from_str_radix(part, 16).map_err(|err| anyhow!("invalid MAC: {err}"))?;
     }
     Ok(mac)
+}
+
+fn default_direct_ssid() -> Result<String> {
+    let mac = station_mac()?;
+    Ok(format!("Direct-{:02x}-Dmesh-Local", mac[5]))
+}
+
+fn copy_cstr_bytes<const N: usize>(dst: &mut [u8; N], src: &[u8]) {
+    dst.fill(0);
+    let len = src.len().min(N);
+    dst[..len].copy_from_slice(&src[..len]);
+}
+
+fn ssid_from_bytes(bytes: &[u8]) -> String {
+    let len = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
+}
+
+fn auth_name(auth: sys::wifi_auth_mode_t) -> &'static str {
+    match auth {
+        x if x == sys::wifi_auth_mode_t_WIFI_AUTH_OPEN => "open",
+        x if x == sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK => "wpa2",
+        x if x == sys::wifi_auth_mode_t_WIFI_AUTH_WPA_WPA2_PSK => "wpa_wpa2",
+        x if x == sys::wifi_auth_mode_t_WIFI_AUTH_WPA3_PSK => "wpa3",
+        x if x == sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_WPA3_PSK => "wpa2_wpa3",
+        _ => "other",
+    }
+}
+
+fn wifi_net_status() -> String {
+    let sta = unsafe { WIFI_STA_NETIF };
+    let ap = unsafe { WIFI_AP_NETIF };
+    format!(
+        "sta_ip={} ap_ip={} ap_stations={} sta_ll={} ap_ll={}",
+        ip4_info(sta).unwrap_or_else(|| "none".to_string()),
+        ip4_info(ap).unwrap_or_else(|| "none".to_string()),
+        ap_station_count(),
+        ip6_linklocal(sta).unwrap_or_else(|| "none".to_string()),
+        ip6_linklocal(ap).unwrap_or_else(|| "none".to_string())
+    )
+}
+
+fn ap_station_count() -> i32 {
+    let mut list = sys::wifi_sta_list_t::default();
+    let ret = unsafe { sys::esp_wifi_ap_get_sta_list(&mut list) };
+    if ret == sys::ESP_OK {
+        list.num
+    } else {
+        -1
+    }
+}
+
+fn ip4_info(netif: *mut sys::esp_netif_t) -> Option<String> {
+    if netif.is_null() {
+        return None;
+    }
+    let mut info = sys::esp_netif_ip_info_t::default();
+    let ret = unsafe { sys::esp_netif_get_ip_info(netif, &mut info) };
+    if ret != sys::ESP_OK || info.ip.addr == 0 {
+        return None;
+    }
+    Some(format_ip4(info.ip.addr))
+}
+
+fn format_ip4(addr: u32) -> String {
+    let bytes = addr.to_le_bytes();
+    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
+}
+
+fn ip6_linklocal(netif: *mut sys::esp_netif_t) -> Option<String> {
+    if netif.is_null() {
+        return None;
+    }
+    let mut ip = sys::esp_ip6_addr_t::default();
+    let ret = unsafe { sys::esp_netif_get_ip6_linklocal(netif, &mut ip) };
+    if ret != sys::ESP_OK {
+        return None;
+    }
+    Some(format_ip6(ip))
+}
+
+fn format_ip6(ip: sys::esp_ip6_addr_t) -> String {
+    let mut words = [0_u16; 8];
+    for (idx, part) in ip.addr.iter().enumerate() {
+        let bytes = part.to_be_bytes();
+        words[idx * 2] = u16::from_be_bytes([bytes[0], bytes[1]]);
+        words[idx * 2 + 1] = u16::from_be_bytes([bytes[2], bytes[3]]);
+    }
+    format!(
+        "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}%{}",
+        words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], ip.zone
+    )
 }
 
 fn start_sntp(server: &str) -> Result<()> {
@@ -844,6 +1888,18 @@ fn validate_wifi_string(name: &str, value: &str, max: usize) -> Result<()> {
         bail!("{name} must be at most {max} bytes");
     }
     Ok(())
+}
+
+fn task_delay(timeout: Duration) {
+    unsafe {
+        sys::vTaskDelay(duration_to_ticks(timeout).max(1));
+    }
+}
+
+fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
+    let hz = sys::configTICK_RATE_HZ as u128;
+    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
+    ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
 }
 
 fn esp_ok(ret: sys::esp_err_t) -> Result<()> {

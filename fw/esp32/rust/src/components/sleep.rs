@@ -12,7 +12,7 @@ use super::settings::{parse_bool, SharedSettings};
 use super::telemetry;
 
 const RTC_MAGIC: u32 = 0x4453_4c50;
-const RTC_VERSION: u16 = 2;
+const RTC_VERSION: u16 = 4;
 const FLAG_WIFI: u32 = 1 << 0;
 const FLAG_SERIAL: u32 = 1 << 1;
 const FLAG_BLE: u32 = 1 << 2;
@@ -33,6 +33,25 @@ static LIGHT_SERIAL: AtomicBool = AtomicBool::new(false);
 static LIGHT_CHANNEL: AtomicU8 = AtomicU8::new(6);
 static LIGHT_WAKE_MS: AtomicU32 = AtomicU32::new(0);
 static LIGHT_PS: AtomicU8 = AtomicU8::new(LIGHT_PS_MIN);
+static LIGHT_TEST_RUNS: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_PREPARE_OK: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_PREPARE_FAIL: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_WAKE_OK: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_WAKE_FAIL: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_RESTORE_OK: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_RESTORE_FAIL: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_WIFI_WAKE_OK: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_WIFI_WAKE_UNSUPPORTED: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_WIFI_BEACON_WAKE_OK: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_WIFI_BEACON_WAKE_UNSUPPORTED: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_BT_WAKE_OK: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_BT_WAKE_UNSUPPORTED: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_LAST_ELAPSED_MS: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_LAST_CAUSE: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_LAST_CAUSES: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_LAST_RET: AtomicU32 = AtomicU32::new(0);
+static LIGHT_TEST_LAST_PHASE: AtomicU8 = AtomicU8::new(0);
+static LIGHT_TEST_LAST_ERR: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "C" {
     fn esp_clk_cpu_freq() -> u32;
@@ -53,12 +72,22 @@ struct RtcLoraConfig {
     rst: i32,
     dio0: i32,
     busy: i32,
+    board_power_pin: i32,
+    board_power_level: i32,
+    sx1262_tcxo_mv: i32,
+    sx1262_pa_duty: i32,
+    sx1262_pa_hp: i32,
+    sx1262_pa_device: i32,
+    sx1262_pa_lut: i32,
+    sx1262_rx_timeout_ms: i32,
+    sx1262_sync_word: i32,
     sf: i32,
     cr: i32,
     sync_word: i32,
     crc: u8,
     beacon: u8,
-    _pad0: [u8; 2],
+    sx1262_dio2_rf_switch: u8,
+    _pad0: u8,
     preamble: i32,
     tx_power: i32,
 }
@@ -112,12 +141,22 @@ impl RtcSleepState {
                 rst: 0,
                 dio0: 0,
                 busy: -1,
+                board_power_pin: -1,
+                board_power_level: 1,
+                sx1262_tcxo_mv: 0,
+                sx1262_pa_duty: 0,
+                sx1262_pa_hp: 0,
+                sx1262_pa_device: 0,
+                sx1262_pa_lut: 0,
+                sx1262_rx_timeout_ms: 0,
+                sx1262_sync_word: -1,
                 sf: 0,
                 cr: 0,
                 sync_word: 0,
                 crc: 0,
                 beacon: 0,
-                _pad0: [0; 2],
+                sx1262_dio2_rf_switch: 0,
+                _pad0: 0,
                 preamble: 0,
                 tx_power: 0,
             },
@@ -140,6 +179,7 @@ pub fn handle_deep_sleep_wake() -> Result<()> {
         state.boot_count = state.boot_count.saturating_add(1);
         state.last_cause = cause;
         state.last_ext1_mask = ext1_mask;
+        state = update_checksum(state);
         write_state(state);
     }
 
@@ -215,12 +255,16 @@ impl CommandHandler for SleepCommand {
     }
 
     fn help(&self) -> &'static str {
-        "sleep status=true | sleep profile=ble_adv|active | sleep mode=deep wake_ms=5000 active_ms=1000 ble=true wifi=true serial=true start=true | sleep mode=light start=true stop=true wifi=true ble=true ble_scan=false raw=true nan=false ps=min|max|none channel=6 wake_ms=0 serial=true"
+        "sleep status=true | sleep test=ble|raw|raw_data|sta|ap ms=5000 restore=true | sleep profile=ble_adv|active | sleep mode=deep wake_ms=5000 active_ms=1000 ble=true wifi=true serial=true start=true | sleep mode=light start=true stop=true wifi=true ble=true ble_scan=false raw=true nan=false ps=min|max|none channel=6 wake_ms=5000 serial=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if let Some(profile) = request.arg("profile") {
             return apply_profile(&self.settings, request, profile);
+        }
+        if let Some(test) = request.arg("test") {
+            let result = run_light_sleep_test(&self.settings, request, test)?;
+            return Ok(CommandResponse::ok(result));
         }
         if request.arg("status").is_some()
             || (request.arg("start").is_none() && request.arg("stop").is_none())
@@ -322,7 +366,7 @@ fn apply_profile(
                     nan: false,
                     serial: false,
                     channel: 6,
-                    wake_ms: 0,
+                    wake_ms: DEFAULT_WAKE_MS,
                     ps: "max",
                 },
             )?;
@@ -369,6 +413,13 @@ pub fn enter_companion_deep_sleep(
     enter_deep_sleep_with_state(state)
 }
 
+pub fn enable_companion_idle_pm(settings: &SharedSettings) -> Result<()> {
+    configure_pm(true)?;
+    configure_light_wake_sources(settings, DEFAULT_WAKE_MS, true)?;
+    telemetry::record_log("ev=sleep.pm companion_idle=true light=true serial=true");
+    Ok(())
+}
+
 struct LightSleepProfile {
     ble: bool,
     ble_scan: bool,
@@ -384,8 +435,6 @@ struct LightSleepProfile {
 fn start_light_sleep_profile(settings: &SharedSettings, profile: LightSleepProfile) -> Result<()> {
     let ps_code = parse_ps(profile.ps)?;
 
-    configure_pm(true)?;
-    configure_light_wake_sources(settings, profile.wake_ms, profile.serial)?;
     if profile.ble {
         if profile.ble_scan {
             super::ble_bt::start_listen_mode()?;
@@ -403,7 +452,7 @@ fn start_light_sleep_profile(settings: &SharedSettings, profile: LightSleepProfi
     }
     if profile.wifi || profile.raw {
         if profile.raw {
-            super::wifi::start_raw_monitor_mode(profile.channel, "action")?;
+            super::wifi::start_raw_monitor_mode(profile.channel, "dmesh")?;
         } else {
             super::wifi::ensure_raw_wifi_started(profile.channel)?;
         }
@@ -414,6 +463,8 @@ fn start_light_sleep_profile(settings: &SharedSettings, profile: LightSleepProfi
     if profile.nan {
         telemetry::record_log("ev=sleep.light nan=requested action=skip reason=no_helper");
     }
+    configure_pm(true)?;
+    configure_light_wake_sources(settings, profile.wake_ms, profile.serial)?;
 
     LIGHT_SLEEP_ENABLED.store(true, Ordering::Relaxed);
     LIGHT_WIFI.store(profile.wifi, Ordering::Relaxed);
@@ -451,9 +502,10 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
         .transpose()?
         .unwrap_or(6)
         .clamp(1, 13);
-    let wake_ms = parse_u32_arg(request, "wake_ms", 0)?
-        .or(parse_u32_arg(request, "ms", 0)?)
-        .unwrap_or(0);
+    let wake_ms = parse_u32_arg(request, "wake_ms", DEFAULT_WAKE_MS)?
+        .or(parse_u32_arg(request, "ms", DEFAULT_WAKE_MS)?)
+        .unwrap_or(DEFAULT_WAKE_MS)
+        .max(1);
     let wifi = request
         .arg("wifi")
         .map(parse_bool)
@@ -484,11 +536,19 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
         .map(parse_bool)
         .transpose()?
         .unwrap_or(true);
+    let radio_wake = request
+        .arg("radio_wake")
+        .or_else(|| request.arg("wifi_wake"))
+        .map(parse_bool)
+        .transpose()?
+        .unwrap_or(false);
     let ps = request.arg("ps").unwrap_or("min");
     let ps_code = parse_ps(ps)?;
 
-    configure_pm(true)?;
-    configure_light_wake_sources(settings, wake_ms, serial)?;
+    telemetry::record_log(format!(
+        "event type=sleep.light phase=radio wifi={} raw={} ble={} ble_scan={} serial={} radio_wake={} wake_ms={} ps={} ch={}",
+        wifi, raw, ble, ble_scan, serial, radio_wake, wake_ms, ps, channel
+    ));
     if ble {
         if ble_scan {
             super::ble_bt::start_listen_mode()?;
@@ -506,7 +566,7 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
     }
     if wifi || raw {
         if raw {
-            super::wifi::start_raw_monitor_mode(channel, "action")?;
+            super::wifi::start_raw_monitor_mode(channel, "dmesh")?;
         } else {
             super::wifi::ensure_raw_wifi_started(channel)?;
         }
@@ -517,6 +577,16 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
     if nan {
         telemetry::record_log("ev=sleep.light nan=requested action=skip reason=no_helper");
     }
+    telemetry::record_log("event type=sleep.light phase=pm");
+    configure_pm(true)?;
+    telemetry::record_log("event type=sleep.light phase=wake_sources");
+    configure_light_test_wake_sources(
+        settings,
+        wake_ms,
+        serial,
+        radio_wake && wifi,
+        radio_wake && ble,
+    )?;
 
     LIGHT_SLEEP_ENABLED.store(true, Ordering::Relaxed);
     LIGHT_WIFI.store(wifi, Ordering::Relaxed);
@@ -533,6 +603,346 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
         wifi, ble, ble_scan, raw, nan, ps, channel, wake_ms, serial
     ));
     Ok(())
+}
+
+fn run_light_sleep_test(
+    settings: &SharedSettings,
+    request: &CommandRequest,
+    test: &str,
+) -> Result<String> {
+    let channel = request
+        .arg("channel")
+        .map(|value| {
+            value
+                .parse::<u8>()
+                .map_err(|err| anyhow!("invalid channel={value}: {err}"))
+        })
+        .transpose()?
+        .unwrap_or(6)
+        .clamp(1, 13);
+    let wake_ms = parse_u32_arg(request, "wake_ms", 5_000)?
+        .or(parse_u32_arg(request, "ms", 5_000)?)
+        .unwrap_or(5_000)
+        .max(1);
+    let ps = request.arg("ps").unwrap_or("max");
+    let restore = request
+        .arg("restore")
+        .map(parse_bool)
+        .transpose()?
+        .unwrap_or(true);
+    let serial = request
+        .arg("serial")
+        .map(parse_bool)
+        .transpose()?
+        .unwrap_or(false);
+    let radio_wake = request
+        .arg("radio_wake")
+        .or_else(|| request.arg("wifi_wake"))
+        .map(parse_bool)
+        .transpose()?
+        .unwrap_or(true);
+
+    telemetry::record_log(format!(
+        "event type=sleep.light_test phase=prepare test={} wake_ms={} channel={} ps={} restore={} serial={} radio_wake={}",
+        test, wake_ms, channel, ps, restore, serial, radio_wake
+    ));
+    LIGHT_TEST_RUNS.fetch_add(1, Ordering::Relaxed);
+    LIGHT_TEST_LAST_PHASE.store(light_test_phase_code("prepare"), Ordering::Relaxed);
+    LIGHT_TEST_LAST_ERR.store(0, Ordering::Relaxed);
+    if let Err(err) = prepare_light_sleep_test_radio(settings, request, test, channel, ps) {
+        LIGHT_TEST_PREPARE_FAIL.fetch_add(1, Ordering::Relaxed);
+        LIGHT_TEST_LAST_ERR.store(0xffff_ffff, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=sleep.light_test phase=prepare ok=false test={} err={}",
+            test,
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+        return Err(err);
+    }
+    LIGHT_TEST_PREPARE_OK.fetch_add(1, Ordering::Relaxed);
+    LIGHT_TEST_LAST_PHASE.store(light_test_phase_code("pm"), Ordering::Relaxed);
+    if let Err(err) = configure_pm(true) {
+        LIGHT_TEST_PREPARE_FAIL.fetch_add(1, Ordering::Relaxed);
+        LIGHT_TEST_LAST_ERR.store(0xffff_fffe, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=sleep.light_test phase=pm ok=false test={} err={}",
+            test,
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+        return Err(err);
+    }
+    LIGHT_TEST_LAST_PHASE.store(light_test_phase_code("wake_sources"), Ordering::Relaxed);
+    configure_light_test_wake_sources(
+        settings,
+        wake_ms,
+        serial,
+        radio_wake && light_test_uses_wifi(test),
+        radio_wake && light_test_uses_ble(test),
+    )?;
+
+    LIGHT_SLEEP_ENABLED.store(true, Ordering::Relaxed);
+    LIGHT_WAKE_MS.store(wake_ms, Ordering::Relaxed);
+    LIGHT_CHANNEL.store(channel, Ordering::Relaxed);
+    LIGHT_PS.store(parse_ps(ps)?, Ordering::Relaxed);
+
+    LIGHT_TEST_LAST_PHASE.store(light_test_phase_code("sleep"), Ordering::Relaxed);
+    let before_us = now_us();
+    let ret = unsafe { sys::esp_light_sleep_start() };
+    let after_us = now_us();
+    let elapsed_ms = after_us.saturating_sub(before_us).saturating_div(1000);
+    let cause = unsafe { sys::esp_sleep_get_wakeup_cause() };
+    let causes = unsafe { sys::esp_sleep_get_wakeup_causes() };
+    LIGHT_TEST_LAST_ELAPSED_MS.store(elapsed_ms.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    LIGHT_TEST_LAST_CAUSE.store(cause as u32, Ordering::Relaxed);
+    LIGHT_TEST_LAST_CAUSES.store(causes, Ordering::Relaxed);
+    LIGHT_TEST_LAST_RET.store(ret as u32, Ordering::Relaxed);
+    LIGHT_TEST_LAST_PHASE.store(light_test_phase_code("wake"), Ordering::Relaxed);
+
+    let ok = ret == sys::ESP_OK;
+    if ok {
+        LIGHT_TEST_WAKE_OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        LIGHT_TEST_WAKE_FAIL.fetch_add(1, Ordering::Relaxed);
+        LIGHT_TEST_LAST_ERR.store(ret as u32, Ordering::Relaxed);
+    }
+    telemetry::record_log(format!(
+        "event type=sleep.light_test phase=wake test={} ok={} ret=0x{:x} elapsed_ms={} cause={} causes=0x{:x}",
+        test,
+        ok,
+        ret,
+        elapsed_ms,
+        wake_cause_name(cause),
+        causes
+    ));
+
+    if restore {
+        let _ = super::ble_bt::disable_controller_sleep();
+        super::ble_bt::stop_radio_activity();
+        LIGHT_TEST_LAST_PHASE.store(light_test_phase_code("restore"), Ordering::Relaxed);
+        if let Err(err) = super::mode::set_infra(settings, false, "light_sleep_test_restore") {
+            LIGHT_TEST_RESTORE_FAIL.fetch_add(1, Ordering::Relaxed);
+            LIGHT_TEST_LAST_ERR.store(0xffff_fffd, Ordering::Relaxed);
+            return Err(err);
+        }
+        LIGHT_TEST_RESTORE_OK.fetch_add(1, Ordering::Relaxed);
+    }
+
+    if !ok {
+        esp_ok(ret)?;
+    }
+    LIGHT_TEST_LAST_PHASE.store(light_test_phase_code("done"), Ordering::Relaxed);
+    Ok(format!(
+        "sleep light_test test={} ok=true elapsed_ms={} requested_ms={} cause={} causes=0x{:x} restored={} {}",
+        test,
+        elapsed_ms,
+        wake_ms,
+        wake_cause_name(cause),
+        causes,
+        restore,
+        status_text()
+    ))
+}
+
+fn prepare_light_sleep_test_radio(
+    settings: &SharedSettings,
+    request: &CommandRequest,
+    test: &str,
+    channel: u8,
+    ps: &str,
+) -> Result<()> {
+    let _ = super::lora::sleep_radio(settings);
+    match test {
+        "ble" | "ble_adv" | "ble_advertise" => {
+            let _ = super::wifi::stop_raw_monitor();
+            super::ble_bt::set_advertising_interval_ms(1000, 1200);
+            super::ble_bt::start_connectable_advertising()?;
+            if let Err(err) = super::ble_bt::enable_controller_sleep() {
+                telemetry::record_log(format!(
+                    "ev=sleep.err mode=light_test target=ble_sleep err={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+            }
+            LIGHT_BLE.store(true, Ordering::Relaxed);
+            LIGHT_BLE_SCAN.store(false, Ordering::Relaxed);
+            LIGHT_WIFI.store(false, Ordering::Relaxed);
+            LIGHT_RAW.store(false, Ordering::Relaxed);
+        }
+        "raw" | "mgmt" | "prom" | "prom_mgmt" => {
+            super::ble_bt::stop_radio_activity();
+            super::wifi::start_light_sleep_test_mode("raw", channel)?;
+            super::wifi::set_power_save(ps)?;
+            LIGHT_BLE.store(false, Ordering::Relaxed);
+            LIGHT_BLE_SCAN.store(false, Ordering::Relaxed);
+            LIGHT_WIFI.store(true, Ordering::Relaxed);
+            LIGHT_RAW.store(true, Ordering::Relaxed);
+        }
+        "raw_data" | "data" | "prom_data" => {
+            super::ble_bt::stop_radio_activity();
+            super::wifi::start_light_sleep_test_mode("raw_data", channel)?;
+            super::wifi::set_power_save(ps)?;
+            LIGHT_BLE.store(false, Ordering::Relaxed);
+            LIGHT_BLE_SCAN.store(false, Ordering::Relaxed);
+            LIGHT_WIFI.store(true, Ordering::Relaxed);
+            LIGHT_RAW.store(true, Ordering::Relaxed);
+        }
+        "sta" | "unconnected_sta" | "idle_sta" => {
+            super::ble_bt::stop_radio_activity();
+            super::wifi::start_light_sleep_test_mode("sta", channel)?;
+            super::wifi::set_power_save(ps)?;
+            LIGHT_BLE.store(false, Ordering::Relaxed);
+            LIGHT_BLE_SCAN.store(false, Ordering::Relaxed);
+            LIGHT_WIFI.store(true, Ordering::Relaxed);
+            LIGHT_RAW.store(false, Ordering::Relaxed);
+        }
+        "ap" | "softap" | "open_ap" => {
+            super::ble_bt::stop_radio_activity();
+            let beacon_ms = parse_u32_arg(request, "beacon_ms", 2_000)?.unwrap_or(2_000);
+            super::wifi::start_light_sleep_test_ap(channel, beacon_ms)?;
+            super::wifi::set_power_save(ps)?;
+            LIGHT_BLE.store(false, Ordering::Relaxed);
+            LIGHT_BLE_SCAN.store(false, Ordering::Relaxed);
+            LIGHT_WIFI.store(true, Ordering::Relaxed);
+            LIGHT_RAW.store(false, Ordering::Relaxed);
+        }
+        _ => bail!("unsupported light sleep test={test}"),
+    }
+    LIGHT_NAN.store(false, Ordering::Relaxed);
+    LIGHT_SERIAL.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+fn light_test_phase_code(phase: &str) -> u8 {
+    match phase {
+        "prepare" => 1,
+        "pm" => 2,
+        "wake_sources" => 3,
+        "sleep" => 4,
+        "wake" => 5,
+        "restore" => 6,
+        "done" => 7,
+        _ => 0,
+    }
+}
+
+fn light_test_phase_name(code: u8) -> &'static str {
+    match code {
+        1 => "prepare",
+        2 => "pm",
+        3 => "wake_sources",
+        4 => "sleep",
+        5 => "wake",
+        6 => "restore",
+        7 => "done",
+        _ => "none",
+    }
+}
+
+fn light_test_uses_ble(test: &str) -> bool {
+    matches!(test, "ble" | "ble_adv" | "ble_advertise")
+}
+
+fn light_test_uses_wifi(test: &str) -> bool {
+    matches!(
+        test,
+        "raw"
+            | "mgmt"
+            | "prom"
+            | "prom_mgmt"
+            | "raw_data"
+            | "data"
+            | "prom_data"
+            | "sta"
+            | "unconnected_sta"
+            | "idle_sta"
+            | "ap"
+            | "softap"
+            | "open_ap"
+    )
+}
+
+fn configure_light_test_wake_sources(
+    settings: &SharedSettings,
+    wake_ms: u32,
+    serial: bool,
+    wifi: bool,
+    ble: bool,
+) -> Result<()> {
+    unsafe {
+        let _ = sys::esp_sleep_disable_wakeup_source(sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_ALL);
+        if wake_ms > 0 {
+            esp_ok(sys::esp_sleep_enable_timer_wakeup(wake_ms as u64 * 1000))?;
+        }
+        if serial {
+            esp_ok_allow_invalid_state(sys::uart_set_wakeup_threshold(
+                sys::uart_port_t_UART_NUM_0,
+                3,
+            ))?;
+            esp_ok_allow_invalid_state(sys::esp_sleep_enable_uart_wakeup(
+                sys::uart_port_t_UART_NUM_0 as i32,
+            ))?;
+        }
+        if wifi {
+            log_optional_wake_source("wifi", sys::esp_sleep_enable_wifi_wakeup())?;
+            log_optional_wake_source("wifi_beacon", sys::esp_sleep_enable_wifi_beacon_wakeup())?;
+        }
+        if ble {
+            log_optional_wake_source("bt", sys::esp_sleep_enable_bt_wakeup())?;
+        }
+    }
+    if let Ok(Some(pin)) = super::button::configure_light_wake(settings) {
+        telemetry::record_log(format!(
+            "ev=sleep.light_test_wake source=button gpio={}",
+            pin
+        ));
+    }
+    Ok(())
+}
+
+fn log_optional_wake_source(source: &str, ret: sys::esp_err_t) -> Result<()> {
+    if ret == sys::ESP_OK {
+        increment_light_test_wake_source(source, true);
+        telemetry::record_log(format!(
+            "ev=sleep.light_test_wake source={} status=enabled",
+            source
+        ));
+        return Ok(());
+    }
+    if ret == sys::ESP_ERR_INVALID_STATE
+        || ret == sys::ESP_ERR_NOT_SUPPORTED
+        || ret == sys::ESP_ERR_NOT_ALLOWED
+    {
+        increment_light_test_wake_source(source, false);
+        telemetry::record_log(format!(
+            "ev=sleep.light_test_wake source={} status=unsupported err=0x{:x}",
+            source, ret
+        ));
+        return Ok(());
+    }
+    esp_ok(ret)
+}
+
+fn increment_light_test_wake_source(source: &str, ok: bool) {
+    match (source, ok) {
+        ("wifi", true) => {
+            LIGHT_TEST_WIFI_WAKE_OK.fetch_add(1, Ordering::Relaxed);
+        }
+        ("wifi", false) => {
+            LIGHT_TEST_WIFI_WAKE_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+        }
+        ("wifi_beacon", true) => {
+            LIGHT_TEST_WIFI_BEACON_WAKE_OK.fetch_add(1, Ordering::Relaxed);
+        }
+        ("wifi_beacon", false) => {
+            LIGHT_TEST_WIFI_BEACON_WAKE_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+        }
+        ("bt", true) => {
+            LIGHT_TEST_BT_WAKE_OK.fetch_add(1, Ordering::Relaxed);
+        }
+        ("bt", false) => {
+            LIGHT_TEST_BT_WAKE_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
 }
 
 fn stop_light_sleep() -> Result<()> {
@@ -636,7 +1046,7 @@ fn status_text() -> String {
         unsafe { sys::esp_pm_get_configuration((&mut pm as *mut sys::esp_pm_config_t).cast()) }
             == sys::ESP_OK;
     format!(
-        "sleep rtc_valid={} cause={} ext1_mask=0x{:x} rtc_bytes={} flags=0x{:x} wake_ms={} forward_ms={} wake_count={} last_len={} last_hash=0x{:08x} light={} pm={} max={} min={} wifi={} ble={} ble_scan={} raw={} nan={} serial={} ch={} ps={} wifi_ps={} light_wake_ms={}",
+        "sleep rtc_valid={} cause={} ext1_mask=0x{:x} rtc_bytes={} flags=0x{:x} wake_ms={} forward_ms={} wake_count={} last_len={} last_hash=0x{:08x} light={} pm={} max={} min={} wifi={} ble={} ble_scan={} raw={} nan={} serial={} ch={} ps={} wifi_ps={} light_wake_ms={} light_tests={} light_prepare_ok={} light_prepare_fail={} light_wake_ok={} light_wake_fail={} light_restore_ok={} light_restore_fail={} light_wifi_wake_ok={} light_wifi_wake_unsupported={} light_wifi_beacon_wake_ok={} light_wifi_beacon_wake_unsupported={} light_bt_wake_ok={} light_bt_wake_unsupported={} light_last_ms={} light_last_ret=0x{:x} light_last_phase={} light_last_err=0x{:x} light_last_cause={} light_last_causes=0x{:x}",
         valid,
         wake_cause_name(cause),
         ext1_mask,
@@ -660,7 +1070,26 @@ fn status_text() -> String {
         LIGHT_CHANNEL.load(Ordering::Relaxed),
         ps_name(LIGHT_PS.load(Ordering::Relaxed)),
         super::wifi::power_save_name(),
-        LIGHT_WAKE_MS.load(Ordering::Relaxed)
+        LIGHT_WAKE_MS.load(Ordering::Relaxed),
+        LIGHT_TEST_RUNS.load(Ordering::Relaxed),
+        LIGHT_TEST_PREPARE_OK.load(Ordering::Relaxed),
+        LIGHT_TEST_PREPARE_FAIL.load(Ordering::Relaxed),
+        LIGHT_TEST_WAKE_OK.load(Ordering::Relaxed),
+        LIGHT_TEST_WAKE_FAIL.load(Ordering::Relaxed),
+        LIGHT_TEST_RESTORE_OK.load(Ordering::Relaxed),
+        LIGHT_TEST_RESTORE_FAIL.load(Ordering::Relaxed),
+        LIGHT_TEST_WIFI_WAKE_OK.load(Ordering::Relaxed),
+        LIGHT_TEST_WIFI_WAKE_UNSUPPORTED.load(Ordering::Relaxed),
+        LIGHT_TEST_WIFI_BEACON_WAKE_OK.load(Ordering::Relaxed),
+        LIGHT_TEST_WIFI_BEACON_WAKE_UNSUPPORTED.load(Ordering::Relaxed),
+        LIGHT_TEST_BT_WAKE_OK.load(Ordering::Relaxed),
+        LIGHT_TEST_BT_WAKE_UNSUPPORTED.load(Ordering::Relaxed),
+        LIGHT_TEST_LAST_ELAPSED_MS.load(Ordering::Relaxed),
+        LIGHT_TEST_LAST_RET.load(Ordering::Relaxed),
+        light_test_phase_name(LIGHT_TEST_LAST_PHASE.load(Ordering::Relaxed)),
+        LIGHT_TEST_LAST_ERR.load(Ordering::Relaxed),
+        wake_cause_name(LIGHT_TEST_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_source_t),
+        LIGHT_TEST_LAST_CAUSES.load(Ordering::Relaxed)
     )
 }
 
@@ -741,7 +1170,7 @@ fn forward_packet(state: &RtcSleepState, packet: &[u8], metrics: Option<(i32, f3
     let elapsed = start.elapsed();
     let target = Duration::from_millis(state.forward_ms as u64);
     if elapsed < target {
-        std::thread::sleep(target - elapsed);
+        task_delay(target - elapsed);
     }
 }
 
@@ -763,7 +1192,7 @@ fn active_window(state: &RtcSleepState) -> Result<bool> {
             telemetry::record_log("event type=sleep.active source=serial action=promote");
             return Ok(true);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        task_delay(Duration::from_millis(50));
     }
     telemetry::record_log(format!(
         "event type=sleep.active source=timer action=sleep active_ms={}",
@@ -778,6 +1207,22 @@ fn uart0_has_input() -> bool {
         sys::uart_read_bytes(sys::uart_port_t_UART_NUM_0, byte.as_mut_ptr().cast(), 1, 0)
     };
     read > 0
+}
+
+fn now_us() -> u64 {
+    unsafe { sys::esp_timer_get_time().max(0) as u64 }
+}
+
+fn task_delay(timeout: Duration) {
+    unsafe {
+        sys::vTaskDelay(duration_to_ticks(timeout).max(1));
+    }
+}
+
+fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
+    let hz = sys::configTICK_RATE_HZ as u128;
+    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
+    ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
 }
 
 fn new_state(config: LoraConfig, wake_ms: u32, forward_ms: u32, flags: u32) -> RtcSleepState {
@@ -820,12 +1265,22 @@ impl RtcLoraConfig {
             rst: config.rst,
             dio0: config.dio0,
             busy: config.busy,
+            board_power_pin: config.board_power_pin,
+            board_power_level: config.board_power_level,
+            sx1262_tcxo_mv: config.sx1262_tcxo_mv,
+            sx1262_pa_duty: config.sx1262_pa_duty,
+            sx1262_pa_hp: config.sx1262_pa_hp,
+            sx1262_pa_device: config.sx1262_pa_device,
+            sx1262_pa_lut: config.sx1262_pa_lut,
+            sx1262_rx_timeout_ms: config.sx1262_rx_timeout_ms,
+            sx1262_sync_word: config.sx1262_sync_word,
             sf: config.sf,
             cr: config.cr,
             sync_word: config.sync_word,
             crc: if config.crc { 1 } else { 0 },
             beacon: if config.beacon { 1 } else { 0 },
-            _pad0: [0; 2],
+            sx1262_dio2_rf_switch: if config.sx1262_dio2_rf_switch { 1 } else { 0 },
+            _pad0: 0,
             preamble: config.preamble,
             tx_power: config.tx_power,
         }
@@ -849,6 +1304,16 @@ impl RtcLoraConfig {
             rst: self.rst,
             dio0: self.dio0,
             busy: self.busy,
+            board_power_pin: self.board_power_pin,
+            board_power_level: self.board_power_level,
+            sx1262_dio2_rf_switch: self.sx1262_dio2_rf_switch != 0,
+            sx1262_tcxo_mv: self.sx1262_tcxo_mv,
+            sx1262_pa_duty: self.sx1262_pa_duty,
+            sx1262_pa_hp: self.sx1262_pa_hp,
+            sx1262_pa_device: self.sx1262_pa_device,
+            sx1262_pa_lut: self.sx1262_pa_lut,
+            sx1262_rx_timeout_ms: self.sx1262_rx_timeout_ms,
+            sx1262_sync_word: self.sx1262_sync_word,
             sf: self.sf,
             cr: self.cr,
             sync_word: self.sync_word,
@@ -873,30 +1338,97 @@ fn valid_state(state: &RtcSleepState) -> bool {
     state.magic == RTC_MAGIC
         && state.version == RTC_VERSION
         && state.len as usize == size_of::<RtcSleepState>()
-        && checksum_for_validation(*state) == state.checksum
+        && checksum_for_validation(state) == state.checksum
 }
 
 fn update_checksum(mut state: RtcSleepState) -> RtcSleepState {
     state.checksum = 0;
-    state.checksum = checksum(state);
+    state.checksum = checksum(&state);
     state
 }
 
-fn checksum(state: RtcSleepState) -> u32 {
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&state as *const RtcSleepState).cast::<u8>(),
-            size_of::<RtcSleepState>(),
-        )
-    };
-    bytes.iter().fold(0x811c_9dc5_u32, |acc, byte| {
-        acc.wrapping_mul(16777619) ^ *byte as u32
-    })
+fn checksum(state: &RtcSleepState) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    hash = hash_u32(hash, state.magic);
+    hash = hash_u16(hash, state.version);
+    hash = hash_u16(hash, state.len);
+    hash = hash_u32(hash, state.flags);
+    hash = hash_u32(hash, state.wake_ms);
+    hash = hash_u32(hash, state.forward_ms);
+    hash = hash_u32(hash, state.boot_count);
+    hash = hash_u32(hash, state.wake_count);
+    hash = hash_u32(hash, state.last_cause);
+    hash = hash_u64(hash, state.last_ext1_mask);
+    hash = hash_u16(hash, state.last_packet_len);
+    hash = hash_u32(hash, state.last_packet_hash);
+
+    let lora = &state.lora;
+    hash = hash_i32(hash, lora.chip);
+    hash = hash_u32(hash, lora.frequency_hz);
+    hash = hash_u32(hash, lora.bandwidth_hz);
+    hash = hash_i32(hash, lora.spi_host);
+    hash = hash_i32(hash, lora.sck);
+    hash = hash_i32(hash, lora.miso);
+    hash = hash_i32(hash, lora.mosi);
+    hash = hash_i32(hash, lora.cs);
+    hash = hash_i32(hash, lora.rst);
+    hash = hash_i32(hash, lora.dio0);
+    hash = hash_i32(hash, lora.busy);
+    hash = hash_i32(hash, lora.board_power_pin);
+    hash = hash_i32(hash, lora.board_power_level);
+    hash = hash_i32(hash, lora.sx1262_tcxo_mv);
+    hash = hash_i32(hash, lora.sx1262_pa_duty);
+    hash = hash_i32(hash, lora.sx1262_pa_hp);
+    hash = hash_i32(hash, lora.sx1262_pa_device);
+    hash = hash_i32(hash, lora.sx1262_pa_lut);
+    hash = hash_i32(hash, lora.sx1262_rx_timeout_ms);
+    hash = hash_i32(hash, lora.sx1262_sync_word);
+    hash = hash_i32(hash, lora.sf);
+    hash = hash_i32(hash, lora.cr);
+    hash = hash_i32(hash, lora.sync_word);
+    hash = hash_u8(hash, lora.crc);
+    hash = hash_u8(hash, lora.beacon);
+    hash = hash_u8(hash, lora.sx1262_dio2_rf_switch);
+    hash = hash_i32(hash, lora.preamble);
+    hash = hash_i32(hash, lora.tx_power);
+    hash
 }
 
-fn checksum_for_validation(mut state: RtcSleepState) -> u32 {
-    state.checksum = 0;
+fn checksum_for_validation(state: &RtcSleepState) -> u32 {
     checksum(state)
+}
+
+fn hash_u8(hash: u32, value: u8) -> u32 {
+    hash_byte(hash, value)
+}
+
+fn hash_u16(mut hash: u32, value: u16) -> u32 {
+    for byte in value.to_le_bytes() {
+        hash = hash_byte(hash, byte);
+    }
+    hash
+}
+
+fn hash_u32(mut hash: u32, value: u32) -> u32 {
+    for byte in value.to_le_bytes() {
+        hash = hash_byte(hash, byte);
+    }
+    hash
+}
+
+fn hash_u64(mut hash: u32, value: u64) -> u32 {
+    for byte in value.to_le_bytes() {
+        hash = hash_byte(hash, byte);
+    }
+    hash
+}
+
+fn hash_i32(hash: u32, value: i32) -> u32 {
+    hash_u32(hash, value as u32)
+}
+
+fn hash_byte(hash: u32, byte: u8) -> u32 {
+    hash.wrapping_mul(16777619) ^ byte as u32
 }
 
 fn fnv1a32(bytes: &[u8]) -> u32 {
