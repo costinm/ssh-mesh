@@ -587,6 +587,25 @@ HOME = "/home/user1"
     }
 
     #[test]
+    fn test_parse_toml_lowercase_resource_aliases() {
+        let toml = r#"
+[Service]
+ExecStart = "/bin/true"
+
+[Resources]
+memory_min = "64M"
+memory_high = "1G"
+memory_max = "2G"
+cpu_weight = 200
+"#;
+        let config = parse_service(toml, Some("lowercase-resources")).unwrap();
+        assert_eq!(config.resources.memory_low, Some(64 * 1024 * 1024));
+        assert_eq!(config.resources.memory_high, Some(1024 * 1024 * 1024));
+        assert_eq!(config.resources.memory_max, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(config.resources.cpu_weight, Some(200));
+    }
+
+    #[test]
     fn test_parse_toml_resolves_user_and_primary_group() {
         let toml = r#"
 [Service]

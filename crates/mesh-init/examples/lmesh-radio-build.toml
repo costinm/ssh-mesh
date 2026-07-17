@@ -18,8 +18,8 @@ WorkingDirectory = "target"
 # Avoid root. Normally should be 'net' - but for testing use the dev user ( I use 'build' )
 User = "build"
 Group = "build"
-# For access to USB on deb-like. May need adjustments.
-SupplementaryGroups = ["plugdev"]
+# For access to WPA control sockets and USB serial devices on deb-like systems.
+SupplementaryGroups = ["plugdev", "dialout"]
 
 # It could also be on-demand if only handling eth.
 Restart = "always"
@@ -52,6 +52,9 @@ MESH_LOG_DIR = "lmesh-radio-build/log"
 
 # Special name with build - separate from the 'main' one.
 LMESH_CONTROL_SOCKET = "/run/mesh/lmesh-radio-build/mesh.sock"
+# WorkingDirectory is target/. Keep runtime config under target/etc/lmesh so it
+# is not tied to this example service name or local user naming.
+LMESH_CONFIG_FILE = "etc/lmesh/lmesh.toml"
 
 LMESH_WIFI_IFACE = "wlan1"
 LMESH_WPA_CTRL_DIR = "/run/mesh/wpa-supplicant-nan"

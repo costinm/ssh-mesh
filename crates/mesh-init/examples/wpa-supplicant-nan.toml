@@ -8,9 +8,7 @@
 Type = "exec"
 # mesh-init should be started with PATH containing the NAN-enabled
 # wpa_supplicant build, for example from .#radio-deps.
-# Keep wpa-supplicant-nan.conf in WorkingDirectory or replace -c with your
-# deployed config path.
-ExecStart = "wpa_supplicant -i wlan1 -D nl80211 -c wpa-supplicant-nan.conf -s"
+ExecStart = "wpa_supplicant -g /run/mesh/wpa-supplicant/global -G plugdev -c /ws/rust/ssh-mesh/crates/mesh-init/examples/wpa-supplicant-nan.conf -dd"
 WorkingDirectory = "target"
 User = "build"
 Group = "plugdev"

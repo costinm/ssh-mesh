@@ -77,6 +77,12 @@ pub fn create_cgroup(name: &str) -> Result<String, CgroupError> {
     if !Path::new(&scope_path).exists() {
         fs::create_dir_all(&scope_path)?;
         info!(path = %scope_path, "cgroup_created");
+    } else if let Err(error) = freeze_cgroup(&scope_path, false) {
+        debug!(
+            path = %scope_path,
+            error = %error,
+            "cgroup_unfreeze_existing_failed"
+        );
     }
 
     Ok(scope_path)
