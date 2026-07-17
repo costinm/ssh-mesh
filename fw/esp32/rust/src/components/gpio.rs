@@ -75,13 +75,29 @@ impl CommandHandler for GpioCommand {
 }
 
 fn validate_pin(pin: i32) -> Result<()> {
-    if !(0..=39).contains(&pin) {
+    if pin < 0 || pin > max_gpio_pin() {
         bail!("invalid ESP32 GPIO pin {pin}");
     }
+    #[cfg(target_feature = "esp32s3ops")]
+    if pin == 22 || pin == 23 || pin == 24 || pin == 25 {
+        bail!("GPIO{pin} is not exposed on ESP32-S3");
+    }
+    #[cfg(not(target_feature = "esp32s3ops"))]
     if (34..=39).contains(&pin) {
         log::warn!("GPIO{pin} is input-only on classic ESP32");
     }
     Ok(())
+}
+
+fn max_gpio_pin() -> i32 {
+    #[cfg(target_feature = "esp32s3ops")]
+    {
+        48
+    }
+    #[cfg(not(target_feature = "esp32s3ops"))]
+    {
+        39
+    }
 }
 
 fn esp_ok(ret: sys::esp_err_t) -> Result<()> {

@@ -13,7 +13,6 @@ use components::l3dmesh::L3Mesh;
 
 const BOOT_ACTIVE_WINDOW_MS: u32 = 10_000;
 const BOOT_PAIRING_HOLD_MS: u32 = 3_000;
-const BOOT_POLL_MS: u64 = 100;
 const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
 static UART0_EVENT_QUEUE: AtomicPtr<esp_idf_sys::QueueDefinition> =
     AtomicPtr::new(core::ptr::null_mut());
@@ -46,6 +45,16 @@ fn run() -> Result<()> {
     quiet_runtime_logs();
 
     let wake_cause = unsafe { esp_idf_sys::esp_sleep_get_wakeup_cause() };
+    rom_print(b"dm-rs boot step=settings\n\0");
+    let settings = components::settings::open_shared();
+    components::serial::configure_active_window(&settings);
+    rom_print(b"dm-rs boot step=power\n\0");
+    if let Err(err) = components::power::apply_default(&settings) {
+        components::telemetry::record_log(format!(
+            "event type=power.default ok=false msg={}",
+            commands::protocol::escape_value(&err.to_string())
+        ));
+    }
     rom_print(b"dm-rs boot step=wake\n\0");
     if let Err(err) = components::sleep::handle_deep_sleep_wake() {
         components::telemetry::record_log(format!(
@@ -54,8 +63,6 @@ fn run() -> Result<()> {
         ));
     }
 
-    rom_print(b"dm-rs boot step=settings\n\0");
-    let settings = components::settings::open_shared();
     rom_print(b"dm-rs boot step=registry\n\0");
     let mut registry = CommandRegistry::new();
     components::register_commands(&mut registry, settings.clone());
@@ -77,9 +84,10 @@ fn run() -> Result<()> {
     components::ble_bt::configure_companion_advertising(30_000, 5_000);
     components::ble_bt::configure_companion_active_window(companion_active_ms);
     rom_print(b"dm-rs boot step=boot_window\n\0");
-    let pairing_recovery = run_boot_active_window(wake_cause, &mut registry);
+    let boot_window = run_boot_active_window(wake_cause, &mut registry);
+    apply_post_boot_uart_policy(&boot_window);
     rom_print(b"dm-rs boot step=mode\n\0");
-    if pairing_recovery {
+    if boot_window.pairing_recovery {
         match components::ble_bt::start_pairing_recovery(&settings) {
             Ok(removed) => {
                 components::telemetry::record_log(format!(
@@ -104,7 +112,7 @@ fn run() -> Result<()> {
         components::mode::init(&settings);
     }
 
-    if pairing_recovery {
+    if boot_window.pairing_recovery {
         rom_print(b"dm-rs boot step=mesh_skip_pairing\n\0");
         components::telemetry::record_log(
             "event type=mesh.start skipped=true reason=pairing_recovery",
@@ -122,6 +130,7 @@ fn run() -> Result<()> {
     let mut serial_enabled = true;
     let ready = "event type=system.ready app=dmesh-rs";
     components::telemetry::record_log(ready);
+    components::serial::activate_window();
     rom_print(b"dm-rs boot step=console\n\0");
     let mut line = Vec::new();
     if serial_enabled {
@@ -132,12 +141,18 @@ fn run() -> Result<()> {
         components::mode::poll(&settings);
         components::ble_bt::poll_text_commands(&mut registry);
         poll_raw_wifi_commands(&mut registry, &settings);
+        poll_nan_commands(&mut registry, &settings);
+        components::test::poll_main();
         if components::button::take_long_presses() > 0 {
             serial_enabled = true;
+            components::serial::set_debug_enabled(true);
+            components::serial::activate_window();
             components::mode::mark_companion_active(&settings, companion_active_ms);
             uart_write("dm-rs> ");
         }
         for _ in 0..components::button::take_cycle_presses() {
+            components::serial::set_debug_enabled(true);
+            components::serial::activate_window();
             components::mode::handle_button_short(&settings);
             serial_enabled = true;
             if serial_enabled {
@@ -156,12 +171,8 @@ fn run() -> Result<()> {
             UartWait::Timeout => {
                 components::telemetry::record_uart_timeout();
             }
-            UartWait::Error => {
-                components::telemetry::record_uart_error();
-                log::warn!("console event wait failed");
-                task_delay(Duration::from_millis(250));
-            }
         }
+        components::serial::poll_active_window();
     }
 }
 
@@ -176,6 +187,8 @@ fn drain_uart_console(
     loop {
         match uart_read(&mut buf, Duration::from_millis(0)) {
             read if read > 0 => {
+                components::serial::set_debug_enabled(true);
+                components::serial::activate_window();
                 components::telemetry::record_uart_read(read as usize);
                 if !*serial_enabled {
                     *serial_enabled = true;
@@ -209,15 +222,24 @@ fn drain_uart_console(
 enum UartWait {
     Data,
     Timeout,
-    Error,
+}
+
+struct BootWindowResult {
+    probed: bool,
+    pairing_recovery: bool,
+    uart_input: bool,
 }
 
 fn run_boot_active_window(
     wake_cause: esp_idf_sys::esp_sleep_source_t,
     registry: &mut CommandRegistry,
-) -> bool {
+) -> BootWindowResult {
     if !is_real_boot(wake_cause) {
-        return false;
+        return BootWindowResult {
+            probed: false,
+            pairing_recovery: false,
+            uart_input: false,
+        };
     }
 
     let boot_pressed = components::button::is_pressed();
@@ -230,7 +252,7 @@ fn run_boot_active_window(
         "event type=boot_window start=true cause={} probe_long_press={} window_ms={}",
         wake_cause_name(wake_cause),
         probe_long_press,
-        BOOT_ACTIVE_WINDOW_MS
+        boot_active_window_ms()
     ));
     uart_write(&format!(
         "event type=boot_window start=true cause={} probe_long_press={} gpio={} pressed={}\n",
@@ -242,57 +264,88 @@ fn run_boot_active_window(
         boot_pressed
     ));
 
-    let deadline = Instant::now() + Duration::from_millis(BOOT_ACTIVE_WINDOW_MS as u64);
-    let mut pressed_since: Option<Instant> = None;
+    let deadline = Instant::now() + Duration::from_millis(boot_active_window_ms() as u64);
     let mut line = Vec::new();
+    let mut uart_input = false;
     uart_write("dm-rs> ");
-    while Instant::now() < deadline {
-        poll_boot_console(registry, &mut line);
-        if probe_long_press {
-            if components::button::is_pressed() {
-                let start = match pressed_since {
-                    Some(start) => start,
-                    None => {
-                        let start = Instant::now();
-                        pressed_since = Some(start);
-                        uart_write("event type=boot_window button_down=true\n");
-                        start
-                    }
-                };
-                if start.elapsed() >= Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64) {
-                    uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
-                    components::button::suppress_until_release();
-                    components::telemetry::record_log(
-                        "event type=boot_window long_press=true pending=pairing_recovery",
-                    );
-                    components::telemetry::record_log(
-                        "event type=boot_window done=true pairing_recovery=true immediate=true",
-                    );
-                    return true;
-                }
-            } else {
-                if let Some(start) = pressed_since.take() {
-                    uart_write(&format!(
-                        "event type=boot_window button_up=true held_ms={}\n",
-                        start.elapsed().as_millis()
-                    ));
-                }
-                pressed_since = None;
-            }
+    if boot_pressed {
+        let hold = Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64);
+        let _ = wait_for_firmware_activity(hold);
+        uart_input |= poll_boot_console(registry, &mut line);
+        if components::button::is_pressed() {
+            uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
+            components::button::suppress_until_release();
+            components::telemetry::record_log(
+                "event type=boot_window long_press=true pending=pairing_recovery",
+            );
+            components::telemetry::record_log(
+                "event type=boot_window done=true pairing_recovery=true immediate=true",
+            );
+            return BootWindowResult {
+                probed: true,
+                pairing_recovery: true,
+                uart_input,
+            };
         }
-        task_delay(Duration::from_millis(BOOT_POLL_MS));
+    }
+    while Instant::now() < deadline {
+        uart_input |= poll_boot_console(registry, &mut line);
+        if probe_long_press && components::button::take_long_presses() > 0 {
+            uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
+            components::button::suppress_until_release();
+            components::telemetry::record_log(
+                "event type=boot_window long_press=true pending=pairing_recovery",
+            );
+            components::telemetry::record_log(
+                "event type=boot_window done=true pairing_recovery=true immediate=true",
+            );
+            return BootWindowResult {
+                probed: true,
+                pairing_recovery: true,
+                uart_input,
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait = remaining.min(Duration::from_millis(500));
+        let _ = wait_for_firmware_activity(wait);
     }
     components::telemetry::record_log(format!(
         "event type=boot_window done=true pairing_recovery={}",
         false
     ));
-    false
+    BootWindowResult {
+        probed: true,
+        pairing_recovery: false,
+        uart_input,
+    }
 }
 
-fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) {
+fn boot_active_window_ms() -> u32 {
+    BOOT_ACTIVE_WINDOW_MS
+}
+
+fn apply_post_boot_uart_policy(boot_window: &BootWindowResult) {
+    if !boot_window.probed {
+        return;
+    }
+    if boot_window.uart_input {
+        components::telemetry::record_log("event type=uart.boot_policy input=true debug=true");
+        components::serial::set_debug_enabled(true);
+        return;
+    }
+
+    components::telemetry::record_log("event type=uart.boot_policy input=false debug=false");
+    components::serial::set_debug_enabled(false);
+}
+
+fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) -> bool {
     let mut buf = [0_u8; 128];
     match uart_read(&mut buf, Duration::from_millis(0)) {
         read if read > 0 => {
+            components::serial::activate_window();
             let read = read as usize;
             for byte in &buf[..read] {
                 if *byte == b'\n' || *byte == b'\r' {
@@ -307,12 +360,14 @@ fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) {
                     line.push(*byte);
                 }
             }
+            true
         }
         -1 => {
             log::warn!("boot console read failed");
             task_delay(Duration::from_millis(20));
+            false
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -355,15 +410,46 @@ fn poll_raw_wifi_commands(
             command.rssi
         ));
         let response = if command.text.starts_with("dmesh.ping") {
-            components::mode::status_pong_text(settings, "wifi_raw")
+            let source = match command.response {
+                components::wifi::WifiResponsePath::Action => "wifi_raw",
+                components::wifi::WifiResponsePath::Data => "wifi_data",
+            };
+            components::mode::status_pong_text(settings, source)
         } else {
             transports::dispatch_text_line(registry, &command.text)
         };
-        if let Err(err) =
-            components::wifi::send_vendor_payload_to(command.source, response.as_bytes())
-        {
+        let response = format!("resp {response}");
+        if let Err(err) = components::wifi::send_response_payload_to(
+            command.response,
+            command.source,
+            response.as_bytes(),
+        ) {
             components::telemetry::record_log(format!(
                 "event type=wifi.raw_response ok=false msg={}",
+                commands::protocol::escape_value(&err.to_string())
+            ));
+        }
+    }
+}
+
+fn poll_nan_commands(
+    registry: &mut CommandRegistry,
+    settings: &components::settings::SharedSettings,
+) {
+    while let Some(command) = components::nan::take_command() {
+        components::telemetry::record_log(format!(
+            "event type=nan.command len={}",
+            command.text.len()
+        ));
+        let response = if command.text.starts_with("dmesh.ping") {
+            components::mode::status_pong_text(settings, "nan")
+        } else {
+            transports::dispatch_text_line(registry, &command.text)
+        };
+        let response = format!("resp {response}");
+        if let Err(err) = components::nan::send_response_payload_to(&command, response.as_bytes()) {
+            components::telemetry::record_log(format!(
+                "event type=nan.response ok=false msg={}",
                 commands::protocol::escape_value(&err.to_string())
             ));
         }
@@ -382,13 +468,12 @@ fn init_console_uart() {
 
     unsafe {
         let mut config = esp_idf_sys::uart_config_t::default();
-        config.baud_rate = 115_200;
+        config.baud_rate = 460_800;
         config.data_bits = esp_idf_sys::uart_word_length_t_UART_DATA_8_BITS;
         config.parity = esp_idf_sys::uart_parity_t_UART_PARITY_DISABLE;
         config.stop_bits = esp_idf_sys::uart_stop_bits_t_UART_STOP_BITS_1;
         config.flow_ctrl = esp_idf_sys::uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE;
-        config.__bindgen_anon_1.source_clk =
-            esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_DEFAULT;
+        config.__bindgen_anon_1.source_clk = uart_source_clk();
 
         let _ = esp_idf_sys::uart_param_config(UART0, &config);
         let mut queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
@@ -407,8 +492,19 @@ fn init_console_uart() {
                 UART0_VFS,
                 esp_idf_sys::esp_line_endings_t_ESP_LINE_ENDINGS_CRLF,
             );
+            components::serial::activate_window();
         }
     }
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
+    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_XTAL
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
+fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
+    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_DEFAULT
 }
 
 fn start_uart_event_task(queue: esp_idf_sys::QueueHandle_t) {
@@ -461,13 +557,6 @@ unsafe extern "C" fn uart_event_task(arg: *mut core::ffi::c_void) {
 }
 
 fn wait_for_firmware_activity(timeout: Duration) -> UartWait {
-    let mut pending = 0_usize;
-    let ret = unsafe {
-        esp_idf_sys::uart_get_buffered_data_len(esp_idf_sys::uart_port_t_UART_NUM_0, &mut pending)
-    };
-    if ret == esp_idf_sys::ESP_OK && pending > 0 {
-        return UartWait::Data;
-    }
     if components::wake::wait(timeout) {
         UartWait::Data
     } else {
@@ -476,14 +565,7 @@ fn wait_for_firmware_activity(timeout: Duration) -> UartWait {
 }
 
 fn uart_read(buf: &mut [u8], timeout: Duration) -> i32 {
-    unsafe {
-        esp_idf_sys::uart_read_bytes(
-            esp_idf_sys::uart_port_t_UART_NUM_0,
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            buf.len() as u32,
-            duration_to_ticks(timeout),
-        )
-    }
+    components::serial::read(buf, duration_to_ticks(timeout))
 }
 
 fn task_delay(timeout: Duration) {
@@ -502,14 +584,7 @@ fn duration_to_ticks(timeout: Duration) -> esp_idf_sys::TickType_t {
 }
 
 fn uart_write(text: &str) {
-    unsafe {
-        let bytes = text.as_bytes();
-        let _ = esp_idf_sys::uart_write_bytes(
-            esp_idf_sys::uart_port_t_UART_NUM_0,
-            bytes.as_ptr() as *const core::ffi::c_void,
-            bytes.len(),
-        );
-    }
+    components::serial::write(text);
 }
 
 fn quiet_runtime_logs() {

@@ -10,9 +10,13 @@ pub mod lora;
 pub mod mode;
 pub mod nan;
 pub mod nvs;
+pub mod power;
+pub mod rgbled;
+pub mod serial;
 pub mod settings;
 pub mod sleep;
 pub mod telemetry;
+pub mod test;
 pub mod wake;
 pub mod wifi;
 
@@ -30,7 +34,10 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     mode::register_commands(registry, settings.clone());
     ble_bt::register_commands(registry, settings.clone());
     nan::register_commands(registry, settings.clone());
+    power::register_commands(registry, settings.clone());
+    rgbled::register_commands(registry);
     sleep::register_commands(registry, settings.clone());
+    test::register_commands(registry);
     telemetry::register_commands(registry, settings.clone());
     nvs::register_commands(registry, settings);
     wifi::register_commands(registry);

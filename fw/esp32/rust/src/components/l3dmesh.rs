@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::Result;
 
 /// A borrowed or owned mesh frame received from an L2 transport.

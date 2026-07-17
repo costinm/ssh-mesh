@@ -292,7 +292,7 @@ def run_cross_radio_smoke(boards: list[Board], args: argparse.Namespace) -> None
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", action="append", default=[], help="Serial port to test.")
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--timeout", type=float, default=6.0)
     parser.add_argument("--lora-freq", type=int, default=913_125_000)
     parser.add_argument("--sync-word", default="0x2b")

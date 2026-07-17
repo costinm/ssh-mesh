@@ -7,47 +7,10 @@ import argparse
 import threading
 import time
 
-import serial
+from serial_cmd import Console
 
 
 PROMPT = b"dm-rs> "
-
-
-class Console:
-    def __init__(self, port: str, timeout: float) -> None:
-        self.port = port
-        self.timeout = timeout
-        self.ser = serial.Serial(port, 115200, timeout=0.2, write_timeout=2)
-
-    def close(self) -> None:
-        self.ser.close()
-
-    def sync(self) -> str:
-        self.ser.reset_input_buffer()
-        self.ser.write(b"\n")
-        self.ser.flush()
-        return self.read_until_prompt(self.timeout)
-
-    def cmd(self, command: str, timeout: float | None = None) -> str:
-        print(f"[{self.port}] $ {command}", flush=True)
-        self.ser.write((command + "\n").encode())
-        self.ser.flush()
-        out = self.read_until_prompt(timeout or self.timeout)
-        print(out.rstrip(), flush=True)
-        return out
-
-    def read_until_prompt(self, timeout: float) -> str:
-        deadline = time.monotonic() + timeout
-        buf = bytearray()
-        while time.monotonic() < deadline:
-            data = self.ser.read(4096)
-            if data:
-                buf.extend(data)
-                if PROMPT in buf:
-                    break
-            else:
-                time.sleep(0.05)
-        return bytes(buf).decode("utf-8", "replace").replace("\r", "")
 
 
 def require_ok(output: str, context: str) -> None:
@@ -69,34 +32,34 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=12.0)
     args = parser.parse_args()
 
-    rx = Console(args.rx, args.timeout)
-    tx = Console(args.tx, args.timeout)
+    rx = Console(args.rx, 460800, args.timeout)
+    tx = Console(args.tx, 460800, args.timeout)
     try:
         print(f"[{args.rx}] sync")
         print(rx.sync().rstrip())
         print(f"[{args.tx}] sync")
         print(tx.sync().rstrip())
 
-        require_ok(rx.cmd("lora rx=false", args.timeout), "rx stop background")
-        require_ok(tx.cmd("lora rx=false", args.timeout), "tx stop background")
+        require_ok(run(rx, "lora rx=false", args.timeout), "rx stop background")
+        require_ok(run(tx, "lora rx=false", args.timeout), "tx stop background")
         time.sleep(0.5)
 
         config = (
             f"lora freq={args.freq} bw={args.bw} sf={args.sf} cr={args.cr} "
             f"sync_word={args.sync_word} preamble=16 crc=true apply=true"
         )
-        require_ok(rx.cmd(config, args.timeout), "rx config")
-        require_ok(tx.cmd(config, args.timeout), "tx config")
+        require_ok(run(rx, config, args.timeout), "rx config")
+        require_ok(run(tx, config, args.timeout), "tx config")
 
         rx_output: dict[str, str] = {}
 
         def listen() -> None:
-            rx_output["text"] = rx.cmd("loralisten ms=9000 count=2", args.timeout + 4)
+            rx_output["text"] = run(rx, "loralisten ms=9000 count=2", args.timeout + 4)
 
         thread = threading.Thread(target=listen)
         thread.start()
         time.sleep(1.0)
-        tx_out = tx.cmd(f"lorasend data={args.payload} timeout=4000", args.timeout)
+        tx_out = run(tx, f"lorasend data={args.payload} timeout=4000", args.timeout)
         require_ok(tx_out, "tx send")
         thread.join(args.timeout + 6)
         if thread.is_alive():
@@ -111,6 +74,13 @@ def main() -> int:
     finally:
         rx.close()
         tx.close()
+
+
+def run(console: Console, command: str, timeout: float | None = None) -> str:
+    print(f"[{console.port}] $ {command}", flush=True)
+    out = console.cmd(command, timeout)
+    print(out.rstrip(), flush=True)
+    return out
 
 
 if __name__ == "__main__":

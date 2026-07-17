@@ -185,14 +185,7 @@ impl CommandHandler for AdcProbeCommand {
 }
 
 fn uart_write(text: &str) {
-    unsafe {
-        let bytes = text.as_bytes();
-        let _ = sys::uart_write_bytes(
-            sys::uart_port_t_UART_NUM_0,
-            bytes.as_ptr() as *const core::ffi::c_void,
-            bytes.len(),
-        );
-    }
+    super::serial::write(text);
 }
 
 #[derive(Clone, Copy)]

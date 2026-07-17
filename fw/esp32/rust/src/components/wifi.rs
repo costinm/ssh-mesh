@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -13,9 +12,20 @@ use super::frames::{hex_bytes, parse_bytes};
 use super::settings::{parse_bool, parse_i32};
 use super::telemetry::{self, Direction};
 
+unsafe extern "C" {
+    fn esp_wifi_connectionless_module_set_wake_interval(wake_interval: u16) -> sys::esp_err_t;
+}
+
 const FRAME_ADDR1: usize = 4;
 const FRAME_ADDR2: usize = 10;
 const FRAME_ADDR3: usize = 16;
+#[allow(dead_code)]
+const ETH_ADDR_DST: usize = 0;
+#[allow(dead_code)]
+const ETH_ADDR_SRC: usize = 6;
+#[allow(dead_code)]
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const IEEE80211_LLC_SNAP_LEN: usize = 8;
 const RAW_FILTER_ALL: u32 = 0;
 const RAW_FILTER_MGMT: u32 = 1;
 const RAW_FILTER_ACTION: u32 = 2;
@@ -32,10 +42,14 @@ const RAW_BROADCAST: [u8; 6] = [0xff; 6];
 // 33:33:00:00:52:27. Directed device traffic uses the peer MAC with the
 // multicast bit set.
 const LMESH_IPV6_DISCOVERY_MULTICAST: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x52, 0x27];
-const DMESH_ESPNOW_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
-const DMESH_ESPNOW_TYPE: u8 = 0x04;
-const DMESH_VENDOR_MARKER_LEN: usize = 9;
+const LMESH_IPV4_MULTICAST: [u8; 4] = [224, 0, 0, 250];
+const DMESH_UDP_PORT: u16 = 15009;
+const DMESH_DATA_MARKER_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
+const DMESH_DATA_MARKER_TYPE: u8 = 0x04;
+const DMESH_DATA_MARKER_LEN: usize = 9;
 const DMESH_FIXED_MESH_DST4: [u8; 4] = [0xff; 4];
+const IEEE80211_LLC_SNAP_IPV4: [u8; IEEE80211_LLC_SNAP_LEN] =
+    [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static RAW_FILTER_MODE: AtomicU32 = AtomicU32::new(RAW_FILTER_MGMT);
@@ -56,6 +70,7 @@ static RAW_RX_LAST_RSSI: AtomicI32 = AtomicI32::new(0);
 static RAW_TX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_DROPPED: AtomicU32 = AtomicU32::new(0);
+static WIFI_CONNECTIONLESS_WAKE_INTERVAL_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_WIFI_INIT: AtomicBool = AtomicBool::new(false);
 static WIFI_NETIF_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 static WIFI_NETIF_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
@@ -69,16 +84,45 @@ static RAW_LAST_COMMAND_PEER: [AtomicU8; 6] = [
     AtomicU8::new(0),
 ];
 static RAW_LAST_COMMAND_PEER_VALID: AtomicBool = AtomicBool::new(false);
+static RAW_LAST_COMMAND_RESPONSE: AtomicU8 = AtomicU8::new(0);
+static WIFI_NOTIFY_FORWARDING: AtomicBool = AtomicBool::new(false);
 static mut RAW_RX_LAST: [u8; 256] = [0; 256];
-static mut WIFI_NETIF_RX_LAST: [u8; 256] = [0; 256];
-static mut WIFI_STA_NETIF: *mut sys::esp_netif_t = std::ptr::null_mut();
-static mut WIFI_AP_NETIF: *mut sys::esp_netif_t = std::ptr::null_mut();
 
 #[derive(Clone, Debug)]
 pub struct RawWifiCommand {
     pub source: [u8; 6],
     pub text: String,
     pub rssi: i32,
+    pub response: WifiResponsePath,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum WifiResponsePath {
+    Action,
+    Data,
+}
+
+impl WifiResponsePath {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Action => 0,
+            Self::Data => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Data,
+            _ => Self::Action,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Action => "action",
+            Self::Data => "data",
+        }
+    }
 }
 
 static RAW_COMMAND_QUEUE: OnceLock<Mutex<VecDeque<RawWifiCommand>>> = OnceLock::new();
@@ -89,16 +133,16 @@ pub fn register_commands(registry: &mut CommandRegistry) {
 
 pub fn forward_management_packet(packet: &[u8]) -> Result<()> {
     ensure_raw_wifi_started(6)?;
-    let frame = vendor_action_frame(RAW_BROADCAST, packet)?;
+    let frame = nan_action_frame(RAW_BROADCAST, packet)?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet("wifi", Direction::Tx, packet, "source=lora_forward");
     Ok(())
 }
 
-pub fn send_vendor_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
+pub fn send_raw_action_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
     ensure_raw_wifi_started(6)?;
-    let frame = vendor_action_frame(destination, payload)?;
+    let frame = nan_action_frame(destination, payload)?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet(
@@ -113,10 +157,58 @@ pub fn send_vendor_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()
     Ok(())
 }
 
+pub fn send_data_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
+    prepare_raw_tx(6)?;
+    let frame = dmesh_data_frame(destination, None, payload)?;
+    raw_tx_frame(&frame, true)?;
+    RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    telemetry::record_packet(
+        "wifi",
+        Direction::Tx,
+        payload,
+        format!(
+            "source=data_command_response dst={}",
+            format_mac(destination)
+        ),
+    );
+    Ok(())
+}
+
+pub fn send_response_payload_to(
+    response: WifiResponsePath,
+    destination: [u8; 6],
+    payload: &[u8],
+) -> Result<()> {
+    match response {
+        WifiResponsePath::Action => send_raw_action_payload_to(destination, payload),
+        WifiResponsePath::Data => send_data_payload_to(destination, payload),
+    }
+}
+
+pub fn forward_console_notification(line: &str) {
+    if WIFI_NOTIFY_FORWARDING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let result = (|| -> Result<()> {
+        let peer = last_command_peer().context("no wifi command peer known")?;
+        let response = last_response_path();
+        let mut payload = String::from("notify ");
+        payload.push_str(line);
+        if payload.len() > 900 {
+            payload.truncate(900);
+        }
+        send_response_payload_to(response, peer, payload.as_bytes())
+    })();
+    if result.is_err() {
+        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    WIFI_NOTIFY_FORWARDING.store(false, Ordering::Release);
+}
+
 #[allow(dead_code)]
 pub fn send_to_last_command_peer(payload: &[u8]) -> Result<()> {
     let peer = last_command_peer().context("no raw wifi command peer known")?;
-    send_vendor_payload_to(peer, payload)
+    send_raw_action_payload_to(peer, payload)
 }
 
 pub fn take_raw_command() -> Option<RawWifiCommand> {
@@ -125,6 +217,12 @@ pub fn take_raw_command() -> Option<RawWifiCommand> {
 
 pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
     start_raw_only(channel, filter)
+}
+
+pub fn start_sta_idle_mode(channel: u8, ssid: &str) -> Result<()> {
+    validate_wifi_string("ssid", ssid, 32)?;
+    low_level_start_sta_idle(ssid, channel.clamp(1, 13))?;
+    Ok(())
 }
 
 pub fn start_light_sleep_test_mode(mode: &str, channel: u8) -> Result<()> {
@@ -206,10 +304,25 @@ pub fn power_save_name() -> &'static str {
     }
 }
 
+pub fn set_connectionless_wake_interval(interval_ms: u16) -> Result<()> {
+    ensure_low_level_wifi()?;
+    unsafe {
+        let _ = sys::esp_wifi_set_promiscuous(false);
+        let _ = sys::esp_wifi_stop();
+        esp_ok(esp_wifi_connectionless_module_set_wake_interval(
+            interval_ms,
+        ))?;
+    }
+    WIFI_CONNECTIONLESS_WAKE_INTERVAL_MS.store(interval_ms as u32, Ordering::Relaxed);
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WifiMode {
     Off,
     StaIdle,
+    ApIdle,
     Raw,
     RawData,
     RawSta,
@@ -240,11 +353,23 @@ impl CommandHandler for WifiCommand {
     }
 
     fn help(&self) -> &'static str {
-        "wifi mode=off|sta_idle|raw|raw_data|raw_sta|raw_sta_data|raw_ap|raw_ap_data|raw_ap_sta|raw_ap_sta_data channel=6 filter=dmesh ssid=SSID psk=PSK timeout=MS | wifi scan=true | wifi raw=hex:... | wifi raw_action=TEXT | wifi raw_data=TEXT | wifi raw_stats=true"
+        "wifi mode=off|sta_idle|ap_idle|raw|raw_data|raw_sta|raw_sta_data|raw_ap|raw_ap_data|raw_ap_sta|raw_ap_sta_data channel=6 filter=dmesh ssid=SSID psk=PSK timeout=MS | wifi wake_interval_ms=7000 | wifi scan=true | wifi raw=hex:... | wifi raw_action=TEXT | wifi raw_data=TEXT | wifi raw_stats=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         self.configure_raw_filter(request)?;
+        if let Some(interval) = request
+            .arg("wake_interval_ms")
+            .or_else(|| request.arg("conn_wake_ms"))
+        {
+            let interval = parse_i32(interval)?.clamp(0, u16::MAX as i32) as u16;
+            set_connectionless_wake_interval(interval)?;
+            return Ok(CommandResponse::ok(format!(
+                "wifi connectionless_wake_interval_ms={} {}",
+                interval,
+                raw_stats()
+            )));
+        }
         if request.arg("raw_stop").is_some() {
             stop_raw_monitor()?;
             return Ok(CommandResponse::ok("wifi raw monitor stopped"));
@@ -329,13 +454,24 @@ impl CommandHandler for WifiCommand {
                 .map(parse_bool)
                 .transpose()?
                 .unwrap_or(false);
+            let ds = request.arg("ds").or_else(|| request.arg("data_ds"));
             prepare_raw_tx(channel)?;
-            let frame = match (bssid, to_ap) {
-                (Some(bssid), true) => {
+            let frame = match (bssid, ds) {
+                (Some(bssid), Some("none" | "nods" | "ibss")) => {
+                    dmesh_data_frame_with_bssid(destination, source, bssid, payload.as_bytes())?
+                }
+                (Some(bssid), Some("to_ap" | "tods" | "sta_to_ap")) => {
                     dmesh_sta_to_ap_data_frame(destination, source, bssid, payload.as_bytes())?
                 }
-                (Some(bssid), false) => {
+                (Some(bssid), Some("from_ap" | "fromds" | "ap_to_sta")) => {
                     dmesh_ap_to_sta_data_frame(destination, bssid, payload.as_bytes())?
+                }
+                (Some(_), Some(other)) => bail!("unsupported raw_data ds={other}"),
+                (Some(bssid), None) if to_ap => {
+                    dmesh_sta_to_ap_data_frame(destination, source, bssid, payload.as_bytes())?
+                }
+                (Some(bssid), None) => {
+                    dmesh_data_frame_with_bssid(destination, source, bssid, payload.as_bytes())?
                 }
                 (None, _) => dmesh_data_frame(destination, source, payload.as_bytes())?,
             };
@@ -365,7 +501,7 @@ impl CommandHandler for WifiCommand {
                 .transpose()?
                 .unwrap_or(RAW_BROADCAST);
             prepare_raw_tx(channel)?;
-            let frame = vendor_action_frame(destination, payload.as_bytes())?;
+            let frame = nan_action_frame(destination, payload.as_bytes())?;
             raw_tx_frame(&frame, true)?;
             RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
             telemetry::record_packet("wifi", Direction::Tx, payload.as_bytes(), "raw_action=true");
@@ -380,8 +516,7 @@ impl CommandHandler for WifiCommand {
             return Ok(CommandResponse::ok("wifi stopped"));
         }
         if request.arg("time").is_some() {
-            start_sntp(request.arg("time").unwrap_or("pool.ntp.org"))?;
-            return Ok(CommandResponse::ok("wifi sntp started"));
+            bail!("wifi time/SNTP is not compiled; firmware does not start IP services");
         }
         if request.arg("scan").is_some() {
             return self.scan();
@@ -445,7 +580,17 @@ impl WifiCommand {
             "sta_idle" | "idle_sta" | "sta_only" | "station_idle" => {
                 let ssid = request.arg("ssid").unwrap_or("DMesh-Idle");
                 validate_wifi_string("ssid", ssid, 32)?;
-                low_level_start_sta_idle(ssid, channel)?;
+                if let Some(bssid) = request
+                    .arg("bssid")
+                    .or_else(|| request.arg("ap_bssid"))
+                    .map(parse_mac)
+                    .transpose()?
+                {
+                    low_level_start_fake_sta(ssid, "", bssid, channel)?;
+                } else {
+                    low_level_start_sta_idle(ssid, channel)?;
+                }
+                reject_netif_probe_if_requested(request)?;
                 self.mode = WifiMode::StaIdle;
                 self.ssid = Some(ssid.to_string());
                 self.psk = None;
@@ -453,6 +598,24 @@ impl WifiCommand {
                     "wifi mode=StaIdle ssid={} channel={} connect=false {} {}",
                     ssid,
                     channel,
+                    wifi_net_status(),
+                    raw_stats()
+                )))
+            }
+            "ap_idle" | "idle_ap" | "ap_only" | "softap_idle" => {
+                let (ssid, psk) = self.ap_identity(request)?;
+                let beacon_tu = command_beacon_tu(request)?;
+                low_level_start_ap_with_beacon_tu(&ssid, &psk, channel, beacon_tu)?;
+                reject_netif_probe_if_requested(request)?;
+                self.mode = WifiMode::ApIdle;
+                self.ssid = Some(ssid.clone());
+                self.psk = Some(psk.clone());
+                Ok(CommandResponse::ok(format!(
+                    "wifi mode=ApIdle ssid={} channel={} beacon_tu={} auth={} {} {}",
+                    ssid,
+                    channel,
+                    beacon_tu,
+                    if psk.is_empty() { "open" } else { "wpa2" },
                     wifi_net_status(),
                     raw_stats()
                 )))
@@ -469,6 +632,7 @@ impl WifiCommand {
                 start_raw_after_wifi(channel, mode_filter_name(request, "dmesh"))?;
                 if timeout_ms > 0 {
                     task_delay(Duration::from_millis(timeout_ms as u64));
+                    disable_mesh_ip_services();
                 }
                 self.mode = WifiMode::RawSta;
                 self.ssid = Some(ssid.to_string());
@@ -492,6 +656,7 @@ impl WifiCommand {
                     start_raw_after_wifi(channel, mode_filter_name(request, "dmesh_data"))?;
                     if timeout_ms > 0 {
                         task_delay(Duration::from_millis(timeout_ms as u64));
+                        disable_mesh_ip_services();
                     }
                     self.mode = WifiMode::RawStaData;
                     self.ssid = Some(ssid.to_string());
@@ -595,6 +760,7 @@ impl WifiCommand {
                 start_raw_after_wifi(channel, mode_filter_name(request, "dmesh"))?;
                 if timeout_ms > 0 {
                     task_delay(Duration::from_millis(timeout_ms as u64));
+                    disable_mesh_ip_services();
                 }
                 self.mode = WifiMode::RawApSta;
                 self.ssid = Some(ap_ssid.clone());
@@ -628,6 +794,7 @@ impl WifiCommand {
                 start_raw_after_wifi(channel, mode_filter_name(request, "dmesh_data"))?;
                 if timeout_ms > 0 {
                     task_delay(Duration::from_millis(timeout_ms as u64));
+                    disable_mesh_ip_services();
                 }
                 self.mode = WifiMode::RawApStaData;
                 self.ssid = Some(ap_ssid.clone());
@@ -662,6 +829,7 @@ impl WifiCommand {
         start_raw_after_wifi(channel, raw_filter_name())?;
         if timeout_ms > 0 {
             task_delay(Duration::from_millis(timeout_ms as u64));
+            disable_mesh_ip_services();
         }
         self.mode = WifiMode::RawSta;
         Ok(CommandResponse::ok(format!(
@@ -808,14 +976,7 @@ pub fn ensure_raw_wifi_started(channel: u8) -> Result<()> {
 
 fn ensure_low_level_wifi() -> Result<()> {
     unsafe {
-        esp_ok_allow_invalid_state(sys::esp_netif_init())?;
         esp_ok_allow_invalid_state(sys::esp_event_loop_create_default())?;
-        if WIFI_STA_NETIF.is_null() {
-            WIFI_STA_NETIF = sys::esp_netif_create_default_wifi_sta();
-        }
-        if WIFI_AP_NETIF.is_null() {
-            WIFI_AP_NETIF = sys::esp_netif_create_default_wifi_ap();
-        }
         if !RAW_WIFI_INIT.swap(true, Ordering::SeqCst) {
             let mut cfg = wifi_init_config_default();
             let ret = sys::esp_wifi_init(&mut cfg);
@@ -829,6 +990,12 @@ fn ensure_low_level_wifi() -> Result<()> {
     Ok(())
 }
 
+fn disable_mesh_ip_services() {
+    // No-op by design: this firmware profile does not create esp_netif objects
+    // for raw mesh modes, so there is no DHCP or IP state to stop.
+}
+
+#[allow(dead_code)]
 fn low_level_start_ap(ssid: &str, psk: &str, channel: u8) -> Result<()> {
     low_level_start_ap_with_beacon_tu(ssid, psk, channel, 100)
 }
@@ -842,6 +1009,7 @@ fn low_level_start_ap_with_beacon_tu(
     ensure_low_level_wifi()?;
     unsafe {
         let _ = sys::esp_wifi_stop();
+        let _ = sys::esp_wifi_set_promiscuous(false);
         esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_AP))?;
         let mut ap = sys::wifi_ap_config_t::default();
         copy_cstr_bytes(&mut ap.ssid, ssid.as_bytes());
@@ -861,10 +1029,10 @@ fn low_level_start_ap_with_beacon_tu(
             &mut conf,
         ))?;
         esp_ok(sys::esp_wifi_start())?;
-        if !WIFI_AP_NETIF.is_null() {
-            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_AP_NETIF);
-        }
+        disable_mesh_ip_services();
     }
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -889,6 +1057,7 @@ fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
     ensure_low_level_wifi()?;
     unsafe {
         let _ = sys::esp_wifi_disconnect();
+        let _ = sys::esp_wifi_set_promiscuous(false);
         let _ = sys::esp_wifi_stop();
         esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
         let mut sta = sys::wifi_sta_config_t::default();
@@ -907,10 +1076,10 @@ fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
         ))?;
         esp_ok(sys::esp_wifi_start())?;
         esp_ok(sys::esp_wifi_connect())?;
-        if !WIFI_STA_NETIF.is_null() {
-            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
-        }
+        disable_mesh_ip_services();
     }
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -935,9 +1104,7 @@ fn low_level_start_sta_idle(ssid: &str, channel: u8) -> Result<()> {
             channel.clamp(1, 13),
             sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
         ))?;
-        if !WIFI_STA_NETIF.is_null() {
-            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
-        }
+        disable_mesh_ip_services();
     }
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
     WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
@@ -971,9 +1138,7 @@ fn low_level_start_fake_sta(ssid: &str, psk: &str, bssid: [u8; 6], channel: u8) 
             channel.clamp(1, 13),
             sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
         ))?;
-        if !WIFI_STA_NETIF.is_null() {
-            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
-        }
+        disable_mesh_ip_services();
     }
     Ok(())
 }
@@ -1026,12 +1191,7 @@ fn low_level_start_ap_sta(
 
         esp_ok(sys::esp_wifi_start())?;
         esp_ok(sys::esp_wifi_connect())?;
-        if !WIFI_AP_NETIF.is_null() {
-            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_AP_NETIF);
-        }
-        if !WIFI_STA_NETIF.is_null() {
-            let _ = sys::esp_netif_create_ip6_linklocal(WIFI_STA_NETIF);
-        }
+        disable_mesh_ip_services();
     }
     Ok(())
 }
@@ -1177,81 +1337,11 @@ fn raw_tx_interface() -> sys::wifi_interface_t {
 }
 
 fn start_netif_probe(iface: &str) -> Result<()> {
-    ensure_low_level_wifi()?;
-    let (netif, wifi_if) = match iface {
-        "ap" | "softap" => (unsafe { WIFI_AP_NETIF }, sys::wifi_interface_t_WIFI_IF_AP),
-        "sta" | "station" => (unsafe { WIFI_STA_NETIF }, sys::wifi_interface_t_WIFI_IF_STA),
-        _ => bail!("unsupported netif_probe iface={iface}"),
-    };
-    if netif.is_null() {
-        bail!("{iface} netif is not initialized");
-    }
-    unsafe {
-        let driver = sys::esp_netif_get_io_driver(netif) as sys::wifi_netif_driver_t;
-        if driver.is_null() {
-            bail!("{iface} netif has no wifi io driver");
-        }
-        esp_ok(sys::esp_wifi_register_if_rxcb(
-            driver,
-            Some(wifi_netif_probe_cb),
-            netif as *mut core::ffi::c_void,
-        ))?;
-    }
-    WIFI_NETIF_PROBE_RUNNING.store(true, Ordering::Relaxed);
-    let line = format!("event type=wifi.netif_probe iface={iface} wifi_if={wifi_if}");
-    telemetry::emit_console(&line);
-    telemetry::record_log(line);
-    Ok(())
+    bail!("netif_probe iface={iface} is not compiled; firmware does not create esp_netif objects")
 }
 
-unsafe extern "C" fn wifi_netif_probe_cb(
-    _esp_netif: *mut sys::esp_netif_t,
-    buffer: *mut core::ffi::c_void,
-    len: usize,
-    eb: *mut core::ffi::c_void,
-) -> sys::esp_err_t {
-    WIFI_NETIF_RX_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if !buffer.is_null() && len > 0 {
-        let copy_len = len.min(256);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buffer as *const u8,
-                core::ptr::addr_of_mut!(WIFI_NETIF_RX_LAST) as *mut u8,
-                copy_len,
-            );
-        }
-        WIFI_NETIF_RX_LAST_LEN.store(copy_len as u32, Ordering::Relaxed);
-        let frame = unsafe { core::slice::from_raw_parts(buffer as *const u8, copy_len) };
-        let line = format!(
-            "event type=wifi.netif_rx len={} sample_len={} sample={}",
-            len,
-            copy_len,
-            hex_bytes(frame)
-        );
-        telemetry::emit_console(&line);
-        telemetry::record_log(line);
-    }
-    unsafe {
-        let free_ptr = if !eb.is_null() { eb } else { buffer };
-        if !free_ptr.is_null() {
-            sys::esp_wifi_internal_free_rx_buffer(free_ptr);
-        }
-    }
-    sys::ESP_OK
-}
-
-fn vendor_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
-    let mac = station_mac()?;
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
-    frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&dmesh_vendor_marker(destination));
-    frame.extend_from_slice(&payload[..body_len]);
-    Ok(frame)
+fn nan_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
+    super::nan::raw_followup_frame(&destination, payload)
 }
 
 fn dmesh_data_frame(
@@ -1260,15 +1350,34 @@ fn dmesh_data_frame(
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     let mac = source.map(Ok).unwrap_or_else(station_mac)?;
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
+    let body = dmesh_ipv4_udp_body(destination, mac, payload);
+    dmesh_data_frame_nods(destination, mac, destination, body)
+}
+
+fn dmesh_data_frame_with_bssid(
+    destination: [u8; 6],
+    source: Option<[u8; 6]>,
+    bssid: [u8; 6],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let mac = source.map(Ok).unwrap_or_else(station_mac)?;
+    let body = dmesh_ipv4_udp_body(destination, mac, payload);
+    dmesh_data_frame_nods(destination, mac, bssid, body)
+}
+
+fn dmesh_data_frame_nods(
+    destination: [u8; 6],
+    source: [u8; 6],
+    bssid: [u8; 6],
+    body: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(24 + body.len());
     frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&dmesh_vendor_marker(destination));
-    frame.extend_from_slice(&payload[..body_len]);
+    frame.extend_from_slice(&body);
     Ok(frame)
 }
 
@@ -1279,15 +1388,14 @@ fn dmesh_sta_to_ap_data_frame(
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     let source = source.map(Ok).unwrap_or_else(station_mac)?;
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
+    let body = dmesh_ipv4_udp_body(destination, source, payload);
+    let mut frame = Vec::with_capacity(24 + body.len());
     frame.extend_from_slice(&[0x08, 0x01, 0x00, 0x00]);
     frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&source);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&dmesh_vendor_marker(destination));
-    frame.extend_from_slice(&payload[..body_len]);
+    frame.extend_from_slice(&body);
     Ok(frame)
 }
 
@@ -1296,23 +1404,63 @@ fn dmesh_ap_to_sta_data_frame(
     bssid: [u8; 6],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(24 + DMESH_VENDOR_MARKER_LEN + body_len);
+    let body = dmesh_ipv4_udp_body(destination, bssid, payload);
+    let mut frame = Vec::with_capacity(24 + body.len());
     frame.extend_from_slice(&[0x08, 0x02, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&dmesh_vendor_marker(destination));
-    frame.extend_from_slice(&payload[..body_len]);
+    frame.extend_from_slice(&body);
     Ok(frame)
 }
 
-fn dmesh_vendor_marker(destination: [u8; 6]) -> [u8; DMESH_VENDOR_MARKER_LEN] {
-    let mut marker = [0_u8; DMESH_VENDOR_MARKER_LEN];
-    marker[..DMESH_ESPNOW_PREFIX.len()].copy_from_slice(&DMESH_ESPNOW_PREFIX);
+fn dmesh_ipv4_udp_body(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Vec<u8> {
+    let body_len = payload.len().min(1380);
+    let udp_len = (8 + DMESH_DATA_MARKER_LEN + body_len) as u16;
+    let ip_len = 20_u16 + udp_len;
+    let mut body = Vec::with_capacity(IEEE80211_LLC_SNAP_LEN + ip_len as usize);
+    body.extend_from_slice(&IEEE80211_LLC_SNAP_IPV4);
+
+    let mut ip = [0_u8; 20];
+    ip[0] = 0x45;
+    ip[1] = 0;
+    ip[2..4].copy_from_slice(&ip_len.to_be_bytes());
+    ip[4..6].copy_from_slice(&0_u16.to_be_bytes());
+    ip[6..8].copy_from_slice(&0x4000_u16.to_be_bytes());
+    ip[8] = 1;
+    ip[9] = 17;
+    ip[12..16].copy_from_slice(&[10, source[3], source[4], source[5]]);
+    ip[16..20].copy_from_slice(&LMESH_IPV4_MULTICAST);
+    let csum = ipv4_checksum(&ip);
+    ip[10..12].copy_from_slice(&csum.to_be_bytes());
+    body.extend_from_slice(&ip);
+
+    body.extend_from_slice(&DMESH_UDP_PORT.to_be_bytes());
+    body.extend_from_slice(&DMESH_UDP_PORT.to_be_bytes());
+    body.extend_from_slice(&udp_len.to_be_bytes());
+    body.extend_from_slice(&0_u16.to_be_bytes());
+    body.extend_from_slice(&dmesh_data_marker(destination));
+    body.extend_from_slice(&payload[..body_len]);
+    body
+}
+
+fn ipv4_checksum(header: &[u8; 20]) -> u16 {
+    let mut sum = 0_u32;
+    for chunk in header.chunks_exact(2) {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn dmesh_data_marker(destination: [u8; 6]) -> [u8; DMESH_DATA_MARKER_LEN] {
+    let mut marker = [0_u8; DMESH_DATA_MARKER_LEN];
+    marker[..DMESH_DATA_MARKER_PREFIX.len()].copy_from_slice(&DMESH_DATA_MARKER_PREFIX);
     marker[4..8].copy_from_slice(&destination[2..6]);
-    marker[8] = DMESH_ESPNOW_TYPE;
+    marker[8] = DMESH_DATA_MARKER_TYPE;
     marker
 }
 
@@ -1376,7 +1524,7 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
     if !matches_raw_filter(frame) {
         return;
     }
-    let dmesh_payload = dmesh_vendor_payload(frame);
+    let dmesh_payload = dmesh_raw_payload(frame);
     if matches!(
         RAW_FILTER_MODE.load(Ordering::Relaxed),
         RAW_FILTER_ALL
@@ -1408,8 +1556,25 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
     RAW_RX_LAST_LEN.store(copy_len as u32, Ordering::Relaxed);
     if let Some(payload) = dmesh_payload {
         telemetry::record_companion_packet("wifi", payload);
-        super::mode::observe_ping("wifi_raw", payload);
-        enqueue_raw_command(frame, payload, rssi);
+        super::mode::observe_ping_no_auto_response("wifi_raw", payload);
+        if is_wifi_terminal_payload(payload) {
+            let line = format!(
+                "event type=wifi.notify source=raw src={} len={} payload_b64={}",
+                frame_address(frame, FRAME_ADDR2)
+                    .map(format_mac)
+                    .unwrap_or_else(|| "none".to_string()),
+                payload.len(),
+                base64_standard(payload)
+            );
+            telemetry::record_log(line);
+            return;
+        }
+        let response = if frame_type(frame) == 2 {
+            WifiResponsePath::Data
+        } else {
+            WifiResponsePath::Action
+        };
+        enqueue_raw_command(frame, payload, rssi, response);
         let dst = frame_address(frame, FRAME_ADDR1)
             .map(format_mac)
             .unwrap_or_else(|| "none".to_string());
@@ -1419,7 +1584,7 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
         let destination = raw_destination_name(frame);
         let payload_b64 = base64_standard(payload);
         let line = format!(
-            "event type=wifi.raw_frame source=dmesh_vendor destination={} src={} dst={} len={} rssi={} payload_b64={}",
+            "event type=wifi.raw_frame source=dmesh_nan destination={} src={} dst={} len={} rssi={} payload_b64={}",
             destination,
             src,
             dst,
@@ -1479,45 +1644,119 @@ fn frame_has_bssid(frame: &[u8]) -> bool {
     false
 }
 
-fn dmesh_vendor_payload(frame: &[u8]) -> Option<&[u8]> {
-    if frame.len() <= 24 + DMESH_VENDOR_MARKER_LEN {
+fn dmesh_raw_payload(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() <= 24 {
         return None;
     }
     if frame_type(frame) == 2 {
         if !frame_matches_dmesh_data_destination(frame) {
             return None;
         }
-        let header = dmesh_vendor_header(&frame[24..])?;
+        let (header, payload) = dmesh_payload_from_body(&frame[24..])?;
         if !mesh_dst4_allowed(header.mesh_dst4) {
             return None;
         }
-        let payload_start = 24 + header.len;
-        let payload_end = frame.len().saturating_sub(4).max(payload_start);
-        return Some(&frame[payload_start..payload_end]);
+        return Some(payload);
     } else if frame_subtype(frame) != 13 {
         return None;
     }
-    let header = dmesh_vendor_header(&frame[24..])?;
-    if !mesh_dst4_allowed(header.mesh_dst4) {
+    super::nan::raw_payload(frame)
+}
+
+fn dmesh_payload_from_body(body: &[u8]) -> Option<(DmeshDataHeader, &[u8])> {
+    if let Some(header) = dmesh_data_header(body) {
+        return Some((header, &body[header.len..]));
+    }
+    dmesh_payload_from_ipv4_udp_body(body)
+}
+
+fn dmesh_payload_from_ipv4_udp_body(body: &[u8]) -> Option<(DmeshDataHeader, &[u8])> {
+    let body = if body.starts_with(&IEEE80211_LLC_SNAP_IPV4) {
+        &body[IEEE80211_LLC_SNAP_LEN..]
+    } else {
+        body
+    };
+    if body.len() < 28 || body.first()? >> 4 != 4 || body[9] != 17 {
         return None;
     }
-    let payload_start = 24 + header.len;
-    Some(&frame[payload_start..])
+    let ihl = ((body[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || body.len() < ihl + 8 {
+        return None;
+    }
+    let total_len = u16::from_be_bytes([body[2], body[3]]) as usize;
+    if total_len < ihl + 8 || body.len() < total_len {
+        return None;
+    }
+    if body[16..20] != LMESH_IPV4_MULTICAST {
+        return None;
+    }
+    let udp = &body[ihl..total_len];
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+    if src_port != DMESH_UDP_PORT || dst_port != DMESH_UDP_PORT || udp_len < 8 {
+        return None;
+    }
+    if udp.len() < udp_len {
+        return None;
+    }
+    let dmesh = &udp[8..udp_len];
+    let header = dmesh_data_header(dmesh)?;
+    Some((header, &dmesh[header.len..]))
+}
+
+#[allow(dead_code)]
+fn dmesh_netif_payload(frame: &[u8]) -> Option<([u8; 6], &[u8])> {
+    if frame.len() >= 14 {
+        let destination = frame_address(frame, ETH_ADDR_DST)?;
+        if !ethernet_destination_allowed(destination) {
+            return None;
+        }
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        if ethertype == ETHERTYPE_IPV4 {
+            let (header, payload) = dmesh_payload_from_ipv4_udp_body(&frame[14..])?;
+            if mesh_dst4_allowed(header.mesh_dst4) {
+                return Some((frame_address(frame, ETH_ADDR_SRC)?, payload));
+            }
+        }
+    }
+    let (header, payload) = dmesh_payload_from_ipv4_udp_body(frame)?;
+    if mesh_dst4_allowed(header.mesh_dst4) {
+        let source = station_mac().unwrap_or([0; 6]);
+        return Some((source, payload));
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn ethernet_destination_allowed(destination: [u8; 6]) -> bool {
+    if destination == LMESH_IPV6_DISCOVERY_MULTICAST {
+        return true;
+    }
+    if station_mac().map(|mac| destination == mac).unwrap_or(false) {
+        return true;
+    }
+    if ap_mac().map(|mac| destination == mac).unwrap_or(false) {
+        return true;
+    }
+    device_multicast_mac()
+        .map(|mac| destination == mac)
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy)]
-struct DmeshVendorHeader {
+struct DmeshDataHeader {
     len: usize,
     mesh_dst4: [u8; 4],
 }
 
-fn dmesh_vendor_header(body: &[u8]) -> Option<DmeshVendorHeader> {
-    if body.len() >= DMESH_VENDOR_MARKER_LEN
-        && body[..DMESH_ESPNOW_PREFIX.len()] == DMESH_ESPNOW_PREFIX
-        && body[8] == DMESH_ESPNOW_TYPE
+fn dmesh_data_header(body: &[u8]) -> Option<DmeshDataHeader> {
+    if body.len() >= DMESH_DATA_MARKER_LEN
+        && body[..DMESH_DATA_MARKER_PREFIX.len()] == DMESH_DATA_MARKER_PREFIX
+        && body[8] == DMESH_DATA_MARKER_TYPE
     {
-        return Some(DmeshVendorHeader {
-            len: DMESH_VENDOR_MARKER_LEN,
+        return Some(DmeshDataHeader {
+            len: DMESH_DATA_MARKER_LEN,
             mesh_dst4: [body[4], body[5], body[6], body[7]],
         });
     }
@@ -1614,7 +1853,15 @@ fn base64_standard(data: &[u8]) -> String {
     out
 }
 
-fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32) {
+fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32, response: WifiResponsePath) {
+    let Some(source) = frame_address(frame, FRAME_ADDR2) else {
+        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    enqueue_command(source, payload, rssi, response);
+}
+
+fn enqueue_command(source: [u8; 6], payload: &[u8], rssi: i32, response: WifiResponsePath) {
     if payload.len() > RAW_COMMAND_MAX_LEN {
         RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
@@ -1626,11 +1873,7 @@ fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32) {
     if text.is_empty() {
         return;
     }
-    let Some(source) = frame_address(frame, FRAME_ADDR2) else {
-        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    set_last_command_peer(source);
+    set_last_command_peer(source, response);
     let Ok(mut queue) = raw_command_queue().lock() else {
         RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
@@ -1643,9 +1886,14 @@ fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32) {
         source,
         text: text.to_string(),
         rssi,
+        response,
     });
     RAW_CMD_RX_TOTAL.fetch_add(1, Ordering::Relaxed);
     super::wake::notify();
+}
+
+fn is_wifi_terminal_payload(payload: &[u8]) -> bool {
+    payload.starts_with(b"notify ") || payload.starts_with(b"resp ")
 }
 
 fn raw_command_queue() -> &'static Mutex<VecDeque<RawWifiCommand>> {
@@ -1656,10 +1904,11 @@ fn frame_address(frame: &[u8], offset: usize) -> Option<[u8; 6]> {
     frame.get(offset..offset + 6)?.try_into().ok()
 }
 
-fn set_last_command_peer(peer: [u8; 6]) {
+fn set_last_command_peer(peer: [u8; 6], response: WifiResponsePath) {
     for (idx, byte) in peer.iter().enumerate() {
         RAW_LAST_COMMAND_PEER[idx].store(*byte, Ordering::Relaxed);
     }
+    RAW_LAST_COMMAND_RESPONSE.store(response.as_u8(), Ordering::Relaxed);
     RAW_LAST_COMMAND_PEER_VALID.store(true, Ordering::Release);
 }
 
@@ -1672,6 +1921,10 @@ fn last_command_peer() -> Option<[u8; 6]> {
         *byte = RAW_LAST_COMMAND_PEER[idx].load(Ordering::Relaxed);
     }
     Some(peer)
+}
+
+fn last_response_path() -> WifiResponsePath {
+    WifiResponsePath::from_u8(RAW_LAST_COMMAND_RESPONSE.load(Ordering::Relaxed))
 }
 
 fn format_mac(mac: [u8; 6]) -> String {
@@ -1687,11 +1940,15 @@ fn raw_stats() -> String {
     let peer = last_command_peer()
         .map(format_mac)
         .unwrap_or_else(|| "none".to_string());
+    let (channel, second) = wifi_channel_status();
     format!(
-        "raw_monitor={} filter={} bssid_filter={} rx={} matched={} dropped={} tx={} cmd_rx={} cmd_dropped={} last_peer={} last_len={} last_rssi={} last={}",
+        "raw_monitor={} filter={} bssid_filter={} ch={} second={} conn_wake_ms={} rx={} matched={} dropped={} tx={} cmd_rx={} cmd_dropped={} last_peer={} last_response={} last_len={} last_rssi={} last={}",
         RAW_MONITOR_RUNNING.load(Ordering::Relaxed),
         raw_filter_name(),
         RAW_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
+        channel,
+        second,
+        WIFI_CONNECTIONLESS_WAKE_INTERVAL_MS.load(Ordering::Relaxed),
         RAW_RX_TOTAL.load(Ordering::Relaxed),
         RAW_RX_MATCHED.load(Ordering::Relaxed),
         RAW_RX_DROPPED.load(Ordering::Relaxed),
@@ -1699,6 +1956,7 @@ fn raw_stats() -> String {
         RAW_CMD_RX_TOTAL.load(Ordering::Relaxed),
         RAW_CMD_DROPPED.load(Ordering::Relaxed),
         peer,
+        last_response_path().name(),
         last_len,
         RAW_RX_LAST_RSSI.load(Ordering::Relaxed),
         hex_bytes(last)
@@ -1706,15 +1964,25 @@ fn raw_stats() -> String {
 }
 
 fn netif_probe_stats() -> String {
-    let last_len = WIFI_NETIF_RX_LAST_LEN.load(Ordering::Relaxed) as usize;
-    let last = unsafe { &WIFI_NETIF_RX_LAST[..last_len.min(256)] };
     format!(
-        "netif_probe={} netif_rx={} netif_last_len={} netif_last={}",
+        "netif_probe={} netif_rx={} netif_last_len={} netif_last=disabled",
         WIFI_NETIF_PROBE_RUNNING.load(Ordering::Relaxed),
         WIFI_NETIF_RX_TOTAL.load(Ordering::Relaxed),
-        last_len,
-        hex_bytes(last)
+        WIFI_NETIF_RX_LAST_LEN.load(Ordering::Relaxed)
     )
+}
+
+fn reject_netif_probe_if_requested(request: &CommandRequest) -> Result<()> {
+    if request
+        .arg("netif_probe")
+        .or_else(|| request.arg("probe"))
+        .map(parse_bool)
+        .transpose()?
+        .unwrap_or(false)
+    {
+        bail!("netif_probe is not compiled; firmware does not create esp_netif objects");
+    }
+    Ok(())
 }
 
 fn parse_raw_filter(value: &str) -> Result<u32> {
@@ -1801,16 +2069,35 @@ fn auth_name(auth: sys::wifi_auth_mode_t) -> &'static str {
 }
 
 fn wifi_net_status() -> String {
-    let sta = unsafe { WIFI_STA_NETIF };
-    let ap = unsafe { WIFI_AP_NETIF };
+    let (channel, second) = wifi_channel_status();
     format!(
-        "sta_ip={} ap_ip={} ap_stations={} sta_ll={} ap_ll={}",
-        ip4_info(sta).unwrap_or_else(|| "none".to_string()),
-        ip4_info(ap).unwrap_or_else(|| "none".to_string()),
-        ap_station_count(),
-        ip6_linklocal(sta).unwrap_or_else(|| "none".to_string()),
-        ip6_linklocal(ap).unwrap_or_else(|| "none".to_string())
+        "sta_mac={} ap_mac={} ch={} second={} ip=disabled ap_stations={}",
+        station_mac()
+            .map(format_mac)
+            .unwrap_or_else(|_| "unknown".to_string()),
+        ap_mac()
+            .map(format_mac)
+            .unwrap_or_else(|_| "unknown".to_string()),
+        channel,
+        second,
+        ap_station_count()
     )
+}
+
+fn wifi_channel_status() -> (i32, &'static str) {
+    let mut primary = 0_u8;
+    let mut second = sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE;
+    let ret = unsafe { sys::esp_wifi_get_channel(&mut primary, &mut second) };
+    if ret != sys::ESP_OK {
+        return (-1, "unknown");
+    }
+    let second = match second {
+        x if x == sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE => "none",
+        x if x == sys::wifi_second_chan_t_WIFI_SECOND_CHAN_ABOVE => "above",
+        x if x == sys::wifi_second_chan_t_WIFI_SECOND_CHAN_BELOW => "below",
+        _ => "other",
+    };
+    (primary as i32, second)
 }
 
 fn ap_station_count() -> i32 {
@@ -1821,66 +2108,6 @@ fn ap_station_count() -> i32 {
     } else {
         -1
     }
-}
-
-fn ip4_info(netif: *mut sys::esp_netif_t) -> Option<String> {
-    if netif.is_null() {
-        return None;
-    }
-    let mut info = sys::esp_netif_ip_info_t::default();
-    let ret = unsafe { sys::esp_netif_get_ip_info(netif, &mut info) };
-    if ret != sys::ESP_OK || info.ip.addr == 0 {
-        return None;
-    }
-    Some(format_ip4(info.ip.addr))
-}
-
-fn format_ip4(addr: u32) -> String {
-    let bytes = addr.to_le_bytes();
-    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
-fn ip6_linklocal(netif: *mut sys::esp_netif_t) -> Option<String> {
-    if netif.is_null() {
-        return None;
-    }
-    let mut ip = sys::esp_ip6_addr_t::default();
-    let ret = unsafe { sys::esp_netif_get_ip6_linklocal(netif, &mut ip) };
-    if ret != sys::ESP_OK {
-        return None;
-    }
-    Some(format_ip6(ip))
-}
-
-fn format_ip6(ip: sys::esp_ip6_addr_t) -> String {
-    let mut words = [0_u16; 8];
-    for (idx, part) in ip.addr.iter().enumerate() {
-        let bytes = part.to_be_bytes();
-        words[idx * 2] = u16::from_be_bytes([bytes[0], bytes[1]]);
-        words[idx * 2 + 1] = u16::from_be_bytes([bytes[2], bytes[3]]);
-    }
-    format!(
-        "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}%{}",
-        words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], ip.zone
-    )
-}
-
-fn start_sntp(server: &str) -> Result<()> {
-    let server = if server == "true" || server.is_empty() {
-        "pool.ntp.org"
-    } else {
-        server
-    };
-    let server = CString::new(server)?;
-    unsafe {
-        if sys::esp_sntp_enabled() {
-            sys::esp_sntp_stop();
-        }
-        sys::esp_sntp_setoperatingmode(sys::esp_sntp_operatingmode_t_ESP_SNTP_OPMODE_POLL);
-        sys::esp_sntp_setservername(0, server.as_ptr());
-        sys::esp_sntp_init();
-    }
-    Ok(())
 }
 
 fn validate_wifi_string(name: &str, value: &str, max: usize) -> Result<()> {

@@ -19,6 +19,8 @@ const MAX_COMPANION_DEPTH: usize = 64;
 const PREVIEW_BYTES: usize = 96;
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
+    registry.register(TelemetryCommand::new("status", settings.clone()));
+    registry.register(TelemetryCommand::new("xstatus", settings.clone()));
     registry.register(TelemetryCommand::new("stats", settings.clone()));
     registry.register(TelemetryCommand::new("logs", settings.clone()));
     registry.register(TelemetryCommand::new("messages", settings.clone()));
@@ -154,6 +156,8 @@ impl CommandHandler for TelemetryCommand {
 
     fn help(&self) -> &'static str {
         match self.name {
+            "status" => "status",
+            "xstatus" => "xstatus reset=true",
             "stats" => "stats reset=true",
             "logs" => "logs count=10 depth=10 max_bytes=2048 clear=true",
             "messages" => {
@@ -168,6 +172,8 @@ impl CommandHandler for TelemetryCommand {
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         match self.name {
+            "status" => Ok(CommandResponse::ok(status_text(&self.settings))),
+            "xstatus" => self.xstatus(request),
             "stats" => self.stats(request),
             "logs" => self.logs(request),
             "messages" => self.messages(request),
@@ -178,6 +184,18 @@ impl CommandHandler for TelemetryCommand {
 }
 
 impl TelemetryCommand {
+    fn xstatus(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        if request
+            .arg("reset")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            reset();
+        }
+        Ok(CommandResponse::ok(xstatus_text(&self.settings)))
+    }
+
     fn stats(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if request
             .arg("reset")
@@ -395,7 +413,130 @@ pub fn stats_text(settings: &SharedSettings) -> String {
     )
 }
 
+pub fn status_text(settings: &SharedSettings) -> String {
+    let state = telemetry().lock().unwrap();
+    let lora = LORA_COUNTER.snapshot();
+    let ble = BLE_COUNTER.snapshot();
+    let wifi = WIFI_COUNTER.snapshot();
+    let runtime = runtime_snapshot();
+    format!(
+        "status uptime_ms={} {} idle_pct={} top={} top_pct={} lora_rx={} lora_tx={} ble_rx={} ble_tx={} wifi_rx={} wifi_tx={} logs={} messages={} companion={} {}",
+        now_ms(),
+        super::power::compact_status_fields(),
+        runtime.idle_pct,
+        runtime.top_name,
+        runtime.top_pct,
+        lora.rx_packets,
+        lora.tx_packets,
+        ble.rx_packets,
+        ble.tx_packets,
+        wifi.rx_packets,
+        wifi.tx_packets,
+        state.logs.len(),
+        state.messages.len(),
+        state.companion_messages.len(),
+        super::battery::stats_fields(settings)
+    )
+}
+
+pub fn xstatus_text(settings: &SharedSettings) -> String {
+    format!(
+        "xstatus uptime_ms={} {} {} {} {} {} {} {} {}",
+        now_ms(),
+        super::power::compact_status_fields(),
+        runtime_stats_text(),
+        super::wake::stats_fields(),
+        main_loop_fields(),
+        queue_fields(),
+        super::battery::stats_fields(settings),
+        super::sleep::status_summary_fields(),
+        radio_summary_fields(settings)
+    )
+}
+
+fn main_loop_fields() -> String {
+    format!(
+        "main_loops={} main_uart_reads={} main_uart_bytes={} main_uart_timeouts={} main_uart_errors={} main_raw_polls={} main_raw_cmds={}",
+        MAIN_LOOP_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_READ_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_BYTE_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_TIMEOUT_COUNTER.load(Ordering::Relaxed),
+        MAIN_UART_ERROR_COUNTER.load(Ordering::Relaxed),
+        MAIN_RAW_POLL_COUNTER.load(Ordering::Relaxed),
+        MAIN_RAW_COMMAND_COUNTER.load(Ordering::Relaxed)
+    )
+}
+
+fn queue_fields() -> String {
+    let state = telemetry().lock().unwrap();
+    format!(
+        "logs={} messages={} local_messages={} companion={}",
+        state.logs.len(),
+        state.messages.len(),
+        state.local_messages.len(),
+        state.companion_messages.len()
+    )
+}
+
+fn radio_summary_fields(settings: &SharedSettings) -> String {
+    let lora = LORA_COUNTER.snapshot();
+    let ble = BLE_COUNTER.snapshot();
+    let wifi = WIFI_COUNTER.snapshot();
+    format!(
+        "lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} ble_rx={} ble_rx_bytes={} ble_tx={} ble_tx_bytes={} wifi_rx={} wifi_rx_bytes={} wifi_tx={} wifi_tx_bytes={} lora_status={}",
+        lora.rx_packets,
+        lora.rx_bytes,
+        lora.tx_packets,
+        lora.tx_bytes,
+        ble.rx_packets,
+        ble.rx_bytes,
+        ble.tx_packets,
+        ble.tx_bytes,
+        wifi.rx_packets,
+        wifi.rx_bytes,
+        wifi.tx_packets,
+        wifi.tx_bytes,
+        quote_text_value(&super::lora::status_text(settings))
+    )
+}
+
 fn runtime_stats_text() -> String {
+    let snapshot = runtime_snapshot();
+    if snapshot.tasks == 0 {
+        return "rt_tasks=0 rt_total=0 rt_reported=0 rt_idle=0 rt_idle_pct=0 rt_top=none rt_top_runtime=0 rt_top_pct=0".to_string();
+    }
+    if snapshot.total == 0 {
+        return format!(
+            "rt_tasks={} rt_total=0 rt_reported={} rt_idle=0 rt_idle_pct=0 rt_top=none rt_top_runtime=0 rt_top_pct=0",
+            snapshot.tasks, snapshot.reported
+        );
+    }
+
+    format!(
+        "rt_tasks={} rt_total={} rt_reported={} rt_idle={} rt_idle_pct={} rt_top={} rt_top_runtime={} rt_top_pct={}",
+        snapshot.tasks,
+        snapshot.total,
+        snapshot.reported,
+        snapshot.idle,
+        snapshot.idle_pct,
+        snapshot.top_name,
+        snapshot.top_runtime,
+        snapshot.top_pct
+    )
+}
+
+struct RuntimeSnapshot {
+    tasks: usize,
+    total: u32,
+    reported: u32,
+    idle: u32,
+    idle_pct: u32,
+    top_name: String,
+    top_runtime: u32,
+    top_pct: u32,
+}
+
+fn runtime_snapshot() -> RuntimeSnapshot {
     const MAX_TASKS: usize = 24;
     let mut tasks = [esp_idf_sys::TaskStatus_t::default(); MAX_TASKS];
     let mut reported_runtime = 0_u32;
@@ -407,7 +548,16 @@ fn runtime_stats_text() -> String {
         )
     } as usize;
     if count == 0 {
-        return "rt_tasks=0 rt_total=0 rt_reported=0 rt_idle=0 rt_idle_pct=0 rt_top=none rt_top_runtime=0 rt_top_pct=0".to_string();
+        return RuntimeSnapshot {
+            tasks: 0,
+            total: 0,
+            reported: 0,
+            idle: 0,
+            idle_pct: 0,
+            top_name: "none".to_string(),
+            top_runtime: 0,
+            top_pct: 0,
+        };
     }
 
     let mut total_runtime = 0_u32;
@@ -424,24 +574,16 @@ fn runtime_stats_text() -> String {
             top_name = sanitize_task_name(&name);
         }
     }
-    if total_runtime == 0 {
-        return format!(
-            "rt_tasks={} rt_total=0 rt_reported={} rt_idle=0 rt_idle_pct=0 rt_top=none rt_top_runtime=0 rt_top_pct=0",
-            count, reported_runtime
-        );
-    }
-
-    format!(
-        "rt_tasks={} rt_total={} rt_reported={} rt_idle={} rt_idle_pct={} rt_top={} rt_top_runtime={} rt_top_pct={}",
-        count,
-        total_runtime,
-        reported_runtime,
-        idle_runtime,
-        pct_u32(idle_runtime, total_runtime),
+    RuntimeSnapshot {
+        tasks: count,
+        total: total_runtime,
+        reported: reported_runtime,
+        idle: idle_runtime,
+        idle_pct: pct_u32(idle_runtime, total_runtime),
         top_name,
         top_runtime,
-        pct_u32(top_runtime, total_runtime)
-    )
+        top_pct: pct_u32(top_runtime, total_runtime),
+    }
 }
 
 fn task_name(name: *const core::ffi::c_char) -> String {
@@ -737,17 +879,11 @@ pub fn emit_console(line: &str) {
     uart_write("\n");
     uart_write(line);
     uart_write("\ndm-rs> ");
+    super::wifi::forward_console_notification(line);
 }
 
 fn uart_write(text: &str) {
-    unsafe {
-        let bytes = text.as_bytes();
-        let _ = esp_idf_sys::uart_write_bytes(
-            esp_idf_sys::uart_port_t_UART_NUM_0,
-            bytes.as_ptr() as *const core::ffi::c_void,
-            bytes.len(),
-        );
-    }
+    super::serial::write(text);
 }
 
 fn reset() {

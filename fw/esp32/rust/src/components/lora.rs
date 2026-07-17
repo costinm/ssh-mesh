@@ -19,6 +19,7 @@ use super::telemetry::{self, Direction};
 
 const DEFAULT_FREQUENCY_HZ: u32 = 913_125_000;
 const DEFAULT_BANDWIDTH_HZ: u32 = 250_000;
+const MESHCORE_FREQUENCY_HZ: u32 = 910_525_000;
 const SX127X_VERSION: u8 = 0x12;
 
 const REG_FIFO: u8 = 0x00;
@@ -77,6 +78,7 @@ const NVS_LORA_CAD_TX: &str = "lora.cad_tx";
 const NVS_LORA_CAD_INT_MS: &str = "lora.cad_int";
 const NVS_LORA_CAD_RX_MS: &str = "lora.cad_rx_ms";
 const NVS_LORA_CAD_TX_N: &str = "lora.cad_tx_n";
+const NVS_LORA_MODE: &str = "lora.mode";
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
     load_cad_settings(&settings);
@@ -122,12 +124,14 @@ pub fn load_cad_settings(settings: &SharedSettings) {
 pub fn sleep_radio(settings: &SharedSettings) -> Result<()> {
     BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
     notify_lora_rx_task();
+    wait_for_background_rx_stopped(Duration::from_millis(250));
     let state = LoraState::load(settings)?;
     let _guard = lora_spi_lock().lock().unwrap();
     let mut radio = Radio::open(&state.config)?;
     radio.sleep()
 }
 
+#[allow(dead_code)]
 pub fn send_text(settings: &SharedSettings, text: &str, hop_limit: u8) -> Result<String> {
     send_payload(
         settings,
@@ -176,9 +180,11 @@ pub fn start_background_rx(settings: SharedSettings) -> Result<Option<thread::Jo
         return Ok(None);
     }
 
-    apply_medium_fast(&mut config);
+    let mode = lora_mode(&settings);
+    apply_preset(&mut config, mode);
     let line = format!(
-        "ev=lora.probe ok=true preset=medium_fast rf={} sync=0x{:02x} sck={} miso={} mosi={} cs={} rst={} dio0={}",
+        "ev=lora.probe ok=true preset={} rf={} sync=0x{:02x} sck={} miso={} mosi={} cs={} rst={} dio0={}",
+        mode.as_str(),
         compact_rf(&config),
         config.sync_word,
         config.sck,
@@ -317,46 +323,52 @@ struct LoraState {
 impl LoraState {
     fn load(settings: &SharedSettings) -> Result<Self> {
         let defaults = LoraConfig::default();
-        let settings = settings.borrow();
-        Ok(Self {
-            config: LoraConfig {
-                chip: settings
-                    .get_str("lora.chip")?
-                    .as_deref()
-                    .map(LoraChip::parse)
-                    .transpose()?
-                    .unwrap_or(defaults.chip),
-                frequency_hz: settings.get_i32("lora.freq", defaults.frequency_hz as i32)? as u32,
-                bandwidth_hz: settings.get_i32("lora.bw", defaults.bandwidth_hz as i32)? as u32,
-                beacon: settings.get_bool("lora.beacon", defaults.beacon)?,
-                spi_host: settings.get_i32("lora.spi_host", defaults.spi_host)?,
-                sck: settings.get_i32("lora.sck", defaults.sck)?,
-                miso: settings.get_i32("lora.miso", defaults.miso)?,
-                mosi: settings.get_i32("lora.mosi", defaults.mosi)?,
-                cs: settings.get_i32("lora.cs", defaults.cs)?,
-                rst: settings.get_i32("lora.rst", defaults.rst)?,
-                dio0: settings.get_i32("lora.dio0", defaults.dio0)?,
-                busy: settings.get_i32("lora.busy", defaults.busy)?,
-                board_power_pin: settings.get_i32("lora.pwrpin", defaults.board_power_pin)?,
-                board_power_level: settings.get_i32("lora.pwrlvl", defaults.board_power_level)?,
-                sx1262_dio2_rf_switch: settings
-                    .get_bool("lora.dio2rf", defaults.sx1262_dio2_rf_switch)?,
-                sx1262_tcxo_mv: settings.get_i32("lora.tcxo_mv", defaults.sx1262_tcxo_mv)?,
-                sx1262_pa_duty: settings.get_i32("lora.pa_duty", defaults.sx1262_pa_duty)?,
-                sx1262_pa_hp: settings.get_i32("lora.pa_hp", defaults.sx1262_pa_hp)?,
-                sx1262_pa_device: settings.get_i32("lora.pa_dev", defaults.sx1262_pa_device)?,
-                sx1262_pa_lut: settings.get_i32("lora.pa_lut", defaults.sx1262_pa_lut)?,
-                sx1262_rx_timeout_ms: settings
-                    .get_i32("lora.rx_timeout", defaults.sx1262_rx_timeout_ms)?,
-                sx1262_sync_word: settings.get_i32("lora.sx_sync", defaults.sx1262_sync_word)?,
-                sf: settings.get_i32("lora.sf", defaults.sf)?,
-                cr: settings.get_i32("lora.cr", defaults.cr)?,
-                sync_word: settings.get_i32("lora.sync_word", defaults.sync_word)?,
-                crc: settings.get_bool("lora.crc", defaults.crc)?,
-                preamble: settings.get_i32("lora.preamble", defaults.preamble)?,
-                tx_power: settings.get_i32("lora.tx_power", defaults.tx_power)?,
-            },
-        })
+        let settings_ref = settings.borrow();
+        let mut config = LoraConfig {
+            chip: settings_ref
+                .get_str("lora.chip")?
+                .as_deref()
+                .map(LoraChip::parse)
+                .transpose()?
+                .unwrap_or(defaults.chip),
+            frequency_hz: settings_ref.get_i32("lora.freq", defaults.frequency_hz as i32)? as u32,
+            bandwidth_hz: settings_ref.get_i32("lora.bw", defaults.bandwidth_hz as i32)? as u32,
+            beacon: settings_ref.get_bool("lora.beacon", defaults.beacon)?,
+            spi_host: settings_ref.get_i32("lora.spi_host", defaults.spi_host)?,
+            sck: settings_ref.get_i32("lora.sck", defaults.sck)?,
+            miso: settings_ref.get_i32("lora.miso", defaults.miso)?,
+            mosi: settings_ref.get_i32("lora.mosi", defaults.mosi)?,
+            cs: settings_ref.get_i32("lora.cs", defaults.cs)?,
+            rst: settings_ref.get_i32("lora.rst", defaults.rst)?,
+            dio0: settings_ref.get_i32("lora.dio0", defaults.dio0)?,
+            busy: settings_ref.get_i32("lora.busy", defaults.busy)?,
+            board_power_pin: settings_ref.get_i32("lora.pwrpin", defaults.board_power_pin)?,
+            board_power_level: settings_ref.get_i32("lora.pwrlvl", defaults.board_power_level)?,
+            sx1262_dio2_rf_switch: settings_ref
+                .get_bool("lora.dio2rf", defaults.sx1262_dio2_rf_switch)?,
+            sx1262_tcxo_mv: settings_ref.get_i32("lora.tcxo_mv", defaults.sx1262_tcxo_mv)?,
+            sx1262_pa_duty: settings_ref.get_i32("lora.pa_duty", defaults.sx1262_pa_duty)?,
+            sx1262_pa_hp: settings_ref.get_i32("lora.pa_hp", defaults.sx1262_pa_hp)?,
+            sx1262_pa_device: settings_ref.get_i32("lora.pa_dev", defaults.sx1262_pa_device)?,
+            sx1262_pa_lut: settings_ref.get_i32("lora.pa_lut", defaults.sx1262_pa_lut)?,
+            sx1262_rx_timeout_ms: settings_ref
+                .get_i32("lora.rx_timeout", defaults.sx1262_rx_timeout_ms)?,
+            sx1262_sync_word: settings_ref.get_i32("lora.sx_sync", defaults.sx1262_sync_word)?,
+            sf: settings_ref.get_i32("lora.sf", defaults.sf)?,
+            cr: settings_ref.get_i32("lora.cr", defaults.cr)?,
+            sync_word: settings_ref.get_i32("lora.sync_word", defaults.sync_word)?,
+            crc: settings_ref.get_bool("lora.crc", defaults.crc)?,
+            preamble: settings_ref.get_i32("lora.preamble", defaults.preamble)?,
+            tx_power: settings_ref.get_i32("lora.tx_power", defaults.tx_power)?,
+        };
+        let mode = settings_ref
+            .get_str(NVS_LORA_MODE)
+            .ok()
+            .flatten()
+            .and_then(|s| LoraMode::parse(&s).ok())
+            .unwrap_or(LoraMode::Meshtastic);
+        apply_preset(&mut config, mode);
+        Ok(Self { config })
     }
 }
 
@@ -375,7 +387,7 @@ impl CommandHandler for LoraCommand {
 
     fn help(&self) -> &'static str {
         match self.name {
-            "lora" => "lora board=heltec_v3 | chip=sx127x|sx1262 preset=medium_fast|medium_slow freq=913125000 bw=250000 sf=9 cr=5 sync_word=0x2b sx_sync=0x24b4 tcxo_mv=1800 dio2rf=true pwrpin=36 pwrlvl=0 rx=true|false sleep=true|false cad=true cad_timeout=50 cad_rx=true|false cad_tx=true|false cad_interval_ms=2000 cad_rx_ms=1000 cad_tx_tries=4 status=true apply=true",
+            "lora" => "lora board=heltec_v3 | chip=sx127x|sx1262 preset=medium_fast|medium_slow|meshcore mode=meshtastic|meshcore freq=913125000 bw=250000 sf=9 cr=5 sync_word=0x2b sx_sync=0x24b4 tcxo_mv=1800 dio2rf=true pwrpin=36 pwrlvl=0 rx=true|false sleep=true|false cad=true cad_timeout=50 cad_rx=true|false cad_tx=true|false cad_interval_ms=2000 cad_rx_ms=1000 cad_tx_tries=4 status=true apply=true",
             "loraprobe" => "loraprobe chip=sx127x|sx1262 sck=5,18,9 miso=19,11 mosi=27,10 cs=18,5,8 rst=14,23,12 dio0=26,14 busy=-1,13 save=true",
             "lorasend" => "lorasend text=hello | data=hex:0102 | format=raw",
             "loralisten" => "loralisten ms=5000 count=4 local_only=true",
@@ -423,8 +435,7 @@ impl LoraCommand {
         }
         let rx_request = request.arg("rx").map(parse_bool).transpose()?;
         if let Some(false) = rx_request {
-            BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
-            notify_lora_rx_task();
+            sleep_radio(&self.settings)?;
             return Ok(CommandResponse::ok("lora rx=false"));
         }
         // CAD-related settings. Updates NVS and the runtime atomics in
@@ -468,12 +479,22 @@ impl LoraCommand {
         if cad_dirty {
             return Ok(CommandResponse::ok(cad_status_text()));
         }
+        if let Some(mode) = request.arg("mode") {
+            let mode = LoraMode::parse(mode)?;
+            self.settings
+                .borrow_mut()
+                .set_str(NVS_LORA_MODE, mode.as_str())?;
+        }
         if let Some(preset) = request.arg("preset") {
             let preset = LoraPreset::parse(preset)?;
             let mut settings = self.settings.borrow_mut();
+            if let Some(freq) = preset.frequency_hz {
+                settings.set_i32("lora.freq", freq as i32)?;
+            }
             settings.set_i32("lora.bw", preset.bandwidth_hz as i32)?;
             settings.set_i32("lora.sf", preset.sf)?;
             settings.set_i32("lora.cr", preset.cr)?;
+            settings.set_i32("lora.sync_word", preset.sync_word)?;
             settings.set_bool("lora.crc", true)?;
             settings.set_i32("lora.preamble", 16)?;
         }
@@ -890,7 +911,9 @@ impl LoraCommand {
 }
 
 pub struct LoraTransport {
+    #[allow(dead_code)]
     sent_frames: u32,
+    #[allow(dead_code)]
     settings: SharedSettings,
 }
 
@@ -1128,10 +1151,12 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
             match radio.is_channel_active(cad_timeout) {
                 Ok(active) => active,
                 Err(err) => {
-                    telemetry::record_log(format!(
-                        "ev=lora.cad c=rx err={}",
-                        crate::commands::protocol::escape_value(&err.to_string())
-                    ));
+                    if !is_cad_timeout_error(&err) {
+                        telemetry::record_log(format!(
+                            "ev=lora.cad c=rx err={}",
+                            crate::commands::protocol::escape_value(&err.to_string())
+                        ));
+                    }
                     false
                 }
             }
@@ -1235,6 +1260,18 @@ fn cad_status_text() -> String {
         LORA_CAD_SAMPLES.load(Ordering::Relaxed),
         LORA_CAD_DETECTED.load(Ordering::Relaxed)
     )
+}
+
+fn wait_for_background_rx_stopped(timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !LORA_RX_TASK.load(Ordering::Acquire).is_null() && Instant::now() < deadline {
+        notify_lora_rx_task();
+        task_delay(Duration::from_millis(10));
+    }
+}
+
+fn is_cad_timeout_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("CAD timeout")
 }
 
 fn record_background_packet(packet: &Packet, source: &str, local_node: Option<u32>) {
@@ -1437,36 +1474,106 @@ struct Packet {
 }
 
 struct LoraPreset {
+    /// Override frequency, or `None` to keep the current setting.
+    frequency_hz: Option<u32>,
     bandwidth_hz: u32,
     sf: i32,
     cr: i32,
+    /// SX127x sync word byte. Meshtastic uses `0x2b`, MeshCore uses `0x34`
+    /// (LoRa private network word).
+    sync_word: i32,
 }
 
 impl LoraPreset {
     fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "medium_fast" | "mediumfast" | "mf" => Ok(Self {
+                frequency_hz: None,
                 bandwidth_hz: 250_000,
                 sf: 9,
                 cr: 5,
+                sync_word: 0x2b,
             }),
             "medium_slow" | "mediumslow" | "ms" => Ok(Self {
+                frequency_hz: None,
                 bandwidth_hz: 250_000,
                 sf: 10,
                 cr: 5,
+                sync_word: 0x2b,
+            }),
+            "meshcore" | "mesh_core" | "mc" => Ok(Self {
+                frequency_hz: Some(MESHCORE_FREQUENCY_HZ),
+                bandwidth_hz: 62_500,
+                sf: 7,
+                cr: 5,
+                sync_word: 0x34,
             }),
             _ => bail!("unsupported LoRa preset {value}"),
         }
     }
 }
 
-fn apply_medium_fast(config: &mut LoraConfig) {
-    config.bandwidth_hz = 250_000;
-    config.sf = 9;
-    config.cr = 5;
-    config.sync_word = 0x2b;
-    config.crc = true;
-    config.preamble = 16;
+/// LoRa operating mode: selects which preset is applied at background RX
+/// startup. Persisted via `lora.mode` in NVS.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LoraMode {
+    /// Meshtastic MEDIUM_FAST: 913.125 MHz, BW 250 kHz, SF 9, CR 5,
+    /// sync_word 0x2b.
+    Meshtastic,
+    /// MeshCore: 910.525 MHz, BW 62.5 kHz, SF 7, CR 5, sync_word 0x34.
+    MeshCore,
+}
+
+impl LoraMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "meshtastic" | "mt" | "medium_fast" => Ok(Self::Meshtastic),
+            "meshcore" | "mesh_core" | "mc" => Ok(Self::MeshCore),
+            _ => bail!("unsupported LoRa mode {value}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Meshtastic => "meshtastic",
+            Self::MeshCore => "meshcore",
+        }
+    }
+}
+
+/// Read the persisted LoRa mode from NVS, defaulting to Meshtastic.
+fn lora_mode(settings: &SharedSettings) -> LoraMode {
+    settings
+        .borrow()
+        .get_str(NVS_LORA_MODE)
+        .ok()
+        .flatten()
+        .and_then(|s| LoraMode::parse(&s).ok())
+        .unwrap_or(LoraMode::Meshtastic)
+}
+
+/// Apply the modulation preset for the given mode to a radio config.
+fn apply_preset(config: &mut LoraConfig, mode: LoraMode) {
+    match mode {
+        LoraMode::Meshtastic => {
+            config.frequency_hz = DEFAULT_FREQUENCY_HZ;
+            config.bandwidth_hz = 250_000;
+            config.sf = 9;
+            config.cr = 5;
+            config.sync_word = 0x2b;
+            config.crc = true;
+            config.preamble = 16;
+        }
+        LoraMode::MeshCore => {
+            config.frequency_hz = MESHCORE_FREQUENCY_HZ;
+            config.bandwidth_hz = 62_500;
+            config.sf = 7;
+            config.cr = 5;
+            config.sync_word = 0x34;
+            config.crc = true;
+            config.preamble = 16;
+        }
+    }
 }
 
 struct Sx127x {
@@ -2600,12 +2707,21 @@ fn symbol_time_us(bw: u32, sf: i32) -> u32 {
 }
 
 fn lora_status_text(settings: &SharedSettings) -> String {
+    if !lora_pins_configured(settings) {
+        return format!(
+            "lora status=false configured=false rx_running={} {}",
+            BACKGROUND_RX_RUNNING.load(Ordering::Relaxed),
+            cad_status_text()
+        );
+    }
     let Ok(state) = LoraState::load(settings) else {
         return "lora status=false error=config".to_string();
     };
     let probe = probe_lora_no_reset(&state.config);
+    let mode = lora_mode(settings);
     format!(
-        "lora status=true chip={} rx_running={} probe={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} sx_sync=0x{:04x} crc={} preamble={} tx_power={} spi_host={} sck={} miso={} mosi={} cs={} rst={} dio0={} busy={} pwrpin={} pwrlvl={} dio2rf={} tcxo_mv={} pa_duty={} pa_hp={} pa_dev={} pa_lut={} rx_timeout={}",
+        "lora status=true mode={} chip={} rx_running={} probe={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} sx_sync=0x{:04x} crc={} preamble={} tx_power={} spi_host={} sck={} miso={} mosi={} cs={} rst={} dio0={} busy={} pwrpin={} pwrlvl={} dio2rf={} tcxo_mv={} pa_duty={} pa_hp={} pa_dev={} pa_lut={} rx_timeout={}",
+        mode.as_str(),
         state.config.chip.as_str(),
         BACKGROUND_RX_RUNNING.load(Ordering::Relaxed),
         crate::commands::protocol::quote_text_value(&probe),
@@ -2636,6 +2752,22 @@ fn lora_status_text(settings: &SharedSettings) -> String {
         state.config.sx1262_pa_lut,
         state.config.sx1262_rx_timeout_ms
     ) + " " + &cad_status_text()
+}
+
+fn lora_pins_configured(settings: &SharedSettings) -> bool {
+    let settings = settings.borrow();
+    [
+        "lora.spi_host",
+        "lora.sck",
+        "lora.miso",
+        "lora.mosi",
+        "lora.cs",
+        "lora.rst",
+        "lora.dio0",
+        "lora.busy",
+    ]
+    .iter()
+    .any(|key| matches!(settings.get_str(key), Ok(Some(_))))
 }
 
 fn probe_lora(config: &LoraConfig) -> String {

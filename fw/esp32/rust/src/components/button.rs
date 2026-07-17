@@ -16,6 +16,7 @@ const BUTTON_LONG_PRESS_MS: u32 = 2_500;
 const BUTTON_DOUBLE_CLICK_MS: u32 = 500;
 const BUTTON_CLASSIFY_MAX_MS: u32 = 3_500;
 const BUTTON_CLASSIFY_SAMPLE_MS: u64 = 25;
+#[allow(dead_code)]
 const BOOT_SAMPLE_MS: u64 = 100;
 
 static BUTTON_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -84,6 +85,7 @@ pub fn suppress_until_release() {
     BUTTON_LEVEL_START_MS.store(now_ms(), Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 pub fn detect_boot_long_press(window_ms: u32, hold_ms: u32) -> bool {
     if !BUTTON_ENABLED.load(Ordering::Relaxed) {
         return false;
@@ -124,6 +126,7 @@ fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
     ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
 }
 
+#[allow(dead_code)]
 pub fn poll_level_press() {
     if !BUTTON_ENABLED.load(Ordering::Relaxed) {
         return;
@@ -256,7 +259,12 @@ unsafe extern "C" fn button_task(_arg: *mut core::ffi::c_void) {
             continue;
         }
         last = Instant::now();
+        super::serial::set_debug_enabled(true);
+        super::serial::activate_window();
         telemetry::record_log("ev=button.edge source=isr".to_string());
+        telemetry::record_log("event type=uart.wake source=button_dtr".to_string());
+        telemetry::emit_console("event type=uart.wake source=button_dtr");
+        super::wake::notify();
         classify_button_press();
         reenable_button_interrupt();
     }

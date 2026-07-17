@@ -111,6 +111,7 @@ static BLE_LOCAL_ADDR: [AtomicU8; 6] = [
 ];
 static BLE_LOCAL_ADDR_TYPE: AtomicU8 = AtomicU8::new(0xff);
 
+#[allow(dead_code)]
 pub const DMESH_BLE_SERVICE_UUID16: u16 = 0xfd5d;
 pub const DMESH_BLE_PAIRING_UUID: [u8; 16] = [
     0x01, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
@@ -263,6 +264,7 @@ pub fn companion_active() -> bool {
     deadline != 0 && deadline.wrapping_sub(now_ms()) < i32::MAX as u32
 }
 
+#[allow(dead_code)]
 pub fn take_companion_active_changed() -> bool {
     BLE_COMPANION_ACTIVE_CHANGED.swap(false, Ordering::Relaxed)
 }
