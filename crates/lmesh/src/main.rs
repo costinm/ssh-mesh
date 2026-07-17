@@ -10,6 +10,8 @@ const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
 const DEFAULT_STANDALONE_SOCKET: &str = "lmesh/mesh.sock";
 const ANNOUNCE_INTERVAL_ENV: &str = "LMESH_ANNOUNCE_INTERVAL_SECS";
 const CONTROL_SOCKET_ENV: &str = "LMESH_CONTROL_SOCKET";
+const NAN_AUTOSTART_ENV: &str = "LMESH_NAN_AUTOSTART";
+const NAN_EVENT_LOG_ENV: &str = "LMESH_NAN_EVENT_LOG";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,6 +28,13 @@ async fn run_server() -> Result<()> {
 
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
+    if nan_autostart_enabled() {
+        let result = service.start_default_nan();
+        debug!(?result, "nan_default_started");
+        if nan_event_log_enabled() {
+            spawn_nan_event_logger(service.clone());
+        }
+    }
     debug!(
         public_key = %service.public_key_b64(),
         "service_started"
@@ -69,6 +78,82 @@ fn announce_interval() -> Duration {
         .ok()
         .and_then(|value| parse_announce_interval_secs(&value));
     Duration::from_secs(secs.unwrap_or(DEFAULT_ANNOUNCE_INTERVAL_SECS))
+}
+
+fn nan_autostart_enabled() -> bool {
+    std::env::var(NAN_AUTOSTART_ENV)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(true)
+}
+
+fn nan_event_log_enabled() -> bool {
+    std::env::var(NAN_EVENT_LOG_ENV)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(true)
+}
+
+fn spawn_nan_event_logger(service: Arc<LmeshService>) {
+    tokio::spawn(async move {
+        let mut consecutive_errors = 0_u32;
+        loop {
+            let service = service.clone();
+            let poll_service = service.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                poll_service.collect_default_nan_events(30_000, 128)
+            })
+            .await;
+            match result {
+                Ok(value) => {
+                    let should_restart = nan_events_need_restart(&value);
+                    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        if consecutive_errors == 1 || consecutive_errors % 12 == 0 {
+                            warn!(?value, consecutive_errors, "nan_event_poll_failed");
+                        }
+                    } else {
+                        consecutive_errors = 0;
+                        if should_restart || nan_events_count(&value) > 0 {
+                            debug!(?value, should_restart, "nan_events_polled");
+                        }
+                    }
+                    if should_restart {
+                        let result = service.start_default_nan();
+                        warn!(?result, "nan_default_restarted_after_termination");
+                    }
+                }
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if consecutive_errors == 1 || consecutive_errors % 12 == 0 {
+                        warn!("NAN event logger task failed: {}", error);
+                    }
+                }
+            }
+            let idle = if consecutive_errors == 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(5)
+            };
+            sleep(idle).await;
+        }
+    });
+}
+
+fn nan_events_count(value: &serde_json::Value) -> usize {
+    value
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn nan_events_need_restart(value: &serde_json::Value) -> bool {
+    value
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| event.get("event").and_then(serde_json::Value::as_str))
+        .any(|event| event == "NAN-PUBLISH-TERMINATED" || event == "NAN-SUBSCRIBE-TERMINATED")
 }
 
 fn parse_announce_interval_secs(value: &str) -> Option<u64> {
@@ -126,7 +211,7 @@ async fn handle_connection(
         let (format, response) = mesh::jsonl::dispatch_request(trimmed, &mcp, move |request| {
             let service = service.clone();
             async move {
-                debug!(?request, "lmesh JSONL request");
+                debug!(?request, "lmesh request");
                 service.handle_request(request).await
             }
         })
@@ -134,7 +219,6 @@ async fn handle_connection(
         let Some(response) = response else {
             continue;
         };
-
         let response = mesh::jsonl::format_response(response, &format)?;
         writer
             .write_all(response.as_bytes())
@@ -161,6 +245,22 @@ mod tests {
     fn parse_announce_interval_rejects_zero_and_invalid_values() {
         assert_eq!(parse_announce_interval_secs("0"), None);
         assert_eq!(parse_announce_interval_secs("nope"), None);
+    }
+
+    #[test]
+    fn nan_autostart_defaults_on() {
+        unsafe {
+            std::env::remove_var(NAN_AUTOSTART_ENV);
+        }
+        assert!(nan_autostart_enabled());
+    }
+
+    #[test]
+    fn nan_event_log_defaults_on() {
+        unsafe {
+            std::env::remove_var(NAN_EVENT_LOG_ENV);
+        }
+        assert!(nan_event_log_enabled());
     }
 
     #[test]

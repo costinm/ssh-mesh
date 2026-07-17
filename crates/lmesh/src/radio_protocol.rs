@@ -5,6 +5,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const DMESH_BLE_SERVICE_UUID16: u16 = 0xfd5d;
+pub const DMESH_BLE_OPERATIONAL_UUID: [u8; 16] = [
+    0x02, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
+];
 const DMESH_MAGIC: [u8; 2] = *b"DM";
 const DMESH_VERSION: u8 = 1;
 const BLE_MAX_PREFIX: usize = 17;
@@ -155,11 +158,13 @@ pub fn build_ble_esp32_service_data(
 }
 
 pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Result<Value> {
-    let data =
+    let (data, service_uuid) =
         if data.len() >= 12 && u16::from_le_bytes([data[0], data[1]]) == DMESH_BLE_SERVICE_UUID16 {
-            &data[2..]
+            (&data[2..], "fd5d")
+        } else if data.len() >= 26 && data[..16] == DMESH_BLE_OPERATIONAL_UUID {
+            (&data[16..], "5f6b6f80-4f2a-4a6f-8c42-4d6573680002")
         } else {
-            data
+            (data, "unknown")
         };
     if data.len() >= 19 && data[0..2] == DMESH_MAGIC && data[2] == DMESH_VERSION {
         return parse_legacy_ble_service_data(data, scan_rssi, address);
@@ -172,6 +177,11 @@ pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Res
     let pending = data[8];
     let battery = data[9];
     let prefix = &data[10..];
+    let event = if pending > 0 {
+        BleEvent::PayloadPending
+    } else {
+        BleEvent::IdleHello
+    };
     let key = format!("{source:08x}:{packet_id:08x}");
     let duplicate = BLE_DEDUPE
         .get_or_init(|| Mutex::new(Dedupe::default()))
@@ -181,7 +191,11 @@ pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Res
     Ok(json!({
         "protocol": "dmesh_ble",
         "layout": "esp32_service_data",
+        "service_uuid": service_uuid,
         "service_uuid16": format!("0x{:04x}", DMESH_BLE_SERVICE_UUID16),
+        "mode": "operational",
+        "event": event.name(),
+        "event_code": event.code(),
         "src": source,
         "src_hex": format!("0x{source:08x}"),
         "packet_id": packet_id,

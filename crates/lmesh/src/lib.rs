@@ -553,6 +553,149 @@ pub enum Request {
         #[serde(default)]
         seen_within_sec: Option<u64>,
     },
+    /// Return lmesh link observations and selected radio paths.
+    #[serde(rename = "links.list")]
+    LinksList {
+        #[serde(default)]
+        seen_within_sec: Option<u64>,
+    },
+    /// Discover peers over one radio or all radios.
+    #[serde(rename = "ping", alias = "disc")]
+    Ping {
+        #[serde(default)]
+        radio: Option<String>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+        #[serde(default)]
+        nonce: Option<String>,
+    },
+    /// Send a mesh payload over the selected radio.
+    #[serde(rename = "send")]
+    Send {
+        #[serde(default)]
+        radio: Option<String>,
+        #[serde(default)]
+        destination: Option<String>,
+        payload: String,
+    },
+    /// List USB serial devices visible to lmesh.
+    #[serde(rename = "usb.serial.list")]
+    UsbSerialList {
+        #[serde(default)]
+        handshake: Option<bool>,
+    },
+    /// Run a generic or firmware-specific USB serial handshake.
+    #[serde(rename = "usb.serial.handshake")]
+    UsbSerialHandshake {
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        profile: Option<String>,
+        #[serde(default)]
+        timeout_sec: Option<f64>,
+    },
+    /// Reset an ESP USB serial adapter into bootloader or running firmware mode.
+    #[serde(rename = "usb.serial.reset")]
+    UsbSerialReset {
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        mode: Option<String>,
+    },
+    /// Start a managed USB serial byte forward on a UDS.
+    #[serde(rename = "usb.serial.forward.start", alias = "usb.serial.connect")]
+    UsbSerialForwardStart {
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        baud: Option<u32>,
+        #[serde(default)]
+        tcp_port: Option<u16>,
+        #[serde(default)]
+        tcp_mode: Option<String>,
+        #[serde(default)]
+        handshake: Option<bool>,
+        #[serde(default)]
+        dtr: Option<bool>,
+        #[serde(default)]
+        multi: Option<bool>,
+    },
+    /// Stop a managed USB serial byte forward.
+    #[serde(rename = "usb.serial.forward.stop", alias = "usb.serial.disconnect")]
+    UsbSerialForwardStop {
+        #[serde(default)]
+        port: Option<String>,
+    },
+    /// List managed USB serial byte forwards.
+    #[serde(rename = "usb.serial.forward.list")]
+    UsbSerialForwardList,
+    /// Run one low-level command against an ESP firmware adapter.
+    #[serde(rename = "esp.serial.command")]
+    EspSerialCommand {
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        port: Option<String>,
+        command: String,
+        #[serde(default)]
+        timeout_sec: Option<f64>,
+    },
+    /// Return LoRa status from an ESP firmware adapter.
+    #[serde(rename = "esp.lora.status")]
+    EspLoraStatus {
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        port: Option<String>,
+    },
+    /// Return raw Wi-Fi status from an ESP firmware adapter.
+    #[serde(rename = "esp.wifi.raw_status")]
+    EspWifiRawStatus {
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        port: Option<String>,
+    },
+    /// Return power/sleep status from an ESP firmware adapter.
+    #[serde(rename = "esp.sleep.status")]
+    EspSleepStatus {
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        port: Option<String>,
+    },
+    /// Return telemetry counters from an ESP firmware adapter.
+    #[serde(rename = "esp.telemetry.stats")]
+    EspTelemetryStats {
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        reset: Option<bool>,
+    },
+    /// Probe ESP ADC pins used for battery detection.
+    #[serde(rename = "esp.battery.adc_probe")]
+    EspBatteryAdcProbe {
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        adc1_pins: Option<String>,
+        #[serde(default)]
+        count: Option<u32>,
+    },
+    /// Record an explicit steering hint for a peer.
+    #[serde(rename = "link.steer")]
+    LinkSteer {
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        radio: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Fan out a discovery ping over one medium or all configured media.
     #[serde(rename = "discovery.ping")]
     DiscoveryPing {
@@ -595,10 +738,115 @@ pub enum Request {
         #[serde(default)]
         destination: Option<String>,
         #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
         tx_variant: Option<String>,
         #[serde(default)]
         tx_duration_ms: Option<u32>,
         payload: String,
+    },
+    /// Send a raw Wi-Fi DMesh status ping and collect replies.
+    #[serde(rename = "wifi.raw.ping")]
+    WifiRawPing {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        listen_sec: Option<u64>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+        #[serde(default)]
+        nonce: Option<String>,
+    },
+    /// Listen for DMesh Ethernet frames on the normal AP/STA netdev path.
+    #[serde(rename = "wifi.data.listen")]
+    WifiDataListen {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        listen_sec: Option<u64>,
+    },
+    /// Send a DMesh Ethernet frame on the normal AP/STA netdev path.
+    #[serde(rename = "wifi.data.send")]
+    WifiDataSend {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        destination: Option<String>,
+        payload: String,
+    },
+    /// Capture Wi-Fi management frames from a monitor interface.
+    #[serde(rename = "wifi.mgmt.capture")]
+    WifiMgmtCapture {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        capture_ms: Option<u64>,
+        #[serde(default)]
+        max_frames: Option<usize>,
+        #[serde(default)]
+        active: Option<bool>,
+    },
+    /// Start an open AP on the shared DMesh channel.
+    #[serde(rename = "wifi.ap.start_open")]
+    WifiApStartOpen {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ssid: Option<String>,
+    },
+    /// Stop AP operation.
+    #[serde(rename = "wifi.ap.stop")]
+    WifiApStop {
+        #[serde(default)]
+        iface: Option<String>,
+    },
+    /// Return AP defaults and station metrics where available.
+    #[serde(rename = "wifi.ap.status")]
+    WifiApStatus {
+        #[serde(default)]
+        iface: Option<String>,
+    },
+    /// Return associated station metrics for an AP interface.
+    #[serde(rename = "wifi.ap.stations")]
+    WifiApStations {
+        #[serde(default)]
+        iface: Option<String>,
+    },
+    /// Experimentally add a station without a normal auth/assoc exchange.
+    #[serde(rename = "wifi.ap.station.add")]
+    WifiApStationAdd {
+        #[serde(default)]
+        iface: Option<String>,
+        mac: String,
+        #[serde(default)]
+        aid: Option<u16>,
+    },
+    /// Scan for nearby Wi-Fi BSS entries.
+    #[serde(rename = "wifi.scan")]
+    WifiScan {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ssid: Option<String>,
+    },
+    /// Join an open AP on the shared DMesh channel.
+    #[serde(rename = "wifi.sta.join_open")]
+    WifiStaJoinOpen {
+        #[serde(default)]
+        iface: Option<String>,
+        ssid: String,
+    },
+    /// Return station-mode association metrics.
+    #[serde(rename = "wifi.sta.status")]
+    WifiStaStatus {
+        #[serde(default)]
+        iface: Option<String>,
     },
     /// Request a BLE scan through raw Linux HCI sockets.
     #[serde(rename = "ble.scan")]
@@ -607,6 +855,8 @@ pub enum Request {
         dev_id: Option<u16>,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        scan_ms: Option<u64>,
     },
     /// Enable or disable BLE advertising through raw Linux HCI sockets.
     #[serde(rename = "ble.adv")]
@@ -626,6 +876,28 @@ pub enum Request {
         #[serde(default)]
         ctrl_dir: Option<String>,
     },
+    /// Return NAN status, capabilities, and recent control events.
+    #[serde(rename = "wifi.nan.status")]
+    WifiNanStatus {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        events_ms: Option<u64>,
+    },
+    /// Apply the default DMesh NAN configuration and start publish/subscribe.
+    #[serde(rename = "wifi.nan.default")]
+    WifiNanDefault {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        service_name: Option<String>,
+        #[serde(default)]
+        ttl: Option<u32>,
+    },
     /// Stop NAN publish/subscribe sessions through wpa_supplicant control.
     #[serde(rename = "wifi.nan.stop")]
     WifiNanStop {
@@ -633,6 +905,86 @@ pub enum Request {
         iface: Option<String>,
         #[serde(default)]
         ctrl_dir: Option<String>,
+    },
+    /// Start NAN publish through wpa_supplicant control with optional custom SSI.
+    #[serde(rename = "wifi.nan.publish")]
+    WifiNanPublish {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        service_name: Option<String>,
+        #[serde(default)]
+        ssi_hex: Option<String>,
+        #[serde(default)]
+        ttl: Option<u32>,
+        #[serde(default)]
+        freq: Option<u32>,
+        #[serde(default)]
+        srv_proto_type: Option<u8>,
+    },
+    /// Start NAN subscribe through wpa_supplicant control with optional custom SSI.
+    #[serde(rename = "wifi.nan.subscribe")]
+    WifiNanSubscribe {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        service_name: Option<String>,
+        #[serde(default)]
+        ssi_hex: Option<String>,
+        #[serde(default)]
+        ttl: Option<u32>,
+        #[serde(default)]
+        freq: Option<u32>,
+        #[serde(default)]
+        active: Option<bool>,
+        #[serde(default)]
+        srv_proto_type: Option<u8>,
+    },
+    /// Send one NAN follow-up through wpa_supplicant control.
+    #[serde(rename = "wifi.nan.transmit")]
+    WifiNanTransmit {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        handle: u32,
+        address: String,
+        #[serde(default)]
+        req_instance_id: Option<u32>,
+        #[serde(default)]
+        ssi_hex: Option<String>,
+        #[serde(default)]
+        payload: Option<String>,
+        #[serde(default)]
+        cookie: Option<u32>,
+    },
+    /// Attach to the WPA control socket and collect NAN events.
+    #[serde(rename = "wifi.nan.events")]
+    WifiNanEvents {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+        #[serde(default)]
+        max_events: Option<usize>,
+    },
+    /// Probe NAN service-info and follow-up payload sizes through wpa_supplicant.
+    #[serde(rename = "wifi.nan.size_probe")]
+    WifiNanSizeProbe {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ctrl_dir: Option<String>,
+        #[serde(default)]
+        sizes: Option<String>,
+        #[serde(default)]
+        mode: Option<String>,
     },
     /// Start NAN publish through wpa_supplicant control.
     #[serde(rename = "wifi.nan.adv")]
@@ -679,6 +1031,17 @@ impl LmeshService {
         }
     }
 
+    /// Start the default host NAN control-plane setup.
+    pub fn start_default_nan(&self) -> serde_json::Value {
+        self.radio.nan_default(None, None, None, None)
+    }
+
+    /// Collect and record NAN events from the default host control socket.
+    pub fn collect_default_nan_events(&self, wait_ms: u64, max_events: usize) -> serde_json::Value {
+        self.radio
+            .nan_events(None, None, Some(wait_ms), Some(max_events))
+    }
+
     /// Return the local public key used for announcements.
     pub fn public_key_b64(&self) -> &str {
         self.discovery.public_key_b64()
@@ -714,6 +1077,95 @@ impl LmeshService {
             Request::Neighbors { seen_within_sec } => {
                 mesh::protocol::Response::ok_with_data(self.radio.neighbors(seen_within_sec))
             }
+            Request::LinksList { seen_within_sec } => {
+                mesh::protocol::Response::ok_with_data(self.radio.links_list(seen_within_sec))
+            }
+            Request::Ping {
+                radio,
+                wait_ms,
+                nonce,
+            } => mesh::protocol::Response::ok_with_data(self.radio.ping(radio, wait_ms, nonce)),
+            Request::Send {
+                radio,
+                destination,
+                payload,
+            } => {
+                mesh::protocol::Response::ok_with_data(self.radio.send(radio, payload, destination))
+            }
+            Request::UsbSerialList { handshake } => {
+                mesh::protocol::Response::ok_with_data(self.radio.usb_serial_list(handshake))
+            }
+            Request::UsbSerialHandshake {
+                port,
+                profile,
+                timeout_sec,
+            } => mesh::protocol::Response::ok_with_data(self.radio.usb_serial_handshake(
+                port,
+                profile,
+                timeout_sec,
+            )),
+            Request::UsbSerialReset { port, mode } => {
+                mesh::protocol::Response::ok_with_data(self.radio.usb_serial_reset(port, mode))
+            }
+            Request::UsbSerialForwardStart {
+                port,
+                baud,
+                tcp_port,
+                tcp_mode,
+                handshake,
+                dtr,
+                multi,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio
+                    .serial_forward_start(port, baud, tcp_port, tcp_mode, handshake, dtr, multi),
+            ),
+            Request::UsbSerialForwardStop { port } => {
+                mesh::protocol::Response::ok_with_data(self.radio.serial_forward_stop(port))
+            }
+            Request::UsbSerialForwardList => {
+                mesh::protocol::Response::ok_with_data(self.radio.serial_forward_list())
+            }
+            Request::EspSerialCommand {
+                adapter,
+                port,
+                command,
+                timeout_sec,
+            } => mesh::protocol::Response::ok_with_data(self.radio.esp_serial_command(
+                adapter,
+                port,
+                command,
+                timeout_sec,
+            )),
+            Request::EspLoraStatus { adapter, port } => {
+                mesh::protocol::Response::ok_with_data(self.radio.esp_lora_status(adapter, port))
+            }
+            Request::EspWifiRawStatus { adapter, port } => mesh::protocol::Response::ok_with_data(
+                self.radio.esp_wifi_raw_status(adapter, port),
+            ),
+            Request::EspSleepStatus { adapter, port } => {
+                mesh::protocol::Response::ok_with_data(self.radio.esp_sleep_status(adapter, port))
+            }
+            Request::EspTelemetryStats {
+                adapter,
+                port,
+                reset,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio.esp_telemetry_stats(adapter, port, reset),
+            ),
+            Request::EspBatteryAdcProbe {
+                adapter,
+                port,
+                adc1_pins,
+                count,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio
+                    .esp_battery_adc_probe(adapter, port, adc1_pins, count),
+            ),
+            Request::LinkSteer {
+                node,
+                radio,
+                reason,
+            } => mesh::protocol::Response::ok_with_data(self.radio.link_steer(node, radio, reason)),
             Request::DiscoveryPing { medium } => {
                 mesh::protocol::Response::ok_with_data(self.radio.discovery_ping(medium))
             }
@@ -726,15 +1178,17 @@ impl LmeshService {
                 channel,
                 listen_sec,
                 rx_variant,
-            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_listen(
-                iface, ctrl_dir, channel, listen_sec, rx_variant,
-            )),
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio
+                    .wifi_raw_listen(iface, ctrl_dir, channel, listen_sec, rx_variant),
+            ),
             Request::WifiRawSend {
                 iface,
                 ctrl_dir,
                 channel,
                 listen_sec,
                 destination,
+                source,
                 tx_variant,
                 tx_duration_ms,
                 payload,
@@ -744,11 +1198,82 @@ impl LmeshService {
                 channel,
                 listen_sec,
                 destination,
+                source,
                 tx_variant,
                 tx_duration_ms,
                 payload,
             )),
-            Request::BleScan { dev_id, reason } => match self.radio.ble_scan(dev_id, reason) {
+            Request::WifiRawPing {
+                iface,
+                ctrl_dir,
+                channel,
+                listen_sec,
+                wait_ms,
+                nonce,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio
+                    .wifi_raw_ping(iface, ctrl_dir, channel, listen_sec, wait_ms, nonce),
+            ),
+            Request::WifiDataListen { iface, listen_sec } => {
+                mesh::protocol::Response::ok_with_data(
+                    self.radio.wifi_data_listen(iface, listen_sec),
+                )
+            }
+            Request::WifiDataSend {
+                iface,
+                destination,
+                payload,
+            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_data_send(
+                iface,
+                destination,
+                payload,
+            )),
+            Request::WifiMgmtCapture {
+                iface,
+                channel,
+                capture_ms,
+                max_frames,
+                active,
+            } => match self
+                .radio
+                .wifi_mgmt_capture(iface, channel, capture_ms, max_frames, active)
+            {
+                Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                Err(error) => {
+                    mesh::protocol::Response::err(format!("wifi.mgmt.capture failed: {error:#}"))
+                }
+            },
+            Request::WifiApStartOpen { iface, ssid } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_ap_start_open(iface, ssid))
+            }
+            Request::WifiApStop { iface } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_ap_stop(iface))
+            }
+            Request::WifiApStatus { iface } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_ap_status(iface))
+            }
+            Request::WifiApStations { iface } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_ap_stations(iface))
+            }
+            Request::WifiApStationAdd { iface, mac, aid } => {
+                mesh::protocol::Response::ok_with_data(
+                    self.radio.wifi_ap_station_add(iface, mac, aid),
+                )
+            }
+            Request::WifiScan { iface, ssid } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_scan(iface, ssid))
+            }
+            Request::WifiStaJoinOpen { iface, ssid } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_sta_join_open(iface, ssid))
+            }
+            Request::WifiStaStatus { iface } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_sta_status(iface))
+            }
+            Request::BleScan {
+                dev_id,
+                reason,
+                scan_ms,
+            } => match self.radio.ble_scan(dev_id, reason, scan_ms) {
                 Ok(data) => mesh::protocol::Response::ok_with_data(data),
                 Err(e) => mesh::protocol::Response::err(e.to_string()),
             },
@@ -763,9 +1288,98 @@ impl LmeshService {
             Request::WifiNanStart { iface, ctrl_dir } => {
                 mesh::protocol::Response::ok_with_data(self.radio.nan_start(iface, ctrl_dir))
             }
+            Request::WifiNanStatus {
+                iface,
+                ctrl_dir,
+                events_ms,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio.nan_status(iface, ctrl_dir, events_ms),
+            ),
+            Request::WifiNanDefault {
+                iface,
+                ctrl_dir,
+                service_name,
+                ttl,
+            } => mesh::protocol::Response::ok_with_data(self.radio.nan_default(
+                iface,
+                ctrl_dir,
+                service_name,
+                ttl,
+            )),
             Request::WifiNanStop { iface, ctrl_dir } => {
                 mesh::protocol::Response::ok_with_data(self.radio.nan_stop(iface, ctrl_dir))
             }
+            Request::WifiNanPublish {
+                iface,
+                ctrl_dir,
+                service_name,
+                ssi_hex,
+                ttl,
+                freq,
+                srv_proto_type,
+            } => mesh::protocol::Response::ok_with_data(self.radio.nan_publish(
+                iface,
+                ctrl_dir,
+                service_name,
+                ssi_hex,
+                ttl,
+                freq,
+                srv_proto_type,
+            )),
+            Request::WifiNanSubscribe {
+                iface,
+                ctrl_dir,
+                service_name,
+                ssi_hex,
+                ttl,
+                freq,
+                active,
+                srv_proto_type,
+            } => mesh::protocol::Response::ok_with_data(self.radio.nan_subscribe(
+                iface,
+                ctrl_dir,
+                service_name,
+                ssi_hex,
+                ttl,
+                freq,
+                active,
+                srv_proto_type,
+            )),
+            Request::WifiNanTransmit {
+                iface,
+                ctrl_dir,
+                handle,
+                address,
+                req_instance_id,
+                ssi_hex,
+                payload,
+                cookie,
+            } => mesh::protocol::Response::ok_with_data(self.radio.nan_transmit(
+                iface,
+                ctrl_dir,
+                handle,
+                address,
+                req_instance_id,
+                ssi_hex,
+                payload,
+                cookie,
+            )),
+            Request::WifiNanEvents {
+                iface,
+                ctrl_dir,
+                wait_ms,
+                max_events,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio.nan_events(iface, ctrl_dir, wait_ms, max_events),
+            ),
+            Request::WifiNanSizeProbe {
+                iface,
+                ctrl_dir,
+                sizes,
+                mode,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio.nan_size_probe(iface, ctrl_dir, sizes, mode),
+            ),
             Request::WifiNanAdv { iface, ctrl_dir } => match self.radio.nan_adv(iface, ctrl_dir) {
                 Ok(data) => mesh::protocol::Response::ok_with_data(data),
                 Err(e) => mesh::protocol::Response::err(e.to_string()),

@@ -34,14 +34,17 @@ JSON-RPC success responses put the payload in `result`; errors use either the me
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LMESH_ANNOUNCE_INTERVAL_SECS` | `60` | Positive integer interval, in seconds, between automatic multicast announcements sent by the lmesh server. Invalid or zero values fall back to `60`. |
+| `LMESH_CONFIG_FILE` | `etc/lmesh/lmesh.toml` | Optional explicit path to `lmesh.toml`. When unset, lmesh loads `etc/lmesh/lmesh.toml` relative to its working directory if it exists. |
 | `LMESH_CONTROL_SOCKET` | `./lmesh/mesh.sock` | Standalone fallback UDS path used only when no activation listener is provided. Relative paths resolve against the working directory. |
 | `LMESH_DEVICE_ID` | derived | Optional 6-byte hex DMesh radio device id, for example `001122334455` or `00:11:22:33:44:55`. |
-| `LMESH_SERIAL_DEVICES` | unset | Comma-separated ESP serial radio devices, for example `/dev/ttyUSB0,/dev/ttyUSB1`. Devices default to 115200 baud and are listed as `esp-serial-*` adapters. |
+| `LMESH_SERIAL_DEVICES` | unset | Comma-separated ESP serial radio devices, for example `/dev/ttyUSB0,/dev/ttyUSB1`. Devices default to 460800 baud and are listed as `esp-serial-*` adapters. |
 | `LMESH_WIFI_IFACE` | `wlan1` | Default Wi-Fi interface used by the NAN/WPA control methods. |
 | `LMESH_WPA_CTRL_DIR` | `/run/ssh-mesh-wpa` | WPA control socket directory used by NAN methods. The mesh-init examples use `/run/mesh/wpa-supplicant-nan`. |
 
-When `MESH_HOME/lmesh.toml` exists, `lmesh` also reads additional radio
-adapters:
+When `etc/lmesh/lmesh.toml` exists under the lmesh working directory, `lmesh`
+also reads additional radio adapters and managed serial forwards.
+`LMESH_CONFIG_FILE` can point to the same TOML format explicitly and takes
+precedence.
 
 ```toml
 [[radios]]
@@ -50,18 +53,34 @@ kind = "esp-serial"
 medium = "serial"
 path = "/dev/ttyUSB0"
 network = "lab"
-baud = 115200
+baud = 460800
 
 [[radios]]
 id = "remote-a"
 kind = "remote-uds"
 medium = "remote"
 path = "/tmp/ssh-forwarded/lmesh.sock"
+
+[[serial_forwards]]
+port = "USB0"
+baud = 460800
+tcp_port = 3330
+tcp_mode = "rfc2217"
+dtr = false
+multi = true
 ```
 
 Known adapter kinds are `host-mcast`, `host-ble`, `host-nan`, `esp-serial`,
-`remote-uds`, `android-ble`, and `android-nan`. Android kinds are contract
-placeholders for future platform adapters.
+`remote-uds`, `android-ble`, and `android-nan`. A `remote-uds` adapter is an
+SSH-forwarded or otherwise proxied lmesh JSONL socket on another machine; it can
+front its own Linux radios, Android JNI radios, or ESP boards connected to that
+remote host. Android kinds are contract placeholders for platform adapters.
+Configured `serial_forwards` are started at lmesh process startup and are
+visible through `usb.serial.forward.list`; use stable RFC2217 TCP ports for
+flashing and console access through forwarded or remote hosts.
+For the local lab service, copy `crates/lmesh/examples/lab-forwards.toml` to
+`target/etc/lmesh/lmesh.toml`; the mesh-init example points at that runtime
+copy instead of using parent-relative repo paths or service-local user names.
 
 ## Lightweight MCP Methods
 
@@ -70,6 +89,12 @@ All lmesh JSONL connections also support the shared mesh MCP-compatible methods:
 The `tools/list` command catalog is the hand-maintained
 `resources/tools.json`. Keep it in sync with this document when the public
 command surface changes; do not generate it from Rust code.
+
+The production API is transport-neutral. Clients should normally call `send`,
+`ping`, `radios.list`, `links.list`, `neighbors`, `messages.history`, and the
+stable Wi-Fi/BLE/NAN methods. Adapter-specific `esp.*` methods are diagnostics
+and direct firmware controls; they are useful for tests and bring-up but should
+not become the product contract when an equivalent high-level method exists.
 
 | Method | Result |
 | --- | --- |
@@ -89,17 +114,51 @@ command surface changes; do not generate it from Rust code.
 | `status` | none | Reports process capabilities, HCI raw-socket probe, and optional WPA control status through the control UDS. |
 | `radios.list` | none | Lists configured host, serial, remote UDS, and future Android radio adapters. |
 | `neighbors` | `seen_within_sec: integer = 21600` | Returns the normalized neighbor table from recent radio messages. |
-| `discovery.ping` | `medium: string = "all"` | Pings matching configured media. ESP serial radios are opened at their configured baud, sent shared mesh text, and reply/log lines are normalized through `mesh::message`; other media record the fanout intent for their adapters. |
+| `links.list` | `seen_within_sec: integer = 21600` | Returns lmesh link observations derived from recent radio messages, including radio, RSSI/SNR, quality, and selected path. |
+| `ping` / `disc` | `radio: string = "all"`, `wait_ms: integer = 900`, `nonce: string \| null` | Discovers peers over `all`, `nan`, `lora`, `ble`, `serial`, or `sta`. The default Wi-Fi path is NAN publish/subscribe through wpa_supplicant, aligned with Android `lib-lm3`. |
+| `send` | `radio: string = "best"`, `destination: mac \| null`, `payload: string` | Sends a mesh payload over the selected radio. `best` currently selects NAN follow-up using the Android-compatible DMesh NAN v1 payload. `lora` uses a configured ESP serial adapter when available; Linux host radios, Android JNI adapters, and SSH-forwarded `remote-uds` lmesh instances should all fit behind this same method. |
+| `link.steer` | `node: string \| null`, `radio: string = "best"`, `reason: string = "manual"` | Records a high-level steering hint for a peer. Future encrypted control-plane forwarding should use this shape. |
+| `discovery.ping` | `medium: string = "all"` | Compatibility wrapper for `ping`, mapping `medium=wifi` to `radio=wifiraw`. |
 | `messages.history` | `keys: string = "messages,net,wifi,BLE,N"`, `limit: integer = 40` | Returns recent radio method results recorded by this process. |
-| `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `rx_variant: string = "nl80211"` | Uses wpa_supplicant control to set P2P listen channel and start a listen window. `nl80211` registers an action-frame match for ESP32 DMesh vendor action bytes `7f:50:6f:9a:42`; `monitor` captures radiotap monitor frames and parses both action and multicast data frames with that marker. Records received payloads as `wifi.raw.rx` events in `messages.history`. Requires `CAP_NET_ADMIN`/`CAP_NET_RAW`. |
-| `wifi.raw.send` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `destination: mac = ff:ff:ff:ff:ff:ff`, `tx_variant: string = "standard"`, `tx_duration_ms: integer \| null`, `payload: string` | Sends an ESP32-compatible DMesh frame. nl80211 variants probe action-frame `FRAME` TX; `pyroute2` matches the common `ifindex/freq/duration/frame` shape; `roc` first issues `REMAIN_ON_CHANNEL` on the same nl80211 socket and skips the wpa_supplicant P2P listen command; `monitor` injects an action frame through AF_PACKET monitor mode; `multicast_data` injects a non-QoS multicast data frame through AF_PACKET monitor mode and defaults `destination` to `01:00:5e:44:4d:01`. Requires `CAP_NET_ADMIN`/`CAP_NET_RAW`. |
-| `ble.scan` | `dev_id: integer = 0`, `reason: string = "jsonl"` | Enables passive LE scanning through raw Linux HCI sockets. Requires `CAP_NET_RAW`. |
+| `usb.serial.list` | `handshake: bool = false` | Lists visible `/dev/ttyUSB*`, `/dev/ttyACM*`, and `/dev/serial/by-id/*` serial devices, including configured lmesh radio adapters and active forwards. With `handshake=true`, probes each device with the DMesh profile. |
+| `usb.serial.handshake` | `port: string = "USB0"`, `profile: string = "generic"`, `timeout_sec: number = 1.5` | Runs a one-shot handshake without holding the device open. `port` is a logical token such as `USB0`, `USB1`, or `ACM0`; lmesh derives `/dev/ttyUSB0`, `/dev/ttyUSB1`, or `/dev/ttyACM0`. `profile=generic` sends `help`; `profile=dmesh`/`esp` sends firmware status probes; `profile=cmd:<text>` sends a custom command. Returns raw text and parsed mesh messages. |
+| `usb.serial.reset` | `port: string = "USB0"`, `mode: "run"\|"bootloader" = "run"` | Pulses ESP USB serial modem lines into running firmware or ROM download mode. If a lmesh forward is active, the reset is queued on that forward's owned serial FD and the TCP/UDS listeners stay up. Flash scripts should use `mode=bootloader`, run esptool with `--before no_reset --after no_reset`, then call `mode=run`. |
+| `usb.serial.forward.start` / `usb.serial.connect` | `port: string = "USB0"`, `baud: integer = 460800`, `tcp_port: integer \| null`, `tcp_mode: "auto"\|"framed"\|"rfc2217" = "auto"`, `handshake: bool = false`, `dtr: bool = false`, `multi: bool = false` | Starts a generic UDS forward for a USB serial device. lmesh derives the device path and socket from `port`, e.g. `USB0` -> `/dev/ttyUSB0` and `/run/mesh/lmesh-radio-build/USB0.sock`. The socket is `0770` and group `dialout`. With `tcp_port`, lmesh also exposes the same forward on `127.0.0.1:<tcp_port>`. Use `tcp_mode=rfc2217` with `rfc2217://127.0.0.1:<tcp_port>` for flasher tools that need baud/control-line changes; use `tcp_mode=framed` for plain `socket://` text or future CBOR/length-framed binary. Serial output is broadcast to all connected UDS and TCP clients with bounded backpressure queues. With `dtr=true`, each client connection briefly pulses DTR for boards that need an interrupt to activate UART; disable this for flasher clients so esptool owns reset timing. By default, only the first connected client can send input; `multi=true` allows every client to send. Framed input sends newline-terminated text or binary records beginning with `0x00` plus a 3-byte big-endian length. RFC2217 mode interprets Telnet/RFC2217 controls and forwards escaped binary data. |
+| `usb.serial.forward.stop` / `usb.serial.disconnect` | `port: string = "USB0"` | Stops a managed serial forward and removes its socket. |
+| `usb.serial.forward.list` | none | Lists active managed serial forwards. |
+| `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `rx_variant: string = "nl80211"` | Debug-only legacy raw Wi-Fi action-frame listener retained for lab comparison. New DMesh control-plane work should use `wifi.nan.*`. |
+| `wifi.raw.send` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `destination: mac \| rx:mac \| raw:mac`, `source: mac \| null`, `tx_variant: string = "standard"`, `tx_duration_ms: integer \| null`, `payload: string` | Debug-only legacy raw Wi-Fi sender retained for lab comparison. New DMesh control-plane work should use `wifi.nan.transmit`. |
+| `wifi.raw.ping` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `wait_ms: integer = 900`, `nonce: string \| null` | Debug-only legacy raw Wi-Fi ping retained for lab comparison. |
+| `wifi.data.listen` | `iface: string = LMESH_WIFI_IFACE`, `listen_sec: integer = 60` | Opens an AF_PACKET listener on the normal AP/STA netdev, requests packet multicast membership for the real MAC, raw receive MAC, and shared multicast MAC, and records matching DMesh Ethernet frames as `wifi.data.rx`. This tests efficient kernel/driver data-path delivery, not monitor visibility. Requires `CAP_NET_RAW`. |
+| `wifi.data.send` | `iface: string = LMESH_WIFI_IFACE`, `destination: mac \| rx:mac \| raw:mac \| null`, `payload: string` | Sends a DMesh Ethernet frame with experimental EtherType `0x88b5` on the normal AP/STA netdev path. Defaults to the shared DMesh multicast MAC. Requires `CAP_NET_RAW`. |
+| `wifi.mgmt.capture` | `iface: string = LMESH_WIFI_IFACE`, `channel: integer = 6`, `capture_ms: integer = 4000`, `max_frames: integer = 32`, `active: bool = false` | Captures beacon and probe-response frames through an AF_PACKET monitor interface and returns raw frame hex plus parsed SSID/channel/rate/capability IE summaries. Requires `CAP_NET_RAW`; `active=true` recreates the monitor interface with active monitor flags. |
+| `wifi.ap.start_open` | `iface: string = LMESH_WIFI_IFACE`, `ssid: string \| null` | Starts a password-less open AP on channel 6 through direct nl80211. When `ssid` is omitted, lmesh uses `Direct-XXXXXXXX-Dmesh-local`, with `XXXXXXXX` from the last 4 MAC bytes. Exact defaults and future tuning knobs are recorded in `WIFI.md`. The response includes `template_lengths`, `steps`, `profiles`, and `selected_profile` so driver rejections can be compared across AP template variants. While the AP is alive, lmesh records AP SME auth/assoc/probe/deauth frames as `wifi.ap.mgmt`, including raw frame hex and `rx_signal_dbm` when available. |
+| `wifi.ap.stop` | `iface: string = LMESH_WIFI_IFACE` | Stops AP operation through direct nl80211. |
+| `wifi.ap.status` | `iface: string = LMESH_WIFI_IFACE` | Returns default AP SSID/channel/BSSID information and station metrics where available. |
+| `wifi.ap.stations` | `iface: string = LMESH_WIFI_IFACE` | Dumps associated station metrics through nl80211, including MAC, RSSI/signal, inactive time, packet/byte counters, retries, failures, and connected time when exposed by the driver. Station observations feed `links.list` as `radio=sta`. |
+| `wifi.ap.station.add` | `iface: string = LMESH_WIFI_IFACE`, `mac: mac`, `aid: integer = 1` | Experimental: calls `NL80211_CMD_NEW_STATION` with a discovered MAC, minimal open-AP station attributes, and authorized/authenticated/associated station flags, without a normal auth/assoc exchange. This is for evaluating whether a driver can accept synthetic station entries discovered over raw Wi-Fi/LoRA/BLE and deliver their data frames on the normal AP netdev. |
+| `wifi.scan` | `iface: string = LMESH_WIFI_IFACE`, `ssid: string \| null` | Scans for nearby Wi-Fi BSS entries through the lmesh radio process and returns parsed BSSID, SSID, signal, frequency/channel, capability, and auth hints. `ssid` optionally limits active scan probes to one SSID. |
+| `wifi.sta.join_open` | `iface: string = LMESH_WIFI_IFACE`, `ssid: string` | Joins a password-less open AP on channel 6 through direct nl80211. |
+| `wifi.sta.status` | `iface: string = LMESH_WIFI_IFACE` | Dumps station-mode AP peer metrics through nl80211 and reports `associated=true` when the interface has a current AP peer. Peer observations feed `links.list` as `radio=sta`. |
+| `ble.scan` | `dev_id: integer = 0`, `reason: string = "jsonl"`, `scan_ms: integer = 1500` | Runs a bounded passive LE scan through raw Linux HCI sockets, parses DMesh 16-bit and operational 128-bit service-data announcements, records `BLE.rx` events, and returns `reports` plus parsed `dmesh` entries with `mode`, `event`, RSSI, address, and duplicate status. Requires `CAP_NET_RAW`. |
 | `ble.adv` | `dev_id: integer = 0`, `on: bool = true`, `payload: string = "lmesh"` | Enables or disables BLE advertising with DMesh service UUID `0xFD5D` and current DMesh service-data layout. Requires `CAP_NET_RAW`. |
-| `wifi.nan.start` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR` | Brings the interface up through native rtnetlink, then probes the WPA control socket with `STATUS` and `DRIVER_FLAGS2`. |
-| `wifi.nan.stop` | `iface`, `ctrl_dir` | Sends best-effort raw `NAN_CANCEL_PUBLISH publish_id=1` and `NAN_CANCEL_SUBSCRIBE subscribe_id=1`. |
-| `wifi.nan.adv` | `iface`, `ctrl_dir` | Sends `NAN_PUBLISH service_name=dmesh ... ssi=<DMesh NAN service info>` through the WPA control UDS. |
-| `wifi.nan.sub` | `iface`, `ctrl_dir` | Sends `NAN_SUBSCRIBE service_name=dmesh active=1 ...` through the WPA control UDS. |
-| `wifi.nan.ping` | `iface`, `ctrl_dir`, `peer: hex device id`, `payload: string = "ping"` | Sends a DMesh NAN follow-up with raw `NAN_TRANSMIT`; when `peer` is omitted the frame target is broadcast-like `ff:ff:ff:ff:ff:ff`. |
+| `esp.serial.command` | `adapter: string \| null`, `port: string \| null`, `command: string`, `timeout_sec: number = 1.5` | Debug/test method: sends one direct firmware text command to an ESP adapter and returns normalized `MeshMessage` records. Prefer high-level methods for product flows. |
+| `esp.status` | `adapter: string \| null`, `port: string \| null`, `extended: bool = false` | Diagnostic wrapper for firmware `status` or `xstatus`. `status` is the compact golden-signal line; `xstatus` is verbose debug telemetry. |
+| `esp.power.profile` | `adapter: string \| null`, `port: string \| null`, `profile: "dfs"\|"perf"\|"low"\|"auto"\|null`, `save: bool = false` | Diagnostic wrapper for `power status=true` or `power profile=...`. Firmware defaults to `dfs`. |
+| `esp.lora.status` | `adapter: string \| null`, `port: string \| null` | Diagnostic wrapper for `lora status=true` on an ESP adapter. Product status should flow into `radios.list`, `links.list`, and `messages.history`. |
+| `esp.wifi.raw_status` | `adapter: string \| null`, `port: string \| null` | Diagnostic wrapper for raw Wi-Fi counters on an ESP adapter. |
+| `esp.sleep.status` | `adapter: string \| null`, `port: string \| null` | Diagnostic wrapper for ESP power/sleep state. |
+| `esp.telemetry.stats` | `adapter: string \| null`, `port: string \| null`, `reset: bool = false` | Diagnostic wrapper for ESP telemetry counters. |
+| `esp.battery.adc_probe` | `adapter: string \| null`, `port: string \| null`, `adc1_pins: string = "32,33,34,35,36,39"`, `count: integer = 3` | Low-level hardware probe for ESP ADC battery wiring. |
+| `wifi.nan.start` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR` | Brings the interface up, attaches it to wpa_supplicant, applies DMesh NAN defaults (`master_pref=1`, `cluster_id=50:6f:9a:01:05:01`, low-band awake DW interval 8), then calls `NAN_START`. |
+| `wifi.nan.default` | `iface`, `ctrl_dir`, `service_name: string = "dmesh"`, `ttl: integer = 3600` | Starts host DMesh NAN: publish with both solicited and unsolicited transmissions plus active subscribe on service `dmesh`, using `radio_protocol::build_nan_service_info("android", device_id, wake_count)`. lmesh calls this at startup unless `LMESH_NAN_AUTOSTART=0`, and logs NAN follow-up events unless `LMESH_NAN_EVENT_LOG=0`. |
+| `wifi.nan.status` | `iface`, `ctrl_dir`, `events_ms: integer = 100` | Returns `STATUS`, `DRIVER_FLAGS`, `DRIVER_FLAGS2`, `NAN_STATUS`, and recently received NAN events. |
+| `wifi.nan.events` | `iface`, `ctrl_dir`, `wait_ms: integer = 250`, `max_events: integer = 64` | Attaches to the wpa_supplicant control socket and returns parsed `NAN-DISCOVERY-RESULT`, `NAN-REPLIED`, `NAN-RECEIVE`, transmit status, and related events. DMesh NAN v1 SSI/follow-up payloads are decoded when present. |
+| `wifi.nan.publish` / `wifi.nan.adv` | `iface`, `ctrl_dir`, `service_name: string = "dmesh"`, `ssi_hex: hex \| null`, `ttl: integer = 3600`, `freq: integer = 2437`, `srv_proto_type: integer = 0` | Sends `NAN_PUBLISH` with wpa_supplicant's default solicited and unsolicited transmissions, so the host both advertises and responds. When `ssi_hex` is omitted, lmesh uses Android-compatible DMesh NAN service info. |
+| `wifi.nan.subscribe` / `wifi.nan.sub` | `iface`, `ctrl_dir`, `service_name: string = "dmesh"`, `ssi_hex: hex \| null`, `ttl: integer = 3600`, `freq: integer = 2437`, `active: bool = true`, `srv_proto_type: integer = 0` | Sends active `NAN_SUBSCRIBE` aligned with Android `lib-lm3`. |
+| `wifi.nan.transmit` | `iface`, `ctrl_dir`, `handle: integer`, `address: mac`, `req_instance_id: integer \| null`, `ssi_hex: hex \| null`, `payload: string \| null`, `cookie: integer \| null` | Sends one NAN follow-up. If `payload` is used, lmesh sends UTF-8 bytes directly; high-level `send radio=nan` wraps payloads with `build_nan_followup("command_text", ...)`. |
+| `wifi.nan.ping` | `iface`, `ctrl_dir`, `peer: hex device id`, `payload: string = "ping"` | Compatibility helper that builds a DMesh NAN follow-up and sends `NAN_TRANSMIT`. |
+| `wifi.nan.size_probe` | `iface`, `ctrl_dir`, `sizes: comma-list = "64,128,192,224,230,255,384,512,1024"`, `mode: "publish"\|"transmit" = "publish"` | Probes what SSI/follow-up sizes wpa_supplicant accepts at the control/API layer. Over-the-air DW success still needs peer observation. |
 
 Node results contain:
 
@@ -183,21 +242,17 @@ Public helpers:
 | `build_nan_service_info` / `parse_nan_service_info` | WiFi Aware/NAN service-specific info frames. |
 | `build_nan_followup` / `parse_nan_followup` | WiFi Aware/NAN follow-up message frames. |
 
-The direct ESP32 Wi-Fi command path currently uses vendor-specific 802.11 action
-frames, not NAN. Firmware builds frames as:
-
-```text
-fc=d0:00 duration=00:00 addr1=<destination> addr2=<station_mac> addr3=<destination> seq=00:00
-body=7f 50 6f 9a 42 <payload bytes>
-```
-
-`wifi.raw.listen rx_variant=nl80211` receives nl80211 `FRAME` notifications
-after registering an action-frame match for that body prefix.
-
-`wifi.raw.send tx_variant=multicast_data` uses the same five-byte body marker,
-but places it in the payload of a non-QoS data frame with frame control
-`08:00`. Multicast and broadcast destinations avoid normal unicast MAC ACK and
-retry behavior.
+The active low-power Wi-Fi control plane is raw NAN, not ESP-NOW-like action
+frames. Sleeping ESP32-S3 nodes manually parse and generate the required NAN
+beacon, discovery-window, service-discovery, and follow-up subset; they do not
+act as master and may deep sleep between discovery windows. Powered Linux and
+Android nodes use their official NAN implementations for interoperability and
+cluster/master duties. Android `lib-lm3` uses service name `dmesh`, solicited
+publish, active subscribe, and the DMesh NAN v1 service-info/follow-up format
+exposed by this crate. lmesh host defaults also keep unsolicited publish
+enabled. Legacy ESP-NOW-like raw Wi-Fi methods remain diagnostics only. See
+`../../notes/ai/lmesh-radio-handoff.md` for the current architecture and test
+handoff.
 
 ## Real-Hardware Radio Setup
 

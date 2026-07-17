@@ -1,0 +1,46 @@
+# Lab USB serial forwards for ESP firmware development.
+#
+# lmesh reads this file when LMESH_CONFIG_FILE points to it. The mesh-init
+# lmesh-radio-build example does that by default so ESP boards keep stable
+# RFC2217 TCP ports across lmesh restarts. ACM0 is intentionally omitted; it is
+# normally the connected Android device in this lab.
+
+[[serial_forwards]]
+port = "USB0"
+baud = 460800
+tcp_port = 3330
+tcp_mode = "rfc2217"
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "USB1"
+baud = 460800
+tcp_port = 3331
+tcp_mode = "rfc2217"
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "USB2"
+baud = 460800
+tcp_port = 3332
+tcp_mode = "rfc2217"
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "USB3"
+baud = 460800
+tcp_port = 3333
+tcp_mode = "rfc2217"
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "ACM1"
+baud = 460800
+tcp_port = 3334
+tcp_mode = "rfc2217"
+dtr = false
+multi = true
