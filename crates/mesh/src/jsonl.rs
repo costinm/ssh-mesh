@@ -24,6 +24,8 @@ pub enum ProtocolFormat {
     FlatJson { id: Option<serde_json::Value> },
     /// JSON-RPC-shaped request/response.
     JsonRpc { id: Option<serde_json::Value> },
+    /// Mesh text record request/response.
+    Text,
 }
 
 /// A parsed JSON-lines request before deserializing into a component request enum.
@@ -355,6 +357,9 @@ impl McpRegistry {
 
 /// Parse a flat or JSON-RPC request without binding it to a component enum.
 pub fn parse_raw_request(trimmed: &str) -> (ProtocolFormat, Result<RawRequest, String>) {
+    if !trimmed.starts_with('{') {
+        return raw_from_text(trimmed);
+    }
     let val: Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(e) => {
@@ -366,6 +371,49 @@ pub fn parse_raw_request(trimmed: &str) -> (ProtocolFormat, Result<RawRequest, S
     };
 
     raw_from_value(val)
+}
+
+fn raw_from_text(trimmed: &str) -> (ProtocolFormat, Result<RawRequest, String>) {
+    let record = match crate::message::TextRecord::parse(trimmed) {
+        Ok(record) => record,
+        Err(error) => return (ProtocolFormat::Text, Err(error.to_string())),
+    };
+    let mut params = serde_json::Map::new();
+    for (key, value) in record.fields {
+        params.insert(key, text_json_value(&value));
+    }
+    if !record.args.is_empty() {
+        params.insert(
+            "args".to_string(),
+            Value::Array(record.args.into_iter().map(Value::String).collect()),
+        );
+    }
+    (
+        ProtocolFormat::Text,
+        Ok(RawRequest {
+            method: record.kind,
+            params,
+        }),
+    )
+}
+
+fn text_json_value(value: &str) -> Value {
+    if value.eq_ignore_ascii_case("true") {
+        return Value::Bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Value::Bool(false);
+    }
+    if value.eq_ignore_ascii_case("null") || value.eq_ignore_ascii_case("none") {
+        return Value::Null;
+    }
+    if let Ok(number) = value.parse::<i64>() {
+        return json!(number);
+    }
+    if let Ok(number) = value.parse::<f64>() {
+        return json!(number);
+    }
+    Value::String(value.to_string())
 }
 
 fn raw_from_value(val: Value) -> (ProtocolFormat, Result<RawRequest, String>) {
@@ -631,6 +679,19 @@ pub fn parse_request<T>(trimmed: &str) -> (ProtocolFormat, Result<T, String>)
 where
     T: DeserializeOwned,
 {
+    if !trimmed.starts_with('{') {
+        let (format, raw) = parse_raw_request(trimmed);
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(error) => return (format, Err(error)),
+        };
+        let mut direct = raw.params;
+        direct.insert("method".to_string(), json!(raw.method));
+        return match serde_json::from_value::<T>(serde_json::Value::Object(direct)) {
+            Ok(req) => (format, Ok(req)),
+            Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
+        };
+    }
     let val: serde_json::Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(e) => {
@@ -729,6 +790,11 @@ pub fn format_response(response: Response, format: &ProtocolFormat) -> anyhow::R
             );
             Ok(serde_json::to_string(&serde_json::Value::Object(map))?)
         }
+        ProtocolFormat::Text => Ok(crate::message::format_text_response(
+            response.success,
+            response.error.as_deref(),
+            response.data.as_ref(),
+        )),
     }
 }
 

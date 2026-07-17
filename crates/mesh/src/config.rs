@@ -236,13 +236,13 @@ pub enum SocketListenType {
 /// The `[resources]` section — maps to cgroup v2 knobs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ResourceLimits {
-    #[serde(rename = "MemoryMin")]
+    #[serde(rename = "MemoryMin", alias = "memory_min", alias = "memory.low")]
     pub memory_low: Option<String>,
-    #[serde(rename = "MemoryHigh")]
+    #[serde(rename = "MemoryHigh", alias = "memory_high", alias = "memory.high")]
     pub memory_high: Option<String>,
-    #[serde(rename = "MemoryMax")]
+    #[serde(rename = "MemoryMax", alias = "memory_max", alias = "memory.max")]
     pub memory_max: Option<String>,
-    #[serde(rename = "CPUWeight")]
+    #[serde(rename = "CPUWeight", alias = "cpu_weight", alias = "cpu.weight")]
     pub cpu_weight: Option<u32>,
 }
 
