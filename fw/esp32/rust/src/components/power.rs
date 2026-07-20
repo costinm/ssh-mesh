@@ -7,6 +7,25 @@ use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandRe
 
 use super::settings::{parse_bool, SharedSettings};
 
+#[repr(C)]
+#[derive(Default)]
+struct SleepMetrics {
+    attempts: u32,
+    entries: u32,
+    skipped: u32,
+    expected_us: u64,
+    slept_us: u64,
+    max_us: u32,
+    tracked_us: u64,
+}
+
+unsafe extern "C" {
+    fn dmesh_pm_metrics_init() -> i32;
+    fn dmesh_pm_metrics_reset();
+    fn dmesh_pm_metrics_snapshot(out: *mut SleepMetrics);
+    fn dmesh_pm_dump_locks(out: *mut u8, out_len: usize) -> i32;
+}
+
 const PROFILE_PERF: u8 = 0;
 const PROFILE_DFS: u8 = 1;
 const PROFILE_LOW: u8 = 2;
@@ -24,6 +43,12 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
 }
 
 pub fn apply_default(settings: &SharedSettings) -> Result<()> {
+    let metrics_ret = unsafe { dmesh_pm_metrics_init() };
+    if metrics_ret != sys::ESP_OK && metrics_ret != sys::ESP_ERR_NOT_SUPPORTED {
+        return Err(anyhow!(
+            "light-sleep metrics init failed err=0x{metrics_ret:x}"
+        ));
+    }
     let profile = settings
         .borrow()
         .get_str("power.profile")?
@@ -48,7 +73,7 @@ pub fn compact_status_fields() -> String {
         unsafe { sys::esp_pm_get_configuration((&mut pm as *mut sys::esp_pm_config_t).cast()) }
             == sys::ESP_OK;
     format!(
-        "power={} cpu_mhz={} xtal_mhz={} pm={} pm_min={} pm_max={} light={} heap={} heap_min={} heap_int={} psram={} psram_free={} psram_min={} psram_largest={} tasks={} tick={}",
+        "power={} cpu_mhz={} xtal_mhz={} pm={} pm_min={} pm_max={} light={} tick={}",
         active_profile_name(),
         cpu_freq_mhz(),
         xtal_freq_mhz(),
@@ -56,6 +81,13 @@ pub fn compact_status_fields() -> String {
         if pm_ok { pm.min_freq_mhz } else { 0 },
         if pm_ok { pm.max_freq_mhz } else { 0 },
         pm_ok && pm.light_sleep_enable,
+        unsafe { sys::xTaskGetTickCount() },
+    )
+}
+
+pub fn resource_status_fields() -> String {
+    format!(
+        "heap={} heap_min={} heap_int={} psram={} psram_free={} psram_min={} psram_largest={} tasks={}",
         unsafe { sys::esp_get_free_heap_size() },
         unsafe { sys::esp_get_minimum_free_heap_size() },
         unsafe { sys::esp_get_free_internal_heap_size() },
@@ -64,12 +96,44 @@ pub fn compact_status_fields() -> String {
         unsafe { sys::heap_caps_get_minimum_free_size(sys::MALLOC_CAP_SPIRAM) },
         unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_SPIRAM) },
         unsafe { sys::uxTaskGetNumberOfTasks() },
-        unsafe { sys::xTaskGetTickCount() },
     )
 }
 
 pub fn status_text() -> String {
-    format!("power {}", compact_status_fields())
+    format!(
+        "power {} {}",
+        compact_status_fields(),
+        sleep_metrics_fields()
+    )
+}
+
+pub fn reset_sleep_metrics() {
+    unsafe { dmesh_pm_metrics_reset() };
+}
+
+pub fn sleep_metrics_fields() -> String {
+    let mut metrics = SleepMetrics::default();
+    unsafe { dmesh_pm_metrics_snapshot(&mut metrics) };
+    let slept_us = metrics.slept_us.min(metrics.tracked_us);
+    let awake_us = metrics.tracked_us.saturating_sub(slept_us);
+    let sleep_pct_x100 = if metrics.tracked_us == 0 {
+        0
+    } else {
+        slept_us.saturating_mul(10_000) / metrics.tracked_us
+    };
+    format!(
+        "ls_attempts={} ls_entries={} ls_skipped={} ls_expected_us={} ls_us={} ls_max_us={} ls_tracked_us={} ls_awake_us={} ls_pct={}.{:02}",
+        metrics.attempts,
+        metrics.entries,
+        metrics.skipped,
+        metrics.expected_us,
+        slept_us,
+        metrics.max_us,
+        metrics.tracked_us,
+        awake_us,
+        sleep_pct_x100 / 100,
+        sleep_pct_x100 % 100,
+    )
 }
 
 struct PowerCommand {
@@ -81,11 +145,61 @@ impl CommandHandler for PowerCommand {
         "power"
     }
 
-    fn help(&self) -> &'static str {
-        "power status=true | power profile=dfs|perf|low|auto save=true min_mhz=40 max_mhz=160 light=true|false"
-    }
-
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        if request
+            .arg("uart_status")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(CommandResponse::ok(
+                super::serial::measurement_status_fields(),
+            ));
+        }
+        if request
+            .arg("uart_uninstall")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            super::serial::request_uninstall_for_measurement();
+            return Ok(CommandResponse::ok(
+                "power uart_uninstall=true pending=true reset_required_for_restore",
+            ));
+        }
+        if request
+            .arg("quiet")
+            .or_else(|| request.arg("uart_off"))
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            super::serial::request_suspend_until_dtr();
+            return Ok(CommandResponse::ok("power quiet=true pending=dtr"));
+        }
+        if request
+            .arg("locks")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let mut dump = [0_u8; 2048];
+            let ret = unsafe { dmesh_pm_dump_locks(dump.as_mut_ptr(), dump.len()) };
+            if ret < 0 {
+                bail!("esp_pm_dump_locks failed err=0x{ret:x}");
+            }
+            if let Ok(text) = core::str::from_utf8(&dump[..ret as usize]) {
+                super::serial::write(text);
+            }
+        }
+        if request
+            .arg("reset")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            reset_sleep_metrics();
+        }
         if request.arg("status").is_some() {
             return Ok(CommandResponse::ok(status_text()));
         }

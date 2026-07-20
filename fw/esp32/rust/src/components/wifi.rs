@@ -47,6 +47,12 @@ const DMESH_UDP_PORT: u16 = 15009;
 const DMESH_DATA_MARKER_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
 const DMESH_DATA_MARKER_TYPE: u8 = 0x04;
 const DMESH_DATA_MARKER_LEN: usize = 9;
+/// Maximum DMesh payload in one custom raw 802.11 vendor action frame.
+///
+/// This is deliberately independent from ESP-NOW's 250-byte compatibility
+/// limit. The complete 802.11 frame remains below the firmware's 1500-byte
+/// raw transmit/receive bound.
+pub const RAW_ACTION_MAX_PAYLOAD: usize = 1200;
 const DMESH_FIXED_MESH_DST4: [u8; 4] = [0xff; 4];
 const IEEE80211_LLC_SNAP_IPV4: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00];
@@ -86,7 +92,77 @@ static RAW_LAST_COMMAND_PEER: [AtomicU8; 6] = [
 static RAW_LAST_COMMAND_PEER_VALID: AtomicBool = AtomicBool::new(false);
 static RAW_LAST_COMMAND_RESPONSE: AtomicU8 = AtomicU8::new(0);
 static WIFI_NOTIFY_FORWARDING: AtomicBool = AtomicBool::new(false);
+static WIFI_BEACON_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
+static WIFI_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
+static WIFI_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static WIFI_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
 static mut RAW_RX_LAST: [u8; 256] = [0; 256];
+
+/// Generic beacon-derived wake plan shared by NAN and AP-beacon schedulers.
+#[derive(Clone, Copy, Debug)]
+pub struct BeaconWakePlan {
+    pub window_delay_ms: u32,
+    pub light_sleep_ms: u32,
+    pub beacon_age_ms: u32,
+    pub expected_tsf_us: u64,
+    pub period_us: u32,
+}
+
+/// Latest observed 802.11 beacon timing state.
+#[derive(Clone, Copy, Debug)]
+pub struct BeaconSnapshot {
+    pub count: u32,
+    pub local_us: u64,
+    pub tsf_us: u64,
+}
+
+pub fn beacon_snapshot() -> BeaconSnapshot {
+    BeaconSnapshot {
+        count: WIFI_BEACON_COUNT.load(Ordering::Relaxed),
+        local_us: load_u64(&WIFI_BEACON_LOCAL_LO, &WIFI_BEACON_LOCAL_HI),
+        tsf_us: load_u64(&WIFI_BEACON_TSF_LO, &WIFI_BEACON_TSF_HI),
+    }
+}
+
+/// Compute the next beacon-aligned active window from any observed 802.11 beacon.
+pub fn beacon_wake_plan(
+    min_delay_ms: u32,
+    interval_tu: u32,
+    offset_tu: u32,
+    wake_early_ms: u32,
+) -> Option<BeaconWakePlan> {
+    let snapshot = beacon_snapshot();
+    let period_us = u64::from(interval_tu.max(1)).saturating_mul(1024);
+    if snapshot.local_us == 0 || snapshot.tsf_us == 0 {
+        return None;
+    }
+    let now_us = unsafe { sys::esp_timer_get_time().max(0) as u64 };
+    let age_us = now_us.saturating_sub(snapshot.local_us);
+    if age_us > period_us.saturating_mul(2) {
+        return None;
+    }
+    let now_tsf_us = snapshot.tsf_us.saturating_add(age_us);
+    let target_us = u64::from(offset_tu).saturating_mul(1024) % period_us;
+    let earliest_us = now_tsf_us.saturating_add(u64::from(min_delay_ms) * 1000);
+    let phase_us = earliest_us % period_us;
+    let until_us = if phase_us <= target_us {
+        target_us - phase_us
+    } else {
+        period_us - (phase_us - target_us)
+    };
+    let delay_us = u64::from(min_delay_ms) * 1000 + until_us;
+    Some(BeaconWakePlan {
+        window_delay_ms: delay_us.div_ceil(1000).min(u64::from(u32::MAX)) as u32,
+        light_sleep_ms: delay_us
+            .saturating_sub(u64::from(wake_early_ms) * 1000)
+            .saturating_div(1000)
+            .min(u64::from(u32::MAX)) as u32,
+        beacon_age_ms: (age_us / 1000).min(u64::from(u32::MAX)) as u32,
+        expected_tsf_us: earliest_us.saturating_add(until_us),
+        period_us: period_us.min(u64::from(u32::MAX)) as u32,
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct RawWifiCommand {
@@ -133,7 +209,7 @@ pub fn register_commands(registry: &mut CommandRegistry) {
 
 pub fn forward_management_packet(packet: &[u8]) -> Result<()> {
     ensure_raw_wifi_started(6)?;
-    let frame = nan_action_frame(RAW_BROADCAST, packet)?;
+    let frame = nan_sdf_action_frame(RAW_BROADCAST, packet)?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet("wifi", Direction::Tx, packet, "source=lora_forward");
@@ -142,7 +218,7 @@ pub fn forward_management_packet(packet: &[u8]) -> Result<()> {
 
 pub fn send_raw_action_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
     ensure_raw_wifi_started(6)?;
-    let frame = nan_action_frame(destination, payload)?;
+    let frame = custom_raw_action_frame(destination, payload)?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet(
@@ -217,12 +293,6 @@ pub fn take_raw_command() -> Option<RawWifiCommand> {
 
 pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
     start_raw_only(channel, filter)
-}
-
-pub fn start_sta_idle_mode(channel: u8, ssid: &str) -> Result<()> {
-    validate_wifi_string("ssid", ssid, 32)?;
-    low_level_start_sta_idle(ssid, channel.clamp(1, 13))?;
-    Ok(())
 }
 
 pub fn start_light_sleep_test_mode(mode: &str, channel: u8) -> Result<()> {
@@ -350,10 +420,6 @@ struct WifiCommand {
 impl CommandHandler for WifiCommand {
     fn name(&self) -> &'static str {
         "wifi"
-    }
-
-    fn help(&self) -> &'static str {
-        "wifi mode=off|sta_idle|ap_idle|raw|raw_data|raw_sta|raw_sta_data|raw_ap|raw_ap_data|raw_ap_sta|raw_ap_sta_data channel=6 filter=dmesh ssid=SSID psk=PSK timeout=MS | wifi wake_interval_ms=7000 | wifi scan=true | wifi raw=hex:... | wifi raw_action=TEXT | wifi raw_data=TEXT | wifi raw_stats=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -501,13 +567,14 @@ impl CommandHandler for WifiCommand {
                 .transpose()?
                 .unwrap_or(RAW_BROADCAST);
             prepare_raw_tx(channel)?;
-            let frame = nan_action_frame(destination, payload.as_bytes())?;
+            let frame = custom_raw_action_frame(destination, payload.as_bytes())?;
             raw_tx_frame(&frame, true)?;
             RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
             telemetry::record_packet("wifi", Direction::Tx, payload.as_bytes(), "raw_action=true");
             return Ok(CommandResponse::ok(format!(
-                "wifi raw_action sent bytes={} {}",
+                "wifi raw_action sent bytes={} payload_max={} {}",
                 frame.len(),
+                RAW_ACTION_MAX_PAYLOAD,
                 raw_stats()
             )));
         }
@@ -1229,10 +1296,18 @@ fn low_level_scan() -> Result<Vec<ScanAp>> {
 fn low_level_stop_wifi() -> Result<()> {
     unsafe {
         let _ = sys::esp_wifi_disconnect();
-        let _ = sys::esp_wifi_stop();
         let _ = sys::esp_wifi_set_promiscuous(false);
         let _ = sys::esp_wifi_internal_reg_rxcb(sys::wifi_interface_t_WIFI_IF_STA, None);
+        let stopped = sys::esp_wifi_stop();
+        if stopped != sys::ESP_OK && stopped != sys::ESP_ERR_WIFI_NOT_INIT {
+            bail!("esp_wifi_stop failed err=0x{stopped:x}");
+        }
+        let deinitialized = sys::esp_wifi_deinit();
+        if deinitialized != sys::ESP_OK && deinitialized != sys::ESP_ERR_WIFI_NOT_INIT {
+            bail!("esp_wifi_deinit failed err=0x{deinitialized:x}");
+        }
     }
+    RAW_WIFI_INIT.store(false, Ordering::SeqCst);
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
     WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
     Ok(())
@@ -1281,7 +1356,14 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
 pub fn stop_raw_monitor() -> Result<()> {
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
-        esp_ok_allow_invalid_state(sys::esp_wifi_stop())?;
+        let stopped = sys::esp_wifi_stop();
+        if stopped != sys::ESP_OK
+            && stopped != sys::ESP_ERR_INVALID_STATE
+            && stopped != sys::ESP_ERR_WIFI_NOT_INIT
+            && stopped != sys::ESP_ERR_WIFI_NOT_STARTED
+        {
+            bail!("esp_wifi_stop failed err=0x{stopped:x}");
+        }
     }
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
     Ok(())
@@ -1340,8 +1422,41 @@ fn start_netif_probe(iface: &str) -> Result<()> {
     bail!("netif_probe iface={iface} is not compiled; firmware does not create esp_netif objects")
 }
 
-fn nan_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
+/// Build the DMesh custom vendor-action frame shared with host lmesh.
+pub fn custom_raw_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() > RAW_ACTION_MAX_PAYLOAD {
+        bail!(
+            "raw action payload exceeds {} bytes: {}",
+            RAW_ACTION_MAX_PAYLOAD,
+            payload.len()
+        );
+    }
+    let source = station_mac()?;
+    let mut frame = Vec::with_capacity(24 + DMESH_DATA_MARKER_LEN + payload.len());
+    frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&dmesh_data_marker(destination));
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+fn nan_sdf_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
     super::nan::raw_followup_frame(&destination, payload)
+}
+
+/// Return the source and binary payload of a DMesh custom vendor-action frame.
+pub fn custom_raw_action_payload(frame: &[u8]) -> Option<([u8; 6], &[u8])> {
+    const IEEE80211_HEADER_LEN: usize = 24;
+    if frame.first() != Some(&0xd0) {
+        return None;
+    }
+    let source = frame_address(frame, FRAME_ADDR2)?;
+    let body = frame.get(IEEE80211_HEADER_LEN..)?;
+    let header = dmesh_data_header(body)?;
+    Some((source, &body[header.len..]))
 }
 
 fn dmesh_data_frame(
@@ -1493,6 +1608,15 @@ fn ap_mac() -> Result<[u8; 6]> {
     Ok(mac)
 }
 
+fn load_u64(low: &AtomicU32, high: &AtomicU32) -> u64 {
+    ((high.load(Ordering::Relaxed) as u64) << 32) | low.load(Ordering::Relaxed) as u64
+}
+
+fn store_u64(low: &AtomicU32, high: &AtomicU32, value: u64) {
+    low.store(value as u32, Ordering::Relaxed);
+    high.store((value >> 32) as u32, Ordering::Relaxed);
+}
+
 unsafe extern "C" fn raw_wifi_cb(
     buf: *mut core::ffi::c_void,
     type_: sys::wifi_promiscuous_pkt_type_t,
@@ -1512,8 +1636,26 @@ unsafe extern "C" fn raw_wifi_cb(
         return;
     }
     let frame = unsafe { core::slice::from_raw_parts(payload, len) };
+    observe_beacon(frame);
     super::nan::observe_promiscuous_frame(frame, pkt.rx_ctrl.rssi() as i32);
     observe_promiscuous_frame(frame, pkt.rx_ctrl.rssi() as i32);
+}
+
+fn observe_beacon(frame: &[u8]) {
+    // Beacon management frames carry the AP/NAN TSF timestamp immediately after
+    // the 24-byte 802.11 header. This is deliberately BSSID-agnostic so an AP
+    // can become the timing source when no NAN publisher is available.
+    if frame.first() != Some(&0x80) || frame.len() < 32 {
+        return;
+    }
+    let tsf_us = u64::from_le_bytes(frame[24..32].try_into().unwrap_or([0; 8]));
+    if tsf_us == 0 {
+        return;
+    }
+    let local_us = unsafe { sys::esp_timer_get_time().max(0) as u64 };
+    store_u64(&WIFI_BEACON_LOCAL_LO, &WIFI_BEACON_LOCAL_HI, local_us);
+    store_u64(&WIFI_BEACON_TSF_LO, &WIFI_BEACON_TSF_HI, tsf_us);
+    WIFI_BEACON_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {

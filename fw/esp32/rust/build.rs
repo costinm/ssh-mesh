@@ -14,5 +14,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_hw/dmesh_hw.c");
     println!("cargo:rerun-if-changed=native/dmesh_hw/include/dmesh_hw.h");
     println!("cargo:rerun-if-changed=native/dmesh_hw/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=native/dmesh_pm/dmesh_pm.c");
+    println!("cargo:rerun-if-changed=native/dmesh_pm/include/dmesh_pm.h");
+    println!("cargo:rerun-if-changed=native/dmesh_pm/CMakeLists.txt");
     embuild::espidf::sysenv::output();
 }

@@ -15,8 +15,9 @@ Defaults:
     between discovery windows;
   * configure DFS and LoRa receive when the board has saved/probed LoRa pins.
 
-Use explicit logical --port arguments such as USB0 or ACM1, or set
-DMESH_FLASH_PORTS=USB0,USB1 when device order matters.
+Use explicit logical --port arguments such as lora1 or s3-1, or set
+DMESH_FLASH_PORTS=lora1,lora2 when device roles matter. Numeric USB/ACM names
+remain compatibility aliases.
 Keep test-specific roles, such as sleepy raw-NAN or pretend-sleep timing loops,
 in separate test scripts or manual serial commands.
 """
@@ -35,6 +36,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
+
+from dmesh.radio import RadioClient
+
 
 ROOT = Path(__file__).resolve().parents[4]
 FW_RUST = ROOT / "fw" / "esp32" / "rust"
@@ -42,9 +47,18 @@ SERIAL_CMD = FW_RUST / "tools" / "serial_cmd.py"
 NAN_PAIR_TEST = FW_RUST / "tools" / "nan_pair_test.py"
 LORA_CAD_TEST = FW_RUST / "tools" / "lora_cad_test.py"
 LORA_PAIR_TEST = FW_RUST / "tools" / "lora_pair_test.py"
+PRESUBMIT = FW_RUST / "tools" / "presubmit.py"
 ESP32_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32" / "dmesh-rs-merged.bin"
 ESP32S3_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
 SPARSE_FLASH_DIR = FW_RUST / "target" / "flash" / "sparse"
+FLASH_BAUD = 460_800
+PREFLASH_FAILURE_MARKERS = (
+    "Guru Meditation",
+    "Interrupt wdt timeout",
+    "rst:0x",
+    "boot: ESP-IDF",
+    "Rebooting...",
+)
 
 
 @dataclass
@@ -164,8 +178,6 @@ def parse_args() -> argparse.Namespace:
             "Defaults to USB2 or DMESH_MESHCORE_PORTS."
         ),
     )
-    parser.add_argument("--baud", type=int, default=460800)
-    parser.add_argument("--probe-baud", type=int, default=460800)
     parser.add_argument(
         "--lmesh-mode",
         choices=("tcp", "local-release"),
@@ -205,6 +217,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-config", action="store_true")
     parser.add_argument("--skip-sanity", action="store_true")
     parser.add_argument(
+        "--skip-preflash-stability",
+        action="store_true",
+        help="Recovery only: flash without requiring the existing firmware to stay up.",
+    )
+    parser.add_argument(
+        "--preflash-stability-samples",
+        type=int,
+        default=3,
+        help="Number of status samples required before reset/flash (minimum 2).",
+    )
+    parser.add_argument(
+        "--preflash-stability-interval-sec",
+        type=float,
+        default=2.0,
+        help="Delay between pre-flash status samples.",
+    )
+    parser.add_argument(
+        "--preflash-stability-dir",
+        default=None,
+        help="Directory for pre-flash per-board status transcripts.",
+    )
+    parser.add_argument(
         "--skip-feature-tests",
         action="store_true",
         help="Skip post-flash NAN/LoRa discovery and basic message tests.",
@@ -213,6 +247,19 @@ def parse_args() -> argparse.Namespace:
         "--feature-test-iterations",
         type=int,
         default=int(os.environ.get("DMESH_FEATURE_TEST_ITERATIONS", "1")),
+    )
+    parser.add_argument(
+        "--presubmit-topology",
+        default=os.environ.get("DMESH_PRESUBMIT_TOPOLOGY"),
+        help=(
+            "Run the common hardware suite with this topology after flashing. "
+            "When set, it replaces the legacy post-flash feature scripts."
+        ),
+    )
+    parser.add_argument(
+        "--presubmit-profile",
+        choices=("quick", "full", "stress"),
+        default=os.environ.get("DMESH_PRESUBMIT_PROFILE", "quick"),
     )
     parser.add_argument(
         "--sleepy-port",
@@ -282,6 +329,8 @@ def looks_like_android_acm(device: dict[str, object]) -> bool:
 def logical_usb_port(port: str) -> str:
     if re.fullmatch(r"(USB|ACM)\d+", port):
         return port
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", port):
+        return port
     name = Path(port).name
     if name.startswith("ttyUSB"):
         return f"USB{name.removeprefix('ttyUSB')}"
@@ -301,7 +350,7 @@ def physical_usb_port(port: str) -> str:
 
 
 def lmesh_socket_path(logical_port_name: str) -> str:
-    return f"/run/mesh/lmesh-radio-build/{logical_port_name}.sock"
+    return f"/run/mesh/lmesh/{logical_port_name}.sock"
 
 
 def lmesh_uds_url(logical_port_name: str) -> str:
@@ -526,6 +575,33 @@ def build_targets(env: dict[str, str]) -> None:
     )
 
 
+def validate_prebuilt_images(devices: list[Device]) -> None:
+    """Reject --skip-build when cargo output is newer than its merged image."""
+    targets = {
+        device.is_s3: (
+            FW_RUST
+            / "target"
+            / ("xtensa-esp32s3-espidf" if device.is_s3 else "xtensa-esp32-espidf")
+            / "release"
+            / "dmesh-rs",
+            ESP32S3_MERGED_IMAGE if device.is_s3 else ESP32_MERGED_IMAGE,
+        )
+        for device in devices
+    }
+    for executable, merged in targets.values():
+        if not executable.exists() or not merged.exists():
+            raise SystemExit(
+                "--skip-build requires existing executable and merged image; run without --skip-build"
+            )
+        if merged.stat().st_mtime_ns < executable.stat().st_mtime_ns:
+            raise SystemExit(
+                "--skip-build refused stale merged image {} older than {}; "
+                "run without --skip-build or regenerate it with cargo espflash save-image".format(
+                    merged, executable
+                )
+            )
+
+
 def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: str) -> None:
     if port.startswith("rfc2217://"):
         chip = "esp32s3" if device.is_s3 else "esp32"
@@ -539,12 +615,11 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
             "--port",
             port,
             "--baud",
-            str(args.baud),
+            str(FLASH_BAUD),
             "--before",
             "no_reset" if args.lmesh_mode == "tcp" else "default_reset",
             "--after",
             "no_reset" if args.lmesh_mode == "tcp" else "hard_reset",
-            "--no-stub",
             "write_flash",
         ]
         cmd.extend(flash_args)
@@ -568,7 +643,7 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
             "--flash-size",
             args.flash_size_s3,
             "--baud",
-            str(args.baud),
+            str(FLASH_BAUD),
             "--non-interactive",
         ]
         flash_env = env.copy()
@@ -588,7 +663,7 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
             "--flash-size",
             args.flash_size_esp32,
             "--baud",
-            str(args.baud),
+            str(FLASH_BAUD),
             "--non-interactive",
         ]
         flash_env = env
@@ -633,16 +708,12 @@ def trim_trailing_ff(data: bytes) -> bytes:
 def configure(device: Device, args: argparse.Namespace, port: str) -> None:
     channel = max(1, min(args.nan_channel, 13))
     commands = [
-        "set key=mode value=infra",
-        f"set key=wifi.mode value={args.wifi_mode}",
-        "set key=power.profile value=dfs",
-        "set key=nan.backend value=raw",
-        "set key=nan.boot value=true",
-        f"set key=nan.role value={args.nan_role}",
-        f"set key=nan.service value={args.nan_service}",
-        f"set key=nan.channel value={channel}",
-        "set key=nan.wake_ms value=2000",
-        "set key=nan.active_ms value=500",
+        (
+            f"nvs set mode=infra wifi.mode={args.wifi_mode} power.profile=dfs "
+            f"nan.backend=raw nan.boot=true nan.role={args.nan_role} "
+            f"nan.service={args.nan_service} nan.channel={channel} "
+            "nan.wake_ms=4000 nan.active_ms=250 nan.light_sleep=true nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0"
+        ),
         "mode infra=true",
         "nan stats=true",
         "lora status=true",
@@ -654,7 +725,7 @@ def configure(device: Device, args: argparse.Namespace, port: str) -> None:
                 "loraprobe chip=sx127x spi_host=2 sck=5 miso=19 mosi=27 "
                 "cs=18 rst=23 dio0=26 save=true"
             ),
-            "set key=lora.enabled value=true",
+            "nvs set lora.enabled=true",
         ]
         meshcore_ports = {logical_usb_port(p) for p in args.meshcore_port}
         if device.port in meshcore_ports:
@@ -739,11 +810,67 @@ def stat_value(text: str, key: str) -> int:
     return int(matches[-1]) if matches else 0
 
 
+def preflash_stability_check(
+    port: str,
+    *,
+    samples: int,
+    interval_sec: float,
+    output_dir: Path,
+) -> None:
+    samples = max(2, samples)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    transcript: list[str] = []
+    uptimes: list[int] = []
+    client = RadioClient(lmesh_uds_url(port), timeout=20.0)
+    try:
+        client.connect()
+        for index in range(samples):
+            result = client.command("status", timeout=20.0)
+            transcript.append("# sample {}\n{}".format(index + 1, result.raw))
+            match = re.search(r"\buptime_ms=(\d+)\b", result.raw)
+            if not match:
+                raise RuntimeError("status response has no uptime_ms")
+            uptimes.append(int(match.group(1)))
+            if index + 1 < samples:
+                time.sleep(interval_sec)
+    finally:
+        client.close()
+        path = output_dir / "{}.log".format(port)
+        path.write_text("\n".join(transcript), encoding="utf-8")
+
+    combined = "\n".join(transcript)
+    markers = [marker for marker in PREFLASH_FAILURE_MARKERS if marker in combined]
+    if markers:
+        raise RuntimeError("firmware emitted reset/panic marker(s): {}".format(", ".join(markers)))
+    if any(after <= before for before, after in zip(uptimes, uptimes[1:])):
+        raise RuntimeError("uptime is not strictly increasing: {}".format(uptimes))
+    print(
+        "preflash stability {}: ok samples={} uptime_ms={}..{} transcript={}".format(
+            port, samples, uptimes[0], uptimes[-1], output_dir / "{}.log".format(port)
+        ),
+        flush=True,
+    )
+
+
 def expected_lora_ports(args: argparse.Namespace) -> set[str]:
     return {logical_usb_port(port) for port in args.expected_lora_port}
 
 
 def post_flash_feature_tests(devices: list[Device], args: argparse.Namespace) -> None:
+    if args.presubmit_topology:
+        run_logged(
+            "feature presubmit",
+            [
+                sys.executable,
+                str(PRESUBMIT),
+                "--topology",
+                args.presubmit_topology,
+                "--profile",
+                args.presubmit_profile,
+            ],
+            cwd=ROOT,
+        )
+        return
     nan_devices = [device for device in devices if device.mac and device.is_classic]
     if len(nan_devices) < 2:
         nan_devices = [
@@ -846,9 +973,10 @@ def sleepy_raw_nan_feature_test(devices: list[Device], args: argparse.Namespace)
     console_commands(
         sleepy,
         [
-            f"set key=nan.wake_ms value={wake_ms}",
-            f"set key=nan.active_ms value={active_ms}",
-            f"set key=nan.channel value={args.nan_channel}",
+            (
+                f"nvs set nan.wake_ms={wake_ms} nan.active_ms={active_ms} "
+                f"nan.channel={args.nan_channel}"
+            ),
             f"test cnt={total} wake_ms={wake_ms} active_ms={active_ms} discovery={discovery}",
         ],
     )
@@ -932,6 +1060,46 @@ def main() -> int:
         if args.lmesh_mode == "tcp":
             tcp_ports[port] = ensure_lmesh_forward(args, port, tcp_ports[port])
 
+    if not args.skip_flash and not args.skip_preflash_stability:
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        stability_dir = Path(
+            args.preflash_stability_dir
+            or FW_RUST / "target" / "esp32-preflash-stability" / stamp
+        )
+        print(
+            "preflash stability: checking {} board(s), samples={} interval_sec={}".format(
+                len(ports), max(2, args.preflash_stability_samples), args.preflash_stability_interval_sec
+            ),
+            flush=True,
+        )
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=max(1, len(ports))) as executor:
+            futures = {
+                executor.submit(
+                    preflash_stability_check,
+                    port,
+                    samples=args.preflash_stability_samples,
+                    interval_sec=args.preflash_stability_interval_sec,
+                    output_dir=stability_dir,
+                ): port
+                for port in ports
+            }
+            for future in as_completed(futures):
+                port = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 - report every bad board before stopping.
+                    message = "{}: {}".format(port, exc)
+                    print("preflash stability {}: failed: {}".format(port, exc), flush=True)
+                    failures.append(message)
+        if failures:
+            raise SystemExit(
+                "preflash stability failed; refusing to reset/flash. Transcripts: {}\n{}\n"
+                "Use --skip-preflash-stability only for an intentional recovery flash.".format(
+                    stability_dir, "\n".join(failures)
+                )
+            )
+
     probed: list[Device] = []
     if args.skip_flash:
         probed = [Device(port=port, chip="unknown", mac=None) for port in ports]
@@ -948,7 +1116,7 @@ def main() -> int:
             )
             return probe(
                 probe_port,
-                args.probe_baud,
+                FLASH_BAUD,
                 physical_port=port,
                 before="no_reset" if args.lmesh_mode == "tcp" else "default_reset",
             )
@@ -980,6 +1148,8 @@ def main() -> int:
 
     if not args.skip_build:
         build_targets(env)
+    elif not args.skip_flash:
+        validate_prebuilt_images(devices)
 
     if not args.skip_flash:
         def flash_one(device: Device) -> None:
@@ -1006,17 +1176,6 @@ def main() -> int:
                 lmesh_start_forward(args, device.port, None)
 
         flashed, flash_failed = run_parallel("flash", devices, args.jobs, flash_one)
-        if flash_failed and args.lmesh_mode == "tcp" and args.baud != 460_800:
-            original_baud = args.baud
-            args.baud = 460_800
-            print(
-                f"flash: retrying {len(flash_failed)} failed device(s) at {args.baud} after {original_baud} failure",
-                flush=True,
-            )
-            retry_ok, retry_failed = run_parallel("flash_retry", flash_failed, args.jobs, flash_one)
-            flashed.extend(retry_ok)
-            flash_failed = retry_failed
-            args.baud = original_baud
         devices = sorted(flashed, key=lambda item: item.port)
         if flash_failed:
             print(

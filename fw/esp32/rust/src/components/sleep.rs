@@ -53,6 +53,68 @@ static LIGHT_TEST_LAST_CAUSES: AtomicU32 = AtomicU32::new(0);
 static LIGHT_TEST_LAST_RET: AtomicU32 = AtomicU32::new(0);
 static LIGHT_TEST_LAST_PHASE: AtomicU8 = AtomicU8::new(0);
 static LIGHT_TEST_LAST_ERR: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LIGHT_RUNS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LIGHT_WAKE_OK: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LIGHT_WAKE_FAIL: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LIGHT_LAST_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LIGHT_LAST_CAUSE: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LIGHT_LAST_RET: AtomicU32 = AtomicU32::new(0);
+
+/// Sleep for a bounded idle interval with the radio-independent wake sources armed.
+///
+/// Timer, button, UART, and LoRa DIO0 wake sources are armed through the same
+/// helper as the interactive light-sleep profile. Transport schedulers decide
+/// their own deadlines and resume their radios after this returns.
+pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> {
+    if sleep_ms == 0 {
+        return Ok(());
+    }
+
+    // A DTR/PRG wake owns the next active window. Do not let the NAN duty
+    // scheduler suspend UART again while the operator is still using the
+    // console or while a command response is being emitted.
+    if super::serial::is_active() {
+        telemetry::record_log("event type=uart.sleep skipped=true reason=active_window");
+        return Ok(());
+    }
+
+    // GPIO0/PRG is the console wake source. Do not arm UART wake here: quiet
+    // mode intentionally powers down UART RX until a DTR/button edge opens a
+    // new console window, and UART wake would corrupt its first input byte.
+    configure_light_wake_sources(settings, sleep_ms, false)?;
+    super::serial::suspend_for_light_sleep();
+    RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
+    let before_us = now_us();
+    let ret = unsafe { sys::esp_light_sleep_start() };
+    let elapsed_ms = now_us()
+        .saturating_sub(before_us)
+        .saturating_div(1000)
+        .min(u32::MAX as u64) as u32;
+    let cause = unsafe { sys::esp_sleep_get_wakeup_cause() };
+    RAW_NAN_LIGHT_LAST_MS.store(elapsed_ms, Ordering::Relaxed);
+    RAW_NAN_LIGHT_LAST_CAUSE.store(cause as u32, Ordering::Relaxed);
+    RAW_NAN_LIGHT_LAST_RET.store(ret as u32, Ordering::Relaxed);
+    if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO
+        || cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART
+    {
+        // GPIO0/DTR can wake light sleep without running the normal GPIO ISR
+        // task. UART RX was disabled immediately before sleep, so re-arm it
+        // here before the host sends the first command. Timer/NAN wakes must
+        // not open the debug window or they would defeat the sleep budget.
+        super::serial::rearm_after_wake();
+        telemetry::record_log(format!(
+            "event type=uart.wake source={} phase=light_sleep_return",
+            wake_cause_name(cause)
+        ));
+    }
+    if ret == sys::ESP_OK {
+        RAW_NAN_LIGHT_WAKE_OK.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    } else {
+        RAW_NAN_LIGHT_WAKE_FAIL.fetch_add(1, Ordering::Relaxed);
+        esp_ok(ret)
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -254,10 +316,6 @@ impl CommandHandler for SleepCommand {
         "sleep"
     }
 
-    fn help(&self) -> &'static str {
-        "sleep status=true | sleep test=ble|raw|raw_data|sta|ap ms=5000 restore=true | sleep profile=ble_adv|active | sleep mode=deep|nan_raw wake_ms=5000 active_ms=1000 ble=true wifi=true serial=true channel=6 start=true | sleep mode=light start=true stop=true wifi=true ble=true ble_scan=false raw=true nan=false ps=min|max|none channel=6 wake_ms=5000 serial=true"
-    }
-
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if let Some(profile) = request.arg("profile") {
             return apply_profile(&self.settings, request, profile);
@@ -438,29 +496,6 @@ pub fn enter_companion_deep_sleep(
     enter_deep_sleep_with_state(state)
 }
 
-pub fn enter_raw_nan_deep_sleep(
-    settings: &SharedSettings,
-    lora_listen: bool,
-    wake_ms: u32,
-    active_ms: u32,
-    channel: u8,
-) -> Result<()> {
-    let config = lora::load_config(settings)?;
-    let mut flags = FLAG_WIFI | FLAG_NAN_RAW;
-    if lora_listen {
-        flags |= FLAG_LORA;
-    }
-    let mut state = new_state(config, wake_ms, active_ms, flags, channel);
-    if lora_listen {
-        lora::prepare_deep_sleep_rx(&state.lora.to_config())?;
-    } else {
-        let _ = lora::sleep_radio(settings);
-    }
-    state = update_checksum(state);
-    write_state(state);
-    enter_deep_sleep_with_state(state)
-}
-
 pub fn enable_companion_idle_pm(settings: &SharedSettings) -> Result<()> {
     configure_pm(true)?;
     configure_light_wake_sources(settings, DEFAULT_WAKE_MS, true)?;
@@ -510,7 +545,7 @@ fn start_light_sleep_profile(settings: &SharedSettings, profile: LightSleepProfi
     }
     if profile.nan {
         super::wifi::stop_raw_monitor().ok();
-        super::nan::start_official_low_power(profile.channel, "dmesh")?;
+        super::nan::start_raw_window(profile.channel, "dmesh")?;
         super::wifi::set_power_save(profile.ps)?;
     }
     configure_pm(true)?;
@@ -626,7 +661,7 @@ fn start_light_sleep(settings: &SharedSettings, request: &CommandRequest) -> Res
     }
     if nan {
         super::wifi::stop_raw_monitor().ok();
-        super::nan::start_official_low_power(channel, "dmesh")?;
+        super::nan::start_raw_window(channel, "dmesh")?;
         super::wifi::set_power_save(ps)?;
     }
     telemetry::record_log("event type=sleep.light phase=pm");
@@ -856,19 +891,9 @@ fn prepare_light_sleep_test_radio(
             LIGHT_WIFI.store(true, Ordering::Relaxed);
             LIGHT_RAW.store(false, Ordering::Relaxed);
         }
-        "nan" | "official_nan" => {
-            super::ble_bt::stop_radio_activity();
-            super::wifi::stop_raw_monitor().ok();
-            super::nan::start_official_low_power(channel, "dmesh")?;
-            super::wifi::set_power_save(ps)?;
-            LIGHT_BLE.store(false, Ordering::Relaxed);
-            LIGHT_BLE_SCAN.store(false, Ordering::Relaxed);
-            LIGHT_WIFI.store(true, Ordering::Relaxed);
-            LIGHT_RAW.store(false, Ordering::Relaxed);
-        }
         _ => bail!("unsupported light sleep test={test}"),
     }
-    LIGHT_NAN.store(matches!(test, "nan" | "official_nan"), Ordering::Relaxed);
+    LIGHT_NAN.store(false, Ordering::Relaxed);
     LIGHT_SERIAL.store(false, Ordering::Relaxed);
     Ok(())
 }
@@ -919,8 +944,6 @@ fn light_test_uses_wifi(test: &str) -> bool {
             | "ap"
             | "softap"
             | "open_ap"
-            | "nan"
-            | "official_nan"
     )
 }
 
@@ -1095,7 +1118,7 @@ fn status_text() -> String {
         unsafe { sys::esp_pm_get_configuration((&mut pm as *mut sys::esp_pm_config_t).cast()) }
             == sys::ESP_OK;
     format!(
-        "sleep rtc_valid={} cause={} rtc_cause={} ext1_mask=0x{:x} rtc_ext1_mask=0x{:x} rtc_bytes={} flags=0x{:x} wake_ms={} forward_ms={} boot_count={} wake_count={} last_len={} last_hash=0x{:08x} rtc_ch={} light={} pm={} max={} min={} wifi={} ble={} ble_scan={} raw={} nan={} serial={} ch={} ps={} wifi_ps={} light_wake_ms={} light_tests={} light_prepare_ok={} light_prepare_fail={} light_wake_ok={} light_wake_fail={} light_restore_ok={} light_restore_fail={} light_wifi_wake_ok={} light_wifi_wake_unsupported={} light_wifi_beacon_wake_ok={} light_wifi_beacon_wake_unsupported={} light_bt_wake_ok={} light_bt_wake_unsupported={} light_last_ms={} light_last_ret=0x{:x} light_last_phase={} light_last_err=0x{:x} light_last_cause={} light_last_causes=0x{:x}",
+        "sleep rtc_valid={} cause={} rtc_cause={} ext1_mask=0x{:x} rtc_ext1_mask=0x{:x} rtc_bytes={} flags=0x{:x} wake_ms={} forward_ms={} boot_count={} wake_count={} last_len={} last_hash=0x{:08x} rtc_ch={} light={} pm={} max={} min={} wifi={} ble={} ble_scan={} raw={} nan={} serial={} ch={} ps={} wifi_ps={} light_wake_ms={} light_tests={} light_prepare_ok={} light_prepare_fail={} light_wake_ok={} light_wake_fail={} light_restore_ok={} light_restore_fail={} light_wifi_wake_ok={} light_wifi_wake_unsupported={} light_wifi_beacon_wake_ok={} light_wifi_beacon_wake_unsupported={} light_bt_wake_ok={} light_bt_wake_unsupported={} light_last_ms={} light_last_ret=0x{:x} light_last_phase={} light_last_err=0x{:x} light_last_cause={} light_last_causes=0x{:x} raw_nan_light_runs={} raw_nan_light_ok={} raw_nan_light_fail={} raw_nan_light_last_ms={} raw_nan_light_cause={} raw_nan_light_ret=0x{:x}",
         valid,
         wake_cause_name(cause),
         if valid {
@@ -1146,7 +1169,13 @@ fn status_text() -> String {
         light_test_phase_name(LIGHT_TEST_LAST_PHASE.load(Ordering::Relaxed)),
         LIGHT_TEST_LAST_ERR.load(Ordering::Relaxed),
         wake_cause_name(LIGHT_TEST_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_source_t),
-        LIGHT_TEST_LAST_CAUSES.load(Ordering::Relaxed)
+        LIGHT_TEST_LAST_CAUSES.load(Ordering::Relaxed),
+        RAW_NAN_LIGHT_RUNS.load(Ordering::Relaxed),
+        RAW_NAN_LIGHT_WAKE_OK.load(Ordering::Relaxed),
+        RAW_NAN_LIGHT_WAKE_FAIL.load(Ordering::Relaxed),
+        RAW_NAN_LIGHT_LAST_MS.load(Ordering::Relaxed),
+        wake_cause_name(RAW_NAN_LIGHT_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_source_t),
+        RAW_NAN_LIGHT_LAST_RET.load(Ordering::Relaxed)
     )
 }
 
@@ -1156,7 +1185,7 @@ pub fn status_summary_fields() -> String {
         unsafe { sys::esp_pm_get_configuration((&mut pm as *mut sys::esp_pm_config_t).cast()) }
             == sys::ESP_OK;
     format!(
-        "sleep_light={} sleep_pm={} sleep_max={} sleep_min={} sleep_wifi={} sleep_ble={} sleep_raw={} sleep_nan={} sleep_serial={} sleep_wake_ms={} sleep_tests={} sleep_wake_ok={} sleep_wake_fail={} sleep_last_ms={} sleep_last_cause={}",
+        "sleep_light={} sleep_pm={} sleep_max={} sleep_min={} sleep_wifi={} sleep_ble={} sleep_raw={} sleep_nan={} sleep_serial={} sleep_wake_ms={} sleep_tests={} sleep_wake_ok={} sleep_wake_fail={} sleep_last_ms={} sleep_last_cause={} raw_nan_light_runs={} raw_nan_light_ok={} raw_nan_light_fail={} raw_nan_light_last_ms={} raw_nan_light_cause={}",
         LIGHT_SLEEP_ENABLED.load(Ordering::Relaxed),
         pm_ok && pm.light_sleep_enable,
         if pm_ok { pm.max_freq_mhz } else { 0 },
@@ -1171,7 +1200,12 @@ pub fn status_summary_fields() -> String {
         LIGHT_TEST_WAKE_OK.load(Ordering::Relaxed),
         LIGHT_TEST_WAKE_FAIL.load(Ordering::Relaxed),
         LIGHT_TEST_LAST_ELAPSED_MS.load(Ordering::Relaxed),
-        wake_cause_name(LIGHT_TEST_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_wakeup_cause_t)
+        wake_cause_name(LIGHT_TEST_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_wakeup_cause_t),
+        RAW_NAN_LIGHT_RUNS.load(Ordering::Relaxed),
+        RAW_NAN_LIGHT_WAKE_OK.load(Ordering::Relaxed),
+        RAW_NAN_LIGHT_WAKE_FAIL.load(Ordering::Relaxed),
+        RAW_NAN_LIGHT_LAST_MS.load(Ordering::Relaxed),
+        wake_cause_name(RAW_NAN_LIGHT_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_wakeup_cause_t)
     )
 }
 

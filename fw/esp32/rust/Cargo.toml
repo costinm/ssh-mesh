@@ -13,6 +13,7 @@ esp-idf-svc = { version = "0.52", default-features = false, features = ["std", "
 esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
 libc = "0.2"
 log = "0.4"
+minicbor = { version = "2.2", features = ["std"] }
 
 [build-dependencies]
 embuild = "0.33"

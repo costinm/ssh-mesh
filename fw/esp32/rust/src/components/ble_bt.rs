@@ -451,10 +451,6 @@ pub fn start_connectable_advertising() -> Result<()> {
     start_connectable_idle()
 }
 
-pub fn gatt_connected() -> bool {
-    BLE_GATT_CONNECTED.load(Ordering::Relaxed)
-}
-
 pub fn set_advertising_interval_ms(min_ms: u32, max_ms: u32) {
     let min = adv_ms_to_units(min_ms);
     let max = adv_ms_to_units(max_ms).max(min);
@@ -528,10 +524,6 @@ impl RadioCommand {
 impl CommandHandler for RadioCommand {
     fn name(&self) -> &'static str {
         self.name
-    }
-
-    fn help(&self) -> &'static str {
-        "ble start=true|stop=true|mode=gatt|mode=connectable|pairable=true|advertise=true payload=hex:... event=generic|lora_rx|wake_request|payload_pending|announce=hex:...|send=hex:...|raw_adv=hex:...|companion=true save=true pairing=true|request|confirm timeout_ms=60000 confirm_ms=60000 pairing_recovery=true reset_pairing=true stats=true bonds=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise ESP NAN command/response between two firmware boards.
-
-The test supports both Espressif official NAN and the firmware raw/custom NAN
-SDF path. Keep both serial consoles open for the full run; opening many ESP32
-USB serial adapters toggles DTR and may reset the board, which can erase
-non-persisted test mode changes.
-"""
+"""Legacy focused raw-NAN check; prefer tools/presubmit.py for submissions."""
 
 from __future__ import annotations
 
@@ -34,17 +28,6 @@ def run(console: Console, command: str, timeout: float | None = None) -> str:
 def nan_stats(console: Console) -> dict[str, int]:
     out = run(console, "nan stats=true")
     return {key: int(value) for key, value in STAT_RE.findall(out)}
-
-
-def wait_for_official_matches(a: Console, b: Console, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        a_stats = nan_stats(a)
-        b_stats = nan_stats(b)
-        if a_stats.get("match", 0) > 0 and b_stats.get("match", 0) > 0:
-            return
-        time.sleep(0.5)
-    raise RuntimeError("timed out waiting for NAN service matches")
 
 
 def wait_for_raw_discovery(a: Console, b: Console, timeout: float) -> None:
@@ -119,31 +102,6 @@ def addressed_payload(payload: str, to_mac: str | None, from_mac: str | None) ->
     return " ".join(fields)
 
 
-def run_official_command_round(
-    a: Console,
-    b: Console,
-    payload: str,
-    to_mac: str | None,
-    from_mac: str | None,
-    expect_response: bool,
-    settle_sec: float,
-) -> None:
-    payload = addressed_payload(payload, to_mac, from_mac)
-    a0 = nan_stats(a)
-    b0 = nan_stats(b)
-    out = run(a, f'nan send="{payload}" backend=official')
-    if "backend=official" not in out:
-        raise RuntimeError(f"official send used unexpected backend: {out}")
-    time.sleep(settle_sec)
-    a1 = nan_stats(a)
-    b1 = nan_stats(b)
-    assert_counter_increased(a0, a1, "fup_tx", f"sender after {payload}")
-    assert_counter_increased(b0, b1, "fup_rx", f"receiver after {payload}")
-    assert_counter_increased(b0, b1, "fup_tx", f"receiver response after {payload}")
-    if expect_response:
-        assert_counter_increased(a0, a1, "fup_rx", f"sender response after {payload}")
-
-
 def run_raw_command_round(
     a: Console,
     b: Console,
@@ -177,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--b", required=True, help="Second ESP serial port")
     parser.add_argument("--a-mac", help="First ESP Wi-Fi MAC, required for raw b->a tests")
     parser.add_argument("--b-mac", help="Second ESP Wi-Fi MAC, required for raw a->b tests")
-    parser.add_argument("--backend", choices=["official", "raw"], default="official")
+    parser.add_argument("--backend", choices=["raw"], default="raw")
     parser.add_argument("--stop", action="append", default=[], help="Extra ESP port to stop NAN on")
     parser.add_argument("--channel", type=int, default=6)
     parser.add_argument("--baud", type=int, default=460800)
@@ -200,50 +158,33 @@ def main() -> int:
         print(a.sync().rstrip())
         print(b.sync().rstrip())
         start_pair(a, b, args.channel, args.backend, not args.keep_lora)
-        if args.backend == "official":
-            wait_for_official_matches(a, b, args.timeout)
-        else:
-            if not args.a_mac or not args.b_mac:
-                raise RuntimeError("--a-mac and --b-mac are required for --backend raw")
-            wait_for_raw_discovery(a, b, args.timeout)
+        if not args.a_mac or not args.b_mac:
+            raise RuntimeError("--a-mac and --b-mac are required for raw NAN")
+        wait_for_raw_discovery(a, b, args.timeout)
 
         expect_response = not args.no_expect_response
         for idx in range(args.iterations):
             suffix = f" iter={idx}"
-            if args.backend == "official":
-                run_official_command_round(
-                    a, b, "status", args.b_mac, args.a_mac, expect_response, args.settle_sec
-                )
-                run_official_command_round(
-                    a,
-                    b,
-                    f"dmesh.ping seq={idx}{suffix}",
-                    args.b_mac,
-                    args.a_mac,
-                    expect_response,
-                    args.settle_sec,
-                )
-            else:
-                run_raw_command_round(
-                    a,
-                    b,
-                    "status",
-                    args.a_mac,
-                    args.b_mac,
-                    args.channel,
-                    expect_response,
-                    args.settle_sec,
-                )
-                run_raw_command_round(
-                    a,
-                    b,
-                    f"dmesh.ping seq={idx}{suffix}",
-                    args.a_mac,
-                    args.b_mac,
-                    args.channel,
-                    expect_response,
-                    args.settle_sec,
-                )
+            run_raw_command_round(
+                a,
+                b,
+                "status",
+                args.a_mac,
+                args.b_mac,
+                args.channel,
+                expect_response,
+                args.settle_sec,
+            )
+            run_raw_command_round(
+                a,
+                b,
+                f"dmesh.ping seq={idx}{suffix}",
+                args.a_mac,
+                args.b_mac,
+                args.channel,
+                expect_response,
+                args.settle_sec,
+            )
 
         print(f"\nNAN {args.backend} command/response OK iterations={args.iterations}")
         return 0

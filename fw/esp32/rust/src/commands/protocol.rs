@@ -1,9 +1,97 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use minicbor::{data::Type, Decoder, Encoder};
 
 use super::{CommandRequest, CommandResponse, CommandStatus};
 
-#[allow(dead_code)]
-pub const BINARY_MAGIC: &[u8; 4] = b"DM01";
+/// Common compact-CBOR field identifiers. These match `mesh::cbor` but are
+/// intentionally duplicated: firmware does not link the host crate.
+pub const CBOR_METHOD: u16 = 0;
+pub const CBOR_PAYLOAD: u16 = 6;
+pub const CBOR_STATUS: u16 = 4;
+pub const CBOR_ERROR: u16 = 5;
+pub const CBOR_MAX_RECORD: usize = 512;
+
+/// Firmware-local command identifiers. These are two-byte CBOR values and are
+/// documented in `crates/lmesh/ESP_FIRMWARE_API.md`.
+pub fn command_id(name: &str) -> Option<u16> {
+    Some(match name {
+        "status" => 33,
+        "xstatus" => 34,
+        "stats" => 35,
+        "logs" => 36,
+        "messages" => 37,
+        "local_messages" => 38,
+        "test" => 39,
+        "wifi" => 40,
+        "nan" => 41,
+        "ble" => 42,
+        "lora" => 43,
+        "lorasend" => 44,
+        "loralisten" => 45,
+        "loradump" => 46,
+        "loraprobe" => 47,
+        "sleep" => 48,
+        "mode" => 49,
+        "power" => 50,
+        "battery" => 51,
+        "adcprobe" => 52,
+        "namespace" => 53,
+        "set" => 54,
+        "get" => 55,
+        "list" => 56,
+        "rgbled" => 57,
+        "gpio" => 58,
+        "i2cconfig" => 59,
+        "i2cprobe" => 60,
+        "i2cdetect" => 61,
+        "i2cget" => 62,
+        "i2cset" => 63,
+        "i2cdump" => 64,
+        "button" => 65,
+        "nvs" => 66,
+        _ => return None,
+    })
+}
+
+pub fn command_name(id: u16) -> Option<&'static str> {
+    Some(match id {
+        33 => "status",
+        34 => "xstatus",
+        35 => "stats",
+        36 => "logs",
+        37 => "messages",
+        38 => "local_messages",
+        39 => "test",
+        40 => "wifi",
+        41 => "nan",
+        42 => "ble",
+        43 => "lora",
+        44 => "lorasend",
+        45 => "loralisten",
+        46 => "loradump",
+        47 => "loraprobe",
+        48 => "sleep",
+        49 => "mode",
+        50 => "power",
+        51 => "battery",
+        52 => "adcprobe",
+        53 => "namespace",
+        54 => "set",
+        55 => "get",
+        56 => "list",
+        57 => "rgbled",
+        58 => "gpio",
+        59 => "i2cconfig",
+        60 => "i2cprobe",
+        61 => "i2cdetect",
+        62 => "i2cget",
+        63 => "i2cset",
+        64 => "i2cdump",
+        65 => "button",
+        66 => "nvs",
+        _ => return None,
+    })
+}
 
 /// Text command format shared by console and line-oriented transports.
 ///
@@ -29,6 +117,7 @@ pub fn parse_text(line: &str) -> Result<CommandRequest> {
                 request.args.insert(key.to_string(), value.to_string());
             }
         } else {
+            request.positionals.push(part.clone());
             request.args.insert(part.to_string(), "true".to_string());
         }
     }
@@ -93,65 +182,111 @@ pub fn format_text(response: &CommandResponse) -> String {
     }
 }
 
-/// Minimal binary envelope for future USB/BLE/Wi-Fi use.
-///
-/// Layout: `DM01 | name_len:u8 | argc:u8 | payload_len:u16-le | name |
-/// key_len:u8 value_len:u8 key value ... | payload`.
+/// Encode a flat compact-CBOR command. USB/TTY adds its length/type envelope;
+/// BLE, LoRa, NAN, raw Wi-Fi, and UDP carry these bytes directly.
 #[allow(dead_code)]
 pub fn encode_binary(request: &CommandRequest) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(BINARY_MAGIC);
-    out.push(request.name.len().min(u8::MAX as usize) as u8);
-    out.push(request.args.len().min(u8::MAX as usize) as u8);
-    out.extend_from_slice(&(request.payload.len().min(u16::MAX as usize) as u16).to_le_bytes());
-    out.extend_from_slice(request.name.as_bytes());
-    for (key, value) in &request.args {
-        out.push(key.len().min(u8::MAX as usize) as u8);
-        out.push(value.len().min(u8::MAX as usize) as u8);
-        out.extend_from_slice(key.as_bytes());
-        out.extend_from_slice(value.as_bytes());
+    let mut encoder = Encoder::new(&mut out);
+    // Compact envelope plus a nested method payload. Command-local fields do
+    // not consume envelope IDs.
+    let entries = 2
+        + usize::from(request.args.contains_key("status"))
+        + usize::from(request.args.contains_key("error"));
+    encoder.map(entries as u64).expect("Vec CBOR encode");
+    encoder.u16(CBOR_METHOD).expect("Vec CBOR encode");
+    match command_id(&request.name) {
+        Some(id) => encoder.u16(id).expect("Vec CBOR encode"),
+        None => encoder.str(&request.name).expect("Vec CBOR encode"),
+    };
+    for (field, id) in [("status", CBOR_STATUS), ("error", CBOR_ERROR)] {
+        if let Some(value) = request.args.get(field) {
+            encoder.u16(id).expect("Vec CBOR encode");
+            encoder.str(value).expect("Vec CBOR encode");
+        }
     }
-    out.extend_from_slice(&request.payload);
+    encoder.u16(CBOR_PAYLOAD).expect("Vec CBOR encode");
+    let payload_fields = request.args.len()
+        - usize::from(request.args.contains_key("status"))
+        - usize::from(request.args.contains_key("error"))
+        + usize::from(!request.payload.is_empty());
+    encoder.map(payload_fields as u64).expect("Vec CBOR encode");
+    for (key, value) in &request.args {
+        if key != "status" && key != "error" {
+            encoder.str(key).expect("Vec CBOR encode");
+            encoder.str(value).expect("Vec CBOR encode");
+        }
+    }
+    if !request.payload.is_empty() {
+        encoder.str("data").expect("Vec CBOR encode");
+        encoder.bytes(&request.payload).expect("Vec CBOR encode");
+    }
     out
 }
 
 #[allow(dead_code)]
 pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
-    if input.len() < 8 || &input[0..4] != BINARY_MAGIC {
-        return Err(anyhow!("invalid binary command magic"));
+    if input.len() > CBOR_MAX_RECORD {
+        bail!("CBOR command exceeds {CBOR_MAX_RECORD} bytes");
     }
-    let name_len = input[4] as usize;
-    let argc = input[5] as usize;
-    let payload_len = u16::from_le_bytes([input[6], input[7]]) as usize;
-    let mut cursor = 8;
-    let name_end = cursor + name_len;
-    if name_end > input.len() {
-        return Err(anyhow!("truncated command name"));
-    }
-    let mut request = CommandRequest::new(std::str::from_utf8(&input[cursor..name_end])?);
-    cursor = name_end;
-    for _ in 0..argc {
-        if cursor + 2 > input.len() {
-            return Err(anyhow!("truncated arg header"));
+    let mut decoder = Decoder::new(input);
+    let Some(count) = decoder.map()? else {
+        bail!("indefinite CBOR maps are not supported");
+    };
+    let mut request = None;
+    let mut args = std::collections::BTreeMap::new();
+    let mut payload = Vec::new();
+    for _ in 0..count {
+        let numeric_key = match decoder.datatype()? {
+            Type::U8 | Type::U16 | Type::U32 => Some(decoder.u16()?),
+            Type::String => {
+                let key = decoder.str()?.to_owned();
+                let value = decoder.str()?.to_owned();
+                args.insert(key, value);
+                continue;
+            }
+            kind => bail!("unsupported CBOR command key {kind:?}"),
+        };
+        match numeric_key {
+            Some(CBOR_METHOD) => {
+                request = Some(match decoder.datatype()? {
+                    Type::U8 | Type::U16 | Type::U32 => command_name(decoder.u16()?)
+                        .ok_or_else(|| anyhow!("unknown CBOR firmware command id"))?
+                        .to_owned(),
+                    Type::String => decoder.str()?.to_owned(),
+                    kind => bail!("unsupported CBOR method value {kind:?}"),
+                });
+            }
+            Some(CBOR_STATUS) => {
+                args.insert("status".to_owned(), decoder.str()?.to_owned());
+            }
+            Some(CBOR_ERROR) => {
+                args.insert("error".to_owned(), decoder.str()?.to_owned());
+            }
+            Some(CBOR_PAYLOAD) => {
+                let Some(payload_count) = decoder.map()? else {
+                    bail!("indefinite firmware payload maps are not supported");
+                };
+                for _ in 0..payload_count {
+                    let key = decoder.str()?.to_owned();
+                    if key == "data" {
+                        payload.extend_from_slice(decoder.bytes()?);
+                    } else {
+                        args.insert(key, decoder.str()?.to_owned());
+                    }
+                }
+            }
+            Some(key) => bail!("unsupported reserved CBOR command field {key}"),
+            None => unreachable!(),
         }
-        let key_len = input[cursor] as usize;
-        let value_len = input[cursor + 1] as usize;
-        cursor += 2;
-        if cursor + key_len + value_len > input.len() {
-            return Err(anyhow!("truncated arg body"));
-        }
-        let key = std::str::from_utf8(&input[cursor..cursor + key_len])?.to_string();
-        cursor += key_len;
-        let value = std::str::from_utf8(&input[cursor..cursor + value_len])?.to_string();
-        cursor += value_len;
-        request.args.insert(key, value);
     }
-    if cursor + payload_len > input.len() {
-        return Err(anyhow!("truncated payload"));
+    if decoder.position() != input.len() {
+        bail!("trailing CBOR command data");
     }
-    request
-        .payload
-        .extend_from_slice(&input[cursor..cursor + payload_len]);
+    let mut request =
+        CommandRequest::new(request.ok_or_else(|| anyhow!("CBOR command has no method"))?);
+    request.args = args;
+    request.payload = payload;
     Ok(request)
 }
 

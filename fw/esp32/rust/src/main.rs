@@ -1,6 +1,6 @@
 use anyhow::Result;
 use esp_idf_svc::log::EspLogger;
-use std::ffi::{c_char, CString};
+use std::ffi::c_char;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{Duration, Instant};
 
@@ -150,14 +150,8 @@ fn run() -> Result<()> {
             components::mode::mark_companion_active(&settings, companion_active_ms);
             uart_write("dm-rs> ");
         }
-        for _ in 0..components::button::take_cycle_presses() {
-            components::serial::set_debug_enabled(true);
-            components::serial::activate_window();
-            components::mode::handle_button_short(&settings);
-            serial_enabled = true;
-            if serial_enabled {
-                uart_write("dm-rs> ");
-            }
+        for _ in 0..components::button::take_sync_requests() {
+            components::mode::send_button_sync(&settings);
         }
         drain_uart_console(
             &mut registry,
@@ -166,6 +160,14 @@ fn run() -> Result<()> {
             companion_active_ms,
             &mut line,
         );
+        if components::serial::finish_pending_suspend() {
+            serial_enabled = false;
+        }
+        if components::serial::finish_pending_uninstall()
+            .map_err(|err| anyhow::anyhow!("uart uninstall err=0x{err:x}"))?
+        {
+            serial_enabled = false;
+        }
         match wait_for_firmware_activity(Duration::from_millis(MAIN_HOUSEKEEPING_POLL_MS)) {
             UartWait::Data => {}
             UartWait::Timeout => {
@@ -195,8 +197,7 @@ fn drain_uart_console(
                     uart_write("dm-rs> ");
                 }
                 components::mode::mark_companion_active(settings, companion_active_ms);
-                let read = read as usize;
-                for byte in &buf[..read] {
+                for byte in &buf[..read as usize] {
                     if *byte == b'\n' || *byte == b'\r' {
                         let command = core::str::from_utf8(line).unwrap_or("").trim();
                         if !command.is_empty() {
@@ -205,13 +206,24 @@ fn drain_uart_console(
                         }
                         line.clear();
                         uart_write("dm-rs> ");
+                        if components::serial::finish_pending_suspend() {
+                            *serial_enabled = false;
+                            return;
+                        }
+                        match components::serial::finish_pending_uninstall() {
+                            Ok(true) => {
+                                *serial_enabled = false;
+                                return;
+                            }
+                            Ok(false) => {}
+                            Err(err) => uart_write(&format!("error uart_uninstall=0x{err:x}\n")),
+                        }
                     } else {
                         line.push(*byte);
                     }
                 }
             }
             -1 => {
-                components::telemetry::record_uart_error();
                 break;
             }
             _ => break,
@@ -356,6 +368,9 @@ fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) -> bool
                     }
                     line.clear();
                     uart_write("dm-rs> ");
+                    if components::serial::finish_pending_suspend() {
+                        return true;
+                    }
                 } else {
                     line.push(*byte);
                 }
@@ -497,21 +512,11 @@ fn init_console_uart() {
     }
 }
 
-#[cfg(target_feature = "esp32s3ops")]
-fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
-    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_XTAL
-}
-
-#[cfg(not(target_feature = "esp32s3ops"))]
-fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
-    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_DEFAULT
-}
-
 fn start_uart_event_task(queue: esp_idf_sys::QueueHandle_t) {
     if !UART0_EVENT_TASK.load(Ordering::SeqCst).is_null() {
         return;
     }
-    let Ok(name) = CString::new("uart_evt") else {
+    let Ok(name) = std::ffi::CString::new("uart_evt") else {
         return;
     };
     let mut task = core::ptr::null_mut();
@@ -554,6 +559,16 @@ unsafe extern "C" fn uart_event_task(arg: *mut core::ffi::c_void) {
         }
         components::wake::notify();
     }
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
+    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_XTAL
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
+fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
+    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_DEFAULT
 }
 
 fn wait_for_firmware_activity(timeout: Duration) -> UartWait {

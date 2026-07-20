@@ -1,7 +1,6 @@
 pub mod battery;
 pub mod ble_bt;
 pub mod button;
-pub mod console;
 pub mod frames;
 pub mod gpio;
 pub mod i2c;
@@ -27,7 +26,6 @@ use settings::SharedSettings;
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
     battery::register_commands(registry, settings.clone());
     button::register_commands(registry, settings.clone());
-    console::register_commands(registry);
     gpio::register_commands(registry);
     i2c::register_commands(registry, settings.clone());
     lora::register_commands(registry, settings.clone());

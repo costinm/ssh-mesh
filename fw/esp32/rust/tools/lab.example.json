@@ -1,0 +1,51 @@
+{
+  "nodes": {
+    "witness": {
+      "destination": "lora1.lmesh",
+      "capabilities": ["nan", "lora"],
+      "reset_on_restore": true,
+      "restore": ["power profile=dfs", "nan start=true backend=raw role=both service=dmesh channel=6", "lora rx=true"]
+    },
+    "sut": {
+      "destination": "lora2.lmesh",
+      "capabilities": ["nan", "lora"],
+      "reset_on_restore": true,
+      "restore": ["power profile=dfs", "nan start=true backend=raw role=both service=dmesh channel=6", "lora rx=true"]
+    },
+    "s3": {
+      "destination": "s3-1.lmesh",
+      "capabilities": ["nan"],
+      "required": false,
+      "reset_on_restore": true,
+      "restore": ["power profile=dfs", "nan start=true backend=raw role=both service=dmesh channel=6"]
+    }
+  },
+  "power_meters": {
+    "power1": {
+      "destination": "power1.lmesh",
+      "measures": "sut",
+      "required": false
+    }
+  },
+  "thresholds": {
+    "nan": {
+      "channel": 6,
+      "settle_sec": 2.0,
+      "spacing_sec": 0.2,
+      "min_delivery_ratio": 1.0,
+      "beacon_observe_sec": 6.0,
+      "require_beacon": false
+    },
+    "lora": {
+      "preset": "medium_fast",
+      "frequency": 913125000,
+      "settle_sec": 2.0,
+      "cad_packets": 8,
+      "cad_interval_ms": 2000,
+      "cad_rx_ms": 1000,
+      "cad_spacing_sec": 1.0,
+      "cad_min_delivery_ratio": 0.5
+    },
+    "power": {}
+  }
+}

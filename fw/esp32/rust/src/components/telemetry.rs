@@ -134,7 +134,11 @@ static MAIN_LOOP_COUNTER: AtomicU32 = AtomicU32::new(0);
 static MAIN_UART_READ_COUNTER: AtomicU32 = AtomicU32::new(0);
 static MAIN_UART_BYTE_COUNTER: AtomicU32 = AtomicU32::new(0);
 static MAIN_UART_TIMEOUT_COUNTER: AtomicU32 = AtomicU32::new(0);
-static MAIN_UART_ERROR_COUNTER: AtomicU32 = AtomicU32::new(0);
+static UART_INGRESS_BYTES: AtomicU32 = AtomicU32::new(0);
+static UART_INGRESS_TEXT: AtomicU32 = AtomicU32::new(0);
+static UART_INGRESS_FRAMED: AtomicU32 = AtomicU32::new(0);
+static UART_INGRESS_DROPPED: AtomicU32 = AtomicU32::new(0);
+static UART_INGRESS_OVERSIZE: AtomicU32 = AtomicU32::new(0);
 static MAIN_RAW_POLL_COUNTER: AtomicU32 = AtomicU32::new(0);
 static MAIN_RAW_COMMAND_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -152,22 +156,6 @@ impl TelemetryCommand {
 impl CommandHandler for TelemetryCommand {
     fn name(&self) -> &'static str {
         self.name
-    }
-
-    fn help(&self) -> &'static str {
-        match self.name {
-            "status" => "status",
-            "xstatus" => "xstatus reset=true",
-            "stats" => "stats reset=true",
-            "logs" => "logs count=10 depth=10 max_bytes=2048 clear=true",
-            "messages" => {
-                "messages count=10 depth=10 max_bytes=2048 transport=lora|ble|wifi direction=rx pull=true after_seq=0 ack=true seq=N hash=0x... clear=true"
-            }
-            "local_messages" => {
-                "local_messages count=10 depth=10 max_bytes=2048 transport=lora|ble|wifi clear=true"
-            }
-            _ => "telemetry",
-        }
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -383,7 +371,7 @@ pub fn stats_text(settings: &SharedSettings) -> String {
     let ble = BLE_COUNTER.snapshot();
     let wifi = WIFI_COUNTER.snapshot();
     format!(
-        "stats lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} ble_rx={} ble_rx_bytes={} ble_tx={} ble_tx_bytes={} wifi_rx={} wifi_rx_bytes={} wifi_tx={} wifi_tx_bytes={} logs={} messages={} local_messages={} companion={} main_loops={} main_uart_reads={} main_uart_bytes={} main_uart_timeouts={} main_uart_errors={} main_raw_polls={} main_raw_cmds={} {} {} {}",
+        "stats lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} ble_rx={} ble_rx_bytes={} ble_tx={} ble_tx_bytes={} wifi_rx={} wifi_rx_bytes={} wifi_tx={} wifi_tx_bytes={} logs={} messages={} local_messages={} companion={} main_loops={} main_uart_reads={} main_uart_bytes={} main_uart_timeouts={} uart_rx_bytes={} uart_text={} uart_framed={} uart_drop={} uart_oversize={} main_raw_polls={} main_raw_cmds={} {} {} {}",
         lora.rx_packets,
         lora.rx_bytes,
         lora.tx_packets,
@@ -404,7 +392,11 @@ pub fn stats_text(settings: &SharedSettings) -> String {
         MAIN_UART_READ_COUNTER.load(Ordering::Relaxed),
         MAIN_UART_BYTE_COUNTER.load(Ordering::Relaxed),
         MAIN_UART_TIMEOUT_COUNTER.load(Ordering::Relaxed),
-        MAIN_UART_ERROR_COUNTER.load(Ordering::Relaxed),
+        UART_INGRESS_BYTES.load(Ordering::Relaxed),
+        UART_INGRESS_TEXT.load(Ordering::Relaxed),
+        UART_INGRESS_FRAMED.load(Ordering::Relaxed),
+        UART_INGRESS_DROPPED.load(Ordering::Relaxed),
+        UART_INGRESS_OVERSIZE.load(Ordering::Relaxed),
         MAIN_RAW_POLL_COUNTER.load(Ordering::Relaxed),
         MAIN_RAW_COMMAND_COUNTER.load(Ordering::Relaxed),
         super::wake::stats_fields(),
@@ -420,9 +412,10 @@ pub fn status_text(settings: &SharedSettings) -> String {
     let wifi = WIFI_COUNTER.snapshot();
     let runtime = runtime_snapshot();
     format!(
-        "status uptime_ms={} {} idle_pct={} top={} top_pct={} lora_rx={} lora_tx={} ble_rx={} ble_tx={} wifi_rx={} wifi_tx={} logs={} messages={} companion={} {}",
+        "status uptime_ms={} {} {} idle_pct={} top={} top_pct={} lora_rx={} lora_tx={} ble_rx={} ble_tx={} wifi_rx={} wifi_tx={} logs={} messages={} companion={} {}",
         now_ms(),
         super::power::compact_status_fields(),
+        super::power::resource_status_fields(),
         runtime.idle_pct,
         runtime.top_name,
         runtime.top_pct,
@@ -441,27 +434,29 @@ pub fn status_text(settings: &SharedSettings) -> String {
 
 pub fn xstatus_text(settings: &SharedSettings) -> String {
     format!(
-        "xstatus uptime_ms={} {} {} {} {} {} {} {} {}",
+        "xstatus uptime_ms={} {} {} {} {} {} {} {} {} {} {} {}",
         now_ms(),
         super::power::compact_status_fields(),
+        super::power::sleep_metrics_fields(),
+        super::power::resource_status_fields(),
         runtime_stats_text(),
         super::wake::stats_fields(),
         main_loop_fields(),
         queue_fields(),
         super::battery::stats_fields(settings),
         super::sleep::status_summary_fields(),
+        super::mode::raw_nan_status_fields(),
         radio_summary_fields(settings)
     )
 }
 
 fn main_loop_fields() -> String {
     format!(
-        "main_loops={} main_uart_reads={} main_uart_bytes={} main_uart_timeouts={} main_uart_errors={} main_raw_polls={} main_raw_cmds={}",
+        "main_loops={} main_uart_reads={} main_uart_bytes={} main_uart_timeouts={} main_raw_polls={} main_raw_cmds={}",
         MAIN_LOOP_COUNTER.load(Ordering::Relaxed),
         MAIN_UART_READ_COUNTER.load(Ordering::Relaxed),
         MAIN_UART_BYTE_COUNTER.load(Ordering::Relaxed),
         MAIN_UART_TIMEOUT_COUNTER.load(Ordering::Relaxed),
-        MAIN_UART_ERROR_COUNTER.load(Ordering::Relaxed),
         MAIN_RAW_POLL_COUNTER.load(Ordering::Relaxed),
         MAIN_RAW_COMMAND_COUNTER.load(Ordering::Relaxed)
     )
@@ -634,10 +629,6 @@ pub fn record_uart_read(bytes: usize) {
 
 pub fn record_uart_timeout() {
     MAIN_UART_TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn record_uart_error() {
-    MAIN_UART_ERROR_COUNTER.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn record_raw_poll() {
@@ -887,6 +878,7 @@ fn uart_write(text: &str) {
 }
 
 fn reset() {
+    super::power::reset_sleep_metrics();
     LORA_COUNTER.reset();
     BLE_COUNTER.reset();
     WIFI_COUNTER.reset();
@@ -894,7 +886,6 @@ fn reset() {
     MAIN_UART_READ_COUNTER.store(0, Ordering::Relaxed);
     MAIN_UART_BYTE_COUNTER.store(0, Ordering::Relaxed);
     MAIN_UART_TIMEOUT_COUNTER.store(0, Ordering::Relaxed);
-    MAIN_UART_ERROR_COUNTER.store(0, Ordering::Relaxed);
     MAIN_RAW_POLL_COUNTER.store(0, Ordering::Relaxed);
     MAIN_RAW_COMMAND_COUNTER.store(0, Ordering::Relaxed);
     super::wake::reset_stats();

@@ -70,18 +70,6 @@ impl CommandHandler for I2cCommand {
         self.name
     }
 
-    fn help(&self) -> &'static str {
-        match self.name {
-            "i2cconfig" => "i2cconfig port=0|1 sda=N scl=N freq=100000",
-            "i2cprobe" => "i2cprobe sda=N[,N] scl=N[,N] addr=0x3c save=true",
-            "i2cdetect" => "i2cdetect",
-            "i2cget" => "i2cget chip=0x3c register=0 length=1",
-            "i2cset" => "i2cset chip=0x3c register=0 data=hex:00",
-            "i2cdump" => "i2cdump chip=0x3c",
-            _ => "i2c",
-        }
-    }
-
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         match self.name {
             "i2cconfig" => self.configure(request),

@@ -7,6 +7,9 @@ unsafe extern "C" {
     fn dmesh_ws2812_write(gpio: c_uchar, red: c_uchar, green: c_uchar, blue: c_uchar) -> c_int;
 }
 
+// RGB Led is present on some dev boards and uses a lot of current - this code
+// is meant to turn it off, not to use it. BLE/NAN and android notifications
+// are used to communicate in STA - not LEDs.
 pub fn register_commands(registry: &mut CommandRegistry) {
     registry.register(RgbLedCommand);
 }
@@ -16,10 +19,6 @@ struct RgbLedCommand;
 impl CommandHandler for RgbLedCommand {
     fn name(&self) -> &'static str {
         "rgbled"
-    }
-
-    fn help(&self) -> &'static str {
-        "rgbled pin=N off=true|r=0..255 g=0..255 b=0..255"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {

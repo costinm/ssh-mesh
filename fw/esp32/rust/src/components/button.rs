@@ -22,7 +22,7 @@ const BOOT_SAMPLE_MS: u64 = 100;
 static BUTTON_ENABLED: AtomicBool = AtomicBool::new(false);
 static BUTTON_GPIO: AtomicI32 = AtomicI32::new(DEFAULT_BUTTON_GPIO);
 static BUTTON_PRESSES: AtomicU32 = AtomicU32::new(0);
-static BUTTON_CYCLE_PENDING: AtomicU32 = AtomicU32::new(0);
+static BUTTON_SYNC_PENDING: AtomicU32 = AtomicU32::new(0);
 static BUTTON_LEVEL_HELD: AtomicBool = AtomicBool::new(false);
 static BUTTON_LEVEL_LONG_REPORTED: AtomicBool = AtomicBool::new(false);
 static BUTTON_LEVEL_START_MS: AtomicU32 = AtomicU32::new(0);
@@ -55,8 +55,8 @@ pub fn configure_light_wake(settings: &SharedSettings) -> Result<Option<i32>> {
     Ok(Some(pin))
 }
 
-pub fn take_cycle_presses() -> u32 {
-    BUTTON_CYCLE_PENDING.swap(0, Ordering::Relaxed)
+pub fn take_sync_requests() -> u32 {
+    BUTTON_SYNC_PENDING.swap(0, Ordering::Relaxed)
 }
 
 pub fn take_long_presses() -> u32 {
@@ -179,7 +179,7 @@ fn configure_button(pin: i32) -> Result<()> {
             mode: sys::gpio_mode_t_GPIO_MODE_INPUT,
             pull_up_en: sys::gpio_pullup_t_GPIO_PULLUP_ENABLE,
             pull_down_en: sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
-            intr_type: sys::gpio_int_type_t_GPIO_INTR_ANYEDGE,
+            intr_type: sys::gpio_int_type_t_GPIO_INTR_NEGEDGE,
         };
         esp_ok(sys::gpio_config(&config))?;
         let _ = sys::gpio_isr_handler_remove(pin);
@@ -200,6 +200,11 @@ fn configure_button(pin: i32) -> Result<()> {
             Some(button_isr),
             std::ptr::null_mut(),
         ))?;
+        esp_ok(sys::gpio_wakeup_enable(
+            pin as sys::gpio_num_t,
+            sys::gpio_int_type_t_GPIO_INTR_LOW_LEVEL,
+        ))?;
+        esp_ok(sys::esp_sleep_enable_gpio_wakeup())?;
         esp_ok(sys::gpio_intr_enable(pin as sys::gpio_num_t))?;
     }
     Ok(())
@@ -259,11 +264,14 @@ unsafe extern "C" fn button_task(_arg: *mut core::ffi::c_void) {
             continue;
         }
         last = Instant::now();
-        super::serial::set_debug_enabled(true);
-        super::serial::activate_window();
+        // Automatic light sleep may dispatch the GPIO edge before its clock
+        // restore path has fully unwound. Acquiring PM locks immediately can
+        // deadlock that transition and trip the interrupt watchdog.
+        task_delay(Duration::from_millis(20));
+        super::serial::rearm_after_wake();
         telemetry::record_log("ev=button.edge source=isr".to_string());
-        telemetry::record_log("event type=uart.wake source=button_dtr".to_string());
-        telemetry::emit_console("event type=uart.wake source=button_dtr");
+        telemetry::record_log("event type=uart.wake source=button".to_string());
+        telemetry::emit_console("event type=uart.wake source=button");
         super::wake::notify();
         classify_button_press();
         reenable_button_interrupt();
@@ -279,12 +287,14 @@ fn record_button_press(source: &str, long_press: bool) {
     super::ble_bt::open_companion_active_window(10_000);
     if long_press {
         BUTTON_LONG_PENDING.fetch_add(1, Ordering::Relaxed);
-        let line = "ev=button.long action=serial".to_string();
+        BUTTON_SYNC_PENDING.fetch_add(1, Ordering::Relaxed);
+        let line = "ev=button.long action=sync".to_string();
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);
     } else {
-        BUTTON_CYCLE_PENDING.fetch_add(1, Ordering::Relaxed);
-        let line = "ev=button.short action=cycle".to_string();
+        // A short PRG press is the physical equivalent of a console/DTR wake.
+        // Keep it side-effect free so it is safe as a recovery action.
+        let line = "ev=button.short action=console".to_string();
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);
     }
@@ -298,8 +308,8 @@ fn record_button_double() {
     telemetry::record_log(line.clone());
     telemetry::emit_console(&line);
     super::ble_bt::open_companion_active_window(10_000);
-    BUTTON_CYCLE_PENDING.fetch_add(1, Ordering::Relaxed);
-    let line = "ev=button.double action=cycle".to_string();
+    BUTTON_SYNC_PENDING.fetch_add(1, Ordering::Relaxed);
+    let line = "ev=button.double action=sync".to_string();
     telemetry::record_log(line.clone());
     telemetry::emit_console(&line);
     super::wake::notify();
@@ -376,10 +386,6 @@ struct ButtonCommand {
 impl CommandHandler for ButtonCommand {
     fn name(&self) -> &'static str {
         "button"
-    }
-
-    fn help(&self) -> &'static str {
-        "button status=true | button gpio=0 enabled=true save=true"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {

@@ -51,10 +51,6 @@ impl CommandHandler for BatteryCommand {
         "battery"
     }
 
-    fn help(&self) -> &'static str {
-        "battery status=true | battery enabled=true pin=35 divider=2.2 ctrl_pin=-1 ctrl_level=1 ref_mv=3300 min_mv=3300 max_mv=4200 save=true"
-    }
-
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if request
             .arg("save")
@@ -128,10 +124,6 @@ impl CommandHandler for BatteryCommand {
 impl CommandHandler for AdcProbeCommand {
     fn name(&self) -> &'static str {
         "adcprobe"
-    }
-
-    fn help(&self) -> &'static str {
-        "adcprobe pins=34,35,36,39 interval_ms=1000 count=1 ref_mv=3300; count=0 streams until UART key"
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {

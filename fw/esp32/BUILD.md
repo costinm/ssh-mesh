@@ -29,9 +29,10 @@ cd fw/esp32
 idf.py -p PORT flash
 ```
 
-For Rust ESP development, source the same environment. `espup`, `espflash`,
-`ldproxy`, the Xtensa Rust toolchain, and Cargo state are all repo-local through
-`target/esp32-5.5`.
+For Rust ESP development, source the same environment. `fw/esp32/env.sh` owns
+the repo-local Nix profile, ESP-IDF tools, ESP Python environment, Cargo home,
+rustup home, and Xtensa Rust toolchain paths under `target/esp32-5.5`; do not
+set those paths manually in scripts.
 
 Build the Rust translation scaffold:
 
@@ -60,9 +61,9 @@ Device-test command examples after flashing the Rust scaffold:
 
 ```text
 list
-get key=i2c.sda
-set key=i2c.sda value=21
-set key=i2c.scl value=22
+nvs list
+nvs get i2c.sda
+nvs set i2c.sda=21 i2c.scl=22
 i2cconfig sda=21 scl=22 freq=100000
 i2cprobe sda=21,4 scl=22,15 addr=0x3c save=true
 lora freq=915000000 sck=5 miso=19 mosi=27 cs=18 rst=14 dio0=26 sf=7 cr=5 sync_word=0x34

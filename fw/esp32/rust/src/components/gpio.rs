@@ -14,10 +14,6 @@ impl CommandHandler for GpioCommand {
         "gpio"
     }
 
-    fn help(&self) -> &'static str {
-        "gpio pin=N mode=input|output level=0|1 pull=none|up|down open_drain=true"
-    }
-
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         let pin = request
             .arg_i32("pin")?

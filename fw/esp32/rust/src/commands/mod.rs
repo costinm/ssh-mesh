@@ -5,12 +5,12 @@ use anyhow::{anyhow, Result};
 pub mod protocol;
 
 pub type CommandArgs = BTreeMap<String, String>;
-const DEFAULT_HELP_MAX_BYTES: usize = 900;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest {
     pub name: String,
     pub args: CommandArgs,
+    pub positionals: Vec<String>,
     pub payload: Vec<u8>,
 }
 
@@ -19,6 +19,7 @@ impl CommandRequest {
         Self {
             name: name.into(),
             args: CommandArgs::new(),
+            positionals: Vec::new(),
             payload: Vec::new(),
         }
     }
@@ -31,6 +32,10 @@ impl CommandRequest {
 
     pub fn arg(&self, key: &str) -> Option<&str> {
         self.args.get(key).map(String::as_str)
+    }
+
+    pub fn positional(&self, index: usize) -> Option<&str> {
+        self.positionals.get(index).map(String::as_str)
     }
 
     pub fn arg_i32(&self, key: &str) -> Result<Option<i32>> {
@@ -77,7 +82,6 @@ pub enum CommandStatus {
 
 pub trait CommandHandler {
     fn name(&self) -> &'static str;
-    fn help(&self) -> &'static str;
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse>;
 }
 
@@ -100,10 +104,6 @@ impl CommandRegistry {
     }
 
     pub fn dispatch(&mut self, request: &CommandRequest) -> CommandResponse {
-        if request.name == "help" {
-            return CommandResponse::ok(self.help_text(request));
-        }
-
         match self
             .handlers
             .iter_mut()
@@ -115,50 +115,4 @@ impl CommandRegistry {
             None => CommandResponse::error(format!("unknown command: {}", request.name)),
         }
     }
-
-    fn help_text(&self, request: &CommandRequest) -> String {
-        if let Some(name) = request.arg("command").or_else(|| request.arg("cmd")) {
-            return self
-                .handlers
-                .iter()
-                .find(|handler| handler.name() == name)
-                .map(|handler| format!("{}: {}", handler.name(), handler.help()))
-                .unwrap_or_else(|| format!("unknown command: {name}"));
-        }
-
-        let max_bytes = request
-            .arg_i32("max_bytes")
-            .ok()
-            .flatten()
-            .unwrap_or(DEFAULT_HELP_MAX_BYTES as i32)
-            .clamp(160, 4096) as usize;
-        let mut out = String::new();
-        let mut count = 0_usize;
-        let mut more = false;
-        for handler in &self.handlers {
-            let line = format!("{}: {}\n", handler.name(), short_help(handler.help()));
-            if out.len() + line.len() > max_bytes {
-                more = true;
-                break;
-            }
-            out.push_str(&line);
-            count += 1;
-        }
-        if more {
-            out.push_str(&format!(
-                "help more=true shown={} total={} hint=\"help command=wifi\"\n",
-                count,
-                self.handlers.len()
-            ));
-        }
-        out
-    }
-}
-
-fn short_help(help: &'static str) -> &'static str {
-    help.split('|')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(help)
 }

@@ -10,8 +10,14 @@ import socket
 import sys
 import termios
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "python"))
+
+from dmesh import RadioClient  # noqa: E402
 
 PROMPT = b"dm-rs> "
 
@@ -27,9 +33,13 @@ class Console:
 
     def sync(self) -> str:
         self.endpoint.write(b"\n\n\n")
-        time.sleep(0.25)
+        # UART light-sleep wake can consume the initial bytes. Let a forwarded
+        # logical-DTR wake finish before clearing the wake prompts and sending
+        # the delimiter for the first real command.
+        time.sleep(0.55)
         self.endpoint.flush_input()
         self.endpoint.write(b"\n")
+        time.sleep(0.25)
         return self.read_until_prompt(self.timeout, require_prompt=True)
 
     def cmd(self, command: str, timeout: float | None = None) -> str:
@@ -176,7 +186,8 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Endpoint to query: /dev/ttyUSB0, uds:///run/.../USB0.sock, "
-            "tcp://127.0.0.1:3330, socket://127.0.0.1:3330, or a bare .sock path."
+            "lora1.lmesh, tcp://127.0.0.1:3330, socket://127.0.0.1:3330, "
+            "or a bare .sock path. Logical/UDS radios use the shared dmesh driver."
         ),
     )
     parser.add_argument("--baud", type=int, default=460800)
@@ -196,6 +207,23 @@ def main() -> int:
     rc = 0
     for port in args.port:
         print(f"=== {port} ===", flush=True)
+        if port.endswith(".lmesh") or port.startswith(("uds://", "unix://")) or port.endswith(
+            ".sock"
+        ):
+            radio = RadioClient(port, timeout=args.timeout)
+            try:
+                radio.connect()
+                if not args.no_sync:
+                    print(radio.wake(timeout=args.timeout).rstrip(), flush=True)
+                for command in args.cmd:
+                    print(f"[{port}] $ {command}", flush=True)
+                    print(radio.command(command, timeout=args.timeout).raw.rstrip(), flush=True)
+            except Exception as exc:  # noqa: BLE001 - report every device failure.
+                print(f"{port}: {exc}", file=sys.stderr, flush=True)
+                rc = 1
+            finally:
+                radio.close()
+            continue
         console = Console(port, args.baud, args.timeout)
         try:
             if not args.no_sync:

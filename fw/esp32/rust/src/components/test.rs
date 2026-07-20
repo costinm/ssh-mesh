@@ -114,10 +114,6 @@ impl CommandHandler for TestCommand {
         "test"
     }
 
-    fn help(&self) -> &'static str {
-        "test cnt=NN wake_ms=4000 active_ms=500 discovery=2 stop=true status=true"
-    }
-
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if request.arg("stop").is_some() {
             write_state(RtcTestState::empty());

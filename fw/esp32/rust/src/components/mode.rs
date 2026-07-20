@@ -14,12 +14,14 @@ const MODE_INFRA: u8 = 1;
 const DEFAULT_ADV_MS: u32 = 1_000;
 const DEFAULT_PENDING_ADV_MS: u32 = 1_500;
 const DEFAULT_WINDOW_MS: u32 = 10_000;
-const DEFAULT_BOOT_WINDOW_MS: u32 = 10_000;
 const DEFAULT_ACTIVE_MS: u32 = 5_000;
 const DEFAULT_PENDING_WINDOW_MS: u32 = 30_000;
 const DEFAULT_WAKE_MS: u32 = 30_000;
-const DEFAULT_NAN_DUTY_MS: u32 = 2_000;
-const DEFAULT_NAN_ACTIVE_MS: u32 = 500;
+const DEFAULT_NAN_DUTY_MS: u32 = 4_000;
+const DEFAULT_NAN_ACTIVE_MS: u32 = 250;
+const DEFAULT_NAN_WAKE_EARLY_MS: u32 = 5;
+const DEFAULT_NAN_DW_TU: u32 = 512;
+const DEFAULT_NAN_DW_OFFSET_TU: u32 = 0;
 const PING_PREFIX: &[u8] = b"dmesh.ping";
 
 static PRODUCT_MODE: AtomicU8 = AtomicU8::new(MODE_INFRA);
@@ -29,6 +31,16 @@ static COMPANION_PENDING_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ENABLED: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_BEACON_BASELINE: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_EXPECT_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_EXPECT_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_EXPECT_PERIOD_US: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_MISS_BACKOFF_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_BEACON_SEEN: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_BEACON_MISSED: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_BEACON_LATE: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_BEACON_LATE_NEXT_DW: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_BEACON_DRIFT: AtomicU32 = AtomicU32::new(0);
 static PING_RESPONSE_PENDING: AtomicBool = AtomicBool::new(false);
 static PING_RX: AtomicU32 = AtomicU32::new(0);
 static PING_TX: AtomicU32 = AtomicU32::new(0);
@@ -38,23 +50,12 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
 }
 
 pub fn init(settings: &SharedSettings) {
-    let mode = configured_mode(settings);
-    PRODUCT_MODE.store(mode, Ordering::Relaxed);
-    if mode == MODE_COMPANION {
-        let _ = enter_companion_advertising(
-            settings,
-            get_u32(settings, "cm.boot_ms", DEFAULT_BOOT_WINDOW_MS),
-            get_u32(settings, "cm.adv_ms", DEFAULT_ADV_MS),
-            "boot",
-        );
-    } else {
-        if let Err(err) = start_infra_radios(settings, "boot") {
-            telemetry::record_log(format!(
-                "event type=mode.infra_start ok=false reason=boot msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            ));
-        }
-        telemetry::record_log("event type=mode active=infra".to_string());
+    PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
+    if let Err(err) = start_infra_radios(settings, "boot") {
+        telemetry::record_log(format!(
+            "event type=mode.infra_start ok=false reason=boot msg={}",
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
     }
 }
 
@@ -64,40 +65,18 @@ pub fn configured_companion(settings: &SharedSettings) -> bool {
 }
 
 pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
-    let mode = configured_mode(settings);
-    PRODUCT_MODE.store(mode, Ordering::Relaxed);
-    if mode == MODE_COMPANION {
-        if button_wake {
-            let _ = enter_companion_advertising(
-                settings,
-                get_u32(settings, "cm.win_ms", DEFAULT_WINDOW_MS),
-                get_u32(settings, "cm.adv_ms", DEFAULT_ADV_MS),
-                "button_wake",
-            );
-        } else if super::ble_bt::gatt_connected() {
-            let _ = enter_companion_advertising(
-                settings,
-                get_u32(settings, "cm.active_ms", DEFAULT_ACTIVE_MS),
-                get_u32(settings, "cm.adv_ms", DEFAULT_ADV_MS),
-                "boot_connected",
-            );
-        } else if let Err(err) = enter_companion_sleep(settings) {
-            telemetry::record_log(format!(
-                "event type=mode.sleep ok=false reason=boot_window_done msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            ));
-        }
+    let reason = if button_wake {
+        "button_wake"
     } else {
-        COMPANION_ADVERTISING.store(false, Ordering::Relaxed);
-        COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
-        COMPANION_DEADLINE_MS.store(0, Ordering::Relaxed);
-        if let Err(err) = start_infra_radios(settings, "boot_window_done") {
-            telemetry::record_log(format!(
-                "event type=mode.infra_start ok=false reason=boot_window_done msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            ));
-        }
-        telemetry::record_log("event type=mode active=infra reason=boot_window_done".to_string());
+        "boot_window_done"
+    };
+    PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
+    if let Err(err) = start_infra_radios(settings, reason) {
+        telemetry::record_log(format!(
+            "event type=mode.infra_start ok=false reason={} msg={}",
+            reason,
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
     }
 }
 
@@ -140,70 +119,19 @@ pub fn poll(settings: &SharedSettings) {
             ));
         }
     }
-
-    if PRODUCT_MODE.load(Ordering::Relaxed) != MODE_COMPANION {
-        return;
-    }
-    if !COMPANION_ADVERTISING.load(Ordering::Relaxed) {
-        return;
-    }
-    if super::ble_bt::gatt_connected() {
-        COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
-        COMPANION_DEADLINE_MS.store(
-            now_ms().wrapping_add(get_u32(settings, "cm.active_ms", DEFAULT_ACTIVE_MS)),
-            Ordering::Relaxed,
-        );
-        return;
-    }
-    let deadline = COMPANION_DEADLINE_MS.load(Ordering::Relaxed);
-    if deadline != 0 && now_ms().wrapping_sub(deadline) < u32::MAX / 2 {
-        if let Err(err) = enter_companion_sleep(settings) {
-            telemetry::record_log(format!(
-                "event type=mode.sleep ok=false msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            ));
-            COMPANION_DEADLINE_MS
-                .store(now_ms().wrapping_add(DEFAULT_WINDOW_MS), Ordering::Relaxed);
-        }
-    }
 }
 
-pub fn handle_button_short(settings: &SharedSettings) {
-    if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_INFRA {
-        if let Err(err) = send_status_ping(settings, "button") {
-            telemetry::record_log(format!(
-                "event type=mode.button action=ping ok=false msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            ));
-        }
-        return;
-    }
-    if COMPANION_ADVERTISING.load(Ordering::Relaxed) && !super::ble_bt::gatt_connected() {
-        if let Err(err) = enter_companion_sleep(settings) {
-            telemetry::record_log(format!(
-                "event type=mode.button action=sleep ok=false msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            ));
-        }
-    } else {
-        let _ = enter_companion_advertising(
-            settings,
-            get_u32(settings, "cm.win_ms", DEFAULT_WINDOW_MS),
-            get_u32(settings, "cm.adv_ms", DEFAULT_ADV_MS),
-            "button",
-        );
+pub fn send_button_sync(settings: &SharedSettings) {
+    if let Err(err) = send_status_ping(settings, "button") {
+        telemetry::record_log(format!(
+            "event type=mode.button action=sync ok=false msg={}",
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
     }
 }
 
 pub fn mark_companion_active(settings: &SharedSettings, window_ms: u32) {
-    if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_COMPANION {
-        let _ = enter_companion_advertising(
-            settings,
-            window_ms.max(1_000),
-            get_u32(settings, "cm.adv_ms", DEFAULT_ADV_MS),
-            "active",
-        );
-    }
+    let _ = (settings, window_ms);
 }
 
 pub fn observe_ping(transport: &'static str, payload: &[u8]) {
@@ -321,122 +249,25 @@ fn enter_companion_sleep(settings: &SharedSettings) -> Result<()> {
 
 fn start_infra_radios(settings: &SharedSettings, reason: &'static str) -> Result<()> {
     boot_print("dm-rs mode step=infra_start");
-    let channel = get_u32(settings, "raw.ch", 6).clamp(1, 13) as u8;
-    let wifi_mode = settings
-        .borrow()
-        .get_str("wifi.mode")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "nan".to_string());
-    match wifi_mode.as_str() {
-        "off" | "false" | "none" => {
-            stop_raw_nan_duty();
-            super::wifi::stop_raw_monitor().ok();
-            super::nan::stop_nan().ok();
-            telemetry::record_log(format!(
-                "event type=mode.infra_radio medium=wifi status=off channel={} reason={}",
-                channel, reason
-            ));
-        }
-        "nan" | "aware" | "true" | "" => {
-            boot_print("dm-rs mode step=wifi_raw_nan");
-            start_raw_nan_duty(settings, reason, channel)?;
-        }
-        "official_nan" | "nan_official" | "idf_nan" => {
-            boot_print("dm-rs mode step=wifi_official_nan");
-            stop_raw_nan_duty();
-            super::wifi::stop_raw_monitor().ok();
-            match super::nan::start_infra_default(settings.clone()) {
-                Ok(status) => telemetry::record_log(format!(
-                    "event type=mode.infra_radio medium=nan status=started channel={} reason={} {}",
-                    channel,
-                    reason,
-                    status
-                )),
-                Err(err) => telemetry::record_log(format!(
-                    "event type=mode.infra_radio medium=nan status=error channel={} reason={} msg={}",
-                    channel,
-                    reason,
-                    crate::commands::protocol::escape_value(&err.to_string())
-                )),
-            }
-        }
-        "nan_sleep" | "raw_nan_sleep" | "sleepy_nan" => {
-            boot_print("dm-rs mode step=wifi_nan_sleep");
-            stop_raw_nan_duty();
-            super::nan::stop_nan().ok();
-            super::wifi::stop_raw_monitor().ok();
-            super::ble_bt::stop_radio_activity();
-            let nan_channel = get_u32(settings, "nan.channel", channel as u32).clamp(1, 13) as u8;
-            let wake_ms = get_u32(
-                settings,
-                "nan.wake_ms",
-                get_u32(settings, "cm.wake_ms", 2_000),
-            );
-            let active_ms = get_u32(
-                settings,
-                "nan.active_ms",
-                get_u32(settings, "cm.active_ms", 500),
-            );
-            let lora_listen = get_bool(settings, "lora.enabled", true);
-            telemetry::record_log(format!(
-                "event type=mode.infra_radio medium=nan status=sleepy_raw channel={} reason={} wake_ms={} active_ms={} lora_listen={}",
-                nan_channel, reason, wake_ms, active_ms, lora_listen
-            ));
-            return super::sleep::enter_raw_nan_deep_sleep(
-                settings,
-                lora_listen,
-                wake_ms,
-                active_ms,
-                nan_channel,
-            );
-        }
-        "sta_idle" | "idle_sta" | "sta_only" => {
-            boot_print("dm-rs mode step=wifi_sta_idle");
-            stop_raw_nan_duty();
-            super::nan::stop_nan().ok();
-            let ssid = settings
-                .borrow()
-                .get_str("wifi.ssid")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "DMesh-Idle".to_string());
-            super::wifi::start_sta_idle_mode(channel, &ssid)?;
-            telemetry::record_log(format!(
-                "event type=mode.infra_radio medium=wifi status=sta_idle ssid={} channel={} reason={}",
-                crate::commands::protocol::escape_value(&ssid),
-                channel,
-                reason
-            ));
-        }
-        "raw" | "dmesh" => {
-            boot_print("dm-rs mode step=wifi_raw");
-            stop_raw_nan_duty();
-            super::nan::stop_nan().ok();
-            super::wifi::start_raw_monitor_mode(channel, "dmesh")?;
-            // TODO(raw-security): raw Wi-Fi commands are intentionally
-            // unauthenticated during bring-up. Add mesh-owner public-key
-            // authentication and payload encryption before this is used
-            // outside local testing.
-            telemetry::record_log(format!(
-                "event type=mode.infra_radio medium=wifi status=raw channel={} filter=dmesh reason={}",
-                channel, reason
-            ));
-        }
-        other => {
-            boot_print("dm-rs mode step=wifi_invalid_fallback");
-            telemetry::record_log(format!(
-                "event type=mode.infra_radio medium=wifi status=invalid mode={} action=raw_nan_duty reason={}",
-                crate::commands::protocol::escape_value(other),
-                reason
-            ));
-            start_raw_nan_duty(settings, reason, channel)?;
-        }
+    let channel =
+        get_u32(settings, "nan.channel", get_u32(settings, "raw.ch", 6)).clamp(1, 13) as u8;
+    if get_bool(settings, "wifi.enabled", true) {
+        start_raw_nan_duty(settings, reason, channel)?;
+        telemetry::record_log(format!(
+            "event type=mode.infra_radio medium=wifi profile=discovery_window channel={} reason={}",
+            channel, reason
+        ));
+    } else {
+        stop_raw_nan_duty();
+        super::nan::stop_nan().ok();
+        super::wifi::stop_raw_monitor().ok();
+        telemetry::record_log(format!(
+            "event type=mode.infra_radio medium=wifi status=disabled channel={} reason={}",
+            channel, reason
+        ));
     }
-    boot_print("dm-rs mode step=wifi_done");
     start_infra_lora(settings, reason)
 }
-
 fn start_infra_lora(settings: &SharedSettings, reason: &'static str) -> Result<()> {
     boot_print("dm-rs mode step=lora_start");
     if !lora_boot_enabled(settings) {
@@ -527,6 +358,12 @@ fn start_raw_nan_duty(
     let duty_ms = get_u32(settings, "nan.wake_ms", DEFAULT_NAN_DUTY_MS)
         .max(active_ms)
         .clamp(100, 60_000);
+    let light_sleep = get_bool(settings, "nan.light_sleep", true);
+    let wake_early_ms = get_u32(settings, "nan.early_ms", DEFAULT_NAN_WAKE_EARLY_MS)
+        .min(duty_ms.saturating_sub(active_ms));
+    let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
+    let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
+    arm_raw_nan_beacon_window(None);
     super::nan::start_raw_window(channel, "sdf")?;
     RAW_NAN_DUTY_ENABLED.store(true, Ordering::Relaxed);
     RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
@@ -536,16 +373,17 @@ fn start_raw_nan_duty(
     }
     let queued_sent = super::nan::drain_raw_queue();
     telemetry::record_log(format!(
-        "event type=mode.infra_radio medium=nan status=raw_duty channel={} reason={} duty_ms={} active_ms={} queued_sent={}",
-        channel, reason, duty_ms, active_ms, queued_sent
+        "event type=mode.infra_radio medium=nan status=raw_duty channel={} reason={} duty_ms={} active_ms={} light_sleep={} wake_early_ms={} dw_tu={} dw_offset_tu={} queued_sent={}",
+        channel, reason, duty_ms, active_ms, light_sleep, wake_early_ms, dw_tu, dw_offset_tu, queued_sent
     ));
     Ok(())
 }
 
-fn stop_raw_nan_duty() {
+pub fn stop_raw_nan_duty() {
     RAW_NAN_DUTY_ENABLED.store(false, Ordering::Relaxed);
     RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
     RAW_NAN_DUTY_NEXT_MS.store(0, Ordering::Relaxed);
+    RAW_NAN_MISS_BACKOFF_MS.store(0, Ordering::Relaxed);
 }
 
 fn poll_raw_nan_duty(settings: &SharedSettings) {
@@ -562,25 +400,81 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     let duty_ms = get_u32(settings, "nan.wake_ms", DEFAULT_NAN_DUTY_MS)
         .max(active_ms)
         .clamp(100, 60_000);
+    let light_sleep = get_bool(settings, "nan.light_sleep", true);
+    let wake_early_ms = get_u32(settings, "nan.early_ms", DEFAULT_NAN_WAKE_EARLY_MS)
+        .min(duty_ms.saturating_sub(active_ms));
+    let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
+    let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
 
     if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
+        finish_raw_nan_beacon_window();
         let queued_sent = super::nan::drain_raw_queue();
         super::nan::stop_nan().ok();
         super::wifi::stop_raw_monitor().ok();
         RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
-        RAW_NAN_DUTY_NEXT_MS.store(
-            now.wrapping_add(duty_ms.saturating_sub(active_ms)),
-            Ordering::Relaxed,
-        );
+        let backoff_ms = RAW_NAN_MISS_BACKOFF_MS.swap(0, Ordering::Relaxed);
+        let idle_ms = duty_ms.saturating_sub(active_ms).saturating_add(backoff_ms);
+        let sync_plan = super::wifi::beacon_wake_plan(idle_ms, dw_tu, dw_offset_tu, wake_early_ms);
+        let window_delay_ms = sync_plan
+            .map(|plan| plan.window_delay_ms)
+            .unwrap_or(idle_ms);
+        let light_sleep_ms = sync_plan
+            .map(|plan| plan.light_sleep_ms)
+            .unwrap_or_else(|| idle_ms.saturating_sub(wake_early_ms));
+        let beacon_age_ms = sync_plan.map(|plan| plan.beacon_age_ms);
         telemetry::record_log(format!(
-            "event type=nan.duty phase=idle channel={} idle_ms={} queued_sent={}",
+            "event type=nan.duty phase=idle channel={} idle_ms={} miss_backoff_ms={} window_delay_ms={} light_sleep={} light_sleep_ms={} wake_early_ms={} sync={} beacon_age_ms={} dw_tu={} dw_offset_tu={} queued_sent={}",
             channel,
-            duty_ms.saturating_sub(active_ms),
+            idle_ms,
+            backoff_ms,
+            window_delay_ms,
+            light_sleep,
+            light_sleep_ms,
+            wake_early_ms,
+            sync_plan.is_some(),
+            beacon_age_ms.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
+            dw_tu,
+            dw_offset_tu,
             queued_sent
         ));
+        if light_sleep {
+            if let Err(err) = super::sleep::idle_light_sleep(settings, light_sleep_ms) {
+                telemetry::record_log(format!(
+                    "event type=nan.duty phase=light_sleep ok=false msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+                arm_raw_nan_beacon_window(None);
+                RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_delay_ms), Ordering::Relaxed);
+                return;
+            }
+            arm_raw_nan_beacon_window(sync_plan);
+            match super::nan::start_raw_window(channel, "sdf") {
+                Ok(()) => {
+                    let queued_sent = super::nan::drain_raw_queue();
+                    RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
+                    RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(active_ms), Ordering::Relaxed);
+                    telemetry::record_log(format!(
+                        "event type=nan.duty phase=active channel={} active_ms={} wake=light queued_sent={}",
+                        channel, active_ms, queued_sent
+                    ));
+                }
+                Err(err) => {
+                    RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(1_000), Ordering::Relaxed);
+                    telemetry::record_log(format!(
+                        "event type=nan.duty phase=active wake=light ok=false msg={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                }
+            }
+        } else {
+            arm_raw_nan_beacon_window(sync_plan);
+            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_delay_ms), Ordering::Relaxed);
+        }
         return;
     }
 
+    // The non-light-sleep diagnostic path arms its beacon baseline when it
+    // schedules the window above. Keep it intact until this delayed start.
     match super::nan::start_raw_window(channel, "sdf") {
         Ok(()) => {
             let queued_sent = super::nan::drain_raw_queue();
@@ -599,6 +493,77 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             ));
         }
     }
+}
+
+fn arm_raw_nan_beacon_window(plan: Option<super::wifi::BeaconWakePlan>) {
+    let snapshot = super::wifi::beacon_snapshot();
+    RAW_NAN_BEACON_BASELINE.store(snapshot.count, Ordering::Relaxed);
+    let (expected_tsf_us, period_us) = plan
+        .map(|plan| (plan.expected_tsf_us, plan.period_us))
+        .unwrap_or((0, 0));
+    RAW_NAN_EXPECT_TSF_LO.store(expected_tsf_us as u32, Ordering::Relaxed);
+    RAW_NAN_EXPECT_TSF_HI.store((expected_tsf_us >> 32) as u32, Ordering::Relaxed);
+    RAW_NAN_EXPECT_PERIOD_US.store(period_us, Ordering::Relaxed);
+}
+
+fn finish_raw_nan_beacon_window() {
+    const LATE_TOLERANCE_US: u64 = 80_000;
+    const MISS_BACKOFF_MS: u32 = 1_000;
+
+    let snapshot = super::wifi::beacon_snapshot();
+    let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
+    let received = snapshot.count.saturating_sub(baseline);
+    if received == 0 {
+        RAW_NAN_BEACON_MISSED.fetch_add(1, Ordering::Relaxed);
+        RAW_NAN_MISS_BACKOFF_MS.store(MISS_BACKOFF_MS, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=nan.duty beacon=missed active_ms_backoff={} baseline={} current={}",
+            MISS_BACKOFF_MS, baseline, snapshot.count
+        ));
+        return;
+    }
+
+    RAW_NAN_BEACON_SEEN.fetch_add(received, Ordering::Relaxed);
+    let expected_tsf_us = (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+        | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed));
+    let period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+    if expected_tsf_us == 0 || period_us == 0 || snapshot.tsf_us == 0 {
+        return;
+    }
+
+    let delta_us = snapshot.tsf_us.abs_diff(expected_tsf_us);
+    if delta_us <= LATE_TOLERANCE_US {
+        return;
+    }
+    RAW_NAN_BEACON_LATE.fetch_add(1, Ordering::Relaxed);
+    let next_dw =
+        snapshot.tsf_us >= expected_tsf_us && delta_us.abs_diff(period_us) <= LATE_TOLERANCE_US;
+    if next_dw {
+        RAW_NAN_BEACON_LATE_NEXT_DW.fetch_add(1, Ordering::Relaxed);
+    } else {
+        RAW_NAN_BEACON_DRIFT.fetch_add(1, Ordering::Relaxed);
+    }
+    telemetry::record_log(format!(
+        "event type=nan.duty beacon=late class={} delta_us={} expected_tsf_us={} actual_tsf_us={} local_us={} period_us={}",
+        if next_dw { "next_dw" } else { "drift" },
+        delta_us,
+        expected_tsf_us,
+        snapshot.tsf_us,
+        snapshot.local_us,
+        period_us
+    ));
+}
+
+pub fn raw_nan_status_fields() -> String {
+    format!(
+        "nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={}",
+        RAW_NAN_BEACON_SEEN.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_MISSED.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_LATE.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_LATE_NEXT_DW.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_DRIFT.load(Ordering::Relaxed),
+        RAW_NAN_MISS_BACKOFF_MS.load(Ordering::Relaxed),
+    )
 }
 
 fn queue_boot_discovery(settings: &SharedSettings, source: &'static str) -> Result<()> {
@@ -717,10 +682,6 @@ impl CommandHandler for ModeCommand {
         "mode"
     }
 
-    fn help(&self) -> &'static str {
-        "mode status=true | mode companion=true|infra=true save=true | mode advertise=true window_ms=10000 adv_ms=1000 | mode active=true ms=5000 | mode sleep=true | mode lora_sleep_listen=true save=true | mode raw_wifi=true channel=6 | mode ping=true"
-    }
-
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if request
             .arg("infra")
@@ -764,6 +725,26 @@ impl CommandHandler for ModeCommand {
             let enabled = parse_bool(enabled)?;
             if save_requested(request) {
                 self.settings.borrow_mut().set_bool("cm.lora", enabled)?;
+            }
+            return Ok(CommandResponse::ok(status_text()));
+        }
+        if let Some(raw_nan) = request.arg("raw_nan").map(parse_bool).transpose()? {
+            if raw_nan {
+                PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
+                let channel = request.arg_i32("channel")?.unwrap_or(6).clamp(1, 13) as u8;
+                start_raw_nan_duty(&self.settings, "command", channel)?;
+                if request
+                    .arg("lora")
+                    .map(parse_bool)
+                    .transpose()?
+                    .is_some_and(|enabled| !enabled)
+                {
+                    super::lora::sleep_radio(&self.settings)?;
+                }
+            } else {
+                stop_raw_nan_duty();
+                super::nan::stop_nan().ok();
+                super::wifi::stop_raw_monitor().ok();
             }
             return Ok(CommandResponse::ok(status_text()));
         }
@@ -866,13 +847,14 @@ fn save_requested(request: &CommandRequest) -> bool {
 
 fn status_text() -> String {
     format!(
-        "mode active={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={}",
+        "mode active={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={} {}",
         mode_name(),
         COMPANION_ADVERTISING.load(Ordering::Relaxed),
         COMPANION_PENDING_ADVERTISING.load(Ordering::Relaxed),
         telemetry::pending_message_count(),
         COMPANION_DEADLINE_MS.load(Ordering::Relaxed),
         PING_RX.load(Ordering::Relaxed),
-        PING_TX.load(Ordering::Relaxed)
+        PING_TX.load(Ordering::Relaxed),
+        raw_nan_status_fields()
     )
 }

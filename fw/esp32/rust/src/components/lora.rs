@@ -73,6 +73,7 @@ static LORA_CAD_RX_WINDOW_MS: AtomicU32 = AtomicU32::new(1_000);
 static LORA_CAD_TX_TRIES: AtomicU32 = AtomicU32::new(4);
 static LORA_CAD_SAMPLES: AtomicU32 = AtomicU32::new(0);
 static LORA_CAD_DETECTED: AtomicU32 = AtomicU32::new(0);
+static LORA_IRQ_WAKES: AtomicU32 = AtomicU32::new(0);
 const NVS_LORA_CAD_RX: &str = "lora.cad_rx";
 const NVS_LORA_CAD_TX: &str = "lora.cad_tx";
 const NVS_LORA_CAD_INT_MS: &str = "lora.cad_int";
@@ -383,17 +384,6 @@ pub fn status_text(settings: &SharedSettings) -> String {
 impl CommandHandler for LoraCommand {
     fn name(&self) -> &'static str {
         self.name
-    }
-
-    fn help(&self) -> &'static str {
-        match self.name {
-            "lora" => "lora board=heltec_v3 | chip=sx127x|sx1262 preset=medium_fast|medium_slow|meshcore mode=meshtastic|meshcore freq=913125000 bw=250000 sf=9 cr=5 sync_word=0x2b sx_sync=0x24b4 tcxo_mv=1800 dio2rf=true pwrpin=36 pwrlvl=0 rx=true|false sleep=true|false cad=true cad_timeout=50 cad_rx=true|false cad_tx=true|false cad_interval_ms=2000 cad_rx_ms=1000 cad_tx_tries=4 status=true apply=true",
-            "loraprobe" => "loraprobe chip=sx127x|sx1262 sck=5,18,9 miso=19,11 mosi=27,10 cs=18,5,8 rst=14,23,12 dio0=26,14 busy=-1,13 save=true",
-            "lorasend" => "lorasend text=hello | data=hex:0102 | format=raw",
-            "loralisten" => "loralisten ms=5000 count=4 local_only=true",
-            "loradump" => "loradump",
-            _ => "lora",
-        }
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
@@ -1105,11 +1095,11 @@ fn run_sx1262_duty_cycle_background_rx(config: &LoraConfig, local_node: Option<u
 
 /// Battery-aware receive loop: channel-activity-detected duty cycling.
 ///
-/// Between scans the radio is held in `SLEEP` (~0.2 uA on SX127x, similar
-/// on SX1262). On each cycle we issue one CAD probe (a few symbol-times);
-/// if preamble activity is detected we immediately start a short RX
-/// window and wait for `IRQ_RX_DONE`. Either way the radio goes back to
-/// SLEEP and the task sleeps for `lora.cad_interval_ms` (default 2 s).
+/// Between scans the SX127x is held in `STDBY`. On each cycle DIO0 is mapped
+/// to `CAD_DONE` and the task blocks for the CAD interrupt. If preamble
+/// activity is detected, DIO0 is remapped to `RX_DONE`, RX starts immediately,
+/// and the task blocks for a packet. The ESP task then waits for
+/// `lora.cad_interval_ms` before the next CAD operation.
 ///
 /// The radio is the dominant ESP32 current source while awake
 /// (SX127x `RX_CONTINUOUS` ~11 mA, SX1262 ~5-7 mA). CAD-RX keeps the
@@ -1121,8 +1111,8 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
         let _guard = lora_spi_lock().lock().unwrap();
         let mut radio = Radio::open(config)?;
         radio.configure_radio()?;
-        // Start in sleep so the loop body always sees a known low-power state.
-        let _ = radio.sleep();
+        // Start in standby so the first and subsequent CAD transitions match.
+        let _ = radio.standby();
     }
     configure_dio0_interrupt(config.dio0)?;
     let cad_timeout = sx127x_cad_timeout(config);
@@ -1176,7 +1166,7 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
                         "ev=lora.cad c=start_rx err={}",
                         crate::commands::protocol::escape_value(&err.to_string())
                     ));
-                    let _ = radio.sleep();
+                    let _ = radio.standby();
                     continue;
                 }
             }
@@ -1204,13 +1194,13 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
                     }
                 }
             }
-            // Radio is in RX/STDBY here; we put it to sleep below. For
-            // SX127x `poll_background_packet` already restarts RX, but
-            // we want to leave it sleeping, so force a sleep.
+            // `poll_background_packet` may have restarted RX. Force standby
+            // before the interval so only the ESP automatic-light-sleep
+            // behavior and SX127x standby current are measured.
             {
                 let _guard = lora_spi_lock().lock().unwrap();
                 let mut radio = Radio::open_no_reset(config)?;
-                let _ = radio.sleep();
+                let _ = radio.standby();
             }
         }
 
@@ -1218,7 +1208,7 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
             break;
         }
 
-        // --- Idle phase: keep radio in SLEEP between CAD cycles ---
+        // --- Idle phase: keep radio in STDBY between CAD cycles ---
         // The wait doubles as a task delay; `wait_for_lora_irq` returns
         // early if any task notification arrives (e.g. a `sleep_radio`
         // request or an out-of-band `notify_lora_rx_task`).
@@ -1251,14 +1241,15 @@ fn background_poll_interval(config: &LoraConfig) -> Duration {
 /// `lora cad_rx=true` and the periodic `lora status=true` output.
 fn cad_status_text() -> String {
     format!(
-        "lora cad_rx={} cad_tx={} cad_interval_ms={} cad_rx_window_ms={} cad_tx_tries={} cad_samples={} cad_detected={}",
+        "lora cad_rx={} cad_tx={} cad_interval_ms={} cad_rx_window_ms={} cad_tx_tries={} cad_samples={} cad_detected={} irq_wakes={}",
         LORA_CAD_RX_ENABLED.load(Ordering::Relaxed),
         LORA_CAD_TX_ENABLED.load(Ordering::Relaxed),
         LORA_CAD_INTERVAL_MS.load(Ordering::Relaxed),
         LORA_CAD_RX_WINDOW_MS.load(Ordering::Relaxed),
         LORA_CAD_TX_TRIES.load(Ordering::Relaxed),
         LORA_CAD_SAMPLES.load(Ordering::Relaxed),
-        LORA_CAD_DETECTED.load(Ordering::Relaxed)
+        LORA_CAD_DETECTED.load(Ordering::Relaxed),
+        LORA_IRQ_WAKES.load(Ordering::Relaxed)
     )
 }
 
@@ -1381,7 +1372,11 @@ fn set_lora_irq_enabled(pin: i32, enabled: bool) -> Result<()> {
 
 fn wait_for_lora_irq(timeout: Duration) -> bool {
     let ticks = duration_to_ticks(timeout);
-    unsafe { sys::ulTaskGenericNotifyTake(0, 1, ticks) != 0 }
+    let woke = unsafe { sys::ulTaskGenericNotifyTake(0, 1, ticks) != 0 };
+    if woke {
+        LORA_IRQ_WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+    woke
 }
 
 fn notify_lora_rx_task() {
@@ -1685,6 +1680,15 @@ impl Radio {
         }
     }
 
+    fn standby(&mut self) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.standby(),
+            // The SX1262 receive path uses hardware duty-cycle RX and does not
+            // call this helper; keep a low-power fallback for completeness.
+            Self::Sx1262(radio) => radio.sleep(),
+        }
+    }
+
     fn poll_packet(&mut self) -> Result<Option<Packet>> {
         match self {
             Self::Sx127x(radio) => radio.poll_packet(),
@@ -1900,19 +1904,27 @@ impl Sx127x {
     }
 
     fn is_channel_active(&mut self, timeout: Duration) -> Result<bool> {
+        // Discard command/task notifications left from the previous cycle;
+        // DIO0 will provide the next CAD completion notification.
+        let _ = wait_for_lora_irq(Duration::ZERO);
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
         self.write_reg(REG_IRQ_FLAGS, 0xff)?;
+        // SX127x RegDioMapping1 bits 7:6 = 10 maps DIO0 to CadDone.
+        self.write_reg(REG_DIO_MAPPING_1, 0x80)?;
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_CAD)?;
 
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || !wait_for_lora_irq(remaining) {
+                break;
+            }
             let irq = self.read_reg(REG_IRQ_FLAGS)?;
             if irq & IRQ_CAD_DONE != 0 {
                 self.write_reg(REG_IRQ_FLAGS, irq)?;
                 self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
                 return Ok(irq & IRQ_CAD_DETECTED != 0);
             }
-            task_delay(Duration::from_millis(1));
         }
 
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
@@ -1921,6 +1933,10 @@ impl Sx127x {
 
     fn sleep(&mut self) -> Result<()> {
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_SLEEP)
+    }
+
+    fn standby(&mut self) -> Result<()> {
+        self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)
     }
 
     fn poll_packet(&mut self) -> Result<Option<Packet>> {
