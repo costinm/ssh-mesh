@@ -12,6 +12,9 @@ const ANNOUNCE_INTERVAL_ENV: &str = "LMESH_ANNOUNCE_INTERVAL_SECS";
 const CONTROL_SOCKET_ENV: &str = "LMESH_CONTROL_SOCKET";
 const NAN_AUTOSTART_ENV: &str = "LMESH_NAN_AUTOSTART";
 const NAN_EVENT_LOG_ENV: &str = "LMESH_NAN_EVENT_LOG";
+const AP_AUTOSTART_ENV: &str = "LMESH_AP_AUTOSTART";
+const AP_IFACE_ENV: &str = "LMESH_AP_IFACE";
+const DEFAULT_AP_IFACE: &str = "wlan0";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,11 +31,35 @@ async fn run_server() -> Result<()> {
 
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
-    if nan_autostart_enabled() {
+    let nan_socket_available =
+        nan_autostart_enabled() && service.default_nan_control_socket_exists();
+    let nan_started = if nan_socket_available {
         let result = service.start_default_nan();
         debug!(?result, "nan_default_started");
+        nan_start_succeeded(&result)
+    } else {
+        false
+    };
+    if nan_started {
         if nan_event_log_enabled() {
             spawn_nan_event_logger(service.clone());
+        }
+    } else if nan_socket_available {
+        warn!("nan_autostart_failed");
+    } else if nan_autostart_enabled() {
+        debug!("nan_autostart_skipped_no_wpa_control_socket");
+    }
+    if nan_started && ap_autostart_enabled() {
+        let nan_iface = wifi_iface();
+        let ap_iface = ap_iface();
+        if ap_can_coexist_with_nan(&nan_iface, &ap_iface) {
+            let result = service.start_default_open_ap(ap_iface);
+            debug!(?result, "open_ap_autostarted");
+        } else {
+            debug!(
+                nan_iface,
+                ap_iface, "open_ap_autostart_skipped_no_safe_coexistence"
+            );
         }
     }
     debug!(
@@ -90,6 +117,29 @@ fn nan_event_log_enabled() -> bool {
     std::env::var(NAN_EVENT_LOG_ENV)
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
         .unwrap_or(true)
+}
+
+fn ap_autostart_enabled() -> bool {
+    std::env::var(AP_AUTOSTART_ENV)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(true)
+}
+
+fn wifi_iface() -> String {
+    std::env::var("LMESH_WIFI_IFACE").unwrap_or_else(|_| "wlan1".to_string())
+}
+
+fn ap_iface() -> String {
+    std::env::var(AP_IFACE_ENV).unwrap_or_else(|_| DEFAULT_AP_IFACE.to_string())
+}
+
+fn ap_can_coexist_with_nan(nan_iface: &str, ap_iface: &str) -> bool {
+    if nan_iface == ap_iface {
+        return false;
+    }
+    let nan_phy = std::fs::read_link(format!("/sys/class/net/{nan_iface}/phy80211"));
+    let ap_phy = std::fs::read_link(format!("/sys/class/net/{ap_iface}/phy80211"));
+    matches!((nan_phy, ap_phy), (Ok(nan_phy), Ok(ap_phy)) if nan_phy != ap_phy)
 }
 
 fn spawn_nan_event_logger(service: Arc<LmeshService>) {
@@ -154,6 +204,13 @@ fn nan_events_need_restart(value: &serde_json::Value) -> bool {
         .flatten()
         .filter_map(|event| event.get("event").and_then(serde_json::Value::as_str))
         .any(|event| event == "NAN-PUBLISH-TERMINATED" || event == "NAN-SUBSCRIBE-TERMINATED")
+}
+
+fn nan_start_succeeded(value: &serde_json::Value) -> bool {
+    value
+        .pointer("/start/nan_capability/ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn parse_announce_interval_secs(value: &str) -> Option<u64> {
@@ -261,6 +318,21 @@ mod tests {
             std::env::remove_var(NAN_EVENT_LOG_ENV);
         }
         assert!(nan_event_log_enabled());
+    }
+
+    #[test]
+    fn ap_does_not_coexist_on_the_nan_interface() {
+        assert!(!ap_can_coexist_with_nan("wlan1", "wlan1"));
+    }
+
+    #[test]
+    fn nan_start_requires_a_successful_wpa_response() {
+        assert!(!nan_start_succeeded(&serde_json::json!({
+            "start": {"nan_capability": {"ok": false}}
+        })));
+        assert!(nan_start_succeeded(&serde_json::json!({
+            "start": {"nan_capability": {"ok": true}}
+        })));
     }
 
     #[test]

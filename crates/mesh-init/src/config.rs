@@ -698,7 +698,11 @@ MeshGID = 1000
         assert!(wpa.command.ends_with("wpa_supplicant"));
         assert_eq!(wpa.user.as_deref(), Some("build"));
         assert_eq!(wpa.group.as_deref(), Some("plugdev"));
-        assert!(wpa.args.contains(&"wlan1".to_string()));
+        assert!(wpa.args.contains(&"-g".to_string()));
+        assert!(
+            wpa.args
+                .contains(&"/run/mesh/wpa-supplicant/global".to_string())
+        );
         assert_eq!(
             wpa.ambient_capabilities,
             vec!["CAP_NET_ADMIN", "CAP_NET_RAW"]

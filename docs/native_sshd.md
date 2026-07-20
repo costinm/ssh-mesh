@@ -102,14 +102,16 @@ as such not very efficient and needs access to some apikeys.
 
 A better option: turn it into a 'passenger', with a mangled forward like
 UDS /h2/DEST - leaving ssh-mesh and mesh-init figure the tunnel route and
-trasnport. This can be merged into sshmc/mesh client.
+transport. This is implemented by the dependency-light `mesh` client.
 
-## Sshmc
+## mesh client
 
-The sshmc client ONLY speaks ControlMaster - with either openssh clients (which act as per-host UDS mux servers) or ssh-mesh. If the protocol is added to mesh-init, both openssh and sshmc will also use same syntax to connect to anything the mesh supports. and the client can be merged with 'mesh' client.
+`mesh` owns the former `sshmc` ControlMaster client. `mux:///path` and `-S
+path` use the native local mux protocol; unresolved bare hosts fall back to the
+real OpenSSH client. Explicit UDS/TCP endpoints use the common JSON/text/CBOR
+RPC codecs instead of service-specific client code.
 
 ## meshkeys
 
 Currently standalone - but may be turned into a service, using the common
 client for interactions. Mostly equivalent to openssh/openssl, focused on certs.
-

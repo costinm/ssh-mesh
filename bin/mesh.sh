@@ -49,7 +49,7 @@ reset() {
 }
 
 build() {
-  cargo build --release --target x86_64-unknown-linux-musl -p mesh -p mesh-init -p mesh-tun
+  cargo build --release --target x86_64-unknown-linux-musl -p mesh-cli -p mesh-init -p mesh-tun
 }
 
 mesh_tun() {

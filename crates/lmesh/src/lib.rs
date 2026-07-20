@@ -1036,6 +1036,16 @@ impl LmeshService {
         self.radio.nan_default(None, None, None, None)
     }
 
+    /// Report whether the configured WPA control socket is available for NAN startup.
+    pub fn default_nan_control_socket_exists(&self) -> bool {
+        self.radio.default_nan_control_socket_exists()
+    }
+
+    /// Start the default open channel-6 access point on the supplied interface.
+    pub fn start_default_open_ap(&self, iface: String) -> serde_json::Value {
+        self.radio.wifi_ap_start_open(Some(iface), None)
+    }
+
     /// Collect and record NAN events from the default host control socket.
     pub fn collect_default_nan_events(&self, wait_ms: u64, max_events: usize) -> serde_json::Value {
         self.radio

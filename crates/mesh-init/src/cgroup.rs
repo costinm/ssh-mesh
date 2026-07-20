@@ -5,8 +5,10 @@
 
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ResolvedResourceLimits;
 
@@ -86,6 +88,59 @@ pub fn create_cgroup(name: &str) -> Result<String, CgroupError> {
     }
 
     Ok(scope_path)
+}
+
+/// Terminate every process left in a configured service scope from a previous
+/// mesh-init instance.
+///
+/// A service is owned by its cgroup, not by its parent PID: after an
+/// unclean mesh-init exit, a child can be reparented while still remaining in
+/// `/sys/fs/cgroup/mesh.slice/<service>.scope`.  `cgroup.kill` covers the
+/// complete subtree, unlike signalling only the direct members in
+/// `cgroup.procs`.
+///
+/// This is deliberately limited to a validated, configured service name.
+/// It never scans or signals processes outside mesh-init's own scope.
+pub fn terminate_stale_service_scope(name: &str) -> Result<(), CgroupError> {
+    let scope_path = cgroup_path_for(name)?;
+    if !Path::new(&scope_path).exists() {
+        return Ok(());
+    }
+
+    let kill_path = format!("{scope_path}/cgroup.kill");
+    if !Path::new(&kill_path).exists() {
+        warn!(
+            service = name,
+            path = %scope_path,
+            "stale_service_scope_has_no_cgroup_kill"
+        );
+        return Ok(());
+    }
+
+    fs::write(&kill_path, "1")?;
+    info!(service = name, path = %scope_path, "stale_service_scope_killed");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service_scope_populated(&scope_path)? {
+        if Instant::now() >= deadline {
+            return Err(CgroupError::CgroupError(format!(
+                "stale service scope did not empty within two seconds: {scope_path}"
+            )));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    remove_cgroup(&scope_path)?;
+    Ok(())
+}
+
+fn service_scope_populated(scope_path: &str) -> Result<bool, CgroupError> {
+    let events_path = format!("{scope_path}/cgroup.events");
+    let events = fs::read_to_string(events_path)?;
+    Ok(events
+        .lines()
+        .find_map(|line| line.strip_prefix("populated "))
+        .is_some_and(|value| value.trim() == "1"))
 }
 
 /// Enable memory, cpu, and io controllers in a cgroup's subtree_control.

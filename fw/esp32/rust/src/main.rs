@@ -1,7 +1,6 @@
 use anyhow::Result;
 use esp_idf_svc::log::EspLogger;
 use std::ffi::c_char;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{Duration, Instant};
 
 mod commands;
@@ -14,10 +13,6 @@ use components::l3dmesh::L3Mesh;
 const BOOT_ACTIVE_WINDOW_MS: u32 = 10_000;
 const BOOT_PAIRING_HOLD_MS: u32 = 3_000;
 const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
-static UART0_EVENT_QUEUE: AtomicPtr<esp_idf_sys::QueueDefinition> =
-    AtomicPtr::new(core::ptr::null_mut());
-static UART0_EVENT_TASK: AtomicPtr<esp_idf_sys::tskTaskControlBlock> =
-    AtomicPtr::new(core::ptr::null_mut());
 
 fn main() {
     if let Err(err) = run() {
@@ -59,6 +54,14 @@ fn run() -> Result<()> {
     if let Err(err) = components::sleep::handle_deep_sleep_wake() {
         components::telemetry::record_log(format!(
             "event type=sleep.error phase=wake message={}",
+            commands::protocol::escape_value(&err.to_string())
+        ));
+    }
+
+    rom_print(b"dm-rs boot step=button\n\0");
+    if let Err(err) = components::button::initialize(&settings) {
+        components::telemetry::record_log(format!(
+            "ev=button.err op=init err={}",
             commands::protocol::escape_value(&err.to_string())
         ));
     }
@@ -127,14 +130,20 @@ fn run() -> Result<()> {
         mesh.add_transport(components::nan::transport());
     }
 
-    let mut serial_enabled = true;
     let ready = "event type=system.ready app=dmesh-rs";
     components::telemetry::record_log(ready);
     components::serial::activate_window();
     rom_print(b"dm-rs boot step=console\n\0");
-    let mut line = Vec::new();
-    if serial_enabled {
-        uart_write("dm-rs> ");
+    uart_write("dm-rs> ");
+    // Install the edge handler only after the UART manager and boot probe are
+    // live. DTR/PRG then opens a 20-second console-active window without
+    // racing early startup or the boot long-press pairing recovery path.
+    match components::button::start_runtime_interrupts() {
+        Ok(()) => components::telemetry::record_log("event type=button.runtime_interrupt ok=true"),
+        Err(err) => components::telemetry::record_log(format!(
+            "event type=button.runtime_interrupt ok=false msg={}",
+            commands::protocol::escape_value(&err.to_string())
+        )),
     }
     loop {
         components::telemetry::record_main_loop();
@@ -143,8 +152,12 @@ fn run() -> Result<()> {
         poll_raw_wifi_commands(&mut registry, &settings);
         poll_nan_commands(&mut registry, &settings);
         components::test::poll_main();
+        if components::button::take_console_wakes() > 0 {
+            components::serial::rearm_after_wake();
+            components::telemetry::record_log("event type=uart.wake source=button");
+            uart_write("event type=uart.wake source=button\ndm-rs> ");
+        }
         if components::button::take_long_presses() > 0 {
-            serial_enabled = true;
             components::serial::set_debug_enabled(true);
             components::serial::activate_window();
             components::mode::mark_companion_active(&settings, companion_active_ms);
@@ -153,21 +166,7 @@ fn run() -> Result<()> {
         for _ in 0..components::button::take_sync_requests() {
             components::mode::send_button_sync(&settings);
         }
-        drain_uart_console(
-            &mut registry,
-            &settings,
-            &mut serial_enabled,
-            companion_active_ms,
-            &mut line,
-        );
-        if components::serial::finish_pending_suspend() {
-            serial_enabled = false;
-        }
-        if components::serial::finish_pending_uninstall()
-            .map_err(|err| anyhow::anyhow!("uart uninstall err=0x{err:x}"))?
-        {
-            serial_enabled = false;
-        }
+        drain_uart_console(&mut registry, &settings, companion_active_ms);
         match wait_for_firmware_activity(Duration::from_millis(MAIN_HOUSEKEEPING_POLL_MS)) {
             UartWait::Data => {}
             UartWait::Timeout => {
@@ -181,53 +180,27 @@ fn run() -> Result<()> {
 fn drain_uart_console(
     registry: &mut CommandRegistry,
     settings: &components::settings::SharedSettings,
-    serial_enabled: &mut bool,
     companion_active_ms: u32,
-    line: &mut Vec<u8>,
 ) {
-    let mut buf = [0_u8; 128];
-    loop {
-        match uart_read(&mut buf, Duration::from_millis(0)) {
-            read if read > 0 => {
-                components::serial::set_debug_enabled(true);
-                components::serial::activate_window();
-                components::telemetry::record_uart_read(read as usize);
-                if !*serial_enabled {
-                    *serial_enabled = true;
-                    uart_write("dm-rs> ");
+    while let Some(frame) = components::serial::take_frame() {
+        components::mode::mark_companion_active(settings, companion_active_ms);
+        match frame.kind {
+            components::serial::UartFrameKind::Text => {
+                let command = core::str::from_utf8(&frame.data).unwrap_or("").trim();
+                if !command.is_empty() {
+                    uart_write(&transports::dispatch_text_line(registry, command));
                 }
-                components::mode::mark_companion_active(settings, companion_active_ms);
-                for byte in &buf[..read as usize] {
-                    if *byte == b'\n' || *byte == b'\r' {
-                        let command = core::str::from_utf8(line).unwrap_or("").trim();
-                        if !command.is_empty() {
-                            let response = transports::dispatch_text_line(registry, command);
-                            uart_write(&response);
-                        }
-                        line.clear();
-                        uart_write("dm-rs> ");
-                        if components::serial::finish_pending_suspend() {
-                            *serial_enabled = false;
-                            return;
-                        }
-                        match components::serial::finish_pending_uninstall() {
-                            Ok(true) => {
-                                *serial_enabled = false;
-                                return;
-                            }
-                            Ok(false) => {}
-                            Err(err) => uart_write(&format!("error uart_uninstall=0x{err:x}\n")),
-                        }
-                    } else {
-                        line.push(*byte);
-                    }
-                }
+                uart_write("dm-rs> ");
             }
-            -1 => {
-                break;
+            components::serial::UartFrameKind::Binary => {
+                let response = transports::dispatch_binary_packet(registry, &frame.data);
+                components::serial::write_bytes(&response);
             }
-            _ => break,
         }
+        // The manager owns driver deletion. It observes this notification only
+        // after the acknowledgement above has been accepted by UART TX.
+        let _ = components::serial::finish_pending_uninstall();
+        let _ = components::serial::finish_pending_suspend();
     }
 }
 
@@ -277,13 +250,12 @@ fn run_boot_active_window(
     ));
 
     let deadline = Instant::now() + Duration::from_millis(boot_active_window_ms() as u64);
-    let mut line = Vec::new();
     let mut uart_input = false;
     uart_write("dm-rs> ");
     if boot_pressed {
         let hold = Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64);
         let _ = wait_for_firmware_activity(hold);
-        uart_input |= poll_boot_console(registry, &mut line);
+        uart_input |= poll_boot_console(registry);
         if components::button::is_pressed() {
             uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
             components::button::suppress_until_release();
@@ -301,7 +273,7 @@ fn run_boot_active_window(
         }
     }
     while Instant::now() < deadline {
-        uart_input |= poll_boot_console(registry, &mut line);
+        uart_input |= poll_boot_console(registry);
         if probe_long_press && components::button::take_long_presses() > 0 {
             uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
             components::button::suppress_until_release();
@@ -353,37 +325,29 @@ fn apply_post_boot_uart_policy(boot_window: &BootWindowResult) {
     components::serial::set_debug_enabled(false);
 }
 
-fn poll_boot_console(registry: &mut CommandRegistry, line: &mut Vec<u8>) -> bool {
-    let mut buf = [0_u8; 128];
-    match uart_read(&mut buf, Duration::from_millis(0)) {
-        read if read > 0 => {
-            components::serial::activate_window();
-            let read = read as usize;
-            for byte in &buf[..read] {
-                if *byte == b'\n' || *byte == b'\r' {
-                    let command = core::str::from_utf8(line).unwrap_or("").trim();
-                    if !command.is_empty() {
-                        let response = transports::dispatch_text_line(registry, command);
-                        uart_write(&response);
-                    }
-                    line.clear();
-                    uart_write("dm-rs> ");
-                    if components::serial::finish_pending_suspend() {
-                        return true;
-                    }
-                } else {
-                    line.push(*byte);
+fn poll_boot_console(registry: &mut CommandRegistry) -> bool {
+    let mut received = false;
+    while let Some(frame) = components::serial::take_frame() {
+        received = true;
+        match frame.kind {
+            components::serial::UartFrameKind::Text => {
+                let command = core::str::from_utf8(&frame.data).unwrap_or("").trim();
+                if !command.is_empty() {
+                    uart_write(&transports::dispatch_text_line(registry, command));
                 }
+                uart_write("dm-rs> ");
             }
-            true
+            components::serial::UartFrameKind::Binary => {
+                components::serial::write_bytes(&transports::dispatch_binary_packet(
+                    registry,
+                    &frame.data,
+                ));
+            }
         }
-        -1 => {
-            log::warn!("boot console read failed");
-            task_delay(Duration::from_millis(20));
-            false
-        }
-        _ => false,
+        let _ = components::serial::finish_pending_suspend();
+        let _ = components::serial::finish_pending_uninstall();
     }
+    received
 }
 
 fn is_real_boot(cause: esp_idf_sys::esp_sleep_source_t) -> bool {
@@ -492,11 +456,18 @@ fn init_console_uart() {
 
         let _ = esp_idf_sys::uart_param_config(UART0, &config);
         let mut queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
-        let install = esp_idf_sys::uart_driver_install(UART0, 2048, 1024, 16, &mut queue, 0);
-        if install == esp_idf_sys::ESP_OK || install == esp_idf_sys::ESP_ERR_INVALID_STATE {
-            if install == esp_idf_sys::ESP_OK && !queue.is_null() {
-                UART0_EVENT_QUEUE.store(queue, Ordering::Relaxed);
-                start_uart_event_task(queue);
+        let mut install = esp_idf_sys::uart_driver_install(UART0, 2048, 1024, 16, &mut queue, 0);
+        if install == esp_idf_sys::ESP_ERR_INVALID_STATE {
+            // ESP-IDF may have installed its stdio UART0 driver before app_main.
+            // It has no event queue we can own, so replace it rather than silently
+            // accepting a console that can write but never receive commands.
+            let _ = esp_idf_sys::uart_driver_delete(UART0);
+            queue = core::ptr::null_mut();
+            install = esp_idf_sys::uart_driver_install(UART0, 2048, 1024, 16, &mut queue, 0);
+        }
+        if install == esp_idf_sys::ESP_OK {
+            if !queue.is_null() {
+                let _ = components::serial::start_ingress_task(queue);
             }
             esp_idf_sys::esp_vfs_dev_uart_use_driver(UART0_VFS);
             esp_idf_sys::esp_vfs_dev_uart_port_set_rx_line_endings(
@@ -512,55 +483,6 @@ fn init_console_uart() {
     }
 }
 
-fn start_uart_event_task(queue: esp_idf_sys::QueueHandle_t) {
-    if !UART0_EVENT_TASK.load(Ordering::SeqCst).is_null() {
-        return;
-    }
-    let Ok(name) = std::ffi::CString::new("uart_evt") else {
-        return;
-    };
-    let mut task = core::ptr::null_mut();
-    let ret = unsafe {
-        esp_idf_sys::xTaskCreatePinnedToCore(
-            Some(uart_event_task),
-            name.as_ptr(),
-            3072,
-            queue.cast(),
-            5,
-            &mut task,
-            0,
-        )
-    };
-    if ret == 1 && !task.is_null() {
-        UART0_EVENT_TASK.store(task, Ordering::SeqCst);
-    }
-}
-
-unsafe extern "C" fn uart_event_task(arg: *mut core::ffi::c_void) {
-    let queue = arg.cast::<esp_idf_sys::QueueDefinition>();
-    let mut event = esp_idf_sys::uart_event_t::default();
-    loop {
-        let ok = unsafe {
-            esp_idf_sys::xQueueReceive(
-                queue,
-                (&mut event as *mut esp_idf_sys::uart_event_t).cast(),
-                esp_idf_sys::TickType_t::MAX,
-            )
-        };
-        if ok != 1 {
-            continue;
-        }
-        if event.type_ == esp_idf_sys::uart_event_type_t_UART_FIFO_OVF
-            || event.type_ == esp_idf_sys::uart_event_type_t_UART_BUFFER_FULL
-        {
-            unsafe {
-                let _ = esp_idf_sys::uart_flush_input(esp_idf_sys::uart_port_t_UART_NUM_0);
-            }
-        }
-        components::wake::notify();
-    }
-}
-
 #[cfg(target_feature = "esp32s3ops")]
 fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
     esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_XTAL
@@ -568,7 +490,10 @@ fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
 
 #[cfg(not(target_feature = "esp32s3ops"))]
 fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
-    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_DEFAULT
+    // REF_TICK is only 1 MHz and cannot represent 460800 baud accurately on
+    // classic ESP32; it silently corrupts RX. Classic ESP-IDF exposes APB as
+    // the accurate source. The active UART PM lock keeps that clock stable.
+    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_APB
 }
 
 fn wait_for_firmware_activity(timeout: Duration) -> UartWait {
@@ -577,25 +502,6 @@ fn wait_for_firmware_activity(timeout: Duration) -> UartWait {
     } else {
         UartWait::Timeout
     }
-}
-
-fn uart_read(buf: &mut [u8], timeout: Duration) -> i32 {
-    components::serial::read(buf, duration_to_ticks(timeout))
-}
-
-fn task_delay(timeout: Duration) {
-    unsafe {
-        esp_idf_sys::vTaskDelay(duration_to_ticks(timeout));
-    }
-}
-
-fn duration_to_ticks(timeout: Duration) -> esp_idf_sys::TickType_t {
-    if timeout.is_zero() {
-        return 0;
-    }
-    let hz = esp_idf_sys::configTICK_RATE_HZ as u128;
-    let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
-    ticks.max(1).min(esp_idf_sys::TickType_t::MAX as u128) as esp_idf_sys::TickType_t
 }
 
 fn uart_write(text: &str) {

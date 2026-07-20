@@ -143,6 +143,15 @@
           ];
         };
 
+        # Python tools for the pure-Python mesh client. Keep this separate
+        # from build-deps so runtime images do not gain Python test tooling.
+        python-tools = pkgs.symlinkJoin {
+          name = "ssh-mesh-python-tools";
+          paths = [
+            (pkgs.python3.withPackages (ps: [ ps.pip ps.pytest ]))
+          ];
+        };
+
         wpa-supplicant-nan = pkgs.wpa_supplicant.overrideAttrs (old: {
           pname = "wpa-supplicant-nan";
           extraConfig = (old.extraConfig or "") + ''
@@ -175,7 +184,7 @@
             wpa_supplicant_bin="''${LMESH_WPA_SUPPLICANT:-wpa_supplicant}"
             wpa_cli_bin="''${WPA_CLI:-wpa_cli}"
             iface="''${LMESH_WIFI_IFACE:-wlan1}"
-            ctrl_dir="''${LMESH_WPA_CTRL_DIR:-/run/ssh-mesh-wpa}"
+            ctrl_dir="''${LMESH_WPA_CTRL_DIR:-/run/mesh/wpa-supplicant-nan}"
 
             section() {
               printf '\n== %s ==\n' "$1"
@@ -275,7 +284,7 @@
       in
       {
         packages = {
-            inherit ssh-mesh sshm musl-toolchain build-deps runtime-deps;
+            inherit ssh-mesh sshm musl-toolchain build-deps runtime-deps python-tools;
             inherit wpa-supplicant-nan radio-deps radio-preflight;
             default = ssh-mesh;
         };

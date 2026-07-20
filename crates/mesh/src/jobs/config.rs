@@ -82,6 +82,7 @@ impl JobConfig {
                 allow_dangerous_env: self.allow_dangerous_env.clone(),
                 ..Default::default()
             },
+            mesh: None,
             socket: None,
             resources: crate::config::ResourceLimits {
                 memory_low: memory_limit_to_toml(self.resources.memory_low),

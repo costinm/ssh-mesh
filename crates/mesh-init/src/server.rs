@@ -164,25 +164,14 @@ impl ControlServer {
             let peer_uid = peer_cred.uid();
             let peer_gid = peer_cred.gid();
 
-            // Use daemon's auth config if available, otherwise fallback to root+self
-            let is_authorized = {
-                let configs = self.daemon.configs.lock();
-                // Check if default config has auth rules
-                let auth = configs.get("default").and_then(|c| c.auth.as_ref());
-                match auth {
-                    Some(auth_config) => auth_config.is_uid_authorized(peer_uid, current_uid),
-                    None => {
-                        mesh::auth::AuthConfig::is_builtin_uid_authorized(peer_uid, current_uid)
-                    }
-                }
-            };
-            if !is_authorized {
-                error!(
-                    peer_uid,
-                    current_uid, "rejected_connection_unauthorized_uid"
-                );
-                continue;
-            }
+            // Admit the connection so request-level policy can distinguish the
+            // safe `reload` operation from privileged lifecycle/observer calls.
+            // Rejecting here made it impossible for an ordinary user to ask
+            // mesh-init to refresh service configuration.
+            debug!(
+                peer_uid,
+                peer_gid, current_uid, "control_connection_admitted"
+            );
 
             debug!(peer_uid, "control_connection_accepted");
 
@@ -235,7 +224,8 @@ async fn handle_connection(
             continue;
         }
 
-        let (_format, parsed_result) = protocol.parse_request_line(trimmed);
+        let normalized = normalize_service_method(trimmed);
+        let (_format, parsed_result) = protocol.parse_request_line(&normalized);
 
         let response = match parsed_result {
             Ok(request) => {
@@ -288,6 +278,26 @@ async fn handle_connection(
 
     debug!("control_connection_closed");
     Ok(())
+}
+
+fn normalize_service_method(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    let Some(method) = value
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return line.to_string();
+    };
+    let Some(method) = method.strip_prefix("mesh-init.") else {
+        return line.to_string();
+    };
+    if let Some(method_value) = value.get_mut("method") {
+        *method_value = serde_json::Value::String(method.to_string());
+    }
+    value.to_string()
 }
 
 async fn read_json_line(stream: &mut tokio::net::UnixStream, line: &mut String) -> Result<usize> {

@@ -427,6 +427,24 @@ impl Daemon {
             }
         }
 
+        // A previous mesh-init can leave children alive after it exits or is
+        // replaced.  Their parent PID is no longer meaningful, but their
+        // service cgroup is.  Clear only scopes named by the current config
+        // before any new service is spawned, so old listeners cannot steal
+        // ports or sockets from the replacement service.
+        for cfg in &loaded_configs {
+            if cfg.name == "default" {
+                continue;
+            }
+            if let Err(error) = crate::cgroup::terminate_stale_service_scope(&cfg.name) {
+                warn!(
+                    service = %cfg.name,
+                    error = %error,
+                    "stale_service_scope_cleanup_failed"
+                );
+            }
+        }
+
         // 2. Start resource manager
         if let Some(ref rm) = self.resource_manager {
             rm.start();

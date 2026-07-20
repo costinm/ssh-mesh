@@ -1,12 +1,16 @@
 pub mod auth;
+pub mod cbor;
 pub mod config;
 pub mod jobs;
 pub mod jsonl;
 pub mod local_trace;
 pub mod message;
+pub mod mux;
+pub mod mux_client;
 pub mod paths;
 pub mod protocol;
 pub mod server;
+pub mod tagged;
 pub mod tun;
 
 use std::sync::Arc;

@@ -78,10 +78,10 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         return Ok(());
     }
 
-    // GPIO0/PRG is the console wake source. Do not arm UART wake here: quiet
-    // mode intentionally powers down UART RX until a DTR/button edge opens a
-    // new console window, and UART wake would corrupt its first input byte.
-    configure_light_wake_sources(settings, sleep_ms, false)?;
+    // Keep UART RX wake armed in idle. A wake preamble can lose its first
+    // bytes during light-sleep clock restoration, but the following command
+    // opens the normal active console window without requiring DTR/PRG.
+    configure_light_wake_sources(settings, sleep_ms, true)?;
     super::serial::suspend_for_light_sleep();
     RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
     let before_us = now_us();
@@ -97,10 +97,9 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
     if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO
         || cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART
     {
-        // GPIO0/DTR can wake light sleep without running the normal GPIO ISR
-        // task. UART RX was disabled immediately before sleep, so re-arm it
-        // here before the host sends the first command. Timer/NAN wakes must
-        // not open the debug window or they would defeat the sleep budget.
+        // GPIO0/DTR and UART wake light sleep without necessarily running the
+        // normal GPIO task. Re-arm the event-driven console before the host
+        // sends its actual command. Timer/NAN wakes stay idle.
         super::serial::rearm_after_wake();
         telemetry::record_log(format!(
             "event type=uart.wake source={} phase=light_sleep_return",

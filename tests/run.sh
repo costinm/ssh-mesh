@@ -75,14 +75,14 @@ connect_host8_sshmx() {
         start_share
         sleep 1
     fi
-    echo "Connecting to $host using sshmc with /tmp/9p.sock forwarding (auto-mount)..."
-    # sshmc uses the same syntax for UDS forwarding: -R local_path:remote_path
+    echo "Connecting to $host using mesh with /tmp/9p.sock forwarding (auto-mount)..."
+    # mesh uses the same syntax for UDS forwarding: -R local_path:remote_path
     # The remote path /tmp/9p.sock triggers per-peer directory + auto-mount on the server.
     local IGNORE=""
     if [ "$host" == "127.0.0.1" ]; then
         IGNORE="SSHMUX_IGNORE=1"
     fi
-    env $IGNORE ${BIN_DIR}/sshmc -R /tmp/9p.sock:/tmp/unpfs.sock "$host" \
+    env $IGNORE ${BIN_DIR}/mesh -R /tmp/9p.sock:/tmp/unpfs.sock "$host" \
         bash -i
 }
 

@@ -295,7 +295,7 @@
     "name": "wifi.raw.listen",
     "title": "Listen Raw Wi-Fi",
     "group": "Radio",
-    "description": "Debug-only legacy raw Wi-Fi action-frame listener retained for lab comparison. Prefer wifi.nan.* for the DMesh control plane.",
+    "description": "Listen for the custom raw vendor-action bulk transport during NAN-synchronized active windows.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -307,7 +307,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         },
         "channel": {
           "type": "integer",
@@ -341,7 +341,7 @@
     "name": "wifi.raw.send",
     "title": "Send Raw Wi-Fi",
     "group": "Radio",
-    "description": "Debug-only legacy raw Wi-Fi action-frame sender retained for lab comparison. Prefer wifi.nan.transmit for the DMesh control plane.",
+    "description": "Send custom raw vendor-action bulk traffic using the stable DMesh marker rather than the ESP-NOW API.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -353,7 +353,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         },
         "channel": {
           "type": "integer",
@@ -431,7 +431,7 @@
     "name": "wifi.raw.ping",
     "title": "Ping Raw Wi-Fi",
     "group": "Radio",
-    "description": "Debug-only legacy raw Wi-Fi ping retained for lab comparison. Prefer ping radio=nan or wifi.nan.default.",
+    "description": "Send a small custom raw-action probe.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -443,7 +443,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         },
         "channel": {
           "type": "integer",
@@ -804,7 +804,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         }
       },
       "additionalProperties": false
@@ -819,7 +819,7 @@
       "type": "object",
       "properties": {
         "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/ssh-mesh-wpa" },
+        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
         "service_name": { "type": "string", "title": "Service name", "default": "dmesh" },
         "ttl": { "type": "integer", "title": "TTL seconds", "default": 3600, "minimum": 0 }
       },
@@ -835,7 +835,7 @@
       "type": "object",
       "properties": {
         "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/ssh-mesh-wpa" },
+        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
         "events_ms": { "type": "integer", "title": "Event wait milliseconds", "default": 100, "minimum": 1 }
       },
       "additionalProperties": false
@@ -850,7 +850,7 @@
       "type": "object",
       "properties": {
         "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/ssh-mesh-wpa" },
+        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
         "wait_ms": { "type": "integer", "title": "Wait milliseconds", "default": 250, "minimum": 1 },
         "max_events": { "type": "integer", "title": "Max events", "default": 64, "minimum": 1 }
       },
@@ -873,7 +873,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         }
       },
       "additionalProperties": false
@@ -888,7 +888,7 @@
       "type": "object",
       "properties": {
         "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/ssh-mesh-wpa" },
+        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
         "service_name": { "type": "string", "title": "Service name", "default": "dmesh" },
         "ssi_hex": { "type": "string", "title": "Service-specific info hex" },
         "ttl": { "type": "integer", "title": "TTL seconds", "default": 3600, "minimum": 0 },
@@ -907,7 +907,7 @@
       "type": "object",
       "properties": {
         "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/ssh-mesh-wpa" },
+        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
         "service_name": { "type": "string", "title": "Service name", "default": "dmesh" },
         "ssi_hex": { "type": "string", "title": "Service-specific info hex" },
         "ttl": { "type": "integer", "title": "TTL seconds", "default": 3600, "minimum": 0 },
@@ -927,7 +927,7 @@
       "type": "object",
       "properties": {
         "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/ssh-mesh-wpa" },
+        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
         "handle": { "type": "integer", "title": "Publish or subscribe handle", "minimum": 1 },
         "address": { "type": "string", "title": "Peer MAC" },
         "req_instance_id": { "type": "integer", "title": "Peer instance ID", "minimum": 1 },
@@ -948,7 +948,7 @@
       "type": "object",
       "properties": {
         "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/ssh-mesh-wpa" },
+        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
         "sizes": { "type": "string", "title": "Comma-separated byte sizes", "default": "64,128,192,224,230,255,384,512,1024" },
         "mode": { "type": "string", "title": "Probe mode", "enum": ["publish", "transmit"], "default": "publish" }
       },
@@ -981,7 +981,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         }
       },
       "additionalProperties": false
@@ -1003,7 +1003,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         }
       },
       "additionalProperties": false
@@ -1025,7 +1025,7 @@
         "ctrl_dir": {
           "type": "string",
           "title": "WPA control dir",
-          "default": "/run/ssh-mesh-wpa"
+          "default": "/run/mesh/wpa-supplicant-nan"
         }
       },
       "additionalProperties": false

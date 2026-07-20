@@ -132,5 +132,11 @@ gost -L=:8080
 
 ```
 
+# Firmware and ESP32
 
+## Docs
+
+One of the most useful docs - read this for any power-related work for ESP32:
+
+https://hubble.com/community/guides/esp32-power-modes-explained-what-the-datasheet-tells-you-and-what-it-doesn-t/
 

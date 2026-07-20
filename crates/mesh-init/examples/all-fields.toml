@@ -239,6 +239,18 @@ MeshActivationMode = "hybrid"
 # to CWD, which doesn't work; use the absolute default below.)
 # MeshActivationSocket = "..."  # see run_dir for the valid prefix
 
+[Mesh]
+# Node-local client view of this logical service. It tells local mesh callers
+# how to connect and which static command catalog to use. It is not provider
+# runtime/resource policy; a future [Workload] section will make that boundary
+# explicit without moving the current mesh-init fields in this iteration.
+# When omitted, callers use `/run/mesh/<service>/mesh.sock`.
+Address = "unix:///run/mesh/example/mesh.sock"
+# `auto`, `cbor`, `json`, `text`, or `mux`.
+DestinationFormat = "auto"
+# Generated public API catalog used by schema-guided CLI conversion.
+Tools = "/opt/example/resources/tools.json"
+
 [Socket]
 # Applies to: socket activation.
 # false passes listener fds to the service using LISTEN_FDS; true accepts each

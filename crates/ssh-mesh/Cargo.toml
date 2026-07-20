@@ -16,10 +16,6 @@ path = "src/bin/h2t.rs"
 name = "meshkeys"
 path = "src/bin/meshkeys.rs"
 
-[[bin]]
-name = "sshmc"
-path = "src/bin/sshmc.rs"
-
 [features]
 default = ["test-utils", "sftp"]
 test-utils = ["tempfile", "once_cell"]

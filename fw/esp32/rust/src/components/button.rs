@@ -27,17 +27,30 @@ static BUTTON_LEVEL_HELD: AtomicBool = AtomicBool::new(false);
 static BUTTON_LEVEL_LONG_REPORTED: AtomicBool = AtomicBool::new(false);
 static BUTTON_LEVEL_START_MS: AtomicU32 = AtomicU32::new(0);
 static BUTTON_LONG_PENDING: AtomicU32 = AtomicU32::new(0);
+static BUTTON_CONSOLE_PENDING: AtomicU32 = AtomicU32::new(0);
 static BUTTON_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(std::ptr::null_mut());
 static GPIO_ISR_SERVICE_READY: AtomicBool = AtomicBool::new(false);
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
-    if let Err(err) = init_from_settings(&settings) {
-        telemetry::record_log(format!(
-            "ev=button.err op=init err={}",
-            crate::commands::protocol::escape_value(&err.to_string())
-        ));
-    }
     registry.register(ButtonCommand { settings });
+}
+
+/// Initialize GPIO0 and its task in a dedicated boot phase. Command registry
+/// construction must remain side-effect free so a button-driver failure cannot
+/// leave startup half-complete before the console becomes usable.
+pub fn initialize(settings: &SharedSettings) -> Result<()> {
+    init_from_settings(settings)
+}
+
+/// Install the runtime edge interrupt only after the boot console and long
+/// press probe are available. GPIO input configuration is intentionally kept
+/// separate because ISR service installation has previously stalled startup on
+/// boards where GPIO0 is also driven by the USB-UART DTR line.
+pub fn start_runtime_interrupts() -> Result<()> {
+    if !BUTTON_ENABLED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    configure_button_interrupts(BUTTON_GPIO.load(Ordering::Relaxed))
 }
 
 pub fn configure_light_wake(settings: &SharedSettings) -> Result<Option<i32>> {
@@ -61,6 +74,12 @@ pub fn take_sync_requests() -> u32 {
 
 pub fn take_long_presses() -> u32 {
     BUTTON_LONG_PENDING.swap(0, Ordering::Relaxed)
+}
+
+/// Consume physical PRG/DTR wake events. The GPIO task deliberately does not
+/// manipulate UART state; the control task opens the console window.
+pub fn take_console_wakes() -> u32 {
+    BUTTON_CONSOLE_PENDING.swap(0, Ordering::Relaxed)
 }
 
 pub fn configured_gpio() -> Option<i32> {
@@ -165,14 +184,14 @@ fn init_from_settings(settings: &SharedSettings) -> Result<()> {
         .clamp(0, 39);
     drop(settings);
     if enabled {
-        configure_button(pin)?;
+        configure_button_input(pin)?;
     }
     BUTTON_ENABLED.store(enabled, Ordering::Relaxed);
     BUTTON_GPIO.store(pin, Ordering::Relaxed);
     Ok(())
 }
 
-fn configure_button(pin: i32) -> Result<()> {
+fn configure_button_input(pin: i32) -> Result<()> {
     unsafe {
         let config = sys::gpio_config_t {
             pin_bit_mask: 1_u64 << pin,
@@ -182,6 +201,17 @@ fn configure_button(pin: i32) -> Result<()> {
             intr_type: sys::gpio_int_type_t_GPIO_INTR_NEGEDGE,
         };
         esp_ok(sys::gpio_config(&config))?;
+        esp_ok(sys::gpio_wakeup_enable(
+            pin as sys::gpio_num_t,
+            sys::gpio_int_type_t_GPIO_INTR_LOW_LEVEL,
+        ))?;
+        esp_ok(sys::esp_sleep_enable_gpio_wakeup())?;
+    }
+    Ok(())
+}
+
+fn configure_button_interrupts(pin: i32) -> Result<()> {
+    unsafe {
         let _ = sys::gpio_isr_handler_remove(pin);
         let _ = sys::gpio_intr_disable(pin as sys::gpio_num_t);
         if !GPIO_ISR_SERVICE_READY.load(Ordering::SeqCst) {
@@ -200,11 +230,6 @@ fn configure_button(pin: i32) -> Result<()> {
             Some(button_isr),
             std::ptr::null_mut(),
         ))?;
-        esp_ok(sys::gpio_wakeup_enable(
-            pin as sys::gpio_num_t,
-            sys::gpio_int_type_t_GPIO_INTR_LOW_LEVEL,
-        ))?;
-        esp_ok(sys::esp_sleep_enable_gpio_wakeup())?;
         esp_ok(sys::gpio_intr_enable(pin as sys::gpio_num_t))?;
     }
     Ok(())
@@ -264,14 +289,11 @@ unsafe extern "C" fn button_task(_arg: *mut core::ffi::c_void) {
             continue;
         }
         last = Instant::now();
-        // Automatic light sleep may dispatch the GPIO edge before its clock
-        // restore path has fully unwound. Acquiring PM locks immediately can
-        // deadlock that transition and trip the interrupt watchdog.
+        // Let the light-sleep clock restoration complete before notifying the
+        // control task. This task must not touch UART APIs or print output.
         task_delay(Duration::from_millis(20));
-        super::serial::rearm_after_wake();
+        BUTTON_CONSOLE_PENDING.fetch_add(1, Ordering::Relaxed);
         telemetry::record_log("ev=button.edge source=isr".to_string());
-        telemetry::record_log("event type=uart.wake source=button".to_string());
-        telemetry::emit_console("event type=uart.wake source=button");
         super::wake::notify();
         classify_button_press();
         reenable_button_interrupt();
@@ -283,20 +305,17 @@ fn record_button_press(source: &str, long_press: bool) {
     let pin = BUTTON_GPIO.load(Ordering::Relaxed);
     let line = format!("ev=button.press gpio={} n={} source={}", pin, total, source);
     telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
     super::ble_bt::open_companion_active_window(10_000);
     if long_press {
         BUTTON_LONG_PENDING.fetch_add(1, Ordering::Relaxed);
         BUTTON_SYNC_PENDING.fetch_add(1, Ordering::Relaxed);
         let line = "ev=button.long action=sync".to_string();
         telemetry::record_log(line.clone());
-        telemetry::emit_console(&line);
     } else {
         // A short PRG press is the physical equivalent of a console/DTR wake.
         // Keep it side-effect free so it is safe as a recovery action.
         let line = "ev=button.short action=console".to_string();
         telemetry::record_log(line.clone());
-        telemetry::emit_console(&line);
     }
     super::wake::notify();
 }
@@ -306,12 +325,10 @@ fn record_button_double() {
     let pin = BUTTON_GPIO.load(Ordering::Relaxed);
     let line = format!("ev=button.press gpio={} n={} source=double", pin, total);
     telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
     super::ble_bt::open_companion_active_window(10_000);
     BUTTON_SYNC_PENDING.fetch_add(1, Ordering::Relaxed);
     let line = "ev=button.double action=sync".to_string();
     telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
     super::wake::notify();
 }
 
@@ -408,7 +425,8 @@ impl CommandHandler for ButtonCommand {
             settings.set_i32("button.gpio", pin)?;
         }
         if enabled {
-            configure_button(pin)?;
+            configure_button_input(pin)?;
+            configure_button_interrupts(pin)?;
         }
         Ok(CommandResponse::ok(format!(
             "button enabled={} gpio={} presses={}",

@@ -50,13 +50,13 @@ in that socket unit, matching the documented systemd shape.
 | --- | --- | --- |
 | `SSH_BASEDIR` | `<ssh-mesh_home>/etc` | Directory for server keys, certificates, `authorized_keys`, `authorized_cas`, and default SSH config. |
 | `HOME` | process environment | Used as the default home in mesh-init exec requests. |
-| `USER` | `system` for HTTP exec; `root` for `sshmc` destination parsing | User name used when constructing mesh-init exec requests or mux socket names. |
+| `USER` | `system` for HTTP exec; `root` for mux socket names | User name used when constructing mesh-init exec requests or mux socket names. |
 | `SFTP_ROOT` | unset; effective root falls back to `SSH_BASEDIR` | Optional SFTP root path. |
 | `SSH_MESH_CONFIG` | `<ssh-mesh_home>/etc` | Directory for `mesh.yaml`, `mesh.json`, or `mesh.toml`, plus per-user SSH authorization. |
 | `SSH_MESH_TRUSTED_STDIO` | `false` | When `1` or `true`, serve trusted SSH transport over stdin/stdout and skip normal listeners. |
 | `APP_HTTP_PORT` | unset | Optional reverse-proxy target used by the fallback HTTP proxy. |
 | `SSH_CONFIG` | `$SSH_BASEDIR/config` | SSH client config path. If the file does not exist, no config file is used. |
-| `SSH_MUX` | `<ssh-mesh_home>/run/ssh-mesh/mux` for `sshmc`; unset for server client manager | Directory for OpenSSH-style mux control sockets. |
+| `SSH_MUX` | `<ssh-mesh_home>/run/ssh-mesh/mux` for local mux clients; unset for server client manager | Directory for OpenSSH-style mux control sockets. |
 | `SSH_MESH_HTTPS_CA` | `$SSH_BASEDIR/authorized_cas` | CA bundle used to require and validate HTTPS client certificates. If missing, HTTPS starts without client-cert auth. |
 | `EXEC_USER` | `1000` | UID used by the legacy foreground command path. |
 | `MESH_INIT_SOCK` | `/run/mesh/mesh-init/mesh.sock` for root systems | mesh-init mesh endpoint used for HTTP exec, SSH terminal delegation, and route activation. |

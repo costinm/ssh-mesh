@@ -7,7 +7,7 @@ rfkill_bin="${RFKILL:-rfkill}"
 wpa_supplicant_bin="${LMESH_WPA_SUPPLICANT:-wpa_supplicant}"
 wpa_cli_bin="${WPA_CLI:-wpa_cli}"
 iface="${LMESH_WIFI_IFACE:-wlan1}"
-ctrl_dir="${LMESH_WPA_CTRL_DIR:-/run/ssh-mesh-wpa}"
+ctrl_dir="${LMESH_WPA_CTRL_DIR:-/run/mesh/wpa-supplicant-nan}"
 
 section() {
   printf '\n== %s ==\n' "$1"

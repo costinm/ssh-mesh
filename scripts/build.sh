@@ -13,10 +13,10 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
 export DEST=${DEST:-/opt/ssh-mesh}
 
-CRATES="mesh-init ssh-mesh mesh mesh9p traceweb sftp-server lmesh ssh-config"
-BIN_TARGETS="h2t meshkeys sshmc mesh-init ssh-mesh mesh mesh9p traceweb sftp-server lmesh ssh-config"
+CRATES="mesh-init ssh-mesh mesh mesh-cli mesh9p traceweb sftp-server lmesh ssh-config"
+BIN_TARGETS="h2t meshkeys mesh-init ssh-mesh mesh mesh9p traceweb sftp-server lmesh ssh-config"
 INSTALL_BIN_TARGETS="$BIN_TARGETS dmesh"
-EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh sshmc lmesh mesh9p sftp-server h2t meshkeys"
+EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh lmesh mesh9p sftp-server h2t meshkeys"
 
 help() {
     cat <<'EOF'

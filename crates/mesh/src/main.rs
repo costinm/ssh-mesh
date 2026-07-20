@@ -121,6 +121,12 @@ enum Command {
         #[clap(long)]
         params: Option<String>,
     },
+    /// Translate an option-first text call through tools.json and send JSONL.
+    Call {
+        /// `component.method -option=value positional...`
+        #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+        invocation: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -267,6 +273,18 @@ async fn main() -> Result<()> {
                     "arguments": params,
                 },
             });
+            let response = send_value(&socket_path, &request).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(());
+        }
+        Command::Call { invocation } => {
+            if invocation.is_empty() {
+                anyhow::bail!("call requires component.method and arguments");
+            }
+            let tools = read_tools_catalog(&args.app)?;
+            let catalog = mesh::tagged::TaggedCatalog::from_tools_json(&tools)?;
+            let record = catalog.parse_text(&invocation.join(" "))?;
+            let request = catalog.to_jsonl(&record);
             let response = send_value(&socket_path, &request).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             return Ok(());

@@ -29,6 +29,7 @@ COPY crates ./crates
 # Build mesh-init and ssh-mesh targets for MUSL, built individually
 # Less efficient (duplicate builds of common deps), but want to evaluate each
 RUN cargo build --target x86_64-unknown-linux-musl --release -p mesh-init
+RUN cargo build --target x86_64-unknown-linux-musl --release -p mesh-cli
 RUN cargo build --target x86_64-unknown-linux-musl --release -p ssh-mesh
 
 # Build traceweb with glibc
@@ -90,7 +91,7 @@ FROM scratch as bin
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/h2t .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/meshkeys .
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/sshmc .
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh .
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh-init .
 COPY --from=build /src/target/release/traceweb .
 

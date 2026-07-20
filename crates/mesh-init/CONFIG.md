@@ -10,6 +10,15 @@ the same service appears in both places, the `/home` file wins. When
 `MESH_INIT_DIR` is set it replaces both default directories. Non-root
 `mesh-init` defaults to `./etc/mesh-init` relative to its working directory.
 
+Service definitions are node-local client policy: they describe how processes
+on this node connect to a logical FQDN, including `[Mesh].Address`, transport,
+encoding, and the local static `Tools` catalog. `ExecStart` is the local-exec
+connection mechanism, comparable to invoking a remote serverless service over
+HTTPS. Existing lifecycle, socket, environment, network, and resource fields
+remain unchanged. A future `[Workload]` section will make provider-side
+runtime/resource policy explicit; this iteration does not move existing
+fields.
+
 For on-demand `start NAME` requests without a loaded core config, root mode
 looks for `/opt/NAME/etc/mesh-init/NAME.toml` and then
 `/home/NAME/etc/mesh-init/NAME.toml`; `/home` wins. If `/home/NAME` exists,

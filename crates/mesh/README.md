@@ -12,7 +12,7 @@ In many cases H2C is overkill - many apps can just expose
 an MCP-like JSON-RPC or plain JSON over stdin/stdout or UDS. In this case the mesh proxy can handle HTTP2 or SSH forwarding, with headers and metadata exposed as either env variables or in the json sent to the app.
 The app will not include a HTTP or H2 library, keeping deps small.
 
-## Line Protocol Selection
+## Baseline protocols and binary framing
 
 `mesh::message::LineProtocolSession` provides the shared connection-level
 protocol selector for line-capable control sockets and stdio services. The
@@ -20,7 +20,33 @@ first byte of the first packet selects the protocol for the whole connection:
 
 - `{` selects JSON / JSON-RPC lines.
 - An ASCII letter selects the shared text-record protocol.
-- `0x00` is reserved for the SSH mux-control binary protocol.
+- `0x00` selects the shared binary protocol.
+
+The binary frame is compatible with the useful shape of an OpenSSH mux packet:
+
+```text
+u32-be length | 0 | message-type | flags | version | payload
+```
+
+`length` includes the four metadata bytes, but not its own four bytes. The zero
+byte is padding. `message-type` reuses RFC 4254 SSH connection message numbers,
+including global request (80), channel open (90), channel data (94), channel
+request (98), and their replies. Consequently an SSH adapter can preserve
+channel, forwarding, EOF, and close semantics instead of translating through a
+second transport enum. Global forwarding uses the standard `tcpip-forward` and
+`cancel-tcpip-forward` request names; channel opens use names such as `session`,
+`direct-tcpip`, and `forwarded-tcpip`.
+
+Message type 203 (`0xcb`) is the private mesh RPC record. Its payload is compact
+CBOR on a binary baseline connection. Datagram transports such as LoRa, NAN,
+BLE, and UDP carry that CBOR directly because their outer envelope already has
+a length. Unix sockets may pass descriptors with the OpenSSH SCM_RIGHTS marker
+convention. OpenSSH ControlMaster request IDs and framing helpers are also
+provided by `mesh::mux` for direct interoperability.
+
+`mesh` owns this unencrypted local transport and JSON/text/CBOR translation. It
+does not depend on `russh`; `ssh-mesh` adds SSH, mTLS/H2, and other authenticated
+remote transports.
 
 The text protocol is logfmt-style: one newline-terminated record, record kind
 as the first token, then `key=value` fields. Values with whitespace or shell
@@ -33,17 +59,25 @@ event type=lora.rx rssi=-71 data_b64=AQID
 error message="service not found"
 ```
 
-Firmware implementations may use only the text protocol, while host services
-should use `LineProtocolSession` so JSON, text, and future binary selection stay
-consistent.
+Firmware should use direct CBOR for datagrams and the framed CBOR form for TTY
+or another byte stream. Host line services use `LineProtocolSession`; binary
+sessions use `mesh::mux::read_frame` rather than a line parser.
 
 If HTTP is needed, it belongs in `ssh-mesh` or the application itself. The `mesh` crate intentionally avoids Axum/Hyper/http dependencies and only provides the activation, peer-checked stream, JSONL, and telemetry primitives.
 
 ## Tools Catalogs
 
-Services that expose a mesh JSONL/JSON-RPC command surface should keep a
-hand-maintained `resources/tools.json` next to the crate. The catalog is used by
+Services that expose a mesh command surface should keep structured `mesh-api`
+blocks in their human-readable `API.md`. Generated `resources/tools.json`
+catalogs are used by
 `tools/list`, ssh-mesh web/admin pages, and the `mesh` CLI:
+
+Mesh-init service definitions are node-local client connection policy. Their
+`[Mesh]` section selects address, transport, encoding, and a local static tools
+catalog; `mesh FQDN help` reads that catalog without contacting the service.
+`ExecStart` is the local-exec connection mechanism. Existing process, socket,
+network, environment, and resource fields remain in place for now; a future
+`[Workload]` section is reserved for making provider runtime policy explicit.
 
 ```sh
 mesh lmesh tools
@@ -51,9 +85,9 @@ mesh lmesh tool nodes
 mesh lmesh tool announce --params '{"metadata":{"role":"dev"}}'
 ```
 
-The catalog is intentionally curated, not generated from code. It may hide or
-simplify internal methods, but it should be updated together with the crate's
-`API.md` when the public command surface changes. During local development,
+`API.md` remains the source of truth and may mark methods public or private;
+the generator emits the public catalog rather than deriving it from Rust code.
+During local development,
 `MESH_RES_DIR` can point at a crate's `resources/` directory; packaged runs use
 the normal `MESH_OPT_BASE`/`MESH_APP_OPT` resource lookup.
 

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import array
+import fcntl
 import os
 import select
 import socket
@@ -20,13 +22,19 @@ sys.path.insert(0, str(ROOT / "python"))
 from dmesh import RadioClient  # noqa: E402
 
 PROMPT = b"dm-rs> "
+DEFAULT_DTR_PULSE_MS = 120
+TIOCMGET = 0x5415
+TIOCMSET = 0x5418
+TIOCM_DTR = 0x002
 
 
 class Console:
-    def __init__(self, port: str, baud: int, timeout: float) -> None:
+    def __init__(self, port: str, baud: int, timeout: float, dtr_pulse_ms: int) -> None:
         self.port = port
         self.timeout = timeout
         self.endpoint = open_endpoint(port, baud)
+        if dtr_pulse_ms:
+            self.endpoint.pulse_dtr(dtr_pulse_ms)
 
     def close(self) -> None:
         self.endpoint.close()
@@ -87,6 +95,19 @@ class Endpoint:
         except termios.error:
             drain_socket_input(self.fd)
 
+    def pulse_dtr(self, hold_ms: int) -> None:
+        """Pulse the board PRG/DTR line and leave it deasserted.
+
+        Physical ESP consoles use this as a wake request. Socket transports
+        have no modem-control line and deliberately override this as a no-op.
+        """
+        bits = array.array("i", [0])
+        fcntl.ioctl(self.fd, TIOCMGET, bits, True)
+        deasserted = bits[0] & ~TIOCM_DTR
+        fcntl.ioctl(self.fd, TIOCMSET, array.array("i", [bits[0] | TIOCM_DTR]))
+        time.sleep(hold_ms / 1000.0)
+        fcntl.ioctl(self.fd, TIOCMSET, array.array("i", [deasserted]))
+
     def close(self) -> None:
         os.close(self.fd)
 
@@ -104,6 +125,9 @@ class SocketEndpoint(Endpoint):
 
     def close(self) -> None:
         self.sock.close()
+
+    def pulse_dtr(self, hold_ms: int) -> None:
+        _ = hold_ms
 
 
 def open_endpoint(port: str, baud: int) -> Endpoint:
@@ -193,6 +217,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument(
+        "--dtr-pulse-ms",
+        type=int,
+        default=DEFAULT_DTR_PULSE_MS,
+        help="Physical UART wake pulse duration; use 0 to suppress it (default: 120).",
+    )
+    parser.add_argument(
         "--cmd",
         action="append",
         required=True,
@@ -224,7 +254,7 @@ def main() -> int:
             finally:
                 radio.close()
             continue
-        console = Console(port, args.baud, args.timeout)
+        console = Console(port, args.baud, args.timeout, args.dtr_pulse_ms)
         try:
             if not args.no_sync:
                 print(console.sync().rstrip(), flush=True)

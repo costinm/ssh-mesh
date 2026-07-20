@@ -1,16 +1,15 @@
 # Build-user lmesh radio service with ambient radio capabilities.
 #
 # Service name from filename: lmesh-radio-build
-# Runtime dir: /run/mesh/lmesh-radio-build
-# mesh-init creates /run/mesh/lmesh-radio-build and chowns it to User/Group.
+# Runtime dir: /run/mesh/lmesh
+# mesh-init creates /run/mesh/lmesh and chowns it to User/Group.
 
 [Service]
 Type = "exec"
 
-# mesh-init should be started with PATH containing the lmesh build/profile bin.
-# For direct repo testing, target/debug/lmesh or
-# target/x86_64-unknown-linux-musl/debug/lmesh are typical candidates for PATH.
-ExecStart = "lmesh"
+# Use the checked build explicitly for this local lab service. This avoids
+# accidentally starting an older profile binary with incompatible forwarding.
+ExecStart = "/ws/rust/ssh-mesh/target/x86_64-unknown-linux-musl/debug/lmesh"
 
 # Symlink to the build target
 WorkingDirectory = "target"
@@ -51,10 +50,9 @@ MESH_LOG_FILE = "lmesh-radio-build/log/lmesh.log"
 MESH_LOG_DIR = "lmesh-radio-build/log"
 
 # Special name with build - separate from the 'main' one.
-LMESH_CONTROL_SOCKET = "/run/mesh/lmesh-radio-build/mesh.sock"
-# WorkingDirectory is target/. Keep runtime config under target/etc/lmesh so it
-# is not tied to this example service name or local user naming.
-LMESH_CONFIG_FILE = "etc/lmesh/lmesh.toml"
+LMESH_CONTROL_SOCKET = "/run/mesh/lmesh/mesh.sock"
+# lmesh automatically loads /home/system/etc/lmesh/lmesh.toml. Set
+# LMESH_CONFIG_FILE only for an isolated or non-system deployment.
 
 LMESH_WIFI_IFACE = "wlan1"
 LMESH_WPA_CTRL_DIR = "/run/mesh/wpa-supplicant-nan"

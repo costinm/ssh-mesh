@@ -17,19 +17,20 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::radio_protocol;
 
 const DEFAULT_WIFI_IFACE: &str = "wlan1";
-const DEFAULT_WPA_CTRL_DIR: &str = "/run/ssh-mesh-wpa";
+const DEFAULT_WPA_CTRL_DIR: &str = "/run/mesh/wpa-supplicant-nan";
 const DEFAULT_WPA_SERVICE_NAME: &str = "dmesh";
 const DEFAULT_NAN_TTL_SECS: u32 = 3600;
 const DEFAULT_HCI_DEV: u16 = 0;
 const DEFAULT_RAW_WIFI_CHANNEL: u8 = 6;
 const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
+const DEFAULT_LMESH_CONFIG_FILE: &str = "/home/system/etc/lmesh/lmesh.toml";
 const MAX_HISTORY: usize = 128;
 const ETH_P_ALL: u16 = 0x0003;
 const ETH_P_DMESH: u16 = 0x88b5;
@@ -54,6 +55,13 @@ const RFC2217_SET_STOPSIZE: u8 = 4;
 const RFC2217_SET_CONTROL: u8 = 5;
 const RFC2217_PURGE_DATA: u8 = 12;
 const SERIAL_FORWARD_MAX_PENDING: usize = 4 * 1024 * 1024;
+const SERIAL_FORWARD_IO_BUFFER_BYTES: usize = 16 * 1024;
+const SERIAL_DTR_DEFAULT_MS: u64 = 120;
+const SERIAL_DTR_MAX_MS: u64 = 10_000;
+const SERIAL_FLASH_LOG_QUIET_MS: u64 = 60_000;
+// Reset requests are sampled between events. 100 ms keeps them responsive
+// without making every idle managed forward wake one hundred times per second.
+const SERIAL_FORWARD_POLL_TIMEOUT_MS: i32 = 100;
 const NETLINK_GENERIC: libc::c_int = 16;
 const NETLINK_EXT_ACK: libc::c_int = 11;
 const GENL_ID_CTRL: u16 = 16;
@@ -182,26 +190,53 @@ pub struct RadioService {
     raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     serial_forwards: Arc<Mutex<BTreeMap<String, SerialForwardRuntime>>>,
+    serial_log: Option<Arc<Mutex<SerialForwardLog>>>,
 }
 
 impl RadioService {
     /// Create a radio service from environment and optional MESH_HOME/lmesh.toml config.
     pub fn from_environment() -> Self {
+        let serial_log =
+            configured_serial_log_path().and_then(|path| match SerialForwardLog::open(&path) {
+                Ok(log) => Some(Arc::new(Mutex::new(log))),
+                Err(error) => {
+                    tracing::warn!(path = %path, error = %error, "serial_forward_log_disabled");
+                    None
+                }
+            });
         let service = Self {
             history: Arc::new(Mutex::new(VecDeque::new())),
             radios: Arc::new(load_radio_adapters()),
             raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
             serial_forwards: Arc::new(Mutex::new(BTreeMap::new())),
+            serial_log,
         };
         service.start_configured_serial_forwards();
         service
     }
 
     fn start_configured_serial_forwards(&self) {
+        let config_path = lmesh_config_path();
         let Some(config) = read_lmesh_config() else {
+            self.record(
+                "usb.serial.forward.config",
+                json!({
+                    "path": config_path,
+                    "loaded": false,
+                    "forwards": 0,
+                }),
+            );
             return;
         };
+        self.record(
+            "usb.serial.forward.config",
+            json!({
+                "path": config_path,
+                "loaded": true,
+                "forwards": config.serial_forwards.len(),
+            }),
+        );
         for forward in config.serial_forwards {
             if forward.enabled == Some(false) {
                 continue;
@@ -429,6 +464,12 @@ impl RadioService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(forward) = forwards.get(&id) {
+                if reset_kind == SERIAL_RESET_BOOTLOADER {
+                    forward.log_flash_quiet_until_ms.store(
+                        now_millis_u64().saturating_add(SERIAL_FLASH_LOG_QUIET_MS),
+                        Ordering::Release,
+                    );
+                }
                 forward.reset_request.store(reset_kind, Ordering::Release);
                 let result = json!({
                     "ok": true,
@@ -604,12 +645,19 @@ impl RadioService {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let reset_request = Arc::new(AtomicU8::new(SERIAL_RESET_NONE));
+        let log_flash_quiet_until_ms = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(SerialForwardStats::default());
+        let log_path = configured_serial_log_path_for_forward(&id);
         let thread_stop = stop.clone();
         let thread_reset_request = reset_request.clone();
+        let thread_log_flash_quiet_until_ms = log_flash_quiet_until_ms.clone();
+        let thread_stats = stats.clone();
         let thread_id = id.clone();
         let thread_path = path.clone();
         let thread_socket_path = socket_path.clone();
         let thread_tcp_listen = tcp_listen.clone();
+        let thread_log_path = log_path.clone();
+        let thread_log = log_path.as_ref().and_then(|_| self.serial_log.clone());
         let thread_baud = baud;
         let handle = std::thread::spawn(move || {
             if let Err(error) = serial_forward_loop(
@@ -622,7 +670,11 @@ impl RadioService {
                 dtr,
                 multi,
                 thread_reset_request,
+                thread_log_flash_quiet_until_ms,
                 thread_stop,
+                thread_stats,
+                thread_log_path,
+                thread_log,
             ) {
                 tracing::warn!(
                     forward_id = %thread_id,
@@ -640,11 +692,14 @@ impl RadioService {
             port: path.clone(),
             socket_path: socket_path.clone(),
             tcp_listen: tcp_listen.clone(),
+            log_path: log_path.clone(),
             baud,
             dtr,
             multi,
             reset_request,
+            log_flash_quiet_until_ms,
             stop,
+            stats,
             handle: Some(handle),
             started_ms: now_millis_u64(),
         };
@@ -665,6 +720,7 @@ impl RadioService {
             "tcp_mode": tcp_mode.name(),
             "socket": socket_path,
             "tcp_listen": tcp_listen,
+            "log_path": log_path,
             "handshake": handshake_result,
         });
         self.record("usb.serial.forward.start", result.clone());
@@ -727,8 +783,10 @@ impl RadioService {
                     "dtr": forward.dtr,
                     "multi": forward.multi,
                     "tcp_listen": forward.tcp_listen,
+                    "log_path": forward.log_path,
                     "started_ms": forward.started_ms,
                     "running": !forward.stop.load(Ordering::Acquire),
+                    "stats": forward.stats.snapshot(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2379,12 +2437,22 @@ impl RadioService {
     }
 
     /// Attach to NAN through the repo-built wpa_supplicant control socket.
+    pub fn default_nan_control_socket_exists(&self) -> bool {
+        let iface = wifi_iface(None);
+        let ctrl_dir = wpa_ctrl_dir(None);
+        std::fs::metadata(std::path::Path::new(&ctrl_dir).join(iface))
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+    }
+
+    /// Attach to NAN through the repo-built wpa_supplicant control socket.
     pub fn nan_start(&self, iface: Option<String>, ctrl_dir: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
         let link_up = set_link_up(&iface);
-        let iface_socket = format!("{ctrl_dir}/{iface}");
-        let interface_add = if std::path::Path::new(&iface_socket).exists() {
+        let interface_add = if wpa_command(&iface, &ctrl_dir, "STATUS")
+            .is_ok_and(|output| output.status == Some(0))
+        {
             Ok(CommandOutput {
                 status: Some(0),
                 stdout: "already attached".to_string(),
@@ -2398,45 +2466,13 @@ impl RadioService {
                 &format!("INTERFACE_ADD {iface}\t\tnl80211\tDIR={ctrl_dir} GROUP=plugdev\t\t"),
             )
         };
-        let configure = vec![
-            (
-                "master_pref",
-                command_result_json(wpa_raw_command(&iface, &ctrl_dir, "NAN_SET master_pref 1")),
-            ),
-            (
-                "dual_band",
-                command_result_json(wpa_raw_command(&iface, &ctrl_dir, "NAN_SET dual_band 0")),
-            ),
-            (
-                "cluster_id",
-                command_result_json(wpa_raw_command(
-                    &iface,
-                    &ctrl_dir,
-                    "NAN_SET cluster_id 50:6f:9a:01:05:01",
-                )),
-            ),
-            (
-                "low_band_cfg",
-                command_result_json(wpa_raw_command(
-                    &iface,
-                    &ctrl_dir,
-                    "NAN_SET low_band_cfg -60,-70,8,0",
-                )),
-            ),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value))
-        .collect::<serde_json::Map<_, _>>();
-        let nan_start = wpa_raw_command(&iface, &ctrl_dir, "NAN_START");
-        let nan_status = wpa_command(&iface, &ctrl_dir, "NAN_STATUS");
+        let nan_capability = wpa_raw_command(&iface, &ctrl_dir, "GET_CAPABILITY nan");
         let status = wpa_command(&iface, &ctrl_dir, "STATUS");
         let driver_flags2 = wpa_command(&iface, &ctrl_dir, "DRIVER_FLAGS2");
         let result = json!({
             "link_up": command_result_json(link_up),
             "interface_add": command_result_json(interface_add),
-            "configure": configure,
-            "nan_start": command_result_json(nan_start),
-            "nan_status": command_result_json(nan_status),
+            "nan_capability": command_result_json(nan_capability),
             "status": command_result_json(status),
             "driver_flags2": command_result_json(driver_flags2),
         });
@@ -2520,7 +2556,7 @@ impl RadioService {
             "status": command_result_json(wpa_command(&iface, &ctrl_dir, "STATUS")),
             "driver_flags": command_result_json(wpa_command(&iface, &ctrl_dir, "DRIVER_FLAGS")),
             "driver_flags2": command_result_json(wpa_command(&iface, &ctrl_dir, "DRIVER_FLAGS2")),
-            "nan_status": command_result_json(wpa_command(&iface, &ctrl_dir, "NAN_STATUS")),
+            "nan_capability": command_result_json(wpa_command(&iface, &ctrl_dir, "GET_CAPABILITY nan")),
             "events": self.nan_events(Some(iface.clone()), Some(ctrl_dir.clone()), events_ms.or(Some(100)), Some(64)),
         });
         self.record("N.status", result.clone());
@@ -2897,13 +2933,67 @@ struct SerialForwardRuntime {
     port: String,
     socket_path: String,
     tcp_listen: Option<String>,
+    log_path: Option<String>,
     baud: u32,
     dtr: bool,
     multi: bool,
     reset_request: Arc<AtomicU8>,
+    log_flash_quiet_until_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    stats: Arc<SerialForwardStats>,
     handle: Option<std::thread::JoinHandle<()>>,
     started_ms: u64,
+}
+
+#[derive(Default, Debug)]
+struct SerialForwardStats {
+    client_accepts: AtomicU64,
+    client_drops: AtomicU64,
+    client_to_serial_bytes: AtomicU64,
+    serial_to_client_bytes: AtomicU64,
+    serial_read_would_block: AtomicU64,
+    serial_write_blocked: AtomicU64,
+    client_read_would_block: AtomicU64,
+    client_write_blocked: AtomicU64,
+    serial_tx_queue_high_water: AtomicU64,
+    client_output_queue_high_water: AtomicU64,
+    client_input_queue_high_water: AtomicU64,
+    poll_calls: AtomicU64,
+    poll_ready: AtomicU64,
+    poll_timeouts: AtomicU64,
+    log_records: AtomicU64,
+    log_write_errors: AtomicU64,
+    log_suppressed_records: AtomicU64,
+    log_suppressed_bytes: AtomicU64,
+}
+
+impl SerialForwardStats {
+    fn record_high_water(counter: &AtomicU64, value: usize) {
+        counter.fetch_max(value as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "client_accepts": self.client_accepts.load(Ordering::Relaxed),
+            "client_drops": self.client_drops.load(Ordering::Relaxed),
+            "client_to_serial_bytes": self.client_to_serial_bytes.load(Ordering::Relaxed),
+            "serial_to_client_bytes": self.serial_to_client_bytes.load(Ordering::Relaxed),
+            "serial_read_would_block": self.serial_read_would_block.load(Ordering::Relaxed),
+            "serial_write_blocked": self.serial_write_blocked.load(Ordering::Relaxed),
+            "client_read_would_block": self.client_read_would_block.load(Ordering::Relaxed),
+            "client_write_blocked": self.client_write_blocked.load(Ordering::Relaxed),
+            "serial_tx_queue_high_water": self.serial_tx_queue_high_water.load(Ordering::Relaxed),
+            "client_output_queue_high_water": self.client_output_queue_high_water.load(Ordering::Relaxed),
+            "client_input_queue_high_water": self.client_input_queue_high_water.load(Ordering::Relaxed),
+            "poll_calls": self.poll_calls.load(Ordering::Relaxed),
+            "poll_ready": self.poll_ready.load(Ordering::Relaxed),
+            "poll_timeouts": self.poll_timeouts.load(Ordering::Relaxed),
+            "log_records": self.log_records.load(Ordering::Relaxed),
+            "log_write_errors": self.log_write_errors.load(Ordering::Relaxed),
+            "log_suppressed_records": self.log_suppressed_records.load(Ordering::Relaxed),
+            "log_suppressed_bytes": self.log_suppressed_bytes.load(Ordering::Relaxed),
+        })
+    }
 }
 
 const SERIAL_RESET_NONE: u8 = 0;
@@ -3113,7 +3203,7 @@ fn resolve_usb_serial_target(port: Option<String>, baud: Option<u32>) -> Option<
         .and_then(canonical_usb_port_id)?;
     let path = usb_port_path(&id)?;
     Some(UsbSerialTarget {
-        socket_path: format!("/run/mesh/lmesh-radio-build/{id}.sock"),
+        socket_path: format!("/run/mesh/lmesh/{id}.sock"),
         id,
         path,
         baud: baud.unwrap_or(460_800),
@@ -3137,10 +3227,20 @@ fn canonical_usb_port_id(port: &str) -> Option<String> {
         return (!num.is_empty() && num.chars().all(|c| c.is_ascii_digit()))
             .then(|| format!("ACM{num}"));
     }
-    None
+    // Configured lab/deployment roles use stable names instead of transient
+    // tty numbering. Keep the accepted alphabet deliberately narrow because
+    // the value is also used in the managed socket filename.
+    (trimmed.len() <= 64
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    .then(|| trimmed.to_string())
 }
 
 fn usb_port_path(id: &str) -> Option<String> {
+    if let Some(path) = configured_serial_path(id) {
+        return Some(path);
+    }
     if let Some(num) = id.strip_prefix("USB") {
         return Some(format!("/dev/ttyUSB{num}"));
     }
@@ -3148,6 +3248,35 @@ fn usb_port_path(id: &str) -> Option<String> {
         return Some(format!("/dev/ttyACM{num}"));
     }
     None
+}
+
+fn configured_serial_path(id: &str) -> Option<String> {
+    let config = read_lmesh_config()?;
+    config
+        .serial_forwards
+        .into_iter()
+        .find(|forward| forward.port == id)
+        .and_then(|forward| forward.path)
+        .filter(|path| !path.is_empty())
+}
+
+fn configured_serial_log_path() -> Option<String> {
+    read_lmesh_config()?
+        .serial_log_path
+        .filter(|path| !path.is_empty())
+}
+
+fn configured_serial_log_path_for_forward(id: &str) -> Option<String> {
+    let config = read_lmesh_config()?;
+    if config
+        .serial_forwards
+        .iter()
+        .find(|forward| forward.port == id)
+        .is_some_and(|forward| forward.log == Some(false))
+    {
+        return None;
+    }
+    config.serial_log_path.filter(|path| !path.is_empty())
 }
 
 fn usb_port_id_from_path(path: &str) -> Option<String> {
@@ -3175,7 +3304,11 @@ fn serial_forward_loop(
     dtr: bool,
     multi: bool,
     reset_request: Arc<AtomicU8>,
+    log_flash_quiet_until_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    stats: Arc<SerialForwardStats>,
+    log_path: Option<String>,
+    serial_log: Option<Arc<Mutex<SerialForwardLog>>>,
 ) -> Result<()> {
     let mut serial = fs::OpenOptions::new()
         .read(true)
@@ -3185,9 +3318,18 @@ fn serial_forward_loop(
         .with_context(|| format!("failed to open serial port {port}"))?;
     configure_serial(serial.as_raw_fd(), baud)
         .with_context(|| format!("failed to configure serial port {port}"))?;
+    // USB-UART drivers may assert modem-control lines on open. On ESP boards
+    // these are wired to GPIO0/EN, so leave both deasserted until an explicit
+    // reset, console DTR pulse, or RFC2217 control request changes them.
+    set_modem_lines(serial.as_raw_fd(), false, false)
+        .with_context(|| format!("failed to deassert modem lines for {port}"))?;
+    if log_path.is_some() && serial_log.is_none() {
+        stats.log_write_errors.fetch_add(1, Ordering::Relaxed);
+    }
     let mut clients: Vec<SerialForwardClient> = Vec::new();
+    let mut had_rfc2217_client = false;
     let mut serial_tx = VecDeque::new();
-    let mut serial_buf = [0_u8; 1024];
+    let mut serial_buf = [0_u8; SERIAL_FORWARD_IO_BUFFER_BYTES];
     while !stop.load(Ordering::Acquire) {
         let mut progressed = false;
         match reset_request.swap(SERIAL_RESET_NONE, Ordering::AcqRel) {
@@ -3209,21 +3351,23 @@ fn serial_forward_loop(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                stats.client_accepts.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(
                     forward_id = %id,
                     port = %port,
                     transport = "uds",
                     "serial_forward_client"
                 );
-                if let Err(error) =
-                    add_serial_forward_unix_client(&mut clients, stream, dtr, &serial)
-                {
-                    tracing::warn!(
-                        forward_id = %id,
-                        port = %port,
-                        error = %error,
-                        "serial_forward_client_error"
-                    );
+                match add_serial_forward_unix_client(&mut clients, stream, dtr, &serial) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            forward_id = %id,
+                            port = %port,
+                            error = %error,
+                            "serial_forward_client_error"
+                        );
+                    }
                 }
                 progressed = true;
             }
@@ -3234,6 +3378,11 @@ fn serial_forward_loop(
             loop {
                 match tcp_listener.accept() {
                     Ok((stream, addr)) => {
+                        // RFC2217 is used by esptool. It must receive no console
+                        // wake bytes; the UDS console path always gets the staged
+                        // logical wake when the forward enables it.
+                        let tcp_console_wake = dtr && tcp_mode != SerialForwardTcpMode::Rfc2217;
+                        stats.client_accepts.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(
                             forward_id = %id,
                             port = %port,
@@ -3241,20 +3390,23 @@ fn serial_forward_loop(
                             client = %addr,
                             "serial_forward_client"
                         );
-                        if let Err(error) = add_serial_forward_tcp_client(
+                        match add_serial_forward_tcp_client(
                             &mut clients,
                             stream,
                             tcp_mode,
-                            dtr,
+                            tcp_console_wake,
                             &serial,
                         ) {
-                            tracing::warn!(
-                                forward_id = %id,
-                                port = %port,
-                                client = %addr,
-                                error = %error,
-                                "serial_forward_client_error"
-                            );
+                            Ok(()) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    forward_id = %id,
+                                    port = %port,
+                                    client = %addr,
+                                    error = %error,
+                                    "serial_forward_client_error"
+                                );
+                            }
                         }
                         progressed = true;
                     }
@@ -3265,19 +3417,44 @@ fn serial_forward_loop(
                 }
             }
         }
+        let flash_log_quiet = log_flash_quiet_until_ms.load(Ordering::Acquire) > now_millis_u64()
+            || clients.iter().any(SerialForwardClient::is_rfc2217);
         match serial.read(&mut serial_buf) {
             Ok(0) => {}
             Ok(n) => {
-                broadcast_serial_output(&mut clients, &serial_buf[..n]);
+                stats
+                    .serial_to_client_bytes
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                record_serial_forward_log(
+                    serial_log.as_ref(),
+                    &stats,
+                    id,
+                    "rx",
+                    &serial_buf[..n],
+                    flash_log_quiet,
+                );
+                broadcast_serial_output(&mut clients, &serial_buf[..n], &stats);
                 progressed = true;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                stats
+                    .serial_read_would_block
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Err(error) => return Err(error).with_context(|| format!("failed to read {port}")),
         }
         let mut idx = 0;
         while idx < clients.len() {
             let may_write = multi || idx == 0;
-            match clients[idx].pump_to_serial(serial.as_raw_fd(), &mut serial_tx, may_write) {
+            match clients[idx].pump_to_serial(
+                serial.as_raw_fd(),
+                &mut serial_tx,
+                may_write,
+                &stats,
+                id,
+                serial_log.as_ref(),
+                flash_log_quiet,
+            ) {
                 Ok((true, client_progressed)) => {
                     progressed |= client_progressed;
                     idx += 1;
@@ -3305,19 +3482,32 @@ fn serial_forward_loop(
                 }
             }
         }
+        SerialForwardStats::record_high_water(&stats.serial_tx_queue_high_water, serial_tx.len());
+        let serial_tx_before = serial_tx.len();
         if flush_queue_to_writer(&mut serial, &mut serial_tx)
             .with_context(|| format!("failed to write queued client data to {port}"))?
         {
             progressed = true;
         }
+        stats.client_to_serial_bytes.fetch_add(
+            serial_tx_before.saturating_sub(serial_tx.len()) as u64,
+            Ordering::Relaxed,
+        );
+        if !serial_tx.is_empty() {
+            stats.serial_write_blocked.fetch_add(1, Ordering::Relaxed);
+        }
         let mut idx = 0;
         while idx < clients.len() {
+            let output_pending = !clients[idx].output.is_empty();
             match clients[idx].flush_output() {
                 Ok(true) => {
                     progressed = true;
                     idx += 1;
                 }
                 Ok(false) => {
+                    if output_pending {
+                        stats.client_write_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
                     idx += 1;
                 }
                 Err(error) => {
@@ -3333,8 +3523,89 @@ fn serial_forward_loop(
                 }
             }
         }
+        let has_rfc2217_client = clients.iter().any(SerialForwardClient::is_rfc2217);
+        if had_rfc2217_client && !has_rfc2217_client {
+            set_modem_lines(serial.as_raw_fd(), false, false)
+                .with_context(|| format!("failed to restore modem lines for {port}"))?;
+        }
+        had_rfc2217_client = has_rfc2217_client;
         if !progressed {
-            std::thread::sleep(Duration::from_millis(5));
+            wait_for_serial_forward_io(
+                &serial,
+                &listener,
+                tcp_listener.as_ref(),
+                &clients,
+                !serial_tx.is_empty(),
+                &stats,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Wait for the next serial-forward event instead of polling every few milliseconds.
+///
+/// The timeout keeps a queued reset request responsive even when every endpoint is idle.
+fn wait_for_serial_forward_io(
+    serial: &fs::File,
+    listener: &UnixListener,
+    tcp_listener: Option<&TcpListener>,
+    clients: &[SerialForwardClient],
+    serial_writable: bool,
+    stats: &SerialForwardStats,
+) -> Result<()> {
+    let mut fds = Vec::with_capacity(3 + clients.len());
+    let mut serial_events = libc::POLLIN;
+    if serial_writable {
+        serial_events |= libc::POLLOUT;
+    }
+    fds.push(libc::pollfd {
+        fd: serial.as_raw_fd(),
+        events: serial_events,
+        revents: 0,
+    });
+    fds.push(libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    if let Some(tcp_listener) = tcp_listener {
+        fds.push(libc::pollfd {
+            fd: tcp_listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    for client in clients {
+        if let Some(fd) = client.stream.raw_fd() {
+            let mut events = libc::POLLIN;
+            if !client.output.is_empty() {
+                events |= libc::POLLOUT;
+            }
+            fds.push(libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            });
+        }
+    }
+    let rc = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            SERIAL_FORWARD_POLL_TIMEOUT_MS,
+        )
+    };
+    stats.poll_calls.fetch_add(1, Ordering::Relaxed);
+    if rc > 0 {
+        stats.poll_ready.fetch_add(1, Ordering::Relaxed);
+    } else if rc == 0 {
+        stats.poll_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("serial forward poll failed");
         }
     }
     Ok(())
@@ -3372,7 +3643,7 @@ fn add_serial_forward_unix_client(
         .set_nonblocking(true)
         .context("failed to set UDS client nonblocking")?;
     if dtr {
-        pulse_dtr(serial.as_raw_fd()).context("failed to pulse DTR")?;
+        pulse_console_dtr(serial.as_raw_fd()).context("failed to pulse console DTR")?;
     }
     add_serial_forward_client(clients, Box::new(stream), SerialForwardTcpMode::Framed);
     Ok(())
@@ -3388,16 +3659,33 @@ fn add_serial_forward_tcp_client(
     stream
         .set_nonblocking(true)
         .context("failed to set TCP client nonblocking")?;
+    stream
+        .set_nodelay(true)
+        .context("failed to disable Nagle buffering for TCP serial forward")?;
     if dtr {
-        pulse_dtr(serial.as_raw_fd()).context("failed to pulse DTR")?;
+        pulse_console_dtr(serial.as_raw_fd()).context("failed to pulse console DTR")?;
     }
     add_serial_forward_client(clients, Box::new(stream), tcp_mode);
     Ok(())
 }
 
-trait SerialForwardStream: Read + Write {}
+trait SerialForwardStream: Read + Write {
+    fn raw_fd(&self) -> Option<RawFd> {
+        None
+    }
+}
 
-impl<T: Read + Write> SerialForwardStream for T {}
+impl SerialForwardStream for UnixStream {
+    fn raw_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
+}
+
+impl SerialForwardStream for TcpStream {
+    fn raw_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
+}
 
 fn add_serial_forward_client(
     clients: &mut Vec<SerialForwardClient>,
@@ -3411,32 +3699,49 @@ fn add_serial_forward_client(
     clients.push(SerialForwardClient::new(id, stream, tcp_mode));
 }
 
-fn broadcast_serial_output(clients: &mut Vec<SerialForwardClient>, bytes: &[u8]) {
-    let mut idx = 0;
-    while idx < clients.len() {
-        if clients[idx].queue_output(bytes) {
-            idx += 1;
-        } else {
-            clients.remove(idx);
-        }
-    }
+/// Pulse the board's PRG/DTR line for a console wake, not a reset.
+fn pulse_console_dtr(fd: RawFd) -> Result<()> {
+    pulse_console_dtr_for(fd, SERIAL_DTR_DEFAULT_MS)
 }
 
-fn pulse_dtr(fd: RawFd) -> Result<()> {
+fn pulse_console_dtr_for(fd: RawFd, hold_ms: u64) -> Result<()> {
     let mut bits: libc::c_int = 0;
     if unsafe { libc::ioctl(fd, libc::TIOCMGET, &mut bits) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("TIOCMGET failed");
+        return Err(std::io::Error::last_os_error()).context("TIOCMGET DTR failed");
     }
-    let original = bits;
+    // A pulse must always finish deasserted. RFC2217 clients can leave DTR set;
+    // restoring that snapshot holds ESP32 GPIO0 low and causes a button ISR
+    // storm as soon as firmware registers the PRG handler.
+    let deasserted = bits & !libc::TIOCM_DTR;
     bits |= libc::TIOCM_DTR;
     if unsafe { libc::ioctl(fd, libc::TIOCMSET, &bits) } < 0 {
         return Err(std::io::Error::last_os_error()).context("TIOCMSET DTR on failed");
     }
-    std::thread::sleep(Duration::from_millis(120));
-    if unsafe { libc::ioctl(fd, libc::TIOCMSET, &original) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("TIOCMSET DTR restore failed");
+    std::thread::sleep(Duration::from_millis(hold_ms));
+    if unsafe { libc::ioctl(fd, libc::TIOCMSET, &deasserted) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("TIOCMSET DTR off failed");
     }
     Ok(())
+}
+
+fn broadcast_serial_output(
+    clients: &mut Vec<SerialForwardClient>,
+    bytes: &[u8],
+    stats: &SerialForwardStats,
+) {
+    let mut idx = 0;
+    while idx < clients.len() {
+        if clients[idx].queue_output(bytes) {
+            SerialForwardStats::record_high_water(
+                &stats.client_output_queue_high_water,
+                clients[idx].output.len(),
+            );
+            idx += 1;
+        } else {
+            clients.remove(idx);
+            stats.client_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 struct SerialForwardClient {
@@ -3486,6 +3791,10 @@ impl SerialForwardClient {
         true
     }
 
+    fn is_rfc2217(&self) -> bool {
+        self.rfc2217_mode || self.tcp_mode == SerialForwardTcpMode::Rfc2217
+    }
+
     fn flush_output(&mut self) -> Result<bool> {
         flush_queue_to_writer(&mut *self.stream, &mut self.output)
     }
@@ -3495,23 +3804,44 @@ impl SerialForwardClient {
         serial_fd: RawFd,
         serial_tx: &mut VecDeque<u8>,
         may_write: bool,
+        stats: &SerialForwardStats,
+        board: &str,
+        serial_log: Option<&Arc<Mutex<SerialForwardLog>>>,
+        flash_log_quiet: bool,
     ) -> Result<(bool, bool)> {
-        let mut buf = [0_u8; 1024];
+        let mut buf = [0_u8; SERIAL_FORWARD_IO_BUFFER_BYTES];
         let mut progressed = false;
         loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => return Ok((false, progressed)),
                 Ok(n) => {
+                    record_serial_forward_log(
+                        serial_log,
+                        stats,
+                        board,
+                        "tx",
+                        &buf[..n],
+                        flash_log_quiet,
+                    );
                     self.input.extend_from_slice(&buf[..n]);
+                    SerialForwardStats::record_high_water(
+                        &stats.client_input_queue_high_water,
+                        self.input.len(),
+                    );
                     progressed = true;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    stats
+                        .client_read_would_block
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
                 Err(error) => return Err(error).context("failed to read UDS client"),
             }
         }
         if may_write {
             progressed |= self.flush_complete_records(serial_fd, serial_tx)?;
-        } else {
+        } else if !may_write {
             progressed |= !self.input.is_empty();
             self.input.clear();
         }
@@ -3568,16 +3898,173 @@ impl SerialForwardClient {
                     return Ok(progressed);
                 }
                 total
-            } else if let Some(pos) = self.input.iter().position(|byte| *byte == b'\n') {
+            } else if let Some(pos) = self
+                .input
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r'))
+            {
                 pos + 1
             } else {
                 return Ok(progressed);
             };
+            if self.input[0] != 0
+                && handle_serial_forward_command(
+                    &self.input[..record_len],
+                    serial_fd,
+                    &mut self.output,
+                )?
+            {
+                self.input.drain(..record_len);
+                progressed = true;
+                continue;
+            }
             queue_serial_bytes(serial_tx, &self.input[..record_len])?;
             self.input.drain(..record_len);
             progressed = true;
         }
     }
+}
+
+/// Append a grep-friendly, lossless logfmt serial event to the shared lab log.
+///
+/// UART reads are arbitrary byte chunks rather than lines. `text` makes normal
+/// firmware output searchable, while `hex` retains the exact bytes for boot ROM
+/// or flashing traffic that is not valid UTF-8.
+struct SerialForwardLog {
+    file: fs::File,
+}
+
+impl SerialForwardLog {
+    fn open(path: &str) -> Result<Self> {
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create serial log directory {}", parent.display())
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open serial log {}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    fn append(&mut self, board: &str, direction: &str, bytes: &[u8]) -> Result<()> {
+        let text = String::from_utf8_lossy(bytes);
+        writeln!(
+            self.file,
+            "ts_ms={} board={} dir={} bytes={} hex={} text={:?}",
+            now_millis_u64(),
+            board,
+            direction,
+            bytes.len(),
+            hex_lower(bytes),
+            text,
+        )
+        .context("failed to write serial log record")?;
+        self.file
+            .flush()
+            .context("failed to flush serial log record")
+    }
+}
+
+fn record_serial_forward_log(
+    log: Option<&Arc<Mutex<SerialForwardLog>>>,
+    stats: &SerialForwardStats,
+    board: &str,
+    direction: &str,
+    bytes: &[u8],
+    suppressed: bool,
+) {
+    if suppressed {
+        stats.log_suppressed_records.fetch_add(1, Ordering::Relaxed);
+        stats
+            .log_suppressed_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        return;
+    }
+    let Some(log) = log else {
+        return;
+    };
+    let mut sink = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match sink.append(board, direction, bytes) {
+        Ok(()) => {
+            stats.log_records.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => {
+            stats.log_write_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(forward_id = %board, direction, error = %error, "serial_forward_log_write_failed");
+        }
+    }
+}
+
+enum SerialForwardCommand {
+    Dtr(u64),
+    Reset,
+}
+
+fn parse_serial_forward_command(record: &[u8]) -> Option<Result<SerialForwardCommand>> {
+    let line = std::str::from_utf8(record).ok()?;
+    let mut words = line.split_ascii_whitespace();
+    match words.next()? {
+        "dtr" => {
+            let hold_ms = match words.next() {
+                Some(value) => match value.parse::<u64>() {
+                    Ok(value) => value,
+                    Err(_) => return Some(Err(anyhow::anyhow!("duration must be milliseconds"))),
+                },
+                None => SERIAL_DTR_DEFAULT_MS,
+            };
+            if words.next().is_some() {
+                return Some(Err(anyhow::anyhow!("usage: dtr [milliseconds]")));
+            }
+            if !(1..=SERIAL_DTR_MAX_MS).contains(&hold_ms) {
+                return Some(Err(anyhow::anyhow!(
+                    "duration must be between 1 and {SERIAL_DTR_MAX_MS} ms"
+                )));
+            }
+            Some(Ok(SerialForwardCommand::Dtr(hold_ms)))
+        }
+        "rst" => {
+            if words.next().is_some() {
+                Some(Err(anyhow::anyhow!("usage: rst")))
+            } else {
+                Some(Ok(SerialForwardCommand::Reset))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn handle_serial_forward_command(
+    record: &[u8],
+    serial_fd: RawFd,
+    output: &mut VecDeque<u8>,
+) -> Result<bool> {
+    let Some(command) = parse_serial_forward_command(record) else {
+        return Ok(false);
+    };
+    match command {
+        Ok(SerialForwardCommand::Dtr(hold_ms)) => {
+            pulse_console_dtr_for(serial_fd, hold_ms)?;
+            queue_client_bytes(
+                output,
+                format!("event type=lmesh.dtr ok=true hold_ms={hold_ms}\n").as_bytes(),
+            )?;
+        }
+        Ok(SerialForwardCommand::Reset) => {
+            esp32_run_reset(serial_fd)?;
+            queue_client_bytes(output, b"event type=lmesh.rst ok=true\n")?;
+        }
+        Err(error) => {
+            queue_client_bytes(
+                output,
+                format!("event type=lmesh.command ok=false error={error:?}\n").as_bytes(),
+            )?;
+        }
+    }
+    Ok(true)
 }
 
 fn queue_serial_bytes(queue: &mut VecDeque<u8>, bytes: &[u8]) -> Result<()> {
@@ -4029,6 +4516,8 @@ struct LmeshToml {
     radios: Vec<RadioConfig>,
     #[serde(default)]
     serial_forwards: Vec<SerialForwardConfig>,
+    /// One append-only, host-timestamped capture for all managed serial forwards.
+    serial_log_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4045,11 +4534,13 @@ struct RadioConfig {
 #[derive(Debug, Deserialize)]
 struct SerialForwardConfig {
     port: String,
+    path: Option<String>,
     baud: Option<u32>,
     tcp_port: Option<u16>,
     tcp_mode: Option<String>,
     dtr: Option<bool>,
     multi: Option<bool>,
+    log: Option<bool>,
     enabled: Option<bool>,
 }
 
@@ -4131,14 +4622,18 @@ fn load_radio_adapters() -> Vec<RadioAdapter> {
 }
 
 fn read_lmesh_config() -> Option<LmeshToml> {
-    let path = std::env::var_os("LMESH_CONFIG_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("etc/lmesh/lmesh.toml"));
+    let path = lmesh_config_path();
     if !path.exists() {
         return None;
     }
     let data = std::fs::read_to_string(path).ok()?;
     toml::from_str(&data).ok()
+}
+
+fn lmesh_config_path() -> PathBuf {
+    std::env::var_os("LMESH_CONFIG_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LMESH_CONFIG_FILE))
 }
 
 fn default_medium_for_kind(kind: &str) -> &'static str {
@@ -7902,6 +8397,8 @@ mod tests {
         }
     }
 
+    impl SerialForwardStream for WouldBlockOnceWriter {}
+
     #[test]
     fn parses_device_ids() {
         assert_eq!(
@@ -7997,6 +8494,31 @@ mod tests {
             client.output.iter().copied().collect::<Vec<_>>(),
             vec![0x41, RFC2217_IAC, RFC2217_IAC, 0x42]
         );
+    }
+
+    #[test]
+    fn serial_forward_local_commands_are_bounded() {
+        assert!(matches!(
+            parse_serial_forward_command(b"dtr\n"),
+            Some(Ok(SerialForwardCommand::Dtr(SERIAL_DTR_DEFAULT_MS)))
+        ));
+        assert!(matches!(
+            parse_serial_forward_command(b"dtr 2500\r\n"),
+            Some(Ok(SerialForwardCommand::Dtr(2500)))
+        ));
+        assert!(matches!(
+            parse_serial_forward_command(b"rst\n"),
+            Some(Ok(SerialForwardCommand::Reset))
+        ));
+        assert!(matches!(
+            parse_serial_forward_command(b"dtr 0\n"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_serial_forward_command(b"dtr 10001\n"),
+            Some(Err(_))
+        ));
+        assert!(parse_serial_forward_command(b"status\n").is_none());
     }
 
     #[test]

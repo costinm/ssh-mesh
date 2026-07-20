@@ -300,6 +300,9 @@ impl LineProtocolFormat {
     pub fn from_first_byte(byte: u8) -> Result<Self> {
         match byte {
             0x00 => Ok(Self::BinaryMux),
+            b'{' => Ok(Self::Json(crate::jsonl::ProtocolFormat::FlatJson {
+                id: None,
+            })),
             byte if byte.is_ascii() => Ok(Self::Text),
             _ => Err(anyhow!("unsupported protocol first byte 0x{byte:02x}")),
         }
@@ -894,11 +897,17 @@ mod tests {
     }
 
     #[test]
-    fn line_protocol_session_treats_ascii_as_text_and_nul_as_binary() {
+    fn line_protocol_session_detects_json_text_and_binary() {
         let mut json_session = LineProtocolSession::new();
         let (format, parsed) = json_session.parse_request_line(r#"{"method":"status","name":"x"}"#);
-        assert!(matches!(format, LineProtocolFormat::Text));
-        assert!(parsed.is_err());
+        assert!(matches!(
+            format,
+            LineProtocolFormat::Json(crate::jsonl::ProtocolFormat::FlatJson { id: None })
+        ));
+        assert!(matches!(
+            parsed.unwrap(),
+            crate::protocol::Request::Status { name } if name.as_deref() == Some("x")
+        ));
 
         let mut binary_session = LineProtocolSession::new();
         let (format, parsed) = binary_session.parse_request_line("\0ignored");

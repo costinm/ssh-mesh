@@ -8,8 +8,7 @@ Run from /ws/rust/ssh-mesh after sourcing the firmware environment:
 
 Defaults:
   * discover devices through lmesh usb.serial.list;
-  * start lmesh UDS plus TCP forwards for each selected logical USB port;
-  * flash through rfc2217://127.0.0.1:<port>;
+  * stop the selected lmesh forward and flash its physical USB-UART bridge;
   * configure baseline infra Wi-Fi mode, currently wifi.mode=nan;
   * configure all ESP targets for raw/custom NAN duty cycle with Wi-Fi off
     between discovery windows;
@@ -59,6 +58,16 @@ PREFLASH_FAILURE_MARKERS = (
     "boot: ESP-IDF",
     "Rebooting...",
 )
+
+
+def esptool_python() -> str:
+    """Use the ESP-IDF interpreter, not the host/lmesh test interpreter."""
+    env_path = os.environ.get("IDF_PYTHON_ENV_PATH")
+    if env_path:
+        candidate = Path(env_path) / "bin" / "python"
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
 
 
 @dataclass
@@ -181,10 +190,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lmesh-mode",
         choices=("tcp", "local-release"),
-        default=os.environ.get("DMESH_LMESH_MODE", "tcp"),
+        default=os.environ.get("DMESH_LMESH_MODE", "local-release"),
         help=(
-            "tcp flashes through lmesh rfc2217:// forwards. local-release is an explicit "
-            "local recovery mode: stop lmesh, flash /dev/ttyUSB*, then reopen UDS."
+            "local-release stops lmesh, flashes the physical USB-UART bridge, then reopens UDS. "
+            "tcp is experimental: use it only after a hardware write/verify qualification run."
         ),
     )
     parser.add_argument(
@@ -349,6 +358,17 @@ def physical_usb_port(port: str) -> str:
     return port
 
 
+def physical_port_for(args: argparse.Namespace, logical_port_name: str) -> str:
+    """Resolve lmesh role names for explicit local recovery flashing."""
+    cached = getattr(args, "local_physical_ports", {}).get(logical_port_name)
+    if cached:
+        return cached
+    forward = lmesh_forward_map(args).get(logical_port_name)
+    if forward and isinstance(forward.get("port"), str):
+        return str(forward["port"])
+    return physical_usb_port(logical_port_name)
+
+
 def lmesh_socket_path(logical_port_name: str) -> str:
     return f"/run/mesh/lmesh/{logical_port_name}.sock"
 
@@ -489,7 +509,7 @@ def probe(
     try:
         proc = run(
             [
-                sys.executable,
+                esptool_python(),
                 "-m",
                 "esptool",
                 "--port",
@@ -607,7 +627,7 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
         chip = "esp32s3" if device.is_s3 else "esp32"
         flash_args, flash_files = sparse_flash_args(device)
         cmd = [
-            sys.executable,
+            esptool_python(),
             "-m",
             "esptool",
             "--chip",
@@ -1056,9 +1076,22 @@ def main() -> int:
         return 1
 
     tcp_ports = {port: args.lmesh_tcp_base + index for index, port in enumerate(ports)}
+    if args.lmesh_mode == "local-release":
+        args.local_physical_ports = {
+            port: str(forward["port"])
+            for port, forward in lmesh_forward_map(args).items()
+            if port in ports and isinstance(forward.get("port"), str)
+        }
     for port in ports:
         if args.lmesh_mode == "tcp":
             tcp_ports[port] = ensure_lmesh_forward(args, port, tcp_ports[port])
+        else:
+            # A direct recovery probe needs exclusive ownership before esptool
+            # toggles RTS/DTR. Releasing only after probe left CP210x ports
+            # open in lmesh and produced intermittent empty bootloader reads.
+            lmesh_stop_forward(args, port)
+    if args.lmesh_mode == "local-release":
+        time.sleep(0.5)
 
     if not args.skip_flash and not args.skip_preflash_stability:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -1112,7 +1145,7 @@ def main() -> int:
             probe_port = (
                 lmesh_rfc2217_url(tcp_ports[port])
                 if args.lmesh_mode == "tcp"
-                else physical_usb_port(port)
+                else physical_port_for(args, port)
             )
             return probe(
                 probe_port,
@@ -1168,11 +1201,11 @@ def main() -> int:
                         flush=True,
                     )
                     lmesh_stop_forward(args, device.port)
-                    flash(device, args, env, physical_usb_port(device.port))
+                    flash(device, args, env, physical_port_for(args, device.port))
                     lmesh_start_forward(args, device.port, tcp_ports[device.port])
             else:
                 lmesh_stop_forward(args, device.port)
-                flash(device, args, env, physical_usb_port(device.port))
+                flash(device, args, env, physical_port_for(args, device.port))
                 lmesh_start_forward(args, device.port, None)
 
         flashed, flash_failed = run_parallel("flash", devices, args.jobs, flash_one)

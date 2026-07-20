@@ -26,6 +26,11 @@ pub const DEFAULT_MESH_TUN_MTU: u32 = 65_520;
 pub struct AppConfigFile {
     #[serde(rename = "Service")]
     pub service: ServiceSection,
+    /// Optional endpoint and catalog information consumed by generic mesh
+    /// clients. This is intentionally part of the common service definition so
+    /// callers do not need the legacy OpenSSH configuration parser.
+    #[serde(default, rename = "Mesh")]
+    pub mesh: Option<MeshSection>,
     #[serde(default, rename = "Socket")]
     pub socket: Option<SocketSection>,
     #[serde(default, rename = "Resources")]
@@ -66,6 +71,33 @@ pub struct AppConfigFile {
     pub estimated_upload_bytes: Option<u64>,
     #[serde(rename = "MeshMinimumNetworkChunkBytes")]
     pub minimum_network_chunk_bytes: Option<u64>,
+}
+
+/// Client-visible mesh endpoint metadata for one service.
+///
+/// A service name may resolve to this endpoint before normal host discovery.
+/// `address` accepts the same URI forms as the `mesh` CLI; an omitted address
+/// uses the service's standard mesh Unix socket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshSection {
+    /// Explicit endpoint URI or path for this logical service/host.
+    #[serde(rename = "Address")]
+    pub address: Option<String>,
+    /// Transport selected for an endpoint whose address alone is ambiguous.
+    #[serde(rename = "Transport")]
+    pub transport: Option<String>,
+    /// Optional OpenSSH-compatible local ControlMaster socket path.
+    #[serde(rename = "ControlPath")]
+    pub control_path: Option<String>,
+    /// Optional generated tools catalog used for tagged conversion.
+    #[serde(rename = "Tools")]
+    pub tools: Option<String>,
+    /// Default outbound encoding: `auto`, `cbor`, `json`, `text`, or `mux`.
+    #[serde(rename = "DestinationFormat")]
+    pub destination_format: Option<String>,
+    /// Stable advertised/discovery name when it differs from the service name.
+    #[serde(rename = "DiscoveryName")]
+    pub discovery_name: Option<String>,
 }
 
 /// The `[Service]` section of a config file.
@@ -496,6 +528,9 @@ pub struct AppConfig {
     pub resources: ResolvedResourceLimits,
     pub activation: Vec<ActivationConfig>,
     pub network: NetworkConfig,
+    /// Optional client-visible endpoint metadata from the common `[Mesh]`
+    /// service-definition section.
+    pub mesh: Option<MeshSection>,
     pub source_path: Option<String>,
     /// Resolved authorization config from `[[peer]]` entries.
     pub auth: Option<AuthConfig>,
@@ -1158,6 +1193,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         resources: resolved,
         activation,
         network: file.network,
+        mesh: file.mesh,
         source_path: None,
         auth: if file.peers.is_empty() && file.impersonation.is_empty() {
             None

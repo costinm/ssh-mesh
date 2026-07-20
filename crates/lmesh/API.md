@@ -5,8 +5,58 @@ domain socket. Under mesh-init it uses systemd-style socket activation and takes
 the activated listener fd. When started standalone without activation, it binds
 `./lmesh/mesh.sock` by default.
 
+Use the generic `mesh` client for normal device commands, for example
+`mesh lora1.lmesh status`. The local endpoint resolves to the UDS forward
+`/run/mesh/lmesh/lora1.sock`; RFC2217 TCP is a parallel flashing/remote-serial
+transport. FQDN-shaped endpoints may instead resolve to a remote host,
+container, VM, SSH forward, or sandbox, so callers must not assume local
+`/dev` or `/run` paths are visible.
+
+Serial forwards also reserve two newline commands locally in lmesh:
+`mesh lora1.lmesh dtr [milliseconds]` pulses PRG/DTR for 120 ms by default
+(1-10000 ms), while `mesh lora1.lmesh rst` pulses reset and returns the board
+to run mode. Neither command is sent to firmware. Bare
+`mesh lora1.lmesh` opens the bidirectional debug stream.
+
+The complete low-level ESP command ABI is kept alongside this product API in
+[`ESP_FIRMWARE_API.md`](ESP_FIRMWARE_API.md). Its command IDs are the source of
+truth for firmware CBOR dispatch; `resources/tools.json` remains the curated
+host-facing subset, not a firmware command inventory.
+
 The same methods can be called using flat JSONL or JSON-RPC 2.0. One request is sent per
 line and one response is returned per line.
+
+## API specification blocks
+
+This document is the source of truth for lmesh's public API. Every public method
+will carry a nearby `mesh-api` TOML block containing its component/method IDs,
+field tags, visibility, and optional positional slots. `mesh` extracts those
+blocks to generate `resources/tools.json` and the schema-optional gateway
+dictionary. Private firmware commands use the same blocks in
+`ESP_FIRMWARE_API.md` but are omitted from the MCP catalog.
+
+## Compact CBOR transports
+
+CBOR is the compact transport form of the same API. A CBOR record has a compact
+envelope map and a nested `payload` map: there is no JSON-RPC `jsonrpc`, `params`,
+or `result` envelope. Only the compact
+one-byte key range `0..15` is reserved: `0=method`, `1=id`, `2=from`, `3=to`,
+`4=status`, `5=error`, `6=payload`, `7=type`, `8=seq`, `9=ts_ms`, `10=name`,
+`11=flags`, `12=count`, `13=total`, `14=more`, and `15=code`. The remaining
+one-byte keys `16..23` are available to a service for its hottest local fields.
+Method-local keys begin at 32 (a two-byte CBOR unsigned integer); common
+segmentation uses nested-payload fields `32=segment_id`, `33=segment_offset`, `34=segment_total`,
+`35=segment_hash`, `36=segment_index`, `37=segment_count`. Unknown names remain
+CBOR text keys.
+
+TTY/USB and other byte streams wrap a record as `u32-be length | 00 cb 00 00 |
+CBOR`; the length includes the four type bytes. Indefinite-length CBOR maps allow
+streaming generation, so a gateway need not pre-serialize payload just to learn its
+encoded length. LoRa, NAN, BLE, raw Wi-Fi, and
+UDP use the CBOR bytes directly because their outer transport carries length.
+Large host records are segmented using the common segment fields. ESP adapters
+forward those records unchanged, reject locally addressed commands above 512
+bytes, and paginate or emit multiple complete response records instead.
 
 Flat request:
 
@@ -34,12 +84,15 @@ JSON-RPC success responses put the payload in `result`; errors use either the me
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LMESH_ANNOUNCE_INTERVAL_SECS` | `60` | Positive integer interval, in seconds, between automatic multicast announcements sent by the lmesh server. Invalid or zero values fall back to `60`. |
-| `LMESH_CONFIG_FILE` | `etc/lmesh/lmesh.toml` | Optional explicit path to `lmesh.toml`. When unset, lmesh loads `etc/lmesh/lmesh.toml` relative to its working directory if it exists. |
+| `LMESH_CONFIG_FILE` | `/home/system/etc/lmesh/lmesh.toml` | Optional override for isolated or non-system deployments. The normal service does not need this variable. |
 | `LMESH_CONTROL_SOCKET` | `./lmesh/mesh.sock` | Standalone fallback UDS path used only when no activation listener is provided. Relative paths resolve against the working directory. |
 | `LMESH_DEVICE_ID` | derived | Optional 6-byte hex DMesh radio device id, for example `001122334455` or `00:11:22:33:44:55`. |
 | `LMESH_SERIAL_DEVICES` | unset | Comma-separated ESP serial radio devices, for example `/dev/ttyUSB0,/dev/ttyUSB1`. Devices default to 460800 baud and are listed as `esp-serial-*` adapters. |
 | `LMESH_WIFI_IFACE` | `wlan1` | Default Wi-Fi interface used by the NAN/WPA control methods. |
-| `LMESH_WPA_CTRL_DIR` | `/run/ssh-mesh-wpa` | WPA control socket directory used by NAN methods. The mesh-init examples use `/run/mesh/wpa-supplicant-nan`. |
+| `LMESH_WPA_CTRL_DIR` | `/run/mesh/wpa-supplicant-nan` | WPA control socket directory used by NAN methods. |
+| `LMESH_NAN_AUTOSTART` | `1` | Starts default NAN publish/subscribe at service startup only when the configured WPA control socket exists. |
+| `LMESH_AP_AUTOSTART` | `1` | Starts the basic open channel-6 AP after NAN startup when it has a separate Wi-Fi phy. Set `0` to disable it. |
+| `LMESH_AP_IFACE` | `wlan0` | Interface used by the startup AP. It must differ from `LMESH_WIFI_IFACE` and use a separate phy. |
 
 When `etc/lmesh/lmesh.toml` exists under the lmesh working directory, `lmesh`
 also reads additional radio adapters and managed serial forwards.
@@ -70,17 +123,34 @@ dtr = false
 multi = true
 ```
 
+Set `serial_log_path` at the top level to capture every managed serial forward
+in one append-only logfmt file. Records contain `ts_ms`, `board`,
+`dir=rx|tx`, escaped `text`, and exact `hex` bytes, so `rg 'Guru Meditation'
+target/lmesh-radio-build/log/serial.log` finds firmware failures while the
+interleaved host timestamps correlate commands, DW activity, and board output.
+`usb.serial.forward.list` reports the configured path plus `log_records` and
+`log_write_errors`. RFC2217 flashing is excluded automatically, including a
+60-second bootloader-reset grace period; `log_suppressed_records` and
+`log_suppressed_bytes` report that excluded traffic.
+Set `log = false` on a `serial_forwards` entry to exclude a noisy source such
+as a power meter while keeping its UDS/TCP forward active.
+
 Known adapter kinds are `host-mcast`, `host-ble`, `host-nan`, `esp-serial`,
 `remote-uds`, `android-ble`, and `android-nan`. A `remote-uds` adapter is an
 SSH-forwarded or otherwise proxied lmesh JSONL socket on another machine; it can
 front its own Linux radios, Android JNI radios, or ESP boards connected to that
 remote host. Android kinds are contract placeholders for platform adapters.
 Configured `serial_forwards` are started at lmesh process startup and are
+resolved by role name. Set `port = "lora1"` (or `power1`, `s3-1`, etc.) and
+provide a stable `/dev/serial/by-id/...` `path`; numeric USB/ACM names remain
+only a compatibility fallback. The runtime sockets are under
+`/run/mesh/lmesh/<role>.sock`.
 visible through `usb.serial.forward.list`; use stable RFC2217 TCP ports for
 flashing and console access through forwarded or remote hosts.
 For the local lab service, copy `crates/lmesh/examples/lab-forwards.toml` to
-`target/etc/lmesh/lmesh.toml`; the mesh-init example points at that runtime
-copy instead of using parent-relative repo paths or service-local user names.
+`/home/system/etc/lmesh/lmesh.toml` (or the checked local target copy); the
+mesh-init example uses the standard path instead of a per-process environment
+variable.
 
 ## Lightweight MCP Methods
 
@@ -123,12 +193,12 @@ not become the product contract when an equivalent high-level method exists.
 | `usb.serial.list` | `handshake: bool = false` | Lists visible `/dev/ttyUSB*`, `/dev/ttyACM*`, and `/dev/serial/by-id/*` serial devices, including configured lmesh radio adapters and active forwards. With `handshake=true`, probes each device with the DMesh profile. |
 | `usb.serial.handshake` | `port: string = "USB0"`, `profile: string = "generic"`, `timeout_sec: number = 1.5` | Runs a one-shot handshake without holding the device open. `port` is a logical token such as `USB0`, `USB1`, or `ACM0`; lmesh derives `/dev/ttyUSB0`, `/dev/ttyUSB1`, or `/dev/ttyACM0`. `profile=generic` sends `help`; `profile=dmesh`/`esp` sends firmware status probes; `profile=cmd:<text>` sends a custom command. Returns raw text and parsed mesh messages. |
 | `usb.serial.reset` | `port: string = "USB0"`, `mode: "run"\|"bootloader" = "run"` | Pulses ESP USB serial modem lines into running firmware or ROM download mode. If a lmesh forward is active, the reset is queued on that forward's owned serial FD and the TCP/UDS listeners stay up. Flash scripts should use `mode=bootloader`, run esptool with `--before no_reset --after no_reset`, then call `mode=run`. |
-| `usb.serial.forward.start` / `usb.serial.connect` | `port: string = "USB0"`, `baud: integer = 460800`, `tcp_port: integer \| null`, `tcp_mode: "auto"\|"framed"\|"rfc2217" = "auto"`, `handshake: bool = false`, `dtr: bool = false`, `multi: bool = false` | Starts a generic UDS forward for a USB serial device. lmesh derives the device path and socket from `port`, e.g. `USB0` -> `/dev/ttyUSB0` and `/run/mesh/lmesh-radio-build/USB0.sock`. The socket is `0770` and group `dialout`. With `tcp_port`, lmesh also exposes the same forward on `127.0.0.1:<tcp_port>`. Use `tcp_mode=rfc2217` with `rfc2217://127.0.0.1:<tcp_port>` for flasher tools that need baud/control-line changes; use `tcp_mode=framed` for plain `socket://` text or future CBOR/length-framed binary. Serial output is broadcast to all connected UDS and TCP clients with bounded backpressure queues. With `dtr=true`, each client connection briefly pulses DTR for boards that need an interrupt to activate UART; disable this for flasher clients so esptool owns reset timing. By default, only the first connected client can send input; `multi=true` allows every client to send. Framed input sends newline-terminated text or binary records beginning with `0x00` plus a 3-byte big-endian length. RFC2217 mode interprets Telnet/RFC2217 controls and forwards escaped binary data. |
+| `usb.serial.forward.start` / `usb.serial.connect` | `port: string = "USB0"`, `baud: integer = 460800`, `tcp_port: integer \| null`, `tcp_mode: "auto"\|"framed"\|"rfc2217" = "auto"`, `handshake: bool = false`, `dtr: bool = false`, `multi: bool = false` | Starts a generic UDS forward for a USB serial device. lmesh derives the device path and socket from `port`, e.g. `USB0` -> `/dev/ttyUSB0` and `/run/mesh/lmesh/USB0.sock`; configured role names use their stable `/dev/serial/by-id` path and `/run/mesh/lmesh/<role>.sock`. The socket is `0770` and group `dialout`. With `tcp_port`, lmesh also exposes the same forward on `127.0.0.1:<tcp_port>`. Use `tcp_mode=rfc2217` with `rfc2217://127.0.0.1:<tcp_port>` for flasher tools that need baud/control-line changes; use `tcp_mode=framed` for plain `socket://` text or future CBOR/length-framed binary. Serial output is broadcast to all connected UDS and TCP clients with bounded backpressure queues. With `dtr=true`, UDS clients pulse the board PRG/DTR line, equivalent to a short physical PRG press, and open the 20-second firmware console window. Newline records `dtr [milliseconds]` (default 120 ms, maximum 10000 ms) and `rst` are handled locally by lmesh and are not sent to firmware. lmesh retains normal line buffering for debug/local commands but injects no synthetic wake bytes. RFC2217 clients never receive the console pulse or wake bytes, so esptool owns reset timing. By default, only the first connected client can send input; `multi=true` allows every client to send. Framed input sends newline-terminated text or binary records beginning with `0x00` plus a 3-byte big-endian length. RFC2217 mode interprets Telnet/RFC2217 controls and forwards escaped binary data. |
 | `usb.serial.forward.stop` / `usb.serial.disconnect` | `port: string = "USB0"` | Stops a managed serial forward and removes its socket. |
-| `usb.serial.forward.list` | none | Lists active managed serial forwards. |
-| `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `rx_variant: string = "nl80211"` | Debug-only legacy raw Wi-Fi action-frame listener retained for lab comparison. New DMesh control-plane work should use `wifi.nan.*`. |
-| `wifi.raw.send` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `destination: mac \| rx:mac \| raw:mac`, `source: mac \| null`, `tx_variant: string = "standard"`, `tx_duration_ms: integer \| null`, `payload: string` | Debug-only legacy raw Wi-Fi sender retained for lab comparison. New DMesh control-plane work should use `wifi.nan.transmit`. |
-| `wifi.raw.ping` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `wait_ms: integer = 900`, `nonce: string \| null` | Debug-only legacy raw Wi-Fi ping retained for lab comparison. |
+| `usb.serial.forward.list` | none | Lists active managed serial forwards. Each forward includes live atomic `stats`: client accepts/drops, bytes in each direction, UART/client `WouldBlock` counts, queue high-water marks, and poll ready/timeout counts. Use it during an RFC2217 transfer to identify whether the UART, TCP client, or bounded queues are limiting progress. |
+| `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `rx_variant: string = "nl80211"` | Listens for the custom raw vendor-action bulk transport during NAN-synchronized active windows. |
+| `wifi.raw.send` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `destination: mac \| rx:mac \| raw:mac`, `source: mac \| null`, `tx_variant: string = "standard"`, `tx_duration_ms: integer \| null`, `payload: string` | Sends custom raw vendor-action bulk traffic. It is unassociated and uses the stable DMesh marker rather than the ESP-NOW API. |
+| `wifi.raw.ping` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `wait_ms: integer = 900`, `nonce: string \| null` | Sends a small custom raw-action probe. |
 | `wifi.data.listen` | `iface: string = LMESH_WIFI_IFACE`, `listen_sec: integer = 60` | Opens an AF_PACKET listener on the normal AP/STA netdev, requests packet multicast membership for the real MAC, raw receive MAC, and shared multicast MAC, and records matching DMesh Ethernet frames as `wifi.data.rx`. This tests efficient kernel/driver data-path delivery, not monitor visibility. Requires `CAP_NET_RAW`. |
 | `wifi.data.send` | `iface: string = LMESH_WIFI_IFACE`, `destination: mac \| rx:mac \| raw:mac \| null`, `payload: string` | Sends a DMesh Ethernet frame with experimental EtherType `0x88b5` on the normal AP/STA netdev path. Defaults to the shared DMesh multicast MAC. Requires `CAP_NET_RAW`. |
 | `wifi.mgmt.capture` | `iface: string = LMESH_WIFI_IFACE`, `channel: integer = 6`, `capture_ms: integer = 4000`, `max_frames: integer = 32`, `active: bool = false` | Captures beacon and probe-response frames through an AF_PACKET monitor interface and returns raw frame hex plus parsed SSID/channel/rate/capability IE summaries. Requires `CAP_NET_RAW`; `active=true` recreates the monitor interface with active monitor flags. |
@@ -150,9 +220,9 @@ not become the product contract when an equivalent high-level method exists.
 | `esp.sleep.status` | `adapter: string \| null`, `port: string \| null` | Diagnostic wrapper for ESP power/sleep state. |
 | `esp.telemetry.stats` | `adapter: string \| null`, `port: string \| null`, `reset: bool = false` | Diagnostic wrapper for ESP telemetry counters. |
 | `esp.battery.adc_probe` | `adapter: string \| null`, `port: string \| null`, `adc1_pins: string = "32,33,34,35,36,39"`, `count: integer = 3` | Low-level hardware probe for ESP ADC battery wiring. |
-| `wifi.nan.start` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR` | Brings the interface up, attaches it to wpa_supplicant, applies DMesh NAN defaults (`master_pref=1`, `cluster_id=50:6f:9a:01:05:01`, low-band awake DW interval 8), then calls `NAN_START`. |
+| `wifi.nan.start` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR` | Brings the interface up, attaches it to wpa_supplicant, and verifies WPA 2.11 NAN/USD support with `GET_CAPABILITY nan`. NAN/USD begins when lmesh publishes or subscribes; it has no separate `NAN_START` control command. |
 | `wifi.nan.default` | `iface`, `ctrl_dir`, `service_name: string = "dmesh"`, `ttl: integer = 3600` | Starts host DMesh NAN: publish with both solicited and unsolicited transmissions plus active subscribe on service `dmesh`, using `radio_protocol::build_nan_service_info("android", device_id, wake_count)`. lmesh calls this at startup unless `LMESH_NAN_AUTOSTART=0`, and logs NAN follow-up events unless `LMESH_NAN_EVENT_LOG=0`. |
-| `wifi.nan.status` | `iface`, `ctrl_dir`, `events_ms: integer = 100` | Returns `STATUS`, `DRIVER_FLAGS`, `DRIVER_FLAGS2`, `NAN_STATUS`, and recently received NAN events. |
+| `wifi.nan.status` | `iface`, `ctrl_dir`, `events_ms: integer = 100` | Returns `STATUS`, `DRIVER_FLAGS`, `DRIVER_FLAGS2`, `GET_CAPABILITY nan`, and recently received NAN events. |
 | `wifi.nan.events` | `iface`, `ctrl_dir`, `wait_ms: integer = 250`, `max_events: integer = 64` | Attaches to the wpa_supplicant control socket and returns parsed `NAN-DISCOVERY-RESULT`, `NAN-REPLIED`, `NAN-RECEIVE`, transmit status, and related events. DMesh NAN v1 SSI/follow-up payloads are decoded when present. |
 | `wifi.nan.publish` / `wifi.nan.adv` | `iface`, `ctrl_dir`, `service_name: string = "dmesh"`, `ssi_hex: hex \| null`, `ttl: integer = 3600`, `freq: integer = 2437`, `srv_proto_type: integer = 0` | Sends `NAN_PUBLISH` with wpa_supplicant's default solicited and unsolicited transmissions, so the host both advertises and responds. When `ssi_hex` is omitted, lmesh uses Android-compatible DMesh NAN service info. |
 | `wifi.nan.subscribe` / `wifi.nan.sub` | `iface`, `ctrl_dir`, `service_name: string = "dmesh"`, `ssi_hex: hex \| null`, `ttl: integer = 3600`, `freq: integer = 2437`, `active: bool = true`, `srv_proto_type: integer = 0` | Sends active `NAN_SUBSCRIBE` aligned with Android `lib-lm3`. |

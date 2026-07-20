@@ -487,6 +487,15 @@ where
         Ok(raw) => raw,
         Err(e) => return (format, Some(Response::err(e))),
     };
+    // mesh-cli addresses a service as `service method`. Keep the wire method
+    // service-qualified for multi-service routing, but let each service strip
+    // its own prefix without disturbing methods that legitimately contain
+    // dots, such as `wifi.raw.listen`.
+    let mut raw = raw;
+    let service_prefix = format!("{}.", registry.server_name);
+    if raw.method.starts_with(&service_prefix) {
+        raw.method = raw.method[service_prefix.len()..].to_string();
+    }
 
     let response = match raw.method.as_str() {
         "initialize" => registry.initialize(&raw.params).await,
