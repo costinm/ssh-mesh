@@ -1,4 +1,3 @@
-use std::ffi::{c_char, CString};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use anyhow::{bail, Result};
@@ -410,7 +409,12 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         finish_raw_nan_beacon_window();
         let queued_sent = super::nan::drain_raw_queue();
         super::nan::stop_nan().ok();
-        super::wifi::stop_raw_monitor().ok();
+        if let Err(err) = super::wifi::stop_raw_wifi_for_sleep() {
+            telemetry::record_log(format!(
+                "event type=wifi.raw_sleep off=false msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        }
         RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
         let backoff_ms = RAW_NAN_MISS_BACKOFF_MS.swap(0, Ordering::Relaxed);
         let idle_ms = duty_ms.saturating_sub(active_ms).saturating_add(backoff_ms);
@@ -659,11 +663,10 @@ fn now_ms() -> u32 {
 }
 
 fn boot_print(line: &str) {
-    if let Ok(message) = CString::new(format!("{line}\n")) {
-        unsafe {
-            sys::esp_rom_printf(message.as_ptr() as *const c_char);
-        }
-    }
+    // Retain startup progress for diagnostics without writing UART0 while the
+    // radio stack starts. A burst of small UART writes at this point can wedge
+    // the classic ESP32 driver's TX ISR.
+    telemetry::record_log(line);
 }
 
 fn mode_name() -> &'static str {

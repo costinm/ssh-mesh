@@ -62,6 +62,12 @@ const IRQ_RX_DONE: u8 = 0x40;
 
 static BACKGROUND_RX_RUNNING: AtomicBool = AtomicBool::new(false);
 static GPIO_ISR_SERVICE_READY: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" {
+    fn dmesh_lora_irq_set_task(task: *mut sys::tskTaskControlBlock);
+    fn dmesh_lora_irq_rearm();
+    fn dmesh_lora_gpio_isr(arg: *mut core::ffi::c_void);
+}
 static LORA_PACKET_COUNTER: AtomicU32 = AtomicU32::new(1);
 static LORA_RX_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(std::ptr::null_mut());
 static LORA_SPI_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -949,6 +955,7 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
         unsafe { sys::xTaskGetCurrentTaskHandle() },
         Ordering::SeqCst,
     );
+    unsafe { dmesh_lora_irq_set_task(LORA_RX_TASK.load(Ordering::SeqCst)) };
     let cad_rx = LORA_CAD_RX_ENABLED.load(Ordering::Relaxed);
     if cad_rx && matches!(config.chip, LoraChip::Sx1262) {
         let result = run_sx1262_duty_cycle_background_rx(&config, local_node);
@@ -957,6 +964,7 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
             let _ = set_lora_irq_enabled(config.dio0, false);
         }
         LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+        unsafe { dmesh_lora_irq_set_task(std::ptr::null_mut()) };
         return result;
     }
     if cad_rx {
@@ -966,6 +974,7 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
             let _ = set_lora_irq_enabled(config.dio0, false);
         }
         LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+        unsafe { dmesh_lora_irq_set_task(std::ptr::null_mut()) };
         return result;
     }
     let result = run_continuous_background_rx(&config, local_node);
@@ -974,6 +983,7 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
         let _ = set_lora_irq_enabled(config.dio0, false);
     }
     LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+    unsafe { dmesh_lora_irq_set_task(std::ptr::null_mut()) };
     result
 }
 
@@ -1338,7 +1348,7 @@ fn lora_spi_lock() -> &'static Mutex<()> {
 fn configure_dio0_interrupt(pin: i32) -> Result<()> {
     unsafe {
         if !GPIO_ISR_SERVICE_READY.load(Ordering::Relaxed) {
-            let install = sys::gpio_install_isr_service(0);
+            let install = sys::gpio_install_isr_service(sys::ESP_INTR_FLAG_IRAM as i32);
             if install != sys::ESP_OK && install != sys::ESP_ERR_INVALID_STATE {
                 esp_ok(install)?;
             }
@@ -1351,7 +1361,7 @@ fn configure_dio0_interrupt(pin: i32) -> Result<()> {
         ))?;
         esp_ok(sys::gpio_isr_handler_add(
             pin,
-            Some(lora_dio0_isr),
+            Some(dmesh_lora_gpio_isr),
             std::ptr::null_mut(),
         ))?;
     }
@@ -1371,6 +1381,10 @@ fn set_lora_irq_enabled(pin: i32, enabled: bool) -> Result<()> {
 }
 
 fn wait_for_lora_irq(timeout: Duration) -> bool {
+    // DIO0 can remain asserted or generate a burst around CAD/RX state
+    // changes. Re-arm the IRAM ISR once per task wait so it cannot hold CPU0
+    // in an interrupt storm before SPI has acknowledged the radio IRQ.
+    unsafe { dmesh_lora_irq_rearm() };
     let ticks = duration_to_ticks(timeout);
     let woke = unsafe { sys::ulTaskGenericNotifyTake(0, 1, ticks) != 0 };
     if woke {
@@ -1403,16 +1417,6 @@ fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
 fn task_delay(timeout: Duration) {
     unsafe {
         sys::vTaskDelay(duration_to_ticks(timeout).max(1));
-    }
-}
-
-unsafe extern "C" fn lora_dio0_isr(_arg: *mut core::ffi::c_void) {
-    let task = LORA_RX_TASK.load(Ordering::SeqCst);
-    if !task.is_null() {
-        let mut higher_priority_task_woken: sys::BaseType_t = 0;
-        unsafe {
-            sys::vTaskGenericNotifyGiveFromISR(task, 0, &mut higher_priority_task_woken);
-        }
     }
 }
 

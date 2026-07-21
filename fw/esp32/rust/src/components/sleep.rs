@@ -78,40 +78,90 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         return Ok(());
     }
 
-    // Keep UART RX wake armed in idle. A wake preamble can lose its first
-    // bytes during light-sleep clock restoration, but the following command
-    // opens the normal active console window without requiring DTR/PRG.
-    configure_light_wake_sources(settings, sleep_ms, true)?;
-    super::serial::suspend_for_light_sleep();
-    RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
-    let before_us = now_us();
-    let ret = unsafe { sys::esp_light_sleep_start() };
-    let elapsed_ms = now_us()
-        .saturating_sub(before_us)
-        .saturating_div(1000)
-        .min(u32::MAX as u64) as u32;
-    let cause = unsafe { sys::esp_sleep_get_wakeup_cause() };
-    RAW_NAN_LIGHT_LAST_MS.store(elapsed_ms, Ordering::Relaxed);
-    RAW_NAN_LIGHT_LAST_CAUSE.store(cause as u32, Ordering::Relaxed);
-    RAW_NAN_LIGHT_LAST_RET.store(ret as u32, Ordering::Relaxed);
-    if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO
-        || cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART
+    #[cfg(target_feature = "esp32s3ops")]
     {
-        // GPIO0/DTR and UART wake light sleep without necessarily running the
-        // normal GPIO task. Re-arm the event-driven console before the host
-        // sends its actual command. Timer/NAN wakes stay idle.
-        super::serial::rearm_after_wake();
-        telemetry::record_log(format!(
-            "event type=uart.wake source={} phase=light_sleep_return",
-            wake_cause_name(cause)
-        ));
-    }
-    if ret == sys::ESP_OK {
+        // On ESP32-S3 the Wi-Fi modem can retain its internal sleep-reject
+        // trigger briefly after a full raw-driver teardown. Explicit
+        // esp_light_sleep_start() then returns ESP_ERR_SLEEP_REJECT even with
+        // timer-only wake configured. Let IDF PM/tickless idle enter light
+        // sleep instead. The UART ingress and GPIO0 button tasks notify the
+        // main task, so this must wait on that notification rather than use a
+        // blind vTaskDelay: otherwise a valid UART wake is parsed but command
+        // dispatch remains delayed until the NAN timer interval expires.
+        // Re-arm the hardware wake sources for every raw-NAN idle boundary.
+        // The normal light-sleep profile can clear the shared sleep source
+        // mask, and automatic PM ultimately enters esp_light_sleep_start()
+        // from its tickless-idle hook.
+        configure_light_wake_sources(settings, sleep_ms, true, false, true)?;
+        super::serial::suspend_for_light_sleep();
+        RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
+        let before_us = now_us();
+        let notified = super::wake::wait(Duration::from_millis(sleep_ms as u64));
+        let elapsed_ms = now_us()
+            .saturating_sub(before_us)
+            .saturating_div(1000)
+            .min(u32::MAX as u64) as u32;
+        RAW_NAN_LIGHT_LAST_MS.store(elapsed_ms, Ordering::Relaxed);
+        RAW_NAN_LIGHT_LAST_CAUSE.store(
+            if notified {
+                sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART as u32
+            } else {
+                sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_TIMER as u32
+            },
+            Ordering::Relaxed,
+        );
+        RAW_NAN_LIGHT_LAST_RET.store(sys::ESP_OK as u32, Ordering::Relaxed);
         RAW_NAN_LIGHT_WAKE_OK.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    } else {
-        RAW_NAN_LIGHT_WAKE_FAIL.fetch_add(1, Ordering::Relaxed);
-        esp_ok(ret)
+        return Ok(());
+    }
+
+    #[cfg(not(target_feature = "esp32s3ops"))]
+    {
+        // Classic ESP32 keeps UART RX wake armed in idle. ESP32-S3 uses GPIO0/DTR
+        // instead: its UART wake detector can be left asserted by the USB-UART
+        // bridge and rejects the sleep request before the timer can run.
+        // Raw-NAN has already stopped Wi-Fi before this interval. Its scheduler
+        // resumes the modem from its timer deadline, so do not register Wi-Fi,
+        // beacon, or BT wake sources here. On ESP32-S3 those inactive sources make
+        // esp_light_sleep_start() reject the sleep configuration with 0x103.
+        configure_light_wake_sources(
+            settings,
+            sleep_ms,
+            super::serial::RAW_NAN_UART_WAKE,
+            false,
+            super::serial::RAW_NAN_BUTTON_WAKE,
+        )?;
+        super::serial::suspend_for_light_sleep();
+        RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
+        let before_us = now_us();
+        let ret = unsafe { sys::esp_light_sleep_start() };
+        let elapsed_ms = now_us()
+            .saturating_sub(before_us)
+            .saturating_div(1000)
+            .min(u32::MAX as u64) as u32;
+        let cause = unsafe { sys::esp_sleep_get_wakeup_cause() };
+        RAW_NAN_LIGHT_LAST_MS.store(elapsed_ms, Ordering::Relaxed);
+        RAW_NAN_LIGHT_LAST_CAUSE.store(cause as u32, Ordering::Relaxed);
+        RAW_NAN_LIGHT_LAST_RET.store(ret as u32, Ordering::Relaxed);
+        if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO
+            || cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART
+        {
+            // GPIO0/DTR and UART wake light sleep without necessarily running the
+            // normal GPIO task. Re-arm the event-driven console before the host
+            // sends its actual command. Timer/NAN wakes stay idle.
+            super::serial::rearm_after_wake();
+            telemetry::record_log(format!(
+                "event type=uart.wake source={} phase=light_sleep_return",
+                wake_cause_name(cause)
+            ));
+        }
+        if ret == sys::ESP_OK {
+            RAW_NAN_LIGHT_WAKE_OK.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        } else {
+            RAW_NAN_LIGHT_WAKE_FAIL.fetch_add(1, Ordering::Relaxed);
+            esp_ok(ret)
+        }
     }
 }
 
@@ -497,7 +547,7 @@ pub fn enter_companion_deep_sleep(
 
 pub fn enable_companion_idle_pm(settings: &SharedSettings) -> Result<()> {
     configure_pm(true)?;
-    configure_light_wake_sources(settings, DEFAULT_WAKE_MS, true)?;
+    configure_light_wake_sources(settings, DEFAULT_WAKE_MS, true, true, true)?;
     telemetry::record_log("ev=sleep.pm companion_idle=true light=true serial=true");
     Ok(())
 }
@@ -548,7 +598,13 @@ fn start_light_sleep_profile(settings: &SharedSettings, profile: LightSleepProfi
         super::wifi::set_power_save(profile.ps)?;
     }
     configure_pm(true)?;
-    configure_light_wake_sources(settings, profile.wake_ms, profile.serial)?;
+    configure_light_wake_sources(
+        settings,
+        profile.wake_ms,
+        profile.serial,
+        profile.wifi || profile.raw || profile.nan || profile.ble,
+        true,
+    )?;
 
     LIGHT_SLEEP_ENABLED.store(true, Ordering::Relaxed);
     LIGHT_WIFI.store(profile.wifi, Ordering::Relaxed);
@@ -1058,6 +1114,8 @@ fn configure_light_wake_sources(
     settings: &SharedSettings,
     wake_ms: u32,
     serial: bool,
+    radio_wake: bool,
+    button_wake: bool,
 ) -> Result<()> {
     unsafe {
         let _ = sys::esp_sleep_disable_wakeup_source(sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_ALL);
@@ -1073,14 +1131,18 @@ fn configure_light_wake_sources(
                 sys::uart_port_t_UART_NUM_0 as i32,
             ))?;
         }
-        let _ = sys::esp_sleep_enable_wifi_wakeup();
-        let _ = sys::esp_sleep_enable_wifi_beacon_wakeup();
-        let _ = sys::esp_sleep_enable_bt_wakeup();
+        if radio_wake {
+            let _ = sys::esp_sleep_enable_wifi_wakeup();
+            let _ = sys::esp_sleep_enable_wifi_beacon_wakeup();
+            let _ = sys::esp_sleep_enable_bt_wakeup();
+        }
     }
 
     let mut button_gpio = None;
-    if let Ok(Some(pin)) = super::button::configure_light_wake(settings) {
-        button_gpio = Some(pin);
+    if button_wake {
+        if let Ok(Some(pin)) = super::button::configure_light_wake(settings) {
+            button_gpio = Some(pin);
+        }
     }
 
     if let Ok(config) = lora::load_config(settings) {
@@ -1321,7 +1383,7 @@ fn active_window(state: &RtcSleepState) -> Result<bool> {
         }
     }
     while Instant::now() < deadline {
-        if state.flags & FLAG_SERIAL != 0 && uart0_has_input() {
+        if state.flags & FLAG_SERIAL != 0 && super::serial::has_pending_frame() {
             telemetry::record_log("event type=sleep.active source=serial action=promote");
             if state.flags & FLAG_NAN_RAW != 0 {
                 let _ = super::nan::stop_nan();
@@ -1342,14 +1404,6 @@ fn active_window(state: &RtcSleepState) -> Result<bool> {
         telemetry::record_log("event type=sleep.active transport=nan_raw status=stopped");
     }
     Ok(false)
-}
-
-fn uart0_has_input() -> bool {
-    let mut byte = [0_u8; 1];
-    let read = unsafe {
-        sys::uart_read_bytes(sys::uart_port_t_UART_NUM_0, byte.as_mut_ptr().cast(), 1, 0)
-    };
-    read > 0
 }
 
 fn now_us() -> u64 {

@@ -147,6 +147,23 @@ impl CommandHandler for PowerCommand {
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if request
+            .arg("uart_probe_reset")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            super::serial::reset_output_probe();
+            return Ok(CommandResponse::ok("power uart_probe_reset=true"));
+        }
+        if let Some(delay_ms) = request.arg_i32("uart_probe_ms")? {
+            let delay_ms = delay_ms.clamp(1, 60_000) as u32;
+            let deadline_ms = super::serial::schedule_output_probe(delay_ms);
+            return Ok(CommandResponse::ok(format!(
+                "power uart_probe=true delay_ms={} deadline_ms={}",
+                delay_ms, deadline_ms
+            )));
+        }
+        if request
             .arg("uart_status")
             .map(parse_bool)
             .transpose()?

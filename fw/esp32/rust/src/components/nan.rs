@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,6 +26,11 @@ const DEFAULT_CHANNEL: u8 = 6;
 const NAN_COMMAND_QUEUE_MAX: usize = 8;
 const NAN_OUTGOING_QUEUE_MAX: usize = 8;
 const NAN_COMMAND_MAX_LEN: usize = 231;
+const NAN_RX_QUEUE_LEN: u32 = 8;
+// NAN beacons, SDFs, and the DMesh action payload all fit below this bound.
+// Drop unusual large management frames in the Wi-Fi callback rather than
+// parsing or allocating in the driver task.
+const NAN_RX_FRAME_MAX: usize = 512;
 
 static NAN_RUNNING: AtomicBool = AtomicBool::new(false);
 static NAN_RX_MGMT: AtomicU32 = AtomicU32::new(0);
@@ -37,6 +43,9 @@ static NAN_RX_MATCHED: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_COMMAND_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_RESPONSE_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_RESPONSE_TX: AtomicU32 = AtomicU32::new(0);
+static NAN_RX_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
+static NAN_RX_QUEUE_DROPS: AtomicU32 = AtomicU32::new(0);
+static NAN_RX_OVERSIZE_DROPS: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
@@ -116,6 +125,14 @@ struct RawNanOutgoing {
     payload: Vec<u8>,
 }
 
+#[repr(C)]
+struct RawNanRxFrame {
+    len: u16,
+    rssi: i8,
+    _reserved: u8,
+    data: [u8; NAN_RX_FRAME_MAX],
+}
+
 fn nan_command_queue() -> &'static Mutex<VecDeque<NanTextCommand>> {
     NAN_COMMAND_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_COMMAND_QUEUE_MAX)))
 }
@@ -126,6 +143,28 @@ fn nan_outgoing_queue() -> &'static Mutex<VecDeque<RawNanOutgoing>> {
 
 pub fn take_command() -> Option<NanTextCommand> {
     nan_command_queue().lock().ok()?.pop_front()
+}
+
+/// Drain management frames copied by the Wi-Fi callback.
+///
+/// The Wi-Fi promiscuous callback runs in a driver task. It must not allocate,
+/// lock telemetry, parse payloads, or dispatch commands, otherwise action
+/// traffic can starve the Wi-Fi interrupt path and trigger an interrupt WDT.
+pub fn poll_rx() {
+    let queue = NAN_RX_QUEUE.load(Ordering::Acquire);
+    if queue.is_null() {
+        return;
+    }
+    loop {
+        let mut received = core::mem::MaybeUninit::<RawNanRxFrame>::uninit();
+        let ok = unsafe { sys::xQueueReceive(queue, received.as_mut_ptr().cast::<c_void>(), 0) };
+        if ok != 1 {
+            return;
+        }
+        let received = unsafe { received.assume_init() };
+        let len = usize::from(received.len).min(NAN_RX_FRAME_MAX);
+        observe_promiscuous_frame(&received.data[..len], received.rssi as i32);
+    }
 }
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
@@ -640,6 +679,7 @@ fn estimated_tsf_us(local_us: u64) -> u64 {
 }
 
 fn start_raw_sniffer(channel: u8) -> Result<()> {
+    ensure_rx_queue()?;
     super::wifi::ensure_raw_wifi_started(channel)?;
     unsafe {
         let mut filter = sys::wifi_promiscuous_filter_t {
@@ -655,6 +695,34 @@ fn start_raw_sniffer(channel: u8) -> Result<()> {
         esp_ok(sys::esp_wifi_set_promiscuous(true))?;
     }
     NAN_RUNNING.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+fn ensure_rx_queue() -> Result<()> {
+    if !NAN_RX_QUEUE.load(Ordering::Acquire).is_null() {
+        return Ok(());
+    }
+    let queue = unsafe {
+        sys::xQueueGenericCreate(
+            NAN_RX_QUEUE_LEN,
+            core::mem::size_of::<RawNanRxFrame>() as u32,
+            0,
+        )
+    };
+    if queue.is_null() {
+        bail!("raw NAN receive queue allocation failed");
+    }
+    if NAN_RX_QUEUE
+        .compare_exchange(
+            core::ptr::null_mut(),
+            queue,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        unsafe { sys::vQueueDelete(queue) };
+    }
     Ok(())
 }
 
@@ -937,15 +1005,43 @@ unsafe extern "C" fn sniffer_cb(
         return;
     }
     let pkt = unsafe { &*(buf as *const sys::wifi_promiscuous_pkt_t) };
-    let len = pkt.rx_ctrl.sig_len().min(1500) as usize;
+    let len = pkt.rx_ctrl.sig_len() as usize;
     let payload = pkt.payload.as_ptr();
     if payload.is_null() || len < FRAME_DATA {
         NAN_RX_OTHER.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let frame = unsafe { core::slice::from_raw_parts(payload, len) };
-    super::wifi::observe_promiscuous_frame(frame, pkt.rx_ctrl.rssi() as i32);
-    observe_promiscuous_frame(frame, pkt.rx_ctrl.rssi() as i32);
+    if len > NAN_RX_FRAME_MAX {
+        NAN_RX_OVERSIZE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let queue = NAN_RX_QUEUE.load(Ordering::Acquire);
+    if queue.is_null() {
+        NAN_RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let mut received = RawNanRxFrame {
+        len: len as u16,
+        rssi: pkt.rx_ctrl.rssi() as i8,
+        _reserved: 0,
+        data: [0; NAN_RX_FRAME_MAX],
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload, received.data.as_mut_ptr(), len);
+    }
+    let sent = unsafe {
+        sys::xQueueGenericSend(
+            queue,
+            (&received as *const RawNanRxFrame).cast::<c_void>(),
+            0,
+            0,
+        )
+    };
+    if sent == 1 {
+        super::wake::notify();
+    } else {
+        NAN_RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
@@ -954,6 +1050,7 @@ pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
     }
     NAN_RX_MGMT.fetch_add(1, Ordering::Relaxed);
     NAN_RX_BYTES.fetch_add(frame.len() as u32, Ordering::Relaxed);
+    super::wifi::observe_promiscuous_frame(frame, _rssi);
     let custom_raw_action = super::wifi::custom_raw_action_payload(frame);
     if custom_raw_action.is_none() && !matches_filter(frame) {
         return;
@@ -1067,7 +1164,7 @@ fn stats() -> String {
         .map(|queue| queue.len())
         .unwrap_or(0);
     format!(
-        "nan support=raw running={} filter={} bssid_filter={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={}",
+        "nan support=raw running={} filter={} bssid_filter={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={}",
         NAN_RUNNING.load(Ordering::Relaxed),
         filter_name(),
         NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
@@ -1081,6 +1178,8 @@ fn stats() -> String {
         NAN_RAW_COMMAND_RX.load(Ordering::Relaxed),
         NAN_RAW_RESPONSE_RX.load(Ordering::Relaxed),
         NAN_RAW_RESPONSE_TX.load(Ordering::Relaxed),
+        NAN_RX_QUEUE_DROPS.load(Ordering::Relaxed),
+        NAN_RX_OVERSIZE_DROPS.load(Ordering::Relaxed),
         last_beacon_local_us,
         last_beacon_tsf_us,
         beacon_age_ms,

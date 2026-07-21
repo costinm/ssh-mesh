@@ -1,6 +1,5 @@
 use std::ffi::{c_char, c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
-use std::sync::Mutex;
 
 use esp_idf_sys as sys;
 
@@ -17,6 +16,14 @@ const UART_REQUIRES_APB_LOCK: bool = false;
 #[cfg(not(target_feature = "esp32s3ops"))]
 const UART_REQUIRES_APB_LOCK: bool = true;
 
+/// Classic ESP32 retains UART/GPIO wake for its explicit raw-NAN sleep path.
+/// ESP32-S3 uses automatic light sleep instead; its console wakes through the
+/// normal UART/GPIO interrupt path.
+#[cfg(not(target_feature = "esp32s3ops"))]
+pub const RAW_NAN_UART_WAKE: bool = true;
+#[cfg(not(target_feature = "esp32s3ops"))]
+pub const RAW_NAN_BUTTON_WAKE: bool = true;
+
 static UART0_APB_LOCK: AtomicPtr<sys::esp_pm_lock> = AtomicPtr::new(core::ptr::null_mut());
 static UART0_APB_LOCK_HELD: AtomicBool = AtomicBool::new(false);
 static UART0_NO_LIGHT_SLEEP_LOCK: AtomicPtr<sys::esp_pm_lock> =
@@ -31,15 +38,27 @@ static UART0_UNINSTALL_AFTER_RESPONSE: AtomicBool = AtomicBool::new(false);
 static UART0_DRIVER_INSTALLED: AtomicBool = AtomicBool::new(true);
 static UART0_EVENT_TASK: AtomicPtr<sys::tskTaskControlBlock> =
     AtomicPtr::new(core::ptr::null_mut());
+static UART0_TX_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(core::ptr::null_mut());
 static UART0_FRAME_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
+static UART0_TX_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
 static UART0_RX_EVENTS: AtomicU32 = AtomicU32::new(0);
 static UART0_RX_DROPS: AtomicU32 = AtomicU32::new(0);
 static UART0_RX_ERRORS: AtomicU32 = AtomicU32::new(0);
 static UART0_TX_DROPS_IDLE: AtomicU32 = AtomicU32::new(0);
-static UART0_TX_LOCK: Mutex<()> = Mutex::new(());
+static UART0_TX_DROPS_QUEUE: AtomicU32 = AtomicU32::new(0);
+static UART0_QUEUED_FRAMES: AtomicU32 = AtomicU32::new(0);
+static UART0_OUTPUT_PROBE_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+static UART0_OUTPUT_PROBE_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static UART0_OUTPUT_PROBE_SENT: AtomicU32 = AtomicU32::new(0);
+static UART0_OUTPUT_PROBE_DROPPED: AtomicU32 = AtomicU32::new(0);
 
 const UART_FRAME_QUEUE_LEN: u32 = 8;
 const UART_MAX_FRAME: usize = 512;
+const UART_TX_QUEUE_LEN: u32 = 16;
+// Keep every driver write below the hardware FIFO capacity. The task waits
+// for idle before each chunk, so ESP-IDF never enables its TX-empty ISR.
+const UART_TX_FRAME_MAX: usize = 512;
+const UART_TX_FIFO_CHUNK: usize = 64;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +80,13 @@ struct QueuedFrame {
     data: *mut Vec<u8>,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QueuedTx {
+    len: u16,
+    data: [u8; UART_TX_FRAME_MAX],
+}
+
 /// Remove the UART0 driver for a one-boot power measurement.
 ///
 /// This is intentionally one-way: reset reinstates the normal boot console.
@@ -71,7 +97,7 @@ pub fn request_uninstall_for_measurement() {
 
 pub fn measurement_status_fields() -> String {
     format!(
-        "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_tx_drop_idle={}",
+        "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
         UART0_DRIVER_INSTALLED.load(Ordering::Relaxed),
         is_active(),
         !UART0_SUSPENDED_UNTIL_DTR.load(Ordering::Relaxed),
@@ -79,7 +105,29 @@ pub fn measurement_status_fields() -> String {
         UART0_RX_DROPS.load(Ordering::Relaxed),
         UART0_RX_ERRORS.load(Ordering::Relaxed),
         UART0_TX_DROPS_IDLE.load(Ordering::Relaxed),
+        UART0_TX_DROPS_QUEUE.load(Ordering::Relaxed),
+        UART0_OUTPUT_PROBE_ATTEMPTS.load(Ordering::Relaxed),
+        UART0_OUTPUT_PROBE_SENT.load(Ordering::Relaxed),
+        UART0_OUTPUT_PROBE_DROPPED.load(Ordering::Relaxed),
     )
+}
+
+/// Schedule one debug-only output attempt after `delay_ms`.
+///
+/// The power command uses this to verify that output really is gated after a
+/// console active window expires. It never changes radio or sleep policy.
+pub fn schedule_output_probe(delay_ms: u32) -> u32 {
+    let deadline = now_ms().wrapping_add(delay_ms).max(1);
+    UART0_OUTPUT_PROBE_DEADLINE_MS.store(deadline, Ordering::Release);
+    deadline
+}
+
+/// Clear output-gate probe state before a bounded verification run.
+pub fn reset_output_probe() {
+    UART0_OUTPUT_PROBE_DEADLINE_MS.store(0, Ordering::Release);
+    UART0_OUTPUT_PROBE_ATTEMPTS.store(0, Ordering::Relaxed);
+    UART0_OUTPUT_PROBE_SENT.store(0, Ordering::Relaxed);
+    UART0_OUTPUT_PROBE_DROPPED.store(0, Ordering::Relaxed);
 }
 
 pub fn configure_active_window(settings: &SharedSettings) {
@@ -112,6 +160,19 @@ pub fn start_ingress_task(event_queue: sys::QueueHandle_t) -> Result<(), sys::es
         return Err(sys::ESP_ERR_NO_MEM);
     }
     UART0_FRAME_QUEUE.store(frame_queue, Ordering::Release);
+    let tx_queue = unsafe {
+        sys::xQueueGenericCreate(
+            UART_TX_QUEUE_LEN,
+            core::mem::size_of::<QueuedTx>() as u32,
+            0,
+        )
+    };
+    if tx_queue.is_null() {
+        unsafe { sys::vQueueDelete(frame_queue) };
+        UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
+        return Err(sys::ESP_ERR_NO_MEM);
+    }
+    UART0_TX_QUEUE.store(tx_queue, Ordering::Release);
     let name = CString::new("uart_mgr").map_err(|_| sys::ESP_FAIL)?;
     let mut task = core::ptr::null_mut();
     let ret = unsafe {
@@ -127,10 +188,35 @@ pub fn start_ingress_task(event_queue: sys::QueueHandle_t) -> Result<(), sys::es
     };
     if ret != 1 || task.is_null() {
         unsafe { sys::vQueueDelete(frame_queue) };
+        unsafe { sys::vQueueDelete(tx_queue) };
         UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
+        UART0_TX_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
         return Err(sys::ESP_FAIL);
     }
     UART0_EVENT_TASK.store(task, Ordering::Release);
+    let tx_name = CString::new("uart_tx").map_err(|_| sys::ESP_FAIL)?;
+    let mut tx_task = core::ptr::null_mut();
+    let tx_ret = unsafe {
+        sys::xTaskCreatePinnedToCore(
+            Some(uart_tx_task),
+            tx_name.as_ptr(),
+            4096,
+            tx_queue.cast::<c_void>(),
+            5,
+            &mut tx_task,
+            0,
+        )
+    };
+    if tx_ret != 1 || tx_task.is_null() {
+        unsafe { sys::vTaskDelete(task) };
+        unsafe { sys::vQueueDelete(frame_queue) };
+        unsafe { sys::vQueueDelete(tx_queue) };
+        UART0_EVENT_TASK.store(core::ptr::null_mut(), Ordering::Release);
+        UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
+        UART0_TX_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
+        return Err(sys::ESP_FAIL);
+    }
+    UART0_TX_TASK.store(tx_task, Ordering::Release);
     Ok(())
 }
 
@@ -148,6 +234,7 @@ pub fn take_frame() -> Option<UartFrame> {
     if received != 1 || queued.data.is_null() {
         return None;
     }
+    UART0_QUEUED_FRAMES.fetch_sub(1, Ordering::Relaxed);
     let kind = match queued.kind {
         1 => UartFrameKind::Text,
         2 => UartFrameKind::Binary,
@@ -163,6 +250,13 @@ pub fn take_frame() -> Option<UartFrame> {
     })
 }
 
+/// Return whether the event-driven UART ingress task has a complete record
+/// ready for the command owner. This deliberately does not touch the UART
+/// driver; `uart_manager_task` is its sole reader.
+pub fn has_pending_frame() -> bool {
+    UART0_QUEUED_FRAMES.load(Ordering::Acquire) != 0
+}
+
 /// Let the ingress task process a deferred driver deletion after the command
 /// acknowledgement has been transmitted. This operation is reset-only.
 pub fn finish_pending_uninstall() -> std::result::Result<bool, sys::esp_err_t> {
@@ -170,10 +264,6 @@ pub fn finish_pending_uninstall() -> std::result::Result<bool, sys::esp_err_t> {
         return Ok(!UART0_DRIVER_INSTALLED.load(Ordering::Acquire));
     }
 
-    // The ingress task may be blocked in the driver's event queue. Deleting
-    // that queue from the consumer itself races its spinlock teardown and
-    // panics on classic ESP32. The control task owns this one-way measurement
-    // transition after it has emitted the command acknowledgement.
     UART0_DEBUG_ENABLED.store(false, Ordering::Release);
     UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Release);
     release_apb_lock();
@@ -181,25 +271,19 @@ pub fn finish_pending_uninstall() -> std::result::Result<bool, sys::esp_err_t> {
     if !task.is_null() {
         unsafe { sys::vTaskDelete(task) };
     }
-    let Ok(_guard) = UART0_TX_LOCK.lock() else {
-        UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-        return Err(sys::ESP_FAIL);
-    };
-    unsafe {
-        let _ = sys::uart_wait_tx_done(
-            sys::uart_port_t_UART_NUM_0,
-            (250 * sys::configTICK_RATE_HZ / 1_000).max(1),
-        );
-        let ret = sys::uart_driver_delete(sys::uart_port_t_UART_NUM_0);
-        if ret == sys::ESP_OK || ret == sys::ESP_ERR_INVALID_STATE {
-            UART0_DRIVER_INSTALLED.store(false, Ordering::Release);
-            UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-            Ok(true)
-        } else {
-            UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-            Err(ret)
-        }
+    let tx_task = UART0_TX_TASK.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if !tx_task.is_null() {
+        unsafe { sys::vTaskDelete(tx_task) };
     }
+    let delete = unsafe { sys::uart_driver_delete(sys::uart_port_t_UART_NUM_0) };
+    if delete != sys::ESP_OK && delete != sys::ESP_ERR_INVALID_STATE {
+        UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return Err(delete);
+    }
+    UART0_DRIVER_INSTALLED.store(false, Ordering::Release);
+    UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
+    UART0_TX_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
+    Ok(true)
 }
 
 pub fn activate_window() {
@@ -226,6 +310,37 @@ pub fn poll_active_window() {
         return;
     }
     release_apb_lock();
+}
+
+/// Run a due output-gate probe from the control task.
+pub fn poll_output_probe() {
+    let deadline = UART0_OUTPUT_PROBE_DEADLINE_MS.load(Ordering::Acquire);
+    if deadline == 0 || !time_after_or_equal(now_ms(), deadline) {
+        return;
+    }
+    if UART0_OUTPUT_PROBE_DEADLINE_MS
+        .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let attempt = UART0_OUTPUT_PROBE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if is_active() {
+        UART0_OUTPUT_PROBE_SENT.fetch_add(1, Ordering::Relaxed);
+        write(&format!(
+            "event type=uart.output_probe n={} sent=true\n",
+            attempt
+        ));
+    } else {
+        UART0_OUTPUT_PROBE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        // Keep this on the normal write path so uart_tx_drop_idle confirms the
+        // output gate, while the dedicated counter distinguishes this test
+        // from expected background notification drops.
+        write(&format!(
+            "event type=uart.output_probe n={} sent=false\n",
+            attempt
+        ));
+    }
 }
 
 pub fn is_active() -> bool {
@@ -310,15 +425,23 @@ pub fn write_bytes(bytes: &[u8]) {
         UART0_TX_DROPS_IDLE.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let Ok(_guard) = UART0_TX_LOCK.lock() else {
+    let queue = UART0_TX_QUEUE.load(Ordering::Acquire);
+    if queue.is_null() {
+        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
         return;
-    };
-    unsafe {
-        let _ = sys::uart_write_bytes(
-            sys::uart_port_t_UART_NUM_0,
-            bytes.as_ptr() as *const core::ffi::c_void,
-            bytes.len(),
-        );
+    }
+    for chunk in bytes.chunks(UART_TX_FRAME_MAX) {
+        let mut queued = QueuedTx {
+            len: chunk.len() as u16,
+            data: [0; UART_TX_FRAME_MAX],
+        };
+        queued.data[..chunk.len()].copy_from_slice(chunk);
+        let sent = unsafe {
+            sys::xQueueGenericSend(queue, (&queued as *const QueuedTx).cast::<c_void>(), 0, 0)
+        };
+        if sent != 1 {
+            UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -478,34 +601,82 @@ fn time_after_or_equal(now: u32, deadline: u32) -> bool {
 
 unsafe extern "C" fn uart_manager_task(arg: *mut c_void) {
     let event_queue = arg.cast::<sys::QueueDefinition>();
-    let mut event = sys::uart_event_t::default();
     let mut parser = UartParser::default();
     loop {
+        let mut event = sys::uart_event_t::default();
         let received = unsafe {
             sys::xQueueReceive(
                 event_queue,
                 (&mut event as *mut sys::uart_event_t).cast::<c_void>(),
-                (100 * sys::configTICK_RATE_HZ / 1_000).max(1),
+                sys::TickType_t::MAX,
             )
         };
-        if received == 1 {
-            UART0_RX_EVENTS.fetch_add(1, Ordering::Relaxed);
-            match event.type_ {
-                x if x == sys::uart_event_type_t_UART_DATA => {
-                    note_rx_activity();
-                    drain_driver_rx(&mut parser);
-                }
-                x if x == sys::uart_event_type_t_UART_FIFO_OVF
-                    || x == sys::uart_event_type_t_UART_BUFFER_FULL =>
+        if received != 1 {
+            continue;
+        }
+        match event.type_ {
+            x if x == sys::uart_event_type_t_UART_DATA => {
+                UART0_RX_EVENTS.fetch_add(1, Ordering::Relaxed);
+                note_rx_activity();
+                drain_driver_rx(&mut parser);
+            }
+            x if x == sys::uart_event_type_t_UART_FIFO_OVF
+                || x == sys::uart_event_type_t_UART_BUFFER_FULL =>
+            unsafe {
+                UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+                let _ = sys::uart_flush_input(sys::uart_port_t_UART_NUM_0);
+                let _ = sys::xQueueGenericReset(event_queue, 0);
+                parser.reset();
+            },
+            _ => {
+                UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The only task that writes UART0 after the driver is installed. Radio and
+/// BLE callbacks enqueue records; each write is FIFO-bounded so the driver's
+/// TX-empty ISR is never armed on classic ESP32.
+unsafe extern "C" fn uart_tx_task(arg: *mut c_void) {
+    let queue = arg.cast::<sys::QueueDefinition>();
+    loop {
+        let mut queued = QueuedTx {
+            len: 0,
+            data: [0; UART_TX_FRAME_MAX],
+        };
+        let received = unsafe {
+            sys::xQueueReceive(
+                queue,
+                (&mut queued as *mut QueuedTx).cast::<c_void>(),
+                sys::TickType_t::MAX,
+            )
+        };
+        if received != 1 || queued.len == 0 || queued.len as usize > UART_TX_FRAME_MAX {
+            continue;
+        }
+        let len = queued.len as usize;
+        for chunk in queued.data[..len].chunks(UART_TX_FIFO_CHUNK) {
+            let wait = unsafe {
+                sys::uart_wait_tx_done(
+                    sys::uart_port_t_UART_NUM_0,
+                    (100 * sys::configTICK_RATE_HZ / 1_000).max(1),
+                )
+            };
+            let written = if wait == sys::ESP_OK {
                 unsafe {
-                    UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    let _ = sys::uart_flush_input(sys::uart_port_t_UART_NUM_0);
-                    let _ = sys::xQueueGenericReset(event_queue, 0);
-                    parser.reset();
-                },
-                _ => {
-                    UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    sys::uart_write_bytes(
+                        sys::uart_port_t_UART_NUM_0,
+                        chunk.as_ptr().cast::<c_void>(),
+                        chunk.len(),
+                    )
                 }
+            } else {
+                -1
+            };
+            if written != chunk.len() as i32 {
+                UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
             }
         }
     }
@@ -557,6 +728,7 @@ fn enqueue_frame(kind: UartFrameKind, data: Vec<u8>) {
         UART0_RX_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    UART0_QUEUED_FRAMES.fetch_add(1, Ordering::Release);
     crate::components::wake::notify();
 }
 

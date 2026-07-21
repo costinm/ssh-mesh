@@ -214,6 +214,7 @@ python tools/serial_cmd.py --port uds:///run/mesh/lmesh/USB0.sock \
 | `logs` | Recent structured event lines. Supports `count`, `depth`, `max_bytes`, `clear=true`. |
 | `messages` | Recent packet buffer. Supports `transport`, `direction`, bounded output, pull/ACK fields. |
 | `local_messages` | Local-address packet buffer. |
+| `button` | `gpio=N` and `enabled=true|false` configure the physical PRG/DTR debug button. `pin=N slots=N [min_us=N|min_ms=N]` starts a separate any-edge GPIO interval capture; it never reconfigures the debug button and rejects its GPIO. `button get` (or `get=true`) returns chronological `low:DELTA_US,high:DELTA_US` samples and resets the ring. `button stop` disables the capture. `slots` is 1-128; `min_us` drops shorter edge intervals and reports the drop count. |
 | `nvs` | Settings namespace and key/value operations: `op=ns|get|set|list`, direct `KEY=VALUE` updates, and `stats=true`. Debug text also accepts `nvs ns`, `nvs get KEY`, `nvs set KEY=VALUE...`, and `nvs list`. |
 | `namespace`, `set`, `get`, `list` | Debug compatibility aliases for the grouped `nvs` command. |
 
@@ -647,6 +648,8 @@ unless explicitly started for testing.
 | `power` | `locks=true` | Print the active ESP-IDF power-management lock table to the debug UART. |
 | `power` | `quiet=true` | Send the response, then enter UART idle: output is suppressed and PM locks are released, but RX/light-sleep wake stays armed. A DTR/PRG edge or UART wake preamble followed by a command reopens the active window. Intended for power tests. |
 | `power` | `uart_status=true` | Report driver, active-window, RX-wake, ingress error/drop, and idle-TX-drop counters. |
+| `power` | `uart_probe_ms=N` | Debug verification only: schedule one UART output attempt after `N` ms (1..60000). After a DTR/UART wake, `uart_status=true` must report `uart_probe_dropped` when the probe ran outside the active window; it must not emit the probe line. |
+| `power` | `uart_probe_reset=true` | Clear the debug output-gate probe counters before a bounded test. |
 | `power` | `uart_uninstall=true` | One-boot power-test operation: acknowledge first, then remove UART0's driver. Reset is required to restore the console. It is never part of normal boot or radio profiles. |
 | `power` | `profile=dfs\|perf\|low\|auto save=true min_mhz=... max_mhz=... light=true\|false` | Configure ESP-IDF PM. Default boot profile is `dfs`: dynamic frequency scaling enabled, automatic light sleep disabled. `light=true` permits automatic light sleep; it does not force immediate sleep if UART, Wi-Fi, BLE, LoRa, timers, or tasks hold the chip active. |
 | `nvs` | `op=set uart.active_ms=20000` | Configure the debug UART input/output window in milliseconds (minimum/default: 20000 ms). PRG/button, lmesh DTR, or UART RX opens/extends the window. RX wake remains armed while idle; firmware output is dropped while idle. |

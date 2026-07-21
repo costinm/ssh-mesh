@@ -391,7 +391,7 @@ fn parse_pins(value: &str) -> Result<Vec<i32>> {
 fn wait_for_key_or_timeout(interval_ms: u64) -> bool {
     let mut waited = 0_u64;
     while waited < interval_ms {
-        if uart0_has_input() {
+        if super::serial::has_pending_frame() {
             return true;
         }
         let step = (interval_ms - waited).min(50);
@@ -411,14 +411,6 @@ fn duration_to_ticks(timeout: Duration) -> sys::TickType_t {
     let hz = sys::configTICK_RATE_HZ as u128;
     let ticks = timeout.as_millis().saturating_mul(hz).div_ceil(1000);
     ticks.min(sys::TickType_t::MAX as u128) as sys::TickType_t
-}
-
-fn uart0_has_input() -> bool {
-    let mut byte = [0_u8; 1];
-    let read = unsafe {
-        sys::uart_read_bytes(sys::uart_port_t_UART_NUM_0, byte.as_mut_ptr().cast(), 1, 0)
-    };
-    read > 0
 }
 
 fn esp_ok(ret: sys::esp_err_t) -> Result<()> {

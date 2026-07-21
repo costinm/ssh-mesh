@@ -15,7 +15,7 @@ path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_
 baud = 460800
 tcp_port = 3330
 tcp_mode = "rfc2217"
-dtr = true
+dtr = false
 multi = true
 
 [[serial_forwards]]
@@ -24,7 +24,7 @@ path = "/dev/serial/by-id/usb-Silicon_Labs_CP2104_USB_to_UART_Bridge_Controller_
 baud = 460800
 tcp_port = 3331
 tcp_mode = "rfc2217"
-dtr = true
+dtr = false
 multi = true
 
 [[serial_forwards]]
@@ -33,7 +33,7 @@ path = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C82104982-if00"
 baud = 460800
 tcp_port = 3334
 tcp_mode = "rfc2217"
-dtr = true
+dtr = false
 multi = true
 
 [[serial_forwards]]

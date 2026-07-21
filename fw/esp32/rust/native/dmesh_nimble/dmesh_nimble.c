@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_err.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
 #if CONFIG_IDF_TARGET_ESP32
@@ -28,6 +29,53 @@
 void ble_store_config_init(void);
 
 static const char *TAG = "dmesh_nimble";
+
+static volatile TaskHandle_t s_button_irq_task;
+static volatile TaskHandle_t s_lora_irq_task;
+static volatile bool s_button_irq_pending;
+static volatile bool s_lora_irq_pending;
+
+void dmesh_button_irq_set_task(void *task) {
+    s_button_irq_task = (TaskHandle_t)task;
+    s_button_irq_pending = false;
+}
+
+void dmesh_lora_irq_set_task(void *task) {
+    s_lora_irq_task = (TaskHandle_t)task;
+    s_lora_irq_pending = false;
+}
+
+void dmesh_button_irq_rearm(void) {
+    s_button_irq_pending = false;
+}
+
+void dmesh_lora_irq_rearm(void) {
+    s_lora_irq_pending = false;
+}
+
+static void IRAM_ATTR notify_task_from_gpio_isr(volatile TaskHandle_t *task,
+                                                 volatile bool *pending) {
+    TaskHandle_t target = *task;
+    if (target == NULL || *pending) {
+        return;
+    }
+    *pending = true;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    vTaskGenericNotifyGiveFromISR(target, 0, &higher_priority_task_woken);
+    if (higher_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+void IRAM_ATTR dmesh_button_gpio_isr(void *arg) {
+    (void)arg;
+    notify_task_from_gpio_isr(&s_button_irq_task, &s_button_irq_pending);
+}
+
+void IRAM_ATTR dmesh_lora_gpio_isr(void *arg) {
+    (void)arg;
+    notify_task_from_gpio_isr(&s_lora_irq_task, &s_lora_irq_pending);
+}
 
 static uint8_t s_addr_type;
 static uint8_t s_addr[6];

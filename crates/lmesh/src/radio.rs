@@ -58,6 +58,10 @@ const SERIAL_FORWARD_MAX_PENDING: usize = 4 * 1024 * 1024;
 const SERIAL_FORWARD_IO_BUFFER_BYTES: usize = 16 * 1024;
 const SERIAL_DTR_DEFAULT_MS: u64 = 120;
 const SERIAL_DTR_MAX_MS: u64 = 10_000;
+// GPIO0/DTR wakes firmware through a short button task before UART RX is
+// re-armed. Keep incoming client bytes in the kernel socket buffer until that
+// transition is complete.
+const SERIAL_DTR_SETTLE_MS: u64 = 600;
 const SERIAL_FLASH_LOG_QUIET_MS: u64 = 60_000;
 // Reset requests are sampled between events. 100 ms keeps them responsive
 // without making every idle managed forward wake one hundred times per second.
@@ -3644,6 +3648,7 @@ fn add_serial_forward_unix_client(
         .context("failed to set UDS client nonblocking")?;
     if dtr {
         pulse_console_dtr(serial.as_raw_fd()).context("failed to pulse console DTR")?;
+        std::thread::sleep(Duration::from_millis(SERIAL_DTR_SETTLE_MS));
     }
     add_serial_forward_client(clients, Box::new(stream), SerialForwardTcpMode::Framed);
     Ok(())
@@ -3664,6 +3669,7 @@ fn add_serial_forward_tcp_client(
         .context("failed to disable Nagle buffering for TCP serial forward")?;
     if dtr {
         pulse_console_dtr(serial.as_raw_fd()).context("failed to pulse console DTR")?;
+        std::thread::sleep(Duration::from_millis(SERIAL_DTR_SETTLE_MS));
     }
     add_serial_forward_client(clients, Box::new(stream), tcp_mode);
     Ok(())
@@ -3705,22 +3711,12 @@ fn pulse_console_dtr(fd: RawFd) -> Result<()> {
 }
 
 fn pulse_console_dtr_for(fd: RawFd, hold_ms: u64) -> Result<()> {
-    let mut bits: libc::c_int = 0;
-    if unsafe { libc::ioctl(fd, libc::TIOCMGET, &mut bits) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("TIOCMGET DTR failed");
-    }
-    // A pulse must always finish deasserted. RFC2217 clients can leave DTR set;
-    // restoring that snapshot holds ESP32 GPIO0 low and causes a button ISR
-    // storm as soon as firmware registers the PRG handler.
-    let deasserted = bits & !libc::TIOCM_DTR;
-    bits |= libc::TIOCM_DTR;
-    if unsafe { libc::ioctl(fd, libc::TIOCMSET, &bits) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("TIOCMSET DTR on failed");
-    }
+    // A console wake must touch only DTR. TIOCMSET rewrites RTS as well, and
+    // the RTS/EN side of CP210x auto-program circuits can reset an ESP even
+    // when the caller only requested PRG/DTR. TIOCMBIS/TIOCMBIC preserve RTS.
+    set_modem_line(fd, libc::TIOCM_DTR, true).context("TIOCMBIS DTR on failed")?;
     std::thread::sleep(Duration::from_millis(hold_ms));
-    if unsafe { libc::ioctl(fd, libc::TIOCMSET, &deasserted) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("TIOCMSET DTR off failed");
-    }
+    set_modem_line(fd, libc::TIOCM_DTR, false).context("TIOCMBIC DTR off failed")?;
     Ok(())
 }
 
@@ -3811,9 +3807,17 @@ impl SerialForwardClient {
     ) -> Result<(bool, bool)> {
         let mut buf = [0_u8; SERIAL_FORWARD_IO_BUFFER_BYTES];
         let mut progressed = false;
+        let mut input_closed = false;
         loop {
             match self.stream.read(&mut buf) {
-                Ok(0) => return Ok((false, progressed)),
+                // A short-lived client such as `printf ... | socat` can write a
+                // complete newline record and close before this nonblocking
+                // loop reaches EOF. Drain the buffered record before removing
+                // the client, otherwise its final command is silently lost.
+                Ok(0) => {
+                    input_closed = true;
+                    break;
+                }
                 Ok(n) => {
                     record_serial_forward_log(
                         serial_log,
@@ -3845,7 +3849,7 @@ impl SerialForwardClient {
             progressed |= !self.input.is_empty();
             self.input.clear();
         }
-        Ok((true, progressed))
+        Ok((!input_closed, progressed))
     }
 
     fn flush_complete_records(

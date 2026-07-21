@@ -59,6 +59,10 @@ def parse_text_record(line):
         return None
     fields = {}
     positional = []
+    record_type = words[0]
+    if "=" in record_type:
+        record_type, value = record_type.split("=", 1)
+        fields[record_type] = _value(value)
     for word in words[1:]:
         if "=" in word:
             key, value = word.split("=", 1)
@@ -66,7 +70,7 @@ def parse_text_record(line):
         else:
             positional.append(_value(word))
     return {
-        "type": words[0],
+        "type": record_type,
         "fields": fields,
         "positional": positional,
         "raw": line,
@@ -178,21 +182,30 @@ class RadioClient:
     def wake(self, milliseconds=120, timeout=None):
         if not 1 <= milliseconds <= 10000:
             raise ValueError("DTR duration must be between 1 and 10000 ms")
-        self.send_line("dtr {}".format(milliseconds))
-        raw = self._receive(
-            timeout or self.timeout,
-            lambda text: "event type=lmesh.dtr ok=true" in text,
-        )
-        # The lmesh acknowledgement confirms the modem-control pulse, while
-        # firmware still needs a short interval to restore UART and PM locks.
-        # Sending immediately races resume and loses the first command.
-        time.sleep(0.3)
+        # Each configured lmesh UDS forward pulses DTR/PRG while accepting a
+        # client. Reconnecting is more robust than sending the lmesh-local
+        # ``dtr`` line on an already-active byte stream: after it has carried
+        # firmware data that record can reach UART0 instead of the forward's
+        # control parser.
+        self.close()
+        self.connect()
+        # lmesh has already held and released DTR before the new stream is
+        # returned. Keep a margin for classic ESP32 UART/APB-clock recovery.
+        time.sleep(0.20)
+        raw = "event type=lmesh.dtr ok=true source=connect hold_ms={}".format(milliseconds)
+        self.wake_uart()
         return raw
 
     def wake_uart(self):
         """Wake a light-sleeping firmware UART without touching modem lines."""
-        self.send_line(b"\n\n\n\n")
-        time.sleep(0.3)
+        # Do not bulk-write this preamble. The APB-clocked UART can resume in
+        # the middle of a bulk write and turn the first real record into a
+        # corrupted command. Separate blank records are intentionally ignored
+        # by firmware and leave a settled boundary before the command.
+        for _ in range(4):
+            self.send_line(b"\n")
+            time.sleep(0.06)
+        time.sleep(0.20)
 
     def reset(self, timeout=None):
         self.send_line("rst")
@@ -214,7 +227,12 @@ class RadioClient:
             normalized = text.replace(PROMPT, "\n")
             for line in normalized.splitlines():
                 line = line.strip()
-                if line == method or line.startswith(method + " ") or line.startswith("error "):
+                if (
+                    line == method
+                    or line.startswith(method + " ")
+                    or line.startswith(method + "=")
+                    or line.startswith("error ")
+                ):
                     return True
             return False
 

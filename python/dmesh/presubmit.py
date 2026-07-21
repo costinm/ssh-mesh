@@ -206,6 +206,74 @@ class PresubmitSuite:
                 raise AssertionError("{} lost {}/{} status responses".format(name, len(failures), attempts))
         return result
 
+    def uart_wake_reliability(self):
+        """Exercise the DTR-to-console wake path after each configured idle gap."""
+        config = self.config.thresholds.get("uart", {})
+        if not config.get("enabled", False):
+            return {"skipped": True, "reason": "thresholds.uart.enabled=false"}
+        rounds = int(config.get("rounds", {"quick": 2, "full": 3, "stress": 10}[self.profile]))
+        idle_sec = float(config.get("idle_sec", 21.0))
+        selected = set(config.get("nodes", self.available))
+        result = {}
+        for name, node in self.nodes.items():
+            if name not in self.available or name not in selected:
+                continue
+            samples = []
+            previous_uptime = None
+            for sequence in range(rounds):
+                if sequence:
+                    time.sleep(idle_sec)
+                node.radio.wake(timeout=self.timeout)
+                status = _fields(node.command("status", timeout=self.timeout), "status")
+                uart = _fields(
+                    node.command(
+                        "power uart_status=true",
+                        timeout=self.timeout,
+                        expected="uart_driver",
+                    ),
+                    "uart_driver",
+                )
+                uptime = status.get("uptime_ms")
+                if not isinstance(uptime, int):
+                    raise AssertionError("{} wake status has no uptime_ms".format(name))
+                if previous_uptime is not None and uptime <= previous_uptime:
+                    raise AssertionError("{} rebooted during UART wake test".format(name))
+                previous_uptime = uptime
+                if not uart.get("uart_active") or uart.get("uart_rx_drop", 0) != 0 or uart.get("uart_rx_err", 0) != 0:
+                    raise AssertionError("{} UART wake counters unhealthy: {}".format(name, uart))
+                samples.append({"uptime_ms": uptime, "uart": uart})
+            result[name] = {"rounds": rounds, "idle_sec": idle_sec, "samples": samples}
+        if not result:
+            raise AssertionError("UART wake test selected no available nodes")
+        probe_delay_sec = float(config.get("output_probe_delay_sec", 21.0))
+        probe_wait_sec = float(config.get("output_probe_wait_sec", probe_delay_sec + 2.0))
+        for name in result:
+            node = self.nodes[name]
+            node.radio.wake(timeout=self.timeout)
+            node.command("power uart_probe_reset=true", timeout=self.timeout)
+            node.command(
+                "power uart_probe_ms={}".format(round(probe_delay_sec * 1000)),
+                timeout=self.timeout,
+            )
+            time.sleep(probe_wait_sec)
+            node.radio.wake(timeout=self.timeout)
+            uart = _fields(
+                node.command(
+                    "power uart_status=true",
+                    timeout=self.timeout,
+                    expected="uart_driver",
+                ),
+                "uart_driver",
+            )
+            if uart.get("uart_probe_dropped", 0) < 1 or uart.get("uart_probe_sent", 0) != 0:
+                raise AssertionError("{} did not gate delayed UART output: {}".format(name, uart))
+            result[name]["output_gate"] = {
+                "probe_delay_sec": probe_delay_sec,
+                "probe_wait_sec": probe_wait_sec,
+                "uart": uart,
+            }
+        return result
+
     def _wifi_mac(self, node):
         fields = _fields(node.command("wifi", timeout=self.timeout), "wifi")
         for key in ("sta_mac", "mac", "ap_mac"):
@@ -434,6 +502,7 @@ class PresubmitSuite:
 
         try:
             run_case("inventory", self.inventory)
+            run_case("uart_wake_reliability", self.uart_wake_reliability)
             run_case("command_reliability", self.command_reliability)
             if self._capable("nan"):
                 run_case("nan_pair", self.nan_pair)

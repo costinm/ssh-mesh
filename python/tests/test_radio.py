@@ -7,6 +7,14 @@ from dmesh.lab import LabConfig, parse_power_sample
 from dmesh.radio import RadioClient, parse_text_record, resolve_radio_socket
 
 
+class RecordingSocket:
+    def __init__(self):
+        self.sent = []
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+
 def test_resolve_radio_socket_is_local_only():
     assert resolve_radio_socket("lora1.lmesh") == "/run/mesh/lmesh/lora1.sock"
     assert resolve_radio_socket("unix:///tmp/radio.sock") == "/tmp/radio.sock"
@@ -55,6 +63,28 @@ def test_radio_command_ignores_wake_prompt_before_matching_response():
     thread.join(timeout=2)
 
 
+def test_radio_command_matches_compact_equals_record():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    client = RadioClient("unused.lmesh", timeout=1.0)
+    client.sock = left
+    left.settimeout(0.05)
+
+    def server():
+        assert right.recv(1024) == b"power uart_status=true\n"
+        right.sendall(b"uart_driver=true uart_active=true\ndm-rs> ")
+
+    thread = threading.Thread(target=server)
+    thread.start()
+    try:
+        result = client.command("power uart_status=true", expected="uart_driver")
+        assert result.record("uart_driver")["fields"]["uart_driver"] is True
+        assert result.record("uart_driver")["fields"]["uart_active"] is True
+    finally:
+        client.close()
+        right.close()
+    thread.join(timeout=2)
+
+
 def test_read_available_is_passive_and_drains_buffer():
     left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     client = RadioClient("unused.lmesh", timeout=1.0)
@@ -74,6 +104,16 @@ def test_read_available_is_passive_and_drains_buffer():
     finally:
         client.close()
         right.close()
+
+
+def test_wake_uart_uses_separate_disposable_records():
+    client = RadioClient("unused.lmesh", timeout=1.0)
+    socket = RecordingSocket()
+    client.sock = socket
+
+    client.wake_uart()
+
+    assert socket.sent == [b"\n", b"\n", b"\n", b"\n"]
 
 
 def test_power_sample_and_lab_config(tmp_path):

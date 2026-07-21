@@ -31,6 +31,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ ESP32_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32" / "dmesh-rs-merged.b
 ESP32S3_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
 SPARSE_FLASH_DIR = FW_RUST / "target" / "flash" / "sparse"
 FLASH_BAUD = 460_800
+DEFAULT_LMESH_CONFIG = Path("/home/system/etc/lmesh/lmesh.toml")
 PREFLASH_FAILURE_MARKERS = (
     "Guru Meditation",
     "Interrupt wdt timeout",
@@ -87,6 +89,19 @@ class Device:
     @property
     def is_classic(self) -> bool:
         return self.chip == "esp32"
+
+
+@dataclass(frozen=True)
+class ForwardSpec:
+    """Persistent lmesh forward settings restored after a direct flash."""
+
+    port: str
+    path: str | None
+    baud: int = FLASH_BAUD
+    tcp_port: int | None = None
+    tcp_mode: str = "framed"
+    dtr: bool = False
+    multi: bool = True
 
 
 def run(
@@ -197,6 +212,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--restore-forwards",
+        action="store_true",
+        help="Start every configured lmesh serial forward, then exit without probing or flashing.",
+    )
+    parser.add_argument(
         "--lmesh-control-socket",
         default=os.environ.get("LMESH_CONTROL_SOCKET"),
         help="lmesh JSONL control UDS.",
@@ -210,8 +230,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lmesh-dtr",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Ask lmesh to pulse DTR on forwarded client connects.",
+        default=None,
+        help="Override configured DTR pulse behavior on forwarded client connects.",
     )
     parser.add_argument(
         "--lmesh-multi",
@@ -323,6 +343,40 @@ def default_ports(control_socket: str) -> list[str]:
     return list(dict.fromkeys(ports))
 
 
+def configured_forward_specs() -> dict[str, ForwardSpec]:
+    """Read persistent serial-forward settings used for automatic restoration."""
+    path = Path(os.environ.get("LMESH_CONFIG_FILE", DEFAULT_LMESH_CONFIG))
+    try:
+        config = tomllib.loads(path.read_text())
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"cannot read lmesh forward config {path}: {exc}") from exc
+    forwards = config.get("serial_forwards", [])
+    if not isinstance(forwards, list):
+        raise RuntimeError(f"invalid serial_forwards in {path}")
+    specs: dict[str, ForwardSpec] = {}
+    for item in forwards:
+        if not isinstance(item, dict) or item.get("enabled") is False:
+            continue
+        port = item.get("port")
+        if not isinstance(port, str) or not logical_usb_port(port):
+            continue
+        path_value = item.get("path")
+        specs[port] = ForwardSpec(
+            port=port,
+            path=path_value if isinstance(path_value, str) else None,
+            baud=int(item.get("baud", FLASH_BAUD)),
+            tcp_port=int(item["tcp_port"]) if isinstance(item.get("tcp_port"), int) else None,
+            tcp_mode=str(item.get("tcp_mode", "rfc2217" if item.get("tcp_port") else "framed")),
+            dtr=bool(item.get("dtr", False)),
+            multi=bool(item.get("multi", True)),
+        )
+    return specs
+
+
+def configured_forward_spec(port: str) -> ForwardSpec | None:
+    return configured_forward_specs().get(port)
+
+
 def split_env_list(key: str) -> list[str]:
     value = os.environ.get(key, "")
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -366,6 +420,9 @@ def physical_port_for(args: argparse.Namespace, logical_port_name: str) -> str:
     forward = lmesh_forward_map(args).get(logical_port_name)
     if forward and isinstance(forward.get("port"), str):
         return str(forward["port"])
+    spec = configured_forward_spec(logical_port_name)
+    if spec and spec.path:
+        return spec.path
     return physical_usb_port(logical_port_name)
 
 
@@ -442,15 +499,23 @@ def lmesh_start_forward(
     tcp_port: int | None,
 ) -> dict[str, object]:
     assert args.lmesh_control_socket
+    spec = configured_forward_spec(logical_port_name)
+    requested_tcp_port = tcp_port if tcp_port is not None else (spec.tcp_port if spec else None)
+    dtr = args.lmesh_dtr if args.lmesh_dtr is not None else (spec.dtr if spec else False)
+    multi = args.lmesh_multi if args.lmesh_multi is not None else (spec.multi if spec else True)
+    baud = spec.baud if spec else FLASH_BAUD
+    tcp_mode = "rfc2217" if requested_tcp_port is not None else "framed"
+    if spec and requested_tcp_port == spec.tcp_port:
+        tcp_mode = spec.tcp_mode
     data = lmesh_request(
         args.lmesh_control_socket,
         "usb.serial.forward.start",
         port=logical_port_name,
-        baud=460800,
-        tcp_port=tcp_port,
-        tcp_mode="rfc2217" if tcp_port is not None else "framed",
-        dtr=args.lmesh_dtr,
-        multi=args.lmesh_multi,
+        baud=baud,
+        tcp_port=requested_tcp_port,
+        tcp_mode=tcp_mode,
+        dtr=dtr,
+        multi=multi,
         handshake=False,
     )
     print(f"lmesh start {logical_port_name}: {data}", flush=True)
@@ -623,71 +688,32 @@ def validate_prebuilt_images(devices: list[Device]) -> None:
 
 
 def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: str) -> None:
-    if port.startswith("rfc2217://"):
-        chip = "esp32s3" if device.is_s3 else "esp32"
-        flash_args, flash_files = sparse_flash_args(device)
-        cmd = [
-            esptool_python(),
-            "-m",
-            "esptool",
-            "--chip",
-            chip,
-            "--port",
-            port,
-            "--baud",
-            str(FLASH_BAUD),
-            "--before",
-            "no_reset" if args.lmesh_mode == "tcp" else "default_reset",
-            "--after",
-            "no_reset" if args.lmesh_mode == "tcp" else "hard_reset",
-            "write_flash",
-        ]
-        cmd.extend(flash_args)
-        for offset, image in flash_files:
-            cmd.extend([offset, str(image)])
-        run_logged(f"flash {device.port}", cmd, cwd=FW_RUST, env=env, tail_lines=24)
-        return
-
-    if device.is_s3:
-        cmd = [
-            "cargo",
-            "espflash",
-            "flash",
-            "--release",
-            "--target",
-            "xtensa-esp32s3-espidf",
-            "--port",
-            port,
-            "--chip",
-            "esp32s3",
-            "--flash-size",
-            args.flash_size_s3,
-            "--baud",
-            str(FLASH_BAUD),
-            "--non-interactive",
-        ]
-        flash_env = env.copy()
-        flash_env.setdefault("ESP_IDF_SDKCONFIG_DEFAULTS", "sdkconfig.heltec_v3.defaults")
-    else:
-        cmd = [
-            "cargo",
-            "espflash",
-            "flash",
-            "--release",
-            "--target",
-            "xtensa-esp32-espidf",
-            "--port",
-            port,
-            "--chip",
-            "esp32",
-            "--flash-size",
-            args.flash_size_esp32,
-            "--baud",
-            str(FLASH_BAUD),
-            "--non-interactive",
-        ]
-        flash_env = env
-    run_logged(f"flash {device.port}", cmd, cwd=FW_RUST, env=flash_env, tail_lines=24)
+    # Always sparse-flash through the esptool RAM stub. This is both more
+    # reliable on direct CP210x bridges than cargo-espflash's retained monitor
+    # handle and protects NVS by omitting its partition entirely.
+    chip = "esp32s3" if device.is_s3 else "esp32"
+    flash_args, flash_files = sparse_flash_args(device)
+    rfc2217 = port.startswith("rfc2217://")
+    cmd = [
+        esptool_python(),
+        "-m",
+        "esptool",
+        "--chip",
+        chip,
+        "--port",
+        port,
+        "--baud",
+        str(FLASH_BAUD),
+        "--before",
+        "no_reset" if rfc2217 else "default_reset",
+        "--after",
+        "no_reset" if rfc2217 else "hard_reset",
+        "write_flash",
+    ]
+    cmd.extend(flash_args)
+    for offset, image in flash_files:
+        cmd.extend([offset, str(image)])
+    run_logged(f"flash {device.port}", cmd, cwd=FW_RUST, env=env, tail_lines=24)
 
 
 def sparse_flash_args(device: Device) -> tuple[list[str], list[tuple[str, Path]]]:

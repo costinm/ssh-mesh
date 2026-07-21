@@ -1369,6 +1369,24 @@ pub fn stop_raw_monitor() -> Result<()> {
     Ok(())
 }
 
+/// Fully release the raw Wi-Fi driver for a bounded sleep interval.
+///
+/// `esp_wifi_stop()` alone leaves the Wi-Fi task and driver allocation alive.
+/// Raw-NAN duty cycling needs the modem genuinely off between discovery
+/// windows, so the next window deliberately performs a fresh initialization.
+pub fn stop_raw_wifi_for_sleep() -> Result<()> {
+    low_level_stop_wifi()?;
+    // ESP32-S3 clears the Wi-Fi modem sleep-reject source asynchronously
+    // after esp_wifi_deinit().  Sleeping in the same scheduling slice is
+    // rejected even with timer-only wake configured, so yield once before the
+    // raw-NAN scheduler calls esp_light_sleep_start().
+    unsafe {
+        sys::vTaskDelay((100 * sys::configTICK_RATE_HZ / 1_000).max(1));
+    }
+    telemetry::record_log("event type=wifi.raw_sleep off=true");
+    Ok(())
+}
+
 fn raw_tx(bytes: &[u8], request: &CommandRequest) -> Result<()> {
     if bytes.len() < 24 || bytes.len() > 1500 {
         bail!(

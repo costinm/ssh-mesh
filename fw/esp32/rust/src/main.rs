@@ -1,6 +1,5 @@
 use anyhow::Result;
-use esp_idf_svc::log::EspLogger;
-use std::ffi::c_char;
+use std::ffi::{c_char, c_int};
 use std::time::{Duration, Instant};
 
 mod commands;
@@ -35,22 +34,20 @@ fn run() -> Result<()> {
     esp_idf_sys::link_patches();
     components::wake::register_main_task();
     init_console_uart();
-    rom_print(b"dm-rs boot step=logger\n\0");
-    EspLogger::initialize_default();
     quiet_runtime_logs();
 
     let wake_cause = unsafe { esp_idf_sys::esp_sleep_get_wakeup_cause() };
-    rom_print(b"dm-rs boot step=settings\n\0");
+    boot_print("dm-rs boot step=settings\n");
     let settings = components::settings::open_shared();
     components::serial::configure_active_window(&settings);
-    rom_print(b"dm-rs boot step=power\n\0");
+    boot_print("dm-rs boot step=power\n");
     if let Err(err) = components::power::apply_default(&settings) {
         components::telemetry::record_log(format!(
             "event type=power.default ok=false msg={}",
             commands::protocol::escape_value(&err.to_string())
         ));
     }
-    rom_print(b"dm-rs boot step=wake\n\0");
+    boot_print("dm-rs boot step=wake\n");
     if let Err(err) = components::sleep::handle_deep_sleep_wake() {
         components::telemetry::record_log(format!(
             "event type=sleep.error phase=wake message={}",
@@ -58,7 +55,7 @@ fn run() -> Result<()> {
         ));
     }
 
-    rom_print(b"dm-rs boot step=button\n\0");
+    boot_print("dm-rs boot step=button\n");
     if let Err(err) = components::button::initialize(&settings) {
         components::telemetry::record_log(format!(
             "ev=button.err op=init err={}",
@@ -66,11 +63,11 @@ fn run() -> Result<()> {
         ));
     }
 
-    rom_print(b"dm-rs boot step=registry\n\0");
+    boot_print("dm-rs boot step=registry\n");
     let mut registry = CommandRegistry::new();
     components::register_commands(&mut registry, settings.clone());
 
-    rom_print(b"dm-rs boot step=ble_config\n\0");
+    boot_print("dm-rs boot step=ble_config\n");
     let companion_setting = settings.borrow().get_bool("ble.comp", true);
     if let Err(err) = &companion_setting {
         let line = format!(
@@ -86,10 +83,10 @@ fn run() -> Result<()> {
         .max(0) as u32;
     components::ble_bt::configure_companion_advertising(30_000, 5_000);
     components::ble_bt::configure_companion_active_window(companion_active_ms);
-    rom_print(b"dm-rs boot step=boot_window\n\0");
+    boot_print("dm-rs boot step=boot_window\n");
     let boot_window = run_boot_active_window(wake_cause, &mut registry);
     apply_post_boot_uart_policy(&boot_window);
-    rom_print(b"dm-rs boot step=mode\n\0");
+    boot_print("dm-rs boot step=mode\n");
     if boot_window.pairing_recovery {
         match components::ble_bt::start_pairing_recovery(&settings) {
             Ok(removed) => {
@@ -116,28 +113,26 @@ fn run() -> Result<()> {
     }
 
     if boot_window.pairing_recovery {
-        rom_print(b"dm-rs boot step=mesh_skip_pairing\n\0");
+        boot_print("dm-rs boot step=mesh_skip_pairing\n");
         components::telemetry::record_log(
             "event type=mesh.start skipped=true reason=pairing_recovery",
         );
     } else {
-        rom_print(b"dm-rs boot step=mesh\n\0");
+        boot_print("dm-rs boot step=mesh\n");
         let mut mesh = L3Mesh::new();
-        rom_print(b"dm-rs boot step=mesh_ble_local_only\n\0");
-        rom_print(b"dm-rs boot step=mesh_lora\n\0");
+        boot_print("dm-rs boot step=mesh_ble_local_only\n");
+        boot_print("dm-rs boot step=mesh_lora\n");
         mesh.add_transport(components::lora::transport(settings.clone()));
-        rom_print(b"dm-rs boot step=mesh_nan\n\0");
+        boot_print("dm-rs boot step=mesh_nan\n");
         mesh.add_transport(components::nan::transport());
     }
 
     let ready = "event type=system.ready app=dmesh-rs";
     components::telemetry::record_log(ready);
-    components::serial::activate_window();
-    rom_print(b"dm-rs boot step=console\n\0");
-    uart_write("dm-rs> ");
-    // Install the edge handler only after the UART manager and boot probe are
-    // live. DTR/PRG then opens a 20-second console-active window without
-    // racing early startup or the boot long-press pairing recovery path.
+    boot_print("dm-rs boot step=console\n");
+    // GPIO0 is shared by physical PRG and CP210x DTR. Its ISR only coalesces
+    // an edge and wakes the button task; all GPIO re-arm/classification work
+    // runs outside interrupt context.
     match components::button::start_runtime_interrupts() {
         Ok(()) => components::telemetry::record_log("event type=button.runtime_interrupt ok=true"),
         Err(err) => components::telemetry::record_log(format!(
@@ -174,6 +169,7 @@ fn run() -> Result<()> {
             }
         }
         components::serial::poll_active_window();
+        components::serial::poll_output_probe();
     }
 }
 
@@ -232,32 +228,20 @@ fn run_boot_active_window(
     components::telemetry::record_log(
         "event type=boot_window barrier=true action=watch_prg_and_console",
     );
-    uart_write("event type=boot_window barrier=true action=watch_prg_and_console\n");
     components::telemetry::record_log(format!(
         "event type=boot_window start=true cause={} probe_long_press={} window_ms={}",
         wake_cause_name(wake_cause),
         probe_long_press,
         boot_active_window_ms()
     ));
-    uart_write(&format!(
-        "event type=boot_window start=true cause={} probe_long_press={} gpio={} pressed={}\n",
-        wake_cause_name(wake_cause),
-        probe_long_press,
-        components::button::configured_gpio()
-            .map(|pin| pin.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        boot_pressed
-    ));
 
     let deadline = Instant::now() + Duration::from_millis(boot_active_window_ms() as u64);
     let mut uart_input = false;
-    uart_write("dm-rs> ");
     if boot_pressed {
         let hold = Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64);
         let _ = wait_for_firmware_activity(hold);
         uart_input |= poll_boot_console(registry);
         if components::button::is_pressed() {
-            uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
             components::button::suppress_until_release();
             components::telemetry::record_log(
                 "event type=boot_window long_press=true pending=pairing_recovery",
@@ -275,7 +259,6 @@ fn run_boot_active_window(
     while Instant::now() < deadline {
         uart_input |= poll_boot_console(registry);
         if probe_long_press && components::button::take_long_presses() > 0 {
-            uart_write("event type=boot_window long_press=true action=pairing_recovery\n");
             components::button::suppress_until_release();
             components::telemetry::record_log(
                 "event type=boot_window long_press=true pending=pairing_recovery",
@@ -415,6 +398,9 @@ fn poll_nan_commands(
     registry: &mut CommandRegistry,
     settings: &components::settings::SharedSettings,
 ) {
+    // Wi-Fi's promiscuous callback only enqueues fixed-size management frames.
+    // Parsing and command dispatch happen here, outside the driver context.
+    components::nan::poll_rx();
     while let Some(command) = components::nan::take_command() {
         components::telemetry::record_log(format!(
             "event type=nan.command len={}",
@@ -441,11 +427,19 @@ fn rom_print(message: &'static [u8]) {
     }
 }
 
+/// Boot progress is retained in telemetry only. UART output is demand-driven:
+/// emitting boot logs before a console client wakes it can leave UART0's IDF
+/// ISR active through the radio startup transition.
+fn boot_print(message: &str) {
+    components::telemetry::record_log(message.trim());
+}
+
 fn init_console_uart() {
     const UART0: esp_idf_sys::uart_port_t = esp_idf_sys::uart_port_t_UART_NUM_0;
-    const UART0_VFS: core::ffi::c_int = esp_idf_sys::uart_port_t_UART_NUM_0 as core::ffi::c_int;
-
     unsafe {
+        // RX uses ESP-IDF's proven interrupt/event queue. TX has no driver
+        // buffer or TX-empty interrupt; serial.rs owns it with direct FIFO
+        // writes, avoiding the classic ESP32 UART TX ISR watchdog failure.
         let mut config = esp_idf_sys::uart_config_t::default();
         config.baud_rate = 460_800;
         config.data_bits = esp_idf_sys::uart_word_length_t_UART_DATA_8_BITS;
@@ -453,35 +447,55 @@ fn init_console_uart() {
         config.stop_bits = esp_idf_sys::uart_stop_bits_t_UART_STOP_BITS_1;
         config.flow_ctrl = esp_idf_sys::uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE;
         config.__bindgen_anon_1.source_clk = uart_source_clk();
-
         let _ = esp_idf_sys::uart_param_config(UART0, &config);
+        preserve_uart0_pins_in_light_sleep();
+
         let mut queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
-        let mut install = esp_idf_sys::uart_driver_install(UART0, 2048, 1024, 16, &mut queue, 0);
+        let mut install = esp_idf_sys::uart_driver_install(UART0, 2048, 0, 16, &mut queue, 0);
         if install == esp_idf_sys::ESP_ERR_INVALID_STATE {
-            // ESP-IDF may have installed its stdio UART0 driver before app_main.
-            // It has no event queue we can own, so replace it rather than silently
-            // accepting a console that can write but never receive commands.
             let _ = esp_idf_sys::uart_driver_delete(UART0);
-            queue = core::ptr::null_mut();
-            install = esp_idf_sys::uart_driver_install(UART0, 2048, 1024, 16, &mut queue, 0);
+            install = esp_idf_sys::uart_driver_install(UART0, 2048, 0, 16, &mut queue, 0);
         }
-        if install == esp_idf_sys::ESP_OK {
-            if !queue.is_null() {
-                let _ = components::serial::start_ingress_task(queue);
+        if install == esp_idf_sys::ESP_OK && !queue.is_null() {
+            let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 1);
+            let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
+            // UART0 is APB-clocked on classic ESP32. Outside the console
+            // window it may enter light sleep, so use a small wake threshold
+            // and require the host to send a disposable preamble first.
+            let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
+            let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
+            match components::serial::start_ingress_task(queue) {
+                Ok(()) => {
+                    components::serial::activate_window();
+                    rom_print(b"event type=uart.rx_queue state=ready baud=460800 tx_isr=false\n\0");
+                }
+                Err(err) => {
+                    rom_print(b"event type=uart.rx_queue state=failed\n\0");
+                    components::telemetry::record_log(&format!(
+                        "event type=uart.rx_queue err={err}"
+                    ));
+                }
             }
-            esp_idf_sys::esp_vfs_dev_uart_use_driver(UART0_VFS);
-            esp_idf_sys::esp_vfs_dev_uart_port_set_rx_line_endings(
-                UART0_VFS,
-                esp_idf_sys::esp_line_endings_t_ESP_LINE_ENDINGS_LF,
-            );
-            esp_idf_sys::esp_vfs_dev_uart_port_set_tx_line_endings(
-                UART0_VFS,
-                esp_idf_sys::esp_line_endings_t_ESP_LINE_ENDINGS_CRLF,
-            );
-            components::serial::activate_window();
+        } else {
+            rom_print(b"event type=uart.rx_queue state=failed\n\0");
         }
     }
 }
+
+#[cfg(target_feature = "esp32s3ops")]
+fn preserve_uart0_pins_in_light_sleep() {
+    unsafe {
+        // ESP32-S3 UART0 is fixed to TX=GPIO43/RX=GPIO44. IDF otherwise
+        // switches those pins to its automatic GPIO sleep configuration,
+        // preventing DTR/UART RX from waking the console while raw-NAN is
+        // between Wi-Fi windows.
+        let _ = esp_idf_sys::gpio_sleep_sel_dis(43);
+        let _ = esp_idf_sys::gpio_sleep_sel_dis(44);
+    }
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
+fn preserve_uart0_pins_in_light_sleep() {}
 
 #[cfg(target_feature = "esp32s3ops")]
 fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
@@ -490,9 +504,6 @@ fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
 
 #[cfg(not(target_feature = "esp32s3ops"))]
 fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
-    // REF_TICK is only 1 MHz and cannot represent 460800 baud accurately on
-    // classic ESP32; it silently corrupts RX. Classic ESP-IDF exposes APB as
-    // the accurate source. The active UART PM lock keeps that clock stable.
     esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_APB
 }
 
@@ -509,8 +520,9 @@ fn uart_write(text: &str) {
 }
 
 fn quiet_runtime_logs() {
-    log::set_max_level(log::LevelFilter::Warn);
+    log::set_max_level(log::LevelFilter::Off);
     unsafe {
+        let _ = esp_idf_sys::esp_log_set_vprintf(Some(discard_log_vprintf));
         set_esp_log_level(b"*\0", esp_idf_sys::esp_log_level_t_ESP_LOG_WARN);
         set_esp_log_level(b"BT_APPL\0", esp_idf_sys::esp_log_level_t_ESP_LOG_NONE);
         set_esp_log_level(b"BT_BTM\0", esp_idf_sys::esp_log_level_t_ESP_LOG_NONE);
@@ -519,6 +531,13 @@ fn quiet_runtime_logs() {
         set_esp_log_level(b"nan_app\0", esp_idf_sys::esp_log_level_t_ESP_LOG_NONE);
         set_esp_log_level(b"wifi\0", esp_idf_sys::esp_log_level_t_ESP_LOG_NONE);
     }
+}
+
+unsafe extern "C" fn discard_log_vprintf(
+    _format: *const c_char,
+    _args: esp_idf_sys::va_list,
+) -> c_int {
+    0
 }
 
 unsafe fn set_esp_log_level(tag: &'static [u8], level: esp_idf_sys::esp_log_level_t) {
