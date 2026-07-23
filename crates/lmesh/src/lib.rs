@@ -674,6 +674,26 @@ pub enum Request {
         #[serde(default)]
         reset: Option<bool>,
     },
+    /// Start a background LoRa discovery stability runner through managed UDS forwards.
+    #[serde(rename = "esp.stability.start")]
+    EspStabilityStart {
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        expected: Option<String>,
+        #[serde(default)]
+        interval_sec: Option<u64>,
+        #[serde(default)]
+        wait_sec: Option<u64>,
+        #[serde(default)]
+        cycles: Option<u32>,
+    },
+    /// Return the latest managed LoRa discovery stability result.
+    #[serde(rename = "esp.stability.status")]
+    EspStabilityStatus,
+    /// Stop the managed LoRa discovery stability runner.
+    #[serde(rename = "esp.stability.stop")]
+    EspStabilityStop,
     /// Probe ESP ADC pins used for battery detection.
     #[serde(rename = "esp.battery.adc_probe")]
     EspBatteryAdcProbe {
@@ -1162,6 +1182,25 @@ impl LmeshService {
             } => mesh::protocol::Response::ok_with_data(
                 self.radio.esp_telemetry_stats(adapter, port, reset),
             ),
+            Request::EspStabilityStart {
+                source,
+                expected,
+                interval_sec,
+                wait_sec,
+                cycles,
+            } => mesh::protocol::Response::ok_with_data(self.radio.stability_start(
+                source,
+                expected,
+                interval_sec,
+                wait_sec,
+                cycles,
+            )),
+            Request::EspStabilityStatus => {
+                mesh::protocol::Response::ok_with_data(self.radio.stability_status())
+            }
+            Request::EspStabilityStop => {
+                mesh::protocol::Response::ok_with_data(self.radio.stability_stop())
+            }
             Request::EspBatteryAdcProbe {
                 adapter,
                 port,

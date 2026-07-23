@@ -58,7 +58,11 @@ const UART_TX_QUEUE_LEN: u32 = 16;
 // Keep every driver write below the hardware FIFO capacity. The task waits
 // for idle before each chunk, so ESP-IDF never enables its TX-empty ISR.
 const UART_TX_FRAME_MAX: usize = 512;
-const UART_TX_FIFO_CHUNK: usize = 64;
+// At 460800 baud a 32-byte chunk drains in less than a millisecond.  Leave a
+// full FreeRTOS tick before the next one instead of using the driver's
+// TX-done/TX-empty ISR path.
+const UART_TX_FIFO_CHUNK: usize = 32;
+const UART_TX_FIFO_DRAIN_MS: u32 = 2;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,8 +147,8 @@ pub fn configure_active_window(settings: &SharedSettings) {
     activate_window();
 }
 
-/// Start the single UART ingress task after UART0 has been installed with an
-/// IDF event queue. No other firmware task may call `uart_read_bytes`.
+/// Start the single UART ingress task after UART0 has installed an IDF RX
+/// event queue. No other firmware task may call `uart_read_bytes`.
 pub fn start_ingress_task(event_queue: sys::QueueHandle_t) -> Result<(), sys::esp_err_t> {
     if !UART0_EVENT_TASK.load(Ordering::Acquire).is_null() {
         return Ok(());
@@ -275,11 +279,9 @@ pub fn finish_pending_uninstall() -> std::result::Result<bool, sys::esp_err_t> {
     if !tx_task.is_null() {
         unsafe { sys::vTaskDelete(tx_task) };
     }
-    let delete = unsafe { sys::uart_driver_delete(sys::uart_port_t_UART_NUM_0) };
-    if delete != sys::ESP_OK && delete != sys::ESP_ERR_INVALID_STATE {
-        UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-        return Err(delete);
-    }
+    unsafe {
+        let _ = sys::uart_driver_delete(sys::uart_port_t_UART_NUM_0);
+    };
     UART0_DRIVER_INSTALLED.store(false, Ordering::Release);
     UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
     UART0_TX_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
@@ -287,6 +289,7 @@ pub fn finish_pending_uninstall() -> std::result::Result<bool, sys::esp_err_t> {
 }
 
 pub fn activate_window() {
+    poll_output_probe();
     if !UART0_DEBUG_ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -590,9 +593,7 @@ fn release_no_light_sleep_lock() {
 }
 
 fn now_ms() -> u32 {
-    let ticks = unsafe { sys::xTaskGetTickCount() } as u64;
-    let hz = sys::configTICK_RATE_HZ as u64;
-    ticks.saturating_mul(1000).saturating_div(hz.max(1)) as u32
+    unsafe { (sys::esp_timer_get_time() / 1000) as u32 }
 }
 
 fn time_after_or_equal(now: u32, deadline: u32) -> bool {
@@ -635,9 +636,32 @@ unsafe extern "C" fn uart_manager_task(arg: *mut c_void) {
     }
 }
 
+fn drain_driver_rx(parser: &mut UartParser) {
+    let mut bytes = [0_u8; 128];
+    loop {
+        let received = unsafe {
+            sys::uart_read_bytes(
+                sys::uart_port_t_UART_NUM_0,
+                bytes.as_mut_ptr().cast::<c_void>(),
+                bytes.len() as u32,
+                0,
+            )
+        };
+        if received <= 0 {
+            break;
+        }
+        crate::components::telemetry::record_uart_read(received as usize);
+        for byte in &bytes[..received as usize] {
+            if let Some((kind, frame)) = parser.push(*byte) {
+                enqueue_frame(kind, frame);
+            }
+        }
+    }
+}
+
 /// The only task that writes UART0 after the driver is installed. Radio and
-/// BLE callbacks enqueue records; each write is FIFO-bounded so the driver's
-/// TX-empty ISR is never armed on classic ESP32.
+/// BLE callbacks enqueue records; `uart_tx_chars` copies directly into the
+/// hardware FIFO and never arms the driver's TX-empty refill ISR.
 unsafe extern "C" fn uart_tx_task(arg: *mut c_void) {
     let queue = arg.cast::<sys::QueueDefinition>();
     loop {
@@ -657,49 +681,23 @@ unsafe extern "C" fn uart_tx_task(arg: *mut c_void) {
         }
         let len = queued.len as usize;
         for chunk in queued.data[..len].chunks(UART_TX_FIFO_CHUNK) {
-            let wait = unsafe {
-                sys::uart_wait_tx_done(
+            // `uart_write_bytes` enables TXFIFO_EMPTY when it needs a refill.
+            // `uart_wait_tx_done` enables another driver TX interrupt. Both
+            // have produced a CPU0 interrupt-WDT loop on classic ESP32. A
+            // FIFO-bounded direct write plus a task delay needs neither.
+            let written = unsafe {
+                sys::uart_tx_chars(
                     sys::uart_port_t_UART_NUM_0,
-                    (100 * sys::configTICK_RATE_HZ / 1_000).max(1),
+                    chunk.as_ptr().cast::<c_char>(),
+                    chunk.len() as u32,
                 )
-            };
-            let written = if wait == sys::ESP_OK {
-                unsafe {
-                    sys::uart_write_bytes(
-                        sys::uart_port_t_UART_NUM_0,
-                        chunk.as_ptr().cast::<c_void>(),
-                        chunk.len(),
-                    )
-                }
-            } else {
-                -1
             };
             if written != chunk.len() as i32 {
                 UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
                 break;
             }
-        }
-    }
-}
-
-fn drain_driver_rx(parser: &mut UartParser) {
-    let mut buf = [0_u8; 128];
-    loop {
-        let read = unsafe {
-            sys::uart_read_bytes(
-                sys::uart_port_t_UART_NUM_0,
-                buf.as_mut_ptr().cast::<c_void>(),
-                buf.len() as u32,
-                0,
-            )
-        };
-        if read <= 0 {
-            break;
-        }
-        crate::components::telemetry::record_uart_read(read as usize);
-        for byte in &buf[..read as usize] {
-            if let Some((kind, frame)) = parser.push(*byte) {
-                enqueue_frame(kind, frame);
+            unsafe {
+                sys::vTaskDelay((UART_TX_FIFO_DRAIN_MS * sys::configTICK_RATE_HZ / 1_000).max(1));
             }
         }
     }
@@ -790,9 +788,9 @@ impl UartParser {
                 if self.length_count != 3 {
                     return None;
                 }
-                self.remaining = self.length_bytes[0] as usize
+                self.remaining = ((self.length_bytes[0] as usize) << 16)
                     | ((self.length_bytes[1] as usize) << 8)
-                    | ((self.length_bytes[2] as usize) << 16);
+                    | self.length_bytes[2] as usize;
                 self.data.clear();
                 if self.remaining == 0 || self.remaining > UART_MAX_FRAME {
                     UART0_RX_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -813,6 +811,23 @@ impl UartParser {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UartFrameKind, UartParser};
+
+    #[test]
+    fn binary_uart_length_is_network_order_u24() {
+        let mut parser = UartParser::default();
+        let mut frame = None;
+        for byte in [0, 0, 0, 5, 1, 2, 3, 4, 5] {
+            frame = parser.push(byte).or(frame);
+        }
+        let (kind, data) = frame.expect("complete five-byte record");
+        assert_eq!(kind, UartFrameKind::Binary);
+        assert_eq!(data, [1, 2, 3, 4, 5]);
     }
 }
 

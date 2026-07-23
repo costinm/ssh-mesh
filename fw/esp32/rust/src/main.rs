@@ -183,10 +183,7 @@ fn drain_uart_console(
         match frame.kind {
             components::serial::UartFrameKind::Text => {
                 let command = core::str::from_utf8(&frame.data).unwrap_or("").trim();
-                if !command.is_empty() {
-                    uart_write(&transports::dispatch_text_line(registry, command));
-                }
-                uart_write("dm-rs> ");
+                write_text_console_response(registry, command);
             }
             components::serial::UartFrameKind::Binary => {
                 let response = transports::dispatch_binary_packet(registry, &frame.data);
@@ -315,10 +312,7 @@ fn poll_boot_console(registry: &mut CommandRegistry) -> bool {
         match frame.kind {
             components::serial::UartFrameKind::Text => {
                 let command = core::str::from_utf8(&frame.data).unwrap_or("").trim();
-                if !command.is_empty() {
-                    uart_write(&transports::dispatch_text_line(registry, command));
-                }
-                uart_write("dm-rs> ");
+                write_text_console_response(registry, command);
             }
             components::serial::UartFrameKind::Binary => {
                 components::serial::write_bytes(&transports::dispatch_binary_packet(
@@ -355,7 +349,7 @@ fn wake_cause_name(cause: esp_idf_sys::esp_sleep_source_t) -> &'static str {
 
 fn poll_raw_wifi_commands(
     registry: &mut CommandRegistry,
-    settings: &components::settings::SharedSettings,
+    _settings: &components::settings::SharedSettings,
 ) {
     components::telemetry::record_raw_poll();
     while let Some(command) = components::wifi::take_raw_command() {
@@ -368,23 +362,14 @@ fn poll_raw_wifi_commands(
             command.source[3],
             command.source[4],
             command.source[5],
-            command.text.len(),
+            command.payload.len(),
             command.rssi
         ));
-        let response = if command.text.starts_with("dmesh.ping") {
-            let source = match command.response {
-                components::wifi::WifiResponsePath::Action => "wifi_raw",
-                components::wifi::WifiResponsePath::Data => "wifi_data",
-            };
-            components::mode::status_pong_text(settings, source)
-        } else {
-            transports::dispatch_text_line(registry, &command.text)
-        };
-        let response = format!("resp {response}");
+        let response_payload = transports::dispatch_binary_packet(registry, &command.payload);
         if let Err(err) = components::wifi::send_response_payload_to(
             command.response,
             command.source,
-            response.as_bytes(),
+            &response_payload,
         ) {
             components::telemetry::record_log(format!(
                 "event type=wifi.raw_response ok=false msg={}",
@@ -396,23 +381,16 @@ fn poll_raw_wifi_commands(
 
 fn poll_nan_commands(
     registry: &mut CommandRegistry,
-    settings: &components::settings::SharedSettings,
+    _settings: &components::settings::SharedSettings,
 ) {
-    // Wi-Fi's promiscuous callback only enqueues fixed-size management frames.
-    // Parsing and command dispatch happen here, outside the driver context.
     components::nan::poll_rx();
     while let Some(command) = components::nan::take_command() {
         components::telemetry::record_log(format!(
             "event type=nan.command len={}",
-            command.text.len()
+            command.payload.len()
         ));
-        let response = if command.text.starts_with("dmesh.ping") {
-            components::mode::status_pong_text(settings, "nan")
-        } else {
-            transports::dispatch_text_line(registry, &command.text)
-        };
-        let response = format!("resp {response}");
-        if let Err(err) = components::nan::send_response_payload_to(&command, response.as_bytes()) {
+        let response_payload = transports::dispatch_binary_packet(registry, &command.payload);
+        if let Err(err) = components::nan::queue_response_payload_to(&command, &response_payload) {
             components::telemetry::record_log(format!(
                 "event type=nan.response ok=false msg={}",
                 commands::protocol::escape_value(&err.to_string())
@@ -450,36 +428,61 @@ fn init_console_uart() {
         let _ = esp_idf_sys::uart_param_config(UART0, &config);
         preserve_uart0_pins_in_light_sleep();
 
+        // Use ESP-IDF's RX event queue. The driver owns RX interrupts and
+        // reports complete data/overflow events to serial.rs; no application
+        // task blocks directly on UART0. TX has no driver buffer and remains
+        // direct FIFO writes from serial.rs, avoiding TX-empty ISR loops.
         let mut queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
-        let mut install = esp_idf_sys::uart_driver_install(UART0, 2048, 0, 16, &mut queue, 0);
+        let mut install = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut queue, 0);
         if install == esp_idf_sys::ESP_ERR_INVALID_STATE {
             let _ = esp_idf_sys::uart_driver_delete(UART0);
-            install = esp_idf_sys::uart_driver_install(UART0, 2048, 0, 16, &mut queue, 0);
+            install = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut queue, 0);
         }
-        if install == esp_idf_sys::ESP_OK && !queue.is_null() {
-            let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 1);
-            let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
-            // UART0 is APB-clocked on classic ESP32. Outside the console
-            // window it may enter light sleep, so use a small wake threshold
-            // and require the host to send a disposable preamble first.
-            let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
-            let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
-            match components::serial::start_ingress_task(queue) {
-                Ok(()) => {
-                    components::serial::activate_window();
-                    rom_print(b"event type=uart.rx_queue state=ready baud=460800 tx_isr=false\n\0");
-                }
-                Err(err) => {
-                    rom_print(b"event type=uart.rx_queue state=failed\n\0");
-                    components::telemetry::record_log(&format!(
-                        "event type=uart.rx_queue err={err}"
-                    ));
-                }
-            }
-        } else {
+        if install != esp_idf_sys::ESP_OK || queue.is_null() {
             rom_print(b"event type=uart.rx_queue state=failed\n\0");
+            components::telemetry::record_log(format!(
+                "event type=uart.rx_queue state=failed err={install}"
+            ));
+            return;
+        }
+        let (tx_pin, rx_pin) = uart0_pins();
+        // A replaced early-console driver does not retain a portable pin
+        // attachment. UART0 is GPIO1/3 on classic ESP32 and GPIO43/44 on the
+        // S3 external bridge used by the Heltec V3 test board.
+        let _ = esp_idf_sys::uart_set_pin(UART0, tx_pin, rx_pin, -1, -1);
+        let _ = esp_idf_sys::uart_disable_tx_intr(UART0);
+        // A console line is much smaller than the default FIFO threshold;
+        // use the hardware timeout to wake the RX manager after short input.
+        let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 1);
+        let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
+        esp_idf_sys::uart_set_always_rx_timeout(UART0, true);
+        let _ = esp_idf_sys::uart_enable_rx_intr(UART0);
+        let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
+        let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
+        match components::serial::start_ingress_task(queue) {
+            Ok(()) => {
+                components::serial::activate_window();
+                rom_print(b"event type=uart.rx_queue state=ready baud=460800 tx_isr=false\n\0");
+                components::telemetry::record_log(
+                    "event type=uart.rx_queue state=ready baud=460800 tx_isr=false",
+                );
+            }
+            Err(err) => {
+                rom_print(b"event type=uart.rx_queue state=failed\n\0");
+                components::telemetry::record_log(&format!("event type=uart.rx_queue err={err}"));
+            }
         }
     }
+}
+
+#[cfg(target_feature = "esp32s3ops")]
+fn uart0_pins() -> (i32, i32) {
+    (43, 44)
+}
+
+#[cfg(not(target_feature = "esp32s3ops"))]
+fn uart0_pins() -> (i32, i32) {
+    (1, 3)
 }
 
 #[cfg(target_feature = "esp32s3ops")]
@@ -517,6 +520,22 @@ fn wait_for_firmware_activity(timeout: Duration) -> UartWait {
 
 fn uart_write(text: &str) {
     components::serial::write(text);
+}
+
+/// Queue a complete text-console record atomically relative to its prompt.
+///
+/// The forwarded debug client uses `dm-rs> ` as the response boundary.  Queuing
+/// a command result and its prompt separately lets an idle/raw-NAN transition
+/// race the second enqueue, leaving the caller with a valid result but no
+/// completion marker.
+fn write_text_console_response(registry: &mut CommandRegistry, command: &str) {
+    let mut response = if command.is_empty() {
+        String::new()
+    } else {
+        transports::dispatch_text_line(registry, command)
+    };
+    response.push_str("dm-rs> ");
+    uart_write(&response);
 }
 
 fn quiet_runtime_logs() {

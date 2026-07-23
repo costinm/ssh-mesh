@@ -80,39 +80,39 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
 
     #[cfg(target_feature = "esp32s3ops")]
     {
-        // On ESP32-S3 the Wi-Fi modem can retain its internal sleep-reject
-        // trigger briefly after a full raw-driver teardown. Explicit
-        // esp_light_sleep_start() then returns ESP_ERR_SLEEP_REJECT even with
-        // timer-only wake configured. Let IDF PM/tickless idle enter light
-        // sleep instead. The UART ingress and GPIO0 button tasks notify the
-        // main task, so this must wait on that notification rather than use a
-        // blind vTaskDelay: otherwise a valid UART wake is parsed but command
-        // dispatch remains delayed until the NAN timer interval expires.
-        // Re-arm the hardware wake sources for every raw-NAN idle boundary.
-        // The normal light-sleep profile can clear the shared sleep source
-        // mask, and automatic PM ultimately enters esp_light_sleep_start()
-        // from its tickless-idle hook.
-        configure_light_wake_sources(settings, sleep_ms, true, false, true)?;
+        // Do not rely on automatic PM here. The S3 has long-lived Wi-Fi and
+        // system tasks, so a FreeRTOS notification wait can remain runnable
+        // while tickless idle never calls into light sleep. GPIO0 is shared by
+        // physical PRG and the CP210x DTR line and is the explicit console
+        // wake source; leave UART RX out of the sleep mask because its level
+        // detector can remain asserted by the bridge and reject the request.
+        configure_light_wake_sources(settings, sleep_ms, false, false, true)?;
         super::serial::suspend_for_light_sleep();
         RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
         let before_us = now_us();
-        let notified = super::wake::wait(Duration::from_millis(sleep_ms as u64));
+        let ret = unsafe { sys::esp_light_sleep_start() };
         let elapsed_ms = now_us()
             .saturating_sub(before_us)
             .saturating_div(1000)
             .min(u32::MAX as u64) as u32;
         RAW_NAN_LIGHT_LAST_MS.store(elapsed_ms, Ordering::Relaxed);
-        RAW_NAN_LIGHT_LAST_CAUSE.store(
-            if notified {
-                sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART as u32
-            } else {
-                sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_TIMER as u32
-            },
-            Ordering::Relaxed,
-        );
-        RAW_NAN_LIGHT_LAST_RET.store(sys::ESP_OK as u32, Ordering::Relaxed);
-        RAW_NAN_LIGHT_WAKE_OK.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+        let cause = unsafe { sys::esp_sleep_get_wakeup_cause() };
+        RAW_NAN_LIGHT_LAST_CAUSE.store(cause as u32, Ordering::Relaxed);
+        RAW_NAN_LIGHT_LAST_RET.store(ret as u32, Ordering::Relaxed);
+        // GPIO0 is both PRG and the CP210x DTR line. DTR is a pulse, so the
+        // level may already be released when esp_light_sleep_start returns.
+        // It is the only GPIO source armed for this S3 raw-NAN interval;
+        // LoRa DIO is intentionally not registered here.
+        if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO {
+            super::serial::rearm_after_wake();
+            telemetry::record_log("event type=uart.wake source=gpio phase=light_sleep_return");
+        }
+        if ret == sys::ESP_OK {
+            RAW_NAN_LIGHT_WAKE_OK.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        RAW_NAN_LIGHT_WAKE_FAIL.fetch_add(1, Ordering::Relaxed);
+        return esp_ok(ret);
     }
 
     #[cfg(not(target_feature = "esp32s3ops"))]
@@ -143,17 +143,19 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         RAW_NAN_LIGHT_LAST_MS.store(elapsed_ms, Ordering::Relaxed);
         RAW_NAN_LIGHT_LAST_CAUSE.store(cause as u32, Ordering::Relaxed);
         RAW_NAN_LIGHT_LAST_RET.store(ret as u32, Ordering::Relaxed);
-        if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO
-            || cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART
-        {
-            // GPIO0/DTR and UART wake light sleep without necessarily running the
-            // normal GPIO task. Re-arm the event-driven console before the host
-            // sends its actual command. Timer/NAN wakes stay idle.
+        let button_wake =
+            cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO && super::button::is_pressed();
+        if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_UART || button_wake {
+            // A real UART edge or asserted GPIO0/PRG wake owns the console
+            // window. LoRa DIO can also wake light sleep through GPIO; it must
+            // not make every CAD/RX interrupt look like a console request.
             super::serial::rearm_after_wake();
             telemetry::record_log(format!(
                 "event type=uart.wake source={} phase=light_sleep_return",
                 wake_cause_name(cause)
             ));
+        } else if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO {
+            telemetry::record_log("event type=sleep.light_wake source=gpio non_console=true");
         }
         if ret == sys::ESP_OK {
             RAW_NAN_LIGHT_WAKE_OK.fetch_add(1, Ordering::Relaxed);
@@ -1145,7 +1147,8 @@ fn configure_light_wake_sources(
         }
     }
 
-    if let Ok(config) = lora::load_config(settings) {
+    if lora::background_rx_running() {
+        let config = lora::load_config(settings)?;
         if config.dio0 >= 0 {
             unsafe {
                 let ret = sys::gpio_wakeup_enable(
@@ -1261,12 +1264,16 @@ pub fn status_summary_fields() -> String {
         LIGHT_TEST_WAKE_OK.load(Ordering::Relaxed),
         LIGHT_TEST_WAKE_FAIL.load(Ordering::Relaxed),
         LIGHT_TEST_LAST_ELAPSED_MS.load(Ordering::Relaxed),
-        wake_cause_name(LIGHT_TEST_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_wakeup_cause_t),
+        wake_cause_name(
+            LIGHT_TEST_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_wakeup_cause_t
+        ),
         RAW_NAN_LIGHT_RUNS.load(Ordering::Relaxed),
         RAW_NAN_LIGHT_WAKE_OK.load(Ordering::Relaxed),
         RAW_NAN_LIGHT_WAKE_FAIL.load(Ordering::Relaxed),
         RAW_NAN_LIGHT_LAST_MS.load(Ordering::Relaxed),
-        wake_cause_name(RAW_NAN_LIGHT_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_wakeup_cause_t)
+        wake_cause_name(
+            RAW_NAN_LIGHT_LAST_CAUSE.load(Ordering::Relaxed) as sys::esp_sleep_wakeup_cause_t
+        )
     )
 }
 

@@ -1,12 +1,11 @@
 #include "dmesh_hw.h"
 
-#include <string.h>
-
 #include "driver/rmt_common.h"
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "hal/gpio_types.h"
 

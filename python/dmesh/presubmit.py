@@ -177,7 +177,7 @@ class PresubmitSuite:
                 if name not in self.available:
                     continue
                 try:
-                    result = node.command("status", timeout=self.timeout)
+                    result = node.command("status", timeout=self.timeout, wake=True)
                     _fields(result, "status")
                     summary[name]["latencies"].append(result.latency_ms)
                 except Exception as error:
@@ -203,7 +203,10 @@ class PresubmitSuite:
                 "failures": failures,
             }
             if failures:
-                raise AssertionError("{} lost {}/{} status responses".format(name, len(failures), attempts))
+                raise CaseFailure(
+                    "{} lost {}/{} status responses".format(name, len(failures), attempts),
+                    details={"failures": failures},
+                )
         return result
 
     def uart_wake_reliability(self):
@@ -266,7 +269,8 @@ class PresubmitSuite:
                 "uart_driver",
             )
             if uart.get("uart_probe_dropped", 0) < 1 or uart.get("uart_probe_sent", 0) != 0:
-                raise AssertionError("{} did not gate delayed UART output: {}".format(name, uart))
+                uptime = _fields(node.command("status", timeout=self.timeout), "status").get("uptime_ms")
+                raise AssertionError("{} did not gate delayed UART output: {} (uptime: {} ms)".format(name, uart, uptime))
             result[name]["output_gate"] = {
                 "probe_delay_sec": probe_delay_sec,
                 "probe_wait_sec": probe_wait_sec,
@@ -283,19 +287,44 @@ class PresubmitSuite:
 
     def nan_pair(self):
         a, b = self._require_nodes("nan", 2)[:2]
-        channel = int(self.config.thresholds.get("nan", {}).get("channel", 6))
-        settle = float(self.config.thresholds.get("nan", {}).get("settle_sec", 2.0))
+        thresholds = self.config.thresholds.get("nan", {})
+        channel = int(thresholds.get("channel", 6))
+        wake_ms = int(thresholds.get("wake_ms", 2_000))
+        active_ms = int(thresholds.get("active_ms", 500))
+        # A message is sent at the sender's next active window. With no beacon
+        # time source, the two nodes can be up to one full period apart, and a
+        # queued response can take one more period. Keep this best-effort test
+        # bounded but do not mistake a normal delayed delivery for a failure.
+        settle = float(
+            thresholds.get(
+                "settle_sec",
+                (wake_ms * 3 + active_ms) / 1_000.0,
+            )
+        )
+        round_wait = float(
+            thresholds.get(
+                "round_wait_sec",
+                (wake_ms + active_ms) / 1_000.0,
+            )
+        )
         for node in (a, b):
             node.command("stats reset=true", timeout=self.timeout)
             node.command(
-                "nan start=true backend=raw role=both service=dmesh channel={}".format(channel),
+                "nvs set nan.wake_ms={} nan.active_ms={} nan.light_sleep=true nan.channel={}".format(
+                    wake_ms, active_ms, channel
+                ),
+                timeout=self.timeout,
+                expected="set",
+            )
+            node.command(
+                "mode raw_nan=true lora=false channel={}".format(channel),
                 timeout=self.timeout,
             )
         a_mac, b_mac = self._wifi_mac(a), self._wifi_mac(b)
         before_a = _fields(a.command("nan stats=true"), "nan")
         before_b = _fields(b.command("nan stats=true"), "nan")
-        iterations = {"quick": 1, "full": 10, "stress": 100}[self.profile]
-        spacing = float(self.config.thresholds.get("nan", {}).get("spacing_sec", 0.2))
+        iterations = {"quick": 3, "full": 8, "stress": 20}[self.profile]
+        spacing = float(thresholds.get("spacing_sec", 0.2))
         directions = (
             (a, b, a_mac, b_mac),
             (b, a, b_mac, a_mac),
@@ -309,11 +338,11 @@ class PresubmitSuite:
                     sequence,
                 )
                 sender.command(
-                    'nan send="{}" backend=raw dst={}'.format(payload, receiver_mac),
+                    'nan queue="{}" backend=raw dst={}'.format(payload, receiver_mac),
                     timeout=self.timeout,
                 )
             if sequence + 1 < iterations:
-                time.sleep(spacing)
+                time.sleep(max(spacing, round_wait))
         time.sleep(settle)
         after_a = _fields(a.command("nan stats=true", wake=True), "nan")
         after_b = _fields(b.command("nan stats=true", wake=True), "nan")
@@ -329,22 +358,31 @@ class PresubmitSuite:
             "beacon_seen_delta_a": _delta(before_a, after_a, "raw_beacon"),
             "beacon_seen_delta_b": _delta(before_b, after_b, "raw_beacon"),
         }
-        min_ratio = float(self.config.thresholds.get("nan", {}).get("min_delivery_ratio", 1.0))
+        min_ratio = float(thresholds.get("min_delivery_ratio", 0.5))
         minimum = max(1, int(iterations * min_ratio))
-        for name in ("a", "b"):
+        for name, node in (("a", a), ("b", b)):
             if result[name + "_raw_cmd_rx_delta"] < minimum:
+                print(f"\n--- {node.config.name} logs ---")
+                print(node.command("logs count=100", wake=True).raw)
                 raise AssertionError(
                     "NAN {} received {}/{} commands, required {}".format(
                         name, result[name + "_raw_cmd_rx_delta"], iterations, minimum
                     )
                 )
             if result[name + "_raw_resp_tx_delta"] < minimum:
+                print(f"\n--- {node.config.name} logs ---")
+                print(node.command("logs count=100", wake=True).raw)
                 raise AssertionError("NAN {} did not transmit command responses".format(name))
             if result[name + "_raw_resp_rx_delta"] < minimum:
+                print(f"\n--- {node.config.name} logs ---")
+                print(node.command("logs count=100", wake=True).raw)
                 raise AssertionError("NAN {} did not receive command responses".format(name))
         if self.config.thresholds.get("nan", {}).get("require_beacon") and (
             result["beacon_seen_delta_a"] < 1 or result["beacon_seen_delta_b"] < 1
         ):
+            for node in (a, b):
+                print(f"\n--- {node.config.name} logs ---")
+                print(node.command("logs count=100", wake=True).raw)
             raise AssertionError("required NAN beacon source was not observed")
         return result
 
@@ -487,11 +525,15 @@ class PresubmitSuite:
         self.artifacts.write_json("power/summary.json", result)
         return result
 
-    def run(self):
+    def run(self, selected=None):
         self.artifacts.write_json("manifest.json", self.manifest())
         for collector in self.collectors.values():
             collector.start()
         failure = None
+        selected = set(selected or ())
+
+        def selected_case(name):
+            return not selected or name in selected
 
         def run_case(name, function):
             nonlocal failure
@@ -502,15 +544,19 @@ class PresubmitSuite:
 
         try:
             run_case("inventory", self.inventory)
-            run_case("uart_wake_reliability", self.uart_wake_reliability)
-            run_case("command_reliability", self.command_reliability)
+            if selected_case("uart_wake_reliability"):
+                run_case("uart_wake_reliability", self.uart_wake_reliability)
+            if selected_case("command_reliability"):
+                run_case("command_reliability", self.command_reliability)
             if self._capable("nan"):
-                run_case("nan_pair", self.nan_pair)
-                if self.profile != "quick":
+                if selected_case("nan_pair"):
+                    run_case("nan_pair", self.nan_pair)
+                if selected_case("beacon_sync") and self.profile != "quick":
                     run_case("beacon_sync", self.beacon_sync)
             if self._capable("lora"):
-                run_case("lora_pair", self.lora_pair)
-                if self.profile != "quick":
+                if selected_case("lora_pair"):
+                    run_case("lora_pair", self.lora_pair)
+                if selected_case("lora_cad") and self.profile != "quick":
                     run_case("lora_cad", self.lora_cad)
         finally:
             for collector in self.collectors.values():

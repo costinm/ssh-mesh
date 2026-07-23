@@ -30,9 +30,12 @@
   "thresholds": {
     "nan": {
       "channel": 6,
-      "settle_sec": 2.0,
+      "wake_ms": 2000,
+      "active_ms": 500,
+      "settle_sec": 6.5,
+      "round_wait_sec": 2.5,
       "spacing_sec": 0.2,
-      "min_delivery_ratio": 1.0,
+      "min_delivery_ratio": 0.5,
       "beacon_observe_sec": 6.0,
       "require_beacon": false
     },

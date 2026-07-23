@@ -182,19 +182,11 @@ class RadioClient:
     def wake(self, milliseconds=120, timeout=None):
         if not 1 <= milliseconds <= 10000:
             raise ValueError("DTR duration must be between 1 and 10000 ms")
-        # Each configured lmesh UDS forward pulses DTR/PRG while accepting a
-        # client. Reconnecting is more robust than sending the lmesh-local
-        # ``dtr`` line on an already-active byte stream: after it has carried
-        # firmware data that record can reach UART0 instead of the forward's
-        # control parser.
-        self.close()
+        # Managed lmesh forwards keep DTR disabled by default. UART RX edges
+        # wake the firmware without reopening the socket or touching GPIO0.
         self.connect()
-        # lmesh has already held and released DTR before the new stream is
-        # returned. Keep a margin for classic ESP32 UART/APB-clock recovery.
-        time.sleep(0.20)
-        raw = "event type=lmesh.dtr ok=true source=connect hold_ms={}".format(milliseconds)
         self.wake_uart()
-        return raw
+        return "event type=uart.wake ok=true source=rx"
 
     def wake_uart(self):
         """Wake a light-sleeping firmware UART without touching modem lines."""

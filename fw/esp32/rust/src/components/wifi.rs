@@ -167,7 +167,7 @@ pub fn beacon_wake_plan(
 #[derive(Clone, Debug)]
 pub struct RawWifiCommand {
     pub source: [u8; 6],
-    pub text: String,
+    pub payload: Vec<u8>,
     pub rssi: i32,
     pub response: WifiResponsePath,
 }
@@ -1369,22 +1369,42 @@ pub fn stop_raw_monitor() -> Result<()> {
     Ok(())
 }
 
-/// Fully release the raw Wi-Fi driver for a bounded sleep interval.
+/// Stop raw Wi-Fi for a bounded raw-NAN sleep interval.
 ///
-/// `esp_wifi_stop()` alone leaves the Wi-Fi task and driver allocation alive.
-/// Raw-NAN duty cycling needs the modem genuinely off between discovery
-/// windows, so the next window deliberately performs a fresh initialization.
+/// `esp_wifi_stop()` powers down the modem.  Classic ESP32 also deinitializes
+/// the driver to release its task and allocation.  On ESP32-S3, repeatedly
+/// deinitializing and recreating Wi-Fi from the raw-NAN scheduler can leave
+/// UART0 RX unusable after the boot-time duty cycle.  Keep the stopped driver
+/// initialized there; the next window still calls `esp_wifi_start()` and the
+/// radio remains off between windows.
 pub fn stop_raw_wifi_for_sleep() -> Result<()> {
-    low_level_stop_wifi()?;
-    // ESP32-S3 clears the Wi-Fi modem sleep-reject source asynchronously
-    // after esp_wifi_deinit().  Sleeping in the same scheduling slice is
-    // rejected even with timer-only wake configured, so yield once before the
-    // raw-NAN scheduler calls esp_light_sleep_start().
-    unsafe {
-        sys::vTaskDelay((100 * sys::configTICK_RATE_HZ / 1_000).max(1));
+    #[cfg(target_feature = "esp32s3ops")]
+    {
+        unsafe {
+            let _ = sys::esp_wifi_disconnect();
+            let _ = sys::esp_wifi_set_promiscuous(false);
+            let _ = sys::esp_wifi_internal_reg_rxcb(sys::wifi_interface_t_WIFI_IF_STA, None);
+            let stopped = sys::esp_wifi_stop();
+            if stopped != sys::ESP_OK
+                && stopped != sys::ESP_ERR_INVALID_STATE
+                && stopped != sys::ESP_ERR_WIFI_NOT_INIT
+                && stopped != sys::ESP_ERR_WIFI_NOT_STARTED
+            {
+                bail!("esp_wifi_stop failed err=0x{stopped:x}");
+            }
+        }
+        RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+        WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
+        telemetry::record_log("event type=wifi.raw_sleep off=true driver_retained=true");
+        return Ok(());
     }
-    telemetry::record_log("event type=wifi.raw_sleep off=true");
-    Ok(())
+
+    #[cfg(not(target_feature = "esp32s3ops"))]
+    {
+        low_level_stop_wifi()?;
+        telemetry::record_log("event type=wifi.raw_sleep off=true driver_retained=false");
+        Ok(())
+    }
 }
 
 fn raw_tx(bytes: &[u8], request: &CommandRequest) -> Result<()> {
@@ -1659,7 +1679,10 @@ unsafe extern "C" fn raw_wifi_cb(
     observe_promiscuous_frame(frame, pkt.rx_ctrl.rssi() as i32);
 }
 
-fn observe_beacon(frame: &[u8]) {
+/// Record a beacon TSF as a shared timing source for raw-NAN and AP schedules.
+/// Raw-NAN owns its own promiscuous callback, so it calls this directly rather
+/// than relying on the generic raw-monitor callback.
+pub fn observe_beacon(frame: &[u8]) {
     // Beacon management frames carry the AP/NAN TSF timestamp immediately after
     // the 24-byte 802.11 header. This is deliberately BSSID-agnostic so an AP
     // can become the timing source when no NAN publisher is available.
@@ -1716,7 +1739,7 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
     RAW_RX_LAST_LEN.store(copy_len as u32, Ordering::Relaxed);
     if let Some(payload) = dmesh_payload {
         telemetry::record_companion_packet("wifi", payload);
-        super::mode::observe_ping_no_auto_response("wifi_raw", payload);
+        super::mode::observe_ping("wifi_raw", payload);
         if is_wifi_terminal_payload(payload) {
             let line = format!(
                 "event type=wifi.notify source=raw src={} len={} payload_b64={}",
@@ -2026,13 +2049,6 @@ fn enqueue_command(source: [u8; 6], payload: &[u8], rssi: i32, response: WifiRes
         RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let Ok(text) = core::str::from_utf8(payload) else {
-        return;
-    };
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
     set_last_command_peer(source, response);
     let Ok(mut queue) = raw_command_queue().lock() else {
         RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2044,7 +2060,7 @@ fn enqueue_command(source: [u8; 6], payload: &[u8], rssi: i32, response: WifiRes
     }
     queue.push_back(RawWifiCommand {
         source,
-        text: text.to_string(),
+        payload: payload.to_vec(),
         rssi,
         response,
     });
@@ -2053,7 +2069,16 @@ fn enqueue_command(source: [u8; 6], payload: &[u8], rssi: i32, response: WifiRes
 }
 
 fn is_wifi_terminal_payload(payload: &[u8]) -> bool {
-    payload.starts_with(b"notify ") || payload.starts_with(b"resp ")
+    if let Ok(req) = crate::commands::protocol::decode_binary(payload) {
+        req.args.contains_key(&4) || req.args.contains_key(&5)
+    } else {
+        payload.starts_with(b"notify ")
+            || payload.starts_with(b"resp ")
+            || payload.starts_with(b"dmesh.pong ")
+            || payload
+                .windows(b"reply=true".len())
+                .any(|part| part == b"reply=true")
+    }
 }
 
 fn raw_command_queue() -> &'static Mutex<VecDeque<RawWifiCommand>> {

@@ -195,6 +195,7 @@ pub struct RadioService {
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     serial_forwards: Arc<Mutex<BTreeMap<String, SerialForwardRuntime>>>,
     serial_log: Option<Arc<Mutex<SerialForwardLog>>>,
+    stability: Arc<Mutex<Option<StabilityRuntime>>>,
 }
 
 impl RadioService {
@@ -215,9 +216,179 @@ impl RadioService {
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
             serial_forwards: Arc::new(Mutex::new(BTreeMap::new())),
             serial_log,
+            stability: Arc::new(Mutex::new(None)),
         };
         service.start_configured_serial_forwards();
         service
+    }
+
+    /// Start a background LoRa discovery check through an existing managed UDS
+    /// forward. The managed forward remains the sole physical TTY owner.
+    pub fn stability_start(
+        &self,
+        source: Option<String>,
+        expected: Option<String>,
+        interval_sec: Option<u64>,
+        wait_sec: Option<u64>,
+        cycles: Option<u32>,
+    ) -> Value {
+        let source = source.unwrap_or_else(|| "lora1".to_string());
+        let interval_sec = interval_sec.unwrap_or(120).clamp(10, 86_400);
+        let wait_sec = wait_sec.unwrap_or(12).clamp(2, 60);
+        let expected = expected
+            .map(|value| split_csv(&value))
+            .unwrap_or_else(|| self.stability_default_targets(&source));
+        let Some(source_socket) = self.serial_forward_socket(&source) else {
+            return json!({"ok": false, "source": source, "error": "source forward is not active"});
+        };
+        if expected.is_empty() {
+            return json!({"ok": false, "source": source, "error": "no expected LoRa forwards"});
+        }
+        let mut guard = self
+            .stability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.as_ref().is_some_and(StabilityRuntime::running) {
+            return json!({"ok": false, "error": "stability runner is already active", "status": guard.as_ref().map(StabilityRuntime::snapshot)});
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(StabilityState::new(
+            source.clone(),
+            expected.clone(),
+            interval_sec,
+            wait_sec,
+            cycles,
+        )));
+        *guard = Some(StabilityRuntime {
+            stop: stop.clone(),
+            state: state.clone(),
+        });
+        drop(guard);
+
+        let service = self.clone();
+        std::thread::spawn(move || {
+            let mut completed = 0_u32;
+            while !stop.load(Ordering::Acquire)
+                && cycles.map(|limit| completed < limit).unwrap_or(true)
+            {
+                let result =
+                    service.run_stability_cycle(&source, &source_socket, &expected, wait_sec);
+                completed = completed.saturating_add(1);
+                {
+                    let mut current = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    current.cycles_completed = completed;
+                    current.last = result.clone();
+                    current.last_completed_ms = now_millis_u64();
+                }
+                service.record("esp.stability.cycle", result);
+                append_stability_result(&state);
+                let deadline = std::time::Instant::now() + Duration::from_secs(interval_sec);
+                while !stop.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .running = false;
+        });
+        self.stability_status()
+    }
+
+    /// Return the managed stability runner state.
+    pub fn stability_status(&self) -> Value {
+        self.stability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(StabilityRuntime::snapshot)
+            .unwrap_or_else(|| json!({"ok": true, "running": false}))
+    }
+
+    /// Request that the stability runner stop after the current serial read.
+    pub fn stability_stop(&self) -> Value {
+        let guard = self
+            .stability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = guard.as_ref() else {
+            return json!({"ok": true, "running": false});
+        };
+        runtime.stop.store(true, Ordering::Release);
+        runtime.snapshot()
+    }
+
+    fn stability_default_targets(&self, source: &str) -> Vec<String> {
+        self.serial_forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .filter(|id| id.as_str() != source && id.starts_with("lora"))
+            .cloned()
+            .collect()
+    }
+
+    fn serial_forward_socket(&self, id: &str) -> Option<String> {
+        self.serial_forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .map(|forward| forward.socket_path.clone())
+    }
+
+    fn run_stability_cycle(
+        &self,
+        source: &str,
+        socket: &str,
+        expected: &[String],
+        wait_sec: u64,
+    ) -> Value {
+        let expected_macs = expected
+            .iter()
+            .map(|id| (id.clone(), self.stability_mac_suffix(id)))
+            .collect::<BTreeMap<_, _>>();
+        let nan_before = stability_nan_stats(socket);
+        let output = match uds_console_exchange(socket, "mode ping=true", wait_sec * 1_000) {
+            Ok(value) => value,
+            Err(error) => return json!({"ok": false, "source": source, "error": error.to_string()}),
+        };
+        let nan_after = stability_nan_stats(socket);
+        let nan = stability_nan_cycle(nan_before.as_ref(), nan_after.as_ref());
+        let observed = parse_stability_pongs(&output);
+        let missing = expected_macs
+            .iter()
+            .filter_map(|(id, mac)| match mac {
+                Some(mac)
+                    if observed
+                        .iter()
+                        .any(|pong| pong.get("from").and_then(Value::as_str) == Some(mac)) =>
+                {
+                    None
+                }
+                _ => Some(id.clone()),
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "ok": missing.is_empty(),
+            "source": source,
+            "expected": expected_macs,
+            "observed": observed,
+            "missing": missing,
+            "nan": nan,
+            "wait_sec": wait_sec,
+        })
+    }
+
+    fn stability_mac_suffix(&self, id: &str) -> Option<String> {
+        let socket = self.serial_forward_socket(id)?;
+        let output = uds_console_exchange(&socket, "wifi status=true", 1_500).ok()?;
+        output.lines().find_map(|line| {
+            line.split_ascii_whitespace()
+                .find_map(|field| field.strip_prefix("sta_mac="))
+                .and_then(normalize_mac_suffix)
+        })
     }
 
     fn start_configured_serial_forwards(&self) {
@@ -2949,6 +3120,77 @@ struct SerialForwardRuntime {
     started_ms: u64,
 }
 
+struct StabilityRuntime {
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<StabilityState>>,
+}
+
+impl StabilityRuntime {
+    fn running(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running
+    }
+
+    fn snapshot(&self) -> Value {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot()
+    }
+}
+
+#[derive(Debug)]
+struct StabilityState {
+    running: bool,
+    source: String,
+    expected: Vec<String>,
+    interval_sec: u64,
+    wait_sec: u64,
+    cycles_requested: Option<u32>,
+    cycles_completed: u32,
+    last_completed_ms: u64,
+    last: Value,
+}
+
+impl StabilityState {
+    fn new(
+        source: String,
+        expected: Vec<String>,
+        interval_sec: u64,
+        wait_sec: u64,
+        cycles_requested: Option<u32>,
+    ) -> Self {
+        Self {
+            running: true,
+            source,
+            expected,
+            interval_sec,
+            wait_sec,
+            cycles_requested,
+            cycles_completed: 0,
+            last_completed_ms: 0,
+            last: Value::Null,
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "ok": true,
+            "running": self.running,
+            "source": self.source,
+            "expected": self.expected,
+            "interval_sec": self.interval_sec,
+            "wait_sec": self.wait_sec,
+            "cycles_requested": self.cycles_requested,
+            "cycles_completed": self.cycles_completed,
+            "last_completed_ms": self.last_completed_ms,
+            "last": self.last,
+        })
+    }
+}
+
 #[derive(Default, Debug)]
 struct SerialForwardStats {
     client_accepts: AtomicU64,
@@ -4418,6 +4660,162 @@ fn serial_exchange(
     timeout_ms: u64,
 ) -> Result<Vec<MeshMessage>> {
     Ok(serial_exchange_raw(path, baud, command, timeout_ms)?.messages)
+}
+
+/// Send one console command through a managed forward and retain asynchronous
+/// radio output until the requested observation window ends.
+fn uds_console_exchange(socket_path: &str, command: &str, timeout_ms: u64) -> Result<String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect managed serial socket {socket_path}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .with_context(|| format!("failed to set read timeout on {socket_path}"))?;
+    stream
+        .write_all(command.as_bytes())
+        .and_then(|()| stream.write_all(b"\n"))
+        .with_context(|| format!("failed to write managed serial command to {socket_path}"))?;
+    stream
+        .flush()
+        .with_context(|| format!("failed to flush {socket_path}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut output = Vec::new();
+    let mut buf = [0_u8; 1024];
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(count) => output.extend_from_slice(&buf[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {socket_path}"));
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_mac_suffix(value: &str) -> Option<String> {
+    let hex = value
+        .bytes()
+        .filter(u8::is_ascii_hexdigit)
+        .map(char::from)
+        .collect::<String>();
+    (hex.len() == 12).then(|| hex[4..].to_ascii_lowercase())
+}
+
+fn parse_stability_pongs(output: &str) -> Vec<Value> {
+    output
+        .lines()
+        .filter(|line| line.contains("type=lora.dmesh_control") && line.contains("kind=pong"))
+        .filter_map(|line| {
+            let mut fields = BTreeMap::new();
+            for field in line.split_ascii_whitespace() {
+                let Some((key, value)) = field.split_once('=') else {
+                    continue;
+                };
+                fields.insert(key, value);
+            }
+            let from = fields.get("from")?;
+            Some(json!({
+                "from": from,
+                "uptime_ms": fields.get("uptime_ms").copied().unwrap_or("-"),
+                "link_rssi_dbm": fields.get("link_rssi_dbm").copied().unwrap_or("-"),
+                "snr": fields.get("snr").copied().unwrap_or("-"),
+                "nan": {
+                    "running": fields.get("nrun").copied().unwrap_or("-"),
+                    "mgmt_rx": fields.get("nmg").copied().unwrap_or("-"),
+                    "sdf_rx": fields.get("nsdf").copied().unwrap_or("-"),
+                    "response_rx": fields.get("nrx").copied().unwrap_or("-"),
+                    "response_tx": fields.get("ntx").copied().unwrap_or("-"),
+                    "prefilter_drop": fields.get("ndrop").copied().unwrap_or("-"),
+                    "beacon_age_ms": fields.get("nage").copied().unwrap_or("-"),
+                },
+            }))
+        })
+        .collect()
+}
+
+/// Read the compact raw-NAN counters exposed by the firmware debug command.
+/// The stability cycle takes a snapshot before and after its ping observation
+/// window, making raw-NAN response delivery observable independently of the
+/// LoRa console packet that carries the human-readable pong.
+fn stability_nan_stats(socket: &str) -> Option<BTreeMap<String, u64>> {
+    // The first bytes after a DTR console wake can be consumed by UART wake
+    // recovery. Retry once so the stability monitor does not turn a normal
+    // dormant console into a missing raw-NAN health sample.
+    for _ in 0..2 {
+        let Ok(output) = uds_console_exchange(socket, "nan stats=true", 1_500) else {
+            continue;
+        };
+        let Some(line) = output
+            .lines()
+            .find_map(|line| line.find("nan support=raw").map(|offset| &line[offset..]))
+        else {
+            continue;
+        };
+        let mut fields = BTreeMap::new();
+        for field in line.split_ascii_whitespace() {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            if matches!(key, "raw_sdf" | "raw_resp_rx" | "raw_resp_tx" | "raw_beacon" | "rx_queue_drop")
+                && let Ok(value) = value.parse::<u64>()
+            {
+                fields.insert(key.to_string(), value);
+            }
+        }
+        return Some(fields);
+    }
+    None
+}
+
+fn stability_nan_cycle(
+    before: Option<&BTreeMap<String, u64>>,
+    after: Option<&BTreeMap<String, u64>>,
+) -> Value {
+    let delta = |key: &str| match (before.and_then(|values| values.get(key)), after.and_then(|values| values.get(key))) {
+        (Some(before), Some(after)) => Some(after.saturating_sub(*before)),
+        _ => None,
+    };
+    let response_rx_delta = delta("raw_resp_rx");
+    json!({
+        "before": before,
+        "after": after,
+        "sdf_rx_delta": delta("raw_sdf"),
+        "response_rx_delta": response_rx_delta,
+        "response_tx_delta": delta("raw_resp_tx"),
+        "beacon_delta": delta("raw_beacon"),
+        "queue_drop_delta": delta("rx_queue_drop"),
+        "response_observed": response_rx_delta.is_some_and(|value| value > 0),
+    })
+}
+
+fn append_stability_result(state: &Arc<Mutex<StabilityState>>) {
+    let snapshot = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    let directory = std::env::var("MESH_LOG_DIR").unwrap_or_else(|_| "/run/mesh/lmesh".to_string());
+    let path = PathBuf::from(directory).join("lora-stability.jsonl");
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        tracing::warn!(path = %path.display(), "stability_log_open_failed");
+        return;
+    };
+    if let Err(error) = writeln!(file, "{}", snapshot) {
+        tracing::warn!(path = %path.display(), error = %error, "stability_log_write_failed");
+    }
 }
 
 #[derive(Debug)]

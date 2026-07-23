@@ -19,9 +19,6 @@ void dmesh_lora_irq_set_task(void *task);
 void dmesh_lora_irq_rearm(void);
 void dmesh_lora_gpio_isr(void *arg);
 
-// UART0 is RX-only and interrupt-driven. The ISR merely clears RX status and
-// notifies its Rust owner; FIFO parsing stays in task context.
-
 #ifdef __cplusplus
 }
 #endif

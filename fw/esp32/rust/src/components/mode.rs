@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use anyhow::{bail, Result};
 use esp_idf_sys as sys;
@@ -21,6 +21,14 @@ const DEFAULT_NAN_ACTIVE_MS: u32 = 250;
 const DEFAULT_NAN_WAKE_EARLY_MS: u32 = 5;
 const DEFAULT_NAN_DW_TU: u32 = 512;
 const DEFAULT_NAN_DW_OFFSET_TU: u32 = 0;
+const RAW_NAN_DW_HISTORY_LEN: usize = 8;
+const RAW_NAN_DW_FLAG_DW0: u32 = 1 << 0;
+const RAW_NAN_DW_FLAG_SYNC: u32 = 1 << 1;
+const RAW_NAN_DW_FLAG_BEACON: u32 = 1 << 2;
+const RAW_NAN_DW_FLAG_LATE: u32 = 1 << 3;
+const RAW_NAN_DW_FLAG_NEXT: u32 = 1 << 4;
+const RAW_NAN_DW_FLAG_DRIFT: u32 = 1 << 5;
+const RAW_NAN_DW_FLAG_LIGHT: u32 = 1 << 6;
 const PING_PREFIX: &[u8] = b"dmesh.ping";
 
 static PRODUCT_MODE: AtomicU8 = AtomicU8::new(MODE_INFRA);
@@ -40,9 +48,27 @@ static RAW_NAN_BEACON_MISSED: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_BEACON_LATE: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_BEACON_LATE_NEXT_DW: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_BEACON_DRIFT: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_DW_TOTAL: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_DW0_TOTAL: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_DW_SYNC_TOTAL: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_DW_EARLY_WAKE_TOTAL: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_DW_ACTIVE_SEQ: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_DW_HISTORY_SEQ: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
+static RAW_NAN_DW_HISTORY_START_MS: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
+static RAW_NAN_DW_HISTORY_BEACONS: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
+static RAW_NAN_DW_HISTORY_FLAGS: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
 static PING_RESPONSE_PENDING: AtomicBool = AtomicBool::new(false);
+static PING_RESPONSE_NOT_BEFORE_MS: AtomicU32 = AtomicU32::new(0);
+static PING_LAST_REQUEST_HASH: AtomicU32 = AtomicU32::new(0);
+static PING_LAST_REQUEST_MS: AtomicU32 = AtomicU32::new(0);
 static PING_RX: AtomicU32 = AtomicU32::new(0);
 static PING_TX: AtomicU32 = AtomicU32::new(0);
+static PING_LAST_RX_RSSI_DBM: AtomicI32 = AtomicI32::new(0);
+static PING_LAST_RX_RSSI_VALID: AtomicBool = AtomicBool::new(false);
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
     registry.register(ModeCommand { settings });
@@ -61,6 +87,13 @@ pub fn init(settings: &SharedSettings) {
 #[allow(dead_code)]
 pub fn configured_companion(settings: &SharedSettings) -> bool {
     configured_mode(settings) == MODE_COMPANION
+}
+
+/// True only while the runtime owns the nearby-phone companion workflow.
+/// Infrastructure nodes must not initialize BLE merely because they receive a
+/// LoRa frame; their radio forwarding path is LoRa plus raw-NAN/Wi-Fi.
+pub fn is_companion_mode() -> bool {
+    PRODUCT_MODE.load(Ordering::Relaxed) == MODE_COMPANION
 }
 
 pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
@@ -110,7 +143,12 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
 pub fn poll(settings: &SharedSettings) {
     poll_raw_nan_duty(settings);
 
-    if PING_RESPONSE_PENDING.swap(false, Ordering::Relaxed) {
+    let response_due = PING_RESPONSE_NOT_BEFORE_MS.load(Ordering::Relaxed);
+    if PING_RESPONSE_PENDING.load(Ordering::Relaxed)
+        && (response_due == 0 || now_ms().wrapping_sub(response_due) < i32::MAX as u32)
+    {
+        PING_RESPONSE_PENDING.store(false, Ordering::Relaxed);
+        PING_RESPONSE_NOT_BEFORE_MS.store(0, Ordering::Relaxed);
         if let Err(err) = send_status_ping(settings, "rx") {
             telemetry::record_log(format!(
                 "event type=mode.ping_response ok=false msg={}",
@@ -133,40 +171,112 @@ pub fn mark_companion_active(settings: &SharedSettings, window_ms: u32) {
     let _ = (settings, window_ms);
 }
 
+/// Observe a ping from a transport that expects the standard infra response.
+/// The request is de-duplicated across LoRa, raw action, and raw-NAN copies.
 pub fn observe_ping(transport: &'static str, payload: &[u8]) {
-    observe_ping_inner(transport, payload, true);
+    observe_ping_inner(transport, payload, true, None);
 }
 
-pub fn observe_ping_no_auto_response(transport: &'static str, payload: &[u8]) {
-    observe_ping_inner(transport, payload, false);
+/// Record a LoRa ping and preserve its receive level for the corresponding
+/// broadcast pong. Wi-Fi action frames currently do not expose a comparable
+/// stable signal value on every target.
+pub fn observe_lora_ping(transport: &'static str, payload: &[u8], rssi_dbm: i32) {
+    observe_ping_inner(transport, payload, true, Some(rssi_dbm));
 }
 
-fn observe_ping_inner(transport: &'static str, payload: &[u8], auto_response: bool) {
-    if !payload.starts_with(PING_PREFIX) {
+fn observe_ping_inner(
+    transport: &'static str,
+    payload: &[u8],
+    auto_response: bool,
+    rssi_dbm: Option<i32>,
+) {
+    let mut is_ping = false;
+    let mut is_reply = false;
+    if let Ok(req) = crate::commands::protocol::decode_binary(payload) {
+        if req.method == 33 {
+            is_ping = true;
+            is_reply = req.args.contains_key(&4) || req.args.contains_key(&5);
+        }
+    } else if payload.starts_with(PING_PREFIX) {
+        is_ping = true;
+        is_reply = payload
+            .windows(b"reply=true".len())
+            .any(|w| w == b"reply=true");
+    }
+
+    if !is_ping {
         return;
     }
     PING_RX.fetch_add(1, Ordering::Relaxed);
+    if let Some(rssi_dbm) = rssi_dbm {
+        PING_LAST_RX_RSSI_DBM.store(rssi_dbm, Ordering::Relaxed);
+        PING_LAST_RX_RSSI_VALID.store(true, Ordering::Relaxed);
+    }
     telemetry::record_log(format!(
-        "event type=mode.ping_rx transport={} len={}",
+        "event type=mode.ping_rx transport={} len={} rssi_dbm={}",
         transport,
-        payload.len()
+        payload.len(),
+        rssi_dbm.unwrap_or(0)
     ));
-    if auto_response
-        && PRODUCT_MODE.load(Ordering::Relaxed) == MODE_INFRA
-        && !payload
-            .windows(b"reply=true".len())
-            .any(|w| w == b"reply=true")
-    {
+    if auto_response && PRODUCT_MODE.load(Ordering::Relaxed) == MODE_INFRA && !is_reply {
+        let hash = ping_hash(payload);
+        let now = now_ms();
+        let previous_hash = PING_LAST_REQUEST_HASH.load(Ordering::Relaxed);
+        let previous_ms = PING_LAST_REQUEST_MS.load(Ordering::Relaxed);
+        if hash == previous_hash && now.wrapping_sub(previous_ms) < 2_000 {
+            telemetry::record_log(format!(
+                "event type=mode.ping_response queued=false reason=duplicate transport={}",
+                transport
+            ));
+            return;
+        }
+        PING_LAST_REQUEST_HASH.store(hash, Ordering::Relaxed);
+        PING_LAST_REQUEST_MS.store(now, Ordering::Relaxed);
+        // A discovery ping is broadcast. Peers must not all answer in the
+        // same LoRa airtime slot or the origin will miss every pong while it
+        // returns from TX to RX. Four deterministic slots keep discovery
+        // bounded below the normal 8-second raw-NAN wake cycle.
+        let slot = local_suffix4_hex()
+            .ok()
+            .and_then(|suffix| u32::from_str_radix(&suffix, 16).ok())
+            .map(|value| {
+                let folded = value ^ (value >> 8) ^ (value >> 16) ^ (value >> 24);
+                folded & 0x07
+            })
+            .unwrap_or(0);
+        let delay_ms = 350 + slot * 700;
+        PING_RESPONSE_NOT_BEFORE_MS.store(now_ms().wrapping_add(delay_ms), Ordering::Relaxed);
         PING_RESPONSE_PENDING.store(true, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=mode.ping_response queued=true delay_ms={} slot={}",
+            delay_ms, slot
+        ));
     }
 }
 
-pub fn status_pong_text(settings: &SharedSettings, source: &'static str) -> String {
+fn ping_hash(payload: &[u8]) -> u32 {
+    payload.iter().fold(0x811c_9dc5_u32, |hash, byte| {
+        hash.wrapping_mul(0x0100_0193) ^ u32::from(*byte)
+    })
+}
+
+pub fn status_pong_text(_settings: &SharedSettings, source: &'static str) -> String {
+    let from = local_suffix4_hex().unwrap_or_else(|_| "00000000".to_string());
+    let rssi = if PING_LAST_RX_RSSI_VALID.load(Ordering::Relaxed) {
+        format!(
+            " rx_rssi_dbm={}",
+            PING_LAST_RX_RSSI_DBM.load(Ordering::Relaxed)
+        )
+    } else {
+        String::new()
+    };
     let mut payload = format!(
-        "dmesh.pong type=status reply=true source={} uptime_ms={} {}",
+        "dmesh.pong type=status reply=true source={} from={} uptime_ms={}{} {}",
         source,
+        from,
         now_ms(),
-        telemetry::stats_text(settings)
+        rssi,
+        super::nan::ping_health_fields()
     );
     if payload.len() > 220 {
         payload.truncate(220);
@@ -363,7 +473,11 @@ fn start_raw_nan_duty(
     let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
     arm_raw_nan_beacon_window(None);
-    super::nan::start_raw_window(channel, "sdf")?;
+    // The production duty window must accept NAN sync beacons as well as DMesh
+    // SDF follow-ups.  SDF-only filtering prevents TSF capture, so the next
+    // window can never be aligned to the powered Android/Linux NAN cluster.
+    super::nan::start_raw_window(channel, "nan")?;
+    record_raw_nan_dw_start(dw_offset_tu, false, light_sleep);
     RAW_NAN_DUTY_ENABLED.store(true, Ordering::Relaxed);
     RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
     RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(active_ms), Ordering::Relaxed);
@@ -373,7 +487,15 @@ fn start_raw_nan_duty(
     let queued_sent = super::nan::drain_raw_queue();
     telemetry::record_log(format!(
         "event type=mode.infra_radio medium=nan status=raw_duty channel={} reason={} duty_ms={} active_ms={} light_sleep={} wake_early_ms={} dw_tu={} dw_offset_tu={} queued_sent={}",
-        channel, reason, duty_ms, active_ms, light_sleep, wake_early_ms, dw_tu, dw_offset_tu, queued_sent
+        channel,
+        reason,
+        duty_ms,
+        active_ms,
+        light_sleep,
+        wake_early_ms,
+        dw_tu,
+        dw_offset_tu,
+        queued_sent
     ));
     Ok(())
 }
@@ -383,6 +505,10 @@ pub fn stop_raw_nan_duty() {
     RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
     RAW_NAN_DUTY_NEXT_MS.store(0, Ordering::Relaxed);
     RAW_NAN_MISS_BACKOFF_MS.store(0, Ordering::Relaxed);
+}
+
+pub fn raw_nan_duty_enabled() -> bool {
+    RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed)
 }
 
 fn poll_raw_nan_duty(settings: &SharedSettings) {
@@ -406,6 +532,16 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
 
     if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
+        // A GPIO0/DTR or UART wake deliberately owns a short debug window.
+        // Keep the existing raw Wi-Fi instance up for that window instead of
+        // tearing it down and rebuilding it every `nan.active_ms`. Apart from
+        // wasting power, that restart loop races UART TX and leaves forwarded
+        // console clients with a result but no prompt. Once the console window
+        // expires the next poll follows the normal modem-off sleep path.
+        if super::serial::is_active() {
+            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
+            return;
+        }
         finish_raw_nan_beacon_window();
         let queued_sent = super::nan::drain_raw_queue();
         super::nan::stop_nan().ok();
@@ -436,25 +572,58 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             light_sleep_ms,
             wake_early_ms,
             sync_plan.is_some(),
-            beacon_age_ms.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
+            beacon_age_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
             dw_tu,
             dw_offset_tu,
             queued_sent
         ));
+        #[cfg(target_feature = "esp32s3ops")]
         if light_sleep {
-            if let Err(err) = super::sleep::idle_light_sleep(settings, light_sleep_ms) {
-                telemetry::record_log(format!(
-                    "event type=nan.duty phase=light_sleep ok=false msg={}",
-                    crate::commands::protocol::escape_value(&err.to_string())
-                ));
-                arm_raw_nan_beacon_window(None);
-                RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_delay_ms), Ordering::Relaxed);
-                return;
+            // S3 must not block the control task in wake::wait() while the
+            // modem is off. Its UART/GPIO wake events then reach the ingress
+            // task, but command dispatch cannot run until the entire NAN
+            // interval expires. Keep the stopped S3 Wi-Fi driver initialized,
+            // arm the next window deadline, and let PM/tickless idle light-sleep between
+            // normal event-driven control-loop wakeups instead.
+            arm_raw_nan_beacon_window(sync_plan);
+            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_delay_ms), Ordering::Relaxed);
+            telemetry::record_log(format!(
+                "event type=nan.duty phase=idle wake=pm channel={} next_ms={}",
+                channel, window_delay_ms
+            ));
+            return;
+        }
+        if light_sleep {
+            let sleep_started_ms = now_ms();
+            loop {
+                let elapsed_ms = now_ms().wrapping_sub(sleep_started_ms);
+                if elapsed_ms >= light_sleep_ms || super::serial::is_active() {
+                    break;
+                }
+                let remaining_ms = light_sleep_ms.saturating_sub(elapsed_ms);
+                if let Err(err) = super::sleep::idle_light_sleep(settings, remaining_ms) {
+                    telemetry::record_log(format!(
+                        "event type=nan.duty phase=light_sleep ok=false msg={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                    arm_raw_nan_beacon_window(None);
+                    RAW_NAN_DUTY_NEXT_MS
+                        .store(now.wrapping_add(window_delay_ms), Ordering::Relaxed);
+                    return;
+                }
+                if now_ms().wrapping_sub(sleep_started_ms) < light_sleep_ms
+                    && !super::serial::is_active()
+                {
+                    RAW_NAN_DW_EARLY_WAKE_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
             }
             arm_raw_nan_beacon_window(sync_plan);
-            match super::nan::start_raw_window(channel, "sdf") {
+            match super::nan::start_raw_window(channel, "nan") {
                 Ok(()) => {
                     let queued_sent = super::nan::drain_raw_queue();
+                    record_raw_nan_dw_start(dw_offset_tu, sync_plan.is_some(), true);
                     RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
                     RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(active_ms), Ordering::Relaxed);
                     telemetry::record_log(format!(
@@ -479,9 +648,13 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
 
     // The non-light-sleep diagnostic path arms its beacon baseline when it
     // schedules the window above. Keep it intact until this delayed start.
-    match super::nan::start_raw_window(channel, "sdf") {
+    match super::nan::start_raw_window(channel, "nan") {
         Ok(()) => {
             let queued_sent = super::nan::drain_raw_queue();
+            // The non-light-sleep diagnostic path does not retain its prior
+            // wake plan across polls, so only mark it synchronized when the
+            // active window itself was entered from the light-sleep path.
+            record_raw_nan_dw_start(dw_offset_tu, false, false);
             RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
             telemetry::record_log(format!(
@@ -519,6 +692,7 @@ fn finish_raw_nan_beacon_window() {
     let received = snapshot.count.saturating_sub(baseline);
     if received == 0 {
         RAW_NAN_BEACON_MISSED.fetch_add(1, Ordering::Relaxed);
+        record_raw_nan_dw_finish(0, 0);
         RAW_NAN_MISS_BACKOFF_MS.store(MISS_BACKOFF_MS, Ordering::Relaxed);
         telemetry::record_log(format!(
             "event type=nan.duty beacon=missed active_ms_backoff={} baseline={} current={}",
@@ -528,6 +702,7 @@ fn finish_raw_nan_beacon_window() {
     }
 
     RAW_NAN_BEACON_SEEN.fetch_add(received, Ordering::Relaxed);
+    record_raw_nan_dw_finish(received, RAW_NAN_DW_FLAG_BEACON);
     let expected_tsf_us = (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
         | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed));
     let period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
@@ -540,12 +715,15 @@ fn finish_raw_nan_beacon_window() {
         return;
     }
     RAW_NAN_BEACON_LATE.fetch_add(1, Ordering::Relaxed);
+    raw_nan_dw_add_flags(RAW_NAN_DW_FLAG_LATE);
     let next_dw =
         snapshot.tsf_us >= expected_tsf_us && delta_us.abs_diff(period_us) <= LATE_TOLERANCE_US;
     if next_dw {
         RAW_NAN_BEACON_LATE_NEXT_DW.fetch_add(1, Ordering::Relaxed);
+        raw_nan_dw_add_flags(RAW_NAN_DW_FLAG_NEXT);
     } else {
         RAW_NAN_BEACON_DRIFT.fetch_add(1, Ordering::Relaxed);
+        raw_nan_dw_add_flags(RAW_NAN_DW_FLAG_DRIFT);
     }
     telemetry::record_log(format!(
         "event type=nan.duty beacon=late class={} delta_us={} expected_tsf_us={} actual_tsf_us={} local_us={} period_us={}",
@@ -558,9 +736,84 @@ fn finish_raw_nan_beacon_window() {
     ));
 }
 
+fn record_raw_nan_dw_start(dw_offset_tu: u32, synced: bool, light_sleep: bool) {
+    let seq = RAW_NAN_DW_TOTAL
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let index = (seq as usize) % RAW_NAN_DW_HISTORY_LEN;
+    let mut flags = 0;
+    if dw_offset_tu == 0 {
+        RAW_NAN_DW0_TOTAL.fetch_add(1, Ordering::Relaxed);
+        flags |= RAW_NAN_DW_FLAG_DW0;
+    }
+    if synced {
+        RAW_NAN_DW_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+        flags |= RAW_NAN_DW_FLAG_SYNC;
+    }
+    if light_sleep {
+        flags |= RAW_NAN_DW_FLAG_LIGHT;
+    }
+    RAW_NAN_DW_HISTORY_START_MS[index].store(now_ms(), Ordering::Relaxed);
+    RAW_NAN_DW_HISTORY_BEACONS[index].store(0, Ordering::Relaxed);
+    RAW_NAN_DW_HISTORY_FLAGS[index].store(flags, Ordering::Relaxed);
+    RAW_NAN_DW_HISTORY_SEQ[index].store(seq, Ordering::Release);
+    RAW_NAN_DW_ACTIVE_SEQ.store(seq, Ordering::Release);
+}
+
+fn raw_nan_dw_add_flags(flags: u32) {
+    let seq = RAW_NAN_DW_ACTIVE_SEQ.load(Ordering::Acquire);
+    if seq == 0 {
+        return;
+    }
+    let index = (seq as usize) % RAW_NAN_DW_HISTORY_LEN;
+    if RAW_NAN_DW_HISTORY_SEQ[index].load(Ordering::Acquire) == seq {
+        RAW_NAN_DW_HISTORY_FLAGS[index].fetch_or(flags, Ordering::Relaxed);
+    }
+}
+
+fn record_raw_nan_dw_finish(beacons: u32, flags: u32) {
+    let seq = RAW_NAN_DW_ACTIVE_SEQ.load(Ordering::Acquire);
+    if seq == 0 {
+        return;
+    }
+    let index = (seq as usize) % RAW_NAN_DW_HISTORY_LEN;
+    if RAW_NAN_DW_HISTORY_SEQ[index].load(Ordering::Acquire) == seq {
+        RAW_NAN_DW_HISTORY_BEACONS[index].store(beacons, Ordering::Relaxed);
+        RAW_NAN_DW_HISTORY_FLAGS[index].fetch_or(flags, Ordering::Relaxed);
+    }
+}
+
+fn raw_nan_dw_recent_fields() -> String {
+    let newest = RAW_NAN_DW_TOTAL.load(Ordering::Relaxed);
+    let mut records = Vec::with_capacity(RAW_NAN_DW_HISTORY_LEN);
+    for offset in 0..RAW_NAN_DW_HISTORY_LEN {
+        let seq = newest.saturating_sub(offset as u32);
+        if seq == 0 {
+            break;
+        }
+        let index = (seq as usize) % RAW_NAN_DW_HISTORY_LEN;
+        if RAW_NAN_DW_HISTORY_SEQ[index].load(Ordering::Acquire) != seq {
+            continue;
+        }
+        records.push(format!(
+            "{}:{}:{}:{}",
+            seq,
+            RAW_NAN_DW_HISTORY_START_MS[index].load(Ordering::Relaxed),
+            RAW_NAN_DW_HISTORY_BEACONS[index].load(Ordering::Relaxed),
+            RAW_NAN_DW_HISTORY_FLAGS[index].load(Ordering::Relaxed),
+        ));
+    }
+    records.join(",")
+}
+
 pub fn raw_nan_status_fields() -> String {
     format!(
-        "nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={}",
+        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={}",
+        RAW_NAN_DW_TOTAL.load(Ordering::Relaxed),
+        RAW_NAN_DW0_TOTAL.load(Ordering::Relaxed),
+        RAW_NAN_DW_SYNC_TOTAL.load(Ordering::Relaxed),
+        RAW_NAN_DW_EARLY_WAKE_TOTAL.load(Ordering::Relaxed),
+        raw_nan_dw_recent_fields(),
         RAW_NAN_BEACON_SEEN.load(Ordering::Relaxed),
         RAW_NAN_BEACON_MISSED.load(Ordering::Relaxed),
         RAW_NAN_BEACON_LATE.load(Ordering::Relaxed),
@@ -612,11 +865,13 @@ fn send_status_ping(settings: &SharedSettings, source: &'static str) -> Result<(
     let mut payload = if source == "rx" {
         status_pong_text(settings, source)
     } else {
+        let from = local_suffix4_hex()?;
         format!(
-            "dmesh.ping type=status reply=false source={} uptime_ms={} {}",
+            "dmesh.ping type=status reply=false source={} from={} uptime_ms={} {}",
             source,
+            from,
             now_ms(),
-            telemetry::stats_text(settings)
+            super::nan::ping_health_fields()
         )
     };
     if payload.len() > 180 {
@@ -625,7 +880,7 @@ fn send_status_ping(settings: &SharedSettings, source: &'static str) -> Result<(
     let bytes = payload.as_bytes();
     let lora = super::lora::send_raw_text(settings, &payload).is_ok();
     let wifi = super::wifi::forward_management_packet(bytes).is_ok();
-    let nan = super::nan::forward_packet(bytes).is_ok();
+    let nan = super::nan::forward_or_queue_packet(bytes).is_ok();
     PING_TX.fetch_add(1, Ordering::Relaxed);
     telemetry::record_log(format!(
         "event type=mode.ping_tx source={} len={} lora={} wifi_raw={} nan={}",

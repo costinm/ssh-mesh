@@ -2,6 +2,7 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     for partition_file in [
         "partitions_4mb_large_app.csv",
+        "partitions_8mb_large_app_store.csv",
         "partitions_16mb_large_app_store.csv",
     ] {
         std::fs::copy(partition_file, format!("{out_dir}/{partition_file}"))

@@ -131,11 +131,41 @@ pub fn load_cad_settings(settings: &SharedSettings) {
 pub fn sleep_radio(settings: &SharedSettings) -> Result<()> {
     BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
     notify_lora_rx_task();
-    wait_for_background_rx_stopped(Duration::from_millis(250));
+    if !wait_for_background_rx_stopped(Duration::from_secs(2)) {
+        bail!("LoRa background receiver did not stop before radio sleep");
+    }
     let state = LoraState::load(settings)?;
     let _guard = lora_spi_lock().lock().unwrap();
-    let mut radio = Radio::open(&state.config)?;
-    radio.sleep()
+    // A SX126x in hardware duty-cycle RX can hold BUSY high while the task is
+    // being stopped. `Radio::open` enables Vext before it probes BUSY, so a
+    // failed probe used to leave Heltec V3's radio rail powered indefinitely.
+    // `rx=false` is an explicit request to turn the radio off: preserve a
+    // successful SetSleep result when possible, but always cut a configured
+    // board rail afterwards.
+    let result = Radio::open(&state.config).and_then(|mut radio| radio.sleep());
+    if state.config.board_power_pin >= 0 {
+        power_down_board(&state.config)?;
+        if let Err(err) = result {
+            // The rail transition is the effective stop operation on boards
+            // such as Heltec V3. Do not prevent a caller from entering its
+            // low-power mode merely because a BUSY-stuck SX1262 could not
+            // acknowledge SetSleep immediately before power was removed.
+            telemetry::record_log(format!(
+                "ev=lora.sleep fallback=board_power_off msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+            return Ok(());
+        }
+    }
+    result
+}
+
+/// Whether the background receiver currently owns the radio IRQ line.
+/// Sleep setup must not arm a board's DIO line after the radio supply was
+/// explicitly removed, because an unpowered input may read high and reject
+/// light sleep immediately.
+pub fn background_rx_running() -> bool {
+    BACKGROUND_RX_RUNNING.load(Ordering::Relaxed)
 }
 
 #[allow(dead_code)]
@@ -256,6 +286,9 @@ pub struct LoraConfig {
     pub mosi: i32,
     pub cs: i32,
     pub rst: i32,
+    // Board GPIO connected to the radio interrupt output. The persisted key is
+    // `lora.dio0` for compatibility: SX127x uses DIO0, while SX126x routes its
+    // selected IRQs to DIO1 and uses this same board GPIO.
     pub dio0: i32,
     pub busy: i32,
     pub board_power_pin: i32,
@@ -956,6 +989,14 @@ fn run_background_rx(config: LoraConfig, local_node: Option<u32>) -> Result<()> 
         Ordering::SeqCst,
     );
     unsafe { dmesh_lora_irq_set_task(LORA_RX_TASK.load(Ordering::SeqCst)) };
+    // `lora rx=false` can arrive immediately after the thread is spawned but
+    // before it begins radio setup. Do not let that late-starting task reopen
+    // a radio that the stop path has already put to sleep.
+    if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
+        LORA_RX_TASK.store(std::ptr::null_mut(), Ordering::SeqCst);
+        unsafe { dmesh_lora_irq_set_task(std::ptr::null_mut()) };
+        return Ok(());
+    }
     let cad_rx = LORA_CAD_RX_ENABLED.load(Ordering::Relaxed);
     if cad_rx && matches!(config.chip, LoraChip::Sx1262) {
         let result = run_sx1262_duty_cycle_background_rx(&config, local_node);
@@ -997,7 +1038,7 @@ fn run_continuous_background_rx(config: &LoraConfig, local_node: Option<u32>) ->
         radio.configure_radio()?;
         radio.start_rx()?;
     }
-    configure_dio0_interrupt(config.dio0)?;
+    configure_lora_irq_interrupt(config.dio0)?;
     telemetry::record_log(format!(
         "ev=lora.rx_start mode=continuous rf={} sync=0x{:02x} cs={} rst={} dio0={}",
         compact_rf(config),
@@ -1008,7 +1049,7 @@ fn run_continuous_background_rx(config: &LoraConfig, local_node: Option<u32>) ->
     ));
 
     while BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
-        let notified = wait_for_lora_irq(background_poll_interval(config));
+        let notified = wait_for_background_lora_irq(config.dio0, background_poll_interval(config));
         if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
             break;
         }
@@ -1053,7 +1094,7 @@ fn run_sx1262_duty_cycle_background_rx(config: &LoraConfig, local_node: Option<u
         radio.configure_radio()?;
         radio.start_background_rx_mode()?
     };
-    configure_dio0_interrupt(config.dio0)?;
+    configure_lora_irq_interrupt(config.dio0)?;
     telemetry::record_log(format!(
         "ev=lora.rx_start mode=sx126x_duty rf={} sync=0x{:02x} cs={} rst={} dio0={} rx_us={} sleep_us={} preamble={} min_symbols=8",
         compact_rf(config),
@@ -1067,7 +1108,7 @@ fn run_sx1262_duty_cycle_background_rx(config: &LoraConfig, local_node: Option<u
     ));
 
     while BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
-        let notified = wait_for_lora_irq(Duration::from_secs(30));
+        let notified = wait_for_background_lora_irq(config.dio0, Duration::from_secs(30));
         if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
             break;
         }
@@ -1124,7 +1165,7 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
         // Start in standby so the first and subsequent CAD transitions match.
         let _ = radio.standby();
     }
-    configure_dio0_interrupt(config.dio0)?;
+    configure_lora_irq_interrupt(config.dio0)?;
     let cad_timeout = sx127x_cad_timeout(config);
     let configured_cad_interval =
         Duration::from_millis(LORA_CAD_INTERVAL_MS.load(Ordering::Relaxed) as u64);
@@ -1183,7 +1224,7 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
             let rx_deadline = Instant::now() + cad_rx_window;
             while BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) && Instant::now() < rx_deadline {
                 let remaining = rx_deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() || !wait_for_lora_irq(remaining) {
+                if remaining.is_zero() || !wait_for_background_lora_irq(config.dio0, remaining) {
                     break;
                 }
                 match poll_background_packet(config) {
@@ -1222,7 +1263,7 @@ fn run_cad_background_rx(config: &LoraConfig, local_node: Option<u32>) -> Result
         // The wait doubles as a task delay; `wait_for_lora_irq` returns
         // early if any task notification arrives (e.g. a `sleep_radio`
         // request or an out-of-band `notify_lora_rx_task`).
-        let _ = wait_for_lora_irq(cad_interval);
+        let _ = wait_for_background_lora_irq(config.dio0, cad_interval);
     }
     Ok(())
 }
@@ -1263,12 +1304,13 @@ fn cad_status_text() -> String {
     )
 }
 
-fn wait_for_background_rx_stopped(timeout: Duration) {
+fn wait_for_background_rx_stopped(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while !LORA_RX_TASK.load(Ordering::Acquire).is_null() && Instant::now() < deadline {
         notify_lora_rx_task();
         task_delay(Duration::from_millis(10));
     }
+    LORA_RX_TASK.load(Ordering::Acquire).is_null()
 }
 
 fn is_cad_timeout_error(err: &anyhow::Error) -> bool {
@@ -1339,13 +1381,56 @@ fn record_background_packet(packet: &Packet, source: &str, local_node: Option<u3
     );
     telemetry::record_log(line.clone());
     telemetry::emit_console(&line);
+    emit_dmesh_control_packet(packet, source);
+}
+
+/// Emit the small, stable subset of DMesh control text required by modem
+/// supervisors. Raw frames remain opaque; only ping/pong metadata is mirrored
+/// to the console so lmesh can attribute a response without scraping packet
+/// bytes or Meshtastic headers.
+fn emit_dmesh_control_packet(packet: &Packet, source: &str) {
+    let Ok(text) = core::str::from_utf8(&packet.data) else {
+        return;
+    };
+    let kind = if text.starts_with("dmesh.pong ") {
+        "pong"
+    } else if text.starts_with("dmesh.ping ") {
+        "ping"
+    } else {
+        return;
+    };
+    let field = |name: &str| {
+        text.split_ascii_whitespace()
+            .find_map(|item| item.strip_prefix(name))
+            .unwrap_or("-")
+    };
+    let line = format!(
+        "event type=lora.dmesh_control kind={} source={} from={} to={} reply={} uptime_ms={} link_rssi_dbm={} snr={} nrun={} nmg={} nsdf={} nrx={} ntx={} ndrop={} nage={}",
+        kind,
+        source,
+        field("from="),
+        field("to="),
+        field("reply="),
+        field("uptime_ms="),
+        packet.rssi,
+        packet.snr,
+        field("nrun="),
+        field("nmg="),
+        field("nsdf="),
+        field("nrx="),
+        field("ntx="),
+        field("ndrop="),
+        field("nage="),
+    );
+    telemetry::record_log(line.clone());
+    telemetry::emit_console(&line);
 }
 
 fn lora_spi_lock() -> &'static Mutex<()> {
     LORA_SPI_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn configure_dio0_interrupt(pin: i32) -> Result<()> {
+fn configure_lora_irq_interrupt(pin: i32) -> Result<()> {
     unsafe {
         if !GPIO_ISR_SERVICE_READY.load(Ordering::Relaxed) {
             let install = sys::gpio_install_isr_service(sys::ESP_INTR_FLAG_IRAM as i32);
@@ -1362,29 +1447,66 @@ fn configure_dio0_interrupt(pin: i32) -> Result<()> {
         esp_ok(sys::gpio_isr_handler_add(
             pin,
             Some(dmesh_lora_gpio_isr),
-            std::ptr::null_mut(),
+            pin as usize as *mut core::ffi::c_void,
         ))?;
     }
     Ok(())
 }
 
 fn set_lora_irq_enabled(pin: i32, enabled: bool) -> Result<()> {
-    let intr_type = if enabled {
-        sys::gpio_int_type_t_GPIO_INTR_POSEDGE
-    } else {
-        sys::gpio_int_type_t_GPIO_INTR_DISABLE
-    };
     unsafe {
-        esp_ok(sys::gpio_set_intr_type(pin, intr_type))?;
+        if enabled {
+            esp_ok(sys::gpio_set_intr_type(
+                pin,
+                sys::gpio_int_type_t_GPIO_INTR_POSEDGE,
+            ))?;
+            esp_ok(sys::gpio_intr_enable(pin as sys::gpio_num_t))?;
+        } else {
+            esp_ok(sys::gpio_intr_disable(pin as sys::gpio_num_t))?;
+            esp_ok(sys::gpio_set_intr_type(
+                pin,
+                sys::gpio_int_type_t_GPIO_INTR_DISABLE,
+            ))?;
+        }
     }
     Ok(())
 }
 
-fn wait_for_lora_irq(timeout: Duration) -> bool {
-    // DIO0 can remain asserted or generate a burst around CAD/RX state
+fn wait_for_lora_irq(pin: i32, timeout: Duration) -> bool {
+    // A radio IRQ line can remain asserted or generate a burst around CAD/RX state
     // changes. Re-arm the IRAM ISR once per task wait so it cannot hold CPU0
     // in an interrupt storm before SPI has acknowledged the radio IRQ.
+    // The ISR masks DIO0 on the first edge. Re-enable it only from task
+    // context, after the previous radio operation has had a chance to clear
+    // its IRQ source. This is shared by SX127x LoRa/FSK mappings and SX126x
+    // LoRa duty-cycle mappings.
     unsafe { dmesh_lora_irq_rearm() };
+    // Clear the software latch before unmasking the GPIO. Otherwise an edge
+    // immediately after gpio_intr_enable could be erased by rearm().
+    if set_lora_irq_enabled(pin, true).is_err() {
+        return false;
+    }
+    let ticks = duration_to_ticks(timeout);
+    let woke = unsafe { sys::ulTaskGenericNotifyTake(0, 1, ticks) != 0 };
+    if woke {
+        LORA_IRQ_WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+    woke
+}
+
+/// Wait for a radio IRQ or a background-RX stop request without losing a stop
+/// notification between the loop condition and the RTOS blocking call.
+fn wait_for_background_lora_irq(pin: i32, timeout: Duration) -> bool {
+    unsafe { dmesh_lora_irq_rearm() };
+    // A stop may arrive while the task configures the radio, before it reaches
+    // its next wait. Check after rearm so that notification cannot be erased
+    // and turned into a 30-second SX126x wait.
+    if !BACKGROUND_RX_RUNNING.load(Ordering::Relaxed) {
+        return true;
+    }
+    if set_lora_irq_enabled(pin, true).is_err() {
+        return false;
+    }
     let ticks = duration_to_ticks(timeout);
     let woke = unsafe { sys::ulTaskGenericNotifyTake(0, 1, ticks) != 0 };
     if woke {
@@ -1421,20 +1543,27 @@ fn task_delay(timeout: Duration) {
 }
 
 fn forward_rx_packet(packet: &Packet) {
-    super::mode::observe_ping("lora", &packet.data);
-    match super::ble_bt::announce_lora_packet(&packet.data, packet.rssi, packet.snr) {
-        Ok(()) => {
-            let line = format!("ev=lora.fwd t=ble len={} ok=true", packet.data.len());
-            telemetry::record_log(line);
+    super::mode::observe_lora_ping("lora", &packet.data, packet.rssi);
+    if super::mode::is_companion_mode() {
+        match super::ble_bt::announce_lora_packet(&packet.data, packet.rssi, packet.snr) {
+            Ok(()) => {
+                let line = format!("ev=lora.fwd t=ble len={} ok=true", packet.data.len());
+                telemetry::record_log(line);
+            }
+            Err(err) => {
+                let line = format!(
+                    "ev=lora.fwd t=ble len={} ok=false msg={}",
+                    packet.data.len(),
+                    crate::commands::protocol::escape_value(&err.to_string())
+                );
+                telemetry::record_log(line);
+            }
         }
-        Err(err) => {
-            let line = format!(
-                "ev=lora.fwd t=ble len={} ok=false msg={}",
-                packet.data.len(),
-                crate::commands::protocol::escape_value(&err.to_string())
-            );
-            telemetry::record_log(line);
-        }
+    } else {
+        telemetry::record_log(format!(
+            "ev=lora.fwd t=ble skipped=true reason=infra len={}",
+            packet.data.len()
+        ));
     }
     match super::wifi::forward_management_packet(&packet.data) {
         Ok(()) => {
@@ -1910,7 +2039,7 @@ impl Sx127x {
     fn is_channel_active(&mut self, timeout: Duration) -> Result<bool> {
         // Discard command/task notifications left from the previous cycle;
         // DIO0 will provide the next CAD completion notification.
-        let _ = wait_for_lora_irq(Duration::ZERO);
+        let _ = wait_for_lora_irq(self.config.dio0, Duration::ZERO);
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
         self.write_reg(REG_IRQ_FLAGS, 0xff)?;
         // SX127x RegDioMapping1 bits 7:6 = 10 maps DIO0 to CadDone.
@@ -1920,7 +2049,7 @@ impl Sx127x {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() || !wait_for_lora_irq(remaining) {
+            if remaining.is_zero() || !wait_for_lora_irq(self.config.dio0, remaining) {
                 break;
             }
             let irq = self.read_reg(REG_IRQ_FLAGS)?;
@@ -2163,6 +2292,7 @@ impl Sx1262 {
             handle,
         };
         if reset {
+            cycle_board_power(config)?;
             radio.reset()?;
             radio.set_standby()?;
         }
@@ -2324,6 +2454,9 @@ impl Sx1262 {
     }
 
     fn set_irq_mask(&mut self, mask: u16) -> Result<()> {
+        // SX126x has a single board interrupt in this firmware: route every
+        // enabled radio IRQ to DIO1. `LoraConfig::dio0` is the legacy setting
+        // name for that board GPIO, shared with SX127x DIO0.
         let dio1 = mask;
         self.command(
             SX126X_CMD_SET_DIO_IRQ_PARAMS,
@@ -2834,6 +2967,42 @@ fn configure_board_power(config: &LoraConfig) -> Result<()> {
     }
     task_delay(Duration::from_millis(5));
     Ok(())
+}
+
+/// Turn off an optional board-level radio supply. This is intentionally only
+/// used by explicit radio-stop paths; LoRa receive duty cycling must keep the
+/// supply on so the SX126x can wake itself between RX windows.
+fn power_down_board(config: &LoraConfig) -> Result<()> {
+    if config.board_power_pin < 0 {
+        return Ok(());
+    }
+    validate_optional_pin(config.board_power_pin)?;
+    let off_level = 1_i32 - config.board_power_level;
+    unsafe {
+        esp_ok(sys::gpio_set_direction(
+            config.board_power_pin,
+            sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+        ))?;
+        esp_ok(sys::gpio_set_level(
+            config.board_power_pin,
+            off_level as u32,
+        ))?;
+    }
+    Ok(())
+}
+
+/// Recover SX126x boards whose hardware duty-cycle receiver leaves BUSY high
+/// while a stop request is in flight. Heltec V3 exposes the radio supply as
+/// active-low Vext, so reset must include a short power cycle before waiting
+/// on BUSY again. Boards without a configured power rail are unaffected.
+fn cycle_board_power(config: &LoraConfig) -> Result<()> {
+    if config.board_power_pin < 0 {
+        return Ok(());
+    }
+    validate_optional_pin(config.board_power_pin)?;
+    power_down_board(config)?;
+    task_delay(Duration::from_millis(10));
+    configure_board_power(config)
 }
 
 fn probe_lora_ready(config: &LoraConfig) -> Result<u8> {

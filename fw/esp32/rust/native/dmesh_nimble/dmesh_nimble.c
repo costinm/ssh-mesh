@@ -7,6 +7,8 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
+#include "hal/gpio_ll.h"
+#include "soc/gpio_struct.h"
 #if CONFIG_IDF_TARGET_ESP32
 #include "esp_bt.h"
 #endif
@@ -73,7 +75,18 @@ void IRAM_ATTR dmesh_button_gpio_isr(void *arg) {
 }
 
 void IRAM_ATTR dmesh_lora_gpio_isr(void *arg) {
-    (void)arg;
+    const uint32_t pin = (uint32_t)(uintptr_t)arg;
+    // The configured LoRa IRQ pin is asserted for every modem event. Mask it before waking the
+    // task so a noisy or uncleared radio IRQ cannot repeatedly enter the GPIO
+    // dispatcher and starve CPU0. The LoRa task reads/clears the chip IRQ and
+    // re-enables this pin for the next mode-specific event.
+    if (pin < 32) {
+        gpio_ll_intr_disable(&GPIO, pin);
+        gpio_ll_clear_intr_status(&GPIO, 1U << pin);
+    } else {
+        gpio_ll_intr_disable(&GPIO, pin);
+        gpio_ll_clear_intr_status_high(&GPIO, 1U << (pin - 32));
+    }
     notify_task_from_gpio_isr(&s_lora_irq_task, &s_lora_irq_pending);
 }
 

@@ -50,6 +50,10 @@ LORA_PAIR_TEST = FW_RUST / "tools" / "lora_pair_test.py"
 PRESUBMIT = FW_RUST / "tools" / "presubmit.py"
 ESP32_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32" / "dmesh-rs-merged.bin"
 ESP32S3_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
+ESP32S3_8MB_TARGET = FW_RUST / "target" / "esp32s3-8mb"
+ESP32S3_8MB_MERGED_IMAGE = (
+    FW_RUST / "target" / "flash" / "esp32s3-8mb" / "dmesh-rs-merged.bin"
+)
 SPARSE_FLASH_DIR = FW_RUST / "target" / "flash" / "sparse"
 FLASH_BAUD = 460_800
 DEFAULT_LMESH_CONFIG = Path("/home/system/etc/lmesh/lmesh.toml")
@@ -77,6 +81,7 @@ class Device:
     port: str
     chip: str
     mac: str | None
+    flash_size_mb: int | None = None
 
     @property
     def logical_port(self) -> str:
@@ -186,10 +191,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-lora-port",
         action="append",
-        default=split_env_list("DMESH_EXPECTED_LORA_PORTS") or ["USB0", "USB1", "USB2"],
+        default=split_env_list("DMESH_EXPECTED_LORA_PORTS")
+        or ["lora1", "lora2", "lora3", "lora4", "USB0", "USB1", "USB2"],
         help=(
-            "Logical port expected to have TLORA/SX127x wiring. Repeatable. "
-            "Defaults to USB0, USB1, USB2 or DMESH_EXPECTED_LORA_PORTS."
+            "Logical port expected to have a configured LoRa radio. Repeatable. "
+            "Defaults to lora1..lora4 plus USB0..USB2, or DMESH_EXPECTED_LORA_PORTS."
+        ),
+    )
+    parser.add_argument(
+        "--heltec-v3-port",
+        action="append",
+        default=split_env_list("DMESH_HELTEC_V3_PORTS") or ["lora4"],
+        help=(
+            "Logical port using the Heltec V3 ESP32-S3/SX1262 preset. Repeatable. "
+            "Defaults to lora4 or DMESH_HELTEC_V3_PORTS."
         ),
     )
     parser.add_argument(
@@ -601,6 +616,7 @@ def probe(
     elif "ESP32" in output:
         chip = "esp32"
     mac_match = re.search(r"MAC:\s*([0-9a-f:]{17})", output, re.IGNORECASE)
+    flash_size_match = re.search(r"(?:Embedded Flash|Detected flash size)\s*(\d+)MB", output)
     if not chip:
         print(f"skip {physical_port or port}: unsupported probe output through {port}\n{output}", flush=True)
         return None
@@ -608,10 +624,13 @@ def probe(
         port=physical_port or port,
         chip=chip,
         mac=mac_match.group(1).lower() if mac_match else None,
+        flash_size_mb=int(flash_size_match.group(1)) if flash_size_match else None,
     )
 
 
 def build_targets(env: dict[str, str]) -> None:
+    for image in (ESP32_MERGED_IMAGE, ESP32S3_MERGED_IMAGE, ESP32S3_8MB_MERGED_IMAGE):
+        image.parent.mkdir(parents=True, exist_ok=True)
     run(["cargo", "build", "--release", "--target", "xtensa-esp32-espidf"], cwd=FW_RUST, env=env)
     run(
         [
@@ -639,6 +658,52 @@ def build_targets(env: dict[str, str]) -> None:
         cwd=FW_RUST,
         env=s3_env,
     )
+    s3_8mb_env = env.copy()
+    s3_8mb_env["ESP_IDF_SDKCONFIG_DEFAULTS"] = "sdkconfig.esp32s3_8mb.defaults"
+    s3_8mb_env["CARGO_TARGET_DIR"] = str(ESP32S3_8MB_TARGET)
+    run(
+        ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
+        cwd=FW_RUST,
+        env=s3_8mb_env,
+    )
+    run(
+        [
+            "cargo",
+            "espflash",
+            "save-image",
+            "--release",
+            "--target",
+            "xtensa-esp32s3-espidf",
+            "--chip",
+            "esp32s3",
+            "--flash-size",
+            "8mb",
+            "--merge",
+            "--skip-padding",
+            str(ESP32S3_8MB_MERGED_IMAGE),
+        ],
+        cwd=FW_RUST,
+        env=s3_8mb_env,
+    )
+
+
+def s3_uses_8mb_image(device: Device) -> bool:
+    """Return whether a probed S3 needs the 8 MB partition table."""
+    return device.is_s3 and device.flash_size_mb is not None and device.flash_size_mb <= 8
+
+
+def merged_image_for(device: Device) -> Path:
+    if not device.is_s3:
+        return ESP32_MERGED_IMAGE
+    return ESP32S3_8MB_MERGED_IMAGE if s3_uses_8mb_image(device) else ESP32S3_MERGED_IMAGE
+
+
+def executable_for(device: Device) -> Path:
+    if not device.is_s3:
+        return FW_RUST / "target" / "xtensa-esp32-espidf" / "release" / "dmesh-rs"
+    if s3_uses_8mb_image(device):
+        return ESP32S3_8MB_TARGET / "xtensa-esp32s3-espidf" / "release" / "dmesh-rs"
+    return FW_RUST / "target" / "xtensa-esp32s3-espidf" / "release" / "dmesh-rs"
     run(
         [
             "cargo",
@@ -662,18 +727,8 @@ def build_targets(env: dict[str, str]) -> None:
 
 def validate_prebuilt_images(devices: list[Device]) -> None:
     """Reject --skip-build when cargo output is newer than its merged image."""
-    targets = {
-        device.is_s3: (
-            FW_RUST
-            / "target"
-            / ("xtensa-esp32s3-espidf" if device.is_s3 else "xtensa-esp32-espidf")
-            / "release"
-            / "dmesh-rs",
-            ESP32S3_MERGED_IMAGE if device.is_s3 else ESP32_MERGED_IMAGE,
-        )
-        for device in devices
-    }
-    for executable, merged in targets.values():
+    targets = {(executable_for(device), merged_image_for(device)) for device in devices}
+    for executable, merged in targets:
         if not executable.exists() or not merged.exists():
             raise SystemExit(
                 "--skip-build requires existing executable and merged image; run without --skip-build"
@@ -717,11 +772,11 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
 
 
 def sparse_flash_args(device: Device) -> tuple[list[str], list[tuple[str, Path]]]:
-    image = ESP32S3_MERGED_IMAGE if device.is_s3 else ESP32_MERGED_IMAGE
-    flash_size = "16MB" if device.is_s3 else "4MB"
+    image = merged_image_for(device)
+    flash_size = "8MB" if s3_uses_8mb_image(device) else "16MB" if device.is_s3 else "4MB"
     flash_freq = "80m" if device.is_s3 else "40m"
     boot_offset = 0x0 if device.is_s3 else 0x1000
-    label = "esp32s3" if device.is_s3 else "esp32"
+    label = "esp32s3-8mb" if s3_uses_8mb_image(device) else "esp32s3" if device.is_s3 else "esp32"
     data = image.read_bytes()
     chunks = [
         (boot_offset, 0x8000, f"{label}-bootloader.bin"),
@@ -755,24 +810,28 @@ def configure(device: Device, args: argparse.Namespace, port: str) -> None:
     channel = max(1, min(args.nan_channel, 13))
     commands = [
         (
-            f"nvs set mode=infra wifi.mode={args.wifi_mode} power.profile=dfs "
+            f"nvs set mode=infra ble.comp=false wifi.enabled=true wifi.mode={args.wifi_mode} power.profile=auto "
             f"nan.backend=raw nan.boot=true nan.role={args.nan_role} "
             f"nan.service={args.nan_service} nan.channel={channel} "
             "nan.wake_ms=4000 nan.active_ms=250 nan.light_sleep=true nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0"
         ),
-        "mode infra=true",
+        "power profile=auto save=true",
+        "mode infra=true save=true",
         "nan stats=true",
         "lora status=true",
         "power status=true",
     ]
     if device.port in expected_lora_ports(args):
-        commands[0:0] = [
-            (
-                "loraprobe chip=sx127x spi_host=2 sck=5 miso=19 mosi=27 "
-                "cs=18 rst=23 dio0=26 save=true"
-            ),
-            "nvs set lora.enabled=true",
-        ]
+        if device.port in heltec_v3_ports(args):
+            commands[0:0] = ["lora board=heltec_v3 apply=true", "nvs set lora.enabled=true"]
+        else:
+            commands[0:0] = [
+                (
+                    "loraprobe chip=sx127x spi_host=2 sck=5 miso=19 mosi=27 "
+                    "cs=18 rst=23 dio0=26 save=true"
+                ),
+                "nvs set lora.enabled=true",
+            ]
         meshcore_ports = {logical_usb_port(p) for p in args.meshcore_port}
         if device.port in meshcore_ports:
             commands.append("lora mode=meshcore")
@@ -900,6 +959,10 @@ def preflash_stability_check(
 
 def expected_lora_ports(args: argparse.Namespace) -> set[str]:
     return {logical_usb_port(port) for port in args.expected_lora_port}
+
+
+def heltec_v3_ports(args: argparse.Namespace) -> set[str]:
+    return {logical_usb_port(port) for port in args.heltec_v3_port}
 
 
 def post_flash_feature_tests(devices: list[Device], args: argparse.Namespace) -> None:
@@ -1095,6 +1158,19 @@ def main() -> int:
     if not args.lmesh_control_socket:
         print("--lmesh-control-socket or LMESH_CONTROL_SOCKET is required", file=sys.stderr)
         return 1
+    if args.restore_forwards:
+        restored = 0
+        for port in configured_forward_specs():
+            try:
+                lmesh_start_forward(args, port, None)
+                restored += 1
+            except RuntimeError as exc:
+                if "already exists" not in str(exc):
+                    raise
+                print(f"lmesh restore {port}: already active", flush=True)
+                restored += 1
+        print(f"restored {restored} configured lmesh serial forward(s)", flush=True)
+        return 0
     env = os.environ.copy()
     ports = [logical_usb_port(port) for port in (args.port or default_ports(args.lmesh_control_socket))]
     if not ports:
@@ -1111,13 +1187,6 @@ def main() -> int:
     for port in ports:
         if args.lmesh_mode == "tcp":
             tcp_ports[port] = ensure_lmesh_forward(args, port, tcp_ports[port])
-        else:
-            # A direct recovery probe needs exclusive ownership before esptool
-            # toggles RTS/DTR. Releasing only after probe left CP210x ports
-            # open in lmesh and produced intermittent empty bootloader reads.
-            lmesh_stop_forward(args, port)
-    if args.lmesh_mode == "local-release":
-        time.sleep(0.5)
 
     if not args.skip_flash and not args.skip_preflash_stability:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -1158,6 +1227,14 @@ def main() -> int:
                     stability_dir, "\n".join(failures)
                 )
             )
+
+    if args.lmesh_mode == "local-release":
+        # Stability checks use the logical lmesh UDS forwards. Release them
+        # only after that check passes, immediately before direct USB probing
+        # and flashing need exclusive ownership of the physical bridge.
+        for port in ports:
+            lmesh_stop_forward(args, port)
+        time.sleep(0.5)
 
     probed: list[Device] = []
     if args.skip_flash:

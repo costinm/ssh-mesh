@@ -256,10 +256,10 @@ impl I2cCommand {
         let chip = parse_arg_or(request, "chip", parse_arg_or(request, "c", 0x3c)?)?;
         let mut rows = Vec::new();
         for base in (0..=0x70).step_by(0x10) {
-            let mut req = CommandRequest::new("i2cget");
-            req.args.insert("chip".into(), chip.to_string());
-            req.args.insert("register".into(), base.to_string());
-            req.args.insert("length".into(), "16".into());
+            let req = CommandRequest::new("i2cget")
+                .arg_pair("chip", chip.to_string())
+                .arg_pair("register", base.to_string())
+                .arg_pair("length", "16");
             rows.push(self.get(&req)?.message);
         }
         Ok(CommandResponse::ok(rows.join(" | ")))

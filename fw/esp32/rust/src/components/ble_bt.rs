@@ -300,16 +300,24 @@ pub fn poll_text_commands(registry: &mut CommandRegistry) {
         let Some(command) = command else {
             return;
         };
-        let line = core::str::from_utf8(&command).unwrap_or("").trim();
-        if line.is_empty() {
+        if command.is_empty() {
             continue;
         }
-        let response = dispatch_text_line(registry, line);
-        let mut response = response.into_bytes();
-        if !response.ends_with(b"\n") {
-            response.push(b'\n');
+        if command.first().map(|byte| byte.is_ascii()).unwrap_or(false) {
+            let line = core::str::from_utf8(&command).unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let response = dispatch_text_line(registry, line);
+            let mut response = response.into_bytes();
+            if !response.ends_with(b"\n") {
+                response.push(b'\n');
+            }
+            send_gatt(&response);
+        } else {
+            let response = crate::transports::dispatch_binary_packet(registry, &command);
+            send_gatt(&response);
         }
-        send_gatt(&response);
     }
 }
 
@@ -1215,6 +1223,7 @@ fn handle_gatt_rx(data: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
     BLE_GATT_RX_BINARY.fetch_add(1, Ordering::Relaxed);
+    queue_ble_text(data);
     Vec::new()
 }
 

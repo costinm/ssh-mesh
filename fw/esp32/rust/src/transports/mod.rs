@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::commands::protocol::{decode_binary, encode_binary, format_text, parse_text};
-use crate::commands::{CommandRegistry, CommandRequest, CommandResponse};
+use crate::commands::{CommandRegistry, CommandRequest, CommandResponse, CommandStatus};
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,18 +65,40 @@ pub fn dispatch_text_line(registry: &mut CommandRegistry, line: &str) -> String 
     }
 }
 
-#[allow(dead_code)]
 pub fn dispatch_binary_packet(registry: &mut CommandRegistry, packet: &[u8]) -> Vec<u8> {
-    match decode_binary(packet) {
+    let is_framed = packet.starts_with(&[0, 0xcb, 0, 0]);
+    let cbor_bytes = if is_framed { &packet[4..] } else { packet };
+    match decode_binary(cbor_bytes) {
         Ok(request) => {
             let response = registry.dispatch(&request);
-            encode_response_as_binary(&request.name, &response)
+            let mut response_bytes = encode_response_as_binary(request.method, &response);
+            if is_framed {
+                response_bytes = wrap_stream_frame(&response_bytes);
+            }
+            response_bytes
         }
         Err(err) => {
-            let request = CommandRequest::new("error").arg_pair("message", err.to_string());
-            encode_binary(&request)
+            let mut request = CommandRequest::new_binary(0);
+            request.args.insert(5, err.to_string()); // CBOR_ERROR is 5
+            let mut response_bytes = encode_binary(&request);
+            if is_framed {
+                response_bytes = wrap_stream_frame(&response_bytes);
+            }
+            response_bytes
         }
     }
+}
+
+fn wrap_stream_frame(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 8);
+    out.push(0);
+    let len = data.len() + 4;
+    out.push((len >> 16) as u8);
+    out.push((len >> 8) as u8);
+    out.push(len as u8);
+    out.extend_from_slice(&[0, 0xcb, 0, 0]);
+    out.extend_from_slice(data);
+    out
 }
 
 #[allow(dead_code)]
@@ -97,16 +119,19 @@ where
     transport.send_response(response.as_bytes())
 }
 
-#[allow(dead_code)]
-fn encode_response_as_binary(name: &str, response: &CommandResponse) -> Vec<u8> {
-    let mut request = CommandRequest::new(name);
-    request.args.insert(
-        "status".to_string(),
-        format!("{:?}", response.status).to_lowercase(),
-    );
-    request
-        .args
-        .insert("message".to_string(), response.message.clone());
+fn encode_response_as_binary(method: u16, response: &CommandResponse) -> Vec<u8> {
+    let mut request = CommandRequest::new_binary(method);
+    match response.status {
+        CommandStatus::Ok => {
+            request.args.insert(4, "ok".to_string()); // CBOR_STATUS is 4
+            if !response.message.is_empty() {
+                request.args.insert(32, response.message.clone()); // tag 32 for message
+            }
+        }
+        CommandStatus::Error => {
+            request.args.insert(5, response.message.clone()); // CBOR_ERROR is 5
+        }
+    }
     request.payload = response.payload.clone();
     encode_binary(&request)
 }

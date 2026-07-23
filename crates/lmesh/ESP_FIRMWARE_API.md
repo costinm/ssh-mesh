@@ -696,8 +696,8 @@ On classic ESP32, avoid ADC2 pins while Wi-Fi is active. Use ADC1 pins
 | Command | Params | Result |
 | --- | --- | --- |
 | `nan` | `start=true\|stop=true`, `backend=official\|raw`, `role=publish\|publisher_solicited\|subscribe\|both`, `service=dmesh`, `channel=6` | Start/stop NAN/raw NAN-like mode. `publisher_solicited` is the low-duty responder mode for lmesh/Android active subscribers. |
-| `nan` | `send="status"` | Send a DMesh NAN follow-up to the most recent NAN peer. Official NAN follow-up payloads that validate as text commands are dispatched through the shared command registry and answered with a `resp ...` follow-up. |
-| `nan` | `stats=true` | NAN support, counters, role/backend state, beacon timing, queued raw-NAN work, and raw command/response counters. |
+| `nan` | `send="status"`, `queue="status" dst=MAC` | `send` emits a DMesh NAN follow-up immediately. `queue` encodes a recognized text command as CBOR and holds it for the next raw-NAN active window; use `queue` for sleepy peers. Raw-NAN command responses use the same queue while duty cycling. |
+| `nan` | `stats=true` | NAN support, counters, role/backend state, beacon timing, queued raw-NAN work, and raw command/response counters. `rx_prefilter_drop` counts unrelated management frames rejected in the Wi-Fi callback before they can fill the raw-NAN queue. |
 
 Official NAN on classic ESP32 is an explicit comparison mode and uses a
 low-power-biased default for power tests:

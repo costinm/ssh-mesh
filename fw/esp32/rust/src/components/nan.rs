@@ -45,6 +45,7 @@ static NAN_RAW_RESPONSE_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_RESPONSE_TX: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
 static NAN_RX_QUEUE_DROPS: AtomicU32 = AtomicU32::new(0);
+static NAN_RX_PREFILTER_DROPS: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_OVERSIZE_DROPS: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
@@ -106,7 +107,7 @@ impl NanBackend {
     }
 }
 
-static NAN_COMMAND_QUEUE: OnceLock<Mutex<VecDeque<NanTextCommand>>> = OnceLock::new();
+static NAN_COMMAND_QUEUE: OnceLock<Mutex<VecDeque<NanIncomingCommand>>> = OnceLock::new();
 static NAN_OUTGOING_QUEUE: OnceLock<Mutex<VecDeque<RawNanOutgoing>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -114,15 +115,16 @@ enum NanCommandPeer {
     Raw { mac: [u8; 6], instance: u8 },
 }
 
-pub struct NanTextCommand {
+pub struct NanIncomingCommand {
     peer: NanCommandPeer,
-    pub text: String,
+    pub payload: Vec<u8>,
 }
 
 struct RawNanOutgoing {
     dst: [u8; 6],
     instance: u8,
     payload: Vec<u8>,
+    response: bool,
 }
 
 #[repr(C)]
@@ -133,7 +135,7 @@ struct RawNanRxFrame {
     data: [u8; NAN_RX_FRAME_MAX],
 }
 
-fn nan_command_queue() -> &'static Mutex<VecDeque<NanTextCommand>> {
+fn nan_command_queue() -> &'static Mutex<VecDeque<NanIncomingCommand>> {
     NAN_COMMAND_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_COMMAND_QUEUE_MAX)))
 }
 
@@ -141,7 +143,7 @@ fn nan_outgoing_queue() -> &'static Mutex<VecDeque<RawNanOutgoing>> {
     NAN_OUTGOING_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_OUTGOING_QUEUE_MAX)))
 }
 
-pub fn take_command() -> Option<NanTextCommand> {
+pub fn take_command() -> Option<NanIncomingCommand> {
     nan_command_queue().lock().ok()?.pop_front()
 }
 
@@ -179,6 +181,13 @@ pub fn forward_packet(packet: &[u8]) -> Result<()> {
     if NAN_RUNNING.load(Ordering::Relaxed) {
         let frame = nan_followup_frame(&[0xff; 6], NAN_ID, packet)?;
         raw_tx(&frame, true)?;
+        if packet.starts_with(b"dmesh.pong ")
+            || packet
+                .windows(b"reply=true".len())
+                .any(|part| part == b"reply=true")
+        {
+            NAN_RAW_RESPONSE_TX.fetch_add(1, Ordering::Relaxed);
+        }
         telemetry::record_log(format!(
             "event type=nan.forward backend=raw dst=ff:ff:ff:ff:ff:ff bytes={}",
             packet.len()
@@ -186,6 +195,25 @@ pub fn forward_packet(packet: &[u8]) -> Result<()> {
         return Ok(());
     }
     bail!("NAN is not running")
+}
+
+/// Send a raw-NAN packet now, or queue it for the next duty-cycle window.
+///
+/// Control-plane discovery must not depend on a console command landing in the
+/// short active window. The queue makes the normal raw-NAN cadence a first
+/// class transport instead of treating an inactive Wi-Fi modem as a send
+/// failure.
+pub fn forward_or_queue_packet(packet: &[u8]) -> Result<bool> {
+    if NAN_RUNNING.load(Ordering::Relaxed) {
+        forward_packet(packet)?;
+        return Ok(false);
+    }
+    queue_raw_broadcast(packet)?;
+    telemetry::record_log(format!(
+        "event type=nan.forward queued=true dst=ff:ff:ff:ff:ff:ff bytes={}",
+        packet.len()
+    ));
+    Ok(true)
 }
 
 pub fn raw_followup_frame(dst: &[u8; 6], data: &[u8]) -> Result<Vec<u8>> {
@@ -256,19 +284,25 @@ fn raw_service_descriptor_payload(body: &[u8]) -> Option<(u8, &[u8])> {
     Some((instance, &body[payload_start..payload_end]))
 }
 
-pub fn send_response_payload_to(command: &NanTextCommand, payload: &[u8]) -> Result<()> {
+/// Queue a response for a raw-NAN peer.
+///
+/// In duty-cycle mode, the scheduler drains this queue during the next radio
+/// window. In continuously active raw mode, drain it now so interactive
+/// diagnostics retain their request/response behavior.
+pub fn queue_response_payload_to(command: &NanIncomingCommand, payload: &[u8]) -> Result<usize> {
     match &command.peer {
         NanCommandPeer::Raw { mac, instance } => {
-            let frame = nan_followup_frame(mac, *instance, payload)?;
-            raw_tx(&frame, true)?;
-            NAN_RAW_RESPONSE_TX.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            let queued = enqueue_outgoing_raw(*mac, *instance, payload, true)?;
+            if !super::mode::raw_nan_duty_enabled() && NAN_RUNNING.load(Ordering::Relaxed) {
+                drain_outgoing_raw();
+            }
+            Ok(queued)
         }
     }
 }
 
 pub fn queue_raw_broadcast(payload: &[u8]) -> Result<usize> {
-    enqueue_outgoing_raw([0xff; 6], NAN_ID, payload)
+    enqueue_outgoing_raw([0xff; 6], NAN_ID, payload, false)
 }
 
 pub fn drain_raw_queue() -> usize {
@@ -281,6 +315,30 @@ pub fn raw_response_rx_count() -> u32 {
 
 pub fn raw_tx_active() -> bool {
     NAN_RUNNING.load(Ordering::Relaxed)
+}
+
+/// Compact raw-NAN counters suitable for a bounded LoRa ping/pong payload.
+///
+/// Short field names keep the response below the Meshtastic-compatible text
+/// frame budget: `nrun`, management frames, SDF frames, response RX/TX,
+/// prefilter drops, and latest beacon age in milliseconds.
+pub fn ping_health_fields() -> String {
+    let last_beacon = last_beacon_local_us();
+    let beacon_age_ms = if last_beacon == 0 {
+        u64::MAX
+    } else {
+        now_us().saturating_sub(last_beacon) / 1_000
+    };
+    format!(
+        "nrun={} nmg={} nsdf={} nrx={} ntx={} ndrop={} nage={}",
+        NAN_RUNNING.load(Ordering::Relaxed) as u8,
+        NAN_RX_MGMT.load(Ordering::Relaxed),
+        NAN_RX_SDF.load(Ordering::Relaxed),
+        NAN_RAW_RESPONSE_RX.load(Ordering::Relaxed),
+        NAN_RAW_RESPONSE_TX.load(Ordering::Relaxed),
+        NAN_RX_PREFILTER_DROPS.load(Ordering::Relaxed),
+        beacon_age_ms,
+    )
 }
 
 pub fn sync_to_next_discovery_window(timeout_ms: u64, dw_tu: u64, offset_tu: u64) -> u64 {
@@ -436,10 +494,11 @@ impl CommandHandler for NanCommand {
                 .transpose()?
                 .unwrap_or(NAN_ID as i32)
                 .clamp(0, 255) as u8;
-            let queued = enqueue_outgoing_raw(dst, instance, data.as_bytes())?;
+            let payload_bytes = encode_command_payload(data);
+            let queued = enqueue_outgoing_raw(dst, instance, &payload_bytes, false)?;
             return Ok(CommandResponse::ok(format!(
                 "nan queued backend=raw len={} queue={}",
-                data.len().min(255),
+                payload_bytes.len().min(255),
                 queued
             )));
         }
@@ -452,12 +511,13 @@ impl CommandHandler for NanCommand {
                 .transpose()?
                 .unwrap_or(NAN_ID as i32)
                 .clamp(0, 255) as u8;
-            let frame = nan_followup_frame(&dst, instance, data.as_bytes())?;
+            let payload_bytes = encode_command_payload(data);
+            let frame = nan_followup_frame(&dst, instance, &payload_bytes)?;
             raw_tx(&frame, true)?;
             return Ok(CommandResponse::ok(format!(
                 "nan followup sent backend={} bytes={}",
                 self.backend.name(),
-                data.len().min(255)
+                payload_bytes.len().min(255)
             )));
         }
         Ok(CommandResponse::ok(stats()))
@@ -477,7 +537,9 @@ impl NanCommand {
             .unwrap_or(500)
             .clamp(50, 60_000) as u64;
         let count = request.arg_i32("count")?.unwrap_or(10).clamp(1, 100) as u32;
-        let filter = request.arg("filter").unwrap_or("sdf");
+        // Match the duty scheduler: TSF synchronization needs NAN beacons in
+        // addition to DMesh SDF follow-ups.
+        let filter = request.arg("filter").unwrap_or("nan");
         let sync = request
             .arg("sync")
             .map(parse_bool)
@@ -792,23 +854,23 @@ fn last_beacon_tsf_us() -> u64 {
 }
 
 fn enqueue_raw_command(source: [u8; 6], instance: u8, payload: &[u8]) -> bool {
-    if payload.starts_with(b"resp ") || payload.starts_with(b"notify ") {
-        return false;
-    }
     if payload.len() > NAN_COMMAND_MAX_LEN {
+        telemetry::record_log("event type=nan.reject reason=len".to_string());
         return false;
     }
-    let Ok(text) = core::str::from_utf8(payload) else {
-        return false;
+    let req = match crate::commands::protocol::decode_binary(payload) {
+        Ok(req) => req,
+        Err(err) => {
+            telemetry::record_log(format!("event type=nan.reject reason=decode err={}", err));
+            return false;
+        }
     };
-    let text = text.trim();
-    if text.is_empty() {
-        return false;
-    }
-    if !command_targets_this_device(text) {
+    if !command_targets_this_device_cbor(&req) {
+        telemetry::record_log("event type=nan.reject reason=target".to_string());
         return false;
     }
     if station_mac().map(|mac| mac == source).unwrap_or(false) {
+        telemetry::record_log("event type=nan.reject reason=self".to_string());
         return false;
     }
     let Ok(mut queue) = nan_command_queue().lock() else {
@@ -817,19 +879,53 @@ fn enqueue_raw_command(source: [u8; 6], instance: u8, payload: &[u8]) -> bool {
     if queue.len() >= NAN_COMMAND_QUEUE_MAX {
         queue.pop_front();
     }
-    queue.push_back(NanTextCommand {
+    queue.push_back(NanIncomingCommand {
         peer: NanCommandPeer::Raw {
             mac: source,
             instance,
         },
-        text: text.to_string(),
+        payload: payload.to_vec(),
     });
     NAN_RAW_COMMAND_RX.fetch_add(1, Ordering::Relaxed);
     super::wake::notify();
     true
 }
 
-fn enqueue_outgoing_raw(dst: [u8; 6], instance: u8, payload: &[u8]) -> Result<usize> {
+fn command_targets_this_device_cbor(request: &CommandRequest) -> bool {
+    let Some(to) = request.args.get(&331) else {
+        telemetry::record_log("event type=nan.target_check to=none".to_string());
+        return true;
+    };
+    if is_broadcast_target(to) {
+        telemetry::record_log("event type=nan.target_check to=broadcast".to_string());
+        return true;
+    }
+    let Ok(mac) = station_mac() else {
+        telemetry::record_log("event type=nan.target_check err=no_mac".to_string());
+        return false;
+    };
+    let suffix = mac_suffix4_hex(&mac);
+    let matched = to.eq_ignore_ascii_case(&suffix);
+    telemetry::record_log(format!(
+        "event type=nan.target_check to={} suffix={} matched={}",
+        to, suffix, matched
+    ));
+    matched
+}
+
+fn encode_command_payload(data: &str) -> Vec<u8> {
+    match crate::commands::protocol::parse_text(data) {
+        Ok(request) => crate::commands::protocol::encode_binary(&request),
+        Err(_) => data.as_bytes().to_vec(),
+    }
+}
+
+fn enqueue_outgoing_raw(
+    dst: [u8; 6],
+    instance: u8,
+    payload: &[u8],
+    response: bool,
+) -> Result<usize> {
     let len = payload.len().min(255);
     let Ok(mut queue) = nan_outgoing_queue().lock() else {
         bail!("nan outgoing queue lock failed")
@@ -841,6 +937,7 @@ fn enqueue_outgoing_raw(dst: [u8; 6], instance: u8, payload: &[u8]) -> Result<us
         dst,
         instance,
         payload: payload[..len].to_vec(),
+        response,
     });
     Ok(queue.len())
 }
@@ -862,6 +959,9 @@ fn drain_outgoing_raw() -> usize {
         {
             Ok(()) => {
                 sent += 1;
+                if item.response {
+                    NAN_RAW_RESPONSE_TX.fetch_add(1, Ordering::Relaxed);
+                }
                 telemetry::record_log(format!(
                     "event type=nan.queue_tx ok=true dst={} len={} sent={}",
                     format_mac(&item.dst),
@@ -876,7 +976,7 @@ fn drain_outgoing_raw() -> usize {
                     item.payload.len(),
                     crate::commands::protocol::escape_value(&err.to_string())
                 ));
-                let _ = enqueue_outgoing_raw(item.dst, item.instance, &item.payload);
+                let _ = enqueue_outgoing_raw(item.dst, item.instance, &item.payload, item.response);
                 return sent;
             }
         }
@@ -1015,6 +1115,15 @@ unsafe extern "C" fn sniffer_cb(
         NAN_RX_OVERSIZE_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    // This callback runs in the Wi-Fi driver task. Do the fixed-offset filter
+    // before copying a complete management frame into the FreeRTOS queue.
+    // Otherwise unrelated SDF/action traffic fills the queue before the main
+    // task can reach a directed raw-NAN command.
+    let frame = unsafe { core::slice::from_raw_parts(payload, len) };
+    if !matches_filter(frame) && super::wifi::custom_raw_action_payload(frame).is_none() {
+        NAN_RX_PREFILTER_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let queue = NAN_RX_QUEUE.load(Ordering::Acquire);
     if queue.is_null() {
         NAN_RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -1066,6 +1175,7 @@ pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
         0x80 => {
             if is_nan_bssid(frame) {
                 NAN_RX_BEACON.fetch_add(1, Ordering::Relaxed);
+                super::wifi::observe_beacon(frame);
                 if let Some(tsf) = beacon_tsf_us(frame) {
                     store_last_beacon_local_us(now_us());
                     store_last_beacon_tsf_us(tsf);
@@ -1084,16 +1194,40 @@ pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
             } else if is_nan_sdf(frame) {
                 NAN_RX_SDF.fetch_add(1, Ordering::Relaxed);
                 if let Some(info) = raw_command_info(frame) {
+                    super::mode::observe_ping("nan_raw", info.payload);
                     telemetry::record_log(format!(
                         "event type=nan.raw_followup_rx peer={} instance={} len={}",
                         format_mac(&info.source),
                         info.instance,
                         info.payload.len()
                     ));
-                    if !station_mac().map(|mac| mac == info.source).unwrap_or(false)
-                        && (info.payload.starts_with(b"resp ")
-                            || info.payload.starts_with(b"notify "))
-                    {
+                    let is_resp =
+                        if let Ok(req) = crate::commands::protocol::decode_binary(info.payload) {
+                            let is_r = req.args.contains_key(&4) || req.args.contains_key(&5);
+                            telemetry::record_log(format!(
+                                "event type=nan.raw_followup_rx.cbor_decode ok=true is_resp={}",
+                                is_r
+                            ));
+                            is_r
+                        } else {
+                            let is_r = info.payload.starts_with(b"resp ")
+                                || info.payload.starts_with(b"notify ")
+                                || info.payload.starts_with(b"dmesh.pong ")
+                                || info
+                                    .payload
+                                    .windows(b"reply=true".len())
+                                    .any(|part| part == b"reply=true");
+                            telemetry::record_log(format!(
+                                "event type=nan.raw_followup_rx.cbor_decode ok=false is_resp={}",
+                                is_r
+                            ));
+                            is_r
+                        };
+                    if !station_mac().map(|mac| mac == info.source).unwrap_or(false) && is_resp {
+                        telemetry::record_log(format!(
+                            "event type=nan.raw_response_rx source={}",
+                            format_mac(&info.source)
+                        ));
                         NAN_RAW_RESPONSE_RX.fetch_add(1, Ordering::Relaxed);
                     } else {
                         enqueue_raw_command(info.source, info.instance, info.payload);
@@ -1164,7 +1298,7 @@ fn stats() -> String {
         .map(|queue| queue.len())
         .unwrap_or(0);
     format!(
-        "nan support=raw running={} filter={} bssid_filter={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={}",
+        "nan support=raw running={} filter={} bssid_filter={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={}",
         NAN_RUNNING.load(Ordering::Relaxed),
         filter_name(),
         NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
@@ -1178,6 +1312,7 @@ fn stats() -> String {
         NAN_RAW_COMMAND_RX.load(Ordering::Relaxed),
         NAN_RAW_RESPONSE_RX.load(Ordering::Relaxed),
         NAN_RAW_RESPONSE_TX.load(Ordering::Relaxed),
+        NAN_RX_PREFILTER_DROPS.load(Ordering::Relaxed),
         NAN_RX_QUEUE_DROPS.load(Ordering::Relaxed),
         NAN_RX_OVERSIZE_DROPS.load(Ordering::Relaxed),
         last_beacon_local_us,

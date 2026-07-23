@@ -81,18 +81,19 @@ impl NvsCommand {
         let mut pairs = Vec::new();
         if let (Some(key), Some(value)) = (request.arg("key"), request.arg("value")) {
             pairs.push((key, value));
+        } else if let (Some(key), Some(value)) = (
+            request.positional(positional_skip),
+            request.positional(positional_skip + 1),
+        ) {
+            pairs.push((key, value));
         }
-        for (key, value) in &request.args {
-            if is_control_arg(key, positional_skip, request) {
-                continue;
+        for (&tag, value) in &request.args {
+            if let Some(key_str) = nvs_key(tag) {
+                pairs.push((key_str, value.as_str()));
             }
-            if key == "key" || key == "value" {
-                continue;
-            }
-            pairs.push((key.as_str(), value.as_str()));
         }
         if pairs.is_empty() {
-            return Err(anyhow!("set requires KEY=VALUE"));
+            return Err(anyhow!("set requires KEY VALUE or key=KEY value=VALUE"));
         }
 
         let mut settings = self.settings.borrow_mut();
@@ -113,7 +114,6 @@ impl NvsCommand {
         let key = request
             .positional(positional_skip)
             .or_else(|| request.arg("key"))
-            .or_else(|| first_non_control_arg(request, positional_skip))
             .ok_or_else(|| anyhow!("get requires KEY"))?;
         let value = self.settings.borrow().get_str(key)?.unwrap_or_default();
         Ok(CommandResponse::ok(format!(
@@ -132,23 +132,6 @@ impl NvsCommand {
         }
         Ok(CommandResponse::ok(values.join(" ")))
     }
-}
-
-fn first_non_control_arg(request: &CommandRequest, positional_skip: usize) -> Option<&str> {
-    request
-        .args
-        .keys()
-        .find(|key| !is_control_arg(key, positional_skip, request))
-        .map(String::as_str)
-}
-
-fn is_control_arg(key: &str, positional_skip: usize, request: &CommandRequest) -> bool {
-    request
-        .positionals
-        .iter()
-        .take(positional_skip)
-        .any(|value| value == key)
-        || matches!(key, "cmd" | "op" | "stats")
 }
 
 fn nvs_stats() -> Result<CommandResponse> {
@@ -174,4 +157,30 @@ fn nvs_stats() -> Result<CommandResponse> {
         stats.total_entries,
         stats.namespace_count
     )))
+}
+
+fn nvs_key(tag: u16) -> Option<&'static str> {
+    Some(match tag {
+        42 => "mode",
+        150 => "wifi.mode",
+        151 => "power.profile",
+        152 => "nan.backend",
+        153 => "nan.boot",
+        154 => "nan.role",
+        155 => "nan.service",
+        156 => "nan.channel",
+        157 => "nan.wake_ms",
+        158 => "nan.active_ms",
+        159 => "nan.light_sleep",
+        160 => "nan.early_ms",
+        161 => "nan.dw_tu",
+        162 => "nan.dw_off_tu",
+        163 => "battery.divider",
+        164 => "battery.mult",
+        165 => "ble.peer",
+        166 => "identity.node",
+        167 => "identity.meshtastic",
+        301 => "lora.enabled",
+        _ => return None,
+    })
 }

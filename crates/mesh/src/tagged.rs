@@ -136,7 +136,7 @@ impl TaggedCatalog {
         self.methods.get(name)
     }
 
-    /// Parse `component.method -name=value positional...` into a tagged record.
+    /// Parse `component.method name=value positional...` into a tagged record.
     pub fn parse_text(&self, line: &str) -> Result<TaggedRecord> {
         let tokens = text_tokens(line)?;
         let (method_name, rest) = tokens
@@ -168,6 +168,15 @@ impl TaggedCatalog {
                 let (name, value) = option
                     .split_once('=')
                     .ok_or_else(|| anyhow!("option {token} requires =value"))?;
+                let key = schema
+                    .and_then(|schema| schema.fields.get(name))
+                    .map(|field| NameOrTag::Tag(field.tag))
+                    .unwrap_or_else(|| NameOrTag::parse(name));
+                record.env.insert(key, text_value(value));
+            } else if options
+                && let Some((name, value)) = token.split_once('=')
+                && !name.is_empty()
+            {
                 let key = schema
                     .and_then(|schema| schema.fields.get(name))
                     .map(|field| NameOrTag::Tag(field.tag))
@@ -273,5 +282,16 @@ mod tests {
         assert_eq!(record.params, vec![json!("wlan0")]);
         assert_eq!(record.env.get(&NameOrTag::Tag(1)), Some(&json!("wlan0")));
         assert_eq!(record.env.get(&NameOrTag::Tag(2)), Some(&json!(1)));
+    }
+
+    #[test]
+    fn text_bare_named_values_are_fields() {
+        let catalog = TaggedCatalog::default();
+        let record = catalog.parse_text("service.stop name=lmesh").unwrap();
+        assert!(record.params.is_empty());
+        assert_eq!(
+            record.env.get(&NameOrTag::Name("name".to_owned())),
+            Some(&json!("lmesh"))
+        );
     }
 }
