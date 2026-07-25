@@ -39,6 +39,12 @@
       "beacon_observe_sec": 6.0,
       "require_beacon": false
     },
+    "active_window": {
+      "active_ms": 5000,
+      "ping_count": 4,
+      "ping_spacing_sec": 0.5,
+      "recovery_sec": 21.0
+    },
     "lora": {
       "preset": "medium_fast",
       "frequency": 913125000,

@@ -38,6 +38,15 @@ static COMPANION_PENDING_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ENABLED: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
+// Infra active mode is a runtime-only override for a powered gateway or a
+// bounded bulk transfer. It deliberately does not persist in NVS: reset must
+// always return a battery node to its configured raw-NAN duty cycle.
+static INFRA_ACTIVE_PERSISTENT: AtomicBool = AtomicBool::new(false);
+static INFRA_ACTIVE_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+static INFRA_ACTIVE_STARTS: AtomicU32 = AtomicU32::new(0);
+static INFRA_ACTIVE_STOPS: AtomicU32 = AtomicU32::new(0);
+static INFRA_ACTIVE_EXPIRES: AtomicU32 = AtomicU32::new(0);
+static INFRA_ACTIVE_UART_EXTENDS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_BEACON_BASELINE: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_EXPECT_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_EXPECT_TSF_HI: AtomicU32 = AtomicU32::new(0);
@@ -127,6 +136,7 @@ pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) ->
 
 pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
     PRODUCT_MODE.store(MODE_COMPANION, Ordering::Relaxed);
+    stop_infra_active_session();
     COMPANION_ADVERTISING.store(true, Ordering::Relaxed);
     COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
     COMPANION_DEADLINE_MS.store(now_ms().wrapping_add(window_ms), Ordering::Relaxed);
@@ -141,6 +151,7 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
 }
 
 pub fn poll(settings: &SharedSettings) {
+    poll_infra_active_session();
     poll_raw_nan_duty(settings);
 
     let response_due = PING_RESPONSE_NOT_BEFORE_MS.load(Ordering::Relaxed);
@@ -168,7 +179,104 @@ pub fn send_button_sync(settings: &SharedSettings) {
 }
 
 pub fn mark_companion_active(settings: &SharedSettings, window_ms: u32) {
-    let _ = (settings, window_ms);
+    if is_companion_mode() {
+        return;
+    }
+    extend_infra_active_session(settings, window_ms, "uart");
+}
+
+fn deadline_is_due(deadline: u32, now: u32) -> bool {
+    deadline != 0 && now.wrapping_sub(deadline) < u32::MAX / 2
+}
+
+fn infra_active_session_enabled() -> bool {
+    if INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed) {
+        return true;
+    }
+    let deadline = INFRA_ACTIVE_DEADLINE_MS.load(Ordering::Relaxed);
+    deadline != 0 && !deadline_is_due(deadline, now_ms())
+}
+
+fn poll_infra_active_session() {
+    if INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed) {
+        return;
+    }
+    let deadline = INFRA_ACTIVE_DEADLINE_MS.load(Ordering::Relaxed);
+    if !deadline_is_due(deadline, now_ms()) {
+        return;
+    }
+    if INFRA_ACTIVE_DEADLINE_MS
+        .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        INFRA_ACTIVE_EXPIRES.fetch_add(1, Ordering::Relaxed);
+        telemetry::record_log("event type=mode.infra_active state=expired");
+    }
+}
+
+fn infra_radio_hold_active() -> bool {
+    infra_active_session_enabled() || super::serial::is_active()
+}
+
+fn extend_infra_active_session(settings: &SharedSettings, window_ms: u32, reason: &'static str) {
+    let window_ms = window_ms.max(1_000).min(300_000);
+    if INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed) {
+        return;
+    }
+    let deadline = now_ms().wrapping_add(window_ms);
+    let previous = INFRA_ACTIVE_DEADLINE_MS.load(Ordering::Relaxed);
+    if previous == 0 || deadline_is_due(previous, deadline) {
+        INFRA_ACTIVE_DEADLINE_MS.store(deadline, Ordering::Relaxed);
+    }
+    INFRA_ACTIVE_UART_EXTENDS.fetch_add(1, Ordering::Relaxed);
+    if let Err(err) = ensure_infra_active_radios(settings, reason) {
+        telemetry::record_log(format!(
+            "event type=mode.infra_active state=uart_extend ok=false msg={}",
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+    }
+}
+
+fn start_infra_active_session(
+    settings: &SharedSettings,
+    active_ms: Option<u32>,
+    reason: &'static str,
+) -> Result<()> {
+    if is_companion_mode() {
+        bail!("mode active requires infra mode; run mode infra=true first");
+    }
+    match active_ms {
+        Some(ms) => {
+            let ms = ms.clamp(1_000, 300_000);
+            INFRA_ACTIVE_PERSISTENT.store(false, Ordering::Relaxed);
+            INFRA_ACTIVE_DEADLINE_MS.store(now_ms().wrapping_add(ms), Ordering::Relaxed);
+        }
+        None => {
+            INFRA_ACTIVE_DEADLINE_MS.store(0, Ordering::Relaxed);
+            INFRA_ACTIVE_PERSISTENT.store(true, Ordering::Relaxed);
+        }
+    }
+    INFRA_ACTIVE_STARTS.fetch_add(1, Ordering::Relaxed);
+    ensure_infra_active_radios(settings, reason)?;
+    let persistent = INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed);
+    telemetry::record_log(format!(
+        "event type=mode.infra_active state=start persistent={} active_ms={}",
+        persistent,
+        active_ms.unwrap_or(0)
+    ));
+    Ok(())
+}
+
+fn stop_infra_active_session() {
+    let was_active = INFRA_ACTIVE_PERSISTENT.swap(false, Ordering::AcqRel)
+        || INFRA_ACTIVE_DEADLINE_MS.swap(0, Ordering::AcqRel) != 0;
+    if was_active {
+        INFRA_ACTIVE_STOPS.fetch_add(1, Ordering::Relaxed);
+        // Let the next mode poll close the current window and compute a fresh
+        // beacon-aligned duty sleep interval.
+        RAW_NAN_DUTY_NEXT_MS.store(now_ms(), Ordering::Relaxed);
+        telemetry::record_log("event type=mode.infra_active state=stopped");
+    }
 }
 
 /// Observe a ping from a transport that expects the standard infra response.
@@ -291,6 +399,7 @@ fn enter_companion_advertising(
     reason: &'static str,
 ) -> Result<()> {
     PRODUCT_MODE.store(MODE_COMPANION, Ordering::Relaxed);
+    stop_infra_active_session();
     if reason != "pending" {
         COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
     }
@@ -500,6 +609,36 @@ fn start_raw_nan_duty(
     Ok(())
 }
 
+/// Ensure the configured infra radios are ready for a powered or bounded
+/// transfer without replacing the raw-NAN duty-cycle configuration.
+fn ensure_infra_active_radios(settings: &SharedSettings, reason: &'static str) -> Result<()> {
+    if !get_bool(settings, "wifi.enabled", true) {
+        bail!("wifi is disabled; set wifi.enabled=true before mode active");
+    }
+    let channel =
+        get_u32(settings, "nan.channel", get_u32(settings, "raw.ch", 6)).clamp(1, 13) as u8;
+    if !RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed) {
+        start_raw_nan_duty(settings, reason, channel)?;
+    } else if !RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
+        arm_raw_nan_beacon_window(None);
+        super::nan::start_raw_window(channel, "nan")?;
+        let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(50, 60_000);
+        let queued_sent = super::nan::drain_raw_queue();
+        record_raw_nan_dw_start(
+            get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU),
+            false,
+            false,
+        );
+        RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
+        RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(active_ms), Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=mode.infra_active wifi=started channel={} reason={} queued_sent={}",
+            channel, reason, queued_sent
+        ));
+    }
+    start_infra_lora(settings, reason)
+}
+
 pub fn stop_raw_nan_duty() {
     RAW_NAN_DUTY_ENABLED.store(false, Ordering::Relaxed);
     RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
@@ -530,6 +669,21 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         .min(duty_ms.saturating_sub(active_ms));
     let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
+    let hold_active = infra_radio_hold_active();
+
+    // A powered gateway, bounded transfer, or locally woken console owns the
+    // radio. If duty sleep had already stopped Wi-Fi, bring it up immediately;
+    // otherwise retain the current receiver without churn.
+    if hold_active && !RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
+        if let Err(err) = ensure_infra_active_radios(settings, "active_session") {
+            telemetry::record_log(format!(
+                "event type=mode.infra_active wifi=started ok=false msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(1_000), Ordering::Relaxed);
+        }
+        return;
+    }
 
     if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
         // A GPIO0/DTR or UART wake deliberately owns a short debug window.
@@ -538,7 +692,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         // wasting power, that restart loop races UART TX and leaves forwarded
         // console clients with a result but no prompt. Once the console window
         // expires the next poll follows the normal modem-off sleep path.
-        if super::serial::is_active() {
+        if hold_active {
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
             return;
         }
@@ -1043,23 +1197,41 @@ impl CommandHandler for ModeCommand {
             send_status_ping(&self.settings, "command")?;
             return Ok(CommandResponse::ok(status_text()));
         }
-        if request
-            .arg("active")
-            .map(parse_bool)
-            .transpose()?
-            .unwrap_or(false)
-        {
-            let ms = request
-                .arg_i32("ms")?
-                .or(request.arg_i32("window_ms")?)
-                .unwrap_or(DEFAULT_ACTIVE_MS as i32)
-                .max(1_000) as u32;
-            enter_companion_advertising(
-                &self.settings,
-                ms,
-                get_u32(&self.settings, "cm.adv_ms", DEFAULT_ADV_MS),
-                "command",
-            )?;
+        if request.arg("active").is_some() || request.arg("active_ms").is_some() {
+            let enabled = request
+                .arg("active")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(true);
+            if is_companion_mode() {
+                if enabled {
+                    let window_ms = request
+                        .arg_i32("active_ms")?
+                        .or(request.arg_i32("ms")?)
+                        .or(request.arg_i32("window_ms")?)
+                        .unwrap_or(DEFAULT_ACTIVE_MS as i32)
+                        .max(1_000) as u32;
+                    enter_companion_advertising(
+                        &self.settings,
+                        window_ms,
+                        get_u32(&self.settings, "cm.adv_ms", DEFAULT_ADV_MS),
+                        "command",
+                    )?;
+                } else {
+                    enter_companion_sleep(&self.settings)?;
+                }
+                return Ok(CommandResponse::ok(status_text()));
+            }
+            if enabled {
+                let active_ms = request
+                    .arg_i32("active_ms")?
+                    .or(request.arg_i32("ms")?)
+                    .or(request.arg_i32("window_ms")?)
+                    .map(|value| value.clamp(1_000, 300_000) as u32);
+                start_infra_active_session(&self.settings, active_ms, "command")?;
+            } else {
+                stop_infra_active_session();
+            }
             return Ok(CommandResponse::ok(status_text()));
         }
         if request
@@ -1105,8 +1277,15 @@ fn save_requested(request: &CommandRequest) -> bool {
 
 fn status_text() -> String {
     format!(
-        "mode active={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={} {}",
+        "mode active={} infra_active={} infra_active_persistent={} infra_active_deadline_ms={} infra_active_start={} infra_active_stop={} infra_active_expire={} infra_active_uart_extend={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={} {}",
         mode_name(),
+        infra_active_session_enabled(),
+        INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed),
+        INFRA_ACTIVE_DEADLINE_MS.load(Ordering::Relaxed),
+        INFRA_ACTIVE_STARTS.load(Ordering::Relaxed),
+        INFRA_ACTIVE_STOPS.load(Ordering::Relaxed),
+        INFRA_ACTIVE_EXPIRES.load(Ordering::Relaxed),
+        INFRA_ACTIVE_UART_EXTENDS.load(Ordering::Relaxed),
         COMPANION_ADVERTISING.load(Ordering::Relaxed),
         COMPANION_PENDING_ADVERTISING.load(Ordering::Relaxed),
         telemetry::pending_message_count(),

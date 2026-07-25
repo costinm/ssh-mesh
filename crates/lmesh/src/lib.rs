@@ -640,6 +640,18 @@ pub enum Request {
         #[serde(default)]
         timeout_sec: Option<f64>,
     },
+    /// Enter or leave the runtime-only ESP powered/transfer radio mode.
+    #[serde(rename = "esp.active")]
+    EspActive {
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        active: Option<bool>,
+        #[serde(default)]
+        active_ms: Option<u32>,
+    },
     /// Return LoRa status from an ESP firmware adapter.
     #[serde(rename = "esp.lora.status")]
     EspLoraStatus {
@@ -674,7 +686,7 @@ pub enum Request {
         #[serde(default)]
         reset: Option<bool>,
     },
-    /// Start a background LoRa discovery stability runner through managed UDS forwards.
+    /// Start a background LoRa and host-NAN discovery stability runner.
     #[serde(rename = "esp.stability.start")]
     EspStabilityStart {
         #[serde(default)]
@@ -687,6 +699,8 @@ pub enum Request {
         wait_sec: Option<u64>,
         #[serde(default)]
         cycles: Option<u32>,
+        #[serde(default)]
+        host_nan: Option<bool>,
     },
     /// Return the latest managed LoRa discovery stability result.
     #[serde(rename = "esp.stability.status")]
@@ -1166,6 +1180,14 @@ impl LmeshService {
                 command,
                 timeout_sec,
             )),
+            Request::EspActive {
+                adapter,
+                port,
+                active,
+                active_ms,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio.esp_active(adapter, port, active, active_ms),
+            ),
             Request::EspLoraStatus { adapter, port } => {
                 mesh::protocol::Response::ok_with_data(self.radio.esp_lora_status(adapter, port))
             }
@@ -1188,12 +1210,14 @@ impl LmeshService {
                 interval_sec,
                 wait_sec,
                 cycles,
+                host_nan,
             } => mesh::protocol::Response::ok_with_data(self.radio.stability_start(
                 source,
                 expected,
                 interval_sec,
                 wait_sec,
                 cycles,
+                host_nan,
             )),
             Request::EspStabilityStatus => {
                 mesh::protocol::Response::ok_with_data(self.radio.stability_status())

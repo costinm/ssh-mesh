@@ -3,6 +3,7 @@ use mesh::message::{
     FIELD_CTRL_DIR, FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD,
     FIELD_RADIO_ID, FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec, TextRecord,
 };
+use minicbor::Encoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -27,6 +28,10 @@ const DEFAULT_WIFI_IFACE: &str = "wlan1";
 const DEFAULT_WPA_CTRL_DIR: &str = "/run/mesh/wpa-supplicant-nan";
 const DEFAULT_WPA_SERVICE_NAME: &str = "dmesh";
 const DEFAULT_NAN_TTL_SECS: u32 = 3600;
+// Firmware raw-NAN peers normally wake every four seconds for a short window.
+// A 700 ms probe cadence walks that phase rather than repeatedly landing on a
+// fixed 250/500 ms boundary.
+const STABILITY_HOST_NAN_RETRY_MS: u64 = 700;
 const DEFAULT_HCI_DEV: u16 = 0;
 const DEFAULT_RAW_WIFI_CHANNEL: u8 = 6;
 const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
@@ -231,10 +236,16 @@ impl RadioService {
         interval_sec: Option<u64>,
         wait_sec: Option<u64>,
         cycles: Option<u32>,
+        host_nan: Option<bool>,
     ) -> Value {
         let source = source.unwrap_or_else(|| "lora1".to_string());
         let interval_sec = interval_sec.unwrap_or(120).clamp(10, 86_400);
         let wait_sec = wait_sec.unwrap_or(12).clamp(2, 60);
+        // Sleeping ESPs only listen in their own raw-NAN window. A host NAN
+        // follow-up cannot be scheduled against that window through the
+        // public WPA API, so direct host-to-sleepy-ESP NAN remains opt-in
+        // diagnostics rather than the gateway stability default.
+        let host_nan = host_nan.unwrap_or(false);
         let expected = expected
             .map(|value| split_csv(&value))
             .unwrap_or_else(|| self.stability_default_targets(&source));
@@ -258,6 +269,7 @@ impl RadioService {
             interval_sec,
             wait_sec,
             cycles,
+            host_nan,
         )));
         *guard = Some(StabilityRuntime {
             stop: stop.clone(),
@@ -271,8 +283,13 @@ impl RadioService {
             while !stop.load(Ordering::Acquire)
                 && cycles.map(|limit| completed < limit).unwrap_or(true)
             {
-                let result =
-                    service.run_stability_cycle(&source, &source_socket, &expected, wait_sec);
+                let result = service.run_stability_cycle(
+                    &source,
+                    &source_socket,
+                    &expected,
+                    wait_sec,
+                    host_nan,
+                );
                 completed = completed.saturating_add(1);
                 {
                     let mut current = state
@@ -344,6 +361,7 @@ impl RadioService {
         socket: &str,
         expected: &[String],
         wait_sec: u64,
+        host_nan: bool,
     ) -> Value {
         let expected_macs = expected
             .iter()
@@ -357,6 +375,8 @@ impl RadioService {
         let nan_after = stability_nan_stats(socket);
         let nan = stability_nan_cycle(nan_before.as_ref(), nan_after.as_ref());
         let observed = parse_stability_pongs(&output);
+        let host_nan =
+            host_nan.then(|| self.run_host_nan_stability_cycle(&expected_macs, wait_sec));
         let missing = expected_macs
             .iter()
             .filter_map(|(id, mac)| match mac {
@@ -377,7 +397,100 @@ impl RadioService {
             "observed": observed,
             "missing": missing,
             "nan": nan,
+            "host_nan": host_nan,
             "wait_sec": wait_sec,
+        })
+    }
+
+    /// Probe the host-to-ESP raw-NAN command and reply path with firmware CBOR.
+    fn run_host_nan_stability_cycle(
+        &self,
+        expected_macs: &BTreeMap<String, Option<String>>,
+        wait_sec: u64,
+    ) -> Value {
+        let start = self.nan_start(None, None);
+        let available = start
+            .get("nan_capability")
+            .and_then(|value| value.get("ok"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !available {
+            return json!({
+                "available": false,
+                "ok": false,
+                "start": start,
+                "error": "host NAN/USD is unavailable",
+            });
+        }
+
+        let payload = match firmware_mode_ping_cbor() {
+            Ok(payload) => payload,
+            Err(error) => {
+                return json!({"available": true, "ok": false, "error": error.to_string()});
+            }
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(wait_sec);
+        let mut transmits = Vec::new();
+        let mut all_events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            transmits.push(self.nan_transmit(
+                None,
+                None,
+                1,
+                "ff:ff:ff:ff:ff:ff".to_string(),
+                None,
+                Some(hex_bytes(&payload)),
+                None,
+                None,
+            ));
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let wait_ms = remaining
+                .as_millis()
+                .min(STABILITY_HOST_NAN_RETRY_MS as u128) as u64;
+            if wait_ms == 0 {
+                break;
+            }
+            let events = self.nan_events(None, None, Some(wait_ms), Some(64));
+            if let Some(events) = events.get("events").and_then(Value::as_array) {
+                all_events.extend(events.iter().cloned());
+            }
+        }
+        let events = json!({"events": all_events});
+        let responses = host_nan_responses(&events);
+        let observed_ids = responses
+            .iter()
+            .filter_map(|event| event.get("device_id").and_then(Value::as_str))
+            .map(str::to_ascii_lowercase)
+            .collect::<HashSet<_>>();
+        let missing = expected_macs
+            .iter()
+            .filter_map(|(id, mac)| match mac {
+                Some(mac)
+                    if !observed_ids
+                        .iter()
+                        .any(|device_id| device_id.ends_with(mac)) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let unresolved = expected_macs
+            .iter()
+            .filter_map(|(id, mac)| mac.is_none().then_some(id))
+            .collect::<Vec<_>>();
+        json!({
+            "available": true,
+            "ok": !responses.is_empty() && missing.is_empty(),
+            "command": "mode ping=true",
+            "command_cbor_bytes": payload.len(),
+            "retry_interval_ms": STABILITY_HOST_NAN_RETRY_MS,
+            "transmit_attempts": transmits.len(),
+            "transmits": transmits,
+            "responses": responses,
+            "response_observed": !observed_ids.is_empty(),
+            "missing": missing,
+            "unresolved": unresolved,
         })
     }
 
@@ -2382,6 +2495,29 @@ impl RadioService {
         }
     }
 
+    /// Enter or leave an ESP runtime-only powered/transfer window.
+    ///
+    /// `active=true` stays enabled until explicitly released. Supplying
+    /// `active_ms` makes it bounded, which is appropriate for battery-node
+    /// transfer and power tests. The firmware never persists either state.
+    pub fn esp_active(
+        &self,
+        adapter: Option<String>,
+        port: Option<String>,
+        active: Option<bool>,
+        active_ms: Option<u32>,
+    ) -> Value {
+        let enabled = active.unwrap_or(true);
+        let command = if !enabled {
+            "mode active=false".to_string()
+        } else if let Some(active_ms) = active_ms {
+            format!("mode active_ms={}", active_ms.clamp(1_000, 300_000))
+        } else {
+            "mode active=true".to_string()
+        };
+        self.esp_serial_command(adapter, port, command, Some(2.0))
+    }
+
     /// Return LoRa status from an ESP firmware serial adapter.
     pub fn esp_lora_status(&self, adapter: Option<String>, port: Option<String>) -> Value {
         self.esp_serial_command(adapter, port, "lora status=true".to_string(), Some(2.0))
@@ -3149,6 +3285,7 @@ struct StabilityState {
     interval_sec: u64,
     wait_sec: u64,
     cycles_requested: Option<u32>,
+    host_nan: bool,
     cycles_completed: u32,
     last_completed_ms: u64,
     last: Value,
@@ -3161,6 +3298,7 @@ impl StabilityState {
         interval_sec: u64,
         wait_sec: u64,
         cycles_requested: Option<u32>,
+        host_nan: bool,
     ) -> Self {
         Self {
             running: true,
@@ -3169,6 +3307,7 @@ impl StabilityState {
             interval_sec,
             wait_sec,
             cycles_requested,
+            host_nan,
             cycles_completed: 0,
             last_completed_ms: 0,
             last: Value::Null,
@@ -3184,6 +3323,7 @@ impl StabilityState {
             "interval_sec": self.interval_sec,
             "wait_sec": self.wait_sec,
             "cycles_requested": self.cycles_requested,
+            "host_nan": self.host_nan,
             "cycles_completed": self.cycles_completed,
             "last_completed_ms": self.last_completed_ms,
             "last": self.last,
@@ -4715,6 +4855,53 @@ fn normalize_mac_suffix(value: &str) -> Option<String> {
     (hex.len() == 12).then(|| hex[4..].to_ascii_lowercase())
 }
 
+/// Encode the firmware's `mode ping=true` command. The numeric tags are part
+/// of the documented ESP firmware ABI: method 49 (`mode`) and argument 190
+/// (`ping`). Keep host NAN command traffic binary even while UART debug text
+/// remains supported.
+fn firmware_mode_ping_cbor() -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(16);
+    let mut encoder = Encoder::new(&mut bytes);
+    encoder
+        .map(2)
+        .and_then(|encoder| encoder.u16(0))
+        .and_then(|encoder| encoder.u16(49))
+        .and_then(|encoder| encoder.u16(6))
+        .and_then(|encoder| encoder.map(1))
+        .and_then(|encoder| encoder.u16(190))
+        .and_then(|encoder| encoder.str("true"))
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    Ok(bytes)
+}
+
+/// Extract DMesh follow-up replies delivered by wpa_supplicant as
+/// `NAN-RECEIVE` events. The DMesh header's device ID is the stable firmware
+/// identity; the WPA peer address may be randomized by platform NAN stacks.
+fn host_nan_responses(events: &Value) -> Vec<Value> {
+    events
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.get("event").and_then(Value::as_str) == Some("NAN-RECEIVE"))
+        .filter_map(|event| {
+            let fields = event.get("fields")?;
+            let dmesh = fields.get("ssi_dmesh")?;
+            (dmesh.get("protocol").and_then(Value::as_str) == Some("dmesh_nan_followup")).then(
+                || {
+                    json!({
+                        "device_id": dmesh.get("device_id"),
+                        "target_id": dmesh.get("target_id"),
+                        "msg_type": dmesh.get("msg_type"),
+                        "payload": dmesh.get("payload_text"),
+                        "peer": fields.get("address"),
+                    })
+                },
+            )
+        })
+        .collect()
+}
+
 fn parse_stability_pongs(output: &str) -> Vec<Value> {
     output
         .lines()
@@ -4770,8 +4957,10 @@ fn stability_nan_stats(socket: &str) -> Option<BTreeMap<String, u64>> {
             let Some((key, value)) = field.split_once('=') else {
                 continue;
             };
-            if matches!(key, "raw_sdf" | "raw_resp_rx" | "raw_resp_tx" | "raw_beacon" | "rx_queue_drop")
-                && let Ok(value) = value.parse::<u64>()
+            if matches!(
+                key,
+                "raw_sdf" | "raw_resp_rx" | "raw_resp_tx" | "raw_beacon" | "rx_queue_drop"
+            ) && let Ok(value) = value.parse::<u64>()
             {
                 fields.insert(key.to_string(), value);
             }
@@ -4785,7 +4974,10 @@ fn stability_nan_cycle(
     before: Option<&BTreeMap<String, u64>>,
     after: Option<&BTreeMap<String, u64>>,
 ) -> Value {
-    let delta = |key: &str| match (before.and_then(|values| values.get(key)), after.and_then(|values| values.get(key))) {
+    let delta = |key: &str| match (
+        before.and_then(|values| values.get(key)),
+        after.and_then(|values| values.get(key)),
+    ) {
         (Some(before), Some(after)) => Some(after.saturating_sub(*before)),
         _ => None,
     };
@@ -8770,6 +8962,37 @@ fn now_millis_u64() -> u64 {
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn host_nan_ping_uses_firmware_cbor_envelope() {
+        assert_eq!(
+            firmware_mode_ping_cbor().unwrap(),
+            vec![
+                0xa2, 0x00, 0x18, 49, 0x06, 0xa1, 0x18, 190, 0x64, b't', b'r', b'u', b'e'
+            ]
+        );
+    }
+
+    #[test]
+    fn host_nan_response_parser_keeps_dmesh_device_id() {
+        let events = json!({"events": [{
+            "event": "NAN-RECEIVE",
+            "fields": {
+                "address": "84:0d:8e:07:41:70",
+                "ssi_dmesh": {
+                    "protocol": "dmesh_nan_followup",
+                    "device_id": "840d8e074170",
+                    "target_id": "001122334455",
+                    "msg_type": "response",
+                    "payload_text": "ok"
+                }
+            }
+        }]});
+        let responses = host_nan_responses(&events);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["device_id"], "840d8e074170");
+        assert_eq!(responses[0]["peer"], "84:0d:8e:07:41:70");
+    }
 
     struct WouldBlockOnceWriter {
         writes: usize,

@@ -1288,6 +1288,39 @@
     "x-source": "fw/esp32/rust"
   },
   {
+    "name": "esp.active",
+    "title": "ESP Active Transfer Mode",
+    "group": "ESP32 Debug",
+    "description": "Enter or leave the runtime-only ESP powered/transfer mode. Persistent active mode remains on until explicitly released; active_ms is a bounded battery-safe transfer window.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "adapter": {
+          "type": ["string", "null"],
+          "title": "Adapter"
+        },
+        "port": {
+          "type": ["string", "null"],
+          "title": "Logical serial port"
+        },
+        "active": {
+          "type": "boolean",
+          "title": "Active",
+          "default": true
+        },
+        "active_ms": {
+          "type": ["integer", "null"],
+          "title": "Bounded active duration",
+          "description": "1,000 through 300,000 milliseconds. Omit for active-until-released."
+        }
+      },
+      "additionalProperties": false
+    },
+    "x-stability": "debug",
+    "x-layer": "low-level",
+    "x-source": "fw/esp32/rust"
+  },
+  {
     "name": "esp.lora.status",
     "title": "LoRa Status",
     "group": "Radio Status",

@@ -303,21 +303,8 @@ pub fn poll_text_commands(registry: &mut CommandRegistry) {
         if command.is_empty() {
             continue;
         }
-        if command.first().map(|byte| byte.is_ascii()).unwrap_or(false) {
-            let line = core::str::from_utf8(&command).unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            let response = dispatch_text_line(registry, line);
-            let mut response = response.into_bytes();
-            if !response.ends_with(b"\n") {
-                response.push(b'\n');
-            }
-            send_gatt(&response);
-        } else {
-            let response = crate::transports::dispatch_binary_packet(registry, &command);
-            send_gatt(&response);
-        }
+        let response = crate::transports::dispatch_binary_packet(registry, &command);
+        send_gatt(&response);
     }
 }
 
@@ -1217,11 +1204,6 @@ fn handle_gatt_rx(data: &[u8]) -> Vec<u8> {
         BLE_GATT_RX_BINARY.fetch_add(1, Ordering::Relaxed);
         return meshcore_response(data);
     }
-    if data.first().map(|byte| byte.is_ascii()).unwrap_or(false) {
-        BLE_GATT_RX_TEXT.fetch_add(1, Ordering::Relaxed);
-        queue_ble_text(&normalize_ble_text(data));
-        return Vec::new();
-    }
     BLE_GATT_RX_BINARY.fetch_add(1, Ordering::Relaxed);
     queue_ble_text(data);
     Vec::new()
@@ -1286,38 +1268,6 @@ fn queue_ble_text(data: &[u8]) {
     }
     queue.push_back(data.to_vec());
     super::wake::notify();
-}
-
-fn normalize_ble_text(data: &[u8]) -> Vec<u8> {
-    let line = core::str::from_utf8(data).unwrap_or("").trim();
-    if matches!(
-        line,
-        "pair" | "pairing" | "pair request" | "pairing request"
-    ) {
-        return b"ble pairing=request".to_vec();
-    }
-    if matches!(line, "pair cancel" | "pairing cancel") {
-        return b"ble pairing=false".to_vec();
-    }
-    if line == "ready" || line.starts_with("ready ") {
-        return format!(
-            "messages pull {}",
-            line.strip_prefix("ready").unwrap_or("").trim()
-        )
-        .trim()
-        .as_bytes()
-        .to_vec();
-    }
-    if line == "ack" || line.starts_with("ack ") {
-        return format!(
-            "messages ack {}",
-            line.strip_prefix("ack").unwrap_or("").trim()
-        )
-        .trim()
-        .as_bytes()
-        .to_vec();
-    }
-    data.to_vec()
 }
 
 fn ble_text_queue() -> &'static Mutex<VecDeque<Vec<u8>>> {

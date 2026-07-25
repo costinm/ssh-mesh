@@ -551,6 +551,41 @@ impl CommandHandler for WifiCommand {
             )));
         }
         if let Some(payload) = request
+            .arg("raw_action_hex")
+            .or_else(|| request.arg("raw_payload_hex"))
+        {
+            let channel = request
+                .arg("channel")
+                .map(parse_i32)
+                .transpose()?
+                .unwrap_or(6)
+                .clamp(1, 13) as u8;
+            let destination = request
+                .arg("dst")
+                .or_else(|| request.arg("destination"))
+                .map(parse_mac)
+                .transpose()?
+                .unwrap_or(RAW_BROADCAST);
+            prepare_raw_tx(channel)?;
+            let payload = parse_bytes(payload)?;
+            let frame = custom_raw_action_frame(destination, &payload)?;
+            raw_tx_frame(&frame, true)?;
+            RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+            telemetry::record_packet(
+                "wifi",
+                Direction::Tx,
+                &payload,
+                "raw_action=true binary=true",
+            );
+            return Ok(CommandResponse::ok(format!(
+                "wifi raw_action sent bytes={} payload_bytes={} payload_max={} binary=true {}",
+                frame.len(),
+                payload.len(),
+                RAW_ACTION_MAX_PAYLOAD,
+                raw_stats()
+            )));
+        }
+        if let Some(payload) = request
             .arg("raw_action")
             .or_else(|| request.arg("raw_payload"))
         {

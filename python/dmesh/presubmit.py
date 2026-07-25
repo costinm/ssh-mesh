@@ -386,6 +386,63 @@ class PresubmitSuite:
             raise AssertionError("required NAN beacon source was not observed")
         return result
 
+    def active_transfer_window(self):
+        """Verify a bounded target transfer window returns to raw-NAN duty sleep."""
+        gateway, target = self._require_nodes("nan", 2)[:2]
+        thresholds = self.config.thresholds.get("active_window", {})
+        active_ms = int(thresholds.get("active_ms", 5_000))
+        ping_count = int(thresholds.get("ping_count", 4))
+        ping_spacing = float(thresholds.get("ping_spacing_sec", 0.5))
+        # The direct UART control used by this lab test deliberately holds the
+        # radio for its 20-second debug window. Production raw-NAN commands do
+        # not have that local-console extension.
+        recovery_sec = float(thresholds.get("recovery_sec", 21.0))
+
+        gateway.command("mode active=true", timeout=self.timeout, wake=True)
+        target.command("stats reset=true", timeout=self.timeout, wake=True)
+        before = _fields(target.command("nan stats=true", timeout=self.timeout), "nan")
+        mode_before = _fields(target.command("mode status=true", timeout=self.timeout), "mode")
+        target.command(
+            "mode active_ms={}".format(max(1_000, min(active_ms, 300_000))),
+            timeout=self.timeout,
+            wake=True,
+        )
+        during = _fields(target.command("mode status=true", timeout=self.timeout), "mode")
+        if during.get("infra_active") is not True:
+            raise CaseFailure("target did not enter bounded active mode", {"during": during})
+
+        for _ in range(max(1, ping_count)):
+            gateway.command("mode ping=true", timeout=self.timeout, wake=True)
+            time.sleep(max(0.05, ping_spacing))
+
+        active_nan = _fields(target.command("nan stats=true", timeout=self.timeout), "nan")
+        if _delta(before, active_nan, "raw_mgmt") < 1:
+            raise CaseFailure(
+                "target received no raw-NAN traffic while active",
+                {"before": before, "active": active_nan},
+            )
+
+        time.sleep(active_ms / 1_000.0 + recovery_sec)
+        after = _fields(target.command("mode status=true", timeout=self.timeout, wake=True), "mode")
+        expire_before = int(mode_before.get("infra_active_expire", 0))
+        expire_after = int(after.get("infra_active_expire", 0))
+        if expire_after <= expire_before:
+            raise CaseFailure(
+                "bounded active mode did not expire",
+                {"before": mode_before, "during": during, "after": after},
+            )
+        gateway.command("mode active=false", timeout=self.timeout, wake=True)
+        return {
+            "gateway": gateway.config.name,
+            "target": target.config.name,
+            "active_ms": active_ms,
+            "ping_count": ping_count,
+            "target_raw_mgmt_delta": _delta(before, active_nan, "raw_mgmt"),
+            "target_raw_cmd_rx_delta": _delta(before, active_nan, "raw_cmd_rx"),
+            "expire_before": expire_before,
+            "expire_after": expire_after,
+        }
+
     def beacon_sync(self):
         nodes = self._require_nodes("nan", 2)[:2]
         before = {
@@ -549,6 +606,10 @@ class PresubmitSuite:
             if selected_case("command_reliability"):
                 run_case("command_reliability", self.command_reliability)
             if self._capable("nan"):
+                if selected_case("active_transfer_window") and (
+                    self.profile != "quick" or bool(selected)
+                ):
+                    run_case("active_transfer_window", self.active_transfer_window)
                 if selected_case("nan_pair"):
                     run_case("nan_pair", self.nan_pair)
                 if selected_case("beacon_sync") and self.profile != "quick":

@@ -257,6 +257,7 @@ reliably stored in NVS on all targets.
 | `nan.channel` | NAN/raw-NAN channel, default 6. |
 | `nan.wake_ms` | Raw-NAN duty period. Default: `4000` ms. |
 | `nan.active_ms` | Raw-NAN active Wi-Fi/SDF window. Default: `250` ms. |
+| Runtime `mode active` | Non-persistent powered/transfer override. `mode active=true` keeps raw-NAN Wi-Fi, NAN beacon/action receive, and configured LoRa RX active until `mode active=false`. `mode active_ms=N` keeps the same radios active for `1000..300000` ms, then resumes the configured duty cycle. UART/PRG input opens its configured console window and temporarily holds the same radio path active; it does not persist across reset. |
 | `nan.light_sleep` | Use explicit light sleep while raw-NAN Wi-Fi is off between windows. Default: `true`; set `false` for timing/debug comparison. |
 | `nan.early_ms` | Return from light sleep this many milliseconds before the expected window. Default: `5` ms. |
 | `nan.dw_tu` | Raw-NAN Discovery Window period in TUs, used with the received beacon TSF to schedule the next radio wake. Default: `512` (524.288 ms). |
@@ -396,6 +397,7 @@ Current behavior:
 | `wifi` | `mode=raw_ap_sta` | AP+STA plus raw action mode. |
 | `wifi` | `wake_interval_ms=7000` | Set ESP-IDF connectionless-module wake interval before starting raw/NAN Wi-Fi tests. `0` restores ESP-IDF default mode. |
 | `wifi` | `raw_action=TEXT` | Send one custom DMesh raw vendor-action payload (up to 1200 bytes). This is the ESP-NOW-like bulk transport, not a NAN SDF follow-up. NAN SDF remains the synchronization and wake-window control path. |
+| `wifi` | `raw_action_hex=hex:...`, `dst`, `channel` | Send arbitrary binary CBOR/application bytes in the same custom raw action frame. This is used by gateway tests because raw-NAN/action command dispatch consumes binary firmware records rather than console text. |
 | `wifi` | `raw=hex:...` | Send raw 802.11 frame bytes. |
 | `wifi` | `raw_data=TEXT`, `dst`, `bssid`, `ds=none\|to_ap\|from_ap` | Inject one experimental data-frame payload for tests. |
 | `wifi` | `raw_stats=true` | Raw RX/TX counters and last-frame summary. |

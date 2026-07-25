@@ -149,6 +149,7 @@ fn run() -> Result<()> {
         components::test::poll_main();
         if components::button::take_console_wakes() > 0 {
             components::serial::rearm_after_wake();
+            components::mode::mark_companion_active(&settings, companion_active_ms);
             components::telemetry::record_log("event type=uart.wake source=button");
             uart_write("event type=uart.wake source=button\ndm-rs> ");
         }
