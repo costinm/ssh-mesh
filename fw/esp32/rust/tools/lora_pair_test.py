@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise default Meshtastic-header LoRa send/receive between two ESP32 consoles."""
+"""Exercise framed-CBOR Meshtastic-header LoRa between two ESP32 ports."""
 
 from __future__ import annotations
 
@@ -10,13 +10,9 @@ import time
 from serial_cmd import Console
 
 
-PROMPT = b"dm-rs> "
-
-
 def require_ok(output: str, context: str) -> None:
-    text = output.strip()
-    if text.startswith("error ") or "\nerror " in text:
-        raise RuntimeError(f"{context} returned error")
+    if "error " in output:
+        raise RuntimeError(f"{context} returned error: {output.strip()}")
 
 
 def main() -> int:
@@ -35,11 +31,8 @@ def main() -> int:
     rx = Console(args.rx, 460800, args.timeout)
     tx = Console(args.tx, 460800, args.timeout)
     try:
-        print(f"[{args.rx}] sync")
-        print(rx.sync().rstrip())
-        print(f"[{args.tx}] sync")
-        print(tx.sync().rstrip())
-
+        rx.wake_probe()
+        tx.wake_probe()
         require_ok(run(rx, "lora rx=false", args.timeout), "rx stop background")
         require_ok(run(tx, "lora rx=false", args.timeout), "tx stop background")
         time.sleep(0.5)
@@ -52,18 +45,26 @@ def main() -> int:
         require_ok(run(tx, config, args.timeout), "tx config")
 
         rx_output: dict[str, str] = {}
+        listener_error: list[BaseException] = []
 
         def listen() -> None:
-            rx_output["text"] = run(rx, "loralisten ms=9000 count=2", args.timeout + 4)
+            try:
+                rx_output["text"] = run(rx, "loralisten ms=9000 count=2", args.timeout + 4)
+            except BaseException as exc:
+                listener_error.append(exc)
 
         thread = threading.Thread(target=listen)
         thread.start()
-        time.sleep(1.0)
-        tx_out = run(tx, f"lorasend data={args.payload} timeout=4000", args.timeout)
-        require_ok(tx_out, "tx send")
-        thread.join(args.timeout + 6)
+        try:
+            time.sleep(1.0)
+            tx_out = run(tx, f"lorasend payload={args.payload} timeout=4000", args.timeout)
+            require_ok(tx_out, "tx send")
+        finally:
+            thread.join(args.timeout + 6)
         if thread.is_alive():
             raise RuntimeError("receiver listen did not finish")
+        if listener_error:
+            raise RuntimeError("LoRa listener failed") from listener_error[0]
 
         out = rx_output.get("text", "")
         require_ok(out, "rx listen")
@@ -78,7 +79,7 @@ def main() -> int:
 
 def run(console: Console, command: str, timeout: float | None = None) -> str:
     print(f"[{console.port}] $ {command}", flush=True)
-    out = console.cmd(command, timeout)
+    out = console.cbor_cmd(command, timeout)
     print(out.rstrip(), flush=True)
     return out
 

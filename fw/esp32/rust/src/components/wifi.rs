@@ -268,12 +268,8 @@ pub fn forward_console_notification(line: &str) {
     let result = (|| -> Result<()> {
         let peer = last_command_peer().context("no wifi command peer known")?;
         let response = last_response_path();
-        let mut payload = String::from("notify ");
-        payload.push_str(line);
-        if payload.len() > 900 {
-            payload.truncate(900);
-        }
-        send_response_payload_to(response, peer, payload.as_bytes())
+        let payload = crate::transports::encode_log_packet(line);
+        send_response_payload_to(response, peer, &payload)
     })();
     if result.is_err() {
         RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2104,16 +2100,9 @@ fn enqueue_command(source: [u8; 6], payload: &[u8], rssi: i32, response: WifiRes
 }
 
 fn is_wifi_terminal_payload(payload: &[u8]) -> bool {
-    if let Ok(req) = crate::commands::protocol::decode_binary(payload) {
-        req.args.contains_key(&4) || req.args.contains_key(&5)
-    } else {
-        payload.starts_with(b"notify ")
-            || payload.starts_with(b"resp ")
-            || payload.starts_with(b"dmesh.pong ")
-            || payload
-                .windows(b"reply=true".len())
-                .any(|part| part == b"reply=true")
-    }
+    crate::commands::protocol::decode_binary(payload)
+        .map(|req| req.args.contains_key(&4) || req.args.contains_key(&5))
+        .unwrap_or(false)
 }
 
 fn raw_command_queue() -> &'static Mutex<VecDeque<RawWifiCommand>> {

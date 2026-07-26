@@ -7,18 +7,18 @@ use super::settings::SharedSettings;
 
 /// Keep the debug transport usable long enough to issue a command after it wakes.
 ///
-/// ESP UART light-sleep wake can consume the first received byte(s), so callers that
-/// wake the port should send a blank line before their actual command.
-pub const DEFAULT_ACTIVE_MS: u32 = 20_000;
-const MIN_ACTIVE_MS: u32 = 20_000;
+/// UART is re-opened by its next raw-NAN wake window, so an interactive
+/// console window need only cover one command/response exchange.
+pub const DEFAULT_ACTIVE_MS: u32 = 2_000;
+const MIN_ACTIVE_MS: u32 = 2_000;
 #[cfg(target_feature = "esp32s3ops")]
 const UART_REQUIRES_APB_LOCK: bool = false;
 #[cfg(not(target_feature = "esp32s3ops"))]
 const UART_REQUIRES_APB_LOCK: bool = true;
 
 /// Classic ESP32 retains UART/GPIO wake for its explicit raw-NAN sleep path.
-/// ESP32-S3 uses automatic light sleep instead; its console wakes through the
-/// normal UART/GPIO interrupt path.
+/// ESP32-S3 uses the same explicit sleep path and its console wakes through
+/// the normal UART/GPIO interrupt path.
 #[cfg(not(target_feature = "esp32s3ops"))]
 pub const RAW_NAN_UART_WAKE: bool = true;
 #[cfg(not(target_feature = "esp32s3ops"))]
@@ -51,9 +51,13 @@ static UART0_OUTPUT_PROBE_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_DROPPED: AtomicU32 = AtomicU32::new(0);
+static UART0_FRAME_DROPS: AtomicU32 = AtomicU32::new(0);
+static UART0_ESCAPE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 const UART_FRAME_QUEUE_LEN: u32 = 8;
-const UART_MAX_FRAME: usize = 512;
+// UART carries compact CBOR directly. The generic mesh stream envelope belongs
+// to lmesh UDS clients, not to the byte-oriented physical serial link.
+const UART_MAX_BODY: usize = crate::commands::protocol::CBOR_MAX_RECORD;
 const UART_TX_QUEUE_LEN: u32 = 16;
 // Keep every driver write below the hardware FIFO capacity. The task waits
 // for idle before each chunk, so ESP-IDF never enables its TX-empty ISR.
@@ -63,24 +67,18 @@ const UART_TX_FRAME_MAX: usize = 512;
 // TX-done/TX-empty ISR path.
 const UART_TX_FIFO_CHUNK: usize = 32;
 const UART_TX_FIFO_DRAIN_MS: u32 = 2;
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UartFrameKind {
-    Text = 1,
-    Binary = 2,
-}
+const UART_PPP_FLAG: u8 = 0x7e;
+const UART_PPP_ESCAPE: u8 = 0x7d;
+const UART_PPP_ESCAPE_XOR: u8 = 0x20;
 
 /// An owned complete UART record. The ingress task is the only code that
 /// reads the IDF UART driver; consumers only receive parsed records.
 pub struct UartFrame {
-    pub kind: UartFrameKind,
     pub data: Vec<u8>,
 }
 
 #[repr(C)]
 struct QueuedFrame {
-    kind: u8,
     data: *mut Vec<u8>,
 }
 
@@ -101,13 +99,15 @@ pub fn request_uninstall_for_measurement() {
 
 pub fn measurement_status_fields() -> String {
     format!(
-        "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
+        "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_frame_drop={} uart_escape_err={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
         UART0_DRIVER_INSTALLED.load(Ordering::Relaxed),
         is_active(),
         !UART0_SUSPENDED_UNTIL_DTR.load(Ordering::Relaxed),
         UART0_RX_EVENTS.load(Ordering::Relaxed),
         UART0_RX_DROPS.load(Ordering::Relaxed),
         UART0_RX_ERRORS.load(Ordering::Relaxed),
+        UART0_FRAME_DROPS.load(Ordering::Relaxed),
+        UART0_ESCAPE_ERRORS.load(Ordering::Relaxed),
         UART0_TX_DROPS_IDLE.load(Ordering::Relaxed),
         UART0_TX_DROPS_QUEUE.load(Ordering::Relaxed),
         UART0_OUTPUT_PROBE_ATTEMPTS.load(Ordering::Relaxed),
@@ -140,8 +140,8 @@ pub fn configure_active_window(settings: &SharedSettings) {
         .get_i32("uart.active_ms", DEFAULT_ACTIVE_MS as i32)
         .unwrap_or(DEFAULT_ACTIVE_MS as i32)
         .max(0) as u32;
-    // A short window makes a sleeping console unusable: UART wake may consume the
-    // first character, then the operator still needs time to send the command.
+    // Delimiter framing makes the first complete CBOR command self-synchronizing,
+    // so a short window is sufficient and avoids holding PM locks for 20 seconds.
     let active_ms = configured_ms.max(MIN_ACTIVE_MS);
     UART0_ACTIVE_WINDOW_MS.store(active_ms, Ordering::Relaxed);
     activate_window();
@@ -230,7 +230,6 @@ pub fn take_frame() -> Option<UartFrame> {
         return None;
     }
     let mut queued = QueuedFrame {
-        kind: 0,
         data: core::ptr::null_mut(),
     };
     let received =
@@ -239,17 +238,7 @@ pub fn take_frame() -> Option<UartFrame> {
         return None;
     }
     UART0_QUEUED_FRAMES.fetch_sub(1, Ordering::Relaxed);
-    let kind = match queued.kind {
-        1 => UartFrameKind::Text,
-        2 => UartFrameKind::Binary,
-        _ => {
-            unsafe { drop(Box::from_raw(queued.data)) };
-            UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-    };
     Some(UartFrame {
-        kind,
         data: *unsafe { Box::from_raw(queued.data) },
     })
 }
@@ -330,19 +319,19 @@ pub fn poll_output_probe() {
     let attempt = UART0_OUTPUT_PROBE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
     if is_active() {
         UART0_OUTPUT_PROBE_SENT.fetch_add(1, Ordering::Relaxed);
-        write(&format!(
-            "event type=uart.output_probe n={} sent=true\n",
+        write_packet(&crate::transports::encode_log_notification(&format!(
+            "event type=uart.output_probe n={} sent=true",
             attempt
-        ));
+        )));
     } else {
         UART0_OUTPUT_PROBE_DROPPED.fetch_add(1, Ordering::Relaxed);
         // Keep this on the normal write path so uart_tx_drop_idle confirms the
         // output gate, while the dedicated counter distinguishes this test
         // from expected background notification drops.
-        write(&format!(
-            "event type=uart.output_probe n={} sent=false\n",
+        write_packet(&crate::transports::encode_log_notification(&format!(
+            "event type=uart.output_probe n={} sent=false",
             attempt
-        ));
+        )));
     }
 }
 
@@ -419,20 +408,17 @@ pub fn suspend_for_light_sleep() {
     release_apb_lock();
 }
 
-pub fn write(text: &str) {
-    write_bytes(text.as_bytes());
-}
-
-pub fn write_bytes(bytes: &[u8]) {
+fn write_wire_bytes(bytes: &[u8]) -> bool {
     if !is_active() {
         UART0_TX_DROPS_IDLE.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
     let queue = UART0_TX_QUEUE.load(Ordering::Acquire);
     if queue.is_null() {
         UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
+    let mut accepted = true;
     for chunk in bytes.chunks(UART_TX_FRAME_MAX) {
         let mut queued = QueuedTx {
             len: chunk.len() as u16,
@@ -444,8 +430,36 @@ pub fn write_bytes(bytes: &[u8]) {
         };
         if sent != 1 {
             UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
+            accepted = false;
         }
     }
+    accepted
+}
+
+/// Queue one complete mesh stream record on the physical UART.
+///
+/// The UDS/mesh boundary remains a generic mesh stream record; UART carries
+/// compact CBOR directly inside an HDLC/PPP frame. This keeps
+/// corrupted serial bytes from being interpreted as a record length.
+pub fn write_packet(stream_frame: &[u8]) -> bool {
+    let Some(body) = stream_frame.get(4..) else {
+        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let Ok(body_len_bytes) = <[u8; 4]>::try_from(&stream_frame[..4]) else {
+        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let body_len = u32::from_be_bytes(body_len_bytes) as usize;
+    if body_len != body.len()
+        || body.len() < 4
+        || body[..4] != [0, 0xcb, 0, 0]
+        || !(1..=UART_MAX_BODY).contains(&(body.len() - 4))
+    {
+        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    write_wire_bytes(&encode_ppp_frame(&body[4..]))
 }
 
 fn ensure_power_locks() -> bool {
@@ -652,8 +666,8 @@ fn drain_driver_rx(parser: &mut UartParser) {
         }
         crate::components::telemetry::record_uart_read(received as usize);
         for byte in &bytes[..received as usize] {
-            if let Some((kind, frame)) = parser.push(*byte) {
-                enqueue_frame(kind, frame);
+            if let Some(frame) = parser.push(*byte) {
+                enqueue_frame(frame);
             }
         }
     }
@@ -703,14 +717,13 @@ unsafe extern "C" fn uart_tx_task(arg: *mut c_void) {
     }
 }
 
-fn enqueue_frame(kind: UartFrameKind, data: Vec<u8>) {
+fn enqueue_frame(data: Vec<u8>) {
     let queue = UART0_FRAME_QUEUE.load(Ordering::Acquire);
     if queue.is_null() {
         UART0_RX_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let queued = QueuedFrame {
-        kind: kind as u8,
         data: Box::into_raw(Box::new(data)),
     };
     let sent = unsafe {
@@ -730,104 +743,142 @@ fn enqueue_frame(kind: UartFrameKind, data: Vec<u8>) {
     crate::components::wake::notify();
 }
 
-#[derive(Default)]
 struct UartParser {
-    mode: UartParseMode,
-    data: Vec<u8>,
-    remaining: usize,
-    length_bytes: [u8; 3],
-    length_count: usize,
+    in_frame: bool,
+    escaped: bool,
+    discard_until_flag: bool,
+    bytes: Vec<u8>,
 }
 
-#[derive(Default)]
-enum UartParseMode {
-    #[default]
-    Text,
-    BinaryLength,
-    Binary,
+impl Default for UartParser {
+    fn default() -> Self {
+        Self {
+            in_frame: false,
+            escaped: false,
+            discard_until_flag: false,
+            bytes: Vec::with_capacity(UART_MAX_BODY + 2),
+        }
+    }
 }
 
 impl UartParser {
     fn reset(&mut self) {
-        self.mode = UartParseMode::Text;
-        self.data.clear();
-        self.remaining = 0;
-        self.length_count = 0;
+        self.bytes.clear();
+        self.in_frame = false;
+        self.escaped = false;
+        self.discard_until_flag = false;
     }
 
-    fn push(&mut self, byte: u8) -> Option<(UartFrameKind, Vec<u8>)> {
-        match self.mode {
-            UartParseMode::Text => {
-                if byte == 0 {
-                    if !self.data.is_empty() {
-                        self.data.clear();
-                        UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.mode = UartParseMode::BinaryLength;
-                    self.length_count = 0;
-                    return None;
-                }
-                if byte == b'\n' || byte == b'\r' {
-                    if self.data.is_empty() {
-                        return None;
-                    }
-                    let data = core::mem::take(&mut self.data);
-                    return Some((UartFrameKind::Text, data));
-                }
-                if self.data.len() >= UART_MAX_FRAME {
-                    self.data.clear();
-                    UART0_RX_DROPS.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.data.push(byte);
-                }
-                None
+    fn push(&mut self, byte: u8) -> Option<Vec<u8>> {
+        if byte == UART_PPP_FLAG {
+            if !self.in_frame {
+                self.in_frame = true;
+                self.escaped = false;
+                self.discard_until_flag = false;
+                self.bytes.clear();
+                return None;
             }
-            UartParseMode::BinaryLength => {
-                self.length_bytes[self.length_count] = byte;
-                self.length_count += 1;
-                if self.length_count != 3 {
-                    return None;
-                }
-                self.remaining = ((self.length_bytes[0] as usize) << 16)
-                    | ((self.length_bytes[1] as usize) << 8)
-                    | self.length_bytes[2] as usize;
-                self.data.clear();
-                if self.remaining == 0 || self.remaining > UART_MAX_FRAME {
-                    UART0_RX_DROPS.fetch_add(1, Ordering::Relaxed);
-                    self.reset();
-                } else {
-                    self.data.reserve(self.remaining);
-                    self.mode = UartParseMode::Binary;
-                }
-                None
+            self.in_frame = true;
+            self.escaped = false;
+            if self.discard_until_flag || self.bytes.is_empty() {
+                self.discard_until_flag = false;
+                self.bytes.clear();
+                return None;
             }
-            UartParseMode::Binary => {
-                self.data.push(byte);
-                self.remaining = self.remaining.saturating_sub(1);
-                if self.remaining == 0 {
-                    self.mode = UartParseMode::Text;
-                    return Some((UartFrameKind::Binary, core::mem::take(&mut self.data)));
-                }
-                None
+            let frame = core::mem::take(&mut self.bytes);
+            self.bytes = Vec::with_capacity(UART_MAX_BODY + 2);
+            if frame.is_empty() {
+                UART0_FRAME_DROPS.fetch_add(1, Ordering::Relaxed);
+                return None;
             }
+            let body_len = frame.len();
+            if !(1..=UART_MAX_BODY).contains(&body_len) {
+                UART0_FRAME_DROPS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            return Some(frame[..body_len].to_vec());
+        }
+        if !self.in_frame || self.discard_until_flag {
+            return None;
+        }
+        if self.escaped {
+            self.bytes.push(byte ^ UART_PPP_ESCAPE_XOR);
+            self.escaped = false;
+        } else if byte == UART_PPP_ESCAPE {
+            self.escaped = true;
+            return None;
+        } else {
+            self.bytes.push(byte);
+        }
+        if self.bytes.len() > UART_MAX_BODY + 2 {
+            UART0_FRAME_DROPS.fetch_add(1, Ordering::Relaxed);
+            UART0_ESCAPE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            self.bytes.clear();
+            self.discard_until_flag = true;
+        }
+        None
+    }
+}
+
+fn encode_ppp_frame(body: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(body.len() * 2 + 2);
+    frame.push(UART_PPP_FLAG);
+    for byte in body.iter().copied() {
+        if matches!(byte, UART_PPP_FLAG | UART_PPP_ESCAPE) {
+            frame.push(UART_PPP_ESCAPE);
+            frame.push(byte ^ UART_PPP_ESCAPE_XOR);
+        } else {
+            frame.push(byte);
         }
     }
+    frame.push(UART_PPP_FLAG);
+    frame
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UartFrameKind, UartParser};
+    use super::{encode_ppp_frame, UartParser, UART_PPP_ESCAPE, UART_PPP_FLAG};
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        encode_ppp_frame(payload)
+    }
 
     #[test]
-    fn binary_uart_length_is_network_order_u24() {
+    fn binary_uart_round_trips_cbor_payload() {
         let mut parser = UartParser::default();
-        let mut frame = None;
-        for byte in [0, 0, 0, 5, 1, 2, 3, 4, 5] {
-            frame = parser.push(byte).or(frame);
-        }
-        let (kind, data) = frame.expect("complete five-byte record");
-        assert_eq!(kind, UartFrameKind::Binary);
-        assert_eq!(data, [1, 2, 3, 4, 5]);
+        let frame = framed(&[1, 2, 3, 4, 5]);
+        let data = frame.into_iter().find_map(|byte| parser.push(byte));
+        assert_eq!(data, Some(vec![1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn binary_uart_accepts_maximum_cbor_record() {
+        let mut parser = UartParser::default();
+        let input = framed(&vec![0_u8; crate::commands::protocol::CBOR_MAX_RECORD]);
+        let frame = input.into_iter().find_map(|byte| parser.push(byte));
+        assert_eq!(
+            frame.unwrap().len(),
+            crate::commands::protocol::CBOR_MAX_RECORD
+        );
+    }
+
+    #[test]
+    fn binary_uart_ignores_unframed_boot_noise() {
+        let mut parser = UartParser::default();
+        let mut input = b"rst:0x1 (POWERON_RESET)\r\n".to_vec();
+        input.extend_from_slice(&framed(&[1]));
+        let frame = input.into_iter().find_map(|byte| parser.push(byte));
+        assert_eq!(frame, Some(vec![1]));
+    }
+
+    #[test]
+    fn escaped_flag_and_escape_round_trip() {
+        let mut parser = UartParser::default();
+        let payload = [UART_PPP_FLAG, UART_PPP_ESCAPE, 0x01];
+        let frame = framed(&payload);
+        assert!(frame.contains(&UART_PPP_ESCAPE));
+        let decoded = frame.into_iter().find_map(|byte| parser.push(byte));
+        assert_eq!(decoded, Some(payload.to_vec()));
     }
 }
 

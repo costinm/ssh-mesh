@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::commands::protocol::{decode_binary, encode_binary, format_text, parse_text};
+use crate::commands::protocol::{decode_binary, encode_binary};
 use crate::commands::{CommandRegistry, CommandRequest, CommandResponse, CommandStatus};
 
 #[allow(dead_code)]
@@ -57,14 +57,8 @@ impl CommandTransport for LoggingCommandTransport {
     }
 }
 
-pub fn dispatch_text_line(registry: &mut CommandRegistry, line: &str) -> String {
-    crate::components::telemetry::record_command(line);
-    match parse_text(line) {
-        Ok(request) => format_text(&registry.dispatch(&request)),
-        Err(err) => format!("error {err}\n"),
-    }
-}
-
+/// Dispatch a compact-CBOR command. UART callers pass the mesh packet body
+/// (`00 cb 00 00` followed by CBOR); radio callers pass CBOR directly.
 pub fn dispatch_binary_packet(registry: &mut CommandRegistry, packet: &[u8]) -> Vec<u8> {
     let is_framed = packet.starts_with(&[0, 0xcb, 0, 0]);
     let cbor_bytes = if is_framed { &packet[4..] } else { packet };
@@ -89,34 +83,21 @@ pub fn dispatch_binary_packet(registry: &mut CommandRegistry, packet: &[u8]) -> 
     }
 }
 
+/// Dispatch one compact-CBOR UART packet. UART's HDLC/PPP codec is below this
+/// layer; lmesh adds the generic mesh stream envelope on the UDS side.
+/// UART always returns a complete stream record, including malformed input
+/// errors.
+pub fn dispatch_uart_packet(registry: &mut CommandRegistry, packet: &[u8]) -> Vec<u8> {
+    wrap_stream_frame(&dispatch_binary_packet(registry, packet))
+}
+
 fn wrap_stream_frame(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 8);
-    out.push(0);
     let len = data.len() + 4;
-    out.push((len >> 16) as u8);
-    out.push((len >> 8) as u8);
-    out.push(len as u8);
+    out.extend_from_slice(&(len as u32).to_be_bytes());
     out.extend_from_slice(&[0, 0xcb, 0, 0]);
     out.extend_from_slice(data);
     out
-}
-
-#[allow(dead_code)]
-pub fn send_text_command<T>(
-    registry: &mut CommandRegistry,
-    transport: &mut T,
-    line: &str,
-) -> Result<()>
-where
-    T: CommandTransport,
-{
-    let response = dispatch_text_line(registry, line);
-    log::info!(
-        "command dispatch: transport={} format={:?}",
-        transport.name(),
-        transport.format()
-    );
-    transport.send_response(response.as_bytes())
 }
 
 fn encode_response_as_binary(method: u16, response: &CommandResponse) -> Vec<u8> {
@@ -134,4 +115,51 @@ fn encode_response_as_binary(method: u16, response: &CommandResponse) -> Vec<u8>
     }
     request.payload = response.payload.clone();
     encode_binary(&request)
+}
+
+/// Encode a diagnostic notification using the same binary stream as command
+/// responses. The diagnostic text is payload data, never UART text output.
+pub fn encode_log_notification(line: &str) -> Vec<u8> {
+    wrap_stream_frame(&encode_log_packet(line))
+}
+
+/// Encode a diagnostic notification for a packet transport. Unlike UART, radio
+/// transports already carry packet boundaries and must not receive stream metadata.
+pub fn encode_log_packet(line: &str) -> Vec<u8> {
+    let mut event = CommandRequest::new_binary(0);
+    event.args.insert(4, "event".to_string());
+    event.args.insert(32, line.to_string());
+    encode_binary(&event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        dispatch_uart_packet, encode_log_notification, encode_log_packet, wrap_stream_frame,
+    };
+    use crate::commands::CommandRegistry;
+
+    #[test]
+    fn stream_frame_uses_u32_network_length() {
+        let frame = wrap_stream_frame(&[1, 2, 3]);
+        assert_eq!(&frame[..4], &(7_u32).to_be_bytes());
+        assert_eq!(&frame[4..8], &[0, 0xcb, 0, 0]);
+        assert_eq!(&frame[8..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn malformed_uart_record_still_gets_a_stream_frame() {
+        let mut registry = CommandRegistry::new();
+        let frame = dispatch_uart_packet(&mut registry, &[0x01]);
+        assert_eq!(&frame[4..8], &[0, 0xcb, 0, 0]);
+    }
+
+    #[test]
+    fn radio_log_notification_is_cbor_without_uart_metadata() {
+        let packet = encode_log_packet("event type=test");
+        let framed = encode_log_notification("event type=test");
+        assert_ne!(packet.get(..4), Some(&[0, 0xcb, 0, 0][..]));
+        assert_eq!(&framed[4..8], &[0, 0xcb, 0, 0]);
+        assert_eq!(&framed[8..], packet.as_slice());
+    }
 }

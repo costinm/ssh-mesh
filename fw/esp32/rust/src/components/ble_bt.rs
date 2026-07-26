@@ -9,7 +9,6 @@ use anyhow::{bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
-use crate::transports::dispatch_text_line;
 
 use super::frames::{decode_frame, hex_bytes};
 use super::settings::{parse_bool, parse_i32, SharedSettings};
@@ -273,18 +272,24 @@ pub fn poll_text_commands(registry: &mut CommandRegistry) {
     poll_companion_advertising();
     if BLE_COMPANION_SAVE_PENDING.swap(false, Ordering::Relaxed) {
         let peer = paired_addr_string();
-        let command = format!("ble companion=true save=true peer={peer}");
-        let response = dispatch_text_line(registry, &command);
+        let mut command = CommandRequest::new_binary(42);
+        command.args.insert(97, "true".to_string());
+        command.args.insert(78, "true".to_string());
+        command.args.insert(98, peer);
+        let response = registry.dispatch(&command);
         let line = format!(
             "event type=ble.companion save=true response={}",
-            crate::commands::protocol::escape_value(response.trim())
+            crate::commands::protocol::escape_value(&response.message)
         );
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);
-        let response = dispatch_text_line(registry, "mode companion=true save=true");
+        let mut command = CommandRequest::new_binary(49);
+        command.args.insert(97, "true".to_string());
+        command.args.insert(78, "true".to_string());
+        let response = registry.dispatch(&command);
         let line = format!(
             "event type=ble.companion mode=companion response={}",
-            crate::commands::protocol::escape_value(response.trim())
+            crate::commands::protocol::escape_value(&response.message)
         );
         telemetry::record_log(line.clone());
         telemetry::emit_console(&line);

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use minicbor::{data::Type, Decoder, Encoder};
 
-use super::{CommandRequest, CommandResponse, CommandStatus};
+use super::CommandRequest;
 
 /// Common compact-CBOR field identifiers. These match `mesh::cbor` but are
 /// intentionally duplicated: firmware does not link the host crate.
@@ -9,7 +9,10 @@ pub const CBOR_METHOD: u16 = 0;
 pub const CBOR_PAYLOAD: u16 = 6;
 pub const CBOR_STATUS: u16 = 4;
 pub const CBOR_ERROR: u16 = 5;
-pub const CBOR_MAX_RECORD: usize = 512;
+/// Maximum compact-CBOR body accepted on a firmware transport. Keep this
+/// below 4 KiB so a corrupted stream can be recovered with the 4,000-byte
+/// resynchronization marker without treating the marker as a valid packet.
+pub const CBOR_MAX_RECORD: usize = 4_000;
 
 /// Firmware-local command identifiers. These are two-byte CBOR values and are
 /// documented in `crates/lmesh/ESP_FIRMWARE_API.md`.
@@ -32,6 +35,9 @@ pub fn command_id(name: &str) -> Option<u16> {
         "loraprobe" => 47,
         "sleep" => 48,
         "mode" => 49,
+        // Convenience aliases for the runtime-only infra radio override.
+        // They deliberately share the mode handler so no NVS state changes.
+        "active" | "idle" => 49,
         "power" => 50,
         "battery" => 51,
         "adcprobe" => 52,
@@ -49,6 +55,7 @@ pub fn command_id(name: &str) -> Option<u16> {
         "i2cdump" => 64,
         "button" => 65,
         "nvs" => 66,
+        "radio" => 67,
         _ => return None,
     })
 }
@@ -89,99 +96,9 @@ pub fn command_name(id: u16) -> Option<&'static str> {
         64 => "i2cdump",
         65 => "button",
         66 => "nvs",
+        67 => "radio",
         _ => return None,
     })
-}
-
-/// Text command format shared by console and line-oriented transports.
-///
-/// Keep this firmware text protocol in sync with the service-side text stream
-/// conventions in `crates/mesh/src/message.rs`: one newline-terminated record,
-/// record type as the first token, and structured fields as `key=value`.
-///
-/// Format:
-/// `command key=value flag payload=hex:001122`
-pub fn parse_text(line: &str) -> Result<CommandRequest> {
-    let mut parts = split_text_tokens(line)?.into_iter();
-    let name = parts
-        .next()
-        .ok_or_else(|| anyhow!("empty command"))?
-        .to_string();
-    let mut request = CommandRequest::new(name);
-
-    for part in parts {
-        if let Some((key, value)) = part.split_once('=') {
-            if key == "payload" {
-                request.payload = parse_payload(value)?;
-            } else if let Some(tag) = arg_tag(key) {
-                request.args.insert(tag, value.to_string());
-            }
-        } else {
-            request.positionals.push(part.clone());
-            if let Some(tag) = arg_tag(&part) {
-                request.args.insert(tag, "true".to_string());
-            }
-        }
-    }
-
-    Ok(request)
-}
-
-fn split_text_tokens(line: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if quoted => quoted = false,
-            '"' if current.is_empty() || current.ends_with('=') => quoted = true,
-            '\\' if quoted => {
-                let Some(escaped) = chars.next() else {
-                    return Err(anyhow!("unterminated text escape"));
-                };
-                current.push(match escaped {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    other => other,
-                });
-            }
-            ch if ch.is_whitespace() && !quoted => {
-                if !current.is_empty() {
-                    tokens.push(core::mem::take(&mut current));
-                }
-            }
-            ch => current.push(ch),
-        }
-    }
-    if quoted {
-        return Err(anyhow!("unterminated quoted text value"));
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    Ok(tokens)
-}
-
-pub fn format_text(response: &CommandResponse) -> String {
-    match response.status {
-        CommandStatus::Ok => {
-            let mut out = response.message.clone();
-            if !response.payload.is_empty() {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str("data=");
-                out.push_str(&encode_hex(&response.payload));
-            }
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out
-        }
-        CommandStatus::Error => format!("error message={}\n", quote_text_value(&response.message)),
-    }
 }
 
 pub fn arg_tag(name: &str) -> Option<u16> {
@@ -275,6 +192,14 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "channel_active" => 118,
         "hop" => 119,
         "wake_only" => 120,
+        "network_id" => 340,
+        "hop_seed" => 341,
+        "bitrate" => 342,
+        "deviation" => 343,
+        "rx_bw" => 344,
+        "slot_ms" => 345,
+        "target" => 346,
+        "sequence" => 347,
         "wifi.mode" => 150,
         "power.profile" => 151,
         "nan.backend" => 152,
@@ -480,6 +405,7 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
         bail!("indefinite CBOR maps are not supported");
     };
     let mut method_id = 0;
+    let mut method_name = None;
     let mut args = std::collections::BTreeMap::new();
     let mut payload = Vec::new();
     for _ in 0..count {
@@ -493,8 +419,10 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
                     Type::U8 | Type::U16 | Type::U32 => decoder.u16()?,
                     Type::String => {
                         let name = decoder.str()?;
-                        command_id(name)
-                            .ok_or_else(|| anyhow!("unknown CBOR command name: {name}"))?
+                        let method = command_id(name)
+                            .ok_or_else(|| anyhow!("unknown CBOR command name: {name}"))?;
+                        method_name = Some(name.to_owned());
+                        method
                     }
                     kind => bail!("unsupported CBOR method value {kind:?}"),
                 };
@@ -537,27 +465,12 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
         bail!("trailing CBOR command data");
     }
     let mut request = CommandRequest::new_binary(method_id);
+    if let Some(method_name) = method_name {
+        request.name = method_name;
+    }
     request.args = args;
     request.payload = payload;
     Ok(request)
-}
-
-fn parse_payload(value: &str) -> Result<Vec<u8>> {
-    if let Some(hex) = value.strip_prefix("hex:") {
-        decode_hex(hex)
-    } else {
-        Ok(value.as_bytes().to_vec())
-    }
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 pub fn escape_value(value: &str) -> String {
@@ -591,24 +504,26 @@ fn is_bare_text_value(value: &str) -> bool {
             .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\'' | b'\\' | b'='))
 }
 
-fn decode_hex(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return Err(anyhow!("hex payload must have an even length"));
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
-        let high = from_hex(pair[0])?;
-        let low = from_hex(pair[1])?;
-        out.push((high << 4) | low);
-    }
-    Ok(out)
-}
+#[cfg(test)]
+mod tests {
+    use minicbor::Encoder;
 
-fn from_hex(byte: u8) -> Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(anyhow!("invalid hex byte")),
+    use super::{command_id, decode_binary};
+
+    #[test]
+    fn active_and_idle_aliases_keep_their_cbor_method_name() {
+        for name in ["active", "idle"] {
+            let mut bytes = Vec::new();
+            Encoder::new(&mut bytes)
+                .map(1)
+                .unwrap()
+                .u16(0)
+                .unwrap()
+                .str(name)
+                .unwrap();
+            let request = decode_binary(&bytes).unwrap();
+            assert_eq!(request.method, command_id("mode").unwrap());
+            assert_eq!(request.name, name);
+        }
     }
 }

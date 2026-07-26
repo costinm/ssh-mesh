@@ -152,8 +152,7 @@ impl CommandHandler for AdcProbeCommand {
             loop {
                 sample = sample.saturating_add(1);
                 let line = adc_sample_line(sample, &pins, ref_mv);
-                uart_write(&line);
-                uart_write("\n");
+                super::telemetry::emit_console(&line);
                 if wait_for_key_or_timeout(interval_ms) {
                     return Ok(CommandResponse::ok(format!(
                         "adcprobe stopped=true samples={sample}"
@@ -174,10 +173,6 @@ impl CommandHandler for AdcProbeCommand {
         }
         Ok(CommandResponse::ok(out))
     }
-}
-
-fn uart_write(text: &str) {
-    super::serial::write(text);
 }
 
 #[derive(Clone, Copy)]

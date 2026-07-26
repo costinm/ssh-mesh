@@ -90,7 +90,7 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         super::serial::suspend_for_light_sleep();
         RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
         let before_us = now_us();
-        let ret = unsafe { sys::esp_light_sleep_start() };
+        let ret = start_raw_nan_light_sleep();
         let elapsed_ms = now_us()
             .saturating_sub(before_us)
             .saturating_div(1000)
@@ -134,7 +134,7 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         super::serial::suspend_for_light_sleep();
         RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
         let before_us = now_us();
-        let ret = unsafe { sys::esp_light_sleep_start() };
+        let ret = start_raw_nan_light_sleep();
         let elapsed_ms = now_us()
             .saturating_sub(before_us)
             .saturating_div(1000)
@@ -164,6 +164,24 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
             RAW_NAN_LIGHT_WAKE_FAIL.fetch_add(1, Ordering::Relaxed);
             esp_ok(ret)
         }
+    }
+}
+
+/// Enter raw-NAN light sleep after Wi-Fi has been stopped.
+///
+/// ESP-IDF occasionally reports `ESP_ERR_INVALID_STATE` in the few
+/// milliseconds while the Wi-Fi/PM teardown completes. Retrying once is
+/// bounded and avoids losing an entire raw-NAN duty interval to that
+/// transition race. Other errors remain observable to the caller.
+fn start_raw_nan_light_sleep() -> sys::esp_err_t {
+    let ret = unsafe { sys::esp_light_sleep_start() };
+    if ret != sys::ESP_ERR_INVALID_STATE {
+        return ret;
+    }
+    telemetry::record_log("event type=nan.duty phase=light_sleep retry=true err=0x103");
+    unsafe {
+        sys::vTaskDelay((10 * sys::configTICK_RATE_HZ / 1_000).max(1));
+        sys::esp_light_sleep_start()
     }
 }
 

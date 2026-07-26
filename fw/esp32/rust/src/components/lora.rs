@@ -47,6 +47,28 @@ const REG_SYNC_WORD: u8 = 0x39;
 const REG_DIO_MAPPING_1: u8 = 0x40;
 const REG_VERSION: u8 = 0x42;
 
+// SX127x FSK/OOK register bank. These addresses intentionally overlap the
+// LoRa bank; they are only used after clearing MODE_LONG_RANGE.
+const REG_FSK_BITRATE_MSB: u8 = 0x02;
+const REG_FSK_BITRATE_LSB: u8 = 0x03;
+const REG_FSK_FDEV_MSB: u8 = 0x04;
+const REG_FSK_FDEV_LSB: u8 = 0x05;
+const REG_FSK_RX_CONFIG: u8 = 0x0d;
+const REG_FSK_RX_BW: u8 = 0x12;
+const REG_FSK_AFC_BW: u8 = 0x13;
+const REG_FSK_PREAMBLE_DETECT: u8 = 0x1f;
+const REG_FSK_RSSI_VALUE: u8 = 0x24;
+const REG_FSK_PREAMBLE_MSB: u8 = 0x25;
+const REG_FSK_PREAMBLE_LSB: u8 = 0x26;
+const REG_FSK_SYNC_CONFIG: u8 = 0x27;
+const REG_FSK_SYNC_VALUE_1: u8 = 0x28;
+const REG_FSK_PACKET_CONFIG_1: u8 = 0x30;
+const REG_FSK_PACKET_CONFIG_2: u8 = 0x31;
+const REG_FSK_PAYLOAD_LENGTH: u8 = 0x32;
+const REG_FSK_FIFO_THRESH: u8 = 0x35;
+const REG_FSK_IRQ_FLAGS_1: u8 = 0x3e;
+const REG_FSK_IRQ_FLAGS_2: u8 = 0x3f;
+
 const MODE_LONG_RANGE: u8 = 0x80;
 const MODE_SLEEP: u8 = 0x00;
 const MODE_STDBY: u8 = 0x01;
@@ -59,6 +81,12 @@ const IRQ_CAD_DONE: u8 = 0x04;
 const IRQ_TX_DONE: u8 = 0x08;
 const IRQ_PAYLOAD_CRC_ERROR: u8 = 0x20;
 const IRQ_RX_DONE: u8 = 0x40;
+
+const FSK_DEFAULT_NETWORK_ID: u16 = 0xd3a5;
+const FSK_DEFAULT_SLOT_MS: u32 = 80;
+const FSK_CHANNEL_COUNT: u8 = 50;
+const FSK_PACKET_MAX: usize = 128;
+const FSK_SYNC_MAGIC: &[u8; 4] = b"DMSF";
 
 static BACKGROUND_RX_RUNNING: AtomicBool = AtomicBool::new(false);
 static GPIO_ISR_SERVICE_READY: AtomicBool = AtomicBool::new(false);
@@ -93,7 +121,8 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     registry.register(LoraCommand::new("loraprobe", settings.clone()));
     registry.register(LoraCommand::new("lorasend", settings.clone()));
     registry.register(LoraCommand::new("loralisten", settings.clone()));
-    registry.register(LoraCommand::new("loradump", settings));
+    registry.register(LoraCommand::new("loradump", settings.clone()));
+    registry.register(RadioCommand::new(settings));
 }
 
 /// Load CAD-related NVS settings into the module atomics. Settings that
@@ -349,6 +378,52 @@ struct LoraCommand {
     settings: SharedSettings,
 }
 
+/// Bounded FSK/GFSK operations. FSK is a host-activated discovery modem, not
+/// a replacement for the background Meshtastic LoRa receiver.
+struct RadioCommand {
+    settings: SharedSettings,
+}
+
+impl RadioCommand {
+    fn new(settings: SharedSettings) -> Self {
+        Self { settings }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FskConfig {
+    network_id: u16,
+    hop_seed: u32,
+    bitrate: u32,
+    deviation: u32,
+    rx_bw: u32,
+    preamble: u16,
+    slot_ms: u32,
+}
+
+impl FskConfig {
+    fn load(settings: &SharedSettings) -> Result<Self> {
+        let s = settings.borrow();
+        Ok(Self {
+            network_id: s
+                .get_i32("fsk.network_id", FSK_DEFAULT_NETWORK_ID as i32)?
+                .clamp(1, u16::MAX as i32) as u16,
+            hop_seed: s.get_i32("fsk.hop_seed", 0)? as u32,
+            bitrate: s.get_i32("fsk.bitrate", 100_000)?.clamp(4_800, 300_000) as u32,
+            deviation: s.get_i32("fsk.deviation", 25_000)?.clamp(1_000, 200_000) as u32,
+            rx_bw: s.get_i32("fsk.rx_bw", 250_000)?.clamp(10_000, 500_000) as u32,
+            preamble: s.get_i32("fsk.preamble", 16)?.clamp(3, u16::MAX as i32) as u16,
+            slot_ms: s
+                .get_i32("fsk.slot_ms", FSK_DEFAULT_SLOT_MS as i32)?
+                .clamp(20, 500) as u32,
+        })
+    }
+
+    fn rendezvous_channel(self) -> u8 {
+        ((self.network_id as u32 ^ self.hop_seed) % FSK_CHANNEL_COUNT as u32) as u8
+    }
+}
+
 impl LoraCommand {
     fn new(name: &'static str, settings: SharedSettings) -> Self {
         Self { name, settings }
@@ -435,6 +510,188 @@ impl CommandHandler for LoraCommand {
             _ => Ok(CommandResponse::error("invalid lora command")),
         }
     }
+}
+
+impl CommandHandler for RadioCommand {
+    fn name(&self) -> &'static str {
+        "radio"
+    }
+
+    fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        if request
+            .arg("status")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(CommandResponse::ok(fsk_status_text(&self.settings)?));
+        }
+        for (arg, key, min, max) in [
+            ("network_id", "fsk.network_id", 1, u16::MAX as i32),
+            ("hop_seed", "fsk.hop_seed", 0, i32::MAX),
+            ("bitrate", "fsk.bitrate", 4_800, 300_000),
+            ("deviation", "fsk.deviation", 1_000, 200_000),
+            ("rx_bw", "fsk.rx_bw", 10_000, 500_000),
+            ("preamble", "fsk.preamble", 3, u16::MAX as i32),
+            ("slot_ms", "fsk.slot_ms", 20, 500),
+        ] {
+            if let Some(value) = request.arg_i32(arg)? {
+                self.settings
+                    .borrow_mut()
+                    .set_i32(key, value.clamp(min, max))?;
+            }
+        }
+        let config = FskConfig::load(&self.settings)?;
+        match request.arg("op").unwrap_or("status") {
+            "status" => Ok(CommandResponse::ok(fsk_status_text(&self.settings)?)),
+            "send" => {
+                let payload = parse_payload(request)?;
+                let channel = request
+                    .arg_i32("channel")?
+                    .unwrap_or(config.rendezvous_channel() as i32)
+                    .clamp(0, (FSK_CHANNEL_COUNT - 1) as i32) as u8;
+                run_fsk_session(&self.settings, config, |radio| {
+                    radio.configure_fsk(config, fsk_channel_hz(channel))?;
+                    radio.send_fsk(
+                        &payload,
+                        request.arg_i32("timeout")?.unwrap_or(500) as u32,
+                        config.preamble,
+                    )
+                })?;
+                Ok(CommandResponse::ok(format!(
+                    "radio fsk=sent channel={} len={}",
+                    channel,
+                    payload.len()
+                )))
+            }
+            "sweep" => {
+                let target = request
+                    .arg("target")
+                    .or_else(|| request.arg("to"))
+                    .map(parse_last4)
+                    .transpose()?
+                    .unwrap_or(u32::MAX);
+                let sequence = request.arg_i32("sequence")?.unwrap_or(0) as u32;
+                let frame = encode_fsk_sync(config, target, sequence);
+                run_fsk_session(&self.settings, config, |radio| {
+                    for channel in 0..FSK_CHANNEL_COUNT {
+                        radio.configure_fsk(config, fsk_channel_hz(channel))?;
+                        radio.send_fsk(&frame, 500, config.preamble)?;
+                        task_delay(Duration::from_millis(config.slot_ms as u64));
+                    }
+                    Ok(())
+                })?;
+                Ok(CommandResponse::ok(format!(
+                    "radio fsk=sweep channels={} slot_ms={} target={:08x} seq={}",
+                    FSK_CHANNEL_COUNT, config.slot_ms, target, sequence
+                )))
+            }
+            "listen" => {
+                let channel = request
+                    .arg_i32("channel")?
+                    .unwrap_or(config.rendezvous_channel() as i32)
+                    .clamp(0, (FSK_CHANNEL_COUNT - 1) as i32) as u8;
+                let ms = request
+                    .arg_i32("ms")?
+                    .unwrap_or((FSK_CHANNEL_COUNT as u32 * config.slot_ms + 100) as i32)
+                    .clamp(20, 10_000) as u32;
+                let (packet, diagnostics) = run_fsk_session(&self.settings, config, |radio| {
+                    radio.configure_fsk(config, fsk_channel_hz(channel))?;
+                    radio.start_fsk_rx()?;
+                    let deadline = Instant::now() + Duration::from_millis(ms as u64);
+                    while Instant::now() < deadline {
+                        if let Some(packet) = radio.poll_fsk_packet()? {
+                            return Ok((Some(packet), radio.fsk_diagnostics()?));
+                        }
+                        task_delay(Duration::from_millis(2));
+                    }
+                    Ok((None, radio.fsk_diagnostics()?))
+                })?;
+                let detail = packet
+                    .map(|p| {
+                        format!(
+                            "len={} rssi={} data={} {}",
+                            p.data.len(),
+                            p.rssi,
+                            hex_bytes(&p.data),
+                            diagnostics
+                        )
+                    })
+                    .unwrap_or_else(|| format!("none=true {diagnostics}"));
+                Ok(CommandResponse::ok(format!(
+                    "radio fsk=listen channel={} ms={} {}",
+                    channel, ms, detail
+                )))
+            }
+            op => bail!("unsupported radio op {op}; use status, send, sweep, or listen"),
+        }
+    }
+}
+
+fn fsk_status_text(settings: &SharedSettings) -> Result<String> {
+    let fsk = FskConfig::load(settings)?;
+    Ok(format!(
+        "radio modulation=gfsk profile=us915_fhss_100k network_id=0x{:04x} hop_seed={} bitrate={} deviation={} rx_bw={} preamble={} slot_ms={} channels={} rendezvous_channel={}",
+        fsk.network_id, fsk.hop_seed, fsk.bitrate, fsk.deviation, fsk.rx_bw,
+        fsk.preamble, fsk.slot_ms, FSK_CHANNEL_COUNT, fsk.rendezvous_channel()
+    ))
+}
+
+fn parse_last4(value: &str) -> Result<u32> {
+    let value = value.trim().trim_start_matches("0x").replace(':', "");
+    u32::from_str_radix(&value, 16)
+        .or_else(|_| value.parse())
+        .map_err(Into::into)
+}
+
+fn fsk_channel_hz(channel: u8) -> u32 {
+    // US915 test map: 22 + 4 + 24 channels, 500 kHz spacing. The selected
+    // modulation is engineering-only until regional RF compliance is checked.
+    match channel {
+        0..=21 => 902_250_000 + channel as u32 * 500_000,
+        22..=25 => 913_750_000 + (channel as u32 - 22) * 500_000,
+        _ => 916_250_000 + (channel as u32 - 26) * 500_000,
+    }
+}
+
+fn encode_fsk_sync(config: FskConfig, target: u32, sequence: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(FSK_SYNC_MAGIC);
+    out.push(1);
+    out.push(0); // FSK_SYNC
+    out.extend_from_slice(&config.network_id.to_be_bytes());
+    out.extend_from_slice(&sequence.to_be_bytes());
+    out.extend_from_slice(&target.to_be_bytes());
+    out
+}
+
+fn run_fsk_session<T>(
+    settings: &SharedSettings,
+    config: FskConfig,
+    f: impl FnOnce(&mut Radio) -> Result<T>,
+) -> Result<T> {
+    let restart_rx = BACKGROUND_RX_RUNNING.swap(false, Ordering::Relaxed);
+    if restart_rx {
+        notify_lora_rx_task();
+        if !wait_for_background_rx_stopped(Duration::from_secs(2)) {
+            bail!("LoRa background receiver did not stop for FSK session");
+        }
+    }
+    let state = LoraState::load(settings)?;
+    let result = {
+        let _guard = lora_spi_lock().lock().unwrap();
+        let mut radio = Radio::open(&state.config)?;
+        let result = f(&mut radio);
+        let _ = radio.sleep();
+        result
+    };
+    if restart_rx {
+        let _ = start_background_rx(settings.clone());
+    }
+    // Keep the argument in this helper so operations cannot accidentally use
+    // stale module globals when FSK configuration grows further.
+    let _ = config;
+    result
 }
 
 impl LoraCommand {
@@ -1835,6 +2092,41 @@ impl Radio {
             Self::Sx1262(radio) => radio.dump(),
         }
     }
+
+    fn configure_fsk(&mut self, config: FskConfig, frequency_hz: u32) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.configure_fsk(config, frequency_hz),
+            Self::Sx1262(radio) => radio.configure_fsk(config, frequency_hz),
+        }
+    }
+
+    fn send_fsk(&mut self, payload: &[u8], timeout_ms: u32, preamble: u16) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.send_fsk(payload, timeout_ms),
+            Self::Sx1262(radio) => radio.send_fsk(payload, timeout_ms, preamble),
+        }
+    }
+
+    fn start_fsk_rx(&mut self) -> Result<()> {
+        match self {
+            Self::Sx127x(radio) => radio.start_fsk_rx(),
+            Self::Sx1262(radio) => radio.start_fsk_rx(),
+        }
+    }
+
+    fn poll_fsk_packet(&mut self) -> Result<Option<Packet>> {
+        match self {
+            Self::Sx127x(radio) => radio.poll_fsk_packet(),
+            Self::Sx1262(radio) => radio.poll_fsk_packet(),
+        }
+    }
+
+    fn fsk_diagnostics(&mut self) -> Result<String> {
+        match self {
+            Self::Sx127x(radio) => radio.fsk_diagnostics(),
+            Self::Sx1262(radio) => radio.fsk_diagnostics(),
+        }
+    }
 }
 
 impl Sx127x {
@@ -1938,6 +2230,144 @@ impl Sx127x {
         self.write_reg(REG_IRQ_FLAGS, 0xff)?;
         self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_STDBY)?;
         Ok(())
+    }
+
+    fn configure_fsk(&mut self, config: FskConfig, frequency_hz: u32) -> Result<()> {
+        // LongRangeMode can only be changed while the SX127x is asleep. Enter
+        // LoRa sleep first, then clear the mode bit in a second transaction.
+        // A single write to 0x00 can be ignored while LoRa is running, leaving
+        // the overlapping register bank in LoRa mode.
+        self.write_reg(REG_OP_MODE, MODE_LONG_RANGE | MODE_SLEEP)?;
+        task_delay(Duration::from_millis(1));
+        self.write_reg(REG_OP_MODE, MODE_SLEEP)?;
+        task_delay(Duration::from_millis(1));
+        let op_mode = self.read_reg(REG_OP_MODE)?;
+        if op_mode & MODE_LONG_RANGE != 0 {
+            bail!("SX127x refused FSK mode switch op_mode=0x{op_mode:02x}");
+        }
+        self.set_frequency(frequency_hz)?;
+        // Fxosc / bitrate and fdev / (Fxosc / 2^19), Fxosc=32 MHz.
+        let bitrate = (32_000_000_u32 / config.bitrate.max(1)).clamp(1, u16::MAX as u32) as u16;
+        let deviation =
+            ((config.deviation as u64 * (1 << 19)) / 32_000_000).clamp(1, u16::MAX as u64) as u16;
+        self.write_reg(REG_FSK_BITRATE_MSB, (bitrate >> 8) as u8)?;
+        self.write_reg(REG_FSK_BITRATE_LSB, bitrate as u8)?;
+        self.write_reg(REG_FSK_FDEV_MSB, (deviation >> 8) as u8)?;
+        self.write_reg(REG_FSK_FDEV_LSB, deviation as u8)?;
+        // 0x01 selects a 250 kHz-ish RX/AFC bandwidth (mantissa 16, exp 1).
+        // The current profile keeps this fixed until the radio command exposes
+        // the SX127x bandwidth code directly.
+        let _ = config.rx_bw;
+        self.write_reg(REG_FSK_RX_BW, 0x01)?;
+        self.write_reg(REG_FSK_AFC_BW, 0x01)?;
+        self.write_reg(REG_FSK_PREAMBLE_MSB, (config.preamble >> 8) as u8)?;
+        self.write_reg(REG_FSK_PREAMBLE_LSB, config.preamble as u8)?;
+        // Enable the FSK preamble detector with the SX127x reference
+        // qualification: two preamble bytes and a tolerance of ten chips.
+        // Reset leaves this gate disabled, which lets RSSI rise without ever
+        // advancing an SX126x packet to sync/payload reception.
+        self.write_reg(REG_FSK_PREAMBLE_DETECT, 0xaa)?;
+        // Use the SX127x default 0xAA preamble. SX126x GFSK uses this
+        // standard polarity as well; setting PreamblePolarity would make the
+        // SX127x receiver wait for 0x55 and miss SX126x transmitters. Bit 4
+        // enables sync and bits 2:0 encode SyncSize - 1 for the two-byte
+        // network ID.
+        self.write_reg(REG_FSK_SYNC_CONFIG, 0x10 | 0x01)?;
+        self.write_reg(REG_FSK_SYNC_VALUE_1, (config.network_id >> 8) as u8)?;
+        self.write_reg(REG_FSK_SYNC_VALUE_1 + 1, config.network_id as u8)?;
+        // Variable length, CCITT CRC, no whitening. SX127x standard
+        // whitening is not wire-compatible with the SX126x GFSK seed path;
+        // discovery frames are short and retain the sync-word and CRC filters.
+        // PacketConfig2 bit 6 selects packet mode; the first FIFO byte is the
+        // packet length.
+        self.write_reg(REG_FSK_PACKET_CONFIG_1, 0x90)?;
+        self.write_reg(REG_FSK_PACKET_CONFIG_2, 0x40)?;
+        self.write_reg(REG_FSK_PAYLOAD_LENGTH, FSK_PACKET_MAX as u8)?;
+        // Do not inherit the packet-engine state from the prior LoRa session.
+        // Bit 7 makes TX begin when the FIFO is non-empty, which is essential
+        // for short packets below the FIFO-level threshold. RX starts from
+        // preamble detection with AFC and AGC enabled, matching Semtech's FSK
+        // reference sequence.
+        self.write_reg(REG_FSK_FIFO_THRESH, 0x80 | 0x0f)?;
+        self.write_reg(REG_FSK_RX_CONFIG, 0x1e)?;
+        self.set_tx_power(self.config.tx_power)?;
+        // DIO0=PacketSent and DIO1=FifoEmpty in FSK TX mapping. We poll the
+        // packet-sent flag, but selecting the correct FifoEmpty mapping keeps
+        // the hardware sequencer in the reference packet-engine state.
+        self.write_reg(REG_DIO_MAPPING_1, 0x10)?;
+        self.write_reg(REG_OP_MODE, MODE_STDBY)
+    }
+
+    fn send_fsk(&mut self, payload: &[u8], timeout_ms: u32) -> Result<()> {
+        if payload.is_empty() || payload.len() > FSK_PACKET_MAX {
+            bail!("FSK payload length must be 1..={FSK_PACKET_MAX}");
+        }
+        self.write_reg(REG_OP_MODE, MODE_STDBY)?;
+        // RegFifoAddrPtr (0x0d) only exists in the LoRa register bank. In
+        // FSK it aliases RegRxConfig; do not touch it while filling the common
+        // FIFO at address zero or the packet-engine receive sequencer changes.
+        self.write_reg(REG_FIFO, payload.len() as u8)?;
+        for byte in payload {
+            self.write_reg(REG_FIFO, *byte)?;
+        }
+        // DIO0=PacketSent and DIO1=FifoEmpty for FSK TX.
+        self.write_reg(REG_DIO_MAPPING_1, 0x10)?;
+        self.write_reg(REG_OP_MODE, MODE_TX)?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        while Instant::now() < deadline {
+            if self.read_reg(REG_FSK_IRQ_FLAGS_2)? & 0x08 != 0 {
+                self.write_reg(REG_OP_MODE, MODE_STDBY)?;
+                return Ok(());
+            }
+            task_delay(Duration::from_millis(2));
+        }
+        self.write_reg(REG_OP_MODE, MODE_STDBY)?;
+        bail!(
+            "FSK TX timeout op_mode=0x{:02x} irq2=0x{:02x} packet1=0x{:02x} packet2=0x{:02x}",
+            self.read_reg(REG_OP_MODE)?,
+            self.read_reg(REG_FSK_IRQ_FLAGS_2)?,
+            self.read_reg(REG_FSK_PACKET_CONFIG_1)?,
+            self.read_reg(REG_FSK_PACKET_CONFIG_2)?,
+        )
+    }
+
+    fn start_fsk_rx(&mut self) -> Result<()> {
+        // FSK reads its common FIFO from the current packet-engine position;
+        // 0x0d is RegRxConfig in this bank, not a FIFO pointer.
+        // DIO0=PayloadReady and DIO1=FifoLevel for FSK RX.
+        self.write_reg(REG_DIO_MAPPING_1, 0x00)?;
+        self.write_reg(REG_FSK_RX_CONFIG, 0x1e)?;
+        self.write_reg(REG_OP_MODE, MODE_RX_CONTINUOUS)
+    }
+
+    fn poll_fsk_packet(&mut self) -> Result<Option<Packet>> {
+        let irq2 = self.read_reg(REG_FSK_IRQ_FLAGS_2)?;
+        if irq2 & 0x04 == 0 {
+            return Ok(None);
+        }
+        let len = self.read_reg(REG_FIFO)? as usize;
+        if len == 0 || len > FSK_PACKET_MAX {
+            return Ok(None);
+        }
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            data.push(self.read_reg(REG_FIFO)?);
+        }
+        let rssi = -(self.read_reg(REG_FSK_RSSI_VALUE)? as i32) / 2;
+        let _ = self.read_reg(REG_FSK_IRQ_FLAGS_1)?;
+        Ok(Some(Packet {
+            data,
+            rssi,
+            snr: 0.0,
+        }))
+    }
+
+    fn fsk_diagnostics(&mut self) -> Result<String> {
+        Ok(format!(
+            "irq1=0x{:02x} irq2=0x{:02x}",
+            self.read_reg(REG_FSK_IRQ_FLAGS_1)?,
+            self.read_reg(REG_FSK_IRQ_FLAGS_2)?,
+        ))
     }
 
     fn set_frequency(&mut self, hz: u32) -> Result<()> {
@@ -2189,6 +2619,9 @@ const SX126X_CMD_GET_IRQ_STATUS: u8 = 0x12;
 const SX126X_CMD_CLEAR_IRQ_STATUS: u8 = 0x02;
 const SX126X_CMD_SET_DIO2_AS_RF_SWITCH: u8 = 0x9d;
 const SX126X_CMD_SET_DIO3_AS_TCXO_CTRL: u8 = 0x97;
+const SX126X_CMD_CALIBRATE: u8 = 0x89;
+const SX126X_CMD_CALIBRATE_IMAGE: u8 = 0x98;
+const SX126X_CMD_SET_RX_TX_FALLBACK_MODE: u8 = 0x93;
 const SX126X_CMD_SET_REGULATOR_MODE: u8 = 0x96;
 const SX126X_CMD_WRITE_REGISTER: u8 = 0x0d;
 const SX126X_CMD_READ_REGISTER: u8 = 0x1d;
@@ -2201,6 +2634,7 @@ const SX126X_CMD_SET_CAD_PARAMS: u8 = 0x88;
 const SX126X_CMD_SET_CAD: u8 = 0xc5;
 
 const SX126X_PACKET_TYPE_LORA: u8 = 0x01;
+const SX126X_PACKET_TYPE_GFSK: u8 = 0x00;
 const SX126X_STANDBY_RC: u8 = 0x00;
 const SX126X_RAMP_200_US: u8 = 0x04;
 const SX126X_IRQ_TX_DONE: u16 = 0x0001;
@@ -2210,7 +2644,9 @@ const SX126X_IRQ_CAD_DONE: u16 = 0x0080;
 const SX126X_IRQ_CAD_DETECTED: u16 = 0x0100;
 const SX126X_IRQ_TIMEOUT: u16 = 0x0200;
 const SX126X_REG_SYNC_WORD: u16 = 0x0740;
+const SX126X_REG_GFSK_SYNC_WORD: u16 = 0x06c0;
 const SX126X_REG_OCP: u16 = 0x08e7;
+const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
 const SX126X_REG_RX_GAIN: u16 = 0x08ac;
 const SX126X_REG_RX_SENSITIVITY: u16 = 0x08b5;
 
@@ -2318,12 +2754,14 @@ impl Sx1262 {
     fn configure_radio(&mut self) -> Result<()> {
         self.set_standby()?;
         self.command(SX126X_CMD_SET_REGULATOR_MODE, &[0x01])?;
-        if self.config.sx1262_dio2_rf_switch {
-            self.command(SX126X_CMD_SET_DIO2_AS_RF_SWITCH, &[0x01])?;
-        }
         if self.config.sx1262_tcxo_mv > 0 {
             self.set_tcxo(self.config.sx1262_tcxo_mv)?;
             task_delay(Duration::from_millis(5));
+        }
+        self.calibrate_902_928mhz()?;
+        self.configure_common_fallback()?;
+        if self.config.sx1262_dio2_rf_switch {
+            self.command(SX126X_CMD_SET_DIO2_AS_RF_SWITCH, &[0x01])?;
         }
         self.command(SX126X_CMD_SET_PACKET_TYPE, &[SX126X_PACKET_TYPE_LORA])?;
         self.set_frequency(self.config.frequency_hz)?;
@@ -2357,8 +2795,149 @@ impl Sx1262 {
         Ok(())
     }
 
+    /// Configure the SX126x GFSK packet engine. This is intentionally kept
+    /// separate from the LoRa helpers: packet type changes the meanings of
+    /// SetModulationParams, SetPacketParams, packet status, and the sync-word
+    /// register range.
+    fn configure_fsk(&mut self, config: FskConfig, frequency_hz: u32) -> Result<()> {
+        self.set_standby()?;
+        self.command(SX126X_CMD_SET_REGULATOR_MODE, &[0x01])?;
+        if self.config.sx1262_tcxo_mv > 0 {
+            self.set_tcxo(self.config.sx1262_tcxo_mv)?;
+            task_delay(Duration::from_millis(5));
+        }
+        self.calibrate_902_928mhz()?;
+        self.configure_common_fallback()?;
+        if self.config.sx1262_dio2_rf_switch {
+            self.command(SX126X_CMD_SET_DIO2_AS_RF_SWITCH, &[0x01])?;
+        }
+        self.command(SX126X_CMD_SET_PACKET_TYPE, &[SX126X_PACKET_TYPE_GFSK])?;
+        self.set_frequency(frequency_hz)?;
+        self.command(
+            SX126X_CMD_SET_PA_CONFIG,
+            &[
+                self.config.sx1262_pa_duty as u8,
+                self.config.sx1262_pa_hp as u8,
+                self.config.sx1262_pa_device as u8,
+                self.config.sx1262_pa_lut as u8,
+            ],
+        )?;
+        self.command(
+            SX126X_CMD_SET_TX_PARAMS,
+            &[
+                self.config.tx_power.clamp(-9, 22) as i8 as u8,
+                SX126X_RAMP_200_US,
+            ],
+        )?;
+        // Keep GFSK TX power-stage setup identical to the normal LoRa path.
+        // The reset OCP setting is not a valid production transmit default.
+        self.set_current_limit_140ma()?;
+        self.command(SX126X_CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x80])?;
+        self.set_fsk_modulation_params(config)?;
+        self.write_register(
+            SX126X_REG_GFSK_SYNC_WORD,
+            &[(config.network_id >> 8) as u8, config.network_id as u8],
+        )?;
+        // In variable packet mode the SX126x hardware length field must use
+        // its full 255-byte maximum. Keep FSK_PACKET_MAX as the application
+        // acceptance limit after a packet is read; using 128 here caused
+        // valid SX127x variable packets to raise PacketLengthError.
+        self.set_fsk_packet_params(u8::MAX, config.preamble)?;
+        // GFSK receive uses the same analog front end as LoRa. Apply the
+        // documented boosted-gain and sensitivity settings before a bounded
+        // FSK listen session, matching the normal receive path.
+        self.set_rx_boosted_gain(true)?;
+        self.apply_rx_sensitivity_patch()?;
+        self.set_irq_mask(
+            SX126X_IRQ_TX_DONE | SX126X_IRQ_RX_DONE | SX126X_IRQ_CRC_ERR | SX126X_IRQ_TIMEOUT,
+        )?;
+        self.clear_irq(0xffff)
+    }
+
+    fn set_fsk_modulation_params(&mut self, config: FskConfig) -> Result<()> {
+        // SetModulationParams(GFSK): bitrate(raw 24 bit), pulse shaping,
+        // RX bandwidth, frequency deviation(raw 24 bit). Raw units are
+        // 32 * 32 MHz / bitrate and frequency * 2^25 / 32 MHz respectively.
+        // Unlike SX127x, SX126x encodes the requested bitrate with an extra
+        // factor of 32. Omitting it changes the 100 kbps profile into 3.2 Mbps.
+        let bitrate =
+            ((32_u64 * 32_000_000) / config.bitrate.max(1) as u64).clamp(1, 0x00ff_ffff) as u32;
+        let deviation =
+            ((config.deviation as u64 * (1 << 25)) / 32_000_000).clamp(1, 0x00ff_ffff) as u32;
+        // Semtech uses a non-linear GFSK Rx-bandwidth selector. Keep this
+        // table explicit: these values are not the LoRa bandwidth selectors.
+        let bandwidth = match config.rx_bw {
+            0..=78_200 => 0x1b,        // 78.2 kHz
+            78_201..=93_800 => 0x13,   // 93.8 kHz
+            93_801..=117_300 => 0x0b,  // 117.3 kHz
+            117_301..=156_200 => 0x1a, // 156.2 kHz
+            156_201..=187_200 => 0x12, // 187.2 kHz
+            187_201..=234_300 => 0x0a, // 234.3 kHz
+            234_301..=312_000 => 0x19, // 312.0 kHz
+            312_001..=373_600 => 0x11, // 373.6 kHz
+            _ => 0x09,                 // 467.0 kHz
+        };
+        self.command(
+            SX126X_CMD_SET_MODULATION_PARAMS,
+            &[
+                (bitrate >> 16) as u8,
+                (bitrate >> 8) as u8,
+                bitrate as u8,
+                0x00, // no shaping; matches the SX127x FSK default
+                bandwidth,
+                (deviation >> 16) as u8,
+                (deviation >> 8) as u8,
+                deviation as u8,
+            ],
+        )
+    }
+
+    fn set_fsk_packet_params(&mut self, payload_len: u8, preamble_bytes: u16) -> Result<()> {
+        // The shared FSK profile defines preamble in bytes, matching SX127x.
+        // SX126x SetPacketParams instead takes its GFSK preamble length in
+        // bits. Sending `16` directly emitted only a two-byte preamble: the
+        // SX126x could receive the longer SX127x preamble with its detector
+        // disabled, but SX127x never detected the SX126x transmission.
+        let preamble_bits = preamble_bytes.saturating_mul(8);
+        // Variable length, 16-bit sync word, CRC-CCITT, and no whitening.
+        // Leave the SX126x preamble detector ungated for SX127x interop. The
+        // SX127x preamble shape can otherwise enter SX126x packet recovery at
+        // a different phase and produce a false CRC error; sync and CRC still
+        // gate packet delivery.
+        self.command(
+            SX126X_CMD_SET_PACKET_PARAMS,
+            &[
+                (preamble_bits >> 8) as u8,
+                preamble_bits as u8,
+                0x00,
+                16,
+                0x00,
+                0x01, // variable packet: hardware adds/consumes the length byte
+                payload_len,
+                0x06,
+                0x00,
+            ],
+        )
+    }
+
     fn set_standby(&mut self) -> Result<()> {
         self.command(SX126X_CMD_SET_STANDBY, &[SX126X_STANDBY_RC])
+    }
+
+    fn calibrate_902_928mhz(&mut self) -> Result<()> {
+        // SX126x reset leaves analog blocks and image rejection uncalibrated.
+        // Both the normal LoRa and GFSK paths operate in US915 for now.
+        self.command(SX126X_CMD_CALIBRATE, &[0x7f])?;
+        self.command(SX126X_CMD_CALIBRATE_IMAGE, &[0xe1, 0xe9])
+    }
+
+    fn configure_common_fallback(&mut self) -> Result<()> {
+        self.command(SX126X_CMD_SET_RX_TX_FALLBACK_MODE, &[0x20])?;
+        // SX1262 datasheet, known limitation 15.2: relax the PA clamp after
+        // reset. Without it an otherwise-valid GFSK TX can remain in TX state
+        // instead of completing.
+        let clamp = self.read_register(SX126X_REG_TX_CLAMP_CONFIG, 1)?[0] | 0x1e;
+        self.write_register(SX126X_REG_TX_CLAMP_CONFIG, &[clamp])
     }
 
     fn set_frequency(&mut self, hz: u32) -> Result<()> {
@@ -2504,6 +3083,46 @@ impl Sx1262 {
         bail!("SX1262 TX timeout");
     }
 
+    fn send_fsk(&mut self, payload: &[u8], timeout_ms: u32, preamble: u16) -> Result<()> {
+        if payload.is_empty() || payload.len() > FSK_PACKET_MAX {
+            bail!("FSK payload length must be 1..={FSK_PACKET_MAX}");
+        }
+        self.set_standby()?;
+        // For SX126x GFSK the payload length in SetPacketParams is used by
+        // the transmitter, including variable-length packets. Leaving the
+        // receive-side maximum (255) here makes a short TX read past the
+        // supplied FIFO payload and eventually time out.
+        self.set_fsk_packet_params(payload.len() as u8, preamble)?;
+        self.write_buffer(0, payload)?;
+        self.clear_irq(0xffff)?;
+        let timeout = sx126x_timeout(timeout_ms);
+        self.command(
+            SX126X_CMD_SET_TX,
+            &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
+        )?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let mut last_irq = 0_u16;
+        while Instant::now() < deadline {
+            let irq = self.irq_status()?;
+            last_irq = irq;
+            if irq & SX126X_IRQ_TX_DONE != 0 {
+                self.clear_irq(irq)?;
+                self.set_standby()?;
+                return Ok(());
+            }
+            if irq & SX126X_IRQ_TIMEOUT != 0 {
+                self.clear_irq(irq)?;
+                bail!("SX1262 FSK TX timeout");
+            }
+            task_delay(Duration::from_millis(2));
+        }
+        bail!(
+            "SX1262 FSK TX timeout irq=0x{last_irq:04x} status=0x{:02x} packet_type=0x{:02x}",
+            self.status()?,
+            self.read_u8(SX126X_CMD_GET_PACKET_TYPE)?,
+        )
+    }
+
     fn start_rx(&mut self) -> Result<()> {
         self.set_standby()?;
         self.set_packet_params(255)?;
@@ -2513,6 +3132,14 @@ impl Sx1262 {
             SX126X_CMD_SET_RX,
             &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
         )
+    }
+
+    fn start_fsk_rx(&mut self) -> Result<()> {
+        self.set_standby()?;
+        self.set_fsk_packet_params(u8::MAX, 16)?;
+        self.clear_irq(0xffff)?;
+        // 0xFFFFFF is the SX126x continuous-RX timeout.
+        self.command(SX126X_CMD_SET_RX, &[0xff, 0xff, 0xff])
     }
 
     fn start_rx_duty_cycle_auto(&mut self) -> Result<RxDutyCycle> {
@@ -2629,6 +3256,43 @@ impl Sx1262 {
         let data = self.read_buffer(offset, len)?;
         let (rssi, snr) = self.packet_status()?;
         Ok(Some(Packet { data, rssi, snr }))
+    }
+
+    fn poll_fsk_packet(&mut self) -> Result<Option<Packet>> {
+        let irq = self.irq_status()?;
+        if irq & SX126X_IRQ_RX_DONE == 0 {
+            return Ok(None);
+        }
+        self.clear_irq(irq)?;
+        if irq & SX126X_IRQ_CRC_ERR != 0 {
+            return Ok(None);
+        }
+        let (len, offset) = self.rx_buffer_status()?;
+        if len == 0 || len as usize > FSK_PACKET_MAX {
+            return Ok(None);
+        }
+        let data = self.read_buffer(offset, len)?;
+        // GFSK packet status has RSSI sync / RSSI average in the first two
+        // bytes. RSSI is encoded as -value/2 dBm; no LoRa SNR exists.
+        let (rssi, _) = self.packet_status()?;
+        Ok(Some(Packet {
+            data,
+            rssi,
+            snr: 0.0,
+        }))
+    }
+
+    fn fsk_diagnostics(&mut self) -> Result<String> {
+        const SX126X_CMD_GET_STATS: u8 = 0x10;
+        let irq = self.irq_status()?;
+        let stats = self.read(SX126X_CMD_GET_STATS, &[], 6)?;
+        let received = u16::from_be_bytes([stats[0], stats[1]]);
+        let crc_error = u16::from_be_bytes([stats[2], stats[3]]);
+        let length_error = u16::from_be_bytes([stats[4], stats[5]]);
+        Ok(format!(
+            "irq=0x{irq:04x} packets={} crc_err={} len_err={}",
+            received, crc_error, length_error
+        ))
     }
 
     fn dump(&mut self) -> Result<String> {
@@ -3403,5 +4067,37 @@ fn esp_ok(ret: sys::esp_err_t) -> Result<()> {
         Ok(())
     } else {
         bail!("esp_err=0x{ret:x}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fsk_channel_map_has_expected_edges() {
+        assert_eq!(fsk_channel_hz(0), 902_250_000);
+        assert_eq!(fsk_channel_hz(21), 912_750_000);
+        assert_eq!(fsk_channel_hz(22), 913_750_000);
+        assert_eq!(fsk_channel_hz(25), 915_250_000);
+        assert_eq!(fsk_channel_hz(26), 916_250_000);
+        assert_eq!(fsk_channel_hz(49), 927_750_000);
+    }
+
+    #[test]
+    fn fsk_sync_is_network_order_and_contains_target() {
+        let config = FskConfig {
+            network_id: 0xd3a5,
+            hop_seed: 0,
+            bitrate: 100_000,
+            deviation: 25_000,
+            rx_bw: 250_000,
+            preamble: 16,
+            slot_ms: 80,
+        };
+        assert_eq!(
+            encode_fsk_sync(config, 0x840d_8e07, 9),
+            vec![b'D', b'M', b'S', b'F', 1, 0, 0xd3, 0xa5, 0, 0, 0, 9, 0x84, 0x0d, 0x8e, 0x07,]
+        );
     }
 }

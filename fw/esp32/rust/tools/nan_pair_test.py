@@ -7,17 +7,16 @@ import argparse
 import re
 import time
 
-from serial_cmd import Console
+from serial_cmd import Console, encode_firmware_command
 
 
-PROMPT = b"dm-rs> "
 STAT_RE = re.compile(
     r"\b(fup_rx|fup_tx|match|raw_sdf|raw_action|raw_beacon|raw_mgmt|raw_cmd_rx|raw_resp_rx|raw_resp_tx|queue_len)=(\d+)\b"
 )
 
 
 def run(console: Console, command: str, timeout: float | None = None) -> str:
-    out = console.cmd(command, timeout)
+    out = console.cbor_cmd(command, timeout)
     print(f"\n[{console.port}] $ {command}")
     print(out.rstrip())
     if "\nerror " in out or out.strip().startswith("error "):
@@ -55,6 +54,7 @@ def wait_for_raw_discovery(a: Console, b: Console, timeout: float) -> None:
 
 def start_pair(a: Console, b: Console, channel: int, backend: str, disable_lora: bool) -> None:
     for console in (a, b):
+        console.wake_probe()
         run(console, "wifi mode=off")
         if disable_lora:
             try:
@@ -63,7 +63,7 @@ def start_pair(a: Console, b: Console, channel: int, backend: str, disable_lora:
                 print(f"[{console.port}] ignoring lora disable failure: {exc}")
         run(
             console,
-            f"nan start=true backend={backend} role=both service=dmesh channel={channel}",
+            f"nan start=true backend={backend} service=dmesh channel={channel}",
             8.0,
         )
 
@@ -71,7 +71,6 @@ def start_pair(a: Console, b: Console, channel: int, backend: str, disable_lora:
 def stop_extra(port: str, baud: int, timeout: float) -> None:
     console = Console(port, baud, timeout)
     try:
-        console.sync()
         run(console, "nan stop=true")
         run(console, "wifi mode=off")
         run(console, "lora rx=false")
@@ -93,15 +92,6 @@ def mac_suffix4(mac: str) -> str:
     return "".join(parts[-4:])
 
 
-def addressed_payload(payload: str, to_mac: str | None, from_mac: str | None) -> str:
-    fields = [payload]
-    if to_mac:
-        fields.append(f"to={mac_suffix4(to_mac)}")
-    if from_mac:
-        fields.append(f"from={mac_suffix4(from_mac)}")
-    return " ".join(fields)
-
-
 def run_raw_command_round(
     a: Console,
     b: Console,
@@ -112,14 +102,19 @@ def run_raw_command_round(
     expect_response: bool,
     settle_sec: float,
 ) -> None:
-    payload = addressed_payload(payload, b_mac, a_mac)
-    run(a, f"nan start=true backend=raw role=both service=dmesh channel={channel}", 8.0)
-    run(b, f"nan start=true backend=raw role=both service=dmesh channel={channel}", 8.0)
+    run(a, f"nan start=true backend=raw service=dmesh channel={channel}", 8.0)
+    run(b, f"nan start=true backend=raw service=dmesh channel={channel}", 8.0)
     a0 = nan_stats(a)
     b0 = nan_stats(b)
-    out = run(a, f'nan send="{payload}" backend=raw dst={b_mac}')
-    if "backend=raw" not in out:
-        raise RuntimeError(f"raw send used unexpected backend: {out}")
+    # The outer NAN command queues an opaque, unframed compact-CBOR command.
+    # Addressing belongs to the raw-NAN frame, not the text command payload.
+    # Strip UART's stream header and metadata from the inner command.
+    inner = encode_firmware_command(payload)[8:]
+    print(f"\n[{a.port}] $ nan payload=<CBOR {payload!r}>")
+    out = a.cbor_cmd_payload("nan", inner)
+    print(out.rstrip())
+    if "queued=true" not in out:
+        raise RuntimeError(f"raw NAN command was not queued: {out}")
     time.sleep(settle_sec)
     a1 = nan_stats(a)
     b1 = nan_stats(b)
@@ -155,8 +150,6 @@ def main() -> int:
     a = Console(args.a, args.baud, args.timeout)
     b = Console(args.b, args.baud, args.timeout)
     try:
-        print(a.sync().rstrip())
-        print(b.sync().rstrip())
         start_pair(a, b, args.channel, args.backend, not args.keep_lora)
         if not args.a_mac or not args.b_mac:
             raise RuntimeError("--a-mac and --b-mac are required for raw NAN")
@@ -164,7 +157,6 @@ def main() -> int:
 
         expect_response = not args.no_expect_response
         for idx in range(args.iterations):
-            suffix = f" iter={idx}"
             run_raw_command_round(
                 a,
                 b,
@@ -178,7 +170,7 @@ def main() -> int:
             run_raw_command_round(
                 a,
                 b,
-                f"dmesh.ping seq={idx}{suffix}",
+                "radio status=true",
                 args.a_mac,
                 args.b_mac,
                 args.channel,

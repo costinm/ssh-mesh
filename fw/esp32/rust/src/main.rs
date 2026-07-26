@@ -14,23 +14,16 @@ const BOOT_PAIRING_HOLD_MS: u32 = 3_000;
 const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
 
 fn main() {
-    if let Err(err) = run() {
-        let _ = err;
-        rom_print(b"event type=system.error phase=main\n\0");
-    }
+    let _ = run();
 }
 
 #[no_mangle]
 pub extern "C" fn app_main() {
-    rom_print(b"dm-rs boot step=app_main\n\0");
-    if let Err(err) = run() {
-        let _ = err;
-        rom_print(b"dm-rs boot step=app_error\n\0");
-    }
+    let _ = run();
 }
 
 fn run() -> Result<()> {
-    rom_print(b"dm-rs boot step=link_patches\n\0");
+    boot_print("dm-rs boot step=link_patches");
     esp_idf_sys::link_patches();
     components::wake::register_main_task();
     init_console_uart();
@@ -142,26 +135,32 @@ fn run() -> Result<()> {
     }
     loop {
         components::telemetry::record_main_loop();
-        components::mode::poll(&settings);
-        components::ble_bt::poll_text_commands(&mut registry);
-        poll_raw_wifi_commands(&mut registry, &settings);
-        poll_nan_commands(&mut registry, &settings);
-        components::test::poll_main();
+        // GPIO0/DTR must be handled before the raw-NAN scheduler.  Otherwise
+        // the scheduler can try to enter light sleep while the DTR/PRG level
+        // is still asserted, and ESP-IDF rejects that sleep request.
         if components::button::take_console_wakes() > 0 {
             components::serial::rearm_after_wake();
+            // GPIO0/DTR is the explicit console wake source. Rearming RX on
+            // its own is insufficient: command responses remain TX-gated
+            // unless this also restores the bounded UART active window.
+            components::serial::activate_window();
             components::mode::mark_companion_active(&settings, companion_active_ms);
             components::telemetry::record_log("event type=uart.wake source=button");
-            uart_write("event type=uart.wake source=button\ndm-rs> ");
+            components::telemetry::emit_console("event type=uart.wake source=button");
         }
         if components::button::take_long_presses() > 0 {
             components::serial::set_debug_enabled(true);
             components::serial::activate_window();
             components::mode::mark_companion_active(&settings, companion_active_ms);
-            uart_write("dm-rs> ");
         }
         for _ in 0..components::button::take_sync_requests() {
             components::mode::send_button_sync(&settings);
         }
+        components::mode::poll(&settings);
+        components::ble_bt::poll_text_commands(&mut registry);
+        poll_raw_wifi_commands(&mut registry, &settings);
+        poll_nan_commands(&mut registry, &settings);
+        components::test::poll_main();
         drain_uart_console(&mut registry, &settings, companion_active_ms);
         match wait_for_firmware_activity(Duration::from_millis(MAIN_HOUSEKEEPING_POLL_MS)) {
             UartWait::Data => {}
@@ -181,16 +180,8 @@ fn drain_uart_console(
 ) {
     while let Some(frame) = components::serial::take_frame() {
         components::mode::mark_companion_active(settings, companion_active_ms);
-        match frame.kind {
-            components::serial::UartFrameKind::Text => {
-                let command = core::str::from_utf8(&frame.data).unwrap_or("").trim();
-                write_text_console_response(registry, command);
-            }
-            components::serial::UartFrameKind::Binary => {
-                let response = transports::dispatch_binary_packet(registry, &frame.data);
-                components::serial::write_bytes(&response);
-            }
-        }
+        let response = transports::dispatch_uart_packet(registry, &frame.data);
+        components::serial::write_packet(&response);
         // The manager owns driver deletion. It observes this notification only
         // after the acknowledgement above has been accepted by UART TX.
         let _ = components::serial::finish_pending_uninstall();
@@ -310,18 +301,7 @@ fn poll_boot_console(registry: &mut CommandRegistry) -> bool {
     let mut received = false;
     while let Some(frame) = components::serial::take_frame() {
         received = true;
-        match frame.kind {
-            components::serial::UartFrameKind::Text => {
-                let command = core::str::from_utf8(&frame.data).unwrap_or("").trim();
-                write_text_console_response(registry, command);
-            }
-            components::serial::UartFrameKind::Binary => {
-                components::serial::write_bytes(&transports::dispatch_binary_packet(
-                    registry,
-                    &frame.data,
-                ));
-            }
-        }
+        components::serial::write_packet(&transports::dispatch_uart_packet(registry, &frame.data));
         let _ = components::serial::finish_pending_suspend();
         let _ = components::serial::finish_pending_uninstall();
     }
@@ -400,12 +380,6 @@ fn poll_nan_commands(
     }
 }
 
-fn rom_print(message: &'static [u8]) {
-    unsafe {
-        esp_idf_sys::esp_rom_printf(message.as_ptr() as *const c_char);
-    }
-}
-
 /// Boot progress is retained in telemetry only. UART output is demand-driven:
 /// emitting boot logs before a console client wakes it can leave UART0's IDF
 /// ISR active through the radio startup transition.
@@ -440,7 +414,6 @@ fn init_console_uart() {
             install = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut queue, 0);
         }
         if install != esp_idf_sys::ESP_OK || queue.is_null() {
-            rom_print(b"event type=uart.rx_queue state=failed\n\0");
             components::telemetry::record_log(format!(
                 "event type=uart.rx_queue state=failed err={install}"
             ));
@@ -463,13 +436,11 @@ fn init_console_uart() {
         match components::serial::start_ingress_task(queue) {
             Ok(()) => {
                 components::serial::activate_window();
-                rom_print(b"event type=uart.rx_queue state=ready baud=460800 tx_isr=false\n\0");
                 components::telemetry::record_log(
                     "event type=uart.rx_queue state=ready baud=460800 tx_isr=false",
                 );
             }
             Err(err) => {
-                rom_print(b"event type=uart.rx_queue state=failed\n\0");
                 components::telemetry::record_log(&format!("event type=uart.rx_queue err={err}"));
             }
         }
@@ -517,26 +488,6 @@ fn wait_for_firmware_activity(timeout: Duration) -> UartWait {
     } else {
         UartWait::Timeout
     }
-}
-
-fn uart_write(text: &str) {
-    components::serial::write(text);
-}
-
-/// Queue a complete text-console record atomically relative to its prompt.
-///
-/// The forwarded debug client uses `dm-rs> ` as the response boundary.  Queuing
-/// a command result and its prompt separately lets an idle/raw-NAN transition
-/// race the second enqueue, leaving the caller with a valid result but no
-/// completion marker.
-fn write_text_console_response(registry: &mut CommandRegistry, command: &str) {
-    let mut response = if command.is_empty() {
-        String::new()
-    } else {
-        transports::dispatch_text_line(registry, command)
-    };
-    response.push_str("dm-rs> ");
-    uart_write(&response);
 }
 
 fn quiet_runtime_logs() {

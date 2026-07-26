@@ -258,6 +258,12 @@ fn start_infra_active_session(
     }
     INFRA_ACTIVE_STARTS.fetch_add(1, Ordering::Relaxed);
     ensure_infra_active_radios(settings, reason)?;
+    // A remote `active` request is also the supported way to recover the
+    // physical debug/modem UART on a sleepy board. Keep the radio override
+    // independent and persistent, but bound UART/APB activity to its normal
+    // debug window so unattended battery nodes still return to low power.
+    super::serial::set_debug_enabled(true);
+    super::serial::activate_window();
     let persistent = INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed);
     telemetry::record_log(format!(
         "event type=mode.infra_active state=start persistent={} active_ms={}",
@@ -693,6 +699,11 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         // console clients with a result but no prompt. Once the console window
         // expires the next poll follows the normal modem-off sleep path.
         if hold_active {
+            // A powered gateway keeps raw Wi-Fi up specifically so it can
+            // deliver queued addressed commands without waiting for its next
+            // duty transition. Leaving this queue undrained made remote
+            // `active` requests remain pending forever.
+            super::nan::drain_raw_queue();
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
             return;
         }
@@ -733,22 +744,6 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             dw_offset_tu,
             queued_sent
         ));
-        #[cfg(target_feature = "esp32s3ops")]
-        if light_sleep {
-            // S3 must not block the control task in wake::wait() while the
-            // modem is off. Its UART/GPIO wake events then reach the ingress
-            // task, but command dispatch cannot run until the entire NAN
-            // interval expires. Keep the stopped S3 Wi-Fi driver initialized,
-            // arm the next window deadline, and let PM/tickless idle light-sleep between
-            // normal event-driven control-loop wakeups instead.
-            arm_raw_nan_beacon_window(sync_plan);
-            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_delay_ms), Ordering::Relaxed);
-            telemetry::record_log(format!(
-                "event type=nan.duty phase=idle wake=pm channel={} next_ms={}",
-                channel, window_delay_ms
-            ));
-            return;
-        }
         if light_sleep {
             let sleep_started_ms = now_ms();
             loop {
@@ -1095,6 +1090,24 @@ impl CommandHandler for ModeCommand {
     }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+        // `active` and `idle` are compact-CBOR command aliases for the
+        // runtime-only radio override. Keep the implementation in `mode` so
+        // both direct UART and addressed raw-NAN commands have identical
+        // semantics.
+        if request.name == "active" {
+            if is_companion_mode() {
+                bail!("active requires infra mode; run mode infra=true first");
+            }
+            start_infra_active_session(&self.settings, None, "command_alias")?;
+            return Ok(CommandResponse::ok(status_text()));
+        }
+        if request.name == "idle" {
+            if is_companion_mode() {
+                bail!("idle requires infra mode; run mode infra=true first");
+            }
+            stop_infra_active_session();
+            return Ok(CommandResponse::ok(status_text()));
+        }
         if request
             .arg("infra")
             .map(parse_bool)

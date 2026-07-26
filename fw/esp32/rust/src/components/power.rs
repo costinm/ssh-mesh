@@ -206,7 +206,7 @@ impl CommandHandler for PowerCommand {
                 bail!("esp_pm_dump_locks failed err=0x{ret:x}");
             }
             if let Ok(text) = core::str::from_utf8(&dump[..ret as usize]) {
-                super::serial::write(text);
+                super::telemetry::record_log(format!("event type=power.locks dump={text:?}"));
             }
         }
         if request

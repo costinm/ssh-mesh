@@ -286,14 +286,6 @@ impl TelemetryCommand {
     }
 }
 
-pub fn record_command(line: &str) {
-    let command = line.split_whitespace().next().unwrap_or("");
-    if matches!(command, "stats" | "logs" | "messages" | "local_messages") {
-        return;
-    }
-    record_log(format!("ev=cmd.rx text={}", quote_text_value(line)));
-}
-
 pub fn record_log(line: impl Into<String>) {
     if let Ok(mut state) = telemetry().try_lock() {
         push_bounded(
@@ -867,14 +859,8 @@ fn companion_ack_text(seq: u64, hash: u32) -> String {
 }
 
 pub fn emit_console(line: &str) {
-    uart_write("\n");
-    uart_write(line);
-    uart_write("\ndm-rs> ");
+    super::serial::write_packet(&crate::transports::encode_log_notification(line));
     super::wifi::forward_console_notification(line);
-}
-
-fn uart_write(text: &str) {
-    super::serial::write(text);
 }
 
 fn reset() {

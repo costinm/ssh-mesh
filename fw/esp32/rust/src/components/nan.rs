@@ -290,9 +290,26 @@ fn raw_service_descriptor_payload(body: &[u8]) -> Option<(u8, &[u8])> {
 /// window. In continuously active raw mode, drain it now so interactive
 /// diagnostics retain their request/response behavior.
 pub fn queue_response_payload_to(command: &NanIncomingCommand, payload: &[u8]) -> Result<usize> {
+    // A raw-NAN SDF carries at most 255 bytes. Never truncate compact CBOR:
+    // an incomplete response is decoded as a request by the peer and corrupts
+    // response accounting. Preserve the method ID where possible and return a
+    // small, valid CBOR error instead.
+    let bounded = if payload.len() <= NAN_COMMAND_MAX_LEN {
+        payload.to_vec()
+    } else {
+        let method = crate::commands::protocol::decode_binary(payload)
+            .map(|response| response.method)
+            .unwrap_or(0);
+        let mut response = CommandRequest::new_binary(method);
+        response.args.insert(
+            crate::commands::protocol::CBOR_ERROR,
+            format!("raw NAN response exceeds {NAN_COMMAND_MAX_LEN} bytes"),
+        );
+        crate::commands::protocol::encode_binary(&response)
+    };
     match &command.peer {
         NanCommandPeer::Raw { mac, instance } => {
-            let queued = enqueue_outgoing_raw(*mac, *instance, payload, true)?;
+            let queued = enqueue_outgoing_raw(*mac, *instance, &bounded, true)?;
             if !super::mode::raw_nan_duty_enabled() && NAN_RUNNING.load(Ordering::Relaxed) {
                 drain_outgoing_raw();
             }
@@ -449,6 +466,27 @@ impl CommandHandler for NanCommand {
         if request.arg("stats").is_some() {
             return Ok(CommandResponse::ok(stats()));
         }
+        // A gateway sends an already-encoded addressed command as binary
+        // payload. Do not accept text here: raw-NAN, BLE, and UART all use the
+        // same compact-CBOR command bytes. The duty scheduler drains this
+        // queue during lora1's next active NAN window.
+        if !request.payload.is_empty() {
+            if request.payload.len() > NAN_COMMAND_MAX_LEN {
+                bail!("nan payload exceeds {NAN_COMMAND_MAX_LEN} bytes");
+            }
+            let queued = queue_raw_broadcast(&request.payload)?;
+            // Duty-cycled nodes transmit from their next scheduled window.
+            // An explicitly active raw-NAN session is used for host debugging
+            // and transfers, so deliver the queued compact-CBOR command now.
+            if !super::mode::raw_nan_duty_enabled() && NAN_RUNNING.load(Ordering::Relaxed) {
+                drain_outgoing_raw();
+            }
+            return Ok(CommandResponse::ok(format!(
+                "nan queued=true bytes={} queue_len={}",
+                request.payload.len(),
+                queued
+            )));
+        }
         if request.arg("start").is_some()
             || request
                 .arg("enable")
@@ -487,38 +525,12 @@ impl CommandHandler for NanCommand {
             )));
         }
         if let Some(data) = request.arg("queue").or_else(|| request.arg("enqueue")) {
-            let dst = parse_mac(request.arg("dst").unwrap_or("ff:ff:ff:ff:ff:ff"))?;
-            let instance = request
-                .arg("instance")
-                .map(parse_i32)
-                .transpose()?
-                .unwrap_or(NAN_ID as i32)
-                .clamp(0, 255) as u8;
-            let payload_bytes = encode_command_payload(data);
-            let queued = enqueue_outgoing_raw(dst, instance, &payload_bytes, false)?;
-            return Ok(CommandResponse::ok(format!(
-                "nan queued backend=raw len={} queue={}",
-                payload_bytes.len().min(255),
-                queued
-            )));
+            let _ = data;
+            return Err(anyhow!("nan queue requires a binary transport payload"));
         }
         if let Some(data) = request.arg("send") {
-            self.ensure_raw_started()?;
-            let dst = parse_mac(request.arg("dst").unwrap_or("ff:ff:ff:ff:ff:ff"))?;
-            let instance = request
-                .arg("instance")
-                .map(parse_i32)
-                .transpose()?
-                .unwrap_or(NAN_ID as i32)
-                .clamp(0, 255) as u8;
-            let payload_bytes = encode_command_payload(data);
-            let frame = nan_followup_frame(&dst, instance, &payload_bytes)?;
-            raw_tx(&frame, true)?;
-            return Ok(CommandResponse::ok(format!(
-                "nan followup sent backend={} bytes={}",
-                self.backend.name(),
-                payload_bytes.len().min(255)
-            )));
+            let _ = data;
+            return Err(anyhow!("nan send requires a binary transport payload"));
         }
         Ok(CommandResponse::ok(stats()))
     }
@@ -913,20 +925,15 @@ fn command_targets_this_device_cbor(request: &CommandRequest) -> bool {
     matched
 }
 
-fn encode_command_payload(data: &str) -> Vec<u8> {
-    match crate::commands::protocol::parse_text(data) {
-        Ok(request) => crate::commands::protocol::encode_binary(&request),
-        Err(_) => data.as_bytes().to_vec(),
-    }
-}
-
 fn enqueue_outgoing_raw(
     dst: [u8; 6],
     instance: u8,
     payload: &[u8],
     response: bool,
 ) -> Result<usize> {
-    let len = payload.len().min(255);
+    if payload.len() > NAN_COMMAND_MAX_LEN {
+        bail!("raw NAN payload exceeds {NAN_COMMAND_MAX_LEN} bytes");
+    }
     let Ok(mut queue) = nan_outgoing_queue().lock() else {
         bail!("nan outgoing queue lock failed")
     };
@@ -936,7 +943,7 @@ fn enqueue_outgoing_raw(
     queue.push_back(RawNanOutgoing {
         dst,
         instance,
-        payload: payload[..len].to_vec(),
+        payload: payload.to_vec(),
         response,
     });
     Ok(queue.len())
@@ -1060,36 +1067,12 @@ fn station_mac() -> Result<[u8; 6]> {
     Ok(mac)
 }
 
-fn command_targets_this_device(text: &str) -> bool {
-    let Some(to) = command_token_value(text, "to") else {
-        return true;
-    };
-    if is_broadcast_target(to) {
-        return true;
-    }
-    let Ok(mac) = station_mac() else {
-        return false;
-    };
-    to.eq_ignore_ascii_case(&mac_suffix4_hex(&mac))
-}
-
 fn is_broadcast_target(value: &str) -> bool {
     let value = value.strip_prefix("0x").unwrap_or(value);
     value.eq_ignore_ascii_case("ffffffff")
         || value.eq_ignore_ascii_case("ff:ff:ff:ff")
         || value.eq_ignore_ascii_case("broadcast")
         || value.eq_ignore_ascii_case("all")
-}
-
-fn command_token_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    text.split_ascii_whitespace().find_map(|token| {
-        let (name, value) = token.split_once('=')?;
-        if name == key && !value.is_empty() {
-            Some(value)
-        } else {
-            None
-        }
-    })
 }
 
 fn mac_suffix4_hex(mac: &[u8; 6]) -> String {
@@ -1201,28 +1184,16 @@ pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
                         info.instance,
                         info.payload.len()
                     ));
-                    let is_resp =
-                        if let Ok(req) = crate::commands::protocol::decode_binary(info.payload) {
-                            let is_r = req.args.contains_key(&4) || req.args.contains_key(&5);
-                            telemetry::record_log(format!(
-                                "event type=nan.raw_followup_rx.cbor_decode ok=true is_resp={}",
-                                is_r
-                            ));
-                            is_r
-                        } else {
-                            let is_r = info.payload.starts_with(b"resp ")
-                                || info.payload.starts_with(b"notify ")
-                                || info.payload.starts_with(b"dmesh.pong ")
-                                || info
-                                    .payload
-                                    .windows(b"reply=true".len())
-                                    .any(|part| part == b"reply=true");
-                            telemetry::record_log(format!(
-                                "event type=nan.raw_followup_rx.cbor_decode ok=false is_resp={}",
-                                is_r
-                            ));
-                            is_r
-                        };
+                    let decoded = crate::commands::protocol::decode_binary(info.payload);
+                    let is_resp = decoded
+                        .as_ref()
+                        .map(|req| req.args.contains_key(&4) || req.args.contains_key(&5))
+                        .unwrap_or(false);
+                    telemetry::record_log(format!(
+                        "event type=nan.raw_followup_rx.cbor_decode ok={} is_resp={}",
+                        decoded.is_ok(),
+                        is_resp
+                    ));
                     if !station_mac().map(|mac| mac == info.source).unwrap_or(false) && is_resp {
                         telemetry::record_log(format!(
                             "event type=nan.raw_response_rx source={}",
