@@ -1,7 +1,7 @@
 # ssh-mesh API
 
 `ssh-mesh` owns the HTTP-facing API surface for the workspace. Components such as
-`mesh-init`, `lmesh`, and `traceweb` expose local JSONL/JSON-RPC over activated Unix
+`mesh-init` and `traceweb` expose local JSONL/JSON-RPC over activated Unix
 sockets; ssh-mesh maps selected HTTP routes to those sockets.
 
 ## JSONL Proxying

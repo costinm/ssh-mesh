@@ -671,45 +671,6 @@ MeshGID = 1000
     }
 
     #[test]
-    fn test_parse_lmesh_radio_examples() {
-        let build = parse_service(
-            include_str!("../examples/lmesh-radio-build.toml"),
-            Some("lmesh-radio-build"),
-        )
-        .unwrap();
-        assert_eq!(build.name, "lmesh-radio-build");
-        assert_eq!(build.user.as_deref(), Some("build"));
-        assert!(!build.supplementary_groups.is_empty());
-        assert_eq!(
-            build.env.get("LMESH_CONTROL_SOCKET").unwrap(),
-            "/run/mesh/lmesh-radio-build/mesh.sock"
-        );
-        assert_eq!(
-            build.ambient_capabilities,
-            vec!["CAP_NET_ADMIN", "CAP_NET_RAW"]
-        );
-
-        let wpa = parse_service(
-            include_str!("../examples/wpa-supplicant-nan.toml"),
-            Some("wpa-supplicant-nan"),
-        )
-        .unwrap();
-        assert_eq!(wpa.name, "wpa-supplicant-nan");
-        assert!(wpa.command.ends_with("wpa_supplicant"));
-        assert_eq!(wpa.user.as_deref(), Some("build"));
-        assert_eq!(wpa.group.as_deref(), Some("plugdev"));
-        assert!(wpa.args.contains(&"-g".to_string()));
-        assert!(
-            wpa.args
-                .contains(&"/run/mesh/wpa-supplicant/global".to_string())
-        );
-        assert_eq!(
-            wpa.ambient_capabilities,
-            vec!["CAP_NET_ADMIN", "CAP_NET_RAW"]
-        );
-    }
-
-    #[test]
     fn test_parse_toml_with_peer() {
         let toml = r#"
 [Service]

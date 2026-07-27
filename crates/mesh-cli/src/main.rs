@@ -163,7 +163,6 @@ fn service_address(service: &str) -> Result<Option<String>> {
     if std::env::var_os("MESH_SERVICE_DIR").is_none() {
         let default = match service {
             "mesh-init" => "/run/mesh/mesh-init/mesh.sock",
-            "lmesh" => "/run/mesh/lmesh/mesh.sock",
             _ => return Ok(None),
         };
         return Ok(Some(format!("unix://{default}")));
@@ -217,20 +216,6 @@ fn tools_path(destination: &str) -> Result<Option<PathBuf>> {
                 config_path.parent().unwrap_or(Path::new(".")).join(path)
             }
         }));
-    }
-    if destination
-        .split_once('.')
-        .is_some_and(|(_, namespace)| namespace == "lmesh")
-    {
-        for path in [
-            PathBuf::from("/home/lmesh/etc/resources/firmware-tools.json"),
-            PathBuf::from("/opt/lmesh/resources/firmware-tools.json"),
-            PathBuf::from("crates/lmesh/resources/firmware-tools.json"),
-        ] {
-            if path.is_file() {
-                return Ok(Some(path));
-            }
-        }
     }
     Ok(None)
 }
@@ -486,44 +471,6 @@ async fn connect_rpc(destination: &str) -> Result<Box<dyn AsyncReadWrite>> {
     unreachable!()
 }
 
-async fn radio_text_command(destination: &str, arguments: &[String]) -> Result<()> {
-    let mut stream = connect_rpc(destination).await?;
-    stream.write_all(arguments.join(" ").as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
-
-    // Keep the write half open until lmesh has consumed the record and queued
-    // its response. Serial forwards are streams, not request/response RPCs.
-    let method = arguments.first().context("missing radio command")?;
-    let expected_local = match method.as_str() {
-        "dtr" => Some("event type=lmesh.dtr"),
-        "rst" => Some("event type=lmesh.rst"),
-        _ => None,
-    };
-    let mut reader = BufReader::new(stream);
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
-            anyhow::ensure!(!line.is_empty(), "empty radio response");
-            print!("{line}");
-            let line = line.trim_start();
-            let line = line.strip_prefix("dm-rs> ").unwrap_or(line);
-            if expected_local.is_some_and(|expected| line.starts_with(expected))
-                || line == method
-                || line.starts_with(&format!("{method} "))
-                || line.starts_with("event type=lmesh.command ok=false")
-                || line.starts_with("error ")
-            {
-                return Ok::<_, anyhow::Error>(());
-            }
-        }
-    })
-    .await
-    .context("timed out waiting for radio response")??;
-    Ok(())
-}
-
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -635,12 +582,12 @@ mod tests {
         let arguments = vec![
             "mesh-init".to_owned(),
             "stop".to_owned(),
-            "name=lmesh".to_owned(),
+            "name=traceweb".to_owned(),
         ];
         let record = record(&arguments, None).unwrap();
         assert_eq!(
             json_request(&record, None),
-            json!({"method": "mesh-init.stop", "name": "lmesh"})
+            json!({"method": "mesh-init.stop", "name": "traceweb"})
         );
     }
 }
@@ -648,10 +595,6 @@ mod tests {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
-    let radio_destination = cli
-        .destination
-        .split_once('.')
-        .is_some_and(|(_, namespace)| namespace == "lmesh");
     if !is_rpc_endpoint(&cli.destination)
         && cli.arguments.first().map(String::as_str) == Some("help")
     {
@@ -662,7 +605,7 @@ async fn main() -> Result<()> {
         && let Some(address) = service_address(&cli.destination)?
     {
         let component = cli.destination.clone();
-        if !radio_destination && !cli.arguments.is_empty() {
+        if !cli.arguments.is_empty() {
             let mut arguments = vec![component];
             arguments.extend(std::mem::take(&mut cli.arguments));
             cli.arguments = arguments;
@@ -670,9 +613,6 @@ async fn main() -> Result<()> {
         cli.destination = address;
     }
     if is_rpc_endpoint(&cli.destination) {
-        if radio_destination && !cli.arguments.is_empty() {
-            return radio_text_command(&cli.destination, &cli.arguments).await;
-        }
         return rpc_destination(&cli).await;
     }
     if let Some(path) = cli.destination.strip_prefix("mux://") {

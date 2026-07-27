@@ -22,7 +22,6 @@ The project consists of several Rust crates:
 - **[ssh-mesh](file:///ws/rust/ssh-mesh/crates/ssh-mesh)**: Core SSH/HTTP server/client and ControlMaster multiplexer.
 - **[mesh-init](file:///ws/rust/ssh-mesh/crates/mesh-init)**: Minimal system init/supervisor daemon and root process observer.
 - **[mesh](file:///ws/rust/ssh-mesh/crates/mesh)**: Common mesh library (Axum server, JSON protocol, UDS helpers).
-- **[lmesh](file:///ws/rust/ssh-mesh/crates/lmesh)**: Lightweight mesh networking utilities.
 - **[ws](file:///ws/rust/ssh-mesh/crates/ws)**: WebSocket bridging and client management.
 - **[sftp](file:///ws/rust/ssh-mesh/crates/sftp)**: SFTP virtual file-system handler.
 - **[ssh-config](file:///ws/rust/ssh-mesh/crates/ssh-config)**: SSH client configuration file parser.

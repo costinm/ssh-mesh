@@ -9,7 +9,6 @@ Required binaries:
 - `mesh-init`
 - `ssh-mesh`
 - `h2t`
-- `lmesh`
 - `meshkeys` to regenerate checked-in example keys and certificates
 - `bwrap`
 - `qemu-system-x86_64`, `crosvm`, and `cloud-hypervisor` for VM examples

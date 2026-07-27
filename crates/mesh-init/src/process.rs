@@ -1569,8 +1569,8 @@ mod tests {
     #[test]
     fn service_runtime_dir_uses_service_name_under_run_mesh() {
         assert_eq!(
-            service_runtime_dir("lmesh-radio-build"),
-            PathBuf::from("/run/mesh/lmesh-radio-build")
+            service_runtime_dir("example-service"),
+            PathBuf::from("/run/mesh/example-service")
         );
     }
 

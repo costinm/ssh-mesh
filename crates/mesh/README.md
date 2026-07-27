@@ -80,9 +80,8 @@ network, environment, and resource fields remain in place for now; a future
 `[Workload]` section is reserved for making provider runtime policy explicit.
 
 ```sh
-mesh lmesh tools
-mesh lmesh tool nodes
-mesh lmesh tool announce --params '{"metadata":{"role":"dev"}}'
+mesh example tools
+mesh example tool status
 ```
 
 `API.md` remains the source of truth and may mark methods public or private;

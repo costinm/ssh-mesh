@@ -114,7 +114,6 @@ need curl
 need nc
 need mesh-init
 need ssh-mesh
-need lmesh
 need h2t
 
 vrun="${example_bin_dir}/vrun"
@@ -205,10 +204,4 @@ wait_for "host2 mesh-init observer HTTP proxy" 60 http_post_ok \
 wait_for "host1 mesh-init observer HTTP proxy" 60 http_post_ok \
   "http://127.0.0.1:18480/_m/proxy/jsonl/mesh-init" \
   '{"method":"processes"}'
-if ! wait_for "host2 lmesh UDS" 10 uds_jsonl_ok \
-  "${state_root}/host2/home/system/run/lmesh/control.sock" \
-  '{"jsonrpc":"2.0","method":"nodes","id":1}'; then
-  echo "warn: host2 lmesh UDS unavailable; multicast can be disabled in restricted namespaces"
-fi
-
 echo "example suite smoke test passed"

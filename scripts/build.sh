@@ -13,10 +13,10 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
 export DEST=${DEST:-/opt/ssh-mesh}
 
-CRATES="mesh-init ssh-mesh mesh mesh-cli mesh9p traceweb sftp-server lmesh ssh-config"
-BIN_TARGETS="h2t meshkeys mesh-init ssh-mesh mesh mesh9p traceweb sftp-server lmesh ssh-config"
-INSTALL_BIN_TARGETS="$BIN_TARGETS dmesh"
-EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh lmesh mesh9p sftp-server h2t meshkeys"
+CRATES="mesh-init ssh-mesh mesh mesh-cli mesh9p traceweb sftp-server ssh-config"
+BIN_TARGETS="h2t meshkeys mesh-init ssh-mesh mesh mesh9p traceweb sftp-server ssh-config"
+INSTALL_BIN_TARGETS="$BIN_TARGETS"
+EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh mesh9p sftp-server h2t meshkeys"
 
 help() {
     cat <<'EOF'
@@ -50,7 +50,6 @@ Common commands:
   dist [path]          Build release binaries into an install-like tree.
   erofs [out ...]      Build the VM EROFS rootfs image.
   install [path]       Install runtime binaries and scripts. Default: /opt/ssh-mesh.
-  dmesh_java [path]    Build dmesh plus the Java/JNI artifacts.
   build [profile]      Full local build: Rust, examples, EROFS, profile.
 
 Environment:
@@ -328,7 +327,7 @@ stage_example_tree() {
 rust() {
     ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
     echo "Building release binaries with musl..."
-    cargo build --target x86_64-unknown-linux-musl --release --workspace --exclude dmesh
+    cargo build --target x86_64-unknown-linux-musl --release --workspace
 }
 
 deploy_examples() {
@@ -350,7 +349,7 @@ setup() {
 }
 debug() {
     ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
-    cargo build --target x86_64-unknown-linux-musl --workspace --exclude dmesh
+    cargo build --target x86_64-unknown-linux-musl --workspace
 
     #_all x86_64-unknown-linux-musl 
 }
@@ -434,87 +433,13 @@ install() {
     echo "Install completed at $dest"
 }
 
-# Build JNI shared library + Java JAR.
-# Layout: $dest/bin/dmesh.jar  $dest/lib/<arch>/libdmesh.so
-# The .so must use a GNU target because musl does not support cdylib.
-jni() {
-    local dest="${1:-target/opt/ssh-mesh}"
-    mkdir -p "$dest/bin" "$dest/lib"
-
-    # Determine host architecture (Android convention names)
-    local host_arch
-    case "$(uname -m)" in
-        x86_64)  host_arch="x86_64" ;;
-        aarch64) host_arch="arm64-v8a" ;;
-        armv7*)  host_arch="armeabi-v7a" ;;
-        i?86)    host_arch="x86" ;;
-        *)       host_arch="$(uname -m)" ;;
-    esac
-
-    # Build the JNI .so with GNU target (musl drops cdylib)
-    local gnu_target
-    case "$(uname -m)" in
-        x86_64)  gnu_target="x86_64-unknown-linux-gnu" ;;
-        aarch64) gnu_target="aarch64-unknown-linux-gnu" ;;
-        *)       gnu_target="$(uname -m)-unknown-linux-gnu" ;;
-    esac
-
-    echo "Building JNI native library for $gnu_target..."
-    cargo build -p dmesh --target "$gnu_target" --release \
-        --no-default-features --features jni-wrapper
-
-    local so_path="target/$gnu_target/release/libdmesh.so"
-    if [ ! -f "$so_path" ]; then
-        echo "Error: $so_path not found after build"
-        return 1
-    fi
-
-    mkdir -p "$dest/lib/$host_arch"
-    cp "$so_path" "$dest/lib/$host_arch/"
-    echo "  -> $dest/lib/$host_arch/libdmesh.so"
-
-    # Compile Java classes
-    echo "Compiling Java classes..."
-    local classes_dir="target/java/classes"
-    rm -rf "$classes_dir"
-    mkdir -p "$classes_dir"
-    javac -d "$classes_dir" $(find java/rust/src/main/java -name "*.java")
-
-    # Create JAR with Main-Class manifest
-    echo "Creating dmesh.jar..."
-    mkdir -p target/java
-    echo "Main-Class: com.github.costinm.dmeshnative.Main" > target/java/MANIFEST.MF
-    jar cfm "$dest/bin/dmesh.jar" target/java/MANIFEST.MF -C "$classes_dir" .
-    echo "  -> $dest/bin/dmesh.jar"
-}
-
-dmesh_java() {
-    local dest="${1:-target/opt/ssh-mesh}"
-    local release_dir="target/x86_64-unknown-linux-musl/release"
-
-    mkdir -p "$dest/bin"
-
-    ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
-
-    echo "Building dmesh release binary with musl..."
-    cargo build -p dmesh --target x86_64-unknown-linux-musl --release
-
-    if [ -f "$release_dir/dmesh" ]; then
-        cp -f "$release_dir/dmesh" "$dest/bin/dmesh_rs"
-        chmod +x "$dest/bin/dmesh_rs"
-        echo "  -> $dest/bin/dmesh_rs"
-    fi
-
-    jni "$dest"
-}
-
 # Build aarch64 release binaries into a separate dist directory.
 arm_release() {
     local dest="${1:-target/dist-aarch64}"
     mkdir -p "$dest/bin" "$dest/lib/arm64-v8a"
 
     echo "Building aarch64 release (musl) for runtime crates..."
-    cargo build --target aarch64-unknown-linux-musl --release --workspace --exclude dmesh
+    cargo build --target aarch64-unknown-linux-musl --release --workspace
 
     echo "Copying aarch64 binaries..."
     for bin in $BIN_TARGETS; do
@@ -677,7 +602,7 @@ main() {
         -h|--help|help)
             help
             ;;
-        default|rust|deps|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|jni|dmesh_java|arm_release|erofs|vm|profile|build)
+        default|rust|deps|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|arm_release|erofs|vm|profile|build)
             "$cmd" "$@"
             ;;
         test)
