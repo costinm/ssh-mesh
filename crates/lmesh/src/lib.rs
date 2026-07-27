@@ -651,6 +651,13 @@ pub enum Request {
         active: Option<bool>,
         #[serde(default)]
         active_ms: Option<u32>,
+        /// Powered serial gateway that queues an addressed raw-NAN command.
+        /// When absent, operate on the directly attached adapter/port.
+        #[serde(default)]
+        gateway: Option<String>,
+        /// Destination Wi-Fi MAC or four-byte suffix for gateway delivery.
+        #[serde(default)]
+        target: Option<String>,
     },
     /// Return LoRa status from an ESP firmware adapter.
     #[serde(rename = "esp.lora.status")]
@@ -1185,8 +1192,11 @@ impl LmeshService {
                 port,
                 active,
                 active_ms,
+                gateway,
+                target,
             } => mesh::protocol::Response::ok_with_data(
-                self.radio.esp_active(adapter, port, active, active_ms),
+                self.radio
+                    .esp_active(adapter, port, active, active_ms, gateway, target),
             ),
             Request::EspLoraStatus { adapter, port } => {
                 mesh::protocol::Response::ok_with_data(self.radio.esp_lora_status(adapter, port))

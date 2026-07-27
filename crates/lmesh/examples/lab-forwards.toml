@@ -15,8 +15,10 @@ path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_
 baud = 460800
 tcp_port = 3330
 tcp_mode = "rfc2217"
-# GPIO0/PRG is the deterministic console wake before the first UART bytes.
-dtr = true
+# lora1 is the powered raw-NAN gateway. It is activated after reset with the
+# binary `active` command, not an automatic CP210x edge on every UDS client.
+# Use the local `dtr [ms]` diagnostic only when debugging the board wiring.
+dtr = false
 multi = true
 
 [[serial_forwards]]
@@ -44,3 +46,6 @@ baud = 115200
 dtr = false
 multi = false
 log = false
+# The meter is not firmware UART: pass its newline-delimited samples through
+# unchanged to the E2E power collector.
+raw = true

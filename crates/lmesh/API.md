@@ -6,17 +6,19 @@ the activated listener fd. When started standalone without activation, it binds
 `./lmesh/mesh.sock` by default.
 
 Use the generic `mesh` client for normal device commands, for example
-`mesh lora1.lmesh status`. The local endpoint resolves to the UDS forward
-`/run/mesh/lmesh/lora1.sock`; RFC2217 TCP is a parallel flashing/remote-serial
-transport. FQDN-shaped endpoints may instead resolve to a remote host,
+`mesh lmesh esp.serial.command port=lora1 command=status`. The local endpoint
+resolves to the UDS forward `/run/mesh/lmesh/lora1.sock`; the optional RFC2217
+TCP listener is diagnostic/remote-serial transport only and is never a
+flashing path. FQDN-shaped endpoints may instead resolve to a remote host,
 container, VM, SSH forward, or sandbox, so callers must not assume local
 `/dev` or `/run` paths are visible.
 
 Serial forwards also reserve two newline commands locally in lmesh:
-`mesh lora1.lmesh dtr [milliseconds]` explicitly pulses a board-specific
-PRG/DTR line for 120 ms by default (1-10000 ms), while `mesh lora1.lmesh rst`
-pulses reset and returns the board to run mode. Normal console wake uses UART
-RX, so neither command is required for ordinary traffic. Bare
+`mesh lora1.lmesh dtr [milliseconds]` and `mesh lora1.lmesh rst` are local
+CP210x diagnostics, not normal firmware commands. The normal path is binary
+CBOR over lmesh; use `esp.active` through a powered gateway to wake a sleepy
+node over raw-NAN. A physical GPIO0/PRG press remains the last-resort local
+recovery path and opens a two-second console/active window. Bare
 `mesh lora1.lmesh` opens the bidirectional debug stream.
 
 The complete low-level ESP command ABI is kept alongside this product API in
@@ -56,8 +58,8 @@ streaming generation, so a gateway need not pre-serialize payload just to learn 
 encoded length. LoRa, NAN, BLE, raw Wi-Fi, and
 UDP use the CBOR bytes directly because their outer transport carries length.
 Large host records are segmented using the common segment fields. ESP adapters
-forward those records unchanged, reject locally addressed commands above 512
-bytes, and paginate or emit multiple complete response records instead.
+forward records up to the firmware's 4,000-byte UART record limit and paginate
+or emit multiple complete response records for larger results.
 
 Flat request:
 
@@ -130,11 +132,13 @@ in one append-only logfmt file. Records contain `ts_ms`, `board`,
 target/lmesh-radio-build/log/serial.log` finds firmware failures while the
 interleaved host timestamps correlate commands, DW activity, and board output.
 `usb.serial.forward.list` reports the configured path plus `log_records` and
-`log_write_errors`. RFC2217 flashing is excluded automatically, including a
-60-second bootloader-reset grace period; `log_suppressed_records` and
-`log_suppressed_bytes` report that excluded traffic.
+`log_write_errors`. Direct USB flashing releases the managed forward first, so
+flash traffic never enters this log; `log_suppressed_records` and
+`log_suppressed_bytes` report other intentionally excluded traffic.
 Set `log = false` on a `serial_forwards` entry to exclude a noisy source such
 as a power meter while keeping its UDS/TCP forward active.
+Set `raw = true` only for a non-firmware serial source such as a power meter;
+it forwards bytes verbatim instead of decoding the ESP UART PPP/CBOR codec.
 
 Known adapter kinds are `host-mcast`, `host-ble`, `host-nan`, `esp-serial`,
 `remote-uds`, `android-ble`, and `android-nan`. A `remote-uds` adapter is an
@@ -146,8 +150,8 @@ resolved by role name. Set `port = "lora1"` (or `power1`, `s3-1`, etc.) and
 provide a stable `/dev/serial/by-id/...` `path`; numeric USB/ACM names remain
 only a compatibility fallback. The runtime sockets are under
 `/run/mesh/lmesh/<role>.sock`.
-visible through `usb.serial.forward.list`; use stable RFC2217 TCP ports for
-flashing and console access through forwarded or remote hosts.
+visible through `usb.serial.forward.list`; use their UDS sockets for console
+and test access. Direct physical USB-UART is required for flashing.
 For the local lab service, copy `crates/lmesh/examples/lab-forwards.toml` to
 `/home/system/etc/lmesh/lmesh.toml` (or the checked local target copy); the
 mesh-init example uses the standard path instead of a per-process environment
@@ -193,8 +197,8 @@ not become the product contract when an equivalent high-level method exists.
 | `messages.history` | `keys: string = "messages,net,wifi,BLE,N"`, `limit: integer = 40` | Returns recent radio method results recorded by this process. |
 | `usb.serial.list` | `handshake: bool = false` | Lists visible `/dev/ttyUSB*`, `/dev/ttyACM*`, and `/dev/serial/by-id/*` serial devices, including configured lmesh radio adapters and active forwards. With `handshake=true`, probes each device with the DMesh profile. |
 | `usb.serial.handshake` | `port: string = "USB0"`, `profile: string = "generic"`, `timeout_sec: number = 1.5` | Runs a one-shot handshake without holding the device open. `port` is a logical token such as `USB0`, `USB1`, or `ACM0`; lmesh derives `/dev/ttyUSB0`, `/dev/ttyUSB1`, or `/dev/ttyACM0`. `profile=generic` sends `help`; `profile=dmesh`/`esp` sends firmware status probes; `profile=cmd:<text>` sends a custom command. Returns raw text and parsed mesh messages. |
-| `usb.serial.reset` | `port: string = "USB0"`, `mode: "run"\|"bootloader" = "run"` | Pulses ESP USB serial modem lines into running firmware or ROM download mode. If a lmesh forward is active, the reset is queued on that forward's owned serial FD and the TCP/UDS listeners stay up. Flash scripts should use `mode=bootloader`, run esptool with `--before no_reset --after no_reset`, then call `mode=run`. |
-| `usb.serial.forward.start` / `usb.serial.connect` | `port: string = "USB0"`, `baud: integer = 460800`, `tcp_port: integer \| null`, `tcp_mode: "auto"\|"framed"\|"rfc2217" = "auto"`, `handshake: bool = false`, `dtr: bool = false`, `multi: bool = false` | Starts a generic UDS forward for a USB serial device. lmesh derives the device path and socket from `port`, e.g. `USB0` -> `/dev/ttyUSB0` and `/run/mesh/lmesh/USB0.sock`; configured role names use their stable `/dev/serial/by-id` path and `/run/mesh/lmesh/<role>.sock`. The socket is `0770` and group `dialout`. With `tcp_port`, lmesh also exposes the same forward on `127.0.0.1:<tcp_port>`. Use `tcp_mode=rfc2217` with `rfc2217://127.0.0.1:<tcp_port>` for flasher tools that need baud/control-line changes; use `tcp_mode=framed` for plain `socket://` text or future CBOR/length-framed binary. Serial output is broadcast to all connected UDS and TCP clients with bounded backpressure queues. DMesh lab forwards set `dtr=true`: lmesh pulses GPIO0/PRG on each new UDS or framed-TCP console client, waits for the firmware button task to restore the 20-second console window, then forwards command bytes. This is the deterministic normal wake path for a battery-powered board; UART RX wake remains a fallback and may consume its initial bytes. `dtr=false` is appropriate only for hardware without a safe PRG modem-control wire. Newline records `dtr [milliseconds]` (default 120 ms, maximum 10000 ms) and `rst` are handled locally by lmesh and are not sent to firmware. RFC2217 clients never receive the console pulse or wake bytes, so esptool owns reset timing. By default, only the first connected client can send input; `multi=true` allows every client to send. Framed input sends newline-terminated text or binary records beginning with `0x00` plus a 3-byte big-endian length. RFC2217 mode interprets Telnet/RFC2217 controls and forwards escaped binary data. |
+| `usb.serial.reset` | `port: string = "USB0"`, `mode: "run"\|"bootloader" = "run"` | Pulses ESP USB serial modem lines into running firmware or ROM download mode. If a lmesh forward is active, reset is queued on that forward's owned serial FD. Release the forward and use direct USB-UART sparse flashing; restore the forward after flash. |
+| `usb.serial.forward.start` / `usb.serial.connect` | `port: string = "USB0"`, `baud: integer = 460800`, `tcp_port: integer \| null`, `tcp_mode: "auto"\|"framed"\|"rfc2217" = "auto"`, `handshake: bool = false`, `multi: bool = false` | Starts a generic UDS forward for a USB serial device. lmesh derives the device path and socket from `port`, e.g. `USB0` -> `/dev/ttyUSB0` and `/run/mesh/lmesh/USB0.sock`; configured role names use their stable `/dev/serial/by-id` path and `/run/mesh/lmesh/<role>.sock`. The socket is `0770` and group `dialout`. With `tcp_port`, lmesh also exposes the same forward on `127.0.0.1:<tcp_port>` for diagnostics or remote serial access, never firmware flashing. Connections are passive: they do not pulse DTR or send a wake probe. Serial output is broadcast to all connected UDS and TCP clients with bounded backpressure queues. Newline records `dtr [milliseconds]` (default 120 ms, maximum 10000 ms) and `rst` are explicit local lmesh controls and are not sent to firmware. By default, only the first connected client can send input; `multi=true` allows every client to send. UDS clients use the mesh stream envelope; lmesh translates it to the physical UART `0x7e | escaped-CBOR | 0x7e` codec. RFC2217 mode interprets Telnet/RFC2217 controls and forwards escaped binary data. |
 | `usb.serial.forward.stop` / `usb.serial.disconnect` | `port: string = "USB0"` | Stops a managed serial forward and removes its socket. |
 | `usb.serial.forward.list` | none | Lists active managed serial forwards. Each forward includes live atomic `stats`: client accepts/drops, bytes in each direction, UART/client `WouldBlock` counts, queue high-water marks, and poll ready/timeout counts. Use it during an RFC2217 transfer to identify whether the UART, TCP client, or bounded queues are limiting progress. |
 | `wifi.raw.listen` | `iface: string = LMESH_WIFI_IFACE`, `ctrl_dir: string = LMESH_WPA_CTRL_DIR`, `channel: integer = 6`, `listen_sec: integer = 60`, `rx_variant: string = "nl80211"` | Listens for the custom raw vendor-action bulk transport during NAN-synchronized active windows. |
@@ -213,14 +217,15 @@ not become the product contract when an equivalent high-level method exists.
 | `wifi.sta.status` | `iface: string = LMESH_WIFI_IFACE` | Dumps station-mode AP peer metrics through nl80211 and reports `associated=true` when the interface has a current AP peer. Peer observations feed `links.list` as `radio=sta`. |
 | `ble.scan` | `dev_id: integer = 0`, `reason: string = "jsonl"`, `scan_ms: integer = 1500` | Runs a bounded passive LE scan through raw Linux HCI sockets, parses DMesh 16-bit and operational 128-bit service-data announcements, records `BLE.rx` events, and returns `reports` plus parsed `dmesh` entries with `mode`, `event`, RSSI, address, and duplicate status. Requires `CAP_NET_RAW`. |
 | `ble.adv` | `dev_id: integer = 0`, `on: bool = true`, `payload: string = "lmesh"` | Enables or disables BLE advertising with DMesh service UUID `0xFD5D` and current DMesh service-data layout. Requires `CAP_NET_RAW`. |
-| `esp.serial.command` | `adapter: string \| null`, `port: string \| null`, `command: string`, `timeout_sec: number = 1.5` | Debug/test method: sends one direct firmware text command to an ESP adapter and returns normalized `MeshMessage` records. Prefer high-level methods for product flows. |
-| `esp.active` | `adapter: string \| null`, `port: string \| null`, `active: bool = true`, `active_ms: integer \| null` | Put an ESP into runtime-only powered/transfer radio mode. `active=true` keeps raw-NAN Wi-Fi, NAN beacon reception, raw action reception, and configured LoRa RX active until `active=false`. `active_ms` requests a bounded 1,000..300,000 ms session that automatically returns to the configured raw-NAN duty cycle. |
+| `esp.serial.command` | `adapter: string \| null`, `port: string \| null`, `command: string`, `timeout_sec: number = 1.5` | Debug/test method: accepts a local text command, translates it to framed CBOR, and returns normalized binary firmware records. Prefer high-level methods for product flows. |
+| `esp.active` | `adapter: string \| null`, `port: string \| null`, `gateway: string \| null`, `target: mac-or-last4 \| null`, `active: bool = true`, `active_ms: integer \| null` | Put an ESP into runtime-only powered/transfer radio mode. Direct `active=true` (`active`) stays on until `active=false` (`idle`) or reset; `active_ms` requests a bounded 1,000..300,000 ms session. Each `active` also enables the target's normal bounded UART debug/modem window, while the radio override remains active until `idle` or reset. With `gateway=lora1` and `target=<last4-or-MAC>`, lmesh sends addressed compact-CBOR `active`/`idle` via lora1's raw-NAN queue; this is the normal sleepy-node control path. Gateway delivery does not support `active_ms` yet. |
 | `esp.status` | `adapter: string \| null`, `port: string \| null`, `extended: bool = false` | Diagnostic wrapper for firmware `status` or `xstatus`. `status` is the compact golden-signal line; `xstatus` is verbose debug telemetry. |
 | `esp.power.profile` | `adapter: string \| null`, `port: string \| null`, `profile: "dfs"\|"perf"\|"low"\|"auto"\|null`, `save: bool = false` | Diagnostic wrapper for `power status=true` or `power profile=...`. The intended saved infra profile is `auto`. |
 | `esp.lora.status` | `adapter: string \| null`, `port: string \| null` | Diagnostic wrapper for `lora status=true` on an ESP adapter. Product status should flow into `radios.list`, `links.list`, and `messages.history`. |
 | `esp.wifi.raw_status` | `adapter: string \| null`, `port: string \| null` | Diagnostic wrapper for raw Wi-Fi counters on an ESP adapter. |
 | `esp.sleep.status` | `adapter: string \| null`, `port: string \| null` | Diagnostic wrapper for ESP power/sleep state. |
 | `esp.telemetry.stats` | `adapter: string \| null`, `port: string \| null`, `reset: bool = false` | Diagnostic wrapper for ESP telemetry counters. |
+| `esp.serial.command` AP sync settings | Use `nvs op=set nan.sync_source=auto|nan_only|ap_only`, `nan.ap_owner=true|false`, and optional `nan.ap_loss_ms`, `nan.ap_recovery_ms`, `nan.ap_recovery_listen_ms`, `nan.ap_slot_tu`, `nan.ap_beacon_tu`; inspect source selection with `mode status=true` and `nan stats=true`. Firmware rationale and the AP-sync E2E scenario are in [`fw/esp32/rust/docs/wifi.md`](../../fw/esp32/rust/docs/wifi.md). |
 | `esp.stability.start` | `source: string = "lora1"`, `expected: comma-list \| null`, `interval_sec: integer = 120`, `wait_sec: integer = 12`, `cycles: integer \| null`, `host_nan: bool = false` | Starts a background discovery/ping runner through the already-managed powered `source` UDS forward. Each cycle sends `mode ping=true` on the source LoRa, raw action, and raw-NAN paths. `host_nan=true` additionally enables the experimental direct host NAN/USD probe; it is not the normal sleepy-ESP control path because WPA does not expose a target Discovery Window scheduler. |
 | `esp.stability.status` | none | Returns the running state, configured source/targets, host-NAN setting, completed-cycle count, and the last cycle's source and host-NAN observations. |
 | `esp.stability.stop` | none | Requests a running stability loop stop; the current serial observation window ends before the worker exits. |

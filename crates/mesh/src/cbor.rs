@@ -15,7 +15,10 @@ use crate::tagged::{NameOrTag, TaggedRecord};
 pub const STREAM_TYPE: [u8; 4] = MESH_META_RPC.0;
 pub const STREAM_HEADER_LEN: usize = 8;
 pub const MAX_RECORD_LEN: usize = 64 * 1024;
-pub const ESP_RECORD_MAX: usize = 512;
+/// Firmware UART/BLE control records are deliberately bounded below 4 KiB.
+/// This matches `fw/esp32/rust` and leaves `0xff * 4000 || 0x0000` available
+/// as an unambiguous serial resynchronization marker.
+pub const ESP_RECORD_MAX: usize = 4_000;
 pub const METHOD: u16 = 0;
 pub const ID: u16 = 1;
 pub const FROM: u16 = 2;

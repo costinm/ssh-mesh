@@ -3,6 +3,13 @@
 This is the canonical low-level firmware ABI reference. `crates/lmesh/API.md`
 is the product API; lmesh adapts these commands over serial, BLE, and raw Wi-Fi.
 
+> This file retains low-level diagnostic commands and dated hardware findings.
+> The supported production control path is the compact-CBOR ABI, raw-NAN duty
+> cycle, and lmesh high-level methods. Treat explicit `official`, `raw_ap`,
+> `raw_sta`, plaintext `resp`/`notify`, and deep-sleep-loop examples below as
+> retained experiment history unless the current firmware command registry and
+> handoff explicitly say otherwise.
+
 > ESP firmware is raw-NAN only. ESP-IDF official NAN was removed from supported
 > firmware modes and tests because it cannot meet the sleep budget. Any later
 > mentions of official NAN in historical measurement notes are not supported API.
@@ -52,13 +59,12 @@ name for forward compatibility.
 | 64 | `i2cdump` |
 | 65 | `button` |
 | 66 | `nvs` |
+| 67 | `radio` |
 
-The ESP32 Rust firmware has a line-oriented text spelling for UART debugging,
-but the product path is lmesh/mesh-cli commands translated by `mesh` into
-compact CBOR for the firmware link. BLE GATT, raw/custom NAN, LoRa, and serial
-adapters should dispatch into the same command registry. Text remains useful
-for manual console work and temporary test scripts, not as the stable product
-protocol.
+The ESP32 Rust firmware is binary-only. lmesh/mesh-cli may accept a convenient
+text or JSON command at their local API boundary, but translate it to compact
+CBOR before it reaches UART. BLE GATT, raw/custom NAN, LoRa, and UART all
+dispatch the same CBOR bytes into the command registry.
 
 The firmware does not serve MCP JSONL or command help. The client-local
 `resources/firmware-tools.json` describes direct ESP modem commands, while
@@ -73,25 +79,24 @@ direct firmware controls unless there is no high-level method yet.
 
 ## Wire Shape
 
-Debug text sends one command per line:
+The lmesh UDS endpoint uses the common mesh stream envelope:
 
 ```text
-lora status=true
-nvs set uart.active_ms=20000 nan.wake_ms=4000
+u32-be body_length | 00 cb 00 00 | compact-CBOR payload
 ```
 
-UART responses are text records followed by the prompt:
+The physical UART link is separate and UART-only:
 
 ```text
-lora status=true chip=sx127x rx_running=true ...
-dm-rs>
+0x7e | escaped compact-CBOR payload | 0x7e
 ```
 
-Errors use:
-
-```text
-error message="..."
-```
+Escape `0x7e` and `0x7d` as `0x7d, byte ^ 0x20`; decoded payloads are limited
+to 4,000 bytes. UART carries no mesh metadata, length, FCS, raw boot marker,
+or text output. lmesh converts between the UDS envelope and this physical
+codec. A diagnostic is a CBOR notification with `status="event"` and its text
+stored as payload data; applications should treat it as structured event data,
+not console output.
 
 Parsing guidance:
 
@@ -103,7 +108,7 @@ Parsing guidance:
 - prefer counters/log events over exact full-line matching.
 
 Structured CBOR/JSON callers should avoid positional debug tokens. Use explicit
-fields instead, for example `method=nvs payload={op:set, uart.active_ms:20000}`
+fields instead, for example `method=nvs payload={op:set, uart.active_ms:2000}`
 or `method=nvs payload={op:get, key:uart.active_ms}`.
 
 ## Host Workflow
@@ -123,7 +128,8 @@ home, and the Xtensa Rust toolchain. Do not hand-edit `PATH`, `IDF_PATH`,
 `CARGO_HOME`, or `RUSTUP_HOME` in test scripts; source `env.sh` instead.
 
 Normal host/CI testing should access firmware through `crates/lmesh` USB
-forwarding. Direct `/dev/ttyUSB*` flashing is a local recovery path.
+forwarding. Flashing always uses the physical USB-UART path after the managed
+forward has been released; it is not an RFC2217 or lmesh transport.
 
 Local recovery flash for classic ESP32:
 
@@ -132,38 +138,37 @@ cargo espflash flash --release --port /dev/ttyUSBX \
   --chip esp32 --flash-size 4mb --non-interactive
 ```
 
-Flash the 16 MB ESP32-S3 test board:
+Flash an 8 MB ESP32-S3 board such as `lora4`:
 
 ```bash
 ESP_IDF_SDKCONFIG_DEFAULTS=sdkconfig.heltec_v3.defaults \
   cargo espflash flash --release --target xtensa-esp32s3-espidf \
-  --port /dev/ttyACMX --chip esp32s3 --flash-size 16mb --non-interactive
+  --port /dev/serial/by-id/<s3-bridge> --chip esp32s3 --flash-size 8mb --non-interactive
 ```
 
 The ESP32-S3 partition profile keeps the first 4 MB layout compatible with the
-classic ESP32 image and adds `dmesh_store` at `0x400000`. On 16 MB flash this
-reserves 12 MB for future logs, message payloads, and radio-store experiments.
+classic ESP32 image and adds `dmesh_store` at `0x400000`. Larger S3 flash parts
+may reserve remaining capacity for future logs, message payloads, and radio-store
+experiments; do not assume every lab S3 has 16 MB.
 
 Fleet flash helper:
 
 ```bash
 LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock \
-  python tools/flash_test_fleet.py --lmesh-mode=tcp \
-    --port ACM1 --port USB0 --port USB1 --port USB2 --port USB3
+  python tools/flash_test_fleet.py --lmesh-mode=local-release \
+    --port lora1 --port lora2 --port lora3 --port lora4 --port e5
 ```
 
-The helper discovers logical lmesh USB ports with `usb.serial.list`, starts a
-UDS plus TCP forward for each selected device, probes/flashes through
-`rfc2217://127.0.0.1:<port>`, and configures through the UDS socket. Use
-logical `--port USB0`/`--port ACM1` or `DMESH_FLASH_PORTS=USB0,USB1` when
-device order matters.
+The helper resolves logical lmesh roles, releases their UDS forwards, sparse
+flashes and verifies directly through the stable physical USB-UART paths, then
+restores the forwards. Use logical role names or `DMESH_FLASH_PORTS` when
+device selection matters.
 
-The RFC2217 flash path must preserve NVS. Do not write the padded merged image
-at `0x0`: the merged image contains `0xff` bytes across the NVS partition
-`0x9000..0xefff`, which erases saved settings. The fleet helper slices the real
-merged Rust image into sparse bootloader, partition-table, and app chunks and
-skips NVS/PHY. It always uploads the esptool RAM stub in the same RFC2217
-session; ROM `--no-stub` is used only for the initial chip probe.
+Flashing must preserve NVS. Do not write the padded merged image at `0x0`: the
+merged image contains `0xff` bytes across NVS (`0x9000..0xefff`) and erases
+saved settings. The fleet helper sparse-flashes bootloader, partition-table,
+and app chunks while skipping NVS/PHY. It uses the esptool RAM stub for writes;
+ROM `--no-stub` is only for an initial chip probe.
 
 The helper configures every flashed ESP for the current default: infra mode,
 DFS, raw-NAN duty cycle, Wi-Fi off between active windows, and LoRa receive on
@@ -227,14 +232,14 @@ stats=true` returns ESP-IDF NVS partition usage. Debug text examples:
 ```text
 nvs ns
 nvs get uart.active_ms
-nvs set uart.active_ms=20000 nan.wake_ms=4000 lora.enabled=true
+nvs set uart.active_ms=2000 nan.wake_ms=4000 lora.enabled=true
 nvs list
 ```
 
 Structured callers should use the grouped command and explicit fields:
 
 ```json
-{"method":"nvs","payload":{"op":"set","uart.active_ms":"20000","nan.wake_ms":"4000"}}
+{"method":"nvs","payload":{"op":"set","uart.active_ms":"2000","nan.wake_ms":"4000"}}
 {"method":"nvs","payload":{"op":"get","key":"uart.active_ms"}}
 ```
 
@@ -247,7 +252,8 @@ reliably stored in NVS on all targets.
 | --- | --- |
 | `mode` | Persisted operating mode: infra or companion. |
 | `power.profile` | Boot PM profile: `dfs`, `perf`, `low`, or `auto`. |
-| `uart.active_ms` | UART debug input/output window after boot, PRG/button, or UART input. Minimum/default: 20000 ms. |
+| `uart.active_ms` | UART debug input/output window after boot, PRG/button, or UART input. Minimum/default: 2000 ms. |
+| `uart.hb_every` | UART heartbeat cadence for raw-NAN duty wakes. `0` (default) disables periodic and LoRa/FSK-triggered UART output. `N>0` opens UART only for `nan.active_ms` and emits one empty `0x7e 0x7e` frame on every Nth raw-NAN wake; LoRa/FSK receive uses a 250 ms event window. A host UART frame then extends the normal `uart.active_ms` interactive window. |
 | `wifi.mode` | Boot Wi-Fi policy; current default is raw/custom NAN duty cycle. |
 | `wifi.ssid` | Saved Wi-Fi SSID for explicit STA/AP experiments. |
 | `nan.enabled` | Enable infra raw/custom NAN duty cycle at boot. |
@@ -262,6 +268,11 @@ reliably stored in NVS on all targets.
 | `nan.early_ms` | Return from light sleep this many milliseconds before the expected window. Default: `5` ms. |
 | `nan.dw_tu` | Raw-NAN Discovery Window period in TUs, used with the received beacon TSF to schedule the next radio wake. Default: `512` (524.288 ms). |
 | `nan.dw_off_tu` | Raw-NAN Discovery Window phase offset in TUs. Default: `0`. |
+| `nan.sync_source` | Timing-source policy: `auto` (default), `nan_only`, or `ap_only`. `ap_only` ignores NAN and is the deterministic AP-sync test mode. |
+| `nan.ap_owner` | Powered timing-AP owner. When true, Wi-Fi stays on; after NAN is absent for `nan.ap_loss_ms`, firmware starts `DIRECT-DMESH-<last4MAChex>` and raw action receive. |
+| `nan.ap_loss_ms` | NAN-loss interval before a powered AP owner starts its fallback AP. Default: `5000` ms. |
+| `nan.ap_recovery_ms` / `nan.ap_recovery_listen_ms` | Battery-node AP/NAN recovery cadence and bounded management-beacon listen duration. Defaults: `32000` / `1200` ms. |
+| `nan.ap_slot_tu` / `nan.ap_beacon_tu` | AP-derived common wake slot and owner SoftAP beacon interval. Defaults: `4000` TU (4.096 s) and `500` TU (512 ms). |
 | `lora.enabled` | Enable LoRa receive at infra boot when pins/radio are configured. |
 | `lora.chip` | Radio chip: `sx127x` or `sx1262`. |
 | `lora.mode` | LoRa preset mode: `meshtastic` or `meshcore`. |
@@ -277,6 +288,11 @@ reliably stored in NVS on all targets.
 | `lora.hop_limit` | Default LoRa hop limit. |
 | `lora.portnum` | Meshtastic port number for encoded sends. |
 | `lora.beacon` | LoRa beacon/announce behavior. |
+
+The firmware rationale, raw-frame constraints, AP fallback state machine, and
+E2E verification are maintained in
+[`fw/esp32/rust/docs/wifi.md`](../../fw/esp32/rust/docs/wifi.md). This API file
+remains the canonical ABI for the setting names and CBOR tags.
 | `lora.channel_hash` | Meshtastic channel hash override. |
 | `lora.rx_timeout` | Receive timeout/window setting. |
 | `lora.spi_host` | ESP SPI host index for the radio. |
@@ -295,6 +311,13 @@ reliably stored in NVS on all targets.
 | `lora.pa_hp` | SX126x PA high-power setting. |
 | `lora.pa_dev` | SX126x PA device selection. |
 | `lora.pa_lut` | SX126x PA lookup-table setting. |
+| `fsk.network_id` | 16-bit GFSK hardware sync/network ID. |
+| `fsk.hop_seed` | Seed combined with the network ID to select the rendezvous channel. |
+| `fsk.bitrate` | GFSK bit rate in bits/sec; default 100000. |
+| `fsk.deviation` | GFSK frequency deviation in Hz; default 25000. |
+| `fsk.rx_bw` | Requested GFSK receive bandwidth in Hz; default 250000. |
+| `fsk.preamble` | GFSK preamble bytes; default 16. |
+| `fsk.slot_ms` | Discovery-slot duration; default 80 ms. |
 | `battery.enabled` | Enable battery voltage reporting. |
 | `battery.pin` | ADC GPIO for battery voltage. |
 | `battery.divider` | Voltage divider ratio/multiplier. |
@@ -356,10 +379,40 @@ reliably stored in NVS on all targets.
 | `lora` | `chip=sx127x\|sx1262`, `board=heltec_v3`, pin/PA/TCXO args | Update hardware mapping. |
 | `lora` | `cad=true`, `cad_timeout=<ms>` | One channel-activity probe. |
 | `lora` | `cad_rx=true\|false`, `cad_tx=true\|false`, `cad_interval_ms`, `cad_rx_ms`, `cad_tx_tries` | Update CAD policy. |
+| `radio` | `status=true` | Report the host-activated GFSK discovery profile and its rendezvous channel. |
+| `radio` | `op=send data=hex:... channel=0..49` | Send one bounded GFSK packet on a selected channel. |
+| `radio` | `op=sweep target=<last4> sequence=<n>` | Send one 50-slot, 4-second US915 discovery sweep. `target` is the destination MAC's final four bytes in network order; omit for broadcast. |
+| `radio` | `op=listen ms=<n> [channel=<n>]` | Dwell on the deterministic rendezvous channel and return the first GFSK packet received. |
 | `lorasend` | `text=...` or `data=hex:...`, `format=meshtastic\|raw`, `hop=0..7`, `portnum`, `timeout` | Send one LoRa packet. |
 | `loralisten` | `ms`, `count`, `local_only=true` | Synchronous receive window. |
 | `loradump` | none | Radio register/status dump. |
 | `loraprobe` | pin lists, `chip`, `save=true` | Probe LoRa wiring candidates. |
+
+### FSK discovery profile
+
+`radio` is deliberately a bounded modem session: it stops the background
+Meshtastic LoRa receiver, configures the requested radio as GFSK, runs the
+operation, sleeps the radio, then restores background LoRa receive. It does
+not alter the boot mode or the low-power LoRa CAD policy.
+
+The initial profile is `us915_fhss_100k`: 100 kbps GFSK, 25 kHz deviation,
+250 kHz receive bandwidth, 16-byte preamble, CCITT CRC with no whitening, a 16-bit
+`network_id` hardware sync word, and packets capped at 128 bytes. Its 50
+500-kHz channels are `902.250..912.750`, `913.750..915.250`, and
+`916.250..927.750` MHz. This is an engineering test profile, not a statement
+of regulatory approval. Current Meshtastic Medium Fast (913.125 MHz) and
+MeshCore (910.525 MHz) are documented coexistence references, not guaranteed
+quiet channels.
+
+The rendezvous channel is `(network_id ^ hop_seed) % 50`. A sender repeats the
+compact `DMSF` sync packet in all 50 slots; a target can dwell on its fixed
+channel for one sweep plus guard instead of scanning. FSK is implemented for
+both SX127x and SX126x. The SX126x path uses its distinct GFSK packet type,
+sync-word register range, packet-status interpretation, and DIO1 IRQ mapping;
+it was validated against a real SX127x on 2026-07-26. The fixed-channel smoke
+matrix passed `lora1 -> lora2`, `lora2 -> lora1`, `lora1 -> lora4`, and
+`lora4 -> lora1`. This does not yet qualify the 50-slot sweep, long-run loss,
+or power behavior.
 
 ### Presets
 
@@ -433,9 +486,9 @@ windows. It deliberately does not use the ESP-NOW API or its 250-byte
 compatibility limit. Firmware receives broad MGMT/action frames and uses a
 fast software marker check for both paths.
 
-DMesh data-frame payloads are experimental and currently use an IPv4/UDP shim
-so Linux/lmesh can reuse packet tooling while the ESP parses only the DMesh
-payload:
+Data-frame payloads are experimental and are not the supported sleepy-node
+path. Earlier experiments used an IPv4/UDP shim so Linux/lmesh could reuse
+packet tooling while the ESP parsed only the DMesh payload:
 
 ```text
 802.11 data + LLC/SNAP IPv4 + UDP src/dst port 15009
@@ -444,24 +497,22 @@ payload:
 
 The synthetic IPv4 source is `10.<last three source-MAC bytes>` and the
 destination is the lmesh announce multicast address `224.0.0.250`. The UDP
-payload uses the debug-only DMesh data marker shown above followed by the text
-payload.
+payload used the debug-only DMesh data marker shown above followed by an
+experiment payload. New firmware command traffic is compact CBOR, not text.
 
 For data-frame injection, `bssid=...` defaults to a no-DS data frame with
 `addr1=dst`, `addr2=sender`, and `addr3=bssid`. Use `ds=to_ap` for STA-to-AP
 frames (`addr1=bssid`, `addr3=dst`) or `ds=from_ap` for AP-to-STA frames
 (`addr1=dst`, `addr2/addr3=bssid`).
 
-Raw Wi-Fi command routing:
+Current raw Wi-Fi command routing:
 
-- payloads without a terminal prefix are dispatched as firmware commands;
+- valid compact-CBOR command records are dispatched through the common registry;
 - action-frame commands receive action-frame responses to the sender MAC;
 - data-frame commands receive unicast data-frame responses to the source MAC;
-- firmware responses are sent as `resp <response-line>`;
-- console notifications to the last valid Wi-Fi command peer are sent as
-  `notify <event-line>` over that peer's last response path;
-- received `resp ` and `notify ` payloads are terminal records and are not
-  dispatched as commands.
+- firmware responses and notifications are compact-CBOR records over the
+  selected response path;
+- text `resp`/`notify` terminal-prefix handling is retired protocol history.
 
 `wifi raw_stats=true` includes the last response path (`action` or `data`) and
 the last command peer. `mode ping=true` sends a ping on all enabled transports:
@@ -473,16 +524,14 @@ Action-frame sizing:
 
 - ESP-IDF TX accepts raw 802.11 frames up to 1500 bytes in this path;
 - NAN SDF follow-ups currently cap their service payload at 255 bytes; the
-  separate custom `wifi raw_action=TEXT` bulk path accepts up to 1200 bytes.
-  bytes;
-- official NAN accepts lmesh/Android DMesh `command_text` follow-ups as
-  firmware text commands. Firmware `nan send=TEXT` emits `command_text`;
-  `packet_chunk` remains accepted for older tests;
-- raw/custom NAN SDF follow-ups also dispatch UTF-8 text commands through the
-  same registry and return `resp ...` as directed raw NAN SDF follow-ups;
-- raw/custom NAN command tests should send `to=<dst-last4>` and
-  `from=<src-last4>` inside the text payload. `nan stats=true` exposes
-  `raw_cmd_rx`, `raw_resp_rx`, and `raw_resp_tx` for deterministic validation;
+  separate custom action-frame bulk path accepts up to 1200 bytes;
+- official NAN and its text follow-up experiments are removed from the active
+  firmware path;
+- raw/custom NAN follow-ups carry compact CBOR command or response records;
+  lmesh may translate local debug text before enqueueing them;
+- raw/custom NAN command tests must use the envelope `to` and `from` fields.
+  `nan stats=true` exposes `raw_cmd_rx`, `raw_resp_rx`, and `raw_resp_tx` for
+  deterministic validation;
 - larger payloads need chunking above this command path.
 
 ## Sleep / Power
@@ -490,7 +539,6 @@ Action-frame sizing:
 | Command | Params | Result |
 | --- | --- | --- |
 | `sleep` | `status=true` | RTC deep-sleep state and light-sleep test counters. |
-| `sleep` | `test=nan wake_ms=5000 ps=max restore=true` | Official NAN plus light-sleep timer test on targets where official NAN links. |
 | `sleep` | `mode=nan_raw wake_ms=7000 active_ms=1000 channel=6 serial=false` | Deep-sleep loop with Wi-Fi fully stopped during sleep, then a raw-NAN SDF receive/transmit window after timer or PRG wake. |
 | `sleep` | `mode=deep wake_ms=5000 active_ms=1000 lora=true` | Deep-sleep loop with optional LoRa DIO0 wake. |
 | `nan` | `cycle=true wake_ms=2000 active_ms=500 count=5 sync=true dw_tu=512 offset_tu=0 filter=nan` | Non-deep-sleep raw NAN timing test: turn Wi-Fi off between windows, start raw NAN, sync to beacon TSF phase, and log radio start/beacon/window timing. |
@@ -505,6 +553,13 @@ This is the intended measurement path for "Wi-Fi off for about 7 seconds,
 awake for about 1 second". PRG/BOOT remains configured as a deep-sleep wake
 source. Any command that promotes the device out of the loop should be followed
 by `wifi mode=off` if the test window left Wi-Fi enabled unexpectedly.
+
+### Historical Measurements and Retired Experiments
+
+The rest of this Wi-Fi/sleep section preserves dated measurement notes and
+retired official-NAN/AP/data-frame experiments. It is not current configuration
+guidance; follow `docs/lmesh-firmware-handoff.md` for the supported raw-NAN
+duty-cycle default.
 
 Short-loop lab result: USB1 with `wake_ms=2000 active_ms=500` repeatedly woke by
 timer and averaged about 37 mA, with about 10 mA during the sleep portion and
@@ -596,6 +651,12 @@ Infra boot radio settings:
   available, it uses the configured duty interval as a conservative fallback.
   Defaults: `nan.wake_ms=4000`, `nan.active_ms=250`,
   `nan.light_sleep=true`, `nan.early_ms=5`, `nan.channel=6`;
+- AP fallback is available for a powered infra owner. Set `nan.ap_owner=true`
+  on `lora1`; after five seconds without NAN it starts open
+  `DIRECT-DMESH-<last4MAChex>` on the raw-NAN channel at 500 TU. AP mode is
+  always powered: it never enters the duty-sleep Wi-Fi-off path. Battery nodes
+  prefer NAN, then a `DIRECT-DMESH-*` or ordinary channel beacon; use
+  `nan.sync_source=ap_only` to validate AP synchronization while NAN exists.
 - `xstatus` and `mode status=true` include raw-NAN per-window beacon telemetry:
   `nan_beacon_seen`, `nan_beacon_missed`, `nan_beacon_late`,
   `nan_beacon_late_next_dw`, and `nan_beacon_drift`. A missed beacon adds a
@@ -642,6 +703,8 @@ unless explicitly started for testing.
 | `mode` | `companion=true\|infra=true save=true` | Switch persisted operating mode. |
 | `mode` | `advertise=true window_ms=... adv_ms=...` | Open companion advertising window. |
 | `mode` | `active=true ms=...` | Keep active for a bounded window. |
+| `active` | none | Runtime-only persistent infra transfer mode. Keeps raw-NAN Wi-Fi, NAN receive, and configured LoRa RX active until `idle` or reset. |
+| `idle` | none | End the runtime-only persistent `active` override and resume the configured raw-NAN duty cycle. |
 | `mode` | `raw_wifi=true channel=6` | Enable raw Wi-Fi under mode policy. |
 | `mode` | `raw_nan=true lora=false channel=6` | Start non-persistent raw-NAN duty cycling. `lora=false` isolates Wi-Fi sleep measurement. |
 | `mode` | `lora_sleep_listen=true save=true` | Persist companion LoRa sleep-listen preference. |
@@ -649,12 +712,13 @@ unless explicitly started for testing.
 | `power` | `status=true` | Current CPU frequency, XTAL, PM min/max, automatic light-sleep permission, and tick counter. Heap/PSRAM/task stats are in `status`/`xstatus`, not `power`. |
 | `power` | `locks=true` | Print the active ESP-IDF power-management lock table to the debug UART. |
 | `power` | `quiet=true` | Send the response, then enter UART idle: output is suppressed and PM locks are released, but RX/light-sleep wake stays armed. A DTR/PRG edge or UART wake preamble followed by a command reopens the active window. Intended for power tests. |
-| `power` | `uart_status=true` | Report driver, active-window, RX-wake, ingress error/drop, and idle-TX-drop counters. |
+| `power` | `uart_status=true` | Report driver, active-window, RX-wake, ingress error/drop, `uart_frame_drop`, `uart_escape_err`, idle-TX-drop, and `uart_hb_*` heartbeat counters including the last heartbeat window. The physical UART decoder drops malformed frames at the next delimiter; it emits no recovery stream. |
 | `power` | `uart_probe_ms=N` | Debug verification only: schedule one UART output attempt after `N` ms (1..60000). After a DTR/UART wake, `uart_status=true` must report `uart_probe_dropped` when the probe ran outside the active window; it must not emit the probe line. |
 | `power` | `uart_probe_reset=true` | Clear the debug output-gate probe counters before a bounded test. |
 | `power` | `uart_uninstall=true` | One-boot power-test operation: acknowledge first, then remove UART0's driver. Reset is required to restore the console. It is never part of normal boot or radio profiles. |
 | `power` | `profile=dfs\|perf\|low\|auto save=true min_mhz=... max_mhz=... light=true\|false` | Configure ESP-IDF PM. Default boot profile is `dfs`: dynamic frequency scaling enabled, automatic light sleep disabled. `light=true` permits automatic light sleep; it does not force immediate sleep if UART, Wi-Fi, BLE, LoRa, timers, or tasks hold the chip active. |
-| `nvs` | `op=set uart.active_ms=20000` | Configure the debug UART input/output window in milliseconds (minimum/default: 20000 ms). PRG/button, lmesh DTR, or UART RX opens/extends the window. RX wake remains armed while idle; firmware output is dropped while idle. |
+| `nvs` | `op=set uart.active_ms=2000` | Configure the debug UART input/output window in milliseconds (minimum/default: 2000 ms). PRG/button, explicit lmesh DTR, or UART RX opens/extends the window. RX wake remains armed while idle; firmware output is dropped while idle. |
+| `nvs` | `op=set uart.hb_every=N` | Configure the disabled-by-default periodic UART heartbeat. `0` suppresses raw-NAN wake and LoRa/FSK-triggered UART output; `N>0` writes an empty UART frame and opens the bounded console window on every Nth raw-NAN wake. lmesh flushes queued command frames after receiving any firmware UART frame. |
 | `sleep` | `status=true` | Sleep/PM/radio state and counters. |
 | `sleep` | `test=ble\|raw\|raw_data\|sta\|ap\|nan ms=... restore=true` | Bounded light-sleep experiment with timer recovery. |
 | `sleep` | `mode=deep wake_ms=... active_ms=... lora=true|false start=true` | Enter deep sleep with timer and button wake. LoRa deep-sleep listen is opt-in with `lora=true`. |
@@ -672,11 +736,11 @@ not deep sleep.
 the APB frequency lock for the debug UART after the active window expired. It
 does not uninstall the UART driver. PRG/button or lmesh DTR opens a new window;
 RX input also opens a closed console window; when waking from light sleep, send
-a disposable newline preamble and then the command because the trigger bytes
-can be lost. Output while closed is intentionally dropped. Each active console window holds both the UART APB lock
-and an `ESP_PM_NO_LIGHT_SLEEP` lock for at least 20 seconds. An lmesh UDS
-forward with `dtr=true` pulses the same PRG/DTR line as a short physical button
-press before forwarding the command.
+a complete delimiter-framed CBOR command; partial or corrupt UART bytes are
+discarded at the next delimiter. Output while closed is intentionally dropped.
+Each active console window holds both the UART APB lock and an
+`ESP_PM_NO_LIGHT_SLEEP` lock for at least two seconds. lmesh UDS forwards are
+passive; use explicit `dtr` only for a local GPIO0/PRG wake.
 
 ## Hardware and Probe
 
@@ -697,15 +761,9 @@ On classic ESP32, avoid ADC2 pins while Wi-Fi is active. Use ADC1 pins
 
 | Command | Params | Result |
 | --- | --- | --- |
-| `nan` | `start=true\|stop=true`, `backend=official\|raw`, `role=publish\|publisher_solicited\|subscribe\|both`, `service=dmesh`, `channel=6` | Start/stop NAN/raw NAN-like mode. `publisher_solicited` is the low-duty responder mode for lmesh/Android active subscribers. |
-| `nan` | `send="status"`, `queue="status" dst=MAC` | `send` emits a DMesh NAN follow-up immediately. `queue` encodes a recognized text command as CBOR and holds it for the next raw-NAN active window; use `queue` for sleepy peers. Raw-NAN command responses use the same queue while duty cycling. |
+| `nan` | `start=true\|stop=true`, `backend=raw`, `role=publish\|publisher_solicited\|subscribe\|both`, `service=dmesh`, `channel=6` | Start/stop raw NAN-like mode. `publisher_solicited` is the low-duty responder mode for lmesh/Android active subscribers. |
+| `nan` | `queue=<CBOR command> dst=MAC` | Queue a compact CBOR command for the next raw-NAN active window; use it for sleepy peers. Raw-NAN command responses use the same queue while duty cycling. |
 | `nan` | `stats=true` | NAN support, counters, role/backend state, beacon timing, queued raw-NAN work, and raw command/response counters. `rx_prefilter_drop` counts unrelated management frames rejected in the Wi-Fi callback before they can fill the raw-NAN queue. |
-
-Official NAN on classic ESP32 is an explicit comparison mode and uses a
-low-power-biased default for power tests:
-`scan_time=1`, `warm_up_sec=2`, passive subscribe, low master preference, and
-`WIFI_PS_MAX_MODEM` after NAN starts. `sleep ... nan=true` now starts official
-NAN instead of recording a skipped request.
 
 Use `role=both` when testing ESP-to-ESP discovery without a host/phone active
 subscriber. Use `role=publisher_solicited` when lmesh or Android owns active
@@ -758,11 +816,9 @@ When a send test is active, `sleep mode=nan_raw start=true` defaults to the
 test's `wake_ms` and `active_ms` values, so the short test cadence can be set on
 the `test` command.
 
-Official NAN command delivery works into the firmware queue, but directed
-response routing is not currently reliable in the full lab cluster with host
-lmesh, wpa_supplicant NAN, Android, and multiple ESP boards active. Treat
-official NAN response tests as an open item until `nan_pair_test.py
---backend official` passes with response expectations enabled.
+Official NAN command-delivery observations are retired with the official NAN
+backend. Do not re-enable that path without a new power and interoperability
+decision.
 
 Companion mode should not depend on ESP NAN. Android can own NAN in companion
 scenarios; ESP raw action frames are an ESP-side Wi-Fi experiment.
@@ -775,7 +831,7 @@ scenarios; ESP raw action frames are an ESP-side Wi-Fi experiment.
 - expose the appropriate curated tools from `resources/tools.json`;
 - translate tool calls into firmware commands;
 - normalize responses into `lmesh` neighbor/link/message records;
-- keep encryption/auth at the mesh layer, not in this text command ABI.
+- keep encryption/auth at the mesh layer, not in a text command ABI.
 
 Production callers should prefer `lmesh send radio=...` over direct firmware
 commands. For example, `send radio=lora payload=...` may use a local ESP over

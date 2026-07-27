@@ -1201,8 +1201,8 @@
         },
         "dtr": {
           "type": "boolean",
-          "title": "Pulse DTR",
-          "description": "Briefly pulse DTR whenever a UDS/TCP client connects, for boards that use DTR as a UART wake interrupt. Disable this for flasher clients so esptool owns reset timing.",
+          "title": "Legacy DTR Option",
+          "description": "Ignored. Managed forward connections are passive; use the explicit local dtr command when a GPIO0/PRG wake is required.",
           "default": false
         },
         "multi": {
