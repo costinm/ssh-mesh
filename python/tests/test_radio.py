@@ -4,6 +4,7 @@ import threading
 import time
 
 from dmesh.lab import LabConfig, parse_power_sample
+from dmesh.binary import MESH_RPC_META, cbor_encode
 from dmesh.radio import RadioClient, parse_text_record, resolve_radio_socket
 
 
@@ -13,6 +14,12 @@ class RecordingSocket:
 
     def sendall(self, data):
         self.sent.append(data)
+
+
+def firmware_frame(message, *, method=33, status="ok"):
+    payload = cbor_encode({0: method, 4: status, 6: {32: message}})
+    body = MESH_RPC_META + payload
+    return len(body).to_bytes(4, "big") + body
 
 
 def test_resolve_radio_socket_is_local_only():
@@ -47,10 +54,7 @@ def test_radio_command_ignores_wake_prompt_before_matching_response():
 
     def server():
         assert right.recv(1024) == b"status\n"
-        right.sendall(
-            b"event type=uart.wake source=button\ndm-rs> \n"
-            b"dm-rs> status uptime_ms=42 pm=true\ndm-rs> "
-        )
+        right.sendall(firmware_frame("status uptime_ms=42 pm=true"))
 
     thread = threading.Thread(target=server)
     thread.start()
@@ -71,7 +75,7 @@ def test_radio_command_matches_compact_equals_record():
 
     def server():
         assert right.recv(1024) == b"power uart_status=true\n"
-        right.sendall(b"uart_driver=true uart_active=true\ndm-rs> ")
+        right.sendall(firmware_frame("uart_driver=true uart_active=true", method=50))
 
     thread = threading.Thread(target=server)
     thread.start()
@@ -85,12 +89,24 @@ def test_radio_command_matches_compact_equals_record():
     thread.join(timeout=2)
 
 
+def test_radio_decoder_resynchronizes_after_invalid_length_candidate():
+    client = RadioClient("unused.lmesh")
+    # This looks like a length-prefixed record, but its body is not CBOR. A
+    # reset/boot fragment must not consume the valid frame that follows.
+    malformed = (5).to_bytes(4, "big") + MESH_RPC_META[:1]
+    client._buffer.extend(malformed + firmware_frame("status uptime_ms=77"))
+
+    records = client._drain_records()
+
+    assert records == ["status uptime_ms=77"]
+
+
 def test_read_available_is_passive_and_drains_buffer():
     left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     client = RadioClient("unused.lmesh", timeout=1.0)
     client.sock = left
     left.settimeout(0.01)
-    right.sendall(b"event type=boot_window start=true\n")
+    right.sendall(firmware_frame("event type=boot_window start=true", method=0, status="event"))
     try:
         assert "boot_window" in client.read_available(duration=0.03)
         started = time.monotonic()
@@ -106,14 +122,24 @@ def test_read_available_is_passive_and_drains_buffer():
         right.close()
 
 
-def test_wake_uart_uses_separate_disposable_records():
+def test_wake_uses_lmesh_control_text_not_firmware_cbor():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     client = RadioClient("unused.lmesh", timeout=1.0)
-    socket = RecordingSocket()
-    client.sock = socket
+    client.sock = left
+    left.settimeout(0.05)
 
-    client.wake_uart()
+    def server():
+        assert right.recv(1024) == b"dtr 120\n"
+        right.sendall(b"event type=lmesh.dtr ok=true hold_ms=120\n")
 
-    assert socket.sent == [b"\n", b"\n", b"\n", b"\n"]
+    thread = threading.Thread(target=server)
+    thread.start()
+    try:
+        assert "lmesh.dtr" in client.wake()
+    finally:
+        client.close()
+        right.close()
+    thread.join(timeout=2)
 
 
 def test_power_sample_and_lab_config(tmp_path):

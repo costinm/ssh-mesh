@@ -189,6 +189,19 @@ class LabNode:
         self.radio = RadioClient(config.destination, timeout=timeout)
 
     def command(self, command, **kwargs):
+        # DTR is board-specific and resets some CP210x-connected ESP boards.
+        # The normal battery modem contract is a queued CBOR request flushed
+        # by the firmware UART heartbeat, so E2E tests must not pulse DTR.
+        kwargs.pop("wake", None)
+        # Firmware NVS commands acknowledge with the requested operation
+        # (`set`, `get`, `list`, ...) rather than the outer `nvs` method.
+        # Keep scenario and restore callers declarative while matching the
+        # binary firmware ABI consistently.
+        if "expected" not in kwargs and command.startswith("nvs "):
+            for word in command.split()[1:]:
+                if word.startswith("op="):
+                    kwargs["expected"] = word.split("=", 1)[1]
+                    break
         result = self.radio.command(command, **kwargs)
         self.artifacts.append_jsonl(
             "commands/{}.jsonl".format(self.config.name),
@@ -208,7 +221,7 @@ class LabNode:
     def restore(self):
         try:
             for command in self.config.restore:
-                self.command(command, timeout=12.0, wake=True)
+                self.command(command, timeout=12.0)
             return
         except Exception:
             if not self.config.reset_on_restore:

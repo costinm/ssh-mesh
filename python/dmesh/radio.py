@@ -6,8 +6,11 @@ import socket
 import time
 from dataclasses import dataclass, field
 
+from dmesh.binary import MESH_RPC_META, cbor_decode
+
 
 PROMPT = "dm-rs> "
+FIRMWARE_RECORD_MAX = 4_000
 _INTEGER = re.compile(r"^-?\d+$")
 _FLOAT = re.compile(r"^-?(?:\d+\.\d*|\d*\.\d+)$")
 
@@ -113,6 +116,67 @@ class RadioClient:
         self.sock = None
         self._buffer = bytearray()
 
+    @staticmethod
+    def _render_cbor_record(payload):
+        """Render the firmware compact-CBOR response for legacy test parsers."""
+        try:
+            record = cbor_decode(payload)
+        except (TypeError, ValueError) as error:
+            return "error message=invalid_cbor_response:{}".format(error)
+        if not isinstance(record, dict):
+            return repr(record)
+        fields = record.get(6)
+        if isinstance(fields, dict) and isinstance(fields.get(32), str):
+            return fields[32]
+        if isinstance(record.get(5), str):
+            return "error message={}".format(record[5])
+        if isinstance(record.get(4), str):
+            return "status={}".format(record[4])
+        return repr(record)
+
+    def _drain_records(self):
+        """Decode binary firmware records, retaining lmesh control text."""
+        records = []
+        while self._buffer:
+            # A reset can leave arbitrary bytes in the managed stream. Scan
+            # for a complete record rather than trusting the first four bytes
+            # as a length prefix. A candidate is authoritative only when it
+            # has the generic UDS metadata *and* its CBOR payload decodes.
+            valid = None
+            limit = max(0, len(self._buffer) - 7)
+            for offset in range(limit):
+                body_len = int.from_bytes(self._buffer[offset : offset + 4], "big")
+                frame_len = body_len + 4
+                if not 4 <= body_len <= FIRMWARE_RECORD_MAX + 4:
+                    continue
+                if offset + frame_len > len(self._buffer):
+                    continue
+                body = bytes(self._buffer[offset + 4 : offset + frame_len])
+                if not body.startswith(MESH_RPC_META):
+                    continue
+                rendered = self._render_cbor_record(body[4:])
+                if rendered.startswith("error message=invalid_cbor_response:"):
+                    continue
+                valid = (offset, frame_len, rendered)
+                break
+            if valid is not None:
+                offset, frame_len, rendered = valid
+                del self._buffer[: offset + frame_len]
+                records.append(rendered)
+                continue
+            if self._buffer[0] == 0:
+                # A partial binary frame may contain newline bytes. Do not
+                # mistake those payload bytes for lmesh control text.
+                break
+            newline = self._buffer.find(b"\n")
+            if newline < 0:
+                break
+            line = bytes(self._buffer[:newline]).decode("utf-8", "replace").rstrip("\r")
+            del self._buffer[: newline + 1]
+            if line:
+                records.append(line)
+        return records
+
     def connect(self):
         if self.sock is None:
             path = self.socket_path
@@ -144,6 +208,8 @@ class RadioClient:
     def _receive(self, timeout, matcher, quiet_after_match=0.12):
         deadline = time.monotonic() + timeout
         matched_at = None
+        records = []
+        text = ""
         while time.monotonic() < deadline:
             if matched_at is not None and time.monotonic() - matched_at >= quiet_after_match:
                 break
@@ -154,13 +220,12 @@ class RadioClient:
             if not chunk:
                 raise EOFError("radio stream closed")
             self._buffer.extend(chunk)
-            text = self._buffer.decode("utf-8", "replace").replace("\r", "")
+            records.extend(self._drain_records())
+            text = "\n".join(records)
             if matcher(text):
                 matched_at = matched_at or time.monotonic()
-        text = self._buffer.decode("utf-8", "replace").replace("\r", "")
         if matched_at is None:
             raise TimeoutError("radio response timeout; tail={!r}".format(text[-400:]))
-        self._buffer.clear()
         return text
 
     def read_available(self, duration=0.2):
@@ -175,29 +240,35 @@ class RadioClient:
             if not chunk:
                 raise EOFError("radio stream closed")
             self._buffer.extend(chunk)
-        text = self._buffer.decode("utf-8", "replace").replace("\r", "")
-        self._buffer.clear()
-        return text
+        return "\n".join(self._drain_records())
 
     def wake(self, milliseconds=120, timeout=None):
         if not 1 <= milliseconds <= 10000:
             raise ValueError("DTR duration must be between 1 and 10000 ms")
-        # Managed lmesh forwards keep DTR disabled by default. UART RX edges
-        # wake the firmware without reopening the socket or touching GPIO0.
         self.connect()
-        self.wake_uart()
-        return "event type=uart.wake ok=true source=rx"
+        self.send_line("dtr {}".format(milliseconds))
+        return self._receive(
+            timeout or self.timeout,
+            lambda text: "event type=lmesh.dtr ok=true" in text,
+        )
 
     def wake_uart(self):
-        """Wake a light-sleeping firmware UART without touching modem lines."""
-        # Do not bulk-write this preamble. The APB-clocked UART can resume in
-        # the middle of a bulk write and turn the first real record into a
-        # corrupted command. Separate blank records are intentionally ignored
-        # by firmware and leave a settled boundary before the command.
-        for _ in range(4):
-            self.send_line(b"\n")
-            time.sleep(0.06)
-        time.sleep(0.20)
+        """Compatibility alias for lmesh-owned DTR wake."""
+        return self.wake()
+
+    def prime_uart(self, settle_sec=4.5):
+        """Consume one UART RX-wake frame before a test command.
+
+        A dormant ESP may consume its first framed command while the UART
+        clock resumes. This intentionally sends only a disposable ``status``
+        request and drains the resulting marker/event/response. Callers then
+        issue their real command once, avoiding an ambiguous retry of a
+        side-effecting operation.
+        """
+        if settle_sec < 0:
+            raise ValueError("settle_sec must not be negative")
+        self.send_line("status")
+        self.read_available(duration=settle_sec)
 
     def reset(self, timeout=None):
         self.send_line("rst")
@@ -207,9 +278,7 @@ class RadioClient:
         )
 
     def command(self, command, timeout=None, wake=False, expected=None):
-        if wake == "uart":
-            self.wake_uart()
-        elif wake:
+        if wake:
             self.wake(timeout=timeout)
         method = expected or command.split(None, 1)[0]
         started = time.monotonic()

@@ -28,13 +28,6 @@ def _delta(before, after, key):
     return after[key] - before[key]
 
 
-def _mac_suffix(mac):
-    parts = mac.split(":")
-    if len(parts) != 6:
-        raise ValueError("invalid MAC {!r}".format(mac))
-    return "".join(parts[-4:]).lower()
-
-
 class PresubmitSuite:
     def __init__(self, config, artifact_dir, profile="quick", timeout=8.0):
         self.config = config
@@ -139,7 +132,6 @@ class PresubmitSuite:
         for name, node in self.nodes.items():
             try:
                 node.radio.connect()
-                node.radio.wake(timeout=self.timeout)
                 status = node.command("status", timeout=self.timeout)
                 stats = node.command("stats", timeout=self.timeout)
                 nan = node.command("nan stats=true", timeout=self.timeout)
@@ -177,7 +169,7 @@ class PresubmitSuite:
                 if name not in self.available:
                     continue
                 try:
-                    result = node.command("status", timeout=self.timeout, wake=True)
+                    result = node.command("status", timeout=self.timeout)
                     _fields(result, "status")
                     summary[name]["latencies"].append(result.latency_ms)
                 except Exception as error:
@@ -226,7 +218,6 @@ class PresubmitSuite:
             for sequence in range(rounds):
                 if sequence:
                     time.sleep(idle_sec)
-                node.radio.wake(timeout=self.timeout)
                 status = _fields(node.command("status", timeout=self.timeout), "status")
                 uart = _fields(
                     node.command(
@@ -252,14 +243,12 @@ class PresubmitSuite:
         probe_wait_sec = float(config.get("output_probe_wait_sec", probe_delay_sec + 2.0))
         for name in result:
             node = self.nodes[name]
-            node.radio.wake(timeout=self.timeout)
             node.command("power uart_probe_reset=true", timeout=self.timeout)
             node.command(
                 "power uart_probe_ms={}".format(round(probe_delay_sec * 1000)),
                 timeout=self.timeout,
             )
             time.sleep(probe_wait_sec)
-            node.radio.wake(timeout=self.timeout)
             uart = _fields(
                 node.command(
                     "power uart_status=true",
@@ -277,13 +266,6 @@ class PresubmitSuite:
                 "uart": uart,
             }
         return result
-
-    def _wifi_mac(self, node):
-        fields = _fields(node.command("wifi", timeout=self.timeout), "wifi")
-        for key in ("sta_mac", "mac", "ap_mac"):
-            if fields.get(key):
-                return fields[key]
-        raise AssertionError("{} wifi response has no MAC".format(node.config.name))
 
     def nan_pair(self):
         a, b = self._require_nodes("nan", 2)[:2]
@@ -310,7 +292,7 @@ class PresubmitSuite:
         for node in (a, b):
             node.command("stats reset=true", timeout=self.timeout)
             node.command(
-                "nvs set nan.wake_ms={} nan.active_ms={} nan.light_sleep=true nan.channel={}".format(
+                "nvs op=set nan.wake_ms={} nan.active_ms={} nan.light_sleep=true nan.channel={}".format(
                     wake_ms, active_ms, channel
                 ),
                 timeout=self.timeout,
@@ -320,25 +302,19 @@ class PresubmitSuite:
                 "mode raw_nan=true lora=false channel={}".format(channel),
                 timeout=self.timeout,
             )
-        a_mac, b_mac = self._wifi_mac(a), self._wifi_mac(b)
         before_a = _fields(a.command("nan stats=true"), "nan")
         before_b = _fields(b.command("nan stats=true"), "nan")
         iterations = {"quick": 3, "full": 8, "stress": 20}[self.profile]
         spacing = float(thresholds.get("spacing_sec", 0.2))
-        directions = (
-            (a, b, a_mac, b_mac),
-            (b, a, b_mac, a_mac),
-        )
+        directions = ((a, b), (b, a))
         for sequence in range(iterations):
-            for sender, receiver, sender_mac, receiver_mac in directions:
-                payload = "status to={} from={} run={} seq={}".format(
-                    _mac_suffix(receiver_mac),
-                    _mac_suffix(sender_mac),
-                    self.run_id,
-                    sequence,
-                )
+            for sender, _receiver in directions:
+                # `mode ping` builds the compact-CBOR discovery packet in
+                # firmware and sends it over every enabled medium, including
+                # the raw-NAN action path. This avoids constructing a text
+                # payload for an ABI that intentionally accepts binary CBOR.
                 sender.command(
-                    'nan queue="{}" backend=raw dst={}'.format(payload, receiver_mac),
+                    "mode ping=true",
                     timeout=self.timeout,
                 )
             if sequence + 1 < iterations:
@@ -477,6 +453,127 @@ class PresubmitSuite:
                 raise AssertionError("required NAN beacon not observed by " + ", ".join(missing))
         return {"observe_sec": observe_sec, "nodes": result}
 
+    def ap_sync(self):
+        """Validate the powered AP timing fallback without depending on host NAN.
+
+        The owner is intentionally kept powered. Peers retain their normal
+        low-power duty configuration and acquire the owner's 500-TU beacon
+        during a bounded recovery listen. Cleanup restores the normal `auto`
+        policy and leaves the configured owner ready to fall back after NAN
+        loss in ordinary operation.
+        """
+        config = self.config.thresholds.get("ap_sync", {})
+        owner_name = config.get("owner", "lora1")
+        if owner_name not in self.nodes or owner_name not in self.available:
+            raise AssertionError("AP sync owner {} is not available".format(owner_name))
+        owner = self.nodes[owner_name]
+        if "nan" not in owner.config.capabilities:
+            raise AssertionError("AP sync owner {} lacks NAN capability".format(owner_name))
+        peer_names = config.get("peers") or [
+            name for name, node in self.nodes.items()
+            if name != owner_name and name in self.available and "nan" in node.config.capabilities
+        ]
+        peers = [self.nodes[name] for name in peer_names if name in self.available]
+        if not peers:
+            raise AssertionError("AP sync needs at least one available NAN peer")
+
+        channel = int(config.get("channel", 6))
+        wake_ms = int(config.get("wake_ms", 4_000))
+        active_ms = int(config.get("active_ms", 250))
+        beacon_tu = int(config.get("beacon_tu", 500))
+        slot_tu = int(config.get("slot_tu", 4_000))
+        settle_sec = float(config.get("settle_sec", 8.0))
+        before = {}
+        result = {
+            "owner": owner_name,
+            "peers": [node.config.name for node in peers],
+            "channel": channel,
+            "beacon_tu": beacon_tu,
+            "slot_tu": slot_tu,
+        }
+        try:
+            owner.command(
+                "nvs op=set nan.ap_owner=true nan.sync_source=ap_only "
+                "nan.channel={} nan.ap_beacon_tu={} nan.ap_slot_tu={}".format(
+                    channel, beacon_tu, slot_tu
+                ),
+                timeout=self.timeout,
+                wake=True,
+                expected="set",
+            )
+            owner.command("mode infra=true", timeout=self.timeout, wake=True)
+            for peer in peers:
+                peer.command(
+                    "nvs op=set nan.ap_owner=false nan.sync_source=ap_only "
+                    "nan.channel={} nan.wake_ms={} nan.active_ms={} nan.light_sleep=true "
+                    "nan.ap_slot_tu={}".format(channel, wake_ms, active_ms, slot_tu),
+                    timeout=self.timeout,
+                    wake=True,
+                    expected="set",
+                )
+                peer.command("mode infra=true", timeout=self.timeout, wake=True)
+                before[peer.config.name] = _fields(
+                    peer.command("mode status=true", timeout=self.timeout, wake=True), "mode"
+                )
+
+            deadline = time.monotonic() + settle_sec
+            owner_status = None
+            while time.monotonic() < deadline:
+                owner_status = _fields(
+                    owner.command("mode status=true", timeout=self.timeout, wake=True), "mode"
+                )
+                if owner_status.get("ap_active") is True:
+                    break
+                time.sleep(0.4)
+            if not owner_status or owner_status.get("ap_active") is not True:
+                raise CaseFailure("powered AP owner did not activate", {"owner": owner_status})
+            if owner_status.get("sleep_inhibited") != "ap":
+                raise CaseFailure("powered AP owner entered a sleepable state", {"owner": owner_status})
+
+            time.sleep(max(0.5, wake_ms / 1000.0 + active_ms / 1000.0))
+            peer_status = {}
+            for peer in peers:
+                status = _fields(
+                    peer.command("mode status=true", timeout=self.timeout, wake=True), "mode"
+                )
+                source = status.get("sync_source")
+                if source not in ("direct_ap", "ap"):
+                    raise CaseFailure(
+                        "{} did not acquire AP timing source".format(peer.config.name),
+                        {"before": before[peer.config.name], "after": status},
+                    )
+                if int(status.get("ap_recovery_runs", 0)) < int(
+                    before[peer.config.name].get("ap_recovery_runs", 0)
+                ):
+                    raise CaseFailure(
+                        "{} AP recovery counter regressed".format(peer.config.name),
+                        {"before": before[peer.config.name], "after": status},
+                    )
+                peer_status[peer.config.name] = status
+            result["owner_status"] = owner_status
+            result["peer_status"] = peer_status
+            return result
+        finally:
+            for peer in peers:
+                try:
+                    peer.command(
+                        "nvs op=set nan.ap_owner=false nan.sync_source=auto", timeout=self.timeout, wake=True
+                    )
+                    peer.command("mode infra=true", timeout=self.timeout, wake=True)
+                except Exception as error:
+                    self.artifacts.append_jsonl(
+                        "cleanup.jsonl", {"node": peer.config.name, "error": str(error)}
+                    )
+            try:
+                owner.command(
+                    "nvs op=set nan.ap_owner=true nan.sync_source=auto", timeout=self.timeout, wake=True
+                )
+                owner.command("mode infra=true", timeout=self.timeout, wake=True)
+            except Exception as error:
+                self.artifacts.append_jsonl(
+                    "cleanup.jsonl", {"node": owner.config.name, "error": str(error)}
+                )
+
     def lora_pair(self):
         a, b = self._require_nodes("lora", 2)[:2]
         lora = self.config.thresholds.get("lora", {})
@@ -614,6 +711,8 @@ class PresubmitSuite:
                     run_case("nan_pair", self.nan_pair)
                 if selected_case("beacon_sync") and self.profile != "quick":
                     run_case("beacon_sync", self.beacon_sync)
+                if selected_case("ap_sync") and self.profile != "quick":
+                    run_case("ap_sync", self.ap_sync)
             if self._capable("lora"):
                 if selected_case("lora_pair"):
                     run_case("lora_pair", self.lora_pair)
@@ -734,6 +833,17 @@ class PresubmitSuite:
             lines.extend(["", "## Beacon synchronization", ""])
             for node, counters in beacon["nodes"].items():
                 lines.append("- `{}`: `{}`".format(node, counters))
+        ap_sync = passed_details("ap_sync")
+        if ap_sync:
+            lines.extend(["", "## AP timing fallback", ""])
+            lines.append(
+                "- `{}` AP active on channel {} at {} TU; peers `{}` acquired AP timing.".format(
+                    ap_sync["owner"],
+                    ap_sync["channel"],
+                    ap_sync["beacon_tu"],
+                    ", ".join(ap_sync["peer_status"]),
+                )
+            )
         power = passed_details("power")
         if power:
             lines.extend(["", "## Power", ""])
