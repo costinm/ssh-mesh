@@ -25,10 +25,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--case",
         action="append",
-        choices=["uart_wake_reliability", "command_reliability", "active_transfer_window", "nan_pair", "beacon_sync", "lora_pair", "lora_cad"],
+        choices=["uart_wake_reliability", "command_reliability", "active_transfer_window", "nan_pair", "beacon_sync", "ap_sync", "lora_pair", "lora_cad"],
         help="Run only the named scenario; inventory, power capture, and restore still run.",
     )
-    parser.add_argument("--timeout", type=float, default=8.0)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=12.0,
+        help="Per-command timeout; must cover a four-second duty wake plus response.",
+    )
     parser.add_argument(
         "--artifacts",
         help="Result directory; defaults under target/esp32-presubmit",

@@ -467,8 +467,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Endpoint to query: /dev/ttyUSB0, uds:///run/.../USB0.sock, "
             "lora1.lmesh, tcp://127.0.0.1:3330, socket://127.0.0.1:3330, "
-            "or a bare .sock path. lmesh owns DTR/RTS and presents a framed "
-            "CBOR command stream to every endpoint."
+            "or a bare .sock path. UDS/TCP endpoints use the mesh stream; "
+            "physical UART endpoints use escaped delimiter-framed CBOR."
         ),
     )
     parser.add_argument("--baud", type=int, default=460800)
@@ -492,7 +492,7 @@ def parse_args() -> argparse.Namespace:
         "--repeat",
         type=int,
         default=1,
-        help="Repeat the complete connect/DTR-wake/command round for each port.",
+        help="Repeat the complete connect/command round for each port.",
     )
     parser.add_argument(
         "--repeat-delay-ms",

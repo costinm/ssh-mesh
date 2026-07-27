@@ -51,6 +51,22 @@ static NAN_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static AP_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
+static AP_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
+static AP_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static AP_LAST_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static AP_LAST_BEACON_INTERVAL_TU: AtomicU32 = AtomicU32::new(0);
+static AP_LAST_BEACON_RSSI: AtomicU32 = AtomicU32::new(0);
+static AP_LAST_BEACON_BSSID: [AtomicU8; 6] = [
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+];
+static AP_LAST_BEACON_DIRECT: AtomicBool = AtomicBool::new(false);
+static AP_RX_BEACON: AtomicU32 = AtomicU32::new(0);
 static NAN_FILTER_MODE: AtomicU32 = AtomicU32::new(FILTER_NAN);
 static NAN_FILTER_BSSID_ENABLED: AtomicBool = AtomicBool::new(false);
 static NAN_FILTER_BSSID: [AtomicU8; 6] = [
@@ -67,6 +83,16 @@ const FILTER_NAN: u32 = 1;
 const FILTER_ACTION: u32 = 2;
 const FILTER_BEACON: u32 = 3;
 const FILTER_SDF: u32 = 4;
+const FILTER_SYNC: u32 = 5;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SyncBeacon {
+    pub local_us: u64,
+    pub tsf_us: u64,
+    pub interval_tu: u32,
+    pub bssid: [u8; 6],
+    pub direct: bool,
+}
 
 static NAN_HEADER: [u8; 30] = [
     0xd0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -225,6 +251,49 @@ pub fn start_raw_window(channel: u8, filter: &str) -> Result<()> {
     start_raw_sniffer(channel.max(1))
 }
 
+/// The most recent NAN synchronization beacon, if one has been received.
+pub fn last_nan_sync_beacon() -> Option<SyncBeacon> {
+    let local_us = last_beacon_local_us();
+    let tsf_us = last_beacon_tsf_us();
+    (local_us != 0 && tsf_us != 0).then_some(SyncBeacon {
+        local_us,
+        tsf_us,
+        interval_tu: 512,
+        bssid: NAN_BSSID,
+        direct: false,
+    })
+}
+
+/// The latest non-NAN channel beacon. Direct DMesh APs are marked so callers
+/// can prefer them without requiring an allow list yet.
+pub fn last_ap_sync_beacon() -> Option<SyncBeacon> {
+    let local_us = load_u64(&AP_LAST_BEACON_LOCAL_LO, &AP_LAST_BEACON_LOCAL_HI);
+    let tsf_us = load_u64(&AP_LAST_BEACON_TSF_LO, &AP_LAST_BEACON_TSF_HI);
+    let interval_tu = AP_LAST_BEACON_INTERVAL_TU.load(Ordering::Relaxed);
+    if local_us == 0 || tsf_us == 0 || interval_tu == 0 {
+        return None;
+    }
+    let mut bssid = [0_u8; 6];
+    for (index, byte) in bssid.iter_mut().enumerate() {
+        *byte = AP_LAST_BEACON_BSSID[index].load(Ordering::Relaxed);
+    }
+    Some(SyncBeacon {
+        local_us,
+        tsf_us,
+        interval_tu,
+        bssid,
+        direct: AP_LAST_BEACON_DIRECT.load(Ordering::Relaxed),
+    })
+}
+
+pub fn nan_beacon_age_ms() -> Option<u32> {
+    beacon_age_ms(last_beacon_local_us())
+}
+
+pub fn ap_beacon_age_ms() -> Option<u32> {
+    beacon_age_ms(load_u64(&AP_LAST_BEACON_LOCAL_LO, &AP_LAST_BEACON_LOCAL_HI))
+}
+
 pub fn raw_payload(frame: &[u8]) -> Option<&[u8]> {
     raw_command_info(frame).map(|info| info.payload)
 }
@@ -332,30 +401,6 @@ pub fn raw_response_rx_count() -> u32 {
 
 pub fn raw_tx_active() -> bool {
     NAN_RUNNING.load(Ordering::Relaxed)
-}
-
-/// Compact raw-NAN counters suitable for a bounded LoRa ping/pong payload.
-///
-/// Short field names keep the response below the Meshtastic-compatible text
-/// frame budget: `nrun`, management frames, SDF frames, response RX/TX,
-/// prefilter drops, and latest beacon age in milliseconds.
-pub fn ping_health_fields() -> String {
-    let last_beacon = last_beacon_local_us();
-    let beacon_age_ms = if last_beacon == 0 {
-        u64::MAX
-    } else {
-        now_us().saturating_sub(last_beacon) / 1_000
-    };
-    format!(
-        "nrun={} nmg={} nsdf={} nrx={} ntx={} ndrop={} nage={}",
-        NAN_RUNNING.load(Ordering::Relaxed) as u8,
-        NAN_RX_MGMT.load(Ordering::Relaxed),
-        NAN_RX_SDF.load(Ordering::Relaxed),
-        NAN_RAW_RESPONSE_RX.load(Ordering::Relaxed),
-        NAN_RAW_RESPONSE_TX.load(Ordering::Relaxed),
-        NAN_RX_PREFILTER_DROPS.load(Ordering::Relaxed),
-        beacon_age_ms,
-    )
 }
 
 pub fn sync_to_next_discovery_window(timeout_ms: u64, dw_tu: u64, offset_tu: u64) -> u64 {
@@ -845,6 +890,20 @@ fn now_us() -> u64 {
     unsafe { sys::esp_timer_get_time().max(0) as u64 }
 }
 
+fn load_u64(low: &AtomicU32, high: &AtomicU32) -> u64 {
+    ((high.load(Ordering::Relaxed) as u64) << 32) | low.load(Ordering::Relaxed) as u64
+}
+
+fn store_u64(low: &AtomicU32, high: &AtomicU32, value: u64) {
+    low.store(value as u32, Ordering::Relaxed);
+    high.store((value >> 32) as u32, Ordering::Relaxed);
+}
+
+fn beacon_age_ms(local_us: u64) -> Option<u32> {
+    (local_us != 0)
+        .then(|| (now_us().saturating_sub(local_us) / 1_000).min(u64::from(u32::MAX)) as u32)
+}
+
 fn store_last_beacon_local_us(value: u64) {
     NAN_LAST_BEACON_LOCAL_LO.store(value as u32, Ordering::Relaxed);
     NAN_LAST_BEACON_LOCAL_HI.store((value >> 32) as u32, Ordering::Relaxed);
@@ -856,13 +915,11 @@ fn store_last_beacon_tsf_us(value: u64) {
 }
 
 fn last_beacon_local_us() -> u64 {
-    ((NAN_LAST_BEACON_LOCAL_HI.load(Ordering::Relaxed) as u64) << 32)
-        | NAN_LAST_BEACON_LOCAL_LO.load(Ordering::Relaxed) as u64
+    load_u64(&NAN_LAST_BEACON_LOCAL_LO, &NAN_LAST_BEACON_LOCAL_HI)
 }
 
 fn last_beacon_tsf_us() -> u64 {
-    ((NAN_LAST_BEACON_TSF_HI.load(Ordering::Relaxed) as u64) << 32)
-        | NAN_LAST_BEACON_TSF_LO.load(Ordering::Relaxed) as u64
+    load_u64(&NAN_LAST_BEACON_TSF_LO, &NAN_LAST_BEACON_TSF_HI)
 }
 
 fn enqueue_raw_command(source: [u8; 6], instance: u8, payload: &[u8]) -> bool {
@@ -1143,26 +1200,28 @@ pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
     NAN_RX_MGMT.fetch_add(1, Ordering::Relaxed);
     NAN_RX_BYTES.fetch_add(frame.len() as u32, Ordering::Relaxed);
     super::wifi::observe_promiscuous_frame(frame, _rssi);
+    if frame.first() == Some(&0x80) {
+        observe_sync_beacon(frame, _rssi);
+    }
     let custom_raw_action = super::wifi::custom_raw_action_payload(frame);
     if custom_raw_action.is_none() && !matches_filter(frame) {
         return;
     }
     NAN_RX_MATCHED.fetch_add(1, Ordering::Relaxed);
-    telemetry::record_packet(
-        "wifi",
-        Direction::Rx,
-        frame,
-        format!("source=nan subtype=0x{:02x}", frame[0]),
-    );
+    // AP recovery scans may observe many unrelated beacons. Keep their timing
+    // state but do not retain every full beacon in bounded telemetry.
+    if frame.first() != Some(&0x80) || is_nan_bssid(frame) || is_direct_dmesh_ssid(frame) {
+        telemetry::record_packet(
+            "wifi",
+            Direction::Rx,
+            frame,
+            format!("source=nan subtype=0x{:02x}", frame[0]),
+        );
+    }
     match frame[0] {
         0x80 => {
             if is_nan_bssid(frame) {
                 NAN_RX_BEACON.fetch_add(1, Ordering::Relaxed);
-                super::wifi::observe_beacon(frame);
-                if let Some(tsf) = beacon_tsf_us(frame) {
-                    store_last_beacon_local_us(now_us());
-                    store_last_beacon_tsf_us(tsf);
-                }
             }
         }
         0xd0 => {
@@ -1212,6 +1271,35 @@ pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
     }
 }
 
+fn observe_sync_beacon(frame: &[u8], rssi: i32) {
+    let Some(tsf_us) = beacon_tsf_us(frame) else {
+        return;
+    };
+    let local_us = now_us();
+    if is_nan_bssid(frame) {
+        store_last_beacon_local_us(local_us);
+        store_last_beacon_tsf_us(tsf_us);
+        super::wifi::observe_beacon(frame);
+        return;
+    }
+
+    let Some(interval_tu) = beacon_interval_tu(frame) else {
+        return;
+    };
+    let Some(bssid) = frame.get(FRAME_BSSID..FRAME_BSSID + 6) else {
+        return;
+    };
+    AP_RX_BEACON.fetch_add(1, Ordering::Relaxed);
+    store_u64(&AP_LAST_BEACON_LOCAL_LO, &AP_LAST_BEACON_LOCAL_HI, local_us);
+    store_u64(&AP_LAST_BEACON_TSF_LO, &AP_LAST_BEACON_TSF_HI, tsf_us);
+    AP_LAST_BEACON_INTERVAL_TU.store(interval_tu, Ordering::Relaxed);
+    AP_LAST_BEACON_RSSI.store(rssi as u32, Ordering::Relaxed);
+    for (index, byte) in bssid.iter().enumerate() {
+        AP_LAST_BEACON_BSSID[index].store(*byte, Ordering::Relaxed);
+    }
+    AP_LAST_BEACON_DIRECT.store(is_direct_dmesh_ssid(frame), Ordering::Relaxed);
+}
+
 fn is_nan_bssid(frame: &[u8]) -> bool {
     frame.len() > FRAME_BSSID + 3
         && frame[FRAME_BSSID] == 0x50
@@ -1222,6 +1310,32 @@ fn is_nan_bssid(frame: &[u8]) -> bool {
 fn beacon_tsf_us(frame: &[u8]) -> Option<u64> {
     let tsf = frame.get(FRAME_DATA..FRAME_DATA + 8)?;
     Some(u64::from_le_bytes(tsf.try_into().ok()?))
+}
+
+fn beacon_interval_tu(frame: &[u8]) -> Option<u32> {
+    let bytes = frame.get(FRAME_DATA + 8..FRAME_DATA + 10)?;
+    let interval = u16::from_le_bytes(bytes.try_into().ok()?) as u32;
+    (interval >= 1).then_some(interval)
+}
+
+fn is_direct_dmesh_ssid(frame: &[u8]) -> bool {
+    let mut offset = FRAME_DATA + 12;
+    while offset + 2 <= frame.len() {
+        let id = frame[offset];
+        let len = frame[offset + 1] as usize;
+        let start = offset + 2;
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if end > frame.len() {
+            return false;
+        }
+        if id == 0 && frame[start..end].starts_with(b"DIRECT-DMESH-") {
+            return true;
+        }
+        offset = end;
+    }
+    false
 }
 
 fn is_nan_sdf(frame: &[u8]) -> bool {
@@ -1252,6 +1366,7 @@ fn matches_filter(frame: &[u8]) -> bool {
         FILTER_ACTION => frame.first() == Some(&0xd0),
         FILTER_BEACON => frame.first() == Some(&0x80),
         FILTER_SDF => is_nan_sdf(frame),
+        FILTER_SYNC => frame.first() == Some(&0x80) || is_nan_bssid(frame),
         _ => is_nan_bssid(frame),
     }
 }
@@ -1268,8 +1383,15 @@ fn stats() -> String {
         .lock()
         .map(|queue| queue.len())
         .unwrap_or(0);
+    let ap = last_ap_sync_beacon();
+    let ap_age_ms = ap_beacon_age_ms()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let ap_bssid = ap
+        .map(|value| format_mac(&value.bssid))
+        .unwrap_or_else(|| "none".to_string());
     format!(
-        "nan support=raw running={} filter={} bssid_filter={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={}",
+        "nan support=raw running={} filter={} bssid_filter={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={}",
         NAN_RUNNING.load(Ordering::Relaxed),
         filter_name(),
         NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
@@ -1277,6 +1399,12 @@ fn stats() -> String {
         NAN_RX_MATCHED.load(Ordering::Relaxed),
         NAN_RX_ACTION.load(Ordering::Relaxed),
         NAN_RX_BEACON.load(Ordering::Relaxed),
+        AP_RX_BEACON.load(Ordering::Relaxed),
+        ap_bssid,
+        ap.map(|value| value.direct).unwrap_or(false),
+        ap.map(|value| value.interval_tu).unwrap_or(0),
+        AP_LAST_BEACON_RSSI.load(Ordering::Relaxed) as i32,
+        ap_age_ms,
         NAN_RX_SDF.load(Ordering::Relaxed),
         NAN_RX_OTHER.load(Ordering::Relaxed),
         NAN_RX_BYTES.load(Ordering::Relaxed),
@@ -1300,6 +1428,7 @@ fn parse_filter_mode(value: &str) -> Result<u32> {
         "action" => Ok(FILTER_ACTION),
         "beacon" => Ok(FILTER_BEACON),
         "sdf" => Ok(FILTER_SDF),
+        "sync" => Ok(FILTER_SYNC),
         _ => bail!("unknown nan filter {value}"),
     }
 }
@@ -1311,6 +1440,7 @@ fn filter_name() -> &'static str {
         FILTER_ACTION => "action",
         FILTER_BEACON => "beacon",
         FILTER_SDF => "sdf",
+        FILTER_SYNC => "sync",
         _ => "nan",
     }
 }

@@ -120,7 +120,14 @@ impl Settings {
                 "cm.wake_ms",
                 "cm.lora",
                 "nan.active_ms",
+                "nan.ap_beacon_tu",
+                "nan.ap_loss_ms",
+                "nan.ap_owner",
+                "nan.ap_recovery_listen_ms",
+                "nan.ap_recovery_ms",
+                "nan.ap_slot_tu",
                 "nan.backend",
+                "nan.boot",
                 "nan.channel",
                 "nan.dw_off_tu",
                 "nan.dw_tu",
@@ -128,10 +135,12 @@ impl Settings {
                 "nan.light_sleep",
                 "nan.role",
                 "nan.service",
+                "nan.sync_source",
                 "nan.early_ms",
                 "nan.wake_ms",
                 "power.profile",
                 "uart.active_ms",
+                "uart.hb_every",
             ],
         }
     }
@@ -151,7 +160,7 @@ impl Settings {
 
         if let Some(nvs) = &self.nvs {
             let mut buf = [0_u8; STRING_BUF_LEN];
-            if let Some(value) = nvs.get_str(key, &mut buf)? {
+            if let Some(value) = nvs.get_str(storage_key(key), &mut buf)? {
                 return Ok(Some(value.to_string()));
             }
         }
@@ -160,12 +169,24 @@ impl Settings {
     }
 
     pub fn set_str(&mut self, key: &str, value: &str) -> Result<()> {
-        validate_key(key)?;
+        validate_key(storage_key(key))?;
         validate_value(value)?;
+        let heartbeat_every = if key == "uart.hb_every" {
+            let every = parse_i32(value)?;
+            if every < 0 {
+                return Err(anyhow!("uart.hb_every must be zero or positive"));
+            }
+            Some(every as u32)
+        } else {
+            None
+        };
         if let Some(nvs) = &mut self.nvs {
-            nvs.set_str(key, value)?;
+            nvs.set_str(storage_key(key), value)?;
         }
         self.cache.insert(key.to_string(), value.to_string());
+        if let Some(every) = heartbeat_every {
+            super::serial::set_heartbeat_every(every);
+        }
         super::telemetry::record_log(format!(
             "ev=nvs.set key={} value={}",
             key,
@@ -194,6 +215,17 @@ impl Settings {
 
     pub fn set_bool(&mut self, key: &str, value: bool) -> Result<()> {
         self.set_str(key, if value { "true" } else { "false" })
+    }
+}
+
+/// ESP-IDF NVS keys are limited to 15 bytes. Keep public settings descriptive
+/// and map only the overlong Wi-Fi fallback keys at the persistence boundary.
+fn storage_key(key: &str) -> &str {
+    match key {
+        "nan.ap_beacon_tu" => "nap_beacon",
+        "nan.ap_recovery_ms" => "nap_recover",
+        "nan.ap_recovery_listen_ms" => "nap_listen",
+        _ => key,
     }
 }
 

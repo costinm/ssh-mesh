@@ -209,15 +209,13 @@ pub fn send_text(settings: &SharedSettings, text: &str, hop_limit: u8) -> Result
     )
 }
 
-pub fn send_raw_text(settings: &SharedSettings, text: &str) -> Result<String> {
-    send_payload(
-        settings,
-        text.as_bytes(),
-        FrameKind::Raw,
-        Some(0),
-        None,
-        2000,
-    )
+/// Send opaque modem-control bytes without imposing a text encoding.
+///
+/// Raw-NAN, raw Wi-Fi, and LoRa share compact-CBOR command packets. Keeping
+/// this byte-oriented avoids accidentally putting a legacy text ping on one
+/// radio while the others carry CBOR.
+pub fn send_raw(settings: &SharedSettings, payload: &[u8]) -> Result<String> {
+    send_payload(settings, payload, FrameKind::Raw, Some(0), None, 2000)
 }
 
 pub fn transport(settings: SharedSettings) -> LoraTransport {
@@ -1636,6 +1634,7 @@ fn record_background_packet(packet: &Packet, source: &str, local_node: Option<u3
         packet.rssi,
         packet.snr
     );
+    super::serial::on_radio_packet_received();
     telemetry::record_log(line.clone());
     telemetry::emit_console(&line);
     emit_dmesh_control_packet(packet, source);

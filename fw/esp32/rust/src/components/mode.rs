@@ -21,6 +21,11 @@ const DEFAULT_NAN_ACTIVE_MS: u32 = 250;
 const DEFAULT_NAN_WAKE_EARLY_MS: u32 = 5;
 const DEFAULT_NAN_DW_TU: u32 = 512;
 const DEFAULT_NAN_DW_OFFSET_TU: u32 = 0;
+const DEFAULT_AP_LOSS_MS: u32 = 5_000;
+const DEFAULT_AP_RECOVERY_MS: u32 = 32_000;
+const DEFAULT_AP_RECOVERY_LISTEN_MS: u32 = 1_200;
+const DEFAULT_AP_SLOT_TU: u32 = 4_000;
+const DEFAULT_AP_BEACON_TU: u16 = 500;
 const RAW_NAN_DW_HISTORY_LEN: usize = 8;
 const RAW_NAN_DW_FLAG_DW0: u32 = 1 << 0;
 const RAW_NAN_DW_FLAG_SYNC: u32 = 1 << 1;
@@ -38,6 +43,16 @@ static COMPANION_PENDING_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ENABLED: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_SYNC_SOURCE: AtomicU8 = AtomicU8::new(SYNC_SOURCE_NONE);
+static RAW_NAN_RECOVERY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_RECOVERY_RUNS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_RECOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AP_OWNER_RUNNING: AtomicBool = AtomicBool::new(false);
+static AP_OWNER_AP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AP_OWNER_STARTED_MS: AtomicU32 = AtomicU32::new(0);
+static AP_OWNER_UART_NEXT_MS: AtomicU32 = AtomicU32::new(0);
+static AP_OWNER_STARTS: AtomicU32 = AtomicU32::new(0);
+static AP_OWNER_STOPS: AtomicU32 = AtomicU32::new(0);
 // Infra active mode is a runtime-only override for a powered gateway or a
 // bounded bulk transfer. It deliberately does not persist in NVS: reset must
 // always return a battery node to its configured raw-NAN duty cycle.
@@ -78,6 +93,18 @@ static PING_RX: AtomicU32 = AtomicU32::new(0);
 static PING_TX: AtomicU32 = AtomicU32::new(0);
 static PING_LAST_RX_RSSI_DBM: AtomicI32 = AtomicI32::new(0);
 static PING_LAST_RX_RSSI_VALID: AtomicBool = AtomicBool::new(false);
+
+const SYNC_SOURCE_NONE: u8 = 0;
+const SYNC_SOURCE_NAN: u8 = 1;
+const SYNC_SOURCE_DIRECT_AP: u8 = 2;
+const SYNC_SOURCE_AP: u8 = 3;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SyncPolicy {
+    Auto,
+    NanOnly,
+    ApOnly,
+}
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
     registry.register(ModeCommand { settings });
@@ -140,6 +167,7 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
     COMPANION_ADVERTISING.store(true, Ordering::Relaxed);
     COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
     COMPANION_DEADLINE_MS.store(now_ms().wrapping_add(window_ms), Ordering::Relaxed);
+    stop_ap_owner().ok();
     stop_raw_nan_duty();
     super::nan::stop_nan().ok();
     super::wifi::stop_raw_monitor().ok();
@@ -152,7 +180,11 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
 
 pub fn poll(settings: &SharedSettings) {
     poll_infra_active_session();
-    poll_raw_nan_duty(settings);
+    if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
+        poll_ap_owner(settings);
+    } else {
+        poll_raw_nan_duty(settings);
+    }
 
     let response_due = PING_RESPONSE_NOT_BEFORE_MS.load(Ordering::Relaxed);
     if PING_RESPONSE_PENDING.load(Ordering::Relaxed)
@@ -374,30 +406,6 @@ fn ping_hash(payload: &[u8]) -> u32 {
     })
 }
 
-pub fn status_pong_text(_settings: &SharedSettings, source: &'static str) -> String {
-    let from = local_suffix4_hex().unwrap_or_else(|_| "00000000".to_string());
-    let rssi = if PING_LAST_RX_RSSI_VALID.load(Ordering::Relaxed) {
-        format!(
-            " rx_rssi_dbm={}",
-            PING_LAST_RX_RSSI_DBM.load(Ordering::Relaxed)
-        )
-    } else {
-        String::new()
-    };
-    let mut payload = format!(
-        "dmesh.pong type=status reply=true source={} from={} uptime_ms={}{} {}",
-        source,
-        from,
-        now_ms(),
-        rssi,
-        super::nan::ping_health_fields()
-    );
-    if payload.len() > 220 {
-        payload.truncate(220);
-    }
-    payload
-}
-
 fn enter_companion_advertising(
     settings: &SharedSettings,
     window_ms: u32,
@@ -409,6 +417,7 @@ fn enter_companion_advertising(
     if reason != "pending" {
         COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
     }
+    stop_ap_owner().ok();
     stop_raw_nan_duty();
     super::nan::stop_nan().ok();
     super::wifi::stop_raw_monitor().ok();
@@ -451,6 +460,7 @@ fn enter_companion_sleep(settings: &SharedSettings) -> Result<()> {
         return enter_companion_advertising(settings, window_ms, adv_ms, "pending");
     }
 
+    stop_ap_owner().ok();
     stop_raw_nan_duty();
     super::nan::stop_nan().ok();
     super::wifi::stop_raw_monitor().ok();
@@ -476,12 +486,18 @@ fn start_infra_radios(settings: &SharedSettings, reason: &'static str) -> Result
     let channel =
         get_u32(settings, "nan.channel", get_u32(settings, "raw.ch", 6)).clamp(1, 13) as u8;
     if get_bool(settings, "wifi.enabled", true) {
-        start_raw_nan_duty(settings, reason, channel)?;
+        if get_bool(settings, "nan.ap_owner", false) {
+            start_ap_owner(settings, reason, channel)?;
+        } else {
+            stop_ap_owner().ok();
+            start_raw_nan_duty(settings, reason, channel)?;
+        }
         telemetry::record_log(format!(
             "event type=mode.infra_radio medium=wifi profile=discovery_window channel={} reason={}",
             channel, reason
         ));
     } else {
+        stop_ap_owner().ok();
         stop_raw_nan_duty();
         super::nan::stop_nan().ok();
         super::wifi::stop_raw_monitor().ok();
@@ -560,11 +576,140 @@ fn lora_boot_enabled(settings: &SharedSettings) -> bool {
     }
 }
 
+fn sync_policy(settings: &SharedSettings) -> SyncPolicy {
+    match settings
+        .borrow()
+        .get_str("nan.sync_source")
+        .ok()
+        .flatten()
+        .as_deref()
+    {
+        Some("nan_only") | Some("nan") => SyncPolicy::NanOnly,
+        Some("ap_only") | Some("ap") => SyncPolicy::ApOnly,
+        _ => SyncPolicy::Auto,
+    }
+}
+
+fn start_ap_owner(settings: &SharedSettings, reason: &'static str, channel: u8) -> Result<()> {
+    if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
+        stop_ap_owner()?;
+    }
+    stop_raw_nan_duty();
+    AP_OWNER_RUNNING.store(true, Ordering::Relaxed);
+    AP_OWNER_STARTED_MS.store(now_ms(), Ordering::Relaxed);
+    AP_OWNER_UART_NEXT_MS.store(0, Ordering::Relaxed);
+    AP_OWNER_AP_ACTIVE.store(false, Ordering::Relaxed);
+    RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
+    AP_OWNER_UART_NEXT_MS.store(0, Ordering::Relaxed);
+    super::nan::start_raw_window(channel, "nan")?;
+    telemetry::record_log(format!(
+        "event type=mode.ap_owner state=watching channel={} reason={} sync_policy={}",
+        channel,
+        reason,
+        sync_policy_name(sync_policy(settings))
+    ));
+    if sync_policy(settings) == SyncPolicy::ApOnly {
+        start_ap_owner_fallback(settings, channel)?;
+    }
+    Ok(())
+}
+
+fn stop_ap_owner() -> Result<()> {
+    if !AP_OWNER_RUNNING.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+    if AP_OWNER_AP_ACTIVE.swap(false, Ordering::AcqRel) {
+        super::nan::stop_nan().ok();
+        super::wifi::stop_direct_ap_beacon_source()?;
+        AP_OWNER_STOPS.fetch_add(1, Ordering::Relaxed);
+    }
+    RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
+    Ok(())
+}
+
+fn start_ap_owner_fallback(settings: &SharedSettings, channel: u8) -> Result<()> {
+    if AP_OWNER_AP_ACTIVE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    super::nan::stop_nan().ok();
+    let beacon_tu = get_u32(settings, "nan.ap_beacon_tu", DEFAULT_AP_BEACON_TU as u32)
+        .clamp(100, 60_000) as u16;
+    let ssid = super::wifi::start_direct_ap_beacon_source(channel, beacon_tu)?;
+    // Re-arm the management callback without changing AP mode.
+    super::nan::start_raw_window(channel, "nan")?;
+    AP_OWNER_AP_ACTIVE.store(true, Ordering::Relaxed);
+    AP_OWNER_STARTS.fetch_add(1, Ordering::Relaxed);
+    RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_DIRECT_AP, Ordering::Relaxed);
+    telemetry::record_log(format!(
+        "event type=mode.ap_owner state=ap_started ssid={} channel={} beacon_tu={} sleep_inhibited=ap",
+        ssid, channel, beacon_tu
+    ));
+    Ok(())
+}
+
+fn poll_ap_owner(settings: &SharedSettings) {
+    // An AP owner keeps Wi-Fi powered rather than entering raw-NAN duty sleep,
+    // so it has no regular duty callback to emit the UART heartbeat. Keep the
+    // host modem contract identical to battery nodes: one bounded UART window
+    // per configured wake cadence, without extending it from UART output.
+    let now = now_ms();
+    let next_uart = AP_OWNER_UART_NEXT_MS.load(Ordering::Relaxed);
+    if next_uart == 0 || now.wrapping_sub(next_uart) < i32::MAX as u32 {
+        let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(100, 5_000);
+        let wake_ms =
+            get_u32(settings, "nan.wake_ms", DEFAULT_NAN_DUTY_MS).clamp(active_ms, 60_000);
+        let _ = super::serial::on_raw_nan_wake(active_ms);
+        AP_OWNER_UART_NEXT_MS.store(now.wrapping_add(wake_ms), Ordering::Relaxed);
+    }
+    let channel = get_u32(settings, "nan.channel", 6).clamp(1, 13) as u8;
+    let policy = sync_policy(settings);
+    let nan_fresh = super::nan::nan_beacon_age_ms()
+        .is_some_and(|age| age <= get_u32(settings, "nan.ap_loss_ms", DEFAULT_AP_LOSS_MS));
+    let owner_age_ms = now_ms().wrapping_sub(AP_OWNER_STARTED_MS.load(Ordering::Relaxed));
+    let loss_ms = get_u32(settings, "nan.ap_loss_ms", DEFAULT_AP_LOSS_MS);
+    let should_run_ap = policy == SyncPolicy::ApOnly
+        || (policy == SyncPolicy::Auto && !nan_fresh && owner_age_ms >= loss_ms);
+
+    if should_run_ap {
+        if let Err(err) = start_ap_owner_fallback(settings, channel) {
+            telemetry::record_log(format!(
+                "event type=mode.ap_owner state=ap_start_failed msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        }
+        return;
+    }
+
+    RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NAN, Ordering::Relaxed);
+    if AP_OWNER_AP_ACTIVE.swap(false, Ordering::AcqRel) {
+        super::nan::stop_nan().ok();
+        if let Err(err) = super::wifi::stop_direct_ap_beacon_source() {
+            telemetry::record_log(format!(
+                "event type=mode.ap_owner state=ap_stop_failed msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+            return;
+        }
+        AP_OWNER_STOPS.fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = super::nan::start_raw_window(channel, "mgmt") {
+            telemetry::record_log(format!(
+                "event type=mode.ap_owner state=nan_watch_failed msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        } else {
+            telemetry::record_log("event type=mode.ap_owner state=nan_detected ap_stopped=true");
+        }
+    }
+}
+
 fn start_raw_nan_duty(
     settings: &SharedSettings,
     reason: &'static str,
     default_channel: u8,
 ) -> Result<()> {
+    if get_bool(settings, "nan.ap_owner", false) {
+        return start_ap_owner(settings, reason, default_channel);
+    }
     #[cfg(target_feature = "esp32s3ops")]
     {
         if matches!(reason, "boot" | "boot_window_done") && !get_bool(settings, "nan.boot", false) {
@@ -591,17 +736,30 @@ fn start_raw_nan_duty(
     // The production duty window must accept NAN sync beacons as well as DMesh
     // SDF follow-ups.  SDF-only filtering prevents TSF capture, so the next
     // window can never be aligned to the powered Android/Linux NAN cluster.
-    super::nan::start_raw_window(channel, "nan")?;
+    let initial_recovery = sync_policy(settings) == SyncPolicy::ApOnly;
+    super::nan::start_raw_window(channel, sync_window_filter(settings, initial_recovery))?;
     record_raw_nan_dw_start(dw_offset_tu, false, light_sleep);
     RAW_NAN_DUTY_ENABLED.store(true, Ordering::Relaxed);
     RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
-    RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(active_ms), Ordering::Relaxed);
+    let initial_window_ms = if initial_recovery {
+        RAW_NAN_RECOVERY_RUNS.fetch_add(1, Ordering::Relaxed);
+        get_u32(
+            settings,
+            "nan.ap_recovery_listen_ms",
+            DEFAULT_AP_RECOVERY_LISTEN_MS,
+        )
+        .max(active_ms)
+    } else {
+        active_ms
+    };
+    RAW_NAN_RECOVERY_ACTIVE.store(initial_recovery, Ordering::Relaxed);
+    RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(initial_window_ms), Ordering::Relaxed);
     if matches!(reason, "boot" | "boot_window_done") {
         let _ = queue_boot_discovery(settings, reason);
     }
     let queued_sent = super::nan::drain_raw_queue();
     telemetry::record_log(format!(
-        "event type=mode.infra_radio medium=nan status=raw_duty channel={} reason={} duty_ms={} active_ms={} light_sleep={} wake_early_ms={} dw_tu={} dw_offset_tu={} queued_sent={}",
+        "event type=mode.infra_radio medium=nan status=raw_duty channel={} reason={} duty_ms={} active_ms={} light_sleep={} wake_early_ms={} dw_tu={} dw_offset_tu={} sync_policy={} queued_sent={}",
         channel,
         reason,
         duty_ms,
@@ -610,6 +768,7 @@ fn start_raw_nan_duty(
         wake_early_ms,
         dw_tu,
         dw_offset_tu,
+        sync_policy_name(sync_policy(settings)),
         queued_sent
     ));
     Ok(())
@@ -627,7 +786,7 @@ fn ensure_infra_active_radios(settings: &SharedSettings, reason: &'static str) -
         start_raw_nan_duty(settings, reason, channel)?;
     } else if !RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
         arm_raw_nan_beacon_window(None);
-        super::nan::start_raw_window(channel, "nan")?;
+        super::nan::start_raw_window(channel, sync_window_filter(settings, false))?;
         let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(50, 60_000);
         let queued_sent = super::nan::drain_raw_queue();
         record_raw_nan_dw_start(
@@ -650,10 +809,95 @@ pub fn stop_raw_nan_duty() {
     RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
     RAW_NAN_DUTY_NEXT_MS.store(0, Ordering::Relaxed);
     RAW_NAN_MISS_BACKOFF_MS.store(0, Ordering::Relaxed);
+    RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
 }
 
 pub fn raw_nan_duty_enabled() -> bool {
     RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed)
+}
+
+fn selected_sync_beacon(settings: &SharedSettings) -> Option<(u8, super::nan::SyncBeacon)> {
+    let policy = sync_policy(settings);
+    let nan_loss_ms = get_u32(settings, "nan.ap_loss_ms", DEFAULT_AP_LOSS_MS);
+    if policy != SyncPolicy::ApOnly {
+        if let Some(beacon) = super::nan::last_nan_sync_beacon() {
+            if super::nan::nan_beacon_age_ms().is_some_and(|age| age <= nan_loss_ms) {
+                return Some((SYNC_SOURCE_NAN, beacon));
+            }
+        }
+    }
+    if policy != SyncPolicy::NanOnly {
+        if let Some(beacon) = super::nan::last_ap_sync_beacon() {
+            let max_age = get_u32(settings, "nan.ap_recovery_ms", DEFAULT_AP_RECOVERY_MS)
+                .saturating_add(get_u32(
+                    settings,
+                    "nan.ap_recovery_listen_ms",
+                    DEFAULT_AP_RECOVERY_LISTEN_MS,
+                ));
+            if super::nan::ap_beacon_age_ms().is_some_and(|age| age <= max_age) {
+                return Some((
+                    if beacon.direct {
+                        SYNC_SOURCE_DIRECT_AP
+                    } else {
+                        SYNC_SOURCE_AP
+                    },
+                    beacon,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn sync_window_filter(settings: &SharedSettings, recovery: bool) -> &'static str {
+    if recovery || sync_policy(settings) == SyncPolicy::ApOnly {
+        "sync"
+    } else {
+        "nan"
+    }
+}
+
+fn sync_policy_name(policy: SyncPolicy) -> &'static str {
+    match policy {
+        SyncPolicy::Auto => "auto",
+        SyncPolicy::NanOnly => "nan_only",
+        SyncPolicy::ApOnly => "ap_only",
+    }
+}
+
+fn sync_source_name(source: u8) -> &'static str {
+    match source {
+        SYNC_SOURCE_NAN => "nan",
+        SYNC_SOURCE_DIRECT_AP => "direct_ap",
+        SYNC_SOURCE_AP => "ap",
+        _ => "none",
+    }
+}
+
+fn sync_wake_plan(
+    settings: &SharedSettings,
+    idle_ms: u32,
+    wake_early_ms: u32,
+    nan_dw_tu: u32,
+    nan_dw_offset_tu: u32,
+) -> Option<(u8, super::wifi::BeaconWakePlan)> {
+    let (source, beacon) = selected_sync_beacon(settings)?;
+    let (period_tu, offset_tu) = if source == SYNC_SOURCE_NAN {
+        (nan_dw_tu, nan_dw_offset_tu)
+    } else {
+        (get_u32(settings, "nan.ap_slot_tu", DEFAULT_AP_SLOT_TU), 0)
+    };
+    let snapshot = super::wifi::BeaconSnapshot {
+        count: 0,
+        local_us: beacon.local_us,
+        tsf_us: beacon.tsf_us,
+    };
+    super::wifi::beacon_wake_plan_from(snapshot, idle_ms, period_tu, offset_tu, wake_early_ms)
+        .map(|plan| (source, plan))
+}
+
+fn deadline_due(now: u32, deadline: u32) -> bool {
+    deadline == 0 || now.wrapping_sub(deadline) < u32::MAX / 2
 }
 
 fn poll_raw_nan_duty(settings: &SharedSettings) {
@@ -676,6 +920,20 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
     let hold_active = infra_radio_hold_active();
+    let source_before_window = selected_sync_beacon(settings).map(|(source, _)| source);
+    let recovery_due = source_before_window.is_none()
+        && sync_policy(settings) != SyncPolicy::NanOnly
+        && deadline_due(now, RAW_NAN_RECOVERY_NEXT_MS.load(Ordering::Relaxed));
+    let window_active_ms = if recovery_due {
+        get_u32(
+            settings,
+            "nan.ap_recovery_listen_ms",
+            DEFAULT_AP_RECOVERY_LISTEN_MS,
+        )
+        .max(active_ms)
+    } else {
+        active_ms
+    };
 
     // A powered gateway, bounded transfer, or locally woken console owns the
     // radio. If duty sleep had already stopped Wi-Fi, bring it up immediately;
@@ -707,7 +965,10 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
             return;
         }
-        finish_raw_nan_beacon_window();
+        let recovery_window = RAW_NAN_RECOVERY_ACTIVE.swap(false, Ordering::AcqRel);
+        if RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN {
+            finish_raw_nan_beacon_window();
+        }
         let queued_sent = super::nan::drain_raw_queue();
         super::nan::stop_nan().ok();
         if let Err(err) = super::wifi::stop_raw_wifi_for_sleep() {
@@ -719,7 +980,22 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
         let backoff_ms = RAW_NAN_MISS_BACKOFF_MS.swap(0, Ordering::Relaxed);
         let idle_ms = duty_ms.saturating_sub(active_ms).saturating_add(backoff_ms);
-        let sync_plan = super::wifi::beacon_wake_plan(idle_ms, dw_tu, dw_offset_tu, wake_early_ms);
+        let selected_plan = sync_wake_plan(settings, idle_ms, wake_early_ms, dw_tu, dw_offset_tu);
+        let sync_plan = selected_plan.map(|(_, plan)| plan);
+        let selected_source = selected_plan
+            .map(|(source, _)| source)
+            .unwrap_or(SYNC_SOURCE_NONE);
+        RAW_NAN_SYNC_SOURCE.store(selected_source, Ordering::Relaxed);
+        if recovery_window {
+            RAW_NAN_RECOVERY_NEXT_MS.store(
+                now_ms().wrapping_add(get_u32(
+                    settings,
+                    "nan.ap_recovery_ms",
+                    DEFAULT_AP_RECOVERY_MS,
+                )),
+                Ordering::Relaxed,
+            );
+        }
         let window_delay_ms = sync_plan
             .map(|plan| plan.window_delay_ms)
             .unwrap_or(idle_ms);
@@ -728,7 +1004,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             .unwrap_or_else(|| idle_ms.saturating_sub(wake_early_ms));
         let beacon_age_ms = sync_plan.map(|plan| plan.beacon_age_ms);
         telemetry::record_log(format!(
-            "event type=nan.duty phase=idle channel={} idle_ms={} miss_backoff_ms={} window_delay_ms={} light_sleep={} light_sleep_ms={} wake_early_ms={} sync={} beacon_age_ms={} dw_tu={} dw_offset_tu={} queued_sent={}",
+            "event type=nan.duty phase=idle channel={} idle_ms={} miss_backoff_ms={} window_delay_ms={} light_sleep={} light_sleep_ms={} wake_early_ms={} sync={} sync_source={} recovery={} beacon_age_ms={} dw_tu={} dw_offset_tu={} queued_sent={}",
             channel,
             idle_ms,
             backoff_ms,
@@ -737,6 +1013,8 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             light_sleep_ms,
             wake_early_ms,
             sync_plan.is_some(),
+            sync_source_name(selected_source),
+            recovery_window,
             beacon_age_ms
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_string()),
@@ -769,15 +1047,22 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                 }
             }
             arm_raw_nan_beacon_window(sync_plan);
-            match super::nan::start_raw_window(channel, "nan") {
+            match super::nan::start_raw_window(channel, sync_window_filter(settings, recovery_due))
+            {
                 Ok(()) => {
                     let queued_sent = super::nan::drain_raw_queue();
                     record_raw_nan_dw_start(dw_offset_tu, sync_plan.is_some(), true);
+                    let uart_heartbeat = super::serial::on_raw_nan_wake(active_ms);
                     RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
-                    RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(active_ms), Ordering::Relaxed);
+                    RAW_NAN_RECOVERY_ACTIVE.store(recovery_due, Ordering::Relaxed);
+                    if recovery_due {
+                        RAW_NAN_RECOVERY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    RAW_NAN_DUTY_NEXT_MS
+                        .store(now_ms().wrapping_add(window_active_ms), Ordering::Relaxed);
                     telemetry::record_log(format!(
-                        "event type=nan.duty phase=active channel={} active_ms={} wake=light queued_sent={}",
-                        channel, active_ms, queued_sent
+                        "event type=nan.duty phase=active channel={} active_ms={} wake=light recovery={} queued_sent={} uart_heartbeat={}",
+                        channel, window_active_ms, recovery_due, queued_sent, uart_heartbeat
                     ));
                 }
                 Err(err) => {
@@ -797,18 +1082,23 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
 
     // The non-light-sleep diagnostic path arms its beacon baseline when it
     // schedules the window above. Keep it intact until this delayed start.
-    match super::nan::start_raw_window(channel, "nan") {
+    match super::nan::start_raw_window(channel, sync_window_filter(settings, recovery_due)) {
         Ok(()) => {
             let queued_sent = super::nan::drain_raw_queue();
             // The non-light-sleep diagnostic path does not retain its prior
             // wake plan across polls, so only mark it synchronized when the
             // active window itself was entered from the light-sleep path.
             record_raw_nan_dw_start(dw_offset_tu, false, false);
+            let uart_heartbeat = super::serial::on_raw_nan_wake(active_ms);
             RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
-            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
+            RAW_NAN_RECOVERY_ACTIVE.store(recovery_due, Ordering::Relaxed);
+            if recovery_due {
+                RAW_NAN_RECOVERY_RUNS.fetch_add(1, Ordering::Relaxed);
+            }
+            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_active_ms), Ordering::Relaxed);
             telemetry::record_log(format!(
-                "event type=nan.duty phase=active channel={} active_ms={} queued_sent={}",
-                channel, active_ms, queued_sent
+                "event type=nan.duty phase=active channel={} active_ms={} recovery={} queued_sent={} uart_heartbeat={}",
+                channel, window_active_ms, recovery_due, queued_sent, uart_heartbeat
             ));
         }
         Err(err) => {
@@ -957,7 +1247,7 @@ fn raw_nan_dw_recent_fields() -> String {
 
 pub fn raw_nan_status_fields() -> String {
     format!(
-        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={}",
+        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={} sync_source={} ap_owner={} ap_active={} sleep_inhibited={} ap_owner_start={} ap_owner_stop={} ap_recovery_runs={} ap_recovery_next_ms={}",
         RAW_NAN_DW_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW0_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW_SYNC_TOTAL.load(Ordering::Relaxed),
@@ -969,25 +1259,23 @@ pub fn raw_nan_status_fields() -> String {
         RAW_NAN_BEACON_LATE_NEXT_DW.load(Ordering::Relaxed),
         RAW_NAN_BEACON_DRIFT.load(Ordering::Relaxed),
         RAW_NAN_MISS_BACKOFF_MS.load(Ordering::Relaxed),
+        sync_source_name(RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed)),
+        AP_OWNER_RUNNING.load(Ordering::Relaxed),
+        AP_OWNER_AP_ACTIVE.load(Ordering::Relaxed),
+        if AP_OWNER_AP_ACTIVE.load(Ordering::Relaxed) { "ap" } else { "none" },
+        AP_OWNER_STARTS.load(Ordering::Relaxed),
+        AP_OWNER_STOPS.load(Ordering::Relaxed),
+        RAW_NAN_RECOVERY_RUNS.load(Ordering::Relaxed),
+        RAW_NAN_RECOVERY_NEXT_MS.load(Ordering::Relaxed),
     )
 }
 
-fn queue_boot_discovery(settings: &SharedSettings, source: &'static str) -> Result<()> {
-    let from = local_suffix4_hex()?;
-    let mut payload = format!(
-        "dmesh.ping type=discover source={} reboot=true reply=false to=ffffffff from={} uptime_ms={} {}",
-        source,
-        from,
-        now_ms(),
-        telemetry::stats_text(settings)
-    );
-    if payload.len() > 220 {
-        payload.truncate(220);
-    }
-    super::nan::queue_raw_broadcast(payload.as_bytes())?;
+fn queue_boot_discovery(_settings: &SharedSettings, _source: &'static str) -> Result<()> {
+    let payload = ping_packet(false);
+    super::nan::queue_raw_broadcast(&payload)?;
     telemetry::record_log(format!(
         "event type=mode.discovery queued=true medium=nan from={} len={}",
-        from,
+        local_suffix4_hex()?,
         payload.len()
     ));
     Ok(())
@@ -1011,25 +1299,10 @@ fn send_status_ping(settings: &SharedSettings, source: &'static str) -> Result<(
     if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_COMPANION {
         bail!("companion firmware does not send ping");
     }
-    let mut payload = if source == "rx" {
-        status_pong_text(settings, source)
-    } else {
-        let from = local_suffix4_hex()?;
-        format!(
-            "dmesh.ping type=status reply=false source={} from={} uptime_ms={} {}",
-            source,
-            from,
-            now_ms(),
-            super::nan::ping_health_fields()
-        )
-    };
-    if payload.len() > 180 {
-        payload.truncate(180);
-    }
-    let bytes = payload.as_bytes();
-    let lora = super::lora::send_raw_text(settings, &payload).is_ok();
-    let wifi = super::wifi::forward_management_packet(bytes).is_ok();
-    let nan = super::nan::forward_or_queue_packet(bytes).is_ok();
+    let bytes = ping_packet(source == "rx");
+    let lora = super::lora::send_raw(settings, &bytes).is_ok();
+    let wifi = super::wifi::forward_management_packet(&bytes).is_ok();
+    let nan = super::nan::forward_or_queue_packet(&bytes).is_ok();
     PING_TX.fetch_add(1, Ordering::Relaxed);
     telemetry::record_log(format!(
         "event type=mode.ping_tx source={} len={} lora={} wifi_raw={} nan={}",
@@ -1040,6 +1313,18 @@ fn send_status_ping(settings: &SharedSettings, source: &'static str) -> Result<(
         nan
     ));
     Ok(())
+}
+
+/// Build the shared raw-radio ping envelope. Method 33 is the stable ping
+/// method; status marks a pong so receiving infra nodes do not answer it.
+fn ping_packet(reply: bool) -> Vec<u8> {
+    let mut request = CommandRequest::new_binary(33);
+    if reply {
+        request
+            .args
+            .insert(crate::commands::protocol::CBOR_STATUS, "pong".to_string());
+    }
+    crate::commands::protocol::encode_binary(&request)
 }
 
 fn configured_mode(settings: &SharedSettings) -> u8 {
@@ -1167,6 +1452,7 @@ impl CommandHandler for ModeCommand {
                     super::lora::sleep_radio(&self.settings)?;
                 }
             } else {
+                stop_ap_owner().ok();
                 stop_raw_nan_duty();
                 super::nan::stop_nan().ok();
                 super::wifi::stop_raw_monitor().ok();
@@ -1307,4 +1593,24 @@ fn status_text() -> String {
         PING_TX.load(Ordering::Relaxed),
         raw_nan_status_fields()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ping_packet;
+    use crate::commands::protocol::{decode_binary, CBOR_STATUS};
+
+    #[test]
+    fn radio_ping_packets_are_compact_cbor_status_requests() {
+        let ping = decode_binary(&ping_packet(false)).expect("ping packet must decode as CBOR");
+        assert_eq!(ping.method, 33);
+        assert!(ping.args.is_empty());
+
+        let pong = decode_binary(&ping_packet(true)).expect("pong packet must decode as CBOR");
+        assert_eq!(pong.method, 33);
+        assert_eq!(
+            pong.args.get(&CBOR_STATUS).map(String::as_str),
+            Some("pong")
+        );
+    }
 }

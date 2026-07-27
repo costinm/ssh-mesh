@@ -1,23 +1,29 @@
 {
   "nodes": {
-    "witness": {
+    "lora1": {
       "destination": "lora1.lmesh",
       "capabilities": ["nan", "lora"],
       "reset_on_restore": true,
-      "restore": ["power profile=dfs", "nan start=true backend=raw role=both service=dmesh channel=6", "lora rx=true"]
+      "restore": ["nvs op=set nan.ap_owner=true nan.sync_source=auto", "mode infra=true", "lora rx=true"]
     },
-    "sut": {
+    "lora2": {
       "destination": "lora2.lmesh",
       "capabilities": ["nan", "lora"],
       "reset_on_restore": true,
-      "restore": ["power profile=dfs", "nan start=true backend=raw role=both service=dmesh channel=6", "lora rx=true"]
+      "restore": ["nvs op=set nan.ap_owner=false nan.sync_source=auto", "mode infra=true", "lora rx=true"]
     },
-    "s3": {
-      "destination": "s3-1.lmesh",
-      "capabilities": ["nan"],
+    "lora3": {
+      "destination": "lora3.lmesh",
+      "capabilities": ["nan", "lora"],
+      "reset_on_restore": true,
+      "restore": ["nvs op=set nan.ap_owner=false nan.sync_source=auto", "mode infra=true", "lora rx=true"]
+    },
+    "lora4": {
+      "destination": "lora4.lmesh",
+      "capabilities": ["nan", "lora"],
       "required": false,
       "reset_on_restore": true,
-      "restore": ["power profile=dfs", "nan start=true backend=raw role=both service=dmesh channel=6"]
+      "restore": ["nvs op=set nan.ap_owner=false nan.sync_source=auto", "mode infra=true", "lora rx=true"]
     }
   },
   "power_meters": {
@@ -39,6 +45,16 @@
       "beacon_observe_sec": 6.0,
       "require_beacon": false
     },
+    "ap_sync": {
+      "owner": "lora1",
+      "peers": ["lora2", "lora3", "lora4"],
+      "channel": 6,
+      "wake_ms": 4000,
+      "active_ms": 250,
+      "beacon_tu": 500,
+      "slot_tu": 4000,
+      "settle_sec": 8.0
+    },
     "active_window": {
       "active_ms": 5000,
       "ping_count": 4,
@@ -57,7 +73,7 @@
     },
     "uart": {
       "enabled": true,
-      "nodes": ["witness"],
+      "nodes": ["lora1"],
       "rounds": 3,
       "idle_sec": 21.0,
       "output_probe_delay_sec": 21.0,

@@ -181,6 +181,14 @@ fn nvs_key(tag: u16) -> Option<&'static str> {
         166 => "identity.node",
         167 => "identity.meshtastic",
         301 => "lora.enabled",
+        380 => "nan.sync_source",
+        381 => "nan.ap_owner",
+        382 => "nan.ap_loss_ms",
+        383 => "nan.ap_recovery_ms",
+        384 => "nan.ap_recovery_listen_ms",
+        385 => "nan.ap_slot_tu",
+        386 => "nan.ap_beacon_tu",
+        387 => "uart.hb_every",
         _ => return None,
     })
 }

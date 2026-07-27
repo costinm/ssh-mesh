@@ -7,10 +7,10 @@ target = "xtensa-esp32-espidf"
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
 
 [target.xtensa-esp32-espidf]
-linker = "ldproxy"
+linker = "tools/ldproxy-wrapper.sh"
 
 [target.xtensa-esp32s3-espidf]
-linker = "ldproxy"
+linker = "tools/ldproxy-wrapper.sh"
 
 [unstable]
 build-std = ["std", "panic_abort"]

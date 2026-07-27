@@ -190,13 +190,11 @@ fn send_one_if_active(source: &'static str) -> Result<bool> {
         "status"
     };
     let seq = state.seq.saturating_add(1);
-    let payload = format!(
-        "dmesh.ping type={} test=true seq={} to=ffffffff from={}",
-        kind,
-        seq,
-        local_suffix4_hex().unwrap_or_else(|_| "00000000".to_string())
-    );
-    let queued = super::nan::queue_raw_broadcast(payload.as_bytes())?;
+    // Raw NAN accepts the same compact-CBOR envelope as the other modem
+    // transports. Include the sequence so the receiver's ping de-duplication
+    // does not collapse a continuous test into a single request.
+    let payload = test_ping_packet(seq);
+    let queued = super::nan::queue_raw_broadcast(&payload)?;
     let sent_now = super::nan::drain_raw_queue();
     if sent_now > 0 {
         if kind == "discover" {
@@ -227,6 +225,12 @@ fn send_one_if_active(source: &'static str) -> Result<bool> {
         responses_seen(&state)
     ));
     Ok(sent_now > 0)
+}
+
+fn test_ping_packet(seq: u32) -> Vec<u8> {
+    crate::commands::protocol::encode_binary(
+        &CommandRequest::new_binary(33).arg_pair_by_tag(220, seq.to_string()),
+    )
 }
 
 fn status_text() -> String {
@@ -300,20 +304,6 @@ fn checksum(state: &RtcTestState) -> u32 {
     hash
 }
 
-fn local_suffix4_hex() -> Result<String> {
-    let mut mac = [0_u8; 6];
-    unsafe {
-        esp_ok(sys::esp_read_mac(
-            mac.as_mut_ptr(),
-            sys::esp_mac_type_t_ESP_MAC_WIFI_STA,
-        ))?;
-    }
-    Ok(format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        mac[2], mac[3], mac[4], mac[5]
-    ))
-}
-
 fn last_send_us(state: &RtcTestState) -> u64 {
     ((state.last_send_us_hi as u64) << 32) | state.last_send_us_lo as u64
 }
@@ -330,12 +320,4 @@ fn now_us() -> u64 {
 
 fn now_ms() -> u32 {
     (now_us() / 1000).min(u32::MAX as u64) as u32
-}
-
-fn esp_ok(ret: sys::esp_err_t) -> Result<()> {
-    if ret == sys::ESP_OK {
-        Ok(())
-    } else {
-        Err(anyhow!("esp_err=0x{:x}", ret))
-    }
 }

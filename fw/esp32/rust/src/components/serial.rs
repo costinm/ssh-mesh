@@ -53,6 +53,13 @@ static UART0_OUTPUT_PROBE_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART0_FRAME_DROPS: AtomicU32 = AtomicU32::new(0);
 static UART0_ESCAPE_ERRORS: AtomicU32 = AtomicU32::new(0);
+static UART0_HEARTBEAT_EVERY: AtomicU32 = AtomicU32::new(0);
+static UART0_HEARTBEAT_WAKES: AtomicU32 = AtomicU32::new(0);
+static UART0_HEARTBEAT_SENT: AtomicU32 = AtomicU32::new(0);
+static UART0_HEARTBEAT_DROPPED: AtomicU32 = AtomicU32::new(0);
+static UART0_HEARTBEAT_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
+
+const RADIO_EVENT_UART_WINDOW_MS: u32 = 250;
 
 const UART_FRAME_QUEUE_LEN: u32 = 8;
 // UART carries compact CBOR directly. The generic mesh stream envelope belongs
@@ -99,7 +106,7 @@ pub fn request_uninstall_for_measurement() {
 
 pub fn measurement_status_fields() -> String {
     format!(
-        "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_frame_drop={} uart_escape_err={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
+        "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_frame_drop={} uart_escape_err={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_hb_every={} uart_hb_wakes={} uart_hb_sent={} uart_hb_dropped={} uart_hb_window_ms={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
         UART0_DRIVER_INSTALLED.load(Ordering::Relaxed),
         is_active(),
         !UART0_SUSPENDED_UNTIL_DTR.load(Ordering::Relaxed),
@@ -110,6 +117,11 @@ pub fn measurement_status_fields() -> String {
         UART0_ESCAPE_ERRORS.load(Ordering::Relaxed),
         UART0_TX_DROPS_IDLE.load(Ordering::Relaxed),
         UART0_TX_DROPS_QUEUE.load(Ordering::Relaxed),
+        UART0_HEARTBEAT_EVERY.load(Ordering::Relaxed),
+        UART0_HEARTBEAT_WAKES.load(Ordering::Relaxed),
+        UART0_HEARTBEAT_SENT.load(Ordering::Relaxed),
+        UART0_HEARTBEAT_DROPPED.load(Ordering::Relaxed),
+        UART0_HEARTBEAT_WINDOW_MS.load(Ordering::Relaxed),
         UART0_OUTPUT_PROBE_ATTEMPTS.load(Ordering::Relaxed),
         UART0_OUTPUT_PROBE_SENT.load(Ordering::Relaxed),
         UART0_OUTPUT_PROBE_DROPPED.load(Ordering::Relaxed),
@@ -144,7 +156,75 @@ pub fn configure_active_window(settings: &SharedSettings) {
     // so a short window is sufficient and avoids holding PM locks for 20 seconds.
     let active_ms = configured_ms.max(MIN_ACTIVE_MS);
     UART0_ACTIVE_WINDOW_MS.store(active_ms, Ordering::Relaxed);
+    set_heartbeat_every(
+        settings
+            .borrow()
+            .get_i32("uart.hb_every", 0)
+            .unwrap_or(0)
+            .max(0) as u32,
+    );
     activate_window();
+}
+
+/// Configure the raw-NAN wake heartbeat cadence.
+///
+/// Zero suppresses both periodic heartbeats and radio-event UART activation.
+/// A nonzero value emits one empty delimiter frame on every Nth raw-NAN wake.
+pub fn set_heartbeat_every(every: u32) {
+    let previous = UART0_HEARTBEAT_EVERY.swap(every, Ordering::AcqRel);
+    if previous != every {
+        UART0_HEARTBEAT_WAKES.store(0, Ordering::Release);
+    }
+}
+
+/// Open the console window and emit an empty UART delimiter frame.
+///
+/// The empty `0x7e 0x7e` frame is transport activity only: lmesh consumes it
+/// locally and uses it to flush queued host-to-firmware records.
+fn activate_window_for(window_ms: u32) {
+    if !UART0_DRIVER_INSTALLED.load(Ordering::Acquire) {
+        return;
+    }
+    UART0_DEBUG_ENABLED.store(true, Ordering::Release);
+    let until = now_ms().wrapping_add(window_ms.max(1));
+    let current = UART0_ACTIVE_UNTIL_MS.load(Ordering::Acquire);
+    if current == 0 || time_after_or_equal(until, current) {
+        UART0_ACTIVE_UNTIL_MS.store(until, Ordering::Release);
+    }
+    let _ = ensure_power_locks();
+}
+
+fn emit_heartbeat(window_ms: u32) -> bool {
+    UART0_HEARTBEAT_WINDOW_MS.store(window_ms, Ordering::Relaxed);
+    activate_window_for(window_ms);
+    if write_wire_bytes(&[UART_PPP_FLAG, UART_PPP_FLAG]) {
+        UART0_HEARTBEAT_SENT.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        UART0_HEARTBEAT_DROPPED.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// Account for a raw-NAN duty wake and emit its configured heartbeat.
+pub fn on_raw_nan_wake(active_ms: u32) -> bool {
+    let every = UART0_HEARTBEAT_EVERY.load(Ordering::Acquire);
+    if every == 0 {
+        return false;
+    }
+    let wake = UART0_HEARTBEAT_WAKES.fetch_add(1, Ordering::AcqRel) + 1;
+    wake % every == 0 && emit_heartbeat(active_ms)
+}
+
+/// Surface a received LoRa/FSK packet over UART when heartbeat delivery is enabled.
+///
+/// Unlike periodic duty wakes this is event-driven: any enabled radio receive
+/// opens one bounded UART window so the following notification can be sent.
+pub fn on_radio_packet_received() -> bool {
+    if UART0_HEARTBEAT_EVERY.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    emit_heartbeat(RADIO_EVENT_UART_WINDOW_MS)
 }
 
 /// Start the single UART ingress task after UART0 has installed an IDF RX
@@ -779,6 +859,13 @@ impl UartParser {
                 return None;
             }
             self.in_frame = true;
+            if self.escaped {
+                UART0_FRAME_DROPS.fetch_add(1, Ordering::Relaxed);
+                UART0_ESCAPE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                self.escaped = false;
+                self.bytes.clear();
+                return None;
+            }
             self.escaped = false;
             if self.discard_until_flag || self.bytes.is_empty() {
                 self.discard_until_flag = false;
@@ -879,6 +966,11 @@ mod tests {
         assert!(frame.contains(&UART_PPP_ESCAPE));
         let decoded = frame.into_iter().find_map(|byte| parser.push(byte));
         assert_eq!(decoded, Some(payload.to_vec()));
+    }
+
+    #[test]
+    fn empty_delimiter_frame_is_a_two_byte_heartbeat() {
+        assert_eq!(encode_ppp_frame(&[]), vec![UART_PPP_FLAG, UART_PPP_FLAG]);
     }
 }
 

@@ -125,14 +125,15 @@ pub fn beacon_snapshot() -> BeaconSnapshot {
     }
 }
 
-/// Compute the next beacon-aligned active window from any observed 802.11 beacon.
-pub fn beacon_wake_plan(
+/// Compute a beacon-aligned wake plan from a caller-selected timing source.
+/// The raw NAN scheduler uses this to keep NAN and AP beacon clocks separate.
+pub fn beacon_wake_plan_from(
+    snapshot: BeaconSnapshot,
     min_delay_ms: u32,
     interval_tu: u32,
     offset_tu: u32,
     wake_early_ms: u32,
 ) -> Option<BeaconWakePlan> {
-    let snapshot = beacon_snapshot();
     let period_us = u64::from(interval_tu.max(1)).saturating_mul(1024);
     if snapshot.local_us == 0 || snapshot.tsf_us == 0 {
         return None;
@@ -1062,7 +1063,13 @@ struct ScanAp {
 pub fn ensure_raw_wifi_started(channel: u8) -> Result<()> {
     ensure_low_level_wifi()?;
     unsafe {
-        esp_ok_allow_invalid_state(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
+        let mut mode = sys::wifi_mode_t_WIFI_MODE_NULL;
+        let _ = sys::esp_wifi_get_mode(&mut mode);
+        // A powered fallback owner runs SoftAP plus raw management/action
+        // receive.  Do not turn that AP into STA merely to arm the sniffer.
+        if mode == sys::wifi_mode_t_WIFI_MODE_NULL {
+            esp_ok_allow_invalid_state(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
+        }
         esp_ok_allow_invalid_state(sys::esp_wifi_start())?;
         esp_ok(sys::esp_wifi_set_channel(
             channel.max(1),
@@ -1070,6 +1077,19 @@ pub fn ensure_raw_wifi_started(channel: u8) -> Result<()> {
         ))?;
     }
     Ok(())
+}
+
+/// Start the powered DMesh timing AP. It intentionally has no IP/netif
+/// services; its beacons and raw action frames are the only mesh interface.
+pub fn start_direct_ap_beacon_source(channel: u8, beacon_tu: u16) -> Result<String> {
+    let ssid = default_direct_ssid()?;
+    low_level_start_ap_with_beacon_tu(&ssid, "", channel, beacon_tu)?;
+    Ok(ssid)
+}
+
+/// Stop the DMesh timing AP before returning to raw-NAN duty cycling.
+pub fn stop_direct_ap_beacon_source() -> Result<()> {
+    low_level_stop_wifi()
 }
 
 fn ensure_low_level_wifi() -> Result<()> {
@@ -2249,7 +2269,10 @@ fn parse_mac(value: &str) -> Result<[u8; 6]> {
 
 fn default_direct_ssid() -> Result<String> {
     let mac = station_mac()?;
-    Ok(format!("Direct-{:02x}-Dmesh-Local", mac[5]))
+    Ok(format!(
+        "DIRECT-DMESH-{:02X}{:02X}{:02X}{:02X}",
+        mac[2], mac[3], mac[4], mac[5]
+    ))
 }
 
 fn copy_cstr_bytes<const N: usize>(dst: &mut [u8; N], src: &[u8]) {

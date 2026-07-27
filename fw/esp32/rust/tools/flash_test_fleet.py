@@ -810,10 +810,11 @@ def configure(device: Device, args: argparse.Namespace, port: str) -> None:
     channel = max(1, min(args.nan_channel, 13))
     commands = [
         (
-            f"nvs set mode=infra ble.comp=false wifi.enabled=true wifi.mode={args.wifi_mode} power.profile=auto "
+            f"nvs op=set mode=infra wifi.mode={args.wifi_mode} power.profile=auto "
             f"nan.backend=raw nan.boot=true nan.role={args.nan_role} "
             f"nan.service={args.nan_service} nan.channel={channel} "
-            "nan.wake_ms=4000 nan.active_ms=250 nan.light_sleep=true nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0"
+            "nan.wake_ms=4000 nan.active_ms=250 nan.light_sleep=true nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0 "
+            "uart.hb_every=1"
         ),
         "power profile=auto save=true",
         "mode infra=true save=true",
@@ -823,22 +824,40 @@ def configure(device: Device, args: argparse.Namespace, port: str) -> None:
     ]
     if device.port in expected_lora_ports(args):
         if device.port in heltec_v3_ports(args):
-            commands[0:0] = ["lora board=heltec_v3 apply=true", "nvs set lora.enabled=true"]
+            commands[0:0] = ["lora board=heltec_v3 apply=true", "nvs op=set lora.enabled=true"]
         else:
             commands[0:0] = [
                 (
                     "loraprobe chip=sx127x spi_host=2 sck=5 miso=19 mosi=27 "
                     "cs=18 rst=23 dio0=26 save=true"
                 ),
-                "nvs set lora.enabled=true",
+                "nvs op=set lora.enabled=true",
             ]
         meshcore_ports = {logical_usb_port(p) for p in args.meshcore_port}
         if device.port in meshcore_ports:
             commands.append("lora mode=meshcore")
         else:
             commands.append("lora mode=meshtastic")
-    # Give the freshly flashed app a moment to boot and print the prompt.
-    time.sleep(1.5)
+    if port.startswith("uds://"):
+        # Firmware UART is intentionally asleep between duty windows. Use the
+        # managed lmesh DTR wake before each command so initial provisioning
+        # does not depend on a previously configured heartbeat.
+        client = RadioClient(f"{device.port}.lmesh", timeout=20)
+        try:
+            for command in commands:
+                result = client.command(command, timeout=20)
+                print(f"configure {device.port}: {result.raw.strip()}", flush=True)
+        finally:
+            client.close()
+        return
+
+    # Direct physical UART is reserved for low-level diagnostics. It has no
+    # lmesh-owned DTR wake, so it is not the normal provisioning path.
+    # ESP-IDF has initialized UART0 by about 0.7 s on the lab boards. The
+    # measured three-second delay leaves seven seconds of the deterministic
+    # boot window for the first CBOR command, without relying on DTR (which is
+    # a reset line on some CP210x boards).
+    time.sleep(3.0)
     argv = [sys.executable, str(SERIAL_CMD), "--port", port, "--timeout", "20"]
     for item in commands:
         argv.extend(["--cmd", item])
@@ -1083,7 +1102,7 @@ def sleepy_raw_nan_feature_test(devices: list[Device], args: argparse.Namespace)
         sleepy,
         [
             (
-                f"nvs set nan.wake_ms={wake_ms} nan.active_ms={active_ms} "
+                f"nvs op=set nan.wake_ms={wake_ms} nan.active_ms={active_ms} "
                 f"nan.channel={args.nan_channel}"
             ),
             f"test cnt={total} wake_ms={wake_ms} active_ms={active_ms} discovery={discovery}",
@@ -1287,6 +1306,10 @@ def main() -> int:
     elif not args.skip_flash:
         validate_prebuilt_images(devices)
 
+    direct_config_after_flash = (
+        not args.skip_flash and not args.skip_config and args.lmesh_mode == "local-release"
+    )
+    flashed_devices: list[Device] = []
     if not args.skip_flash:
         def flash_one(device: Device) -> None:
             if args.lmesh_mode == "tcp":
@@ -1309,9 +1332,11 @@ def main() -> int:
             else:
                 lmesh_stop_forward(args, device.port)
                 flash(device, args, env, physical_port_for(args, device.port))
-                lmesh_start_forward(args, device.port, None)
+                if direct_config_after_flash:
+                    configure(device, args, physical_port_for(args, device.port))
 
         flashed, flash_failed = run_parallel("flash", devices, args.jobs, flash_one)
+        flashed_devices = list(flashed)
         devices = sorted(flashed, key=lambda item: item.port)
         if flash_failed:
             print(
@@ -1322,7 +1347,7 @@ def main() -> int:
             print("flash: no devices flashed successfully", file=sys.stderr)
             return 1
 
-    if not args.skip_config:
+    if not args.skip_config and not direct_config_after_flash:
         def configure_one(device: Device) -> None:
             if args.lmesh_mode == "local-release":
                 try:
@@ -1339,6 +1364,22 @@ def main() -> int:
                 "configure: failed devices: " + ", ".join(device.port for device in config_failed),
                 flush=True,
             )
+
+    if args.lmesh_mode == "local-release" and not args.skip_flash:
+        _, restore_failed = run_parallel(
+            "restore forwards",
+            flashed_devices,
+            args.jobs,
+            lambda device: lmesh_start_forward(args, device.port, None),
+        )
+        if restore_failed:
+            print(
+                "restore forwards: failed devices: "
+                + ", ".join(device.port for device in restore_failed),
+                flush=True,
+            )
+            return 1
+
 
     if not args.skip_sanity:
         _, sanity_failed = run_parallel(
