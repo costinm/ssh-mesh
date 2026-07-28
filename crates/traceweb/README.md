@@ -1,5 +1,22 @@
 # Trace aggregation service
 
+Deprecated. New model:
+
+- each app owns its data - including telemetry. 
+- mesh policies control access to app data and services - including telemetry
+- in-memory buffer and application files - owned by app, in their dir
+- libraries can handle rotation, indexing, sync/upload
+- telemetry is just data - like anything else the app may use
+- cross-app/user/device is a data access policy, not specific to telemetry.
+
+Mesh-init and mesh library still need to provide discovery of all services and
+interfaces supported by an app - and access to files that may be shared based on
+policy/permissions. Some label or convention may be used for telemetry - just like
+any other dat.
+
+
+
+# Old: 
 The mesh crate provides a library for initializing an in-memory trace buffer
 and exporting traces over UDS, as well as a control interface using JSON-L.
 
