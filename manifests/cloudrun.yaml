@@ -16,65 +16,45 @@ spec:
         run.googleapis.com/execution-environment: gen2
 
         # Attach to the VPC (no connector)
-        run.googleapis.com/network-interfaces: '[{"network": "default", "subnetwork": "default"}]'
+        # run.googleapis.com/network-interfaces: '[{"network": "default", "subnetwork": "default"}]'
 
         autoscaling.knative.dev/minScale: '0'
         autoscaling.knative.dev/maxScale: '1'
         run.googleapis.com/cpu-throttling: 'false'
-        # If adding more images/containers
-        #run.googleapis.com/container-dependencies: '{"app":["sshm"]}'
 
     spec:
       containerConcurrency: 1000
       timeoutSeconds: 900
-      #serviceAccountName: k8s-sshc
       containers:
         - name: app
-          image: costinm/sshm:latest # ${IMG}
-          # The start command is modified to start sshd first - which in turn starts the server.
-          #command: [ "/usr/local/bin/sshd", "/usr/local/bin/server" ]
+          image: docker.io/costinm/sshm:h2c-v3
           ports:
             - name: h2c
-              containerPort: 15028
+              containerPort: 8080
           env:
-            # Maintain a connection to this server.
-            #- name: SSH_UPSTREAM
-            #  value: costin15.webinf.duckdns.org:15022
             - name: SSH_DEFAULT_H2
               value: https://httpbin.org
 
             - name: SSH_DEFAULT_HTTP
               value: https://httpbin.org
 
-            # Allow shell access for the users authenticated with the key.
-            # Allow forwarding for users with keys signed by the CA or using JWTs
+            # Trusted CA keys and authorized keys passed via environment variable
+            - name: SSH_AUTHORIZED_CAS
+              value: |
+                ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDu9dWIA381ojxsUS8i0VJv0ED5Ac2zRFX1JijLjAO5HywPJ5a3CMM0NrXH5GqSoyDB/j92/Ta/f0QFAQZDhiFQ= ca.s.webinf.duckdns.org
+
             - name: SSH_AUTHORIZED_KEYS
               value: |
                 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBRjGteKUhj757bQ8qaju5bvgWjoaZuGLvkq/Xnhr/LDW//qAk8O3v+RswbaCodSjKI6SDgFKl6samdUhP+kUwI= costin@costin15
-                cert-authority ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDu9dWIA381ojxsUS8i0VJv0ED5Ac2zRFX1JijLjAO5HywPJ5a3CMM0NrXH5GqSoyDB/j92/Ta/f0QFAQZDhiFQ= ca.s.webinf.duckdns.org
+
+            - name: MESH_SSH_MESH_UID
+              value: "1001"
+
+            - name: RUST_LOG
+              value: "info"
 
             - name: DEPLOY
               value: "${DEPLOY}"
-#            - name: SSHD
-#              valueFrom:
-#                  secretKeyRef:
-#                    key: "1"
-#                    name: mesh
-#          volumeMounts:
-#            # /var/run/secrets fails with /var/run already exists
-#            - mountPath: /mesh
-#              name: mesh
-#          resources:
-#            limits:
-#              cpu: '1'
-#              memory: 1G
-#      volumes:
-#        - name: mesh
-#          secret:
-#            #            items:
-#            #              - key: "1"
-#            #                path: mesh
-#            secretName: mesh
 
           resources:
             limits:

@@ -1132,6 +1132,10 @@ fn mesh_init_socket_path() -> String {
     if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
         return path;
     }
+    let root_path = std::path::Path::new("/run/mesh/mesh-init/mesh.sock");
+    if root_path.exists() {
+        return root_path.to_string_lossy().into_owned();
+    }
     mesh::paths::AppPaths::for_app("mesh-init")
         .mesh_socket()
         .to_string_lossy()
@@ -1166,7 +1170,16 @@ fn cert_terminal_for_user(user: &str) -> Option<MeshInitTerminal> {
         .or_else(|_| std::env::var("MESH_HOME_BASE"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| mesh::paths::default_home_base());
-    let home_path = home_root.join(user);
+    let mut home_path = home_root.join(user);
+    if !home_path.exists() {
+        if user == "root" && std::path::Path::new("/root").is_dir() {
+            home_path = std::path::PathBuf::from("/root");
+        } else if std::path::Path::new(&format!("/home/{user}")).is_dir() {
+            home_path = std::path::PathBuf::from(format!("/home/{user}"));
+        } else if std::path::Path::new("/tmp").is_dir() {
+            home_path = std::path::PathBuf::from("/tmp");
+        }
+    }
     let metadata = match std::fs::metadata(&home_path) {
         Ok(metadata) => metadata,
         Err(error) => {

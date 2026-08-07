@@ -242,20 +242,6 @@ class RadioClient:
             self._buffer.extend(chunk)
         return "\n".join(self._drain_records())
 
-    def wake(self, milliseconds=120, timeout=None):
-        if not 1 <= milliseconds <= 10000:
-            raise ValueError("DTR duration must be between 1 and 10000 ms")
-        self.connect()
-        self.send_line("dtr {}".format(milliseconds))
-        return self._receive(
-            timeout or self.timeout,
-            lambda text: "event type=lmesh.dtr ok=true" in text,
-        )
-
-    def wake_uart(self):
-        """Compatibility alias for lmesh-owned DTR wake."""
-        return self.wake()
-
     def prime_uart(self, settle_sec=4.5):
         """Consume one UART RX-wake frame before a test command.
 
@@ -278,8 +264,10 @@ class RadioClient:
         )
 
     def command(self, command, timeout=None, wake=False, expected=None):
-        if wake:
-            self.wake(timeout=timeout)
+        # ``wake`` remains an accepted keyword for older scenario files, but
+        # runtime wake/reset is owned by firmware NAN heartbeats and the
+        # managed lmesh service. Never turn it into a modem-line operation.
+        del wake
         method = expected or command.split(None, 1)[0]
         started = time.monotonic()
         self.send_line(command)

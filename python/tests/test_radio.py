@@ -122,26 +122,6 @@ def test_read_available_is_passive_and_drains_buffer():
         right.close()
 
 
-def test_wake_uses_lmesh_control_text_not_firmware_cbor():
-    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    client = RadioClient("unused.lmesh", timeout=1.0)
-    client.sock = left
-    left.settimeout(0.05)
-
-    def server():
-        assert right.recv(1024) == b"dtr 120\n"
-        right.sendall(b"event type=lmesh.dtr ok=true hold_ms=120\n")
-
-    thread = threading.Thread(target=server)
-    thread.start()
-    try:
-        assert "lmesh.dtr" in client.wake()
-    finally:
-        client.close()
-        right.close()
-    thread.join(timeout=2)
-
-
 def test_power_sample_and_lab_config(tmp_path):
     sample = parse_power_sample("2.400 0.0372 0.000 0.0351 1800 600 7 1", 1234)
     assert sample.current_ma == 37.2

@@ -189,9 +189,9 @@ class LabNode:
         self.radio = RadioClient(config.destination, timeout=timeout)
 
     def command(self, command, **kwargs):
-        # DTR is board-specific and resets some CP210x-connected ESP boards.
-        # The normal battery modem contract is a queued CBOR request flushed
-        # by the firmware UART heartbeat, so E2E tests must not pulse DTR.
+        # Runtime wake/reset is not a lab-client operation. The normal battery
+        # modem contract queues CBOR and lets firmware/lmesh flush it during a
+        # heartbeat or explicitly addressed radio wake.
         kwargs.pop("wake", None)
         # Firmware NVS commands acknowledge with the requested operation
         # (`set`, `get`, `list`, ...) rather than the outer `nvs` method.

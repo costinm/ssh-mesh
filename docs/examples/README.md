@@ -269,36 +269,32 @@ as `root@host3-vm.example.m`.
 From the repository root:
 
 ```bash
-scripts/build.sh profile
 scripts/build.sh
 docs/examples/start_all.sh
 ```
 
-`profile` builds the optional repo-local Linux VM profile with the custom
-kernel, module image, and hypervisors. It defaults to `target/nix/profile`.
 The default `scripts/build.sh` command builds the musl Rust binaries and creates
-`target/dist/opt` plus `target/dist/img`; VM artifacts are copied from the
-optional profile only when it is present.
-
-## Start All Nodes
+`target/dist/opt`. For VM examples (host3-vm), VM artifacts are sourced from
+the [initos](https://github.com/costinm/initos) repo. Build the initos VM
+profile and point `NIX_PROFILE` at the result:
 
 ```bash
-cd docs/examples
-./start_all.sh
+nix build path:/path/to/initos#vm-tools -o /some/profile
+export NIX_PROFILE=/some/profile
 ```
 
-Press `Ctrl-C` to stop all nodes and their child services.
+`start_all.sh` looks for `vrun` in `$NIX_PROFILE/bin/` automatically and skips
+VM examples gracefully if it is absent.
 
-After `scripts/build.sh profile`, `scripts/build.sh` copies the optional VM
-kernel and modules into `target/dist/img` and builds
-`target/dist/img/ssh-mesh.erofs` from `target/dist/opt`. VM example launchers
-use those dist artifacts directly:
+VM example launchers use these artifacts:
 
 ```text
-target/dist/opt
-target/dist/img/ssh-mesh.erofs
-target/nix/profile/opt/ssh-mesh-kernel
+target/dist/opt                   # ssh-mesh binaries (built here)
+target/dist/img/ssh-mesh.erofs    # EROFS rootfs (built by initos)
+$NIX_PROFILE/opt/ssh-mesh-kernel  # kernel and modules (built by initos)
+$NIX_PROFILE/bin/vrun             # VM launcher (built by initos)
 ```
+
 
 After config-only edits, reload the relevant running daemon instead of
 restarting binaries. For example, inside a host/app environment:

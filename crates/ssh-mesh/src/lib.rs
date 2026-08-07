@@ -454,6 +454,52 @@ impl MeshNode {
             }
         };
 
+        // Read CA keys from env vars (SSH_AUTHORIZED_CAS, SSH_CA_KEYS)
+        for env_var in &["SSH_AUTHORIZED_CAS", "SSH_CA_KEYS"] {
+            if let Ok(content) = std::env::var(env_var) {
+                if !content.trim().is_empty() {
+                    match crate::auth::parse_authorized_cas_content(&content) {
+                        Ok(cas) => {
+                            info!("Loaded {} CA keys from {} env var", cas.len(), env_var);
+                            ca_keys_vec.extend(cas);
+                        }
+                        Err(e) => error!("Failed to parse {} env var: {}", env_var, e),
+                    }
+                }
+            }
+        }
+
+        // Read authorized keys and CA keys from SSH_AUTHORIZED_KEYS env var
+        if let Ok(content) = std::env::var("SSH_AUTHORIZED_KEYS") {
+            if !content.trim().is_empty() {
+                let ca_lines: Vec<&str> = content
+                    .lines()
+                    .filter(|line| {
+                        let l = line.trim();
+                        l.starts_with("cert-authority") || l.starts_with("@cert-authority")
+                    })
+                    .collect();
+                if !ca_lines.is_empty() {
+                    let ca_content = ca_lines.join("\n");
+                    match crate::auth::parse_authorized_cas_content(&ca_content) {
+                        Ok(cas) => {
+                            info!("Loaded {} CA keys from SSH_AUTHORIZED_KEYS env var", cas.len());
+                            ca_keys_vec.extend(cas);
+                        }
+                        Err(e) => error!("Failed to parse CA keys from SSH_AUTHORIZED_KEYS: {}", e),
+                    }
+                }
+
+                match crate::auth::parse_authorized_keys_content(&content) {
+                    Ok(entries) => {
+                        info!("Loaded {} authorized keys from SSH_AUTHORIZED_KEYS env var", entries.len());
+                        authorized_keys_vec.extend(entries);
+                    }
+                    Err(e) => error!("Failed to parse SSH_AUTHORIZED_KEYS env var: {}", e),
+                }
+            }
+        }
+
         // Append CA keys from config if present
         if let Some(ref config_cas) = cfg.ca_keys {
             for line in config_cas {

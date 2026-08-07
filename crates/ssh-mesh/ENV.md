@@ -80,7 +80,6 @@ in that socket unit, matching the documented systemd shape.
 | --- | --- | --- |
 | `SFTP_SERVER_PATH` | unset | Optional external SFTP server binary path. |
 | `<APP>_UDS` | app-specific | Optional app UDS override for `/_m/proxy/*/:app` generic proxy routes, for example `MESH_INIT_UDS`. |
-| `TRACEWEB_UDS` | `/run/mesh/traceweb/mesh.sock` for root systems | traceweb mesh endpoint for `/_m/trace` proxy routes. |
 
 
 # Generated Variables

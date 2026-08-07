@@ -251,40 +251,31 @@ pub async fn handle_ssh_request(
     let handler_id = handler.id;
     let connected_clients = ssh_server.connected_clients.clone();
 
-    // Run SSH over the HTTP/2 stream
-    match russh::server::run_stream(config, stream, handler).await {
-        Ok(session) => {
-            info!("SSH session started successfully");
-
-            // Spawn task to handle the SSH session
-            tokio::spawn(async move {
+    // Spawn task to run the SSH session asynchronously so response headers can be sent immediately
+    tokio::spawn(async move {
+        match russh::server::run_stream(config, stream, handler).await {
+            Ok(session) => {
+                info!("SSH session started successfully");
                 if let Err(e) = session.await {
                     tracing_error!("SSH session error: {:?}", e);
                 }
                 info!("SSH session completed");
-
-                // Explicit cleanup after session ends
-                let mut clients = connected_clients.lock().await;
-                if clients.remove(&handler_id).is_some() {
-                    debug!("Removed client {} from connected_clients", handler_id);
-                }
-            });
-
-            // Create response body from writer_rx
-            // Body::from_stream expects a stream of Bytes (Result<Bytes, Error>)
-            let response_stream =
-                tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
-
-            response_with_status(StatusCode::OK, Body::from_stream(response_stream))
+            }
+            Err(e) => {
+                tracing_error!("Failed to start SSH session: {:?}", e);
+            }
         }
-        Err(e) => {
-            tracing_error!("Failed to start SSH session: {:?}", e);
-            response_with_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Body::from(format!("SSH session failed: {:?}", e)),
-            )
+        let mut clients = connected_clients.lock().await;
+        if clients.remove(&handler_id).is_some() {
+            debug!("Removed client {} from connected_clients", handler_id);
         }
-    }
+    });
+
+    // Create response body from writer_rx and return HTTP 200 OK immediately
+    let response_stream =
+        tokio_stream::wrappers::ReceiverStream::new(writer_rx).map(Ok::<_, std::io::Error>);
+
+    response_with_status(StatusCode::OK, Body::from_stream(response_stream))
 }
 
 /// Pipe frames from an HTTP body into an MPSC sender.
@@ -293,10 +284,10 @@ async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Err
     while let Some(frame_res) = body.frame().await {
         match frame_res {
             Ok(frame) => {
-                if let Ok(data) = frame.into_data()
-                    && tx.send(Ok(data)).await.is_err()
-                {
-                    return;
+                if let Ok(data) = frame.into_data() {
+                    if !data.is_empty() && tx.send(Ok(data)).await.is_err() {
+                        return;
+                    }
                 }
             }
             Err(e) => {
@@ -511,6 +502,10 @@ fn send_mesh_init_exec_fd_blocking(
 fn mesh_init_socket_path() -> String {
     if let Ok(path) = std::env::var("MESH_INIT_SOCK") {
         return path;
+    }
+    let root_path = std::path::Path::new("/run/mesh/mesh-init/mesh.sock");
+    if root_path.exists() {
+        return root_path.to_string_lossy().into_owned();
     }
     mesh::paths::AppPaths::for_app("mesh-init")
         .mesh_socket()

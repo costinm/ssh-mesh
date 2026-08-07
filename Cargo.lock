@@ -3889,6 +3889,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-roots 1.0.8",
  "ws",
  "x509-parser",
 ]
@@ -4297,20 +4298,6 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
-
-[[package]]
-name = "traceweb"
-version = "0.1.0"
-dependencies = [
- "clap",
- "mesh",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "tracing"

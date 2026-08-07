@@ -6,9 +6,9 @@
 #   $HOME/etc/mesh-init/ssh-mesh.toml
 
 [Service]
-
 ExecStart = "ssh-mesh"
 OOMScoreAdjust = -900
+
 [Resources]
 # Resource limits are harmless if cgroup control is unavailable.
 MemoryHigh = "256M"
@@ -16,7 +16,7 @@ MemoryMax = "512M"
 CPUWeight = 100
 
 [Environment]
-PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin"
+PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin:/usr/bin"
 RUST_LOG = "info"
 SSH_PORT = "18422"
 HTTP_PORT = "18480"

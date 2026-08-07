@@ -17,7 +17,7 @@ name = "meshkeys"
 path = "src/bin/meshkeys.rs"
 
 [features]
-default = ["test-utils", "sftp"]
+default = ["test-utils", "sftp", "ws"]
 test-utils = ["tempfile", "once_cell"]
 sftp = ["dep:sftp-server", "dep:russh-sftp"]
 ws = ["dep:ws"]
@@ -64,6 +64,7 @@ chrono = "0.4.43"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2"
+webpki-roots = "1.0"
 rust-embed = "8.11.0"
 mime_guess = "2.0.5"
 russh-sftp = { version = "2", optional = true }

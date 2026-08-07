@@ -13,8 +13,8 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
 export DEST=${DEST:-/opt/ssh-mesh}
 
-CRATES="mesh-init ssh-mesh mesh mesh-cli mesh9p traceweb sftp-server ssh-config"
-BIN_TARGETS="h2t meshkeys mesh-init ssh-mesh mesh mesh9p traceweb sftp-server ssh-config"
+CRATES="mesh-init ssh-mesh mesh mesh-cli mesh9p sftp-server ssh-config"
+BIN_TARGETS="h2t meshkeys mesh-init ssh-mesh mesh mesh9p sftp-server ssh-config"
 INSTALL_BIN_TARGETS="$BIN_TARGETS"
 EXAMPLE_BIN_TARGETS="mesh-init ssh-mesh mesh mesh9p sftp-server h2t meshkeys"
 
@@ -25,15 +25,7 @@ Usage: scripts/build.sh [command] [args...]
 Default command:
   scripts/build.sh
       Build Rust musl release binaries and create distributable artifacts under
-      target/dist, including target/dist/opt and target/dist/img/ssh-mesh.erofs.
-
-Fresh target/examples sequence:
-  scripts/build.sh profile
-      Build/update the optional repo-local Linux VM profile with the standalone
-      custom kernel artifact and optional hypervisor tools used by VM examples.
-
-  scripts/build.sh
-      Build the Rust binaries and create target/dist artifacts.
+      target/dist, including target/dist/opt.
 
   docs/examples/start_all.sh
       Start host1, host2, host3-vm, and activated app environments.
@@ -46,11 +38,12 @@ Common commands:
   deploy_examples      Compatibility alias for dist.
   stage_examples       Compatibility alias for staging target/dist/opt.
   stage_example_tree   Refresh checked-in example files under target/examples.
-  profile [path]       Build/update the Nix profile. Default: target/nix/profile.
   dist [path]          Build release binaries into an install-like tree.
-  erofs [out ...]      Build the VM EROFS rootfs image.
   install [path]       Install runtime binaries and scripts. Default: /opt/ssh-mesh.
-  build [profile]      Full local build: Rust, examples, EROFS, profile.
+
+Note: VM builds (EROFS rootfs, kernel profile, vm-tools) and VM tests are now
+      owned by the initos repo (https://github.com/costinm/initos).
+      Use 'nix build ./vm#default' there for VM artifacts.
 
 Environment:
   SSH_MESH_BUSYBOX         Busybox path used for staged target/dist/opt/busybox.
@@ -96,10 +89,6 @@ find_busybox() {
     fi
     if [ -x "$PWD/target/nix/profile/bin/busybox" ]; then
         printf '%s\n' "$PWD/target/nix/profile/bin/busybox"
-        return 0
-    fi
-    if [ -x "/ws/initos/target/nix/bin/busybox" ]; then
-        printf '%s\n' "/ws/initos/target/nix/bin/busybox"
         return 0
     fi
     if [ -x "/usr/bin/busybox" ]; then
@@ -250,18 +239,13 @@ stage_opt_tree() {
     local opt="$2"
     local busybox="$3"
 
-    rm -rf "$opt/ssh-mesh" "$opt/busybox" "$opt/initos"
-    mkdir -p "$opt/ssh-mesh/bin" "$opt/initos/bin"
+    rm -rf "$opt/ssh-mesh" "$opt/busybox"
+    mkdir -p "$opt/ssh-mesh/bin"
 
     copy_runtime_bins "$src" "$opt/ssh-mesh/bin" $EXAMPLE_BIN_TARGETS
-    cp -f bin/vrun "$opt/ssh-mesh/bin/vrun"
-    ln -sf vrun "$opt/ssh-mesh/bin/initos-vrun"
     cp -f bin/run_bwrap.sh "$opt/ssh-mesh/bin/run_bwrap.sh"
     cp -f bin/run_podman.sh "$opt/ssh-mesh/bin/run_podman.sh"
     chmod +x "$opt/ssh-mesh/bin/"*
-
-    cp -f bin/initos-init-vm "$opt/initos/bin/initos-init-vm"
-    chmod +x "$opt/initos/bin/initos-init-vm"
 
     install_busybox_tree "$busybox" "$opt/busybox"
 }
@@ -408,7 +392,6 @@ dist() {
     echo "Creating dist artifacts under $dest"
     mkdir -p "$dest"
     stage_opt_tree "$release_dir" "$dest/opt" "$busybox"
-    erofs "$dest" "$busybox" "bin/initos-init-vm" "$dest/opt"
 
     echo "Dist completed at $dest"
 }
@@ -426,8 +409,6 @@ install() {
     
     echo "Copying scripts..."
     cp -r bin/* "$dest/bin/"
-    cp -f bin/vrun "$dest/bin/vrun"
-    ln -sf vrun "$dest/bin/initos-vrun"
     chmod +x "$dest/bin/"*
 
     echo "Install completed at $dest"
@@ -455,82 +436,9 @@ arm_release() {
     echo "aarch64 release completed at $dest"
 }
 
-erofs() {
-    local out="${1:-$PWD/target/erofs}"
-    local busybox="${2:-busybox}"
-    local initos_vm="${3:-bin/initos-init-vm}"
-    local opt_src="${4:-$PWD/target/dist/opt}"
-
-    busybox="$(find_busybox "$busybox")" || {
-        echo "Error: busybox binary not found" >&2
-        return 1
-    }
-
-    mkdir -p "$out/img" "$out/bin"
-    local rootfs="$out/rootfs"
-    rm -rf "$rootfs"
-    
-    # Pre-create all expected VM directories/mountpoints to avoid Read-only FS errors
-    mkdir -p "$rootfs"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin}
-    mkdir -p "$rootfs"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,out,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,usr/bin,usr/sbin,usr/lib,usr/lib64,lib,lib/modules,lib/firmware}
-
-    ln -s opt/busybox/bin "$rootfs/bin"
-    ln -s opt/busybox/bin "$rootfs/sbin"
-
-    if [ -d "$opt_src/ssh-mesh/bin" ] && [ -d "$opt_src/busybox/bin" ]; then
-        cp -a "$opt_src/." "$rootfs/opt/"
-    else
-        echo "Staged opt tree not found at $opt_src; creating one from release binaries"
-        stage_opt_tree "target/x86_64-unknown-linux-musl/release" "$rootfs/opt" "$busybox"
-    fi
-
-    if [ -f "$initos_vm" ] && [ ! -x "$rootfs/opt/initos/bin/initos-init-vm" ]; then
-        cp -f "$initos_vm" "$rootfs/opt/initos/bin/initos-init-vm"
-        chmod +x "$rootfs/opt/initos/bin/initos-init-vm"
-    fi
-
-    mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "$out/img/ssh-mesh.erofs" "$rootfs"
-    ln -sf ssh-mesh.erofs "$out/img/initos.erofs"
-
-    cat > "$out/bin/ssh-mesh-erofs" <<EOF
-#!/bin/sh
-echo "$out/img/ssh-mesh.erofs"
-EOF
-    chmod +x "$out/bin/ssh-mesh-erofs"
-    
-    echo "EROFS image created at $out/img/ssh-mesh.erofs"
-}
-
-
-vm() {
-    local profile="${1:-$PWD/target/vm/initos-vm}"
-    echo "Building VM profile into $profile..."
-    nix build ./linux#default -o "$profile"
-}
-
-profile() {
-    # Default NIX_PROFILE target path
-    local target_profile="${1:-${NIX_PROFILE:-$(default_nix_profile)}}"
-
-    echo "Adding missing Nix profile dependencies to: ${target_profile}"
-    target_profile="$(resolve_nix_profile "$target_profile")"
-    prepare_nix_profile_path "$target_profile"
-    if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "kernel-cloud"; then
-        echo "  kernel-cloud: already present"
-    else
-        echo "  kernel-cloud: nix profile add ./linux#kernel-cloud"
-        nix profile add "./linux#kernel-cloud" --profile "${target_profile}" || return $?
-    fi
-    if [ "${SSH_MESH_PROFILE_VM_TOOLS:-1}" != "0" ]; then
-        if nix profile list --profile "${target_profile}" 2>/dev/null | grep -q "vm-tools"; then
-            echo "  vm-tools: already present"
-        else
-            echo "  vm-tools: nix profile add ./vm-tools#default --priority 4"
-            nix profile add "./vm-tools#default" --profile "${target_profile}" --priority 4 || return $?
-        fi
-    fi
-    prepend_nix_profile_path "$target_profile"
-}
+# VM EROFS image, kernel profile, and vm-tools commands have moved to the initos repo.
+# See https://github.com/costinm/initos — use 'nix build ./vm#default' there for VM artifacts.
+# Use 'nix build ./vm#vm-scripts' for vrun and initos-init-vm.
 
 build() {
     # Default NIX_PROFILE target path
@@ -550,10 +458,8 @@ test_cmd() {
     local name="${1:-}"
     if [ -z "$name" ]; then
         echo "Usage: scripts/build.sh test NAME" >&2
-        echo "Known tests: examples, ssh_mesh_activation, traceweb, vm_cloud_hypervisor_acpi_s5," >&2
-        echo "             vm_echo_latency, vm_microvm_echo, vm_qemu_echo," >&2
-        echo "             vm_vrun_cloud_hypervisor_echo, vm_vrun_crosvm_echo," >&2
-        echo "             vrun_pod_name, vrun_stop_cleanup" >&2
+        echo "Known tests: examples, ssh_mesh_activation, trace" >&2
+        echo "Note: VM tests (test_vm_*) have moved to the initos repo." >&2
         return 2
     fi
     shift
@@ -570,23 +476,16 @@ test_cmd() {
             export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
             tests/test_ssh_mesh_activation.sh
             ;;
-        traceweb)
+        trace)
             rust
             stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
             export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
-            tests/test_traceweb.sh "$@"
-            ;;
-        vm_cloud_hypervisor_acpi_s5|vm_echo_latency|vm_microvm_echo|vm_qemu_echo|vm_vrun_cloud_hypervisor_echo|vm_vrun_crosvm_echo)
-            export NIX_PROFILE="$(resolve_nix_profile "${NIX_PROFILE:-$(default_nix_profile)}")"
-            export PATH="$NIX_PROFILE/bin:${PATH:-}"
-            "tests/test_${name}.sh" "$@"
-            ;;
-        vrun_pod_name|vrun_stop_cleanup)
-            "tests/test_${name}.sh" "$@"
+            tests/test_trace.sh "$@"
             ;;
         *)
             echo "Unknown test: $name" >&2
             echo "Run scripts/build.sh test with no NAME to list known tests." >&2
+            echo "Note: VM tests (test_vm_*) have moved to the initos repo." >&2
             return 2
             ;;
     esac
@@ -602,7 +501,7 @@ main() {
         -h|--help|help)
             help
             ;;
-        default|rust|deps|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|arm_release|erofs|vm|profile|build)
+        default|rust|deps|deploy_examples|stage_examples|stage_example_tree|setup|debug|release|arm|unpfs|push|dist|install|arm_release|build)
             "$cmd" "$@"
             ;;
         test)

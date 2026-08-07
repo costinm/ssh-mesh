@@ -526,6 +526,31 @@ where
                 Err(e) => Response::err(format!("tools/call request mapping failed: {e}")),
             }
         }
+        "trace.set_level" | "set_level" | "set_trace_level" | "set_source_level" => {
+            let level = raw
+                .params
+                .get("level")
+                .and_then(Value::as_str)
+                .unwrap_or("info");
+            let req = crate::local_trace::TraceLevelRequest {
+                level: level.to_string(),
+            };
+            match crate::local_trace::set_trace_level(&req) {
+                Ok(resp) => Response::ok_with_data(serde_json::to_value(resp).unwrap_or_default()),
+                Err(resp) => Response::err(
+                    resp.message
+                        .unwrap_or_else(|| "Failed to set trace level".to_string()),
+                ),
+            }
+        }
+        "trace.get_level" | "get_level" | "get_trace_level" => {
+            let resp = crate::local_trace::get_trace_level();
+            Response::ok_with_data(serde_json::to_value(resp).unwrap_or_default())
+        }
+        "trace.subscribe" | "subscribe" => Response::ok_with_data(json!({
+            "subscribed": true,
+            "service": registry.server_name
+        })),
         _ => {
             let mut direct = raw.params;
             direct.insert("method".to_string(), json!(raw.method));
@@ -1034,11 +1059,11 @@ mod tests {
         let home_base = temp.path().join("home");
         let opt_base = temp.path().join("opt");
         write(
-            &home_base.join("traceweb/etc/resources/tools.json"),
+            &home_base.join("demo/etc/resources/tools.json"),
             r#"{"tools":[{"name":"home"}]}"#,
         );
         write(
-            &opt_base.join("traceweb/resources/tools.json"),
+            &opt_base.join("demo/resources/tools.json"),
             r#"{"tools":[{"name":"opt"}]}"#,
         );
 
@@ -1049,7 +1074,7 @@ mod tests {
                 std::env::set_var("MESH_HOME_BASE", &home_base);
                 std::env::set_var("MESH_OPT_BASE", &opt_base);
             }
-            let registry = McpRegistry::new("traceweb");
+            let registry = McpRegistry::new("demo");
             unsafe {
                 std::env::remove_var("MESH_HOME_BASE");
                 std::env::remove_var("MESH_OPT_BASE");

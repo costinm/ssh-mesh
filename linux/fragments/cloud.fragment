@@ -1,4 +1,0 @@
-# Settings for cloud on top of debian
-
-CONFIG_SWAP=y
-CONFIG_PCI=y

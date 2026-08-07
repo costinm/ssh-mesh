@@ -8,23 +8,25 @@ else
     _env_dir="$(pwd)"
 fi
 
-export REPO_ROOT="${REPO_ROOT:-${_env_dir}}"
+# This checkout owns its build/cache roots. Do not inherit another project's
+# REPO_ROOT when env.sh is sourced from a parent shell.
+export REPO_ROOT="${_env_dir}"
 export REAL_HOME="${REAL_HOME:-${HOME:-}}"
 
 export HOME="${SSH_MESH_LOCAL_HOME:-${REPO_ROOT}/target/home}"
 export CODEX_HOME="${CODEX_HOME:-${REAL_HOME}/.codex}"
 
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${REPO_ROOT}/target/cache}"
-export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${REPO_ROOT}/target/config}"
-export XDG_DATA_HOME="${XDG_DATA_HOME:-${REPO_ROOT}/target/share}"
-export XDG_STATE_HOME="${XDG_STATE_HOME:-${REPO_ROOT}/target/state}"
+export XDG_CACHE_HOME="${SSH_MESH_XDG_CACHE_HOME:-${REPO_ROOT}/target/cache}"
+export XDG_CONFIG_HOME="${SSH_MESH_XDG_CONFIG_HOME:-${REPO_ROOT}/target/config}"
+export XDG_DATA_HOME="${SSH_MESH_XDG_DATA_HOME:-${REPO_ROOT}/target/share}"
+export XDG_STATE_HOME="${SSH_MESH_XDG_STATE_HOME:-${REPO_ROOT}/target/state}"
 
-export NIX_PROFILE="${NIX_PROFILE:-${REPO_ROOT}/target/nix/profile}"
+export NIX_PROFILE="${SSH_MESH_NIX_PROFILE:-${REPO_ROOT}/target/nix/profile}"
 export NIX_CONFIG="${NIX_CONFIG:-experimental-features = nix-command flakes}"
 
-export MESH_HOME="${MESH_HOME:-${REPO_ROOT}/target/mesh}"
+export MESH_HOME="${SSH_MESH_MESH_HOME:-${REPO_ROOT}/target/mesh}"
 export SSH_MESH_STATE_ROOT="${SSH_MESH_STATE_ROOT:-${REPO_ROOT}/target/ssh-mesh-state}"
-export TMPDIR="${TMPDIR:-${REPO_ROOT}/target/tmp}"
+export TMPDIR="${SSH_MESH_TMPDIR:-${REPO_ROOT}/target/tmp}"
 
 export CARGO_HOME="${SSH_MESH_CARGO_HOME:-${REPO_ROOT}/target/cargo}"
 export RUSTUP_HOME="${SSH_MESH_RUSTUP_HOME:-${REPO_ROOT}/target/rustup}"
@@ -60,11 +62,13 @@ _path_force_prepend() {
 _path_prepend "/nix/var/nix/profiles/default/bin"
 _path_prepend "${NIX_PROFILE}/bin"
 _path_prepend "${CARGO_HOME}/bin"
+_path_prepend "${REPO_ROOT}/target/x86_64-unknown-linux-musl/release"
 export PATH
 
 _path_force_prepend "/nix/var/nix/profiles/default/bin"
 _path_force_prepend "${NIX_PROFILE}/bin"
 _path_force_prepend "${CARGO_HOME}/bin"
+_path_force_prepend "${REPO_ROOT}/target/x86_64-unknown-linux-musl/release"
 export PATH
 
 unset _env_dir

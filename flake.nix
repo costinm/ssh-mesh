@@ -83,15 +83,13 @@
               mkdir -p "$out/share/ssh-mesh/nixos"
               cp ${./nixos/module.nix} "$out/share/ssh-mesh/nixos/module.nix"
               cp ${./nixos/example.nix} "$out/share/ssh-mesh/nixos/example.nix"
-              for app in ssh-mesh mesh-init traceweb; do
+              for app in ssh-mesh mesh-init; do
                 if [ -d "${./crates}/$app/resources" ]; then
                   mkdir -p "$out/opt/$app/resources"
-                  cp -a "${./crates}/$app/resources/." "$out/opt/$app/resources/"
+                  cp -rL "${./crates}/$app/resources/." "$out/opt/$app/resources/"
                 fi
               done
-              cp ${./bin/vrun} "$out/bin/vrun"
-              chmod +x "$out/bin/vrun"
-              ln -s vrun "$out/bin/initos-vrun"
+              chmod -R +w "$out"
             '';
           });
 
@@ -156,20 +154,88 @@
 
         # ── Docker image ──────────────────────────────────────────
 
+        sshm-opt-bin = pkgs.runCommand "sshm-opt-bin" {} ''
+          mkdir -p $out/opt/ssh-mesh/bin
+          for f in ${ssh-mesh}/bin/*; do
+            ln -s $f $out/opt/ssh-mesh/bin/$(basename $f)
+          done
+        '';
+
+        sshm-busybox-opt = pkgs.runCommand "sshm-busybox-opt" {} ''
+          mkdir -p $out/opt/busybox/bin
+          for f in ${pkgs.pkgsStatic.busybox}/bin/*; do
+            ln -s $f $out/opt/busybox/bin/$(basename $f)
+          done
+          ${pkgs.pkgsStatic.busybox}/bin/busybox --install -s $out/opt/busybox/bin
+        '';
+
+        sshm-config = pkgs.runCommand "sshm-config" {} ''
+          mkdir -p $out/home/system/etc/mesh-init
+          cat > $out/home/system/etc/mesh-init/ssh-mesh.toml <<'EOF'
+[Service]
+ExecStart = "/opt/ssh-mesh/bin/ssh-mesh"
+User = "1001"
+Group = "1001"
+OOMScoreAdjust = -900
+
+[Socket]
+Accept = false
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "15022"
+Name = "ssh"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "8080"
+Name = "http"
+
+[Environment]
+SSH_BASEDIR = "/home/ssh-mesh/.ssh"
+SSH_PORT = "15022"
+HTTP_PORT = "8080"
+MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock"
+RUST_LOG = "info"
+EOF
+        '';
+
         sshm = pkgs.dockerTools.buildLayeredImage {
-          name = "ghcr.io/costinm/sshm";
+          name = "docker.io/costinm/sshm";
           tag = "latest";
-          contents = [ ssh-mesh ];
+          contents = [
+            sshm-opt-bin
+            sshm-busybox-opt
+            sshm-config
+            pkgs.cacert
+          ];
+          extraCommands = ''
+            mkdir -p tmp var/tmp var/run run root home/ssh-mesh/.ssh home/system/etc/mesh-init
+            chmod 1777 tmp var/tmp
+            chmod 0755 home/ssh-mesh root home/system/etc/mesh-init
+            chmod 0700 home/ssh-mesh/.ssh
+            chown -R 1001:1001 home/ssh-mesh 2>/dev/null || true
+          '';
           config = {
-            Entrypoint = [ "${ssh-mesh}/bin/mesh-init" ];
-            Env = [ "PATH=/bin:/usr/bin" ];
+            Entrypoint = [ "/opt/ssh-mesh/bin/mesh-init" ];
+            Cmd = [];
+            Env = [
+              "PATH=/opt/ssh-mesh/bin:/opt/busybox/bin"
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-certificates.crt"
+              "HOME=/root"
+              "MESH_SSH_MESH_UID=1001"
+            ];
+            ExposedPorts = {
+              "15022/tcp" = {};
+              "8080/tcp" = {};
+            };
           };
         };
 
       in
       {
         packages = {
-            inherit ssh-mesh sshm musl-toolchain build-deps runtime-deps python-tools;
+            inherit ssh-mesh sshm sshm-config musl-toolchain build-deps runtime-deps python-tools;
             default = ssh-mesh;
         };
 
@@ -215,57 +281,6 @@
                 coreutils
                 util-linux
               ];
-
-              system.stateVersion = "26.05";
-            })
-          ];
-        };
-
-        vmSystem = nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          modules = [
-            "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
-            ./nixos/module.nix
-            ({ pkgs, ... }: {
-              services.ssh-mesh = {
-                enable = true;
-                package = self.packages.x86_64-linux.ssh-mesh;
-                authorizedKeys = [
-                  (builtins.readFile ./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub)
-                ];
-              };
-
-              virtualisation = {
-                graphics = false;
-                memorySize = 1024;
-                cores = 1;
-                forwardPorts = [
-                  { from = "host"; host.port = 14022; guest.port = 15022; }
-                  { from = "host"; host.port = 28080; guest.port = 8080; }
-                ];
-                sharedDirectories = {
-                  home = {
-                    source = "target/nixos-vm-fs/home";
-                    target = "/home";
-                    securityModel = "mapped-xattr";
-                  };
-                  opt = {
-                    source = "target/nixos-vm-fs/opt";
-                    target = "/opt";
-                    securityModel = "mapped-xattr";
-                  };
-                };
-              };
-
-              services.getty.autologinUser = "root";
-
-              system.activationScripts.vm-testdata-keys.text = ''
-                install -d -m 0750 -o ssh-mesh -g ssh-mesh /home/ssh-mesh/etc
-                install -m 0600 -o ssh-mesh -g ssh-mesh ${./crates/ssh-mesh/tests/testdata/alice/id_ecdsa} /home/ssh-mesh/etc/id_ecdsa
-                install -m 0644 -o ssh-mesh -g ssh-mesh ${./crates/ssh-mesh/tests/testdata/alice/id_ecdsa.pub} /home/ssh-mesh/etc/id_ecdsa.pub
-              '';
-
-              boot.loader.grub.enable = false;
 
               system.stateVersion = "26.05";
             })

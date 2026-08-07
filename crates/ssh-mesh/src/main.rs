@@ -166,7 +166,7 @@ async fn main() -> Result<(), anyhow::Error> {
         host_ip
     );
 
-    if let Some(listener) = take_named_or_next_tcp_listener(&["ssh", "ssh-tcp"], "SSH")? {
+    if let Some(listener) = take_named_or_next_tcp_listener(&["ssh", "ssh-tcp", "ssh-mesh"], "SSH")? {
         let ssh_server_clone = ssh_server.clone();
         tokio::spawn(async move {
             let config = Arc::new(ssh_server_clone.get_config());
@@ -225,7 +225,7 @@ async fn main() -> Result<(), anyhow::Error> {
         app.clone(),
         true,
     )?;
-    start_http_listener_if_present(&["http"], "HTTP", web_app.clone(), true)?;
+    start_http_listener_if_present(&["http", "h2c"], "HTTP", app.clone(), true)?;
     start_tls_listener_if_present(&base_dir, &["https"], "HTTPS", web_app, true)?;
     start_admin_listener_if_present(app.clone())?;
     start_jsonl_listener_if_present(app_state.ssh_client_manager.clone())?;
@@ -419,8 +419,25 @@ fn start_http_listener_if_present(
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
             log::info!("{} listener serving HTTP on {}", label, addr);
-            if let Err(e) = axum::serve(listener, app.into_make_service()).await {
-                log::error!("{} server failed: {}", label, e);
+
+            let mut auto = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            auto.http2().enable_connect_protocol();
+
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(res) => res,
+                    Err(_) => continue,
+                };
+
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let service = hyper_util::service::TowerToHyperService::new(app.clone());
+                let auto = auto.clone();
+
+                tokio::spawn(async move {
+                    if let Err(err) = auto.serve_connection(io, service).await {
+                        log::debug!("HTTP connection error: {:?}", err);
+                    }
+                });
             }
         });
     }

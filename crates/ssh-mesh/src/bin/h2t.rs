@@ -2,19 +2,16 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::{Method, Request, Uri};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use std::env;
 use std::fs::OpenOptions;
 use std::process;
 use std::str::FromStr;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{error, info};
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing::error;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use url::Url;
@@ -107,36 +104,33 @@ async fn handle_websocket(
         );
     }
 
-    info!("Connecting to {}", request.uri());
+    eprintln!("[h2t] Connecting WebSocket to {}", request.uri());
 
-    // Check TCP first
-    let host = request.uri().host().unwrap_or("127.0.0.1");
-    let port = request.uri().port_u16().unwrap_or(80);
-    match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(_) => info!("TCP connection successful"),
-        Err(e) => {
-            error!("TCP connection failed: {}", e);
-            return Err(e.into());
-        }
-    }
+    let host = request.uri().host().unwrap_or("127.0.0.1").to_string();
+    let is_wss = request.uri().scheme_str() == Some("wss") || request.uri().scheme_str() == Some("https");
+    let port = request.uri().port_u16().unwrap_or(if is_wss { 443 } else { 80 });
 
-    let (ws_stream, _): (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        _,
-    ) = match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
-        Ok(Ok(res)) => res,
-        Ok(Err(e)) => {
-            error!("Failed to connect: {}", e);
-            return Err(e.into());
-        }
-        Err(_) => {
-            error!("Connection timeout during WebSocket handshake");
-            return Err("Timeout".into());
-        }
+    let tcp_stream = connect_tcp_stream(&host, port).await?;
+
+    let maybe_tls = if is_wss {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from(host.clone())?;
+        let tls_stream = connector.connect(server_name, tcp_stream).await?;
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream)
+    } else {
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream)
     };
-    info!("Connected to WebSocket");
+
+    let (ws_stream, _) = tokio_tungstenite::client_async(request, maybe_tls).await?;
+
+    eprintln!("[h2t] Connected to WebSocket");
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -196,19 +190,76 @@ async fn handle_websocket(
     Ok(())
 }
 
+enum H2Stream {
+    Tcp(tokio::net::TcpStream),
+    Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+}
+
+impl tokio::io::AsyncRead for H2Stream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            H2Stream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for H2Stream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            H2Stream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            H2Stream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            H2Stream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn connect_tcp_stream(host: &str, port: u16) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    let addrs: Vec<_> = tokio::net::lookup_host(format!("{}:{}", host, port)).await?.collect();
+    let mut sorted_addrs = addrs.clone();
+    sorted_addrs.sort_by_key(|addr| if addr.is_ipv4() { 0 } else { 1 });
+
+    for addr in sorted_addrs {
+        eprintln!("[h2t] Trying connection to {}", addr);
+        if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+            return Ok(stream);
+        }
+    }
+
+    Err("Failed to connect to any resolved IP address".into())
+}
+
 async fn handle_h2(
     url: &str,
     token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Create HTTP client
-    let mut https_connector = HttpConnector::new();
-    https_connector.enforce_http(false);
-
-    let client = Client::builder(TokioExecutor::new())
-        .http2_only(true)
-        .build(https_connector);
-
-    // Format URL
     let full_url = if url.contains("://") {
         url.to_string()
     } else {
@@ -216,6 +267,39 @@ async fn handle_h2(
     };
 
     let uri = Uri::from_str(&full_url)?;
+    let host = uri.host().ok_or("missing host in URI")?;
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
+
+    let tcp_stream = connect_tcp_stream(host, port).await?;
+
+    let stream = if uri.scheme_str() == Some("https") {
+        eprintln!("[h2t] Initiating TLS handshake with ALPN h2 for {}", host);
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+        let tls_stream = connector.connect(server_name, tcp_stream).await?;
+        H2Stream::Tls(tls_stream)
+    } else {
+        H2Stream::Tcp(tcp_stream)
+    };
+
+    eprintln!("[h2t] Performing HTTP/2 handshake...");
+    let io_stream = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), io_stream).await?;
+
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            eprintln!("[h2t] HTTP/2 connection error: {:?}", err);
+        }
+    });
 
     // Create a channel for sending body chunks
     let (tx, rx) =
@@ -225,23 +309,40 @@ async fn handle_h2(
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = StreamBody::new(stream);
 
-    // Build request
+
+    // Build request (Hyper derives :method, :scheme, :authority, and :path from full URI)
     let mut req_builder = Request::builder()
         .method(Method::POST)
         .uri(&uri)
-        .header("x-host", "localhost:15022"); // TODO: Make configurable
+        .header("x-host", "localhost:15022");
 
     if let Some(token) = token {
         req_builder = req_builder.header("authorization", format!("Bearer {}", token));
     }
 
-    let request = req_builder.body(body)?;
+    // Read the exact client SSH identification string from stdin if available (or use OpenSSH default)
+    let mut stdin = tokio::io::stdin();
+    let mut banner_buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while let Ok(1) = tokio::time::timeout(std::time::Duration::from_millis(100), stdin.read(&mut byte)).await.unwrap_or(Ok(0)) {
+        banner_buf.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
 
-    // Spawn a task to read from stdin and send to the channel
+    let client_banner = if !banner_buf.is_empty() {
+        Bytes::from(banner_buf)
+    } else {
+        Bytes::from_static(b"SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u10\r\n")
+    };
+
+    // Synchronously send exact SSH identification string so Google Frontend flushes POST headers & data immediately
+    let _ = tx.try_send(Ok(Frame::data(client_banner)));
+
+    // Spawn a task to read remaining binary data from stdin and send to the channel
     tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
         let mut buffer = [0u8; 8192];
-
         loop {
             match stdin.read(&mut buffer).await {
                 Ok(0) => break, // EOF
@@ -252,7 +353,7 @@ async fn handle_h2(
                     }
                 }
                 Err(e) => {
-                    error!("Error reading from stdin: {}", e);
+                    eprintln!("[h2t] Error reading from stdin: {}", e);
                     let _ = tx.send(Err(e.into())).await;
                     break;
                 }
@@ -260,8 +361,27 @@ async fn handle_h2(
         }
     });
 
-    // Send request and get response
-    let mut response = client.request(request).await?;
+    let request = req_builder.body(body)?;
+
+    eprintln!("[h2t] Sending POST request...");
+    let mut response = sender.send_request(request).await?;
+    eprintln!("[h2t] Response status: {}", response.status());
+
+    if response.status().as_u16() != 200 {
+        eprintln!("[h2t] HTTP error: {}", response.status());
+        return Err("HTTP request failed".into());
+    }
+
+    // Read response body and write to stdout
+    let mut stdout = tokio::io::stdout();
+    while let Some(frame_res) = response.body_mut().frame().await {
+        if let Ok(frame) = frame_res {
+            if let Ok(data) = frame.into_data() {
+                stdout.write_all(&data).await?;
+                stdout.flush().await?;
+            }
+        }
+    }
 
     if response.status().as_u16() != 200 {
         error!("HTTP error: {}", response.status());
@@ -270,8 +390,8 @@ async fn handle_h2(
 
     // Read response body and write to stdout
     let mut stdout = tokio::io::stdout();
-    while let Some(frame) = response.body_mut().frame().await {
-        match frame {
+    while let Some(frame_res) = response.body_mut().frame().await {
+        match frame_res {
             Ok(frame) => {
                 if let Ok(data) = frame.into_data() {
                     stdout.write_all(&data).await?;

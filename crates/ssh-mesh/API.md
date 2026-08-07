@@ -1,7 +1,7 @@
 # ssh-mesh API
 
 `ssh-mesh` owns the HTTP-facing API surface for the workspace. Components such as
-`mesh-init` and `traceweb` expose local JSONL/JSON-RPC over activated Unix
+`mesh-init` expose local JSONL/JSON-RPC over activated Unix
 sockets; ssh-mesh maps selected HTTP routes to those sockets.
 
 ## JSONL Proxying
@@ -56,24 +56,17 @@ Native ssh-mesh MCP method:
 
 Base route: `/_m/trace`
 
-The upstream traceweb UDS path comes from `TRACEWEB_UDS`, defaulting to:
+`ssh-mesh` serves its own telemetry and trace viewer directly using the `mesh` telemetry API.
 
-```text
-/run/mesh/traceweb/mesh.sock
-```
+| HTTP route | Description |
+| --- | --- |
+| `GET /_m/trace/` | Serves the trace viewer from ssh-mesh web assets. |
+| `GET /_m/trace/web/*path` | Serves trace viewer assets. |
+| `GET /_m/trace/level` | Returns current tracing filter level info. |
+| `POST /_m/trace/level` / `PUT /_m/trace/level` | JSON body: `{ "level": "debug" }`. Updates tracing level. |
+| `POST /_m/trace/api/sources/:name/level` | JSON body: `{ "level": "debug" }`. Updates tracing level. |
+| `GET /_m/trace/api/stream` | Streams live trace log events via Server-Sent Events (SSE). |
 
-| HTTP route | Upstream JSON-RPC method | Description |
-| --- | --- | --- |
-| `GET /_m/trace/` | none | Serves the trace viewer from ssh-mesh web assets. |
-| `GET /_m/trace/web/*path` | none | Serves trace viewer assets. |
-| `GET /_m/trace/api/discover` | `discover` | Lists trace producer sockets. |
-| `GET /_m/trace/api/sources` | `sources` | Lists connected trace sources. |
-| `GET /_m/trace/api/sources/connect?name=N&path=P` | `connect_source` | Connects traceweb to a producer. `path` is optional. |
-| `GET /_m/trace/api/sources/disconnect?name=N` | `disconnect_source` | Removes a connected source entry. |
-| `POST /_m/trace/api/sources/:name/level` | `set_source_level` | JSON body: `{ "level": "debug" }`. |
-| `GET /_m/trace/api/stream?sources=a,b` | `subscribe` | Maps JSONL `trace_entry` notifications to Server-Sent Events. |
-
-SSE event data is the `trace_entry.params` object from traceweb.
 
 ## Generic App Proxy
 

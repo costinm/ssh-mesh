@@ -31,6 +31,14 @@ use tracing_subscriber::{EnvFilter, Registry, reload};
 /// the tracing subscriber with a reload layer.
 pub static TRACING_RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
+/// Global reference to the process's primary `LogBuffer`.
+pub static GLOBAL_LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
+
+/// Retrieve the process-global `LogBuffer` if initialized.
+pub fn global_buffer() -> Option<LogBuffer> {
+    GLOBAL_LOG_BUFFER.get().cloned()
+}
+
 /// Maximum number of log entries to keep in the circular buffer (default)
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 
@@ -356,7 +364,7 @@ pub struct TraceConfig {
     /// Control-only mode: when true, the producer applies `global_level`/
     /// `modules` (raising its trace level) and replies with a single JSON ack
     /// line, then closes the connection without streaming. Used by collectors
-    /// (e.g. traceweb) to change a producer's level out-of-band.
+    /// to change a producer's level out-of-band.
     #[serde(default)]
     pub control: Option<bool>,
 }
@@ -451,11 +459,11 @@ fn level_lte(level: &str, threshold: &str) -> bool {
 /// 3. Streams new entries that match the config.
 ///
 /// The parent directory is created if missing and the socket is given mode
-/// `0o660` so that a same-group collector (e.g. traceweb) can connect.
+/// `0o660` so that local collectors can connect.
 ///
 /// Example usage:
 /// ```bash
-/// echo '{"global_level":"debug","modules":{"ssh_mesh":"trace"}}' | nc -U /home/traceweb/run/traceweb/ssh-mesh.sock
+/// echo '{"global_level":"debug","modules":{"ssh_mesh":"trace"}}' | nc -U /run/mesh/mesh-init/mesh.sock
 /// ```
 pub async fn start_uds_listener(
     socket_path: impl AsRef<Path>,
@@ -463,7 +471,7 @@ pub async fn start_uds_listener(
 ) -> std::io::Result<()> {
     let socket_path = socket_path.as_ref();
 
-    // Ensure the parent directory exists (e.g. /home/traceweb/run/traceweb).
+    // Ensure the parent directory exists (e.g. /run/mesh/mesh-init).
     if let Some(parent) = socket_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -638,18 +646,15 @@ pub fn create_log_buffer_with_size(size: usize) -> LogBuffer {
 
 /// Resolve the shared directory where trace sockets live.
 ///
-/// Honors the `TRACE_SOCKET_DIR` env var; otherwise defaults to the traceweb
-/// app runtime directory. Both producers (binding `<dir>/<app>.sock`) and
-/// the traceweb collector (scanning `<dir>`) use this so discovery needs no
-/// extra configuration.
-///
+/// Honors the `TRACE_SOCKET_DIR` env var; otherwise defaults to the mesh
+/// app runtime directory.
 pub fn default_trace_socket_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("TRACE_SOCKET_DIR")
         && !dir.is_empty()
     {
         return Some(std::path::PathBuf::from(dir));
     }
-    Some(crate::paths::AppPaths::for_app("traceweb").run_dir("traceweb"))
+    Some(crate::paths::AppPaths::for_app("mesh").run_dir("mesh"))
 }
 
 /// Resolve the default trace socket path for an app: `<dir>/<app>.sock`,
@@ -727,6 +732,7 @@ pub fn init(
     };
 
     let _ = TRACING_RELOAD_HANDLE.set(reload_handle);
+    let _ = GLOBAL_LOG_BUFFER.set(log_buffer.clone());
     (log_buffer, guard)
 }
 
@@ -805,6 +811,67 @@ pub fn serve(app_name: &str, buffer: LogBuffer) {
             tracing::error!(app = %app_name, error = %e, "UDS trace listener stopped");
         }
     });
+}
+
+/// Stream log entries from `buffer` to `writer`.
+///
+/// Sends existing buffered entries matching optional filter criteria,
+/// then subscribes and streams new entries until client disconnects or channel closes.
+pub async fn stream_logs<W>(
+    buffer: &LogBuffer,
+    format: &crate::jsonl::ProtocolFormat,
+    writer: &mut W,
+    source_name: &str,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let existing = buffer.get_all();
+    for entry in existing {
+        let line = format_log_entry(&entry, source_name, format);
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+    }
+    let mut rx = buffer.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(entry) => {
+                let line = format_log_entry(&entry, source_name, format);
+                if writer.write_all(line.as_bytes()).await.is_err()
+                    || writer.write_all(b"\n").await.is_err()
+                {
+                    break;
+                }
+                let _ = writer.flush().await;
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    Ok(())
+}
+
+fn format_log_entry(
+    entry: &LogEntry,
+    source_name: &str,
+    format: &crate::jsonl::ProtocolFormat,
+) -> String {
+    let mut val = serde_json::to_value(entry).unwrap_or_default();
+    if let serde_json::Value::Object(ref mut map) = val {
+        map.insert(
+            "source".to_string(),
+            serde_json::Value::String(source_name.to_string()),
+        );
+    }
+    match format {
+        crate::jsonl::ProtocolFormat::JsonRpc { .. } => serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "trace_entry",
+            "params": val
+        })
+        .to_string(),
+        _ => val.to_string(),
+    }
 }
 
 #[cfg(test)]

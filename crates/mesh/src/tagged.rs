@@ -139,6 +139,23 @@ impl TaggedCatalog {
     /// Parse `component.method name=value positional...` into a tagged record.
     pub fn parse_text(&self, line: &str) -> Result<TaggedRecord> {
         let tokens = text_tokens(line)?;
+        self.parse_tokens(&tokens)
+    }
+
+    /// Parse a method name and already shell-split arguments into a tagged record.
+    ///
+    /// Command-line clients must use this rather than joining argv back into a
+    /// text line: a field value such as `command=ble stats=true` is one argv
+    /// token and must remain one value when a generated tools catalog supplies
+    /// its wire tags.
+    pub fn parse_argv(&self, method_name: &str, arguments: &[String]) -> Result<TaggedRecord> {
+        let mut tokens = Vec::with_capacity(arguments.len() + 1);
+        tokens.push(method_name);
+        tokens.extend(arguments.iter().map(String::as_str));
+        self.parse_tokens(&tokens)
+    }
+
+    fn parse_tokens(&self, tokens: &[&str]) -> Result<TaggedRecord> {
         let (method_name, rest) = tokens
             .split_first()
             .ok_or_else(|| anyhow!("missing method"))?;
@@ -292,6 +309,23 @@ mod tests {
         assert_eq!(
             record.env.get(&NameOrTag::Name("name".to_owned())),
             Some(&json!("lmesh"))
+        );
+    }
+
+    #[test]
+    fn argv_preserves_space_containing_field_value() {
+        let catalog = TaggedCatalog::from_tools_json(&json!([{
+            "name":"esp.serial.command",
+            "x-mesh-wire":{"component":"esp","method":"serial.command"},
+            "inputSchema":{"properties":{"command":{"x-mesh-wire":{"tag":1}}}}
+        }]))
+        .unwrap();
+        let record = catalog
+            .parse_argv("esp.serial.command", &["command=ble stats=true".to_owned()])
+            .unwrap();
+        assert_eq!(
+            record.env.get(&NameOrTag::Tag(1)),
+            Some(&json!("ble stats=true"))
         );
     }
 }

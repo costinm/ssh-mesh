@@ -68,7 +68,12 @@ need ssh-mesh
 
 rootfs="${artifact_dir}/img/ssh-mesh.erofs"
 vm_available=1
+# vrun is built by the initos repo (https://github.com/costinm/initos).
+# Set NIX_PROFILE to a built initos VM profile to enable VM examples.
 vrun="${staged_opt}/ssh-mesh/bin/vrun"
+if [ ! -x "${vrun}" ] && [ -n "${NIX_PROFILE:-}" ] && [ -x "${NIX_PROFILE}/bin/vrun" ]; then
+  vrun="${NIX_PROFILE}/bin/vrun"
+fi
 
 if [ ! -x "${vrun}" ] ||
    ! VIRT="${NIX_PROFILE}" VIRT_ROOTFS="${rootfs}" "${vrun}" available qemuvirt >/dev/null 2>&1; then
@@ -79,9 +84,7 @@ if [ "${SSH_MESH_EXAMPLES_REQUIRE_VM:-0}" = "1" ] && [ "${vm_available}" != "1" 
   cat >&2 <<EOF
 Host3-vm requires vrun, a readable rootfs, a detected VM kernel profile, and qemu.
 
-Build optional VM assets with:
-  ${workspace_dir}/scripts/build.sh profile
-  ${workspace_dir}/scripts/build.sh
+Set NIX_PROFILE to a built initos VM profile. See https://github.com/costinm/initos
 EOF
   exit 2
 fi

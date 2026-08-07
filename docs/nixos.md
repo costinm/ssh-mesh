@@ -61,50 +61,10 @@ Then enable the service in `configuration.nix`:
 - The module does not use `/etc/ssh-mesh`, `/etc/mesh-init`, or
   `/run/mesh-init`.
 
-## Start a Test VM
+## Module Notes
 
-Prepare the host-mounted `/home` and `/opt` trees, then build and start the
-manual NixOS VM:
-
-```bash
-mkdir -p target/nixos-vm-fs/home target/nixos-vm-fs/opt
-nix build .#nixosConfigurations.vmSystem.config.system.build.vm -o target/nixos-vm
-target/nixos-vm/bin/run-nixos-vm
-```
-
-That VM starts `mesh-init.service`, mounts host `target/nixos-vm-fs/home` at
-guest `/home`, mounts host `target/nixos-vm-fs/opt` at guest `/opt`, starts
-`ssh-mesh` through mesh-init activation, and forwards guest TCP `15022` to host
-TCP `14022`. The guest also has `/nix` mounted by the NixOS VM environment.
-
-In another terminal, connect with the testdata key:
-
-```bash
-ssh -i crates/ssh-mesh/tests/testdata/alice/id_ecdsa \
-  -p 14022 \
-  -o IdentitiesOnly=yes \
-  -o IdentityAgent=none \
-  -o CertificateFile=none \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  system@127.0.0.1 true
-```
-
-Use `journalctl -u mesh-init -f` in the VM to watch `mesh-init` and activated
-`ssh-mesh` logs.
-
-The `IdentitiesOnly`, `IdentityAgent`, and `CertificateFile` options keep the
-host OpenSSH client from offering unrelated agent keys or configured
-certificates. The manual VM authorizes only the raw Alice test key.
-
-After the VM is running, run the SSH-driven VM integration test with:
-
-```bash
-scripts/verify_nixos.sh
-```
-
-The test does not boot the VM. It copies checked-in fixtures from
-`tests/nixos/mesh-init` into `target/nixos-vm-fs`, connects to the running VM
-with OpenSSH, verifies that systemd started `mesh-init`, checks the shared
-`/run/mesh` sockets, verifies `/opt` then `/home` config layering, tests
-on-demand UID allocation, and runs mesh-init resource and hardening checks.
+For VM-based integration testing of `mesh-init` and `ssh-mesh` together, see
+the `initos` repository at `github.com/costinm/initos`. The `vm/` directory
+there provides the kernel, `vrun` launcher, and test harnesses. VMs connect to
+`ssh-mesh` via vsock and nftables-based traffic capture (Istio-style), with
+`mesh-init` managing the process lifecycle.

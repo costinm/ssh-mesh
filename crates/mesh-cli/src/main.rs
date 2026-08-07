@@ -160,6 +160,15 @@ fn service_address(service: &str) -> Result<Option<String>> {
             "unix:///run/mesh/{namespace}/{endpoint}.sock"
         )));
     }
+    // A conventional mesh-init service without a [Mesh] section still owns
+    // the standard per-service control socket.  This lets `mesh lmesh ...`
+    // select the local service without conflating it with an SSH host.
+    if service_config_candidates(service)
+        .into_iter()
+        .any(|path| path.is_file())
+    {
+        return Ok(Some(format!("unix:///run/mesh/{service}/mesh.sock")));
+    }
     if std::env::var_os("MESH_SERVICE_DIR").is_none() {
         let default = match service {
             "mesh-init" => "/run/mesh/mesh-init/mesh.sock",
@@ -293,20 +302,39 @@ fn catalog() -> Result<Option<TaggedCatalog>> {
 }
 
 fn record(arguments: &[String], catalog: Option<&TaggedCatalog>) -> Result<TaggedRecord> {
-    let [component, method, rest @ ..] = arguments else {
-        anyhow::bail!("RPC endpoints require COMPONENT METHOD [options/parameters]");
+    let component = arguments
+        .first()
+        .context("RPC endpoints require COMPONENT METHOD [options/parameters]")?;
+    // Catalog methods are named `component.method`. Preserve that documented
+    // dotted spelling while also accepting the older two-word form.
+    let (method_name, invocation_args) = if component.contains('.') {
+        (component.clone(), arguments[1..].to_vec())
+    } else {
+        let method = arguments
+            .get(1)
+            .context("RPC endpoints require COMPONENT METHOD [options/parameters]")?;
+        (format!("{component}.{method}"), arguments[2..].to_vec())
     };
     if let Some(catalog) = catalog {
-        let invocation = std::iter::once(format!("{component}.{method}"))
-            .chain(rest.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        return catalog.parse_text(&invocation);
+        return catalog.parse_argv(&method_name, &invocation_args);
     }
+    let (component, method) = if component.contains('.') {
+        component
+            .split_once('.')
+            .context("dotted RPC method must contain a component and method")?
+    } else {
+        (
+            component.as_str(),
+            arguments
+                .get(1)
+                .context("RPC endpoints require COMPONENT METHOD [options/parameters]")?
+                .as_str(),
+        )
+    };
     let mut env = BTreeMap::new();
     let mut params = Vec::new();
     let mut options = true;
-    for value in rest {
+    for value in &invocation_args {
         if options && value == "--" {
             options = false;
         } else if options && value.starts_with('-') {
@@ -365,7 +393,10 @@ fn text_request(record: &TaggedRecord) -> String {
         record
             .env
             .iter()
-            .map(|(key, value)| format!("-{}={}", key.text(), render_text_value(value))),
+            // Bare key=value fields are the mesh UDS wire format. The
+            // leading-dash spelling belongs to the CLI/catalog parser, not
+            // to mesh.sock or lmesh's text protocol.
+            .map(|(key, value)| format!("{}={}", key.text(), render_text_value(value))),
     );
     values.extend(record.params.iter().map(render_text_value));
     format!("{}\n", values.join(" "))
@@ -403,8 +434,31 @@ where
         }
     }
     write.flush().await?;
-    drop(write);
+    let is_subscribe = record.method.text().ends_with("subscribe")
+        || record.component.text().ends_with("subscribe");
     let mut reader = BufReader::new(read);
+
+    if is_subscribe {
+        let mut line = String::new();
+        while reader.read_line(&mut line).await? > 0 {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        println!("{trimmed}");
+                    }
+                } else {
+                    println!("{trimmed}");
+                }
+            }
+            line.clear();
+        }
+        return Ok(());
+    }
+
+    drop(write);
     let first = reader
         .fill_buf()
         .await?
@@ -582,12 +636,52 @@ mod tests {
         let arguments = vec![
             "mesh-init".to_owned(),
             "stop".to_owned(),
-            "name=traceweb".to_owned(),
+            "name=demo".to_owned(),
         ];
         let record = record(&arguments, None).unwrap();
         assert_eq!(
             json_request(&record, None),
-            json!({"method": "mesh-init.stop", "name": "traceweb"})
+            json!({"method": "mesh-init.stop", "name": "demo"})
+        );
+    }
+
+    #[test]
+    fn dotted_rpc_method_preserves_named_fields() {
+        let arguments = vec![
+            "esp.serial.command".to_owned(),
+            "port=lora2".to_owned(),
+            "command=status".to_owned(),
+        ];
+        let record = record(&arguments, None).unwrap();
+        assert_eq!(record.component.text(), "esp");
+        assert_eq!(record.method.text(), "serial.command");
+        assert_eq!(
+            json_request(&record, None),
+            json!({"method": "esp.serial.command", "port": "lora2", "command": "status"})
+        );
+    }
+
+    #[test]
+    fn dotted_rpc_method_accepts_no_parameters() {
+        let arguments = vec!["usb.serial.forward.list".to_owned()];
+        let record = record(&arguments, None).unwrap();
+        assert_eq!(
+            json_request(&record, None),
+            json!({"method": "usb.serial.forward.list"})
+        );
+    }
+
+    #[test]
+    fn text_request_uses_mesh_wire_fields_without_cli_dashes() {
+        let arguments = vec![
+            "esp.serial.command".to_owned(),
+            "port=lora3".to_owned(),
+            "command=status".to_owned(),
+        ];
+        let record = record(&arguments, None).unwrap();
+        assert_eq!(
+            text_request(&record),
+            "esp.serial.command command=status port=lora3\n"
         );
     }
 }
@@ -604,12 +698,9 @@ async fn main() -> Result<()> {
         && !cli.destination.starts_with("mux://")
         && let Some(address) = service_address(&cli.destination)?
     {
-        let component = cli.destination.clone();
-        if !cli.arguments.is_empty() {
-            let mut arguments = vec![component];
-            arguments.extend(std::mem::take(&mut cli.arguments));
-            cli.arguments = arguments;
-        }
+        // The logical destination selects a service endpoint.  RPC components
+        // remain command arguments, so a catalog-backed call reads naturally
+        // as `mesh lmesh esp serial.command ...`.
         cli.destination = address;
     }
     if is_rpc_endpoint(&cli.destination) {

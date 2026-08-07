@@ -1,9 +1,10 @@
 # On-demand activator for a no-network VM started by the unprivileged host1
-# mesh-init. vrun selects crosvm when KVM is available and falls back to QEMU.
+# mesh-init. vrun is provided by the initos VM profile (NIX_PROFILE/bin/vrun).
+# vrun selects crosvm when KVM is available and falls back to QEMU.
 
 [Service]
 
-ExecStart = "/opt/ssh-mesh/bin/vrun start"
+ExecStart = "vrun start"
 Type = "oneshot"
 OOMScoreAdjust = -766
 [[Peer]]

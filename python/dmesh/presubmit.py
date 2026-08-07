@@ -202,7 +202,7 @@ class PresubmitSuite:
         return result
 
     def uart_wake_reliability(self):
-        """Exercise the DTR-to-console wake path after each configured idle gap."""
+        """Exercise heartbeat-queued UART commands after each idle gap."""
         config = self.config.thresholds.get("uart", {})
         if not config.get("enabled", False):
             return {"skipped": True, "reason": "thresholds.uart.enabled=false"}

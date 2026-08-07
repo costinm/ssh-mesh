@@ -117,14 +117,19 @@ need ssh-mesh
 need h2t
 
 vrun="${example_bin_dir}/vrun"
+# vrun is built by the initos repo (https://github.com/costinm/initos).
+# If not in the dist tree, look in NIX_PROFILE if the user has set it.
+if [ ! -x "${vrun}" ] && [ -n "${NIX_PROFILE:-}" ] && [ -x "${NIX_PROFILE}/bin/vrun" ]; then
+  vrun="${NIX_PROFILE}/bin/vrun"
+fi
+rootfs="${SSH_MESH_APP_VM_ROOTFS:-${artifact_dir}/img/ssh-mesh.erofs}"
 if [ ! -x "${vrun}" ] ||
-   ! VIRT="${NIX_PROFILE:-${root}/target/nix/profile}" VIRT_ROOTFS="${artifact_dir}/img/ssh-mesh.erofs" "${vrun}" available qemuvirt >/dev/null 2>&1; then
+   ! VIRT="${NIX_PROFILE:-${root}/target/nix/profile}" VIRT_ROOTFS="${rootfs}" "${vrun}" available qemuvirt >/dev/null 2>&1; then
   cat <<EOF
 skipping VM-heavy example suite; vrun, qemu, rootfs, or custom VM profile is missing
 
-Build optional VM assets with:
-  scripts/build.sh profile
-  scripts/build.sh
+Set NIX_PROFILE to a built initos VM profile that contains vrun, the kernel,
+and hypervisors. See https://github.com/costinm/initos for details.
 EOF
   exit 0
 fi

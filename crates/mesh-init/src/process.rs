@@ -1081,7 +1081,7 @@ pub fn spawn_process(
             cmd.env(
                 "LISTEN_FDNAMES",
                 fds.iter()
-                    .map(|fd| fd.name.as_deref().unwrap_or("unknown"))
+                    .map(|fd| fd.name.as_deref().unwrap_or(&config.name))
                     .collect::<Vec<_>>()
                     .join(":"),
             );
