@@ -1,0 +1,32 @@
+# docs/examples/cloudrun-h2c.toml — Example ssh-mesh configuration for CloudRun / H2C
+#
+# Used by mesh-init to launch ssh-mesh with socket activation for both
+# direct SSH (15022) and CloudRun H2C tunneling (8080).
+[Service]
+ExecStart = "/opt/ssh-mesh/bin/ssh-mesh"
+User = "1001"
+Group = "1001"
+OOMScoreAdjust = -900
+
+[Socket]
+Accept = false
+
+# Primary SSH TCP listener
+[[Socket.Listen]]
+Type = "stream"
+Address = "15022"
+Name = "ssh"
+
+# CloudRun H2C HTTP/2 tunnel listener
+[[Socket.Listen]]
+Type = "stream"
+Address = "8080"
+Name = "http"
+
+[Environment]
+SSH_BASEDIR = "/home/ssh-mesh/.ssh"
+SSH_PORT = "15022"
+HTTP_PORT = "8080"
+MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock"
+MESH_SSH_MESH_UID = "1001"
+RUST_LOG = "info"
