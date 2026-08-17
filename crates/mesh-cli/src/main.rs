@@ -17,6 +17,7 @@ use mesh::mux_client::MuxClient;
 use mesh::tagged::{NameOrTag, TaggedCatalog, TaggedRecord};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::time::{Duration, timeout};
 
 #[derive(Clone, Parser, Debug)]
 #[command(name = "mesh", about = "Generic mesh and SSH-compatible client")]
@@ -39,6 +40,9 @@ struct Cli {
     /// Do not start a command after establishing forwards.
     #[arg(short = 'N')]
     no_command: bool,
+    /// Maximum time to wait for an RPC response or streaming subscription.
+    #[arg(long, default_value_t = 9)]
+    timeout_sec: u64,
     /// Destination endpoint, host, service name, or URI.
     destination: String,
     /// SSH command for a host/mux endpoint, or COMPONENT METHOD arguments for
@@ -512,7 +516,13 @@ async fn rpc_destination(cli: &Cli) -> Result<()> {
     let record = record(&cli.arguments, catalog.as_ref())?;
     let format = DestinationFormat::from_env()?;
     let stream = connect_rpc(&cli.destination).await?;
-    rpc(stream, record, catalog.as_ref(), format).await
+    timeout(
+        Duration::from_secs(cli.timeout_sec),
+        rpc(stream, record, catalog.as_ref(), format),
+    )
+    .await
+    .context("mesh RPC timed out")??;
+    Ok(())
 }
 
 async fn connect_rpc(destination: &str) -> Result<Box<dyn AsyncReadWrite>> {

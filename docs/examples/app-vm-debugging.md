@@ -29,31 +29,31 @@ ssh -F ssh_config -p 29322 host3-vm-root-direct
 
 ## Mesh-Init Commands
 
-Inside host3-vm, `mesh-init` supports:
+Inside host3-vm, use the `mesh` CLI for `mesh-init` service control:
 
 ```bash
-mesh-init status [SERVICE]
-mesh-init start SERVICE [ARGS...]
-mesh-init stop SERVICE [--signal SIGNAL]
-mesh-init reload
-mesh-init freeze SERVICE
-mesh-init unfreeze SERVICE
-mesh-init shutdown
+mesh mesh-init status [SERVICE]
+mesh mesh-init start SERVICE [ARGS...]
+mesh mesh-init stop SERVICE [--signal SIGNAL]
+mesh mesh-init reload
+mesh mesh-init freeze SERVICE
+mesh mesh-init unfreeze SERVICE
+mesh mesh-init shutdown
 ```
 
 Check and start app2/app3:
 
 ```bash
-mesh-init status activate-app2-qemu
-mesh-init start activate-app2-qemu
-mesh-init status activate-app2-qemu
+mesh mesh-init status activate-app2-qemu
+mesh mesh-init start activate-app2-qemu
+mesh mesh-init status activate-app2-qemu
 
-mesh-init status activate-app3-crosvm
-mesh-init start activate-app3-crosvm
-mesh-init status activate-app3-crosvm
+mesh mesh-init status activate-app3-crosvm
+mesh mesh-init start activate-app3-crosvm
+mesh mesh-init status activate-app3-crosvm
 ```
 
-If `mesh-init status activate-app2-qemu` or `activate-app3-crosvm` returns
+If `mesh mesh-init status activate-app2-qemu` or `activate-app3-crosvm` returns
 `service not found`, check that host3-vm is running with the current example
 configs:
 
@@ -61,7 +61,7 @@ configs:
 ls -la /home/system/etc/mesh-init/
 cat /home/system/etc/mesh-init/app2-qemu.toml
 cat /home/system/etc/mesh-init/app3-crosvm.toml
-mesh-init reload
+mesh mesh-init reload
 ```
 
 ## Trigger Activation Manually

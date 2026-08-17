@@ -300,13 +300,13 @@ After config-only edits, reload the relevant running daemon instead of
 restarting binaries. For example, inside a host/app environment:
 
 ```bash
-mesh-init reload
+mesh mesh-init reload
 ```
 
 From the host, point `MESH_INIT_RUN` at the daemon run directory:
 
 ```bash
-MESH_INIT_RUN="$SSH_MESH_STATE_ROOT/host1/home/system/run/mesh-init" mesh-init reload
+MESH_INIT_RUN="$SSH_MESH_STATE_ROOT/host1/home/system/run/mesh-init" mesh mesh-init reload
 ```
 
 ## Ports

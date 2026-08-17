@@ -42,8 +42,8 @@ Deprecated:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `RUST_LOG` | tracing subscriber default | Initial tracing filter for `local_trace::init` and binaries using `EnvFilter::from_default_env`. |
-| `MESH_LOG_FILE` | unset | Exact JSON trace log path for `local_trace::init`, for example `/dev/stderr` or `/tmp/ssh-mesh.log`. Takes precedence over `MESH_LOG_DIR`. |
-| `MESH_LOG_DIR` | unset | Directory for `local_trace::init` JSON trace logs; writes `<MESH_LOG_DIR>/<app>.log`. |
+| `MESH_LOG_FILE` | unset | Exact JSON trace log path for `local_trace::init`, for example `/dev/stderr` or `/tmp/ssh-mesh.log`. Takes precedence over `MESH_LOG_DIR`; directory-based logs rotate daily. |
+| `MESH_LOG_DIR` | unset | Directory for `local_trace::init` JSON trace logs; writes a daily-rotated `<MESH_LOG_DIR>/<app>.log` file. |
 | `TRACE_SOCKET_DIR` | `<mesh_home>/run/mesh` | Shared directory for local trace sockets; producer sockets are `<TRACE_SOCKET_DIR>/<app>.sock`. |
 
 ## Generated Variables

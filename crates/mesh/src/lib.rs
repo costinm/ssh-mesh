@@ -9,6 +9,7 @@ pub mod mux;
 pub mod mux_client;
 pub mod paths;
 pub mod protocol;
+pub mod schema;
 pub mod server;
 pub mod tagged;
 pub mod tun;

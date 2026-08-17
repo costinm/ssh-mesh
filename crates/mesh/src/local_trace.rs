@@ -15,7 +15,6 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -24,6 +23,7 @@ use tokio::sync::broadcast;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry, reload};
+use tracing_subscriber::filter::filter_fn;
 
 /// Global handle for dynamically reloading the tracing filter, required to integrate.
 ///
@@ -149,6 +149,14 @@ impl LogBuffer {
         inner.tx.subscribe()
     }
 
+    /// Broadcast a live-only event without retaining it in the circular
+    /// history. This is used for high-rate radio packets whose consumers must
+    /// explicitly subscribe while the monitor is active.
+    pub fn push_unbuffered(&self, entry: LogEntry) {
+        let inner = self.inner.read();
+        let _ = inner.tx.send(entry);
+    }
+
     /// Get the current buffer size
     pub fn len(&self) -> usize {
         let inner = self.inner.read();
@@ -196,10 +204,17 @@ where
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
 
+        let target = visitor
+            .fields
+            .get("event_type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|_| metadata.target() == "dmesh.event")
+            .map(|event| format!("dmesh.event.{event}"))
+            .unwrap_or_else(|| metadata.target().to_string());
         let entry = LogEntry {
             timestamp: chrono::Utc::now().to_rfc3339(),
             level: metadata.level().to_string().to_lowercase(),
-            target: metadata.target().to_string(),
+            target,
             message: visitor.message,
             fields: if visitor.fields.is_empty() {
                 None
@@ -209,7 +224,19 @@ where
             },
         };
 
-        self.buffer.push(entry);
+        let live_only = entry.target.starts_with("dmesh.event.wifi.rawnan")
+            || (entry.target == "dmesh.event.wifi.raw.rx"
+                && entry
+                    .fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|source| source.ends_with("mon")));
+        if live_only {
+            self.buffer.push_unbuffered(entry);
+        } else {
+            self.buffer.push(entry);
+        }
     }
 }
 
@@ -680,8 +707,8 @@ pub fn default_trace_socket_path(app_name: &str) -> Option<std::path::PathBuf> {
 /// If `MESH_LOG_FILE` or `MESH_LOG_DIR` is set, a non-blocking JSON `fmt`
 /// layer is also installed that writes every event (subject to the same
 /// `EnvFilter`) to that path. `MESH_LOG_FILE` is an exact file path;
-/// `MESH_LOG_DIR` writes `<dir>/<app>.log`. Parent directories are created if
-/// missing. The returned `WorkerGuard` must be kept alive for the lifetime of
+/// `MESH_LOG_DIR` writes a daily-rotated `<dir>/<app>.log` file. Parent
+/// directories are created if missing. The returned `WorkerGuard` must be kept alive for the lifetime of
 /// the process (dropping it stops the background writer thread and flushes
 /// pending events); bind it to a named variable in `main` to be safe. If none
 /// of the file env vars is set, no file is written and the second tuple element
@@ -707,16 +734,21 @@ pub fn init(
 
     let guard = match build_file_writer(app) {
         Some((non_blocking, guard)) => {
+            // Radio packet events are intentionally retained in the bounded
+            // in-memory/socket trace stream, but must not be copied into the
+            // operational file.  With a file sink configured, do not also
+            // inherit the supervisor's stderr: that path is commonly a
+            // shared /tmp/log.json and defeats per-app rotation.
             Registry::default()
                 .with(filter)
                 .with(buffer_layer)
-                .with(stderr_layer)
                 .with(
                     tracing_subscriber::fmt::layer()
                         .json()
                         .with_current_span(false)
                         .with_span_list(false)
-                        .with_writer(non_blocking),
+                        .with_writer(non_blocking)
+                        .with_filter(filter_fn(|metadata| metadata.target() != "dmesh.event")),
                 )
                 .init();
             Some(guard)
@@ -768,16 +800,37 @@ fn build_file_writer(
 
     let dir = parent;
     let file_name = log_path.file_name()?.to_string_lossy();
-    if let Err(e) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        tracing::warn!(
-            path = ?log_path,
-            error = %e,
-            "log file could not be opened; file logging disabled"
-        );
-        return None;
-    }
-    let appender = tracing_appender::rolling::never(dir, file_name.as_ref());
+    prune_log_files(dir, &file_name, 512 * 1024 * 1024);
+    // Keep one current file per day. This bounds each file without requiring
+    // a second logging process and works for both mesh-init and child apps.
+    let appender = tracing_appender::rolling::daily(dir, file_name.as_ref());
     Some(tracing_appender::non_blocking(appender))
+}
+
+/// Keep historical per-app logs bounded. The active daily file is retained;
+/// oldest rotated files are removed first. Failure is deliberately best
+/// effort because logging must never prevent the service from starting.
+fn prune_log_files(dir: &std::path::Path, basename: &str, max_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy();
+            if name == basename || !name.starts_with(&format!("{basename}.")) {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            Some((path, metadata.len(), metadata.modified().ok()))
+        })
+        .collect::<Vec<_>>();
+    let mut total = files.iter().map(|(_, size, _)| *size).sum::<u64>();
+    if total <= max_bytes { return; }
+    files.sort_by_key(|(_, _, modified)| *modified);
+    for (path, size, _) in files {
+        if total <= max_bytes { break; }
+        if std::fs::remove_file(path).is_ok() { total = total.saturating_sub(size); }
+    }
 }
 
 /// Bind the app's UDS trace socket and serve it in a background task.
@@ -851,6 +904,47 @@ where
     Ok(())
 }
 
+/// Stream buffered and future trace entries matching an explicit subscription
+/// configuration. This is the pub/sub primitive used by component control
+/// sockets; unlike a one-shot history request it remains connected until the
+/// subscriber closes the socket.
+pub async fn stream_logs_filtered<W>(
+    buffer: &LogBuffer,
+    format: &crate::jsonl::ProtocolFormat,
+    writer: &mut W,
+    source_name: &str,
+    config: &TraceConfig,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    for entry in buffer.get_all() {
+        if config.matches(&entry) {
+            let line = format_log_entry(&entry, source_name, format);
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+        }
+    }
+    let mut rx = buffer.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(entry) if config.matches(&entry) => {
+                let line = format_log_entry(&entry, source_name, format);
+                if writer.write_all(line.as_bytes()).await.is_err()
+                    || writer.write_all(b"\n").await.is_err()
+                {
+                    break;
+                }
+                writer.flush().await?;
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    Ok(())
+}
+
 fn format_log_entry(
     entry: &LogEntry,
     source_name: &str,
@@ -862,6 +956,9 @@ fn format_log_entry(
             "source".to_string(),
             serde_json::Value::String(source_name.to_string()),
         );
+        if let Some(serde_json::Value::Object(fields)) = map.get_mut("fields") {
+            fields.remove("event_type");
+        }
     }
     match format {
         crate::jsonl::ProtocolFormat::JsonRpc { .. } => serde_json::json!({
@@ -900,9 +997,17 @@ mod tests {
         // Drop the guard to flush and shut down the background writer.
         drop(guard);
 
-        let log_path = dir.path().join("smoke-test.log");
-        let contents = std::fs::read_to_string(&log_path)
-            .unwrap_or_else(|e| panic!("read {:?}: {}", log_path, e));
+        let contents = std::fs::read_dir(dir.path())
+            .expect("read log directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("smoke-test.log")
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<String>();
         assert!(!contents.is_empty(), "log file is empty: {:?}", contents);
         assert!(
             contents.contains("smoke-test event"),

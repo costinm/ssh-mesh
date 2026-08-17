@@ -1,0 +1,43 @@
+# mesh-init systemd unit (temporary local-build installation).
+#
+# Build the binary first:
+#   cd /ws/rust/ssh-mesh
+#   source env.sh
+#   cargo build --release --target x86_64-unknown-linux-musl -p mesh-init
+#
+# Install this unit as root:
+#   install -Dm0644 /ws/rust/ssh-mesh/crates/mesh-init/examples/mesh-init.service \
+#     /etc/systemd/system/mesh-init.service
+#
+# Enable and start it:
+#   systemctl daemon-reload
+#   systemctl enable --now mesh-init.service
+#
+# Check the daemon:
+#   systemctl status mesh-init.service
+#   journalctl -u mesh-init.service
+
+[Unit]
+Description=mesh-init service supervisor
+After=local-fs.target
+
+[Service]
+# mesh-init stays in the foreground and blocks in its control server, so the
+# default systemd process model is the correct one. It does not fork or send
+# systemd readiness notifications.
+Type=simple
+ExecStart=/ws/rust/ssh-mesh/target/x86_64-unknown-linux-musl/release/mesh-init
+WorkingDirectory=/home/system
+Environment=HOME=/home/system
+# Keep the executable/tool lookup environment used by /home/system/meshroot.sh.
+# systemd does not expand $PATH in Environment= assignments, so include the
+# normal system directories explicitly. The Nix profile paths are listed with
+# their bin directories because PATH entries must point at executable files.
+Environment="PATH=/ws/dmesh/target/x86_64-unknown-linux-musl/release:/ws/rust/ssh-mesh/target/x86_64-unknown-linux-musl/release:/ws/rust/ssh-mesh/target/x86_64-unknown-linux-musl/debug:/opt/ssh-mesh/bin:/ws/rust/ssh-mesh/target/nix/profile/bin:/ws/dmesh/target/nix/profile/bin:/home/system/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/etc/profiles/per-user/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment=RUST_LOG=INFO
+Environment=MESH_LOG_DIR=/home/mesh-init/logs
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

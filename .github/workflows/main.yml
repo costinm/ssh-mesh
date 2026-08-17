@@ -67,6 +67,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           docker load < result-sshm
+          docker tag docker.io/costinm/sshm:latest ghcr.io/costinm/sshm:latest
           docker push ghcr.io/costinm/sshm:latest
 
   # ── Release: attach NARs to GitHub releases ────────────────────

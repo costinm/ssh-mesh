@@ -44,12 +44,15 @@ workspace `target/` directory.
 
 ## Client Commands
 
+Use the `mesh` binary for service-control requests. The `mesh-init` binary is
+the supervisor daemon, not the operator-facing service-control CLI.
+
 ```bash
 ./target/debug/mesh mesh-init status
 ./target/debug/mesh mesh-init start echo-service
 ./target/debug/mesh mesh-init status echo-service
 ./target/debug/mesh mesh-init stop echo-service
-./target/debug/mesh-init reload
+./target/debug/mesh mesh-init reload
 ./target/debug/mesh mesh-init shutdown
 ```
 
@@ -144,7 +147,7 @@ MeshPersisted = true
 MeshSaveResult = true
 
 [Service]
-ExecStart = "mesh-init start sync-service"
+ExecStart = "mesh mesh-init start sync-service"
 OOMScoreAdjust = -700
 
 [Schedule]
