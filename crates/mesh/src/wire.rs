@@ -80,6 +80,28 @@ pub trait TaggedRecordHandler: Send + Sync {
     /// Return `None` for a one-way message. A request must return a response
     /// whose ID is the request ID; `serve_cbor_session` checks that invariant.
     async fn handle_record(&self, record: TaggedRecord) -> Result<Option<TaggedRecord>>;
+
+    /// Route a request that names another mesh destination.
+    ///
+    /// The common session loop calls this instead of [`Self::handle_record`]
+    /// whenever envelope key 9 (`to`) is present.  This prevents a local
+    /// control service from accidentally applying a request intended for a
+    /// device behind it.  A mesh service with a selected bearer overrides this
+    /// method and forwards the original tagged record, including its binary
+    /// `data` lane.  The default is deliberately a correlated error rather
+    /// than a local fallback.
+    async fn forward_record(&self, record: TaggedRecord) -> Result<Option<TaggedRecord>> {
+        let id = record
+            .id
+            .context("directed tagged-CBOR request missing id")?;
+        Ok(Some(response_error(
+            id,
+            serde_json::json!({
+                "error": "mesh forwarding is unavailable for this service",
+                "to": record.to,
+            }),
+        )))
+    }
 }
 
 /// Construct a correlated successful response.
@@ -177,7 +199,11 @@ where
     while let Some(request) = read_cbor_record(stream).await? {
         let request_kind = request.kind()?;
         let request_id = request.id.clone();
-        let response = handler.handle_record(request).await?;
+        let response = if request.to.is_some() {
+            handler.forward_record(request).await?
+        } else {
+            handler.handle_record(request).await?
+        };
         match (request_kind, response) {
             (RecordKind::Request, Some(response)) => {
                 if response.id != request_id
@@ -235,6 +261,48 @@ mod tests {
         let response = read_cbor_record(&mut client).await.unwrap().unwrap();
         assert_eq!(response.id, Some(json!(41)));
         assert_eq!(response.result, Some(json!({"echo": true})));
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    struct MustNotExecuteDirected {
+        invoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaggedRecordHandler for MustNotExecuteDirected {
+        async fn handle_record(&self, _record: TaggedRecord) -> Result<Option<TaggedRecord>> {
+            self.invoked
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn directed_record_never_reaches_the_local_handler() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = MustNotExecuteDirected {
+            invoked: invoked.clone(),
+        };
+        let server_task = tokio::spawn(async move { serve_cbor_session(&mut server, &handler).await });
+        write_cbor_record(
+            &mut client,
+            &TaggedRecord {
+                component: NameOrTag::Tag(7),
+                method: NameOrTag::Tag(2),
+                id: Some(json!(41)),
+                to: Some(json!("e7")),
+                data: Some(vec![0, 0xff]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_cbor_record(&mut client).await.unwrap().unwrap();
+        assert_eq!(response.id, Some(json!(41)));
+        assert!(response.error.is_some());
+        assert!(!invoked.load(std::sync::atomic::Ordering::Acquire));
         client.shutdown().await.unwrap();
         server_task.await.unwrap().unwrap();
     }
