@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "properties": {
+        "method": {
+          "const": "mesh.initialize"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 1,
+      "x-method-index": 1
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh.tools/list"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 1,
+      "x-method-index": 2
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "trace.subscribe"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 2,
+      "x-method-index": 1
+    },
+    {
+      "properties": {
+        "level": {
+          "type": "string",
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "method": {
+          "const": "trace.set_level"
+        }
+      },
+      "required": [
+        "method",
+        "level"
+      ],
+      "type": "object",
+      "x-component-index": 2,
+      "x-method-index": 2
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "trace.get_level"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 2,
+      "x-method-index": 3
+    }
+  ]
+}

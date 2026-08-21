@@ -71,12 +71,17 @@ const COMMON: &[(u16, &str)] = &[
 /// Encode the format-neutral gateway record. Root keys are deliberately
 /// one-based so the same schema IDs are valid protobuf field numbers.
 pub fn encode_record(record: &TaggedRecord) -> Result<Vec<u8>> {
+    record.kind()?;
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     let fields = 2
         + usize::from(record.id.is_some())
         + usize::from(!record.params.is_empty())
-        + usize::from(!record.env.is_empty());
+        + usize::from(!record.env.is_empty())
+        + usize::from(record.result.is_some())
+        + usize::from(record.error.is_some())
+        + usize::from(record.to.is_some())
+        + usize::from(record.data.is_some());
     encoder.map(fields as u64)?;
     encoder.u8(1)?;
     encode_name_or_tag(&mut encoder, &record.component)?;
@@ -99,6 +104,21 @@ pub fn encode_record(record: &TaggedRecord) -> Result<Vec<u8>> {
             encode_value(&mut encoder, value)?;
         }
     }
+    if let Some(result) = &record.result {
+        encoder.u8(6)?;
+        encode_value(&mut encoder, result)?;
+    }
+    if let Some(error) = &record.error {
+        encoder.u8(7)?;
+        encode_value(&mut encoder, error)?;
+    }
+    if let Some(to) = &record.to {
+        encoder.u8(9)?;
+        encode_value(&mut encoder, to)?;
+    }
+    if let Some(data) = &record.data {
+        encoder.u8(10)?.bytes(data)?;
+    }
     Ok(bytes)
 }
 
@@ -106,39 +126,74 @@ pub fn encode_record(record: &TaggedRecord) -> Result<Vec<u8>> {
 /// remain numeric and become `@N` only in text/JSON adapters.
 pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
     let mut decoder = Decoder::new(bytes);
-    let value = decode_value(&mut decoder)?;
+    let fields = decoder
+        .map()?
+        .ok_or_else(|| anyhow!("indefinite tagged-CBOR root map is unsupported"))?;
+    let mut component = None;
+    let mut method = None;
+    let mut id = None;
+    let mut params = Vec::new();
+    let mut env = BTreeMap::new();
+    let mut result = None;
+    let mut error = None;
+    let mut to = None;
+    let mut data = None;
+
+    for _ in 0..fields {
+        match decoder.u64()? {
+            1 => component = Some(decode_name_or_tag(&decode_value(&mut decoder)?)?),
+            2 => method = Some(decode_name_or_tag(&decode_value(&mut decoder)?)?),
+            3 => id = Some(decode_value(&mut decoder)?),
+            4 => {
+                params = decode_value(&mut decoder)?
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("tagged-CBOR params must be an array"))?;
+            }
+            5 => {
+                let values = decode_value(&mut decoder)?;
+                let values = values
+                    .as_object()
+                    .ok_or_else(|| anyhow!("tagged-CBOR fields must be a map"))?;
+                for (key, value) in values {
+                    // `decode_value` represents a CBOR map key as a JSON object key.
+                    // Recover the numeric tagged-CBOR spelling here; text keys remain
+                    // names. Native TaggedValue will remove this bridge entirely, but
+                    // this keeps generated numeric schemas correct in the interim.
+                    let key = key
+                        .parse::<u32>()
+                        .map(NameOrTag::Tag)
+                        .unwrap_or_else(|_| NameOrTag::parse(key));
+                    env.insert(key, value.clone());
+                }
+            }
+            6 => result = Some(decode_value(&mut decoder)?),
+            7 => error = Some(decode_value(&mut decoder)?),
+            9 => to = Some(decode_value(&mut decoder)?),
+            // Unlike ordinary handler fields, data is never materialized as
+            // the `base64:` JSON compatibility value. This is the one owned
+            // copy required by the host session object; forwarding and
+            // re-encoding use these bytes directly.
+            10 => data = Some(decoder.bytes()?.to_vec()),
+            _ => decoder.skip()?,
+        }
+    }
     if decoder.position() != bytes.len() {
         bail!("trailing CBOR data");
     }
-    let root = value
-        .as_object()
-        .ok_or_else(|| anyhow!("record must be a CBOR map"))?;
-    let component = decode_name_or_tag(
-        root.get("1")
-            .ok_or_else(|| anyhow!("record lacks component"))?,
-    )?;
-    let method = decode_name_or_tag(
-        root.get("2")
-            .ok_or_else(|| anyhow!("record lacks method"))?,
-    )?;
-    let params = root
-        .get("4")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut env = BTreeMap::new();
-    if let Some(values) = root.get("5").and_then(Value::as_object) {
-        for (key, value) in values {
-            env.insert(NameOrTag::parse(key), value.clone());
-        }
-    }
-    Ok(TaggedRecord {
-        component,
-        method,
-        id: root.get("3").cloned(),
+    let record = TaggedRecord {
+        component: component.ok_or_else(|| anyhow!("record lacks component"))?,
+        method: method.ok_or_else(|| anyhow!("record lacks method"))?,
+        id,
         params,
         env,
-    })
+        result,
+        error,
+        to,
+        data,
+    };
+    record.kind()?;
+    Ok(record)
 }
 
 fn encode_name_or_tag(encoder: &mut Encoder<&mut Vec<u8>>, value: &NameOrTag) -> Result<()> {
@@ -482,7 +537,7 @@ fn decode_value(decoder: &mut Decoder<'_>) -> Result<Value> {
     })
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
@@ -520,5 +575,44 @@ mod tests {
         );
         let frame = encode_stream_frame(&cbor).unwrap();
         assert_eq!(decode_stream_frame(&frame).unwrap(), cbor.as_slice());
+    }
+
+    #[test]
+    fn tagged_record_preserves_response_envelope_fields() {
+        let record = TaggedRecord {
+            id: Some(json!(17)),
+            result: Some(json!({"ok": true})),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_record(&encode_record(&record).unwrap()).unwrap(),
+            record
+        );
+
+        let error = TaggedRecord {
+            id: Some(json!(17)),
+            error: Some(json!({"code": "sample"})),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_record(&encode_record(&error).unwrap()).unwrap(),
+            error
+        );
+    }
+
+    #[test]
+    fn tagged_record_preserves_mesh_destination_and_binary_data() {
+        let record = TaggedRecord {
+            component: NameOrTag::Tag(4),
+            method: NameOrTag::Tag(8),
+            id: Some(json!(19)),
+            to: Some(json!("e7")),
+            data: Some(vec![0, 0xff, 0x7e, 0x42]),
+            ..Default::default()
+        };
+        let encoded = encode_record(&record).unwrap();
+        // Key 10 is a CBOR byte string, not an array or a base64 text field.
+        assert!(encoded.windows(2).any(|window| window == [10, 0x44]));
+        assert_eq!(decode_record(&encoded).unwrap(), record);
     }
 }

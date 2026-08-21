@@ -1,3 +1,6 @@
+/// Generated API data types from the normative mesh-init API.md catalog.
+#[doc(hidden)]
+pub mod api;
 pub mod activation;
 pub mod cgroup;
 pub mod config;

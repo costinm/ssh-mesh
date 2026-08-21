@@ -5,7 +5,6 @@
 //! host falls back to the system OpenSSH client, while `mux://` uses the shared
 //! local ControlMaster implementation.
 
-use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -14,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use mesh::cbor::{decode_record, decode_stream_frame, encode_record, encode_stream_frame};
 use mesh::mux_client::MuxClient;
-use mesh::tagged::{NameOrTag, TaggedCatalog, TaggedRecord};
+use mesh::tagged::{TaggedCatalog, TaggedRecord, record_from_argv, to_json};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, timeout};
@@ -43,6 +42,10 @@ struct Cli {
     /// Maximum time to wait for an RPC response or streaming subscription.
     #[arg(long, default_value_t = 9)]
     timeout_sec: u64,
+    /// RPC codec: auto (numeric catalog selects tagged-CBOR), cbor, or
+    /// json-rpc. Environment `MESH_DEST_FORMAT` supplies the same default.
+    #[arg(long, value_parser = ["auto", "cbor", "json-rpc"])]
+    rpc_format: Option<String>,
     /// Destination endpoint, host, service name, or URI.
     destination: String,
     /// SSH command for a host/mux endpoint, or COMPONENT METHOD arguments for
@@ -53,22 +56,34 @@ struct Cli {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DestinationFormat {
-    Json,
     Cbor,
-    Text,
+    JsonRpc,
 }
 
 impl DestinationFormat {
-    fn from_env() -> Result<Self> {
-        match std::env::var("MESH_DEST_FORMAT")
-            .unwrap_or_else(|_| "auto".to_owned())
-            .as_str()
-        {
-            "auto" | "json" => Ok(Self::Json),
-            "cbor" => Ok(Self::Cbor),
-            "text" => Ok(Self::Text),
+    fn from_cli(value: Option<&str>, has_numeric_tags: bool) -> Result<Self> {
+        let value = value.map(str::to_owned).unwrap_or_else(|| {
+            std::env::var("MESH_DEST_FORMAT").unwrap_or_else(|_| "auto".to_owned())
+        });
+        Self::from_value(&value, has_numeric_tags)
+    }
+
+    fn from_value(value: &str, has_numeric_tags: bool) -> Result<Self> {
+        match value {
+            // CBOR is intentionally the *tagged* wire format. Without a
+            // generated catalog JSON-RPC is less ambiguous than inventing a
+            // second, text-named CBOR compatibility dialect.
+            "auto" if has_numeric_tags => Ok(Self::Cbor),
+            "auto" => Ok(Self::JsonRpc),
+            "cbor" if has_numeric_tags => Ok(Self::Cbor),
+            "cbor" => anyhow::bail!(
+                "MESH_DEST_FORMAT=cbor requires a generated catalog with numeric tags"
+            ),
+            "json-rpc" => Ok(Self::JsonRpc),
             "mux" => anyhow::bail!("MESH_DEST_FORMAT=mux selects a transport, not an RPC codec"),
-            value => anyhow::bail!("unsupported MESH_DEST_FORMAT={value}"),
+            value => {
+                anyhow::bail!("unsupported MESH_DEST_FORMAT={value}; use auto, cbor, or json-rpc")
+            }
         }
     }
 }
@@ -230,7 +245,20 @@ fn tools_path(destination: &str) -> Result<Option<PathBuf>> {
             }
         }));
     }
-    Ok(None)
+    // A packaged service can expose its generated catalog even before a local
+    // service-definition file is installed. This is especially useful for the
+    // mesh-init bootstrap endpoint. Do not manufacture a schema: absence
+    // remains a JSON-RPC selection, exactly like a remote/gateway endpoint.
+    Ok(packaged_tools_path(
+        mesh::paths::AppPaths::for_app(destination).resource_dirs(),
+    ))
+}
+
+fn packaged_tools_path(resource_dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    resource_dirs
+        .into_iter()
+        .map(|resource_dir| resource_dir.join("tools.json"))
+        .find(|candidate| candidate.is_file())
 }
 
 fn print_local_help(destination: &str, command: Option<&str>) -> Result<()> {
@@ -282,135 +310,15 @@ fn print_local_help(destination: &str, command: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn text_value(value: &str) -> Value {
-    if let Ok(value) = value.parse::<i64>() {
-        Value::from(value)
-    } else if let Ok(value) = value.parse::<f64>() {
-        Value::from(value)
-    } else if matches!(value, "true" | "false") {
-        Value::Bool(value == "true")
-    } else {
-        Value::String(value.to_owned())
-    }
-}
-
-fn catalog() -> Result<Option<TaggedCatalog>> {
-    let Ok(path) = std::env::var("MESH_TOOLS") else {
+fn catalog(destination: &str) -> Result<Option<TaggedCatalog>> {
+    let Some(path) = tools_path(destination)? else {
         return Ok(None);
     };
-    let contents =
-        std::fs::read_to_string(&path).with_context(|| format!("read MESH_TOOLS={path}"))?;
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("read tools catalog {}", path.display()))?;
     Ok(Some(TaggedCatalog::from_tools_json(
         &serde_json::from_str(&contents)?,
     )?))
-}
-
-fn record(arguments: &[String], catalog: Option<&TaggedCatalog>) -> Result<TaggedRecord> {
-    let component = arguments
-        .first()
-        .context("RPC endpoints require COMPONENT METHOD [options/parameters]")?;
-    // Catalog methods are named `component.method`. Preserve that documented
-    // dotted spelling while also accepting the older two-word form.
-    let (method_name, invocation_args) = if component.contains('.') {
-        (component.clone(), arguments[1..].to_vec())
-    } else {
-        let method = arguments
-            .get(1)
-            .context("RPC endpoints require COMPONENT METHOD [options/parameters]")?;
-        (format!("{component}.{method}"), arguments[2..].to_vec())
-    };
-    if let Some(catalog) = catalog {
-        return catalog.parse_argv(&method_name, &invocation_args);
-    }
-    let (component, method) = if component.contains('.') {
-        component
-            .split_once('.')
-            .context("dotted RPC method must contain a component and method")?
-    } else {
-        (
-            component.as_str(),
-            arguments
-                .get(1)
-                .context("RPC endpoints require COMPONENT METHOD [options/parameters]")?
-                .as_str(),
-        )
-    };
-    let mut env = BTreeMap::new();
-    let mut params = Vec::new();
-    let mut options = true;
-    for value in &invocation_args {
-        if options && value == "--" {
-            options = false;
-        } else if options && value.starts_with('-') {
-            let (key, value) = value
-                .trim_start_matches('-')
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("option {value} requires =value"))?;
-            env.insert(NameOrTag::parse(key), text_value(value));
-        } else if options
-            && let Some((key, value)) = value.split_once('=')
-            && !key.is_empty()
-        {
-            env.insert(NameOrTag::parse(key), text_value(value));
-        } else {
-            params.push(text_value(value));
-        }
-    }
-    Ok(TaggedRecord {
-        component: NameOrTag::parse(component),
-        method: NameOrTag::parse(method),
-        id: None,
-        params,
-        env,
-    })
-}
-
-fn json_request(record: &TaggedRecord, catalog: Option<&TaggedCatalog>) -> Value {
-    if let Some(catalog) = catalog {
-        return catalog.to_jsonl(record);
-    }
-    let mut value = Map::new();
-    value.insert(
-        "method".to_owned(),
-        Value::String(format!(
-            "{}.{}",
-            record.component.text(),
-            record.method.text()
-        )),
-    );
-    for (key, item) in &record.env {
-        value.insert(key.text(), item.clone());
-    }
-    if !record.params.is_empty() {
-        value.insert("params".to_owned(), Value::Array(record.params.clone()));
-    }
-    Value::Object(value)
-}
-
-fn text_request(record: &TaggedRecord) -> String {
-    let mut values = vec![format!(
-        "{}.{}",
-        record.component.text(),
-        record.method.text()
-    )];
-    values.extend(
-        record
-            .env
-            .iter()
-            // Bare key=value fields are the mesh UDS wire format. The
-            // leading-dash spelling belongs to the CLI/catalog parser, not
-            // to mesh.sock or lmesh's text protocol.
-            .map(|(key, value)| format!("{}={}", key.text(), render_text_value(value))),
-    );
-    values.extend(record.params.iter().map(render_text_value));
-    format!("{}\n", values.join(" "))
-}
-
-fn render_text_value(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.clone(),
-        _ => value.to_string(),
-    }
 }
 
 async fn rpc<S>(
@@ -424,13 +332,12 @@ where
 {
     let (read, mut write) = tokio::io::split(stream);
     match format {
-        DestinationFormat::Json => {
+        DestinationFormat::JsonRpc => {
             write
-                .write_all(serde_json::to_string(&json_request(&record, catalog))?.as_bytes())
+                .write_all(serde_json::to_string(&json_rpc_request(&record, catalog))?.as_bytes())
                 .await?;
             write.write_all(b"\n").await?;
         }
-        DestinationFormat::Text => write.write_all(text_request(&record).as_bytes()).await?,
         DestinationFormat::Cbor => {
             write
                 .write_all(&encode_stream_frame(&encode_record(&record)?)?)
@@ -479,7 +386,7 @@ where
         reader.read_exact(&mut frame[4..]).await?;
         println!(
             "{}",
-            serde_json::to_string_pretty(&json_request(
+            serde_json::to_string_pretty(&to_json(
                 &decode_record(decode_stream_frame(&frame)?)?,
                 catalog
             ))?
@@ -497,7 +404,26 @@ where
     Ok(())
 }
 
-async fn rpc_destination(cli: &Cli) -> Result<()> {
+/// The explicit JSON gateway spelling is real JSON-RPC, not the older flat
+/// JSONL dialect. Its payload comes from the same tagged request as CBOR.
+fn json_rpc_request(record: &TaggedRecord, catalog: Option<&TaggedCatalog>) -> Value {
+    let mut flat = to_json(record, catalog);
+    let object = flat
+        .as_object_mut()
+        .expect("tagged record JSON adapter always returns an object");
+    let method = object
+        .remove("method")
+        .expect("tagged record JSON adapter always includes method");
+    let id = object.remove("id").unwrap_or(Value::Null);
+    let mut request = Map::new();
+    request.insert("jsonrpc".to_owned(), Value::String("2.0".to_owned()));
+    request.insert("id".to_owned(), id);
+    request.insert("method".to_owned(), method);
+    request.insert("params".to_owned(), Value::Object(std::mem::take(object)));
+    Value::Object(request)
+}
+
+async fn rpc_destination(cli: &Cli, catalog_destination: &str) -> Result<()> {
     if !cli.local_forward.is_empty()
         || !cli.remote_forward.is_empty()
         || cli.stdio_forward.is_some()
@@ -506,15 +432,29 @@ async fn rpc_destination(cli: &Cli) -> Result<()> {
         anyhow::bail!("SSH forwarding flags require a session/mux endpoint");
     }
     if cli.arguments.is_empty() {
-        return match DestinationFormat::from_env()? {
-            DestinationFormat::Json => interactive_rpc(connect_rpc(&cli.destination).await?).await,
-            DestinationFormat::Cbor => interactive_rpc(connect_rpc(&cli.destination).await?).await,
-            DestinationFormat::Text => interactive_rpc(connect_rpc(&cli.destination).await?).await,
-        };
+        anyhow::bail!(
+            "mesh does not provide a text interactive RPC mode; use a command or a manual gateway client"
+        );
     }
-    let catalog = catalog()?;
-    let record = record(&cli.arguments, catalog.as_ref())?;
-    let format = DestinationFormat::from_env()?;
+    // Service-name resolution may already have replaced `cli.destination`
+    // with a Unix address. Catalog lookup stays tied to the logical service
+    // name so its [Mesh].Tools entry (or packaged generated catalog) remains
+    // available after transport resolution.
+    let catalog = catalog(catalog_destination)?;
+    let mut record = record_from_argv(&cli.arguments, catalog.as_ref())?;
+    // CLI invocations are request/reply exchanges. One-way events are emitted
+    // by service code, not fabricated by a command-line client.
+    record.id = Some(Value::from(1_u64));
+    let format = DestinationFormat::from_cli(
+        cli.rpc_format.as_deref(),
+        matches!(
+            (&record.component, &record.method),
+            (
+                mesh::tagged::NameOrTag::Tag(_),
+                mesh::tagged::NameOrTag::Tag(_)
+            )
+        ),
+    )?;
     let stream = connect_rpc(&cli.destination).await?;
     timeout(
         Duration::from_secs(cli.timeout_sec),
@@ -537,28 +477,6 @@ async fn connect_rpc(destination: &str) -> Result<Box<dyn AsyncReadWrite>> {
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-
-async fn interactive_rpc(stream: Box<dyn AsyncReadWrite>) -> Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut output = Box::pin(tokio::io::copy(&mut reader, &mut stdout));
-    let input_result = {
-        let mut input = Box::pin(tokio::io::copy(&mut stdin, &mut writer));
-        tokio::select! {
-            result = &mut input => Some(result?),
-            result = &mut output => {
-                result?;
-                None
-            }
-        }
-    };
-    if input_result.is_some() {
-        writer.shutdown().await?;
-        output.await?;
-    }
-    Ok(())
-}
 
 async fn mux_destination(cli: &Cli, path: PathBuf) -> Result<()> {
     let mut client = MuxClient::connect(&path).await?;
@@ -640,6 +558,7 @@ fn external_ssh() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn bare_named_rpc_argument_is_a_top_level_field() {
@@ -648,9 +567,9 @@ mod tests {
             "stop".to_owned(),
             "name=demo".to_owned(),
         ];
-        let record = record(&arguments, None).unwrap();
+        let record = record_from_argv(&arguments, None).unwrap();
         assert_eq!(
-            json_request(&record, None),
+            to_json(&record, None),
             json!({"method": "mesh-init.stop", "name": "demo"})
         );
     }
@@ -662,11 +581,11 @@ mod tests {
             "port=lora2".to_owned(),
             "command=status".to_owned(),
         ];
-        let record = record(&arguments, None).unwrap();
+        let record = record_from_argv(&arguments, None).unwrap();
         assert_eq!(record.component.text(), "esp");
         assert_eq!(record.method.text(), "serial.command");
         assert_eq!(
-            json_request(&record, None),
+            to_json(&record, None),
             json!({"method": "esp.serial.command", "port": "lora2", "command": "status"})
         );
     }
@@ -674,31 +593,160 @@ mod tests {
     #[test]
     fn dotted_rpc_method_accepts_no_parameters() {
         let arguments = vec!["usb.serial.forward.list".to_owned()];
-        let record = record(&arguments, None).unwrap();
+        let record = record_from_argv(&arguments, None).unwrap();
         assert_eq!(
-            json_request(&record, None),
+            to_json(&record, None),
             json!({"method": "usb.serial.forward.list"})
         );
     }
 
     #[test]
-    fn text_request_uses_mesh_wire_fields_without_cli_dashes() {
+    fn json_rpc_gateway_uses_the_common_tagged_request() {
         let arguments = vec![
             "esp.serial.command".to_owned(),
             "port=lora3".to_owned(),
             "command=status".to_owned(),
         ];
-        let record = record(&arguments, None).unwrap();
+        let mut record = record_from_argv(&arguments, None).unwrap();
+        record.id = Some(json!(12));
         assert_eq!(
-            text_request(&record),
-            "esp.serial.command command=status port=lora3\n"
+            json_rpc_request(&record, None),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "esp.serial.command",
+                "params": {"port": "lora3", "command": "status"}
+            })
         );
+    }
+
+    #[test]
+    fn automatic_codec_requires_numeric_tags_for_cbor() {
+        assert_eq!(
+            DestinationFormat::from_value("auto", true).unwrap(),
+            DestinationFormat::Cbor
+        );
+        assert_eq!(
+            DestinationFormat::from_value("auto", false).unwrap(),
+            DestinationFormat::JsonRpc
+        );
+        assert!(DestinationFormat::from_value("cbor", false).is_err());
+    }
+
+    #[test]
+    fn explicit_cli_codec_overrides_environment_selection() {
+        assert_eq!(
+            DestinationFormat::from_cli(Some("json-rpc"), true).unwrap(),
+            DestinationFormat::JsonRpc
+        );
+    }
+
+    #[test]
+    fn packaged_generated_catalog_is_discoverable_without_service_toml() {
+        let directory = std::env::temp_dir().join(format!(
+            "mesh-cli-generated-tools-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let catalog = directory.join("tools.json");
+        std::fs::write(&catalog, "[]").unwrap();
+        assert_eq!(packaged_tools_path(vec![directory.clone()]), Some(catalog));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_uses_json_rpc_on_wire_without_numeric_schema() {
+        let (client, server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["jsonrpc"], "2.0");
+            assert_eq!(request["method"], "mesh.status");
+            assert_eq!(request["params"]["verbose"], true);
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n")
+                .await
+                .unwrap();
+        });
+        let record = TaggedRecord {
+            component: mesh::tagged::NameOrTag::Name("mesh".to_owned()),
+            method: mesh::tagged::NameOrTag::Name("status".to_owned()),
+            id: Some(json!(1)),
+            env: [(
+                mesh::tagged::NameOrTag::Name("verbose".to_owned()),
+                json!(true),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        rpc(client, record, None, DestinationFormat::JsonRpc)
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_uses_tagged_cbor_on_wire_with_numeric_schema() {
+        let catalog = TaggedCatalog::from_tools_json(&json!([{
+            "name": "mesh.status",
+            "x-component-index": 1,
+            "x-method-index": 2,
+            "inputSchema": {"properties": {
+                "verbose": {"x-protobuf-index": 3}
+            }}
+        }]))
+        .unwrap();
+        let mut record = catalog
+            .parse_argv("mesh.status", &["verbose=true".to_owned()])
+            .unwrap();
+        record.id = Some(json!(1));
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut header = [0_u8; 4];
+            server.read_exact(&mut header).await.unwrap();
+            let mut frame = vec![0_u8; u32::from_be_bytes(header) as usize + 4];
+            frame[..4].copy_from_slice(&header);
+            server.read_exact(&mut frame[4..]).await.unwrap();
+            let request = decode_record(decode_stream_frame(&frame).unwrap()).unwrap();
+            assert_eq!(request.component, mesh::tagged::NameOrTag::Tag(1));
+            assert_eq!(request.method, mesh::tagged::NameOrTag::Tag(2));
+            assert_eq!(
+                request.env.get(&mesh::tagged::NameOrTag::Tag(3)),
+                Some(&json!(true))
+            );
+            server
+                .write_all(
+                    &encode_stream_frame(
+                        &encode_record(&TaggedRecord {
+                            id: Some(json!(1)),
+                            result: Some(json!({"ok": true})),
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        rpc(client, record, Some(&catalog), DestinationFormat::Cbor)
+            .await
+            .unwrap();
+        server_task.await.unwrap();
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    let catalog_destination = cli.destination.clone();
     if !is_rpc_endpoint(&cli.destination)
         && cli.arguments.first().map(String::as_str) == Some("help")
     {
@@ -714,7 +762,7 @@ async fn main() -> Result<()> {
         cli.destination = address;
     }
     if is_rpc_endpoint(&cli.destination) {
-        return rpc_destination(&cli).await;
+        return rpc_destination(&cli, &catalog_destination).await;
     }
     if let Some(path) = cli.destination.strip_prefix("mux://") {
         return mux_destination(&cli, PathBuf::from(path)).await;

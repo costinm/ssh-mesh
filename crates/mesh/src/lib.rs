@@ -1,6 +1,11 @@
 pub mod auth;
 pub mod cbor;
 pub mod config;
+/// Generated numeric IDs from the normative mesh API.md catalog.
+pub mod generated_api_ids;
+/// Generated API data types from the normative mesh API.md catalog.
+#[doc(hidden)]
+pub mod api;
 pub mod jobs;
 pub mod jsonl;
 pub mod local_trace;
@@ -13,6 +18,7 @@ pub mod schema;
 pub mod server;
 pub mod tagged;
 pub mod tun;
+pub mod wire;
 
 use std::sync::Arc;
 

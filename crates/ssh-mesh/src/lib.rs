@@ -20,6 +20,9 @@ use std::{
 use tracing::{debug, instrument};
 
 // File paths for SSH authentication
+/// Generated API data types from the normative ssh-mesh API.md catalog.
+#[doc(hidden)]
+pub mod api;
 pub mod auth;
 pub mod config_provider;
 pub mod generic_proxy;

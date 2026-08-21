@@ -1,225 +1,319 @@
 [
   {
-    "name": "status",
-    "title": "Status",
-    "group": "Services",
-    "description": "Query status for one service or all loaded services.",
+    "description": "Query status for one service or all loaded services",
     "inputSchema": {
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": ["string", "null"],
-          "title": "Service name"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "start",
-    "title": "Start Service",
-    "group": "Services",
-    "description": "Start a configured service by name.",
-    "inputSchema": {
-      "type": "object",
       "properties": {
         "name": {
           "type": "string",
-          "title": "Service name"
-        },
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.status",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 1
+  },
+  {
+    "description": "Start a configured service by name",
+    "inputSchema": {
+      "properties": {
         "args": {
           "type": "array",
-          "title": "Arguments"
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "array"
         },
         "env": {
           "type": "object",
-          "title": "Environment"
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "object"
+        },
+        "name": {
+          "type": "string",
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
         }
       },
-      "required": ["name"],
-      "additionalProperties": false
-    }
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.start",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 2
   },
   {
-    "name": "stop",
-    "title": "Stop Service",
-    "group": "Services",
-    "description": "Gracefully terminate or signal a running service.",
+    "description": "Gracefully terminate or signal a running service",
     "inputSchema": {
-      "type": "object",
       "properties": {
         "name": {
           "type": "string",
-          "title": "Service name"
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
         },
         "signal": {
-          "type": ["integer", "null"],
-          "title": "Signal"
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "i32"
         }
       },
-      "required": ["name"],
-      "additionalProperties": false
-    }
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.stop",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 3
   },
   {
-    "name": "freeze",
-    "title": "Freeze Service",
-    "group": "Services",
-    "description": "Suspend a running service.",
+    "description": "Suspend a running service",
     "inputSchema": {
-      "type": "object",
       "properties": {
         "name": {
           "type": "string",
-          "title": "Service name"
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
         }
       },
-      "required": ["name"],
-      "additionalProperties": false
-    }
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.freeze",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 4
   },
   {
-    "name": "unfreeze",
-    "title": "Unfreeze Service",
-    "group": "Services",
-    "description": "Resume a frozen service.",
+    "description": "Resume a frozen service",
     "inputSchema": {
-      "type": "object",
       "properties": {
         "name": {
           "type": "string",
-          "title": "Service name"
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
         }
       },
-      "required": ["name"],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "reload",
-    "title": "Reload Config",
-    "group": "Services",
-    "description": "Reload service configuration from disk.",
-    "inputSchema": {
-      "type": "object",
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.unfreeze",
+    "outputSchema": {
       "properties": {},
-      "additionalProperties": false
-    }
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 5
   },
   {
-    "name": "processes",
-    "title": "List Processes",
-    "group": "Observer",
-    "description": "List observed processes from mesh-init's process observer.",
+    "description": "Reload service configuration from disk",
     "inputSchema": {
-      "type": "object",
       "properties": {},
-      "additionalProperties": false
-    }
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.reload",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 6
   },
   {
-    "name": "process",
-    "title": "Get Process",
-    "group": "Observer",
-    "description": "Return detailed information for one process.",
+    "description": "List observed processes from the process observer",
     "inputSchema": {
-      "type": "object",
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.processes",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 7
+  },
+  {
+    "description": "Return detailed information for one process",
+    "inputSchema": {
       "properties": {
         "pid": {
           "type": "integer",
-          "title": "PID",
-          "minimum": 0
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u32"
         }
       },
-      "required": ["pid"],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "cgroups",
-    "title": "List CGroups",
-    "group": "Observer",
-    "description": "Return all observed cgroups.",
-    "inputSchema": {
-      "type": "object",
+      "required": [
+        "pid"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.process",
+    "outputSchema": {
       "properties": {},
-      "additionalProperties": false
-    }
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 8
   },
   {
-    "name": "cgroup",
-    "title": "Get CGroup",
-    "group": "Observer",
-    "description": "Return detailed information for one cgroup path.",
+    "description": "Return all observed cgroups",
     "inputSchema": {
-      "type": "object",
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.cgroups",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 9
+  },
+  {
+    "description": "Return detailed information for one cgroup path",
+    "inputSchema": {
       "properties": {
         "path": {
           "type": "string",
-          "title": "Path"
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
         }
       },
-      "required": ["path"],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "pressure",
-    "title": "Pressure",
-    "group": "Observer",
-    "description": "Return pressure watch state.",
-    "inputSchema": {
-      "type": "object",
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.cgroup",
+    "outputSchema": {
       "properties": {},
-      "additionalProperties": false
-    }
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 10
   },
   {
-    "name": "cgroup_high",
-    "title": "Set memory.high",
-    "group": "Observer",
-    "description": "Set memory.high for a cgroup based on current memory usage.",
+    "description": "Return pressure watch state",
     "inputSchema": {
-      "type": "object",
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.pressure",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 11
+  },
+  {
+    "description": "Set memory.high for a cgroup based on current memory usage",
+    "inputSchema": {
       "properties": {
+        "interval": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u64"
+        },
         "path": {
           "type": "string",
-          "title": "Path"
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
         },
         "percentage": {
           "type": "number",
-          "title": "Percentage"
-        },
-        "interval": {
-          "type": "integer",
-          "title": "Reset interval seconds",
-          "minimum": 0
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "f64"
         }
       },
-      "required": ["path", "percentage", "interval"],
-      "additionalProperties": false
-    }
+      "required": [
+        "path",
+        "percentage",
+        "interval"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.cgroup_high",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 12
   },
   {
-    "name": "move_process",
-    "title": "Move Process",
-    "group": "Observer",
-    "description": "Move a process to a named cgroup.",
+    "description": "Move a process to a named cgroup",
     "inputSchema": {
-      "type": "object",
       "properties": {
+        "cgroup_name": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
         "pid": {
           "type": "integer",
-          "title": "PID",
-          "minimum": 0
-        },
-        "cgroup_name": {
-          "type": ["string", "null"],
-          "title": "CGroup name"
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u32"
         }
       },
-      "required": ["pid"],
-      "additionalProperties": false
-    }
+      "required": [
+        "pid"
+      ],
+      "type": "object"
+    },
+    "name": "mesh-init.move_process",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 13
   }
 ]

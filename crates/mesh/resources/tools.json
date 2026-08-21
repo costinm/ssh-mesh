@@ -1,0 +1,91 @@
+[
+  {
+    "description": "Return MCP initialization info",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh.initialize",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 1,
+    "x-method-index": 1
+  },
+  {
+    "description": "List registered MCP tools from catalog",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh.tools/list",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 1,
+    "x-method-index": 2
+  },
+  {
+    "description": "Subscribe to live trace log event stream",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "trace.subscribe",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 2,
+    "x-method-index": 1
+  },
+  {
+    "description": "Dynamically update tracing filter level",
+    "inputSchema": {
+      "properties": {
+        "level": {
+          "type": "string",
+          "x-cli-position": 1,
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [
+        "level"
+      ],
+      "type": "object"
+    },
+    "name": "trace.set_level",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 2,
+    "x-method-index": 2
+  },
+  {
+    "description": "Get current tracing filter level info",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "trace.get_level",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 2,
+    "x-method-index": 3
+  }
+]

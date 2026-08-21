@@ -2076,6 +2076,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-api-gen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "mesh-cli"
 version = "0.1.0"
 dependencies = [
@@ -2091,6 +2101,7 @@ name = "mesh-init"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "libc",
  "mesh",

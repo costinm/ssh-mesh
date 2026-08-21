@@ -1,8 +1,11 @@
-[
-  {
-    "description": "Send a JSON-RPC request to a component Unix socket and return the unwrapped result",
-    "inputSchema": {
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
       "properties": {
+        "method": {
+          "const": "ssh-mesh.jsonl_call"
+        },
         "method_name": {
           "type": "string",
           "x-cli-position": 2,
@@ -22,18 +25,13 @@
         }
       },
       "required": [
+        "method",
         "socket_path",
         "method_name"
       ],
-      "type": "object"
-    },
-    "name": "ssh-mesh.jsonl_call",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
-    "x-method-index": 1
-  }
-]
+      "type": "object",
+      "x-component-index": 4,
+      "x-method-index": 1
+    }
+  ]
+}

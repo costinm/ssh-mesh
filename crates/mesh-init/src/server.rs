@@ -5,7 +5,7 @@
 
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use nix::cmsg_space;
@@ -19,12 +19,26 @@ use tracing::{debug, error, info, warn};
 use crate::daemon::Daemon;
 use crate::protocol::{Request, Response};
 
+use mesh::tagged::{TaggedCatalog, TaggedRecord};
+use mesh::wire::{TaggedRecordHandler, response_ok, serve_cbor_session};
+
 // ============================================================================
 // Control Server
 // ============================================================================
 
 /// Default maximum number of concurrent control-socket connections.
 const DEFAULT_MAX_CONTROL_CONNECTIONS: usize = 32;
+
+/// Public, generated schema used to translate numeric CBOR tags back into the
+/// existing serde `Request` enum. The schema is embedded with the daemon so a
+/// client and server cannot silently disagree because a runtime file changed.
+static CONTROL_CATALOG: LazyLock<TaggedCatalog> = LazyLock::new(|| {
+    TaggedCatalog::from_tools_json(
+        &serde_json::from_str(include_str!("../resources/tools.json"))
+            .expect("mesh-init generated tools.json must be valid JSON"),
+    )
+    .expect("mesh-init generated tools.json must be a valid tagged catalog")
+});
 
 /// Resolve the configured maximum number of concurrent control-socket
 /// connections from the `MESH_INIT_MAX_CONTROL_CONNECTIONS` env var.
@@ -199,9 +213,10 @@ impl ControlServer {
 
 /// Handle a single control connection.
 ///
-/// Protocol selection is owned by `mesh::message::LineProtocolSession`: the
-/// first byte of the first packet selects JSON, text, or binary for the whole
-/// connection. mesh-init only reads/writes the socket and dispatches requests.
+/// Programmatic callers use a length-framed tagged-CBOR session when the first
+/// byte is zero (the high byte of the bounded frame length). The legacy line
+/// selector remains a deliberate JSON-RPC/text gateway for humans and old
+/// clients. A connection chooses once; it is never re-detected per request.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     daemon: Arc<Daemon>,
@@ -209,6 +224,15 @@ async fn handle_connection(
     peer_gid: u32,
 ) -> Result<()> {
     let mut stream = stream;
+    if control_uses_tagged_cbor(&stream).await? {
+        let handler = CborControlHandler {
+            daemon,
+            peer_uid,
+            peer_gid,
+        };
+        return serve_cbor_session(&mut stream, &handler).await;
+    }
+
     let mut line = String::new();
     let mut protocol = mesh::message::LineProtocolSession::new();
 
@@ -278,6 +302,99 @@ async fn handle_connection(
 
     debug!("control_connection_closed");
     Ok(())
+}
+
+/// Peek without consuming the byte so the selected handler receives the
+/// complete stream. `UnixStream` has no async `peek`; waiting for readability
+/// before `recv(MSG_PEEK|MSG_DONTWAIT)` keeps this small syscall non-blocking.
+async fn control_uses_tagged_cbor(stream: &tokio::net::UnixStream) -> Result<bool> {
+    stream.readable().await?;
+    let mut first = [0_u8; 1];
+    // SAFETY: `as_raw_fd` is a live Unix socket for the duration of this call,
+    // and `first` is a writable one-byte buffer.
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            first.as_mut_ptr().cast(),
+            first.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if read == 0 {
+        return Ok(false);
+    }
+    if read < 0 {
+        return Err(std::io::Error::last_os_error()).context("peek control protocol byte");
+    }
+    Ok(first[0] == 0)
+}
+
+struct CborControlHandler {
+    daemon: Arc<Daemon>,
+    peer_uid: u32,
+    peer_gid: u32,
+}
+
+#[async_trait::async_trait]
+impl TaggedRecordHandler for CborControlHandler {
+    async fn handle_record(&self, record: TaggedRecord) -> Result<Option<TaggedRecord>> {
+        let id = record
+            .id
+            .clone()
+            .context("tagged-CBOR request missing id")?;
+        let request = match decode_tagged_request(&record) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Some(response_ok(
+                    id,
+                    serde_json::to_value(Response::err(format!("invalid request: {error}")))?,
+                )));
+            }
+        };
+        let response = match request {
+            // These operations need SCM_RIGHTS. Tagged CBOR is still a normal
+            // UDS stream, but the shared session deliberately has no hidden
+            // ancillary-data side channel. Keeping it explicit prevents a
+            // seemingly valid request from losing terminal descriptors.
+            Request::StartTerminal { .. } | Request::RegisterNamespace { .. } => {
+                Response::err("this operation requires the explicit UDS SCM_RIGHTS protocol")
+            }
+            Request::Shutdown => {
+                let daemon = self.daemon.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    daemon.shutdown().await;
+                });
+                Response::ok()
+            }
+            request => {
+                self.daemon
+                    .handle_request(request, self.peer_uid, self.peer_gid)
+                    .await
+            }
+        };
+        Ok(Some(response_ok(id, serde_json::to_value(response)?)))
+    }
+}
+
+/// Reconstruct the stable public method and field names before invoking the
+/// existing serde-based service handler. Numeric tags never leak into service
+/// code; the generated catalog is the sole translation boundary.
+fn decode_tagged_request(record: &TaggedRecord) -> Result<Request> {
+    if CONTROL_CATALOG.method_name(record).is_none() {
+        anyhow::bail!("tagged-CBOR method is outside the mesh-init public catalog");
+    }
+    let mut value = CONTROL_CATALOG.to_jsonl(record);
+    let method = value
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .context("tagged-CBOR record has no documented mesh-init method")?
+        .to_owned();
+    let method = method
+        .strip_prefix("mesh-init.")
+        .context("tagged-CBOR method is outside the mesh-init public catalog")?;
+    value["method"] = serde_json::Value::String(method.to_owned());
+    serde_json::from_value(value).context("deserialize tagged mesh-init request")
 }
 
 fn normalize_service_method(line: &str) -> String {
@@ -415,6 +532,11 @@ pub async fn send_request(socket_path: &str, request: &Request) -> Result<Respon
 
 #[cfg(test)]
 mod tests {
+    use mesh::tagged::NameOrTag;
+    use mesh::wire::{read_cbor_record, write_cbor_record};
+    use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+
     use super::*;
 
     #[tokio::test]
@@ -437,6 +559,77 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(parsed.success);
+    }
+
+    #[test]
+    fn generated_catalog_decodes_numeric_cbor_request_into_existing_serde_type() {
+        let request = decode_tagged_request(&TaggedRecord {
+            component: NameOrTag::Tag(3),
+            method: NameOrTag::Tag(3),
+            id: Some(json!(9)),
+            env: [
+                (NameOrTag::Tag(1), json!("radio")),
+                (NameOrTag::Tag(2), json!(15)),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::Stop {
+                name,
+                signal: Some(15)
+            } if name == "radio"
+        ));
+    }
+
+    #[test]
+    fn tagged_cbor_rejects_methods_outside_generated_public_catalog() {
+        let error = decode_tagged_request(&TaggedRecord {
+            component: NameOrTag::Name("mesh-init".to_owned()),
+            method: NameOrTag::Name("start_terminal".to_owned()),
+            id: Some(json!(9)),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside the mesh-init public catalog")
+        );
+    }
+
+    #[tokio::test]
+    async fn uds_control_connection_dispatches_generated_tagged_cbor() {
+        let daemon = Daemon::new(crate::daemon::DaemonConfig {
+            config_dirs: Vec::new(),
+            socket_path: "/tmp/mesh-init-cbor-test.sock".to_owned(),
+        });
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(handle_connection(
+            server,
+            daemon,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        ));
+        write_cbor_record(
+            &mut client,
+            &TaggedRecord {
+                component: NameOrTag::Tag(3),
+                method: NameOrTag::Tag(1),
+                id: Some(json!(17)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let response = read_cbor_record(&mut client).await.unwrap().unwrap();
+        assert_eq!(response.id, Some(json!(17)));
+        assert_eq!(response.result.unwrap()["success"], true);
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
     }
 
     #[test]
