@@ -107,8 +107,12 @@ async fn handle_websocket(
     eprintln!("[h2t] Connecting WebSocket to {}", request.uri());
 
     let host = request.uri().host().unwrap_or("127.0.0.1").to_string();
-    let is_wss = request.uri().scheme_str() == Some("wss") || request.uri().scheme_str() == Some("https");
-    let port = request.uri().port_u16().unwrap_or(if is_wss { 443 } else { 80 });
+    let is_wss =
+        request.uri().scheme_str() == Some("wss") || request.uri().scheme_str() == Some("https");
+    let port = request
+        .uri()
+        .port_u16()
+        .unwrap_or(if is_wss { 443 } else { 80 });
 
     let tcp_stream = connect_tcp_stream(&host, port).await?;
 
@@ -241,8 +245,13 @@ impl tokio::io::AsyncWrite for H2Stream {
     }
 }
 
-async fn connect_tcp_stream(host: &str, port: u16) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    let addrs: Vec<_> = tokio::net::lookup_host(format!("{}:{}", host, port)).await?.collect();
+async fn connect_tcp_stream(
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    let addrs: Vec<_> = tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await?
+        .collect();
     let mut sorted_addrs = addrs.clone();
     sorted_addrs.sort_by_key(|addr| if addr.is_ipv4() { 0 } else { 1 });
 
@@ -268,7 +277,13 @@ async fn handle_h2(
 
     let uri = Uri::from_str(&full_url)?;
     let host = uri.host().ok_or("missing host in URI")?;
-    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
 
     let tcp_stream = connect_tcp_stream(host, port).await?;
 
@@ -309,7 +324,6 @@ async fn handle_h2(
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = StreamBody::new(stream);
 
-
     // Build request (Hyper derives :method, :scheme, :authority, and :path from full URI)
     let mut req_builder = Request::builder()
         .method(Method::POST)
@@ -324,7 +338,11 @@ async fn handle_h2(
     let mut stdin = tokio::io::stdin();
     let mut banner_buf = Vec::new();
     let mut byte = [0u8; 1];
-    while let Ok(1) = tokio::time::timeout(std::time::Duration::from_millis(100), stdin.read(&mut byte)).await.unwrap_or(Ok(0)) {
+    while let Ok(1) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), stdin.read(&mut byte))
+            .await
+            .unwrap_or(Ok(0))
+    {
         banner_buf.push(byte[0]);
         if byte[0] == b'\n' {
             break;

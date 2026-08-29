@@ -271,7 +271,7 @@ impl Catalog {
 
 #[derive(Clone, Debug)]
 enum Key {
-    Num(u16),
+    Num(u32),
     Text(String),
 }
 
@@ -466,7 +466,15 @@ fn encode_value(encoder: &mut Encoder<&mut Vec<u8>>, value: &Value) -> Result<()
         Value::Object(values) => {
             encoder.map(values.len() as u64)?;
             for (key, value) in values {
-                encoder.str(key)?;
+                // JSON object keys are necessarily strings.  Preserve the
+                // schema-free numeric projection: {"1": 4} is CBOR {1: 4},
+                // not {"1": 4}.  Non-numeric keys remain text and this
+                // applies recursively to nested maps as well.
+                if let Ok(key) = key.parse::<u32>() {
+                    encoder.u32(key)?;
+                } else {
+                    encoder.str(key)?;
+                }
                 encode_value(encoder, value)?;
             }
         }
@@ -476,8 +484,9 @@ fn encode_value(encoder: &mut Encoder<&mut Vec<u8>>, value: &Value) -> Result<()
 
 fn decode_key(decoder: &mut Decoder<'_>) -> Result<Key> {
     match decoder.datatype()? {
-        Type::U8 | Type::U16 | Type::U32 => Ok(Key::Num(
-            u16::try_from(decoder.u32()?).context("CBOR map key exceeds u16")?,
+        Type::U8 | Type::U16 | Type::U32 => Ok(Key::Num(decoder.u32()?)),
+        Type::U64 => Ok(Key::Num(
+            u32::try_from(decoder.u64()?).context("CBOR map key exceeds u32")?,
         )),
         Type::String => Ok(Key::Text(decoder.str()?.to_owned())),
         value => bail!("unsupported CBOR map key {value:?}"),
@@ -614,5 +623,20 @@ mod tests {
         // Key 10 is a CBOR byte string, not an array or a base64 text field.
         assert!(encoded.windows(2).any(|window| window == [10, 0x44]));
         assert_eq!(decode_record(&encoded).unwrap(), record);
+    }
+
+    #[test]
+    fn nested_numeric_json_keys_encode_as_cbor_integer_keys() {
+        let record = TaggedRecord {
+            component: NameOrTag::Tag(4),
+            method: NameOrTag::Tag(7),
+            id: Some(json!(1)),
+            env: [(NameOrTag::Tag(1), json!({"2": {"3": 4}}))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let decoded = decode_record(&encode_record(&record).unwrap()).unwrap();
+        assert_eq!(decoded, record);
     }
 }

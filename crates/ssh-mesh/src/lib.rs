@@ -29,6 +29,7 @@ pub mod generic_proxy;
 pub mod handlers;
 pub mod jsonl_proxy;
 pub mod mcp_proxy;
+pub mod mesh_rest;
 pub mod mux;
 pub mod sshc;
 pub mod sshd;
@@ -358,6 +359,11 @@ pub struct AppState {
     pub ssh_server: Arc<MeshNode>,
     pub target_http_address: Option<String>,
     pub ssh_client_manager: Arc<sshc::SshClientManager>,
+    /// Generic mesh-service backends exposed by the localhost/admin REST API.
+    pub mesh_services: mesh_rest::MeshServiceRegistry,
+    /// Optional development asset root, confined by the admin asset handler.
+    /// Embedded assets remain the production fallback.
+    pub web_root: Option<std::path::PathBuf>,
 }
 
 // TODO: move the env vars to main
@@ -486,7 +492,10 @@ impl MeshNode {
                     let ca_content = ca_lines.join("\n");
                     match crate::auth::parse_authorized_cas_content(&ca_content) {
                         Ok(cas) => {
-                            info!("Loaded {} CA keys from SSH_AUTHORIZED_KEYS env var", cas.len());
+                            info!(
+                                "Loaded {} CA keys from SSH_AUTHORIZED_KEYS env var",
+                                cas.len()
+                            );
                             ca_keys_vec.extend(cas);
                         }
                         Err(e) => error!("Failed to parse CA keys from SSH_AUTHORIZED_KEYS: {}", e),
@@ -495,7 +504,10 @@ impl MeshNode {
 
                 match crate::auth::parse_authorized_keys_content(&content) {
                     Ok(entries) => {
-                        info!("Loaded {} authorized keys from SSH_AUTHORIZED_KEYS env var", entries.len());
+                        info!(
+                            "Loaded {} authorized keys from SSH_AUTHORIZED_KEYS env var",
+                            entries.len()
+                        );
                         authorized_keys_vec.extend(entries);
                     }
                     Err(e) => error!("Failed to parse SSH_AUTHORIZED_KEYS env var: {}", e),

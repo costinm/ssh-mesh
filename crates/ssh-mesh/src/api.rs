@@ -40,4 +40,3 @@ pub struct SshMeshJsonlCallRequest {
 /// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SshMeshJsonlCallResponse;
-

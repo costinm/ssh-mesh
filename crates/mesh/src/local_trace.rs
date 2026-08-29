@@ -20,10 +20,10 @@ use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry, reload};
-use tracing_subscriber::filter::filter_fn;
 
 /// Global handle for dynamically reloading the tracing filter, required to integrate.
 ///
@@ -33,6 +33,114 @@ pub static TRACING_RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> 
 
 /// Global reference to the process's primary `LogBuffer`.
 pub static GLOBAL_LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
+
+/// Current, reloadable producer filter.  Keeping the spelling lets HTTP/UDS
+/// clients report the actual default instead of a placeholder.
+static CURRENT_TRACE_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
+
+/// Event telemetry is intentionally separate from severity. Producers attach
+/// a generic `event_type` field and the core keeps bounded counters for every
+/// type, but retains or streams an event only after its exact type is watched.
+static EVENT_TRACE_CONTROL: OnceLock<RwLock<EventTraceControl>> = OnceLock::new();
+const MAX_EVENT_TYPES: usize = 256;
+
+#[derive(Default)]
+struct EventTraceControl {
+    counts: HashMap<String, u64>,
+    selected: std::collections::HashSet<String>,
+}
+
+/// A bounded event-name counter exposed to observability UIs and future
+/// metrics collectors. `selected` means the type is currently dispatched.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceEventStats {
+    pub name: String,
+    pub count: u64,
+    pub selected: bool,
+}
+
+fn event_trace_control() -> &'static RwLock<EventTraceControl> {
+    EVENT_TRACE_CONTROL.get_or_init(|| RwLock::new(EventTraceControl::default()))
+}
+
+fn watch_event_name(name: &str) -> bool {
+    let mut control = event_trace_control().write();
+    let selected = control.selected.contains(name);
+    // Counters are bounded metrics, not trace records. Even packet-rate raw
+    // sources are counted here, but below they reach neither history nor SSE
+    // unless an operator watches the exact type.
+    if let Some(count) = control.counts.get_mut(name) {
+        *count = count.saturating_add(1);
+    } else if control.counts.len() < MAX_EVENT_TYPES {
+        control.counts.insert(name.to_string(), 1);
+    } else {
+        *control.counts.entry("event.other".to_string()).or_default() += 1;
+    }
+    selected
+}
+
+/// Count one named structured event and report whether tracing is enabled for
+/// it. Producers on packet-rate paths must call this before constructing a
+/// `tracing` event, so an unwatched event has no formatting, history, or
+/// subscriber cost beyond this bounded counter update.
+pub fn is_event_enabled(name: &str) -> bool {
+    watch_event_name(name)
+}
+
+/// Return known event names and their lifetime process counters, most frequent
+/// first. Counts stay bounded by the number of distinct names, not event rate.
+pub fn trace_event_stats() -> Vec<TraceEventStats> {
+    let control = event_trace_control().read();
+    let mut stats: Vec<_> = control
+        .counts
+        .iter()
+        .map(|(name, count)| TraceEventStats {
+            name: name.clone(),
+            count: *count,
+            selected: control.selected.contains(name),
+        })
+        .chain(
+            control
+                .selected
+                .iter()
+                .filter(|name| !control.counts.contains_key(*name))
+                .map(|name| TraceEventStats {
+                    name: name.clone(),
+                    count: 0,
+                    selected: true,
+                }),
+        )
+        .collect();
+    stats.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    stats
+}
+
+/// Enable or disable dispatch for one exact generic event or fallback log type.
+pub fn set_trace_event_info(name: &str, enabled: bool) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 192
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(
+            "event name must be a bounded ASCII type such as wifi.raw.monitor or log.warn"
+                .to_string(),
+        );
+    }
+    let mut control = event_trace_control().write();
+    if enabled {
+        control.selected.insert(name.to_string());
+    } else {
+        control.selected.remove(name);
+    }
+    Ok(())
+}
 
 /// Retrieve the process-global `LogBuffer` if initialized.
 pub fn global_buffer() -> Option<LogBuffer> {
@@ -204,17 +312,20 @@ where
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
 
-        let target = visitor
+        let event_type = visitor
             .fields
             .get("event_type")
             .and_then(serde_json::Value::as_str)
-            .filter(|_| metadata.target() == "dmesh.event")
-            .map(|event| format!("dmesh.event.{event}"))
-            .unwrap_or_else(|| metadata.target().to_string());
+            .map(str::to_owned);
+        let prechecked = visitor
+            .fields
+            .get("trace_prechecked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let entry = LogEntry {
             timestamp: chrono::Utc::now().to_rfc3339(),
             level: metadata.level().to_string().to_lowercase(),
-            target,
+            target: metadata.target().to_string(),
             message: visitor.message,
             fields: if visitor.fields.is_empty() {
                 None
@@ -224,19 +335,23 @@ where
             },
         };
 
-        let live_only = entry.target.starts_with("dmesh.event.wifi.rawnan")
-            || (entry.target == "dmesh.event.wifi.raw.rx"
-                && entry
-                    .fields
-                    .as_ref()
-                    .and_then(|fields| fields.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|source| source.ends_with("mon")));
-        if live_only {
-            self.buffer.push_unbuffered(entry);
+        // Event type, not severity, is the subscription key. Conventional
+        // logs lack `event_type`, so warnings/errors use a small fallback type
+        // while retaining their original target and level for context.
+        let event_name = if let Some(event_type) = event_type.as_deref() {
+            event_type
         } else {
-            self.buffer.push(entry);
+            match metadata.level() {
+                &tracing::Level::WARN => "log.warn",
+                &tracing::Level::ERROR => "log.error",
+                _ => return,
+            }
+        };
+        if !prechecked && !watch_event_name(event_name) {
+            return;
         }
+
+        self.buffer.push(entry);
     }
 }
 
@@ -298,8 +413,11 @@ impl tracing::field::Visit for LogVisitor {
 /// doesn't easily expose its current state as a string).
 pub fn get_trace_level() -> TraceLevelResponse {
     TraceLevelResponse {
-        level: "See logs for current level (configured via RUST_LOG or set via PUT)".to_string(),
-        message: Some("Use PUT to update the trace level".to_string()),
+        level: CURRENT_TRACE_LEVEL
+            .get_or_init(|| RwLock::new(default_trace_filter()))
+            .read()
+            .clone(),
+        message: Some("Event-name info capture is controlled separately".to_string()),
     }
 }
 
@@ -307,12 +425,21 @@ pub fn get_trace_level() -> TraceLevelResponse {
 ///
 /// Returns `Ok(response)` on success, `Err(response)` with error details on failure.
 pub fn set_trace_level(req: &TraceLevelRequest) -> Result<TraceLevelResponse, TraceLevelResponse> {
+    let requested = req.level.trim();
+    // Event routing is independent of severity. Keep info admitted so a
+    // producer's generic `event_type` field can be counted, then let
+    // LogBufferLayer decide whether that type is watched.
+    let level = if requested.is_empty() {
+        default_trace_filter()
+    } else {
+        format!("{requested},info")
+    };
     // Parse the new filter
-    let new_filter = match req.level.parse::<EnvFilter>() {
+    let new_filter = match level.parse::<EnvFilter>() {
         Ok(filter) => filter,
         Err(e) => {
             return Err(TraceLevelResponse {
-                level: req.level.clone(),
+                level,
                 message: Some(format!("Invalid filter format: {}", e)),
             });
         }
@@ -322,16 +449,19 @@ pub fn set_trace_level(req: &TraceLevelRequest) -> Result<TraceLevelResponse, Tr
     match TRACING_RELOAD_HANDLE.get() {
         Some(handle) => match handle.reload(new_filter) {
             Ok(()) => {
-                tracing::info!("Tracing level updated to: {}", req.level);
+                *CURRENT_TRACE_LEVEL
+                    .get_or_init(|| RwLock::new(default_trace_filter()))
+                    .write() = level.clone();
+                tracing::info!("Tracing level updated to: {}", level);
                 Ok(TraceLevelResponse {
-                    level: req.level.clone(),
+                    level,
                     message: Some("Trace level updated successfully".to_string()),
                 })
             }
             Err(e) => {
                 tracing::error!("Failed to reload tracing filter: {:?}", e);
                 Err(TraceLevelResponse {
-                    level: req.level.clone(),
+                    level,
                     message: Some(format!("Failed to reload filter: {:?}", e)),
                 })
             }
@@ -339,7 +469,7 @@ pub fn set_trace_level(req: &TraceLevelRequest) -> Result<TraceLevelResponse, Tr
         None => {
             tracing::error!("Tracing reload handle not initialized");
             Err(TraceLevelResponse {
-                level: req.level.clone(),
+                level,
                 message: Some("Tracing reload handle not initialized".to_string()),
             })
         }
@@ -397,6 +527,10 @@ pub struct TraceConfig {
 }
 
 fn default_global_level() -> String {
+    "warn".to_string()
+}
+
+fn default_trace_filter() -> String {
     "info".to_string()
 }
 
@@ -700,9 +834,10 @@ pub fn default_trace_socket_path(app_name: &str) -> Option<std::path::PathBuf> {
 /// `app` is the producer's short name (e.g. `"ssh-mesh"`, `"mesh-tun"`).
 /// It is used as the directory-based log file's basename (`<dir>/<app>.log`).
 ///
-/// The initial filter is taken from `RUST_LOG` (via `EnvFilter::from_default_env`).
-/// A global reload handle is installed so UDS collectors can raise the level
-/// at runtime (see `handle_uds_connection`).
+/// The initial filter admits info so generic `event_type` records can be
+/// counted. `LogBufferLayer` still retains and streams only watched types; the
+/// output sinks below keep ordinary info records out of operational logs. Set
+/// `MESH_TRACE_LEVEL` to add diagnostic directives when needed.
 ///
 /// If `MESH_LOG_FILE` or `MESH_LOG_DIR` is set, a non-blocking JSON `fmt`
 /// layer is also installed that writes every event (subject to the same
@@ -722,7 +857,10 @@ pub fn init(
     LogBuffer,
     Option<tracing_appender::non_blocking::WorkerGuard>,
 ) {
-    let filter = EnvFilter::from_default_env();
+    let filter_text = std::env::var("MESH_TRACE_LEVEL").unwrap_or_else(|_| default_trace_filter());
+    let filter = filter_text
+        .parse::<EnvFilter>()
+        .unwrap_or_else(|_| EnvFilter::new(default_trace_filter()));
     let (filter, reload_handle) = reload::Layer::new(filter);
     let buffer_layer = LogBufferLayer::new();
     let log_buffer = buffer_layer.buffer();
@@ -748,7 +886,12 @@ pub fn init(
                         .with_current_span(false)
                         .with_span_list(false)
                         .with_writer(non_blocking)
-                        .with_filter(filter_fn(|metadata| metadata.target() != "dmesh.event")),
+                        .with_filter(filter_fn(|metadata| {
+                            matches!(
+                                metadata.level(),
+                                &tracing::Level::WARN | &tracing::Level::ERROR
+                            )
+                        })),
                 )
                 .init();
             Some(guard)
@@ -757,13 +900,22 @@ pub fn init(
             Registry::default()
                 .with(filter)
                 .with(buffer_layer)
-                .with(stderr_layer)
+                // Info is admitted only so LogBufferLayer can count generic
+                // event types. Never mirror it to stderr during on-demand
+                // tracing.
+                .with(stderr_layer.with_filter(filter_fn(|metadata| {
+                    matches!(
+                        metadata.level(),
+                        &tracing::Level::WARN | &tracing::Level::ERROR
+                    )
+                })))
                 .init();
             None
         }
     };
 
     let _ = TRACING_RELOAD_HANDLE.set(reload_handle);
+    let _ = CURRENT_TRACE_LEVEL.set(RwLock::new(filter_text));
     let _ = GLOBAL_LOG_BUFFER.set(log_buffer.clone());
     (log_buffer, guard)
 }
@@ -811,7 +963,9 @@ fn build_file_writer(
 /// oldest rotated files are removed first. Failure is deliberately best
 /// effort because logging must never prevent the service from starting.
 fn prune_log_files(dir: &std::path::Path, basename: &str, max_bytes: u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut files = entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -825,11 +979,17 @@ fn prune_log_files(dir: &std::path::Path, basename: &str, max_bytes: u64) {
         })
         .collect::<Vec<_>>();
     let mut total = files.iter().map(|(_, size, _)| *size).sum::<u64>();
-    if total <= max_bytes { return; }
+    if total <= max_bytes {
+        return;
+    }
     files.sort_by_key(|(_, _, modified)| *modified);
     for (path, size, _) in files {
-        if total <= max_bytes { break; }
-        if std::fs::remove_file(path).is_ok() { total = total.saturating_sub(size); }
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(size);
+        }
     }
 }
 
@@ -975,6 +1135,35 @@ fn format_log_entry(
 mod tests {
     use super::*;
 
+    #[test]
+    fn event_watch_is_exact_and_counted() {
+        const EVENT: &str = "test.on_demand";
+        set_trace_event_info(EVENT, false).unwrap();
+        assert!(!watch_event_name(EVENT));
+        set_trace_event_info(EVENT, true).unwrap();
+        assert!(watch_event_name(EVENT));
+        let stat = trace_event_stats()
+            .into_iter()
+            .find(|stat| stat.name == EVENT)
+            .expect("event stat");
+        assert!(stat.selected);
+        assert!(stat.count >= 2);
+        set_trace_event_info(EVENT, false).unwrap();
+    }
+
+    #[test]
+    fn unwatched_raw_event_is_counted_without_trace_dispatch() {
+        const EVENT: &str = "wifi.raw.test_counter_only";
+        set_trace_event_info(EVENT, false).unwrap();
+        assert!(!watch_event_name(EVENT));
+        let stat = trace_event_stats()
+            .into_iter()
+            .find(|stat| stat.name == EVENT)
+            .expect("raw event stat");
+        assert_eq!(stat.count, 1);
+        assert!(!stat.selected);
+    }
+
     /// `init` installs a global subscriber; only one test in this module can
     /// call it. Verifies that `MESH_LOG_DIR=<dir> init("smoke-test")` writes a
     /// JSON line per emitted event to `<dir>/smoke-test.log`. Dropping the
@@ -982,16 +1171,17 @@ mod tests {
     #[test]
     fn mesh_log_dir_writes_json_log_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: this test owns `MESH_LOG_DIR` and `RUST_LOG` for its
+        // SAFETY: this test owns `MESH_LOG_DIR` and `MESH_TRACE_LEVEL` for its
         // duration; the global subscriber is one-shot so concurrent
         // `init` calls would panic regardless.
         unsafe {
             std::env::set_var("MESH_LOG_DIR", dir.path());
-            std::env::set_var("RUST_LOG", "info");
+            std::env::set_var("MESH_TRACE_LEVEL", "info");
         }
 
+        set_trace_event_info("log.warn", true).unwrap();
         let (buffer, guard) = init("smoke-test");
-        tracing::info!(answer = 42, "smoke-test event");
+        tracing::warn!(answer = 42, "smoke-test event");
         assert_eq!(buffer.get_all().len(), 1, "buffer should capture the event");
 
         // Drop the guard to flush and shut down the background writer.
@@ -1019,8 +1209,9 @@ mod tests {
             "log file missing structured field: {}",
             contents
         );
+        set_trace_event_info("log.warn", false).unwrap();
         assert!(
-            contents.contains("\"level\":\"INFO\""),
+            contents.contains("\"level\":\"WARN\""),
             "log file missing level: {}",
             contents
         );

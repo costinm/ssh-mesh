@@ -8,7 +8,10 @@ use axum::{
     },
     routing::{get, post},
 };
-use mesh::local_trace::{TraceLevelRequest, get_trace_level, global_buffer, set_trace_level};
+use mesh::local_trace::{
+    TraceLevelRequest, get_trace_level, global_buffer, set_trace_event_info, set_trace_level,
+    trace_event_stats,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -47,6 +50,11 @@ struct TraceLevelBody {
     level: String,
 }
 
+#[derive(Deserialize)]
+struct TraceEventBody {
+    enabled: bool,
+}
+
 async fn handle_get_level() -> impl IntoResponse {
     let resp = get_trace_level();
     (StatusCode::OK, Json(json!(resp)))
@@ -57,6 +65,35 @@ async fn handle_set_level(Json(body): Json<TraceLevelBody>) -> impl IntoResponse
     match set_trace_level(&req) {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))).into_response(),
         Err(resp) => (StatusCode::BAD_REQUEST, Json(json!(resp))).into_response(),
+    }
+}
+
+async fn handle_get_events() -> impl IntoResponse {
+    Json(json!({ "events": trace_event_stats() }))
+}
+
+/// Bounded snapshot for clients which cannot keep an SSE connection alive
+/// through a reverse proxy or an SSH forward.
+async fn handle_get_entries() -> impl IntoResponse {
+    let entries = global_buffer()
+        .map(|buffer| buffer.get_all())
+        .unwrap_or_default();
+    Json(json!({ "entries": entries }))
+}
+
+async fn handle_set_event(
+    Path(name): Path<String>,
+    Json(body): Json<TraceEventBody>,
+) -> impl IntoResponse {
+    match set_trace_event_info(&name, body.enabled) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "name": name, "enabled": body.enabled })),
+        )
+            .into_response(),
+        Err(message) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "message": message }))).into_response()
+        }
     }
 }
 
@@ -80,6 +117,9 @@ pub fn routes() -> Router<AppState> {
             "/api/sources/:name/level",
             post(|Json(body): Json<TraceLevelBody>| handle_set_level(Json(body))),
         )
+        .route("/api/events", get(handle_get_events))
+        .route("/api/events/:name", post(handle_set_event))
+        .route("/api/entries", get(handle_get_entries))
         .route("/api/stream", get(stream_sse))
 }
 

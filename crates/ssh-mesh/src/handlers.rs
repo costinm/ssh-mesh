@@ -21,6 +21,9 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error as tracing_error, instrument};
 
+// Keep the administrative UI embedded with the server binary. Asset-only
+// changes therefore require rebuilding this crate before a supervised lmesh
+// restart can serve them.
 #[derive(RustEmbed)]
 #[folder = "web/"]
 pub struct Assets;
@@ -32,7 +35,7 @@ use crate::AppState;
 /// The path is confined to the `web/` directory: any `..` components or
 /// absolute paths are rejected to prevent traversal.
 async fn serve_json(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
-    let confined = confine_to_web_dir(&path);
+    let confined = confine_to_web_dir(std::path::Path::new("web"), &path);
     let file_path = match confined {
         Some(p) => p,
         None => return (StatusCode::BAD_REQUEST, "invalid path").into_response(),
@@ -51,10 +54,9 @@ async fn serve_json(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
 /// Resolve a request path to a filesystem path confined within the `web/`
 /// directory. Returns `None` if the path escapes `web/` (via `..`, absolute
 /// paths, or symlink resolution outside the root).
-fn confine_to_web_dir(request_path: &str) -> Option<std::path::PathBuf> {
-    let web_root = std::path::Path::new("web");
-    let web_root_canonical = std::fs::canonicalize(web_root).ok()?;
-    let joined = web_root.join(request_path.trim_start_matches('/'));
+fn confine_to_web_dir(root: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
+    let web_root_canonical = std::fs::canonicalize(root).ok()?;
+    let joined = root.join(request_path.trim_start_matches('/'));
     // Canonicalize if the file exists; otherwise canonicalize the parent and
     // re-append the leaf so not-yet-existing files are still checked.
     let canonical = match std::fs::canonicalize(&joined) {
@@ -138,6 +140,7 @@ fn mesh_routes(app_state: &AppState) -> Router<AppState> {
         .route("/_exec/*cmd", any(handle_exec))
         .route("/_ssh/*rest", any(handle_ssh_request))
         .nest("/mcp", crate::mcp_proxy::routes())
+        .nest("/mesh", crate::mesh_rest::routes())
         .nest("/proxy", crate::generic_proxy::routes())
         .nest("/trace", crate::trace_proxy::routes())
         .route("/api/ssh/clients", get(get_ssh_clients))
@@ -170,21 +173,16 @@ fn mime_for_path(path: &str) -> String {
 
 /// Serve embedded or local web assets by path.
 pub async fn handle_web_request(
+    State(app_state): State<AppState>,
     AxumPath(path): AxumPath<String>,
 ) -> impl axum::response::IntoResponse {
     let path = path.trim_start_matches('/');
-    // Check local filesystem first (for dev), confined to web/.
-    if let Some(local_path) = confine_to_web_dir(path)
-        && local_path.is_file()
-        && let Ok(content) = std::fs::read(&local_path)
-    {
-        let mime = mime_for_path(&local_path.to_string_lossy());
-        return (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, mime)],
-            content,
-        )
-            .into_response();
+    handle_web_asset(app_state.web_root.as_deref(), path)
+}
+
+fn handle_web_asset(dev_root: Option<&std::path::Path>, path: &str) -> Response {
+    if let Some(response) = serve_local_web_asset(dev_root, path) {
+        return response;
     }
 
     match Assets::get(path) {
@@ -202,11 +200,46 @@ pub async fn handle_web_request(
 }
 
 /// Serve the web asset index page.
-async fn serve_index() -> impl IntoResponse {
-    match Assets::get("index.html").or_else(|| Assets::get("ssh.html")) {
-        Some(content) => Html(String::from_utf8_lossy(&content.data).into_owned()),
-        None => Html("<h1>Error: index.html not found</h1>".to_string()),
+async fn serve_index(State(app_state): State<AppState>) -> impl IntoResponse {
+    serve_index_asset(app_state.web_root.as_deref())
+}
+
+fn serve_index_asset(dev_root: Option<&std::path::Path>) -> Response {
+    if let Some(response) = serve_local_web_asset(dev_root, "index.html") {
+        return response;
     }
+    match Assets::get("index.html").or_else(|| Assets::get("ssh.html")) {
+        Some(content) => Html(String::from_utf8_lossy(&content.data).into_owned()).into_response(),
+        None => Html("<h1>Error: index.html not found</h1>".to_string()).into_response(),
+    }
+}
+
+/// Look up an asset in an explicitly configured development tree first, then
+/// preserve the historical cwd-relative `web/` override for ssh-mesh itself.
+/// Every lookup is canonicalized and confined to its selected root.
+fn serve_local_web_asset(dev_root: Option<&std::path::Path>, path: &str) -> Option<Response> {
+    let roots = dev_root
+        .into_iter()
+        .chain(std::iter::once(std::path::Path::new("web")));
+    for root in roots {
+        let Some(local_path) = confine_to_web_dir(root, path) else {
+            continue;
+        };
+        if !local_path.is_file() {
+            continue;
+        }
+        let content = std::fs::read(&local_path).ok()?;
+        let mime = mime_for_path(&local_path.to_string_lossy());
+        return Some(
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, mime)],
+                content,
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 fn response_with_status(status: StatusCode, body: Body) -> Response {
@@ -737,7 +770,9 @@ pub async fn handle_proxy_request(
     State(state): State<AppState>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
-    if let Some(response) = prefixed_admin_response(req.uri().path()).await {
+    if let Some(response) =
+        prefixed_admin_response(req.uri().path(), state.web_root.as_deref()).await
+    {
         return response;
     }
 
@@ -802,7 +837,10 @@ pub async fn handle_proxy_request(
     }
 }
 
-async fn prefixed_admin_response(path: &str) -> Option<Response> {
+async fn prefixed_admin_response(
+    path: &str,
+    dev_root: Option<&std::path::Path>,
+) -> Option<Response> {
     let marker = "/_m/adm";
     let idx = path.find(marker)?;
     let prefix = &path[..idx];
@@ -812,14 +850,10 @@ async fn prefixed_admin_response(path: &str) -> Option<Response> {
         return Some(Redirect::temporary(&format!("{prefix}{marker}/")).into_response());
     }
     if admin_path == format!("{marker}/") {
-        return Some(serve_index().await.into_response());
+        return Some(serve_index_asset(dev_root));
     }
     let asset_path = admin_path.strip_prefix("/_m/adm/")?;
-    Some(
-        handle_web_request(AxumPath(asset_path.to_string()))
-            .await
-            .into_response(),
-    )
+    Some(handle_web_asset(dev_root, asset_path))
 }
 
 fn prefixed_admin_location(path: &str) -> Option<String> {
@@ -848,7 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn serves_prefixed_admin_index_from_fallback() {
-        let response = prefixed_admin_response("/proxy/15080/_m/adm/")
+        let response = prefixed_admin_response("/proxy/15080/_m/adm/", None)
             .await
             .expect("prefixed admin response");
         assert_eq!(response.status(), StatusCode::OK);

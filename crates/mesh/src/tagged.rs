@@ -528,7 +528,100 @@ pub fn to_json(record: &TaggedRecord, catalog: Option<&TaggedCatalog>) -> Value 
     if let Some(error) = &record.error {
         value.insert("error".to_owned(), error.clone());
     }
+    if let Some(to) = &record.to {
+        value.insert("to".to_owned(), to.clone());
+    }
+    if let Some(data) = &record.data {
+        value.insert(
+            "data".to_owned(),
+            Value::Array(data.iter().copied().map(Value::from).collect()),
+        );
+    }
     Value::Object(value)
+}
+
+/// Decode the schema-free JSON projection used by generic HTTP gateways.
+///
+/// `component`, `method`, and `env` keys accept either names or decimal numeric
+/// strings/numbers.  Numeric object keys are retained as [`NameOrTag::Tag`],
+/// allowing a gateway to convert `{ "1": 4 }` to CBOR integer map key `1`
+/// without loading a catalog.
+pub fn record_from_json(value: &Value) -> Result<TaggedRecord> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("tagged JSON record must be an object"))?;
+    let component = object
+        .get("component")
+        .ok_or_else(|| anyhow!("tagged JSON record lacks component"))
+        .and_then(json_name_or_tag)?;
+    let method = object
+        .get("method")
+        .ok_or_else(|| anyhow!("tagged JSON record lacks method"))
+        .and_then(json_name_or_tag)?;
+    let params = object
+        .get("params")
+        .map(|value| {
+            value
+                .as_array()
+                .cloned()
+                .ok_or_else(|| anyhow!("tagged JSON params must be an array"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut env = BTreeMap::new();
+    if let Some(values) = object.get("env") {
+        for (key, value) in values
+            .as_object()
+            .ok_or_else(|| anyhow!("tagged JSON env must be an object"))?
+        {
+            let key = key
+                .parse::<u32>()
+                .map(NameOrTag::Tag)
+                .unwrap_or_else(|_| NameOrTag::Name(key.clone()));
+            env.insert(key, value.clone());
+        }
+    }
+    let data = object
+        .get("data")
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| anyhow!("tagged JSON data must be an octet array"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| u8::try_from(value).ok())
+                        .ok_or_else(|| anyhow!("tagged JSON data contains a non-octet"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let record = TaggedRecord {
+        component,
+        method,
+        id: object.get("id").cloned(),
+        params,
+        env,
+        result: object.get("result").cloned(),
+        error: object.get("error").cloned(),
+        to: object.get("to").cloned(),
+        data,
+    };
+    record.kind()?;
+    Ok(record)
+}
+
+fn json_name_or_tag(value: &Value) -> Result<NameOrTag> {
+    match value {
+        Value::String(value) => Ok(NameOrTag::parse(value)),
+        Value::Number(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(NameOrTag::Tag)
+            .ok_or_else(|| anyhow!("numeric tag must fit u32")),
+        _ => bail!("name/tag must be a string or unsigned integer"),
+    }
 }
 
 /// Render a tagged record as a structured-text command for operator and
@@ -682,6 +775,23 @@ mod tests {
             ..Default::default()
         };
         assert!(malformed.kind().is_err());
+    }
+
+    #[test]
+    fn schema_free_json_envelope_keeps_numeric_fields_and_destination() {
+        let record = record_from_json(&json!({
+            "component": 4,
+            "method": 7,
+            "id": 9,
+            "to": "peer-a",
+            "env": {"1": 4, "label": "ok"}
+        }))
+        .unwrap();
+        assert_eq!(record.component, NameOrTag::Tag(4));
+        assert_eq!(record.method, NameOrTag::Tag(7));
+        assert_eq!(record.env.get(&NameOrTag::Tag(1)), Some(&json!(4)));
+        assert_eq!(record.env.get(&NameOrTag::Name("label".to_owned())), Some(&json!("ok")));
+        assert_eq!(record.to, Some(json!("peer-a")));
     }
 
     #[test]

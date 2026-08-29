@@ -143,6 +143,8 @@ async fn main() -> Result<(), anyhow::Error> {
             )
             .with_discovery_dir(Some(base_dir.clone())),
         ),
+        mesh_services: ssh_mesh::mesh_rest::MeshServiceRegistry::default(),
+        web_root: std::env::var_os("MESH_HTTP_WEB_DIR").map(std::path::PathBuf::from),
     };
 
     // Start configured SSH client connections from config
@@ -166,7 +168,8 @@ async fn main() -> Result<(), anyhow::Error> {
         host_ip
     );
 
-    if let Some(listener) = take_named_or_next_tcp_listener(&["ssh", "ssh-tcp", "ssh-mesh"], "SSH")? {
+    if let Some(listener) = take_named_or_next_tcp_listener(&["ssh", "ssh-tcp", "ssh-mesh"], "SSH")?
+    {
         let ssh_server_clone = ssh_server.clone();
         tokio::spawn(async move {
             let config = Arc::new(ssh_server_clone.get_config());
@@ -420,7 +423,8 @@ fn start_http_listener_if_present(
                 .unwrap_or_else(|_| "unknown".to_string());
             log::info!("{} listener serving HTTP on {}", label, addr);
 
-            let mut auto = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let mut auto =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             auto.http2().enable_connect_protocol();
 
             loop {
