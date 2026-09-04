@@ -3,7 +3,9 @@
 `mesh-api-gen` is a standalone host build tool. It is not linked by `mesh`,
 `dmesh-server`, firmware, or service binaries.
 
-The normative input is fenced `mesh-api` TOML in an `API.md` file:
+The normative input is fenced `mesh-api` TOML in an `API.md` file. Keep the
+file API-only; put transport descriptions, tutorials, and operational examples
+in the component `README.md`.
 
 ````markdown
 ```mesh-api
@@ -29,7 +31,8 @@ cargo run -p mesh-api-gen -- \
   --api crates/service/API.md \
   --out-tools crates/service/tools.json \
   --out-schema crates/service/schema.json \
-  --out-ids crates/dmesh-server/src/generated/service_ids.rs
+  --out-ids crates/dmesh-server/src/generated/service_ids.rs \
+  --out-rust crates/service/src/api.rs
 
 # CI drift check
 cargo run -p mesh-api-gen -- \
@@ -37,12 +40,17 @@ cargo run -p mesh-api-gen -- \
   --out-tools crates/service/tools.json \
   --out-schema crates/service/schema.json \
   --out-ids crates/dmesh-server/src/generated/service_ids.rs \
+  --out-rust crates/service/src/api.rs \
   --check
 ```
 
-Rust structs may be an authoring convenience, not a runtime schema mechanism.
-Document a struct immediately with a compact TOML annotation vocabulary, then
-generate an API fragment for review and check-in:
+`src/api.rs` is generated only and must not be edited. It contains serializable
+request/response structs and the complete `mesh-api` annotation vocabulary, so
+a future source scan can produce reviewable `API-gen.md` fragments. The
+generated types use `serde_json::Value` for unconstrained `object`/`array`
+fields; a later source scan can replace those with reviewed domain types.
+
+Rust struct scanning remains available for that migration and review path:
 
 ```rust
 /// mesh-api: id = "wifi.raw.check"
@@ -86,7 +94,7 @@ cargo run -p mesh-api-gen -- \
 `--component` supplies the component name for older catalogs with bare method
 names such as `status`; dotted names keep their existing component.
 
-The source form deliberately parses comments only. `mesh-api-field` comments
+The source scan deliberately parses comments only. `mesh-api-field` comments
 immediately before public fields emit `[[request.fields]]`; a second struct
 with the same identity and `shape = "response"` emits `[[response.fields]]`.
 Their Rust types map to the API primitives (`String`/`&str`, integers, `bool`,

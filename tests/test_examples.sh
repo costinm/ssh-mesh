@@ -204,9 +204,9 @@ wait_for "host1 mesh-init observer JSONL UDS" 60 uds_jsonl_ok \
   "${state_root}/host1/home/system/run/mesh-init/control.sock" \
   '{"jsonrpc":"2.0","method":"processes","id":1}'
 wait_for "host2 mesh-init observer HTTP proxy" 60 http_post_ok \
-  "http://127.0.0.1:18280/_m/proxy/jsonl/mesh-init" \
-  '{"method":"processes"}'
+  "http://127.0.0.1:18280/_m/proxy/jsonrpc/mesh-init" \
+  '{"jsonrpc":"2.0","method":"processes","params":{},"id":1}'
 wait_for "host1 mesh-init observer HTTP proxy" 60 http_post_ok \
-  "http://127.0.0.1:18480/_m/proxy/jsonl/mesh-init" \
-  '{"method":"processes"}'
+  "http://127.0.0.1:18480/_m/proxy/jsonrpc/mesh-init" \
+  '{"jsonrpc":"2.0","method":"processes","params":{},"id":1}'
 echo "example suite smoke test passed"

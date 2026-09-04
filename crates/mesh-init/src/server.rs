@@ -633,18 +633,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_incoming_flat_json() {
+    fn test_rejects_incoming_flat_json() {
         let trimmed = r#"{"method":"status","name":"x","id":"req-id"}"#;
         let mut session = mesh::message::LineProtocolSession::new();
         let (format, parsed) = session.parse_request_line(trimmed);
-        assert!(
-            matches!(format, mesh::message::LineProtocolFormat::Json(mesh::jsonl::ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) }) if s == "req-id")
-        );
-        let req = parsed.unwrap();
-        match req {
-            Request::Status { name } => assert_eq!(name, Some("x".to_string())),
-            _ => panic!("Expected status request"),
-        }
+        assert!(matches!(
+            format,
+            mesh::message::LineProtocolFormat::Json(mesh::jsonl::ProtocolFormat::JsonRpc { .. })
+        ));
+        assert_eq!(parsed.unwrap_err(), "JSON requests must use JSON-RPC 2.0");
     }
 
     #[test]

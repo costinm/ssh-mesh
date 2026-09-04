@@ -1,0 +1,12 @@
+[package]
+name = "mesh-api"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }

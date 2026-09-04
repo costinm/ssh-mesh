@@ -181,7 +181,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
     if decoder.position() != bytes.len() {
         bail!("trailing CBOR data");
     }
-    let record = TaggedRecord {
+    let mut record = TaggedRecord {
         component: component.ok_or_else(|| anyhow!("record lacks component"))?,
         method: method.ok_or_else(|| anyhow!("record lacks method"))?,
         id,
@@ -192,6 +192,14 @@ pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
         to,
         data,
     };
+    // DMesh tagged-CBOR responses retain the numeric component and method
+    // that selected the handler. The generic gateway response form leaves
+    // both empty. They describe the same correlation result, so normalize
+    // the former at this boundary before enforcing the generic envelope kind.
+    if record.result.is_some() || record.error.is_some() {
+        record.component = NameOrTag::default();
+        record.method = NameOrTag::default();
+    }
     record.kind()?;
     Ok(record)
 }
@@ -606,6 +614,22 @@ mod tests {
         assert_eq!(
             decode_record(&encode_record(&error).unwrap()).unwrap(),
             error
+        );
+    }
+
+    #[test]
+    fn retained_dmesh_handler_tags_normalize_to_a_gateway_response() {
+        // {1: 6, 2: 9, 3: 201, 6: {}}. DMesh stream handlers retain the
+        // numeric component/method in a response; the generic gateway uses
+        // an empty pair for the same response envelope.
+        let wire = [0xa4, 1, 6, 2, 9, 3, 0x18, 201, 6, 0xa0];
+        assert_eq!(
+            decode_record(&wire).unwrap(),
+            TaggedRecord {
+                id: Some(json!(201)),
+                result: Some(json!({})),
+                ..Default::default()
+            }
         );
     }
 

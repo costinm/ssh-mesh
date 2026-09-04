@@ -1,20 +1,188 @@
 # `mesh-init` — UDS Control Protocol API
 
-`mesh-init` exposes its control interface over a Unix Domain Socket (UDS) located at `/run/mesh/mesh-init/mesh.sock` on root-run systems. The endpoint uses the shared `mesh::message::LineProtocolSession` selector: the first byte of the first packet selects the protocol for the whole connection.
+`mesh-init` exposes its control interface over a Unix Domain Socket (UDS) located at `/run/mesh/mesh-init/mesh.sock` on root-run systems. The first byte of the first packet selects the protocol for the whole connection.
 
 * `{` selects line JSON or JSON-RPC-shaped requests.
 * An ASCII letter selects the shared text-record protocol (`kind key=value`).
-* `0x00` is reserved for the SSH mux-control binary protocol.
+* `0x00` selects a 4-byte-length-framed tagged-CBOR session. Programmatic
+  clients with this document's generated numeric catalog use this form.
 
 The endpoint does not re-detect protocol per line.
 
-Clients can interact using flat JSON structures where the `method` field defines the action. The protocol supports standard control requests as well as file descriptor-passing requests via Unix domain socket ancillary data (`SCM_RIGHTS`).
+The CBOR session handles the generated public catalog below. Operations that
+transfer file descriptors (`start_terminal`, `register_namespace`) remain an
+explicit JSON/text UDS + `SCM_RIGHTS` operation: CBOR never hides descriptor
+passing inside a normal request record.
 
-`resources/tools.json` is the hand-maintained public command catalog for UI,
-CLI, and ssh-mesh generic MCP proxy clients. It is intentionally curated rather
-than generated from `mesh::protocol::Request`, so it may hide or simplify
-internal methods. Keep it in sync with this document when the exposed command
-surface changes.
+JSON clients use JSON-RPC 2.0, with a `method`, object `params`, and request `id`. Text records remain supported for human and script clients. The protocol supports standard control requests as well as file descriptor-passing requests via Unix domain socket ancillary data (`SCM_RIGHTS`).
+
+`resources/tools.json` is generated from the normative `mesh-api` blocks in
+this document. The blocks intentionally cover only the public subset of
+`mesh::protocol::Request`; descriptor-passing terminal operations and internal
+observer controls are not silently exposed merely because their serde variants
+exist. Stable numeric tags let programmatic callers select tagged CBOR, while
+the JSON-RPC gateway remains available for clients without this catalog.
+
+## Generated tagged-CBOR catalog
+
+The `mesh-init` component owns numeric component index 3. Field indexes are
+stable wire identifiers, not Rust field order. Regenerate the checked-in
+catalog after changing a block:
+
+```sh
+cargo run -p mesh-api-gen -- --api crates/mesh-init/API.md \
+  --out-tools crates/mesh-init/resources/tools.json \
+  --out-rust crates/mesh-init/src/api.rs
+```
+
+```mesh-api
+id = "mesh-init.status"
+component = "mesh-init"
+method = "status"
+component-index = 3
+method-index = 1
+summary = "Query status for one service or all loaded services"
+[request]
+fields = [{ name = "name", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "mesh-init.start"
+component = "mesh-init"
+method = "start"
+component-index = 3
+method-index = 2
+summary = "Start a configured service by name"
+[request]
+fields = [
+  { name = "name", index = 1, type = "string", required = true, position = 1 },
+  { name = "args", index = 2, type = "array" },
+  { name = "env", index = 3, type = "object" },
+]
+```
+
+```mesh-api
+id = "mesh-init.stop"
+component = "mesh-init"
+method = "stop"
+component-index = 3
+method-index = 3
+summary = "Gracefully terminate or signal a running service"
+[request]
+fields = [
+  { name = "name", index = 1, type = "string", required = true, position = 1 },
+  { name = "signal", index = 2, type = "i32" },
+]
+```
+
+```mesh-api
+id = "mesh-init.freeze"
+component = "mesh-init"
+method = "freeze"
+component-index = 3
+method-index = 4
+summary = "Suspend a running service"
+[request]
+fields = [{ name = "name", index = 1, type = "string", required = true, position = 1 }]
+```
+
+```mesh-api
+id = "mesh-init.unfreeze"
+component = "mesh-init"
+method = "unfreeze"
+component-index = 3
+method-index = 5
+summary = "Resume a frozen service"
+[request]
+fields = [{ name = "name", index = 1, type = "string", required = true, position = 1 }]
+```
+
+```mesh-api
+id = "mesh-init.reload"
+component = "mesh-init"
+method = "reload"
+component-index = 3
+method-index = 6
+summary = "Reload service configuration from disk"
+```
+
+```mesh-api
+id = "mesh-init.processes"
+component = "mesh-init"
+method = "processes"
+component-index = 3
+method-index = 7
+summary = "List observed processes from the process observer"
+```
+
+```mesh-api
+id = "mesh-init.process"
+component = "mesh-init"
+method = "process"
+component-index = 3
+method-index = 8
+summary = "Return detailed information for one process"
+[request]
+fields = [{ name = "pid", index = 1, type = "u32", required = true, position = 1 }]
+```
+
+```mesh-api
+id = "mesh-init.cgroups"
+component = "mesh-init"
+method = "cgroups"
+component-index = 3
+method-index = 9
+summary = "Return all observed cgroups"
+```
+
+```mesh-api
+id = "mesh-init.cgroup"
+component = "mesh-init"
+method = "cgroup"
+component-index = 3
+method-index = 10
+summary = "Return detailed information for one cgroup path"
+[request]
+fields = [{ name = "path", index = 1, type = "string", required = true, position = 1 }]
+```
+
+```mesh-api
+id = "mesh-init.pressure"
+component = "mesh-init"
+method = "pressure"
+component-index = 3
+method-index = 11
+summary = "Return pressure watch state"
+```
+
+```mesh-api
+id = "mesh-init.cgroup_high"
+component = "mesh-init"
+method = "cgroup_high"
+component-index = 3
+method-index = 12
+summary = "Set memory.high for a cgroup based on current memory usage"
+[request]
+fields = [
+  { name = "path", index = 1, type = "string", required = true },
+  { name = "percentage", index = 2, type = "f64", required = true },
+  { name = "interval", index = 3, type = "u64", required = true },
+]
+```
+
+```mesh-api
+id = "mesh-init.move_process"
+component = "mesh-init"
+method = "move_process"
+component-index = 3
+method-index = 13
+summary = "Move a process to a named cgroup"
+[request]
+fields = [
+  { name = "pid", index = 1, type = "u32", required = true, position = 1 },
+  { name = "cgroup_name", index = 2, type = "string" },
+]
+```
 
 ---
 
@@ -150,7 +318,7 @@ When a socket-activated service is triggered by an incoming connection
 it spawns:
 
 ```json
-{"method":"prepare_activation","name":"my-service","context":{...}}
+{"jsonrpc":"2.0","id":1,"method":"prepare_activation","params":{"name":"my-service","context":{...}}}
 ```
 
 The context is queued (max 32 per service) and consumed by the next

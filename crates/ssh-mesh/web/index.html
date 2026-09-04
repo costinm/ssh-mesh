@@ -41,7 +41,7 @@
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 14px;
         }
-        a {
+        a, .card {
             display: block;
             min-height: 108px;
             padding: 18px;
@@ -72,35 +72,50 @@
     </header>
     <main>
         <div class="grid">
-            <a href="dashboard.html">
-                <strong>Dashboard</strong>
-                <span>View mesh status and devices, request discovery, and run advertised IPERF checks.</span>
+            <section class="card" id="this-node">
+                <strong>This node</strong>
+                <span>Loading the announced local status…</span>
+            </section>
+            <a href="discovery.html">
+                <strong>Discovery</strong>
+                <span>View discovered physical, VM, container, and control-plane nodes, then request bounded discovery.</span>
+            </a>
+            <a href="probe.html">
+                <strong>Probe</strong>
+                <span>Run the public end-to-end probe when this mesh advertises probe.run.</span>
             </a>
             <a href="services.html">
                 <strong>Services</strong>
-                <span>Browse registered mesh services and send JSON or CBOR tagged records.</span>
-            </a>
-            <a href="mesh/processes.html">
-                <strong>Processes</strong>
-                <span>Inspect process memory, cgroup placement, and process actions.</span>
-            </a>
-            <a href="mesh/cgroups.html">
-                <strong>CGroups</strong>
-                <span>Inspect cgroup memory, pressure, and control operations.</span>
-            </a>
-            <a href="mesh/radio.html">
-                <strong>Radio</strong>
-                <span>Run mesh radio commands through the message registry.</span>
+                <span>Browse the intended interface, or enable Show all tagged methods for legacy, debug, protocol, and service-specific APIs.</span>
             </a>
             <a href="trace/trace_viewer.html">
                 <strong>Trace</strong>
                 <span>Open the trace aggregation viewer.</span>
             </a>
-            <a href="ssh.html">
-                <strong>SSH</strong>
-                <span>Open the browser SSH terminal interface.</span>
-            </a>
         </div>
     </main>
+    <script>
+        const base = new URL('../mesh/', location.href);
+        const key = new URL(location.href).searchParams.get('apikey');
+        const root = document.getElementById('this-node');
+        const url = path => { const value = new URL(path, base); if (key) value.searchParams.set('apikey', key); return value; };
+        async function request(path, options) { const response = await fetch(url(path), options); const value = await response.json().catch(() => ({})); if (!response.ok) throw Error(value.error || `HTTP ${response.status}`); return value; }
+        async function loadThisNode() {
+            try {
+                const registry = await request('services'); let service;
+                for (const candidate of registry.services || []) {
+                    const catalog = await request(`services/${encodeURIComponent(candidate.name)}/tools?view=default`);
+                    if ((Array.isArray(catalog) ? catalog : catalog.tools || []).some(tool => tool.name === 'discovery.status')) { service = candidate.name; break; }
+                }
+                if (!service) throw Error('discovery.status is not advertised.');
+                const response = await request(`services/${encodeURIComponent(service)}/call/discovery.status`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:1})});
+                const status = response?.result || response || {};
+                const rows = [];
+                for (const network of status.local_networks || []) { const address = network.link_local_v6 || network.addresses?.[0]; if (address) rows.push(`${network.interface ? `${network.interface}: ` : ''}${address}${network.interface && !address.includes('%') ? `%${network.interface}` : ''}`); }
+                root.replaceChildren(Object.assign(document.createElement('strong'), {textContent:'This node'}), Object.assign(document.createElement('span'), {textContent:rows.length ? rows.join(' · ') : 'No announced local address is currently available.'}));
+            } catch (error) { root.replaceChildren(Object.assign(document.createElement('strong'), {textContent:'This node'}), Object.assign(document.createElement('span'), {textContent:error.message})); }
+        }
+        loadThisNode();
+    </script>
 </body>
 </html>

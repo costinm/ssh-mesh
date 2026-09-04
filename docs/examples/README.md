@@ -349,8 +349,8 @@ Mesh-init observer HTTP through ssh-mesh:
 
 ```bash
 curl -H 'content-type: application/json' \
-  -d '{"method":"processes"}' \
-  http://127.0.0.1:18480/_m/proxy/jsonl/mesh-init
+  -d '{"jsonrpc":"2.0","method":"processes","params":{},"id":1}' \
+  http://127.0.0.1:18480/_m/proxy/jsonrpc/mesh-init
 ```
 
 Mesh-init observer JSONL through a local forward:

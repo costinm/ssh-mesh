@@ -24,6 +24,7 @@ use axum::{
 };
 use mesh::{
     cbor::{decode_record, encode_record},
+    message::format_text_response,
     tagged::{RecordKind, TaggedCatalog, TaggedRecord, record_from_json, to_json},
     wire::{TaggedRecordHandler, read_cbor_record, write_cbor_record},
 };
@@ -176,7 +177,53 @@ fn persist_api_key(mut response: Response, query_key: Option<&str>, persist: boo
 struct DeliveryQuery {
     mode: Option<String>,
     to: Option<String>,
+    /// `text` is the existing logfmt-like mesh text response. `tsv` is a
+    /// flattened, schema-neutral view of the public JSON response for shell
+    /// scripts. JSON remains the default API representation.
+    format: Option<String>,
     apikey: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CatalogQuery {
+    apikey: Option<String>,
+    /// `default` omits catalog methods that are deliberately masked from the
+    /// normal explorer. `all` is the unfiltered catalog for the Show all view
+    /// and programmatic catalog consumers.
+    view: Option<String>,
+}
+
+fn catalog_for_view(catalog: &Value, view: Option<&str>) -> Result<Value> {
+    match view.unwrap_or("all") {
+        "all" => Ok(catalog.clone()),
+        "default" => {
+            let tools = match catalog {
+                Value::Array(tools) => tools,
+                Value::Object(object) => object
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("catalog tools must be an array"))?,
+                _ => bail!("catalog must be an array or object with tools"),
+            };
+            let tools = tools
+                .iter()
+                .filter(|tool| {
+                    tool.get("x-ui-visibility").and_then(Value::as_str) == Some("default")
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            match catalog {
+                Value::Array(_) => Ok(Value::Array(tools)),
+                Value::Object(object) => {
+                    let mut filtered = object.clone();
+                    filtered.insert("tools".to_owned(), Value::Array(tools));
+                    Ok(Value::Object(filtered))
+                }
+                _ => unreachable!("validated above"),
+            }
+        }
+        other => bail!("unknown catalog view {other:?}; use default or all"),
+    }
 }
 
 fn is_oneway(query: &DeliveryQuery, record: &TaggedRecord) -> Result<bool> {
@@ -202,6 +249,105 @@ fn prepare_delivery(
         registry.assign_request_id(record);
     }
     Ok(one_way)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponseFormat {
+    Json,
+    Text,
+    Tsv,
+}
+
+fn response_format(query: &DeliveryQuery) -> Result<ResponseFormat> {
+    match query.format.as_deref().unwrap_or("json") {
+        "json" => Ok(ResponseFormat::Json),
+        "text" => Ok(ResponseFormat::Text),
+        "tsv" => Ok(ResponseFormat::Tsv),
+        value => bail!("unknown response format {value:?}; use json, text, or tsv"),
+    }
+}
+
+fn escape_tsv(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn flatten_tsv(value: &Value, path: &str, out: &mut String) {
+    match value {
+        Value::Object(values) if values.is_empty() => {
+            out.push_str("value\t");
+            out.push_str(path);
+            out.push_str("\t{}\n");
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                let path = if path.is_empty() {
+                    key.to_owned()
+                } else {
+                    format!("{path}.{key}")
+                };
+                flatten_tsv(value, &path, out);
+            }
+        }
+        Value::Array(values) if values.is_empty() => {
+            out.push_str("value\t");
+            out.push_str(path);
+            out.push_str("\t[]\n");
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                flatten_tsv(value, &format!("{path}[{index}]"), out);
+            }
+        }
+        value => {
+            out.push_str("value\t");
+            out.push_str(path);
+            out.push('\t');
+            let rendered = match value {
+                Value::String(value) => value.clone(),
+                value => value.to_string(),
+            };
+            out.push_str(&escape_tsv(&rendered));
+            out.push('\n');
+        }
+    }
+}
+
+fn tsv_response(value: &Value) -> String {
+    let mut out = String::from("kind\tpath\tvalue\n");
+    flatten_tsv(value, "", &mut out);
+    out
+}
+
+fn formatted_response(format: ResponseFormat, value: Value, record: Option<&TaggedRecord>) -> Response {
+    match format {
+        ResponseFormat::Json => Json(value).into_response(),
+        ResponseFormat::Text => {
+            let (success, error, data) = match record {
+                Some(record) => {
+                    let error = record.error.as_ref().map(|value| match value {
+                        Value::String(value) => value.clone(),
+                        value => value.to_string(),
+                    });
+                    (record.error.is_none(), error, record.result.as_ref())
+                }
+                None => (true, None, Some(&value)),
+            };
+            (
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("{}\n", format_text_response(success, error.as_deref(), data)),
+            )
+                .into_response()
+        }
+        ResponseFormat::Tsv => (
+            [(header::CONTENT_TYPE, "text/tab-separated-values; charset=utf-8")],
+            tsv_response(&value),
+        )
+            .into_response(),
+    }
 }
 
 async fn dispatch(service: &MeshService, record: TaggedRecord) -> Result<Option<TaggedRecord>> {
@@ -262,6 +408,10 @@ async fn post_record(
                 .split(',')
                 .any(|value| value.trim() == "application/cbor")
         });
+    let format = match response_format(&query) {
+        Ok(format) => format,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
     let result = async {
         let mut record = if cbor {
             decode_record(&body).context("decode application/cbor tagged record")?
@@ -270,6 +420,12 @@ async fn post_record(
                 serde_json::from_slice(&body).context("decode JSON tagged record")?;
             record_from_json(&value)?
         };
+        if let Some(to) = &query.to {
+            if record.to.as_ref().is_some_and(|value| value != to) {
+                bail!("query to conflicts with body to")
+            }
+            record.to = Some(Value::String(to.clone()));
+        }
         let one_way = prepare_delivery(&state.mesh_services, &query, &mut record)?;
         let service = state.mesh_services.service(&service_name)?;
         let response = dispatch(&service, record.clone()).await?;
@@ -307,7 +463,11 @@ async fn post_record(
             }
             Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
         },
-        Ok((status, value, _)) => (status, Json(value)).into_response(),
+        Ok((status, value, record)) => {
+            let mut response = formatted_response(format, value, record.as_ref());
+            *response.status_mut() = status;
+            response
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     };
     persist_api_key(response, query.apikey.as_deref(), persist)
@@ -328,6 +488,10 @@ async fn post_call(
     {
         Ok(persist) => persist,
         Err(error) => return error_response(StatusCode::UNAUTHORIZED, error),
+    };
+    let format = match response_format(&query) {
+        Ok(format) => format,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
     let result = async {
         let service = state.mesh_services.service(&service_name)?;
@@ -361,6 +525,7 @@ async fn post_call(
                     "completion": "local_submission",
                     "directed": record.to.is_some(),
                 }),
+                None,
             ));
         }
         let response =
@@ -373,11 +538,15 @@ async fn post_call(
         } else {
             StatusCode::OK
         };
-        Ok((status, to_json(&response, Some(&catalog))))
+        Ok((status, to_json(&response, Some(&catalog)), Some(response)))
     }
     .await;
     let response = match result {
-        Ok((status, value)) => (status, Json(value)).into_response(),
+        Ok((status, value, record)) => {
+            let mut response = formatted_response(format, value, record.as_ref());
+            *response.status_mut() = status;
+            response
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     };
     persist_api_key(response, query.apikey.as_deref(), persist)
@@ -404,7 +573,7 @@ async fn list_services(
 async fn get_tools(
     State(state): State<AppState>,
     Path(service_name): Path<String>,
-    Query(query): Query<DeliveryQuery>,
+    Query(query): Query<CatalogQuery>,
     headers: HeaderMap,
 ) -> Response {
     let persist = match state
@@ -417,7 +586,10 @@ async fn get_tools(
     match state.mesh_services.service(&service_name) {
         Ok(service) => match service.catalog {
             Some(catalog) => persist_api_key(
-                Json(catalog).into_response(),
+                match catalog_for_view(&catalog, query.view.as_deref()) {
+                    Ok(catalog) => Json(catalog).into_response(),
+                    Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+                },
                 query.apikey.as_deref(),
                 persist,
             ),
@@ -530,6 +702,7 @@ mod tests {
                 &DeliveryQuery {
                     mode: Some("oneway".to_owned()),
                     to: None,
+                    format: None,
                     apikey: None
                 },
                 &mut one_way,
@@ -551,5 +724,62 @@ mod tests {
         let mut cookie_headers = HeaderMap::new();
         cookie_headers.insert(header::COOKIE, "mesh_api_key=test-key".parse().unwrap());
         assert!(!registry.authorize(None, &cookie_headers).unwrap());
+    }
+
+    #[test]
+    fn default_catalog_view_masks_only_marked_methods() {
+        let catalog = json!({"tools": [
+            {"name": "discovery.nodes", "x-ui-visibility": "default"},
+            {"name": "wifi.raw.send", "x-ui-visibility": "masked"},
+            {"name": "legacy.unspecified"}
+        ]});
+        let default = catalog_for_view(&catalog, Some("default")).unwrap();
+        let names = default["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["discovery.nodes"]);
+        assert_eq!(catalog_for_view(&catalog, Some("all")).unwrap(), catalog);
+        assert_eq!(
+            catalog_for_view(
+                &json!([
+                    {"name": "default", "x-ui-visibility": "default"},
+                    {"name": "masked", "x-ui-visibility": "masked"}
+                ]),
+                Some("default")
+            )
+            .unwrap(),
+            json!([{"name": "default", "x-ui-visibility": "default"}])
+        );
+        assert!(catalog_for_view(&catalog, Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn tsv_response_flattens_any_schema_result_without_method_specific_logic() {
+        assert_eq!(
+            tsv_response(&json!({"result": {"devices": [{"identity": "e7"}]}})),
+            "kind\tpath\tvalue\nvalue\tresult.devices[0].identity\te7\n"
+        );
+    }
+
+    #[test]
+    fn response_format_accepts_existing_text_and_script_tsv() {
+        let text = DeliveryQuery {
+            format: Some("text".to_owned()),
+            ..Default::default()
+        };
+        let tsv = DeliveryQuery {
+            format: Some("tsv".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(response_format(&text).unwrap(), ResponseFormat::Text);
+        assert_eq!(response_format(&tsv).unwrap(), ResponseFormat::Tsv);
+        assert!(response_format(&DeliveryQuery {
+            format: Some("xml".to_owned()),
+            ..Default::default()
+        })
+        .is_err());
     }
 }

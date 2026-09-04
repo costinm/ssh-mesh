@@ -1,8 +1,7 @@
 //! Shared JSON-lines request/response helpers.
 //!
-//! Each message is a single JSON object terminated by `\n`. Requests may use
-//! the workspace's flat form (`{"method":"status", ...}`) or JSON-RPC 2.0
-//! shape (`{"jsonrpc":"2.0","method":"status","params":{...},"id":1}`).
+//! Each JSON message is a JSON-RPC 2.0 object terminated by `\n`. Text
+//! records remain supported for human and script clients.
 
 use std::future::Future;
 use std::io::{IoSlice, IoSliceMut, Write};
@@ -20,8 +19,6 @@ use crate::protocol::Response;
 /// Wire format detected for an incoming JSON-lines request.
 #[derive(Debug, Clone)]
 pub enum ProtocolFormat {
-    /// Workspace-native flat JSON request/response.
-    FlatJson { id: Option<serde_json::Value> },
     /// JSON-RPC-shaped request/response.
     JsonRpc { id: Option<serde_json::Value> },
     /// Mesh text record request/response.
@@ -355,7 +352,7 @@ impl McpRegistry {
     }
 }
 
-/// Parse a flat or JSON-RPC request without binding it to a component enum.
+/// Parse a JSON-RPC request without binding it to a component enum.
 pub fn parse_raw_request(trimmed: &str) -> (ProtocolFormat, Result<RawRequest, String>) {
     if !trimmed.starts_with('{') {
         return raw_from_text(trimmed);
@@ -364,7 +361,7 @@ pub fn parse_raw_request(trimmed: &str) -> (ProtocolFormat, Result<RawRequest, S
         Ok(v) => v,
         Err(e) => {
             return (
-                ProtocolFormat::FlatJson { id: None },
+                ProtocolFormat::JsonRpc { id: None },
                 Err(format!("Invalid JSON: {}", e)),
             );
         }
@@ -419,49 +416,27 @@ fn text_json_value(value: &str) -> Value {
 fn raw_from_value(val: Value) -> (ProtocolFormat, Result<RawRequest, String>) {
     let Some(obj) = val.as_object() else {
         return (
-            ProtocolFormat::FlatJson { id: None },
+            ProtocolFormat::JsonRpc { id: None },
             Err("JSON payload is not an object".to_string()),
         );
     };
 
     let id = obj.get("id").cloned();
-    if obj.contains_key("jsonrpc") {
-        let format = ProtocolFormat::JsonRpc { id };
-        let Some(method) = obj.get("method").and_then(Value::as_str) else {
-            return (
-                format,
-                Err("Missing or invalid 'method' in JSON-RPC request".to_string()),
-            );
-        };
-        let params = match obj.get("params") {
-            Some(Value::Object(params)) => params.clone(),
-            Some(Value::Null) | None => serde_json::Map::new(),
-            Some(_) => {
-                return (
-                    format,
-                    Err("JSON-RPC 'params' must be an object".to_string()),
-                );
-            }
-        };
-        return (
-            format,
-            Ok(RawRequest {
-                method: method.to_string(),
-                params,
-            }),
-        );
+    let format = ProtocolFormat::JsonRpc { id };
+    if obj.get("jsonrpc") != Some(&Value::String("2.0".to_string())) {
+        return (format, Err("JSON requests must use JSON-RPC 2.0".to_string()));
     }
-
-    let format = ProtocolFormat::FlatJson { id };
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         return (
             format,
-            Err("Missing or invalid 'method' in JSON request".to_string()),
+            Err("Missing or invalid 'method' in JSON-RPC request".to_string()),
         );
     };
-    let mut params = obj.clone();
-    params.remove("method");
-    params.remove("id");
+    let params = match obj.get("params") {
+        Some(Value::Object(params)) => params.clone(),
+        Some(Value::Null) | None => serde_json::Map::new(),
+        Some(_) => return (format, Err("JSON-RPC 'params' must be an object".to_string())),
+    };
     (
         format,
         Ok(RawRequest {
@@ -708,7 +683,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Parse a flat or JSON-RPC-shaped JSON-lines request.
+/// Parse a JSON-RPC-shaped JSON-lines request.
 pub fn parse_request<T>(trimmed: &str) -> (ProtocolFormat, Result<T, String>)
 where
     T: DeserializeOwned,
@@ -730,7 +705,7 @@ where
         Ok(v) => v,
         Err(e) => {
             return (
-                ProtocolFormat::FlatJson { id: None },
+                ProtocolFormat::JsonRpc { id: None },
                 Err(format!("Invalid JSON: {}", e)),
             );
         }
@@ -738,72 +713,41 @@ where
 
     let Some(obj) = val.as_object() else {
         return (
-            ProtocolFormat::FlatJson { id: None },
+            ProtocolFormat::JsonRpc { id: None },
             Err("JSON payload is not an object".to_string()),
         );
     };
 
     let id = obj.get("id").cloned();
-    if obj.contains_key("jsonrpc") {
-        let format = ProtocolFormat::JsonRpc { id };
-        let method = match obj.get("method").and_then(|m| m.as_str()) {
-            Some(m) => m,
-            None => {
-                return (
-                    format,
-                    Err("Missing or invalid 'method' in JSON-RPC request".to_string()),
-                );
-            }
-        };
-
-        let mut flat = serde_json::Map::new();
-        flat.insert("method".to_string(), serde_json::json!(method));
-        if let Some(params) = obj.get("params") {
-            if let Some(params_obj) = params.as_object() {
-                for (k, v) in params_obj {
-                    flat.insert(k.clone(), v.clone());
-                }
-            } else if !params.is_null() {
-                return (
-                    format,
-                    Err("JSON-RPC 'params' must be an object".to_string()),
-                );
-            }
-        }
-
-        match serde_json::from_value::<T>(serde_json::Value::Object(flat)) {
-            Ok(req) => (format, Ok(req)),
-            Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
-        }
-    } else {
-        let format = ProtocolFormat::FlatJson { id };
-        match serde_json::from_value::<T>(val) {
-            Ok(req) => (format, Ok(req)),
-            Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
-        }
+    let format = ProtocolFormat::JsonRpc { id };
+    if obj.get("jsonrpc") != Some(&Value::String("2.0".to_string())) {
+        return (format, Err("JSON requests must use JSON-RPC 2.0".to_string()));
+    }
+    let method = match obj.get("method").and_then(Value::as_str) {
+        Some(method) => method,
+        None => return (format, Err("Missing or invalid 'method' in JSON-RPC request".to_string())),
+    };
+    let mut request = serde_json::Map::new();
+    request.insert("method".to_string(), json!(method));
+    match obj.get("params") {
+        Some(Value::Object(params)) => request.extend(params.clone()),
+        Some(Value::Null) | None => {}
+        Some(_) => return (format, Err("JSON-RPC 'params' must be an object".to_string())),
+    }
+    match serde_json::from_value::<T>(Value::Object(request)) {
+        Ok(req) => (format, Ok(req)),
+        Err(e) => (format, Err(format!("Failed to deserialize request: {}", e))),
     }
 }
 
 /// Format a protocol response in the same shape as the incoming request.
 pub fn format_response(response: Response, format: &ProtocolFormat) -> anyhow::Result<String> {
     match format {
-        ProtocolFormat::FlatJson { id } => {
-            let mut val = serde_json::to_value(&response)?;
-            if let Some(obj) = val.as_object_mut()
-                && let Some(id_val) = id
-            {
-                obj.insert("id".to_string(), id_val.clone());
-            }
-            Ok(serde_json::to_string(&val)?)
-        }
         ProtocolFormat::JsonRpc { id } => {
             let mut map = serde_json::Map::new();
             map.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
             if response.success {
-                map.insert(
-                    "result".to_string(),
-                    response.data.clone().unwrap_or(serde_json::Value::Null),
-                );
+                map.insert("result".to_string(), response_object(response.data));
             } else {
                 let mut err_map = serde_json::Map::new();
                 err_map.insert("code".to_string(), serde_json::json!(-32603));
@@ -829,6 +773,16 @@ pub fn format_response(response: Response, format: &ProtocolFormat) -> anyhow::R
             response.error.as_deref(),
             response.data.as_ref(),
         )),
+    }
+}
+
+/// RPC result payloads are always objects. Legacy scalar/no-content handlers
+/// are made explicit rather than leaking a second response shape.
+fn response_object(data: Option<serde_json::Value>) -> serde_json::Value {
+    match data {
+        Some(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
+        None | Some(serde_json::Value::Null) => serde_json::json!({}),
+        Some(value) => serde_json::json!({"value": value}),
     }
 }
 
@@ -903,16 +857,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_flat_json() {
+    fn rejects_flat_json() {
         let (format, parsed) =
             parse_request::<TestRequest>(r#"{"method":"status","name":"x","id":"req-id"}"#);
-        assert!(
-            matches!(format, ProtocolFormat::FlatJson { id: Some(serde_json::Value::String(ref s)) } if s == "req-id")
-        );
-        match parsed.unwrap() {
-            TestRequest::Status { name } => assert_eq!(name.as_deref(), Some("x")),
-            TestRequest::Echo { .. } => panic!("unexpected request"),
-        }
+        assert!(matches!(format, ProtocolFormat::JsonRpc { .. }));
+        assert_eq!(parsed.unwrap_err(), "JSON requests must use JSON-RPC 2.0");
     }
 
     #[test]
@@ -972,7 +921,7 @@ mod tests {
             }
         ]));
         let (_format, response) = dispatch_request::<TestRequest, _, _>(
-            r#"{"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
             &registry,
             |_| async { Response::err("should not call direct handler") },
         )

@@ -59,9 +59,11 @@ event type=lora.rx rssi=-71 data_b64=AQID
 error message="service not found"
 ```
 
-Firmware should use direct CBOR for datagrams and the framed CBOR form for TTY
-or another byte stream. Host line services use `LineProtocolSession`; binary
-sessions use `mesh::mux::read_frame` rather than a line parser.
+Firmware uses its own bounded CBOR implementation for datagrams and the framed
+CBOR form for TTY or another byte stream. Host service UDS and reliable mesh
+bearers use `mesh::wire::serve_cbor_session`: the same tagged-CBOR dispatcher
+and request/reply correlation applies to either transport. Text and JSON are
+gateway/operator codecs, never a second programmatic service protocol.
 
 If HTTP is needed, it belongs in `ssh-mesh` or the application itself. The `mesh` crate intentionally avoids Axum/Hyper/http dependencies and only provides the activation, peer-checked stream, JSONL, and telemetry primitives.
 
@@ -85,7 +87,14 @@ mesh example tool status
 ```
 
 `API.md` remains the source of truth and may mark methods public or private;
-the generator emits the public catalog rather than deriving it from Rust code.
+the standalone `mesh-api-gen` emits the public catalog, JSON Schema, and
+no-std numeric IDs. A documented Rust serde struct can generate a reviewed
+API.md block as an authoring convenience, but no generator/reflection
+dependency reaches services or firmware.
+
+The core catalog is checked in at `resources/tools.json`, with matching
+`resources/schema.json` and `src/generated_api_ids.rs`. The `mesh-cli` build
+gate runs `mesh-api-gen --check` against all three artifacts.
 During local development,
 `MESH_RES_DIR` can point at a crate's `resources/` directory; packaged runs use
 the normal `MESH_OPT_BASE`/`MESH_APP_OPT` resource lookup.

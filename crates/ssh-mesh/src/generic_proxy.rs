@@ -69,42 +69,18 @@ fn app_socket_path(app: &str, explicit: Option<&str>) -> String {
         .into_owned()
 }
 
-async fn proxy_jsonl(
-    Path(app): Path<String>,
-    Query(query): Query<ProxyQuery>,
-    Json(payload): Json<Value>,
-) -> impl IntoResponse {
-    let method = payload
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("status")
-        .to_string();
-    if let Some(result) = call_bridge(&app, &method, payload.clone()).await {
-        return match result {
-            Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
-        };
-    }
-
-    let socket = app_socket_path(&app, query.socket.as_deref());
-    match crate::jsonl_proxy::call_jsonl_value(&socket, payload)
-        .await
-        .and_then(crate::jsonl_proxy::jsonl_response_payload)
-    {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
 async fn proxy_json_rpc(
     Path(app): Path<String>,
     Query(query): Query<ProxyQuery>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    if payload.get("jsonrpc") != Some(&json!("2.0")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "JSON-RPC payload requires jsonrpc: 2.0"})),
+        )
+            .into_response();
+    }
     let Some(method) = payload.get("method").and_then(Value::as_str) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -113,6 +89,13 @@ async fn proxy_json_rpc(
             .into_response();
     };
     let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() && !params.is_null() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "JSON-RPC params must be an object"})),
+        )
+            .into_response();
+    }
     if let Some(result) = call_bridge(&app, method, params.clone()).await {
         return match result {
             Ok(value) => (StatusCode::OK, Json(value)).into_response(),
@@ -302,7 +285,6 @@ enum GenericMcpRequest {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/jsonl/:app", post(proxy_jsonl))
         .route("/jsonrpc/:app", post(proxy_json_rpc))
         .route("/mcp/:app", post(proxy_mcp))
 }

@@ -24,19 +24,6 @@ pub async fn call_jsonl_value(socket_path: &str, request: Value) -> Result<Value
     Ok(serde_json::from_str(response.trim())?)
 }
 
-/// Send a single flat JSONL request to a Unix socket and return the parsed response.
-pub async fn call_jsonl(socket_path: &str, method: &str, params: Value) -> Result<Value> {
-    let mut request = serde_json::Map::new();
-    request.insert("method".to_string(), json!(method));
-    if let Some(params) = params.as_object() {
-        for (k, v) in params {
-            request.insert(k.clone(), v.clone());
-        }
-    }
-
-    call_jsonl_value(socket_path, Value::Object(request)).await
-}
-
 /// Send a JSON-RPC 2.0 request over JSONL and return the parsed response.
 pub async fn call_json_rpc(socket_path: &str, method: &str, params: Value) -> Result<Value> {
     call_jsonl_value(
@@ -55,25 +42,44 @@ pub async fn call_json_rpc(socket_path: &str, method: &str, params: Value) -> Re
 pub fn jsonl_response_payload(response: Value) -> Result<Value> {
     if response.get("jsonrpc").is_some() {
         if let Some(error) = response.get("error") {
-            anyhow::bail!("{}", error);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| error.as_str().unwrap_or("JSON-RPC request failed"));
+            anyhow::bail!("{}", message);
         }
         return Ok(response.get("result").cloned().unwrap_or(Value::Null));
     }
 
-    if response
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Ok(response
-            .get("data")
-            .cloned()
-            .unwrap_or_else(|| json!({"status": "ok"})));
+    anyhow::bail!("JSONL response is not JSON-RPC")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jsonl_response_payload;
+    use serde_json::json;
+
+    #[test]
+    fn unwraps_json_rpc_result() {
+        let payload = jsonl_response_payload(json!({
+            "jsonrpc": "2.0",
+            "id": "request-1",
+            "result": {"pid": 42},
+        }))
+        .unwrap();
+
+        assert_eq!(payload, json!({"pid": 42}));
     }
 
-    let error = response
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("JSONL request failed");
-    anyhow::bail!("{}", error)
+    #[test]
+    fn json_rpc_error_remains_an_error() {
+        let error = jsonl_response_payload(json!({
+            "jsonrpc": "2.0",
+            "id": "request-2",
+            "error": {"code": -32603, "message": "not available"},
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "not available");
+    }
 }

@@ -23,6 +23,8 @@ pub struct ApiMethod {
     pub component_index: Option<u32>,
     #[serde(rename = "method-index")]
     pub method_index: Option<u32>,
+    #[serde(rename = "ui-visibility")]
+    pub ui_visibility: Option<String>,
     #[serde(default)]
     pub request: ApiShape,
     #[serde(default)]
@@ -64,6 +66,9 @@ use serde::{Deserialize, Serialize};\n\n",
     for method in methods {
         render_rust_shape(&mut output, method, "request");
         render_rust_shape(&mut output, method, "response");
+    }
+    while output.ends_with("\n\n") {
+        output.pop();
     }
     output
 }
@@ -525,6 +530,12 @@ pub fn tools_json(methods: &[ApiMethod]) -> Value {
                 }
                 if let Some(index) = method.method_index {
                     tool.insert("x-method-index".to_owned(), Value::from(index));
+                }
+                if let Some(visibility) = &method.ui_visibility {
+                    tool.insert(
+                        "x-ui-visibility".to_owned(),
+                        Value::String(visibility.clone()),
+                    );
                 }
                 tool.insert("inputSchema".to_owned(), shape_schema(&method.request));
                 tool.insert("outputSchema".to_owned(), shape_schema(&method.response));

@@ -1,5 +1,7 @@
 pub mod auth;
 pub mod cbor;
+/// Transport-neutral outgoing mesh stream client contract.
+pub mod client;
 pub mod config;
 /// Generated numeric IDs from the normative mesh API.md catalog.
 pub mod generated_api_ids;
@@ -19,6 +21,8 @@ pub mod server;
 pub mod tagged;
 pub mod tun;
 pub mod wire;
+
+pub use client::{MeshClient, MeshStream, MeshTarget};
 
 use std::sync::Arc;
 

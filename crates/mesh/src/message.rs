@@ -300,7 +300,7 @@ impl LineProtocolFormat {
     pub fn from_first_byte(byte: u8) -> Result<Self> {
         match byte {
             0x00 => Ok(Self::BinaryMux),
-            b'{' => Ok(Self::Json(crate::jsonl::ProtocolFormat::FlatJson {
+            b'{' => Ok(Self::Json(crate::jsonl::ProtocolFormat::JsonRpc {
                 id: None,
             })),
             byte if byte.is_ascii() => Ok(Self::Text),
@@ -899,10 +899,14 @@ mod tests {
     #[test]
     fn line_protocol_session_detects_json_text_and_binary() {
         let mut json_session = LineProtocolSession::new();
-        let (format, parsed) = json_session.parse_request_line(r#"{"method":"status","name":"x"}"#);
+        let (format, parsed) = json_session.parse_request_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"status","params":{"name":"x"}}"#,
+        );
         assert!(matches!(
             format,
-            LineProtocolFormat::Json(crate::jsonl::ProtocolFormat::FlatJson { id: None })
+            LineProtocolFormat::Json(crate::jsonl::ProtocolFormat::JsonRpc {
+                id: Some(serde_json::Value::Number(ref id)),
+            }) if id.as_i64() == Some(1)
         ));
         assert!(matches!(
             parsed.unwrap(),

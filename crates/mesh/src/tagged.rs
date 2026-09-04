@@ -363,7 +363,7 @@ impl TaggedCatalog {
         Ok(record)
     }
 
-    /// Produce the established flat JSONL request form for an endpoint.
+    /// Produce the method-and-fields JSON object used for local dispatch.
     pub fn to_jsonl(&self, record: &TaggedRecord) -> Value {
         let mut value = Map::new();
         let documented_name = self.method_name(record);
@@ -495,9 +495,9 @@ pub fn record_from_argv(
     Ok(record)
 }
 
-/// Convert a tagged record to flat JSON without duplicating client-specific
-/// translation logic. Catalog names are preferred; unknown numeric keys use
-/// the stable `@N` spelling.
+/// Convert a tagged record to a method-and-fields JSON object without
+/// duplicating client-specific translation logic. Catalog names are preferred;
+/// unknown numeric keys use the stable `@N` spelling.
 pub fn to_json(record: &TaggedRecord, catalog: Option<&TaggedCatalog>) -> Value {
     if let Some(catalog) = catalog {
         return catalog.to_jsonl(record);

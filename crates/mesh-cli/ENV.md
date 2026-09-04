@@ -5,16 +5,18 @@
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MESH_DEST_FORMAT` | `auto` | Outbound RPC encoding: `auto`/`json`, `cbor`, or `text`. Replies are always detected from their first byte. `mux` is a transport selector and is rejected as an RPC codec. |
-| `MESH_TOOLS` | unset | Explicit generated `tools.json` catalog for numeric tags and option/positional mapping. Without it, names remain strings. |
+| `MESH_DEST_FORMAT` | `auto` | When the selected method resolves to numeric component and method tags, outbound RPC uses tagged-CBOR. Otherwise it uses JSON-RPC. `cbor` explicitly requires numeric tags; `json-rpc` is the explicit gateway selection. `mesh` does not emit flat JSONL or text requests. Replies are detected from their first byte. `mux` is a transport selector and is rejected as an RPC codec. |
+| `MESH_TOOLS` | unset | Explicit generated `tools.json` catalog for numeric tags and option/positional mapping. If unset, `mesh` uses the logical destination service's configured `[Mesh].Tools` catalog, then its packaged `resources/tools.json`, when available. |
 | `MESH_SERVICE_DIR` | unset | Common mesh service TOML file, or directory containing `<service>.toml`. A bare service name resolves its `[Mesh].Address` or standard mesh socket from this definition. |
 | `MESH_SSH_COMMAND` | `/usr/bin/ssh` | Real OpenSSH binary used for an unresolved bare host. This avoids recursion when `mesh` is symlinked as `ssh`. |
+
+`--rpc-format auto|cbor|json-rpc` overrides `MESH_DEST_FORMAT` for one call.
 
 Explicit UDS/TCP endpoints are RPC calls:
 
 ```sh
 mesh unix:///run/mesh/example/mesh.sock example status
-MESH_DEST_FORMAT=cbor mesh unix:///run/mesh/device.sock device listen
+MESH_DEST_FORMAT=json-rpc mesh unix:///run/mesh/gateway.sock device listen
 ```
 
 Configured local mesh endpoints under `/run/mesh` also have a namespace form:
@@ -33,15 +35,9 @@ node-local service definition and does not connect to, activate, or query the
 service. `mesh FQDN help COMMAND` prints the complete static descriptor for one
 command.
 
-With no command, `mesh` keeps the RPC connection open and bridges stdin/stdout:
-
-```sh
-mesh service1.example
-```
-
-The session accepts newline-delimited JSON, text, or the selected CBOR stream
-format and forwards responses and asynchronous notifications until stdin or
-the service closes. This is the RPC equivalent of an SSH interactive session.
+`mesh` is intentionally not an interactive text gateway. Use an explicit
+command for typed tagged-CBOR RPC; use `dmesh-cli` for UART/device interaction
+or a dedicated JSON/text gateway tool for manual debugging.
 
 `mux:///path` or `-S /path` selects the native ControlMaster client. A bare
 host retains normal SSH command and forwarding syntax.
