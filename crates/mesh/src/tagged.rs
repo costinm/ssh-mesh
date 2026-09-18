@@ -790,7 +790,10 @@ mod tests {
         assert_eq!(record.component, NameOrTag::Tag(4));
         assert_eq!(record.method, NameOrTag::Tag(7));
         assert_eq!(record.env.get(&NameOrTag::Tag(1)), Some(&json!(4)));
-        assert_eq!(record.env.get(&NameOrTag::Name("label".to_owned())), Some(&json!("ok")));
+        assert_eq!(
+            record.env.get(&NameOrTag::Name("label".to_owned())),
+            Some(&json!("ok"))
+        );
         assert_eq!(record.to, Some(json!("peer-a")));
     }
 

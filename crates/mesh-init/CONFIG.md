@@ -5,10 +5,8 @@ filename stem: `worker.toml` defines service `worker`. Socket activation is
 declared in the same file with an optional `[Socket]` table.
 
 When started as root and `MESH_INIT_DIR` is unset, core config is loaded from
-`/opt/system/etc/mesh-init` first and `/home/system/etc/mesh-init` second. If
-the same service appears in both places, the `/home` file wins. When
-`MESH_INIT_DIR` is set it replaces both default directories. Non-root
-`mesh-init` defaults to `./etc/mesh-init` relative to its working directory.
+`/home/system/etc/mesh-init`. `MESH_INIT_DIR` replaces that default directory.
+Non-root `mesh-init` defaults to `$HOME/etc/mesh-init`.
 
 Service definitions are node-local client policy: they describe how processes
 on this node connect to a logical FQDN, including `[Mesh].Address`, transport,

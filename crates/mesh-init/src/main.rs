@@ -1,15 +1,23 @@
 //! mesh-init — minimal init/supervisor daemon with mesh and resource awareness.
 //!
-//! When run without a subcommand, starts the daemon. With a subcommand,
-//! connects to a running daemon via UDS and sends a control request.
+//! When run without a command, starts the supervisor daemon.
+//!
+//! With a command, mesh-init acts as a container supervisor: it starts configured
+//! and on-demand secondary services, runs the command as its main child, and
+//! shuts down when that main child exits.
+//!
+//! Running as root will create /run/mesh/mesh-init/mesh.sock as control socket and
+//! default to /home/system/etc/mesh-init for configs.
+//!
+//! As a regular user it can't grant permissions or use `/run/mesh`, but will still
+//! start additional services, using `$HOME/etc/mesh-init` for configuration and
+//! `$HOME/.local/run/<service>/mesh.sock` for service sockets.
 
 use anyhow::Result;
 use clap::Parser;
-use std::collections::HashMap;
-use tracing::{error, info};
+use tracing::info;
 
 use mesh_init::daemon::{Daemon, DaemonConfig};
-use mesh_init::protocol::{Request, Response};
 
 #[derive(Parser, Debug)]
 #[clap(name = "mesh-init", version = "0.1.0", trailing_var_arg = true)]
@@ -18,6 +26,11 @@ struct Args {
     command: Vec<String>,
 }
 
+// Note: this implements a narrow subset of systemd - using sockets instead of dbus,
+// toml files with a subset of the fields for config, and with special adaptation for
+// containers. It is far more tolerant - can run as any PID, fallbacks if it can't
+// handle cgroups, etc. It is also using /home
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let (_log_buffer, _trace_guard) = mesh::local_trace::init("mesh-init");
@@ -25,12 +38,6 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let socket_path = get_socket_path();
     let config_dirs = get_config_dirs();
-
-    if let Some(request) = control_request(&args.command)? {
-        let response = mesh_init::server::send_request(&socket_path, &request).await?;
-        print_response(response)?;
-        return Ok(());
-    }
 
     let command = if args.command.is_empty() {
         None
@@ -41,87 +48,7 @@ async fn main() -> Result<()> {
     run(config_dirs, socket_path, command).await
 }
 
-fn control_request(command: &[String]) -> Result<Option<Request>> {
-    let Some(method) = command.first().map(String::as_str) else {
-        return Ok(None);
-    };
-
-    let request = match method {
-        "reload" => Request::Reload,
-        "status" => Request::Status {
-            name: command.get(1).cloned(),
-        },
-        "start" => {
-            let Some(name) = command.get(1) else {
-                anyhow::bail!("usage: mesh-init start SERVICE [ARGS...]");
-            };
-            Request::Start {
-                name: name.clone(),
-                args: command[2..].to_vec(),
-                env: HashMap::new(),
-                context: None,
-            }
-        }
-        "stop" => {
-            let Some(name) = command.get(1) else {
-                anyhow::bail!("usage: mesh-init stop SERVICE [--signal SIGNAL]");
-            };
-            let mut signal = None;
-            let mut i = 2;
-            while i < command.len() {
-                match command[i].as_str() {
-                    "--signal" => {
-                        let Some(value) = command.get(i + 1) else {
-                            anyhow::bail!("missing value for --signal");
-                        };
-                        signal = Some(value.parse()?);
-                        i += 2;
-                    }
-                    other => anyhow::bail!("unknown stop argument: {}", other),
-                }
-            }
-            Request::Stop {
-                name: name.clone(),
-                signal,
-            }
-        }
-        "shutdown" => Request::Shutdown,
-        "freeze" => {
-            let Some(name) = command.get(1) else {
-                anyhow::bail!("usage: mesh-init freeze SERVICE");
-            };
-            Request::Freeze { name: name.clone() }
-        }
-        "unfreeze" => {
-            let Some(name) = command.get(1) else {
-                anyhow::bail!("usage: mesh-init unfreeze SERVICE");
-            };
-            Request::Unfreeze { name: name.clone() }
-        }
-        _ => return Ok(None),
-    };
-
-    Ok(Some(request))
-}
-
-fn print_response(response: Response) -> Result<()> {
-    if response.success {
-        if let Some(data) = response.data {
-            println!("{}", serde_json::to_string_pretty(&data)?);
-        } else {
-            println!("OK");
-        }
-        Ok(())
-    } else {
-        eprintln!(
-            "Error: {}",
-            response.error.as_deref().unwrap_or("unknown error")
-        );
-        std::process::exit(1);
-    }
-}
-
-/// Common startup: create daemon, start everything, optionally run a CLI command.
+/// Common startup: create the supervisor and optionally run its main child.
 async fn run(
     config_dirs: Vec<String>,
     socket_path: String,
@@ -146,48 +73,16 @@ async fn run(
     let daemon = Daemon::new(config);
 
     if let Some(command) = command {
-        // Execution mode: run only the requested command. Do not autostart
-        // configured services or bind the daemon control socket; doing so can
-        // steal the real daemon's socket when mesh-init is used as a shell.
-        {
-            let dirs: Vec<&str> = daemon
-                .config
-                .config_dirs
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let loaded_configs = mesh_init::config::load_system_configs(&dirs);
-            let mut configs = daemon.configs.lock();
-            for cfg in loaded_configs {
-                configs.insert(cfg.name.clone(), cfg.clone());
-            }
-        }
-        daemon.start_child_manager();
+        // Container mode remains a full supervisor. Configured services and
+        // activation listeners are available while the main child runs, and
+        // callers can start further on-demand services through mesh.sock.
+        daemon.start_background_tasks();
 
-        // Run init-* services first
-        let init_configs = {
-            let configs = daemon.configs.lock();
-            let mut inits: Vec<_> = configs
-                .values()
-                .filter(|c| c.name.starts_with("init-"))
-                .cloned()
-                .collect();
-            inits.sort_by_key(|c| c.priority);
-            inits
-        };
-
-        for init_cfg in init_configs {
-            info!(service = %init_cfg.name, "running_init_setup_service");
-            let name = init_cfg.name.clone();
-            match daemon.start_service_with_config(init_cfg, None) {
-                Ok(_) => {
-                    wait_for_service_exit(&daemon, &name).await;
-                }
-                Err(e) => {
-                    error!(service = %name, error = %e, "start_init_setup_service_failed");
-                }
-            }
-        }
+        // Preserve the setup sequencing guarantee: oneshot `init-*` services
+        // are setup work (mounts, network, env) that must complete before the
+        // main child starts. Long-running `init-*` services are dependencies
+        // that stay up, so they do not block startup.
+        wait_for_init_services(&daemon).await;
 
         let app_name = "cmd";
         let cmd = command[0].clone();
@@ -215,10 +110,27 @@ async fn run(
         info!(command = %cfg.command, args = ?cfg.args, "executing_command");
         let _pid = daemon.start_service_with_config(cfg, None)?;
 
-        // Wait for the main command to end
-        wait_for_service_exit(&daemon, app_name).await;
+        let server = mesh_init::server::ControlServer::new(
+            daemon.config.socket_path.clone(),
+            daemon.clone(),
+        );
+        let server_run = server.run();
+        tokio::pin!(server_run);
+        let main_exit = wait_for_service_exit(&daemon, app_name);
+        tokio::pin!(main_exit);
 
-        daemon.shutdown().await;
+        tokio::select! {
+            () = &mut main_exit => {
+                daemon.shutdown().await;
+                server_run.await?;
+            }
+            result = &mut server_run => {
+                result?;
+                // A requested daemon shutdown also terminates the main child.
+                daemon.shutdown().await;
+                wait_for_service_exit(&daemon, app_name).await;
+            }
+        }
     } else {
         // Start all background tasks: load configs, start init-* services,
         // start regular services/activation listeners, resource manager, child reaper.
@@ -251,6 +163,69 @@ async fn run(
     }
 
     Ok(())
+}
+
+/// Wait until configured oneshot `init-*` services have exited.
+///
+/// `start_background_tasks` starts services concurrently, so oneshot setup
+/// services (`init-*` with `Type = "oneshot"`) can race the main child. This
+/// waits for them to reach the `Stopped` state before the caller proceeds.
+/// A bounded deadline keeps a wedged setup service from hanging container
+/// startup forever; the timeout is logged and startup continues.
+async fn wait_for_init_services(daemon: &std::sync::Arc<Daemon>) {
+    const INIT_SEQUENCE_TIMEOUT_SECS: u64 = 120;
+
+    let init_names: Vec<String> = {
+        let configs = daemon.configs.lock();
+        let mut names: Vec<String> = configs
+            .values()
+            .filter(|cfg| cfg.name.starts_with("init-") && cfg.oneshot)
+            .map(|cfg| cfg.name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    if init_names.is_empty() {
+        return;
+    }
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(INIT_SEQUENCE_TIMEOUT_SECS);
+    let mut rx = daemon.service_exit_tx.subscribe();
+
+    loop {
+        let pending: Vec<String> = {
+            let services = daemon.services.lock();
+            init_names
+                .iter()
+                .filter(|name| match services.get(*name) {
+                    Some(proc) => {
+                        !(proc.state == mesh_init::protocol::ServiceState::Stopped
+                            && proc.pid.is_none())
+                    }
+                    None => false,
+                })
+                .cloned()
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!(
+                services = ?pending,
+                timeout_secs = INIT_SEQUENCE_TIMEOUT_SECS,
+                "init_services_timeout_continuing"
+            );
+            return;
+        }
+
+        // Service exits are announced on the broadcast channel; wake on any
+        // exit and re-check. A timeout just loops until the deadline.
+        let _ = tokio::time::timeout(deadline - now, rx.recv()).await;
+    }
 }
 
 /// Wait until a service transitions to Stopped state.
@@ -309,21 +284,6 @@ fn get_socket_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reload_is_control_request() {
-        let args = vec!["reload".to_string()];
-        assert!(matches!(
-            control_request(&args).unwrap(),
-            Some(Request::Reload)
-        ));
-    }
-
-    #[test]
-    fn unknown_command_remains_exec_mode() {
-        let args = vec!["echo".to_string(), "hi".to_string()];
-        assert!(control_request(&args).unwrap().is_none());
-    }
 
     #[test]
     fn default_paths_use_system_app_home() {

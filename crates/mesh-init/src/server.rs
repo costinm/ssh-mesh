@@ -72,6 +72,22 @@ impl ControlServer {
     /// Removes any stale socket file, binds, and accepts connections in a loop.
     /// Each connection is handled in a separate task.
     pub async fn run(&self) -> Result<()> {
+        // Refuse to steal a socket owned by a live daemon. A stale file left
+        // behind by a crashed daemon never accepts connections, so only a
+        // successful `status` round-trip blocks the re-bind.
+        if std::path::Path::new(&self.socket_path).exists()
+            && let Ok(Ok(_)) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                send_request(&self.socket_path, &Request::Status { name: None }),
+            )
+            .await
+        {
+            return Err(anyhow::anyhow!(
+                "mesh-init control socket {} is owned by a live daemon",
+                self.socket_path
+            ));
+        }
+
         // Clean up stale socket
         if let Err(error) = std::fs::remove_file(&self.socket_path)
             && error.kind() != std::io::ErrorKind::NotFound

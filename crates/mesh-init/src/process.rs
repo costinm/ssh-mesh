@@ -704,6 +704,10 @@ pub struct ManagedProcess {
     pub last_active: Option<u64>,
     pub last_sess: Option<u64>,
     pub idle_since: Option<Instant>,
+    /// When the service entered `Stopping`. Set by every path that signals a
+    /// live service for termination so the scheduler can escalate to SIGKILL
+    /// if the signal does not take effect.
+    pub stopping_since: Option<Instant>,
 }
 
 impl ManagedProcess {
@@ -731,6 +735,7 @@ impl ManagedProcess {
             last_active: None,
             last_sess: None,
             idle_since: None,
+            stopping_since: None,
         }
     }
 

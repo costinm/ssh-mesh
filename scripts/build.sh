@@ -6,6 +6,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# Keep Cargo, Rustup, HOME, and target selection repository-local.
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/env.sh"
+
 export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc 
 
@@ -32,7 +36,7 @@ Default command:
 
 Common commands:
   help                 Show this help.
-  rust                 Build x86_64 musl release Rust binaries.
+  rust [PACKAGE]       Build all x86_64 musl release crates, or one package.
   test NAME            Build and run a focused test from tests/test_NAME.sh.
   deps [path]          Add missing build dependencies to the Nix profile.
   deploy_examples      Compatibility alias for dist.
@@ -46,6 +50,7 @@ Note: VM builds (EROFS rootfs, kernel profile, vm-tools) and VM tests are now
       Use 'nix build ./vm#default' there for VM artifacts.
 
 Environment:
+  MESH_BUILD_TARGET        Rust target for `rust`; defaults to x86_64-unknown-linux-musl.
   SSH_MESH_BUSYBOX         Busybox path used for staged target/dist/opt/busybox.
   NIX_PROFILE              Nix profile used by examples. Default: target/nix/profile.
 EOF
@@ -309,9 +314,19 @@ stage_example_tree() {
 }
 
 rust() {
+    local target="${MESH_BUILD_TARGET:-x86_64-unknown-linux-musl}"
+    if [ "$#" -gt 1 ]; then
+        echo "Usage: scripts/build.sh rust [PACKAGE]" >&2
+        return 2
+    fi
     ensure_musl_toolchain_profile "${NIX_PROFILE:-$(default_nix_profile)}"
-    echo "Building release binaries with musl..."
-    cargo build --target x86_64-unknown-linux-musl --release --workspace
+    if [ "$#" -eq 1 ]; then
+        echo "Building release package $1 with musl..."
+        cargo build --target "$target" --release -p "$1"
+    else
+        echo "Building release binaries with musl..."
+        cargo build --target "$target" --release --workspace
+    fi
 }
 
 deploy_examples() {

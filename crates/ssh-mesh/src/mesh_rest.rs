@@ -187,14 +187,15 @@ struct DeliveryQuery {
 #[derive(Debug, Deserialize, Default)]
 struct CatalogQuery {
     apikey: Option<String>,
-    /// `default` omits catalog methods that are deliberately masked from the
-    /// normal explorer. `all` is the unfiltered catalog for the Show all view
-    /// and programmatic catalog consumers.
+    /// `default` includes methods marked `default` and those without an
+    /// explicit `x-ui-visibility` value, for the normal explorer. `all` is
+    /// the unfiltered catalog for the Show all view and programmatic catalog
+    /// consumers.
     view: Option<String>,
 }
 
 fn catalog_for_view(catalog: &Value, view: Option<&str>) -> Result<Value> {
-    match view.unwrap_or("all") {
+    match view.unwrap_or("default") {
         "all" => Ok(catalog.clone()),
         "default" => {
             let tools = match catalog {
@@ -208,7 +209,15 @@ fn catalog_for_view(catalog: &Value, view: Option<&str>) -> Result<Value> {
             let tools = tools
                 .iter()
                 .filter(|tool| {
-                    tool.get("x-ui-visibility").and_then(Value::as_str) == Some("default")
+                    // Allowlist, not a `masked` denylist: only unspecified
+                    // (schema did not mark the method) and explicitly
+                    // `default` methods belong in the explorer. Future
+                    // visibility values (`internal`, `hidden`, ...) stay out
+                    // of the default view until they are added here.
+                    match tool.get("x-ui-visibility").and_then(Value::as_str) {
+                        None | Some("default") => true,
+                        Some(_) => false,
+                    }
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -322,7 +331,11 @@ fn tsv_response(value: &Value) -> String {
     out
 }
 
-fn formatted_response(format: ResponseFormat, value: Value, record: Option<&TaggedRecord>) -> Response {
+fn formatted_response(
+    format: ResponseFormat,
+    value: Value,
+    record: Option<&TaggedRecord>,
+) -> Response {
     match format {
         ResponseFormat::Json => Json(value).into_response(),
         ResponseFormat::Text => {
@@ -338,12 +351,18 @@ fn formatted_response(format: ResponseFormat, value: Value, record: Option<&Tagg
             };
             (
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                format!("{}\n", format_text_response(success, error.as_deref(), data)),
+                format!(
+                    "{}\n",
+                    format_text_response(success, error.as_deref(), data)
+                ),
             )
                 .into_response()
         }
         ResponseFormat::Tsv => (
-            [(header::CONTENT_TYPE, "text/tab-separated-values; charset=utf-8")],
+            [(
+                header::CONTENT_TYPE,
+                "text/tab-separated-values; charset=utf-8",
+            )],
             tsv_response(&value),
         )
             .into_response(),
@@ -727,10 +746,11 @@ mod tests {
     }
 
     #[test]
-    fn default_catalog_view_masks_only_marked_methods() {
+    fn default_catalog_view_includes_default_and_unspecified_methods_only() {
         let catalog = json!({"tools": [
             {"name": "discovery.nodes", "x-ui-visibility": "default"},
             {"name": "wifi.raw.send", "x-ui-visibility": "masked"},
+            {"name": "admin.debug", "x-ui-visibility": "internal"},
             {"name": "legacy.unspecified"}
         ]});
         let default = catalog_for_view(&catalog, Some("default")).unwrap();
@@ -740,18 +760,23 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["discovery.nodes"]);
+        assert_eq!(names, ["discovery.nodes", "legacy.unspecified"]);
+        assert_eq!(catalog_for_view(&catalog, None).unwrap(), default);
         assert_eq!(catalog_for_view(&catalog, Some("all")).unwrap(), catalog);
         assert_eq!(
             catalog_for_view(
                 &json!([
                     {"name": "default", "x-ui-visibility": "default"},
-                    {"name": "masked", "x-ui-visibility": "masked"}
+                    {"name": "masked", "x-ui-visibility": "masked"},
+                    {"name": "unspecified"}
                 ]),
                 Some("default")
             )
             .unwrap(),
-            json!([{"name": "default", "x-ui-visibility": "default"}])
+            json!([
+                {"name": "default", "x-ui-visibility": "default"},
+                {"name": "unspecified"}
+            ])
         );
         assert!(catalog_for_view(&catalog, Some("invalid")).is_err());
     }
@@ -776,10 +801,12 @@ mod tests {
         };
         assert_eq!(response_format(&text).unwrap(), ResponseFormat::Text);
         assert_eq!(response_format(&tsv).unwrap(), ResponseFormat::Tsv);
-        assert!(response_format(&DeliveryQuery {
-            format: Some("xml".to_owned()),
-            ..Default::default()
-        })
-        .is_err());
+        assert!(
+            response_format(&DeliveryQuery {
+                format: Some("xml".to_owned()),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 }

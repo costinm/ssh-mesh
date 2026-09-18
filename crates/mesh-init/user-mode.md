@@ -19,4 +19,6 @@ As user:
 
 ## Layout
 
-mesh-init current dir is used as a base, with ./etc/mesh-init used for configs.
+The user's home directory is used as the base. Service configuration is loaded
+from `$HOME/etc/mesh-init`, and local mesh endpoints are created under
+`$HOME/.local/run/<service>/mesh.sock`.

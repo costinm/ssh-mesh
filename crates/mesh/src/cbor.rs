@@ -478,16 +478,100 @@ fn encode_value(encoder: &mut Encoder<&mut Vec<u8>>, value: &Value) -> Result<()
                 // schema-free numeric projection: {"1": 4} is CBOR {1: 4},
                 // not {"1": 4}.  Non-numeric keys remain text and this
                 // applies recursively to nested maps as well.
-                if let Ok(key) = key.parse::<u32>() {
+                //
+                // JSON has no byte-string scalar, so binary intent is carried
+                // by the key instead of the value: a `_hex` or `_b64` key
+                // suffix marks a text field as an encoded byte string and is
+                // removed after parsing ({"payload_hex": "0a0b"} is CBOR
+                // {"payload": h'0a0b'}). Keys are schema-controlled while
+                // values are arbitrary text, so ordinary string payloads are
+                // never silently reinterpreted as bytes.
+                if let Some((name, bytes)) = encoded_byte_field(key, value)? {
+                    if let Ok(tag) = name.parse::<u32>() {
+                        encoder.u32(tag)?;
+                    } else {
+                        encoder.str(name)?;
+                    }
+                    encoder.bytes(&bytes)?;
+                } else if let Ok(key) = key.parse::<u32>() {
                     encoder.u32(key)?;
+                    encode_value(encoder, value)?;
                 } else {
                     encoder.str(key)?;
+                    encode_value(encoder, value)?;
                 }
-                encode_value(encoder, value)?;
             }
         }
     }
     Ok(())
+}
+
+/// Recognize the `_hex`/`_b64` byte-string key convention and return the
+/// stripped key with the decoded bytes. Returns `None` for ordinary keys.
+fn encoded_byte_field<'a>(key: &'a str, value: &Value) -> Result<Option<(&'a str, Vec<u8>)>> {
+    type Decode = fn(&str) -> Result<Vec<u8>>;
+    let (name, decode): (&str, Decode) = match key.strip_suffix("_hex") {
+        Some(name) => (name, decode_hex),
+        None => match key.strip_suffix("_b64") {
+            Some(name) => (name, decode_base64),
+            None => return Ok(None),
+        },
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow!("byte field `{key}` requires a text value"))?;
+    Ok(Some((name, decode(text)?)))
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        bail!("hex byte string length must be even");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            Ok((digit(pair[0]).context("invalid hex byte string")? << 4)
+                | digit(pair[1]).context("invalid hex byte string")?)
+        })
+        .collect()
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(value.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut padding = false;
+    for byte in value.bytes() {
+        let digit = match byte {
+            b'A'..=b'Z' => (byte - b'A') as u32,
+            b'a'..=b'z' => (byte - b'a' + 26) as u32,
+            b'0'..=b'9' => (byte - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding = true;
+                continue;
+            }
+            _ => bail!("invalid base64 byte string"),
+        };
+        if padding {
+            bail!("base64 byte string has data after padding");
+        }
+        acc = (acc << 6) | digit;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 fn decode_key(decoder: &mut Decoder<'_>) -> Result<Key> {
@@ -647,6 +731,87 @@ mod tests {
         // Key 10 is a CBOR byte string, not an array or a base64 text field.
         assert!(encoded.windows(2).any(|window| window == [10, 0x44]));
         assert_eq!(decode_record(&encoded).unwrap(), record);
+    }
+
+    #[test]
+    fn hex_and_b64_key_suffixes_encode_as_cbor_bytes() {
+        let record = TaggedRecord {
+            component: NameOrTag::Tag(104),
+            method: NameOrTag::Tag(86),
+            env: [(
+                NameOrTag::Tag(2),
+                json!({"payload_hex": "deadbeef", "frame_b64": base64(&[0, 1, 2, 3])}),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let encoded = encode_record(&record).unwrap();
+        // The suffix is consumed: each byte string is stored under the
+        // stripped key, not the `_hex`/`_b64` name.
+        let decoded = decode_record(&encoded).unwrap();
+        assert_eq!(
+            decoded.env.get(&NameOrTag::Tag(2)),
+            Some(&json!({
+                "payload": format!("base64:{}", base64(&[0xde, 0xad, 0xbe, 0xef])),
+                "frame": format!("base64:{}", base64(&[0, 1, 2, 3])),
+            }))
+        );
+    }
+
+    #[test]
+    fn byte_field_suffixes_apply_recursively_and_reject_invalid_values() {
+        let record = TaggedRecord {
+            component: NameOrTag::Tag(1),
+            method: NameOrTag::Tag(1),
+            env: [(NameOrTag::Tag(1), json!({"outer": {"inner_hex": "00ff"}}))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let decoded = decode_record(&encode_record(&record).unwrap()).unwrap();
+        assert_eq!(
+            decoded.env.get(&NameOrTag::Tag(1)),
+            Some(&json!({
+                "outer": {"inner": format!("base64:{}", base64(&[0x00, 0xff]))},
+            }))
+        );
+
+        // Malformed or non-text byte fields are rejected, not silently text.
+        for bad in [
+            json!({"payload_hex": "not-hex"}),
+            json!({"payload_hex": 5}),
+            json!({"payload_b64": "!!"}),
+        ] {
+            assert!(
+                encode_record(&TaggedRecord {
+                    component: NameOrTag::Tag(1),
+                    method: NameOrTag::Tag(1),
+                    env: [(NameOrTag::Tag(1), bad)].into_iter().collect(),
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn text_values_starting_with_hex_stay_text() {
+        // The convention lives in the key, so ordinary string payloads that
+        // merely begin with `hex:` survive the JSON -> CBOR hop unchanged.
+        let record = TaggedRecord {
+            component: NameOrTag::Tag(1),
+            method: NameOrTag::Tag(1),
+            env: [(NameOrTag::Tag(1), json!("hex:deadbeef"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let decoded = decode_record(&encode_record(&record).unwrap()).unwrap();
+        assert_eq!(
+            decoded.env.get(&NameOrTag::Tag(1)),
+            Some(&json!("hex:deadbeef"))
+        );
     }
 
     #[test]

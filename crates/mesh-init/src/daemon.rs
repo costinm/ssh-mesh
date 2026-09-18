@@ -189,6 +189,7 @@ pub struct Daemon {
     pub tracked_child_pids: Mutex<Option<Arc<parking_lot::Mutex<std::collections::HashSet<u32>>>>>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub service_exit_tx: tokio::sync::broadcast::Sender<String>,
+    scheduler_tx: tokio::sync::watch::Sender<u64>,
 }
 
 struct TerminalSession {
@@ -199,6 +200,11 @@ struct TerminalSession {
     /// signal without PID-recycle risk. See `process::open_pidfd`.
     pidfd: Option<OwnedFd>,
 }
+
+/// How long a service may sit in `Stopping` with a live PID before the
+/// scheduler escalates to SIGKILL. Covers both a failed signal and a process
+/// that ignores (or is stuck in uninterruptible sleep against) SIGTERM.
+const STOPPING_ESCALATION_SECS: u64 = 5;
 
 /// Environment variables that are dangerous when set by a caller because they
 /// can hijack the spawned process (library injection, shell-config, etc.).
@@ -373,6 +379,7 @@ impl Daemon {
         let observer = Arc::new(ProcessObserver::new().expect("create mesh-init process observer"));
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let (service_exit_tx, _) = tokio::sync::broadcast::channel(128);
+        let (scheduler_tx, _) = tokio::sync::watch::channel(0_u64);
 
         Arc::new(Self {
             config,
@@ -386,11 +393,26 @@ impl Daemon {
             tracked_child_pids: Mutex::new(None),
             shutdown_tx,
             service_exit_tx,
+            scheduler_tx,
         })
     }
 
     fn notify_service_exit(&self, name: &str) {
         let _ = self.service_exit_tx.send(name.to_string());
+    }
+
+    fn wake_scheduler(&self) {
+        // `send_modify` panics when there are no receivers. The scheduler task
+        // subscribes inside `start_child_manager`, but autostart and container
+        // mode can call `wake_scheduler` synchronously before that task is
+        // first polled. Wake-ups before subscription are safe to drop: the
+        // scheduler computes deadlines from state on its first poll anyway.
+        if self.scheduler_tx.receiver_count() == 0 {
+            return;
+        }
+        self.scheduler_tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
     }
 
     /// Run the daemon main loop.
@@ -545,16 +567,26 @@ impl Daemon {
 
         let daemon_clone = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut scheduler_rx = daemon_clone.scheduler_tx.subscribe();
             loop {
+                let deadline = daemon_clone.next_service_deadline();
                 tokio::select! {
                     Some((pid, exit_code)) = rx.recv() => {
                         daemon_clone.handle_child_exit(pid, exit_code);
                     }
-                    _ = tick.tick() => {
-                        daemon_clone.check_restarts();
+                    changed = scheduler_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
                     }
+                    _ = async {
+                        match deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
                 }
+                daemon_clone.check_restarts();
             }
         });
     }
@@ -598,8 +630,9 @@ impl Daemon {
             Request::Stop { name, signal } => {
                 self.handle_stop(&name, signal, peer_uid, peer_gid).await
             }
-            Request::Freeze { name } => self.handle_freeze(&name, peer_uid, peer_gid),
-            Request::Unfreeze { name } => self.handle_unfreeze(&name, peer_uid, peer_gid),
+            Request::Freeze { name } => self.handle_freeze(&name, peer_uid, peer_gid).await,
+            Request::Unfreeze { name } => self.handle_unfreeze(&name, peer_uid, peer_gid).await,
+            Request::Reconcile => self.handle_reconcile(peer_uid).await,
             Request::Status { name } => self.handle_status(name.as_deref()),
             Request::Shutdown => self.handle_shutdown().await,
             Request::Reload => self.handle_reload(),
@@ -959,6 +992,7 @@ impl Daemon {
                 if let Some(proc) = services.get_mut(name) {
                     proc.config = config.clone();
                     proc.state = ServiceState::Stopping;
+                    proc.stopping_since = Some(std::time::Instant::now());
                     // Don't change target_state so it restarts
                     proc.consecutive_failures = 0;
                     proc.next_restart_at = None;
@@ -1330,6 +1364,7 @@ impl Daemon {
                         return resp;
                     }
                     proc.state = ServiceState::Stopping;
+                    proc.stopping_since = Some(std::time::Instant::now());
                     proc.target_state = ServiceState::Stopped;
                     proc.netns_fd = None;
                     proc.userns_fd = None;
@@ -1390,60 +1425,120 @@ impl Daemon {
         Response::ok()
     }
 
-    fn handle_freeze(&self, name: &str, peer_uid: u32, peer_gid: u32) -> Response {
+    async fn handle_freeze(&self, name: &str, peer_uid: u32, peer_gid: u32) -> Response {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
         }
-        let mut services = self.services.lock();
-        let proc = match services.get_mut(name) {
-            Some(p) if p.state == ServiceState::Running => p,
-            Some(_) => return Response::err(format!("service '{}' is not running", name)),
-            None => return Response::err(format!("service '{}' not found", name)),
-        };
-        // Authorization: a non-privileged peer may only freeze services
-        // running as its own UID.
-        let svc_uid = proc.config.uid.unwrap_or(peer_uid);
-        let svc_gid = proc.config.gid;
-        if let Err(resp) = check_impersonation(peer_uid, peer_gid, svc_uid, svc_gid, name) {
-            return resp;
-        }
-
-        if let Some(pid) = proc.pid {
-            if let Err(e) = process::freeze_process(pid, proc.cgroup_path.as_deref()) {
-                return Response::err(e.to_string());
+        let config = {
+            let services = self.services.lock();
+            let proc = match services.get(name) {
+                Some(p) if p.state == ServiceState::Running => p,
+                Some(_) => return Response::err(format!("service '{}' is not running", name)),
+                None => return Response::err(format!("service '{}' not found", name)),
+            };
+            // Authorization: a non-privileged peer may only freeze services
+            // running as its own UID.
+            let svc_uid = proc.config.uid.unwrap_or(peer_uid);
+            let svc_gid = proc.config.gid;
+            if let Err(resp) = check_impersonation(peer_uid, peer_gid, svc_uid, svc_gid, name) {
+                return resp;
             }
-            proc.state = ServiceState::Frozen;
-            info!(service = %name, "service_frozen");
+            proc.config.clone()
+        };
+
+        let _ = notify_lifecycle(
+            &config,
+            mesh::lifecycle::LifecycleEvent {
+                action: mesh::lifecycle::LifecycleAction::Freeze,
+                cause: mesh::lifecycle::LifecycleCause::Requested,
+                observed: false,
+            },
+        )
+        .await;
+
+        let freeze_result = {
+            let mut services = self.services.lock();
+            match services.get_mut(name) {
+                Some(proc) if proc.state == ServiceState::Running => match proc.pid {
+                    Some(pid) => process::freeze_process(pid, proc.cgroup_path.as_deref())
+                        .map(|()| {
+                            proc.state = ServiceState::Frozen;
+                            info!(service = %name, "service_frozen");
+                        })
+                        .map_err(|error| error.to_string()),
+                    None => Err(format!("service '{}' has no running process", name)),
+                },
+                Some(_) => Err(format!("service '{}' is no longer running", name)),
+                None => Err(format!("service '{}' not found", name)),
+            }
+        };
+
+        if let Err(error) = freeze_result {
+            // The application already prepared for a freeze. Pair that event
+            // even when the process exits in the race window or freezing the
+            // cgroup fails, so it can undo its preparation.
+            let _ = notify_lifecycle(
+                &config,
+                mesh::lifecycle::LifecycleEvent {
+                    action: mesh::lifecycle::LifecycleAction::Unfreeze,
+                    cause: mesh::lifecycle::LifecycleCause::Requested,
+                    observed: false,
+                },
+            )
+            .await;
+            return Response::err(error);
         }
 
         Response::ok()
     }
 
-    fn handle_unfreeze(&self, name: &str, peer_uid: u32, peer_gid: u32) -> Response {
+    async fn handle_unfreeze(&self, name: &str, peer_uid: u32, peer_gid: u32) -> Response {
         if let Err(reason) = crate::config::validate_cgroup_name(name) {
             return Response::err(format!("invalid service name: {reason}"));
         }
-        let mut services = self.services.lock();
-        let proc = match services.get_mut(name) {
-            Some(p) if p.state == ServiceState::Frozen => p,
-            Some(_) => return Response::err(format!("service '{}' is not frozen", name)),
-            None => return Response::err(format!("service '{}' not found", name)),
-        };
-        // Authorization: a non-privileged peer may only unfreeze services
-        // running as its own UID.
-        let svc_uid = proc.config.uid.unwrap_or(peer_uid);
-        let svc_gid = proc.config.gid;
-        if let Err(resp) = check_impersonation(peer_uid, peer_gid, svc_uid, svc_gid, name) {
-            return resp;
-        }
-
-        if let Some(pid) = proc.pid {
-            if let Err(e) = process::unfreeze_process(pid, proc.cgroup_path.as_deref()) {
-                return Response::err(e.to_string());
+        let config = {
+            let mut services = self.services.lock();
+            let proc = match services.get_mut(name) {
+                Some(p) if p.state == ServiceState::Frozen => p,
+                Some(_) => return Response::err(format!("service '{}' is not frozen", name)),
+                None => return Response::err(format!("service '{}' not found", name)),
+            };
+            // Authorization: a non-privileged peer may only unfreeze services
+            // running as its own UID.
+            let svc_uid = proc.config.uid.unwrap_or(peer_uid);
+            let svc_gid = proc.config.gid;
+            if let Err(resp) = check_impersonation(peer_uid, peer_gid, svc_uid, svc_gid, name) {
+                return resp;
             }
-            proc.state = ServiceState::Running;
-            info!(service = %name, "service_unfrozen");
-        }
+
+            let config = proc.config.clone();
+            if let Some(pid) = proc.pid {
+                if let Err(e) = process::unfreeze_process(pid, proc.cgroup_path.as_deref()) {
+                    return Response::err(e.to_string());
+                }
+                proc.state = ServiceState::Running;
+                // Frozen time is not service execution time. Give watchdog
+                // and idle policies a fresh interval for application resume
+                // work instead of immediately expiring an old deadline.
+                let now = std::time::Instant::now();
+                proc.last_watchdog_ping = Some(now);
+                proc.last_stderr_at = Some(now);
+                proc.idle_since = None;
+                info!(service = %name, "service_unfrozen");
+            }
+            config
+        };
+        self.wake_scheduler();
+
+        let _ = notify_lifecycle(
+            &config,
+            mesh::lifecycle::LifecycleEvent {
+                action: mesh::lifecycle::LifecycleAction::Unfreeze,
+                cause: mesh::lifecycle::LifecycleCause::Requested,
+                observed: false,
+            },
+        )
+        .await;
 
         Response::ok()
     }
@@ -1639,6 +1734,7 @@ impl Daemon {
                 {
                     proc.config = new_cfg.clone();
                     proc.state = ServiceState::Stopping;
+                    proc.stopping_since = Some(std::time::Instant::now());
                     // Keep target_state running so it gets restarted!
                     proc.consecutive_failures = 0;
                     proc.next_restart_at = None;
@@ -1733,6 +1829,7 @@ impl Daemon {
 
                 proc.state = ServiceState::Stopped;
                 proc.pid = None;
+                proc.stopping_since = None;
                 proc.netns_fd = None;
                 proc.userns_fd = None;
                 proc.namespace_pid = None;
@@ -1808,12 +1905,81 @@ impl Daemon {
         debug!(pid, exit_code, "unmanaged_child_exited");
     }
 
+    fn next_service_deadline(&self) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        let services = self.services.lock();
+        services
+            .values()
+            .filter_map(|proc| {
+                if proc.state == ServiceState::Stopped
+                    && proc.target_state == ServiceState::Running
+                    && proc.pid.is_none()
+                {
+                    return Some(proc.next_restart_at.unwrap_or(now));
+                }
+                if proc.state == ServiceState::Stopping {
+                    // A Stopping service must not be parked forever if its
+                    // signal did not take effect; wake up for the SIGKILL
+                    // escalation.
+                    return proc.stopping_since.map(|since| {
+                        since + std::time::Duration::from_secs(STOPPING_ESCALATION_SECS)
+                    });
+                }
+                if proc.state != ServiceState::Running {
+                    return None;
+                }
+
+                let watchdog_deadline = proc.config.watchdog_sec.and_then(|watchdog_sec| {
+                    if proc.config.ready_match.is_some() && !proc.ready {
+                        return None;
+                    }
+                    proc.last_watchdog_ping
+                        .or(proc.started_at)
+                        .map(|last_ping| last_ping + std::time::Duration::from_secs(watchdog_sec))
+                });
+
+                let idle_deadline = proc.config.idle_termination_sec.and_then(|idle_sec| {
+                    let metrics_idle =
+                        proc.last_active == Some(0) && proc.last_sess.unwrap_or(0) == 0;
+                    if !metrics_idle {
+                        return None;
+                    }
+                    let duration = std::time::Duration::from_secs(idle_sec);
+                    proc.idle_since
+                        .map(|idle_since| idle_since + duration)
+                        .or_else(|| {
+                            proc.last_stderr_at
+                                .map(|last_stderr| last_stderr + duration)
+                        })
+                });
+
+                watchdog_deadline.into_iter().chain(idle_deadline).min()
+            })
+            .min()
+    }
+
     fn check_restarts(&self) {
         let now = std::time::Instant::now();
         let mut to_restart = Vec::new();
 
         {
             let mut services = self.services.lock();
+            for (name, proc) in services.iter_mut() {
+                if proc.state == ServiceState::Stopping
+                    && proc.pid.is_some()
+                    && proc.stopping_since.is_some_and(|since| {
+                        now.duration_since(since)
+                            >= std::time::Duration::from_secs(STOPPING_ESCALATION_SECS)
+                    })
+                {
+                    warn!(service = %name, pid = proc.pid, "stopping_escalation_sigkill");
+                    if let Some(pid) = proc.pid {
+                        let _ = process::send_signal(pid, libc::SIGKILL);
+                    }
+                    // Keep `stopping_since` so a still-living process is
+                    // escalated again on every scheduler pass until exit.
+                }
+            }
             for (_name, proc) in services.iter_mut() {
                 if proc.state == ServiceState::Stopped
                     && proc.target_state == ServiceState::Running
@@ -1854,7 +2020,7 @@ impl Daemon {
                                 .last_watchdog_ping
                                 .unwrap_or(proc.started_at.unwrap_or(now));
                             if now.duration_since(last_ping)
-                                > std::time::Duration::from_secs(watchdog_sec)
+                                >= std::time::Duration::from_secs(watchdog_sec)
                             {
                                 warn!(
                                     service = %name,
@@ -1862,6 +2028,8 @@ impl Daemon {
                                     pattern = %proc.config.watchdog_match.as_deref().unwrap_or("active"),
                                     "watchdog_timeout"
                                 );
+                                proc.state = ServiceState::Stopping;
+                                proc.stopping_since = Some(now);
                                 if let Some(pid) = proc.pid {
                                     let _ = process::send_signal(pid, libc::SIGKILL);
                                 }
@@ -1893,6 +2061,8 @@ impl Daemon {
                                         idle_sec,
                                         "idle_termination_triggered"
                                     );
+                                    proc.state = ServiceState::Stopping;
+                                    proc.stopping_since = Some(now);
                                     proc.target_state = ServiceState::Stopped;
                                     if let Some(pid) = proc.pid {
                                         let _ = process::send_signal(pid, proc.config.kill_signal);
@@ -1947,6 +2117,128 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Thaw children that should be running after mesh-init itself resumes.
+    ///
+    /// A cgroup-v2 freezer has no provenance: systemd, a user, and mesh-init
+    /// all leave the same `frozen 1` state.  The daemon's lifecycle state is
+    /// therefore authoritative.  Services explicitly frozen through
+    /// mesh-init are `Frozen` and are intentionally left alone; only a child
+    /// still recorded as both current and desired `Running` is repaired.
+    async fn reconcile_unexpected_frozen_services(&self) -> (usize, usize, usize) {
+        let candidates: Vec<(String, Option<String>, AppConfig)> = {
+            let services = self.services.lock();
+            services
+                .iter()
+                .filter_map(|(name, proc)| {
+                    (proc.state == ServiceState::Running
+                        && proc.target_state == ServiceState::Running)
+                        .then(|| (name.clone(), proc.cgroup_path.clone(), proc.config.clone()))
+                })
+                .collect()
+        };
+
+        let checked = candidates.len();
+        let mut reconciled = 0;
+        let mut failed = 0;
+        let mut notifications = tokio::task::JoinSet::new();
+        for (name, cgroup_path, config) in candidates {
+            match cgroup_path
+                .as_deref()
+                .map(crate::cgroup::cgroup_is_frozen)
+                .transpose()
+            {
+                Ok(Some(true)) => match crate::cgroup::freeze_cgroup(
+                    cgroup_path.as_deref().expect("checked cgroup path"),
+                    false,
+                ) {
+                    Ok(()) => {
+                        reconciled += 1;
+                        info!(
+                            service = %name,
+                            path = %cgroup_path.as_deref().unwrap_or_default(),
+                            "unexpected_frozen_service_reconciled"
+                        );
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        warn!(
+                            service = %name,
+                            path = %cgroup_path.as_deref().unwrap_or_default(),
+                            error = %error,
+                            "unexpected_frozen_service_unfreeze_failed"
+                        );
+                    }
+                },
+                Ok(Some(false) | None) => {}
+                Err(error) => {
+                    failed += 1;
+                    debug!(
+                        service = %name,
+                        path = %cgroup_path.as_deref().unwrap_or_default(),
+                        error = %error,
+                        "service_cgroup_freeze_state_unavailable"
+                    );
+                }
+            }
+            // A reconcile request is also the platform-neutral resume event.
+            // Notify every service that should be running, including services
+            // whose cgroup was already thawed correctly by the host.
+            notifications.spawn(async move {
+                // Preserve event order per service while allowing different
+                // services to be notified concurrently.
+                let mut notification_failures = 0;
+                if !notify_lifecycle(
+                    &config,
+                    mesh::lifecycle::LifecycleEvent {
+                        action: mesh::lifecycle::LifecycleAction::Freeze,
+                        cause: mesh::lifecycle::LifecycleCause::External,
+                        observed: true,
+                    },
+                )
+                .await
+                {
+                    notification_failures += 1;
+                }
+                if !notify_lifecycle(
+                    &config,
+                    mesh::lifecycle::LifecycleEvent {
+                        action: mesh::lifecycle::LifecycleAction::Unfreeze,
+                        cause: mesh::lifecycle::LifecycleCause::External,
+                        observed: false,
+                    },
+                )
+                .await
+                {
+                    notification_failures += 1;
+                }
+                notification_failures
+            });
+        }
+        while let Some(result) = notifications.join_next().await {
+            match result {
+                Ok(notification_failures) => failed += notification_failures,
+                Err(error) => {
+                    // A task represents both ordered notifications.
+                    failed += 2;
+                    warn!(error = %error, "service_lifecycle_notification_task_failed");
+                }
+            }
+        }
+        (checked, reconciled, failed)
+    }
+
+    async fn handle_reconcile(&self, peer_uid: u32) -> Response {
+        if let Err(response) = require_system_or_root(peer_uid) {
+            return response;
+        }
+        let (checked, reconciled, failed) = self.reconcile_unexpected_frozen_services().await;
+        Response::ok_with_data(serde_json::json!({
+            "checked": checked,
+            "reconciled": reconciled,
+            "failed": failed,
+        }))
     }
 
     /// Start a service by name using the pre-loaded config.
@@ -2118,10 +2410,16 @@ impl Daemon {
             }
         }
         info!(service = %name, pid, "service_started");
+        self.wake_scheduler();
 
         if let Some(stderr_pipe) = stderr {
             let services_clone = self.services.clone();
-            spawn_stderr_reader(name.clone(), stderr_pipe, services_clone);
+            spawn_stderr_reader(
+                name.clone(),
+                stderr_pipe,
+                services_clone,
+                self.scheduler_tx.clone(),
+            );
         }
 
         if let Err(error) = run_service_commands(
@@ -2209,6 +2507,50 @@ impl Daemon {
     }
 }
 
+fn lifecycle_socket(config: &AppConfig) -> Option<std::path::PathBuf> {
+    match config
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.address.as_deref())
+    {
+        Some(address) if address.starts_with("unix://") => {
+            Some(std::path::PathBuf::from(&address[7..]))
+        }
+        Some(address) if address.starts_with('/') => Some(std::path::PathBuf::from(address)),
+        Some(address) => {
+            debug!(
+                service = %config.name,
+                address,
+                "lifecycle_notification_non_unix_endpoint_unsupported"
+            );
+            None
+        }
+        None => Some(
+            mesh::paths::AppPaths::for_app(&config.name)
+                .mesh_socket()
+                .clone(),
+        ),
+    }
+}
+
+async fn notify_lifecycle(config: &AppConfig, event: mesh::lifecycle::LifecycleEvent) -> bool {
+    let Some(socket) = lifecycle_socket(config) else {
+        return false;
+    };
+    if let Err(error) = mesh::lifecycle::notify(&socket, &event).await {
+        debug!(
+            service = %config.name,
+            path = %socket.display(),
+            action = ?event.action,
+            cause = ?event.cause,
+            error = %error,
+            "service_lifecycle_notification_failed"
+        );
+        return false;
+    }
+    true
+}
+
 fn restart_delay_with_jitter(service_name: &str, base_secs: u64) -> u64 {
     if base_secs <= 1 {
         return base_secs;
@@ -2245,6 +2587,7 @@ fn spawn_stderr_reader(
     name: String,
     stderr: std::process::ChildStderr,
     services: Arc<Mutex<HashMap<String, ManagedProcess>>>,
+    scheduler_tx: tokio::sync::watch::Sender<u64>,
 ) {
     std::thread::spawn(move || {
         use std::io::BufRead;
@@ -2270,6 +2613,12 @@ fn spawn_stderr_reader(
 
             proc.last_stderr_at = Some(now);
 
+            // Only wake the scheduler for state that moves a deadline earlier
+            // or creates one. `last_stderr_at` alone pushes idle deadlines
+            // later, which the scheduler reconciles on its next scheduled
+            // wake, so chatty output does not spin the scheduler per line.
+            let mut wake = false;
+
             // 3. Detect format
             let is_json = line.trim_start().starts_with('{');
 
@@ -2277,6 +2626,7 @@ fn spawn_stderr_reader(
             if let Some(ref ready_match) = proc.config.ready_match {
                 if !proc.ready && line.contains(ready_match) {
                     proc.ready = true;
+                    wake = true;
                     info!(service = %name, pattern = %ready_match, "service_ready");
                 }
             }
@@ -2285,6 +2635,7 @@ fn spawn_stderr_reader(
             if let Some(ref watchdog_match) = proc.config.watchdog_match {
                 if line.contains(watchdog_match) {
                     proc.last_watchdog_ping = Some(now);
+                    wake = true;
                 }
             }
 
@@ -2327,10 +2678,18 @@ fn spawn_stderr_reader(
             }
 
             if active.is_some() {
+                wake |= proc.last_active != active;
                 proc.last_active = active;
             }
             if sess.is_some() {
+                wake |= proc.last_sess != sess;
                 proc.last_sess = sess;
+            }
+            drop(services_guard);
+            if wake {
+                scheduler_tx.send_modify(|revision| {
+                    *revision = revision.wrapping_add(1);
+                });
             }
         }
     });
@@ -2351,6 +2710,76 @@ mod tests {
     fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn resume_reconciliation_thaws_running_service_only() {
+        let root = std::env::temp_dir().join(format!(
+            "mesh-init-reconcile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        for name in ["running", "intentional"] {
+            let path = root.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+            std::fs::write(path.join("cgroup.freeze"), "1").unwrap();
+        }
+
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-reconcile.sock".to_string(),
+        });
+        let mut running = ManagedProcess::new(AppConfig::default());
+        running.state = ServiceState::Running;
+        running.target_state = ServiceState::Running;
+        running.cgroup_path = Some(root.join("running").display().to_string());
+
+        let mut intentional = ManagedProcess::new(AppConfig::default());
+        intentional.state = ServiceState::Frozen;
+        intentional.target_state = ServiceState::Running;
+        intentional.cgroup_path = Some(root.join("intentional").display().to_string());
+
+        {
+            let mut services = daemon.services.lock();
+            services.insert("running".to_string(), running);
+            services.insert("intentional".to_string(), intentional);
+        }
+
+        let counts = daemon.reconcile_unexpected_frozen_services().await;
+        // No mesh sockets are listening, so both ordered lifecycle
+        // notifications are reported as delivery failures.
+        assert_eq!(counts, (1, 1, 2));
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("running/cgroup.freeze")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("intentional/cgroup.freeze")).unwrap(),
+            "1"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_unprivileged_peer() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-reconcile-auth.sock".to_string(),
+        });
+        let response = daemon.handle_reconcile(424_242).await;
+        assert!(!response.success);
+        assert!(
+            response
+                .error
+                .is_some_and(|error| error.contains("permission denied"))
+        );
     }
 
     #[test]
@@ -2799,6 +3228,60 @@ OOMScoreAdjust = -700
         let second = restart_delay_with_jitter("svc-a", 100);
         assert_eq!(first, second);
         assert!((100..=110).contains(&first));
+    }
+
+    #[test]
+    fn scheduler_selects_the_nearest_service_deadline() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-scheduler-deadline.sock".to_string(),
+        });
+        let now = std::time::Instant::now();
+
+        let mut restart = ManagedProcess::new(AppConfig::default());
+        restart.state = ServiceState::Stopped;
+        restart.target_state = ServiceState::Running;
+        restart.next_restart_at = Some(now + std::time::Duration::from_secs(30));
+
+        let watchdog_config = AppConfig {
+            watchdog_sec: Some(5),
+            ..AppConfig::default()
+        };
+        let mut watchdog = ManagedProcess::new(watchdog_config);
+        watchdog.state = ServiceState::Running;
+        watchdog.target_state = ServiceState::Running;
+        watchdog.started_at = Some(now);
+
+        daemon.services.lock().extend([
+            ("restart".to_string(), restart),
+            ("watchdog".to_string(), watchdog),
+        ]);
+
+        assert_eq!(
+            daemon.next_service_deadline(),
+            Some(now + std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn scheduler_waits_for_ready_match_before_arming_watchdog() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-scheduler-ready.sock".to_string(),
+        });
+        let config = AppConfig {
+            watchdog_sec: Some(5),
+            ready_match: Some("ready".to_string()),
+            ..AppConfig::default()
+        };
+        let mut proc = ManagedProcess::new(config);
+        proc.state = ServiceState::Running;
+        proc.target_state = ServiceState::Running;
+        proc.started_at = Some(std::time::Instant::now());
+        proc.ready = false;
+        daemon.services.lock().insert("service".to_string(), proc);
+
+        assert_eq!(daemon.next_service_deadline(), None);
     }
 
     #[tokio::test]

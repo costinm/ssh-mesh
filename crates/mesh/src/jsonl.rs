@@ -424,7 +424,10 @@ fn raw_from_value(val: Value) -> (ProtocolFormat, Result<RawRequest, String>) {
     let id = obj.get("id").cloned();
     let format = ProtocolFormat::JsonRpc { id };
     if obj.get("jsonrpc") != Some(&Value::String("2.0".to_string())) {
-        return (format, Err("JSON requests must use JSON-RPC 2.0".to_string()));
+        return (
+            format,
+            Err("JSON requests must use JSON-RPC 2.0".to_string()),
+        );
     }
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         return (
@@ -435,7 +438,12 @@ fn raw_from_value(val: Value) -> (ProtocolFormat, Result<RawRequest, String>) {
     let params = match obj.get("params") {
         Some(Value::Object(params)) => params.clone(),
         Some(Value::Null) | None => serde_json::Map::new(),
-        Some(_) => return (format, Err("JSON-RPC 'params' must be an object".to_string())),
+        Some(_) => {
+            return (
+                format,
+                Err("JSON-RPC 'params' must be an object".to_string()),
+            );
+        }
     };
     (
         format,
@@ -473,6 +481,16 @@ where
     }
 
     let response = match raw.method.as_str() {
+        "mesh.lifecycle" | "lifecycle" => {
+            match serde_json::from_value::<crate::lifecycle::LifecycleEvent>(Value::Object(
+                raw.params.clone(),
+            )) {
+                Ok(event) => Response::ok_with_data(json!({
+                    "subscribers": crate::lifecycle::publish(event),
+                })),
+                Err(error) => Response::err(format!("invalid mesh.lifecycle event: {error}")),
+            }
+        }
         "initialize" => registry.initialize(&raw.params).await,
         "notifications/initialized" => return (format, None),
         "tools/list" => registry.tools_list().await,
@@ -721,18 +739,31 @@ where
     let id = obj.get("id").cloned();
     let format = ProtocolFormat::JsonRpc { id };
     if obj.get("jsonrpc") != Some(&Value::String("2.0".to_string())) {
-        return (format, Err("JSON requests must use JSON-RPC 2.0".to_string()));
+        return (
+            format,
+            Err("JSON requests must use JSON-RPC 2.0".to_string()),
+        );
     }
     let method = match obj.get("method").and_then(Value::as_str) {
         Some(method) => method,
-        None => return (format, Err("Missing or invalid 'method' in JSON-RPC request".to_string())),
+        None => {
+            return (
+                format,
+                Err("Missing or invalid 'method' in JSON-RPC request".to_string()),
+            );
+        }
     };
     let mut request = serde_json::Map::new();
     request.insert("method".to_string(), json!(method));
     match obj.get("params") {
         Some(Value::Object(params)) => request.extend(params.clone()),
         Some(Value::Null) | None => {}
-        Some(_) => return (format, Err("JSON-RPC 'params' must be an object".to_string())),
+        Some(_) => {
+            return (
+                format,
+                Err("JSON-RPC 'params' must be an object".to_string()),
+            );
+        }
     }
     match serde_json::from_value::<T>(Value::Object(request)) {
         Ok(req) => (format, Ok(req)),
@@ -949,6 +980,30 @@ mod tests {
         let data = response.unwrap().data.unwrap();
         assert_eq!(data["structuredContent"]["echo"], "hello");
         assert_eq!(data["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_requests_publish_to_service_subscribers() {
+        let registry = McpRegistry::new("test-service");
+        let mut lifecycle = crate::lifecycle::subscribe();
+        let (format, response) = dispatch_request::<TestRequest, _, _>(
+            r#"{"jsonrpc":"2.0","id":9,"method":"mesh.lifecycle","params":{"action":"unfreeze","cause":"external","observed":false}}"#,
+            &registry,
+            |_| async { Response::err("should not call component handler") },
+        )
+        .await;
+        let response = response.expect("correlated response");
+        assert!(response.success);
+        assert!(matches!(format, ProtocolFormat::JsonRpc { .. }));
+        assert_eq!(response.data.unwrap()["subscribers"], 1);
+        assert_eq!(
+            lifecycle.recv().await.unwrap(),
+            crate::lifecycle::LifecycleEvent {
+                action: crate::lifecycle::LifecycleAction::Unfreeze,
+                cause: crate::lifecycle::LifecycleCause::External,
+                observed: false,
+            }
+        );
     }
 
     fn write(path: &Path, content: &str) {

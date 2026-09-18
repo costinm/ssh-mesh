@@ -197,6 +197,10 @@ pub enum Request {
     #[serde(rename = "unfreeze")]
     Unfreeze { name: String },
 
+    /// Reconcile managed service state after host resume or external recovery.
+    #[serde(rename = "reconcile")]
+    Reconcile,
+
     /// Query status of a specific service or all services.
     #[serde(rename = "status")]
     Status { name: Option<String> },
@@ -470,6 +474,7 @@ mod tests {
             r#"{"method":"stop","name":"x","signal":9}"#,
             r#"{"method":"freeze","name":"x"}"#,
             r#"{"method":"unfreeze","name":"x"}"#,
+            r#"{"method":"reconcile"}"#,
             r#"{"method":"status","name":null}"#,
             r#"{"method":"shutdown"}"#,
             r#"{"method":"reload"}"#,

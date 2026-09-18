@@ -2,6 +2,47 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Receive a supervisor freeze or unfreeze notification
+/// mesh-api: summary = "Receive a supervisor freeze or unfreeze notification"
+/// mesh-api: id = "mesh.lifecycle"
+/// mesh-api: component = "mesh"
+/// mesh-api: method = "lifecycle"
+/// mesh-api: visibility = "private"
+/// mesh-api: component-index = 1
+/// mesh-api: method-index = 3
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshLifecycleRequest {
+    /// API field `action`.
+    /// mesh-api-field: index = 1
+    /// mesh-api-field: required = true
+    pub action: String,
+    /// API field `cause`.
+    /// mesh-api-field: index = 2
+    /// mesh-api-field: required = true
+    pub cause: String,
+    /// API field `observed`.
+    /// mesh-api-field: index = 3
+    /// mesh-api-field: required = true
+    pub observed: bool,
+}
+
+/// Receive a supervisor freeze or unfreeze notification
+/// mesh-api: summary = "Receive a supervisor freeze or unfreeze notification"
+/// mesh-api: id = "mesh.lifecycle"
+/// mesh-api: component = "mesh"
+/// mesh-api: method = "lifecycle"
+/// mesh-api: visibility = "private"
+/// mesh-api: component-index = 1
+/// mesh-api: method-index = 3
+/// mesh-api: shape = "response"
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshLifecycleResponse {
+    /// API field `subscribers`.
+    /// mesh-api-field: index = 1
+    /// mesh-api-field: required = true
+    pub subscribers: u64,
+}
+
 /// Return MCP initialization info
 /// mesh-api: summary = "Return MCP initialization info"
 /// mesh-api: id = "mesh.mcp.initialize"
@@ -122,4 +163,3 @@ pub struct TraceGetLevelRequest;
 /// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceGetLevelResponse;
-

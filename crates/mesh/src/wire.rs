@@ -285,7 +285,8 @@ mod tests {
         let handler = MustNotExecuteDirected {
             invoked: invoked.clone(),
         };
-        let server_task = tokio::spawn(async move { serve_cbor_session(&mut server, &handler).await });
+        let server_task =
+            tokio::spawn(async move { serve_cbor_session(&mut server, &handler).await });
         write_cbor_record(
             &mut client,
             &TaggedRecord {

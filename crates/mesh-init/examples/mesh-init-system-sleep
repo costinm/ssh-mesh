@@ -1,0 +1,35 @@
+#!/bin/sh
+# Ask mesh-init to reconcile its managed cgroups after suspend or hibernation.
+#
+# Debian installation:
+#   sudo install -Dm0755 \
+#     crates/mesh-init/examples/mesh-init-system-sleep \
+#     /usr/lib/systemd/system-sleep/mesh-init-reconcile
+#
+# Install the generic mesh client at its normal system path if needed:
+#   sudo install -Dm0755 target/x86_64-unknown-linux-musl/release/mesh \
+#     /opt/ssh-mesh/bin/mesh
+#
+# Test without suspending:
+#   sudo env PATH=/opt/ssh-mesh/bin:/usr/local/bin:/usr/bin \
+#     mesh mesh-init mesh-init reconcile
+#
+# Test the hook's post-resume branch directly:
+#   sudo /usr/lib/systemd/system-sleep/mesh-init-reconcile post suspend
+#
+# Use a fixed system PATH because systemd sleep hooks do not inherit an
+# interactive shell environment. The mesh client already resolves mesh-init to
+# /run/mesh/mesh-init/mesh.sock. The timeout prevents an unavailable daemon
+# from delaying completion of system resume. systemd runs sleep hooks in
+# parallel and supplies "pre" or "post" as $1 and the sleep operation as $2.
+
+PATH=/opt/ssh-mesh/bin:/usr/local/bin:/usr/bin
+export PATH
+
+case "$1" in
+    post)
+        exec timeout 5 mesh mesh-init mesh-init reconcile
+        ;;
+esac
+
+exit 0

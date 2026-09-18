@@ -63,7 +63,6 @@ rm -rf \
   "${STATE}/home/system/tmp" \
   "${STATE}/home/override-app" \
   "${STATE}/home/demo-app" \
-  "${STATE}/opt/system/etc/mesh-init" \
   "${STATE}/opt/demo-app" \
   "${STATE}/opt/override-app"
 
@@ -86,20 +85,24 @@ wait_for_ssh
 
 echo "=== Checking required guest mounts ==="
 ssh_vm 'set -eu
+PATH=/opt/ssh-mesh/bin:$PATH
+export PATH
 findmnt -n /nix >/dev/null
 findmnt -n /home >/dev/null
 findmnt -n /opt >/dev/null
-test -x /opt/ssh-mesh/bin/mesh-init
+command -v mesh-init >/dev/null
+command -v mesh >/dev/null
 test -d /home/system/etc/mesh-init
-test -d /opt/system/etc/mesh-init
 '
 
 echo "=== Reloading mesh-init and checking mesh endpoints ==="
 ssh_vm 'set -eu
-/opt/ssh-mesh/bin/mesh-init reload
+PATH=/opt/ssh-mesh/bin:$PATH
+export PATH
+mesh mesh-init mesh-init reload
 test -S /run/mesh/mesh-init/mesh.sock
 test "$(stat -c %a /run/mesh/mesh-init/mesh.sock)" = 666
-/opt/ssh-mesh/bin/mesh-init status ssh-mesh >/dev/null
+mesh mesh-init mesh-init status ssh-mesh >/dev/null
 for i in $(seq 1 60); do
   [ -S /run/mesh/ssh-mesh/mesh.sock ] && break
   sleep 1
@@ -108,25 +111,29 @@ test -S /run/mesh/ssh-mesh/mesh.sock
 test "$(stat -c %a /run/mesh/ssh-mesh/mesh.sock)" = 666
 '
 
-echo "=== Checking core config /home overrides /opt ==="
+echo "=== Checking core config from /home/system ==="
 ssh_vm 'set -eu
+PATH=/opt/ssh-mesh/bin:$PATH
+export PATH
 rm -f /home/system/tmp/override-check
-/opt/ssh-mesh/bin/mesh-init start override-check >/dev/null
+mesh mesh-init mesh-init start override-check >/dev/null
 test "$(cat /home/system/tmp/override-check)" = home
 '
 
 echo "=== Checking cgroup resources and hardening fixtures ==="
 ssh_vm 'set -eu
-/opt/ssh-mesh/bin/mesh-init start memlimit | grep pid
+PATH=/opt/ssh-mesh/bin:$PATH
+export PATH
+mesh mesh-init mesh-init start memlimit | grep pid
 test -d /sys/fs/cgroup/mesh.slice/memlimit.scope
 test "$(cat /sys/fs/cgroup/mesh.slice/memlimit.scope/memory.low)" = 67108864
 test "$(cat /sys/fs/cgroup/mesh.slice/memlimit.scope/memory.high)" = 268435456
 test "$(cat /sys/fs/cgroup/mesh.slice/memlimit.scope/memory.max)" = 536870912
 test "$(cat /sys/fs/cgroup/mesh.slice/memlimit.scope/cpu.weight)" = 50
-/opt/ssh-mesh/bin/mesh-init start hardening-mounts
-/opt/ssh-mesh/bin/mesh-init start hardening-process
-/opt/ssh-mesh/bin/mesh-init start hardening-caps-drop
-/opt/ssh-mesh/bin/mesh-init start hardening-caps-ambient
+mesh mesh-init mesh-init start hardening-mounts
+mesh mesh-init mesh-init start hardening-process
+mesh mesh-init mesh-init start hardening-caps-drop
+mesh mesh-init mesh-init start hardening-caps-ambient
 for path in \
   /home/system/tmp/results-mounts \
   /home/system/tmp/results-process \
@@ -146,9 +153,11 @@ grep "PASS caps-ambient" /home/system/tmp/results-caps-ambient
 
 echo "=== Checking on-demand app UID allocation ==="
 ssh_vm 'set -eu
+PATH=/opt/ssh-mesh/bin:$PATH
+export PATH
 rm -rf /home/demo-app
 rm -f /home/system/etc/uidmap
-/opt/ssh-mesh/bin/mesh-init start demo-app
+mesh mesh-init mesh-init start demo-app
 for path in /home/demo-app/uid /home/demo-app/gid /home/demo-app/source; do
   for i in $(seq 1 60); do
     [ -s "$path" ] && break
@@ -170,7 +179,9 @@ test "$(cat /home/demo-app/source)" = opt
 
 echo "=== Checking on-demand /home app config overrides /opt ==="
 ssh_vm 'set -eu
-/opt/ssh-mesh/bin/mesh-init start override-app
+PATH=/opt/ssh-mesh/bin:$PATH
+export PATH
+mesh mesh-init mesh-init start override-app
 for i in $(seq 1 60); do
   [ -s /home/override-app/source ] && break
   sleep 1

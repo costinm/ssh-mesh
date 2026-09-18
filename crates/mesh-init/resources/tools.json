@@ -5,6 +5,7 @@
       "properties": {
         "name": {
           "type": "string",
+          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
@@ -151,6 +152,58 @@
     },
     "x-component-index": 3,
     "x-method-index": 6
+  },
+  {
+    "description": "Reconcile managed services after host resume or recovery",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.reconcile",
+    "outputSchema": {
+      "properties": {
+        "checked": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u64"
+        },
+        "failed": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u64"
+        },
+        "reconciled": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u64"
+        }
+      },
+      "required": [
+        "checked",
+        "reconciled",
+        "failed"
+      ],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 14
+  },
+  {
+    "description": "Gracefully stop all services and shut down mesh-init",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.shutdown",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 15
   },
   {
     "description": "List observed processes from the process observer",

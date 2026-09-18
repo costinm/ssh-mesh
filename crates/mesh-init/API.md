@@ -43,7 +43,7 @@ component-index = 3
 method-index = 1
 summary = "Query status for one service or all loaded services"
 [request]
-fields = [{ name = "name", index = 1, type = "string" }]
+fields = [{ name = "name", index = 1, type = "string", position = 1 }]
 ```
 
 ```mesh-api
@@ -104,6 +104,30 @@ method = "reload"
 component-index = 3
 method-index = 6
 summary = "Reload service configuration from disk"
+```
+
+```mesh-api
+id = "mesh-init.reconcile"
+component = "mesh-init"
+method = "reconcile"
+component-index = 3
+method-index = 14
+summary = "Reconcile managed services after host resume or recovery"
+[response]
+fields = [
+  { name = "checked", index = 1, type = "u64", required = true },
+  { name = "reconciled", index = 2, type = "u64", required = true },
+  { name = "failed", index = 3, type = "u64", required = true },
+]
+```
+
+```mesh-api
+id = "mesh-init.shutdown"
+component = "mesh-init"
+method = "shutdown"
+component-index = 3
+method-index = 15
+summary = "Gracefully stop all services and shut down mesh-init"
 ```
 
 ```mesh-api
@@ -242,6 +266,27 @@ Query status of a specific service or list all loaded services.
 
 ### `reload`
 Reload all service configurations from disk and restart modified services.
+
+### `reconcile`
+Reconcile managed services with their desired lifecycle state after host resume
+or another external recovery event. Only services recorded as both current and
+desired `Running` are considered; deliberately frozen services remain frozen.
+This method requires the root or system UID.
+
+For every service that should be running, mesh-init sends `mesh.lifecycle`
+events to its standard mesh endpoint: first an observed external `freeze`, then
+an external `unfreeze`. This also covers services whose cgroup was thawed
+correctly by the host but which still need to restore interfaces. Explicit
+`freeze` and `unfreeze` control requests send the same events with cause
+`requested`; the requested freeze notification is sent before the cgroup is
+frozen. If that transition fails, mesh-init sends a compensating requested
+`unfreeze` event. A successful requested unfreeze resets watchdog and idle
+deadlines, giving the application its configured interval to resume.
+
+Lifecycle notifications for different services run concurrently while event
+order is preserved within each service. **Returns:** counts named `checked`,
+`reconciled`, and `failed`; `failed` includes cgroup operations and individual
+lifecycle notifications that could not be delivered.
 
 ### `shutdown`
 Gracefully shut down all services and exit the daemon.

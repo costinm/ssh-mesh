@@ -115,17 +115,10 @@ where
         return vec![PathBuf::from(dir)];
     }
     if uid == 0 {
-        let (home_base, opt_base) = home_opt_bases(&mut env);
-        vec![
-            opt_base.join("system/etc/mesh-init"),
-            home_base.join("system/etc/mesh-init"),
-        ]
+        let (home_base, _) = home_opt_bases(&mut env);
+        vec![home_base.join("system/etc/mesh-init")]
     } else {
-        vec![
-            current_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("etc/mesh-init"),
-        ]
+        vec![user_config_home(&mut env, current_dir).join("etc/mesh-init")]
     }
 }
 
@@ -166,12 +159,21 @@ where
         ]
     } else {
         vec![
-            current_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
+            user_config_home(&mut env, current_dir)
                 .join("etc/mesh-init")
                 .join(format!("{service_name}.toml")),
         ]
     }
+}
+
+fn user_config_home<F, C>(env: &mut F, current_dir: C) -> PathBuf
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+    C: FnOnce() -> Option<PathBuf>,
+{
+    env("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_dir().unwrap_or_else(|| PathBuf::from(".")))
 }
 
 fn home_opt_bases<F>(env: &mut F) -> (PathBuf, PathBuf)
@@ -425,27 +427,24 @@ mod tests {
     }
 
     #[test]
-    fn core_config_dirs_layer_root_opt_then_home() {
+    fn core_config_dirs_root_uses_system_home() {
         let dirs = core_config_dirs_with_context(env_from(&[]), || None, 0);
         assert_eq!(
             dirs,
-            vec![
-                std::path::PathBuf::from("/opt/system/etc/mesh-init"),
-                std::path::PathBuf::from("/home/system/etc/mesh-init"),
-            ]
+            vec![std::path::PathBuf::from("/home/system/etc/mesh-init")]
         );
     }
 
     #[test]
-    fn core_config_dirs_non_root_uses_cwd() {
+    fn core_config_dirs_non_root_uses_home() {
         let dirs = core_config_dirs_with_context(
-            env_from(&[]),
+            env_from(&[("HOME", "/home/alice")]),
             || Some(std::path::PathBuf::from("/workspace/app")),
             1000,
         );
         assert_eq!(
             dirs,
-            vec![std::path::PathBuf::from("/workspace/app/etc/mesh-init")]
+            vec![std::path::PathBuf::from("/home/alice/etc/mesh-init")]
         );
     }
 
@@ -486,17 +485,17 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_candidates_non_root_uses_cwd() {
+    fn on_demand_candidates_non_root_use_home() {
         let dirs = on_demand_config_candidates_with_context(
             "demo",
-            env_from(&[]),
+            env_from(&[("HOME", "/home/alice")]),
             || Some(std::path::PathBuf::from("/workspace/app")),
             1000,
         );
         assert_eq!(
             dirs,
             vec![std::path::PathBuf::from(
-                "/workspace/app/etc/mesh-init/demo.toml"
+                "/home/alice/etc/mesh-init/demo.toml"
             )]
         );
     }

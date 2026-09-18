@@ -16,6 +16,13 @@
 # Check the daemon:
 #   systemctl status mesh-init.service
 #   journalctl -u mesh-init.service
+#
+# Install the post-resume hook on Debian and similar systems:
+#   install -Dm0755 \
+#     /ws/rust/ssh-mesh/crates/mesh-init/examples/mesh-init-system-sleep \
+#     /usr/lib/systemd/system-sleep/mesh-init-reconcile
+#
+# NixOS should use the declarative mesh-init-resume.nix example instead.
 
 [Unit]
 Description=mesh-init service supervisor

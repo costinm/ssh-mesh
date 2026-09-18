@@ -61,12 +61,14 @@ impl AppPaths {
         C: FnOnce() -> Option<PathBuf>,
     {
         let app = app.into();
+        let current_dir = current_dir();
         let mesh_root = env("MESH_HOME").map(PathBuf::from).or_else(|| {
             if uid == 0 {
                 None
             } else {
                 Some(
-                    current_dir()
+                    current_dir
+                        .clone()
                         .unwrap_or_else(|| PathBuf::from("."))
                         .join("mesh"),
                 )
@@ -87,10 +89,16 @@ impl AppPaths {
                 .join(&app)
         });
         let mesh_run_base = env("MESH_RUN_BASE").map(PathBuf::from).unwrap_or_else(|| {
-            mesh_root
-                .as_ref()
-                .map(|root| root.join("run/mesh"))
-                .unwrap_or_else(|| PathBuf::from("/run/mesh"))
+            if let Some(root) = env("MESH_HOME").map(PathBuf::from) {
+                root.join("run/mesh")
+            } else if uid == 0 {
+                PathBuf::from("/run/mesh")
+            } else {
+                env("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| current_dir.clone().unwrap_or_else(|| PathBuf::from(".")))
+                    .join(".local/run")
+            }
         });
         let mesh_ipc_dir = mesh_run_base.join(&app);
         let mesh_socket = mesh_ipc_dir.join("mesh.sock");
@@ -158,6 +166,56 @@ impl AppPaths {
     }
 }
 
+/// Conventional mesh socket for a system service.
+pub fn system_service_socket(service: impl AsRef<str>) -> PathBuf {
+    PathBuf::from("/run/mesh")
+        .join(service.as_ref())
+        .join("mesh.sock")
+}
+
+/// Conventional mesh socket for a service owned by the current home directory.
+pub fn user_service_socket(service: impl AsRef<str>) -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".local/run")
+            .join(service.as_ref())
+            .join("mesh.sock")
+    })
+}
+
+/// Candidate local endpoints for a service, in caller-appropriate order.
+pub fn service_socket_candidates(service: impl AsRef<str>) -> Vec<PathBuf> {
+    let service = service.as_ref();
+    let system = system_service_socket(service);
+    let user = user_service_socket(service);
+    if current_uid() == 0 {
+        Some(system).into_iter().chain(user).collect()
+    } else {
+        user.into_iter().chain(Some(system)).collect()
+    }
+}
+
+/// Resolve a service socket consistently for clients and libraries.
+///
+/// A socket owned by the caller is preferred in user mode; root prefers the
+/// system endpoint. A candidate only wins when a client can actually connect
+/// to it, so a stale socket file left behind by a dead service does not
+/// shadow a live endpoint. If no candidate is connectable, the caller's
+/// standard `AppPaths` endpoint is returned so connection errors name the
+/// expected path.
+pub fn resolve_service_socket(service: impl AsRef<str>) -> PathBuf {
+    let service = service.as_ref();
+    service_socket_candidates(service)
+        .into_iter()
+        .find(|path| socket_is_connectable(path))
+        .unwrap_or_else(|| AppPaths::for_app(service).mesh_socket().clone())
+}
+
+/// True when `path` is a stream socket a client can connect to right now.
+fn socket_is_connectable(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
 /// Resolve the base directory that contains app home directories.
 pub fn default_home_base() -> PathBuf {
     home_base_with_env_and_context(
@@ -220,18 +278,19 @@ mod tests {
     }
 
     #[test]
-    fn non_root_default_paths_use_mesh_home_under_cwd() {
+    fn non_root_default_paths_use_home_runtime_directory() {
         let cwd = PathBuf::from("/workspace");
-        let paths =
-            AppPaths::for_app_with_env_and_context("demo", |_| None, || Some(cwd.clone()), 1000);
-        assert_eq!(paths.home, PathBuf::from("/workspace/mesh/home/demo"));
-        assert_eq!(
-            paths.mesh_run_base,
-            PathBuf::from("/workspace/mesh/run/mesh")
+        let paths = AppPaths::for_app_with_env_and_context(
+            "demo",
+            |key| (key == "HOME").then(|| OsString::from("/home/alice")),
+            || Some(cwd.clone()),
+            1000,
         );
+        assert_eq!(paths.home, PathBuf::from("/workspace/mesh/home/demo"));
+        assert_eq!(paths.mesh_run_base, PathBuf::from("/home/alice/.local/run"));
         assert_eq!(
             paths.mesh_socket,
-            PathBuf::from("/workspace/mesh/run/mesh/demo/mesh.sock")
+            PathBuf::from("/home/alice/.local/run/demo/mesh.sock")
         );
         assert_eq!(paths.run, PathBuf::from("/workspace/mesh/home/demo/run"));
         assert_eq!(paths.etc, PathBuf::from("/workspace/mesh/home/demo/etc"));

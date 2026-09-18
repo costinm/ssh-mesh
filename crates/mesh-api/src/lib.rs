@@ -10,6 +10,37 @@ extern crate alloc;
 
 use alloc::string::String;
 
+/// A supervisor transition delivered to a managed mesh service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum LifecycleAction {
+    Freeze,
+    Unfreeze,
+}
+
+/// Why the supervisor is reporting a lifecycle transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum LifecycleCause {
+    /// A mesh-init control request intentionally caused the transition.
+    Requested,
+    /// An external supervisor or host lifecycle caused the transition.
+    External,
+}
+
+/// Portable lifecycle event accepted by every mesh JSON-RPC service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct LifecycleEvent {
+    pub action: LifecycleAction,
+    pub cause: LifecycleCause,
+    /// True when the transition had already happened before mesh-init could
+    /// notify the service, as with a host-wide freezer during suspend.
+    pub observed: bool,
+}
+
 /// Logical peer identity and an optional one-call egress-path request.
 ///
 /// `node` keys one reusable peer association. `path` selects a particular
@@ -18,13 +49,19 @@ use alloc::string::String;
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct MeshTarget {
     pub node: String,
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub path: Option<String>,
 }
 
 impl MeshTarget {
     pub fn node(node: impl Into<String>) -> Self {
-        Self { node: node.into(), path: None }
+        Self {
+            node: node.into(),
+            path: None,
+        }
     }
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {

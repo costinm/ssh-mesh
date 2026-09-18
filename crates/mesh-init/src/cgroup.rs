@@ -143,6 +143,30 @@ fn service_scope_populated(scope_path: &str) -> Result<bool, CgroupError> {
         .is_some_and(|value| value.trim() == "1"))
 }
 
+/// Return whether a service scope is currently frozen.
+///
+/// `cgroup.events` is used instead of inferring the state from the process:
+/// a frozen process is deliberately still alive, and its parent may have been
+/// frozen at the same time.  This is also safe to call after mesh-init itself
+/// resumes: the first scheduler tick can repair a child scope that was left
+/// frozen by a host suspend/resume cycle.
+pub fn cgroup_is_frozen(cgroup_path: &str) -> Result<bool, CgroupError> {
+    let events_path = format!("{cgroup_path}/cgroup.events");
+    let events = fs::read_to_string(events_path)?;
+    Ok(cgroup_events_value(&events, "frozen"))
+}
+
+fn cgroup_events_value(events: &str, name: &str) -> bool {
+    events
+        .lines()
+        .find_map(|line| {
+            line.split_once(' ')
+                .filter(|(key, _)| *key == name)
+                .map(|(_, value)| value.trim())
+        })
+        .is_some_and(|value| value == "1")
+}
+
 /// Enable memory, cpu, and io controllers in a cgroup's subtree_control.
 pub fn enable_controllers(path: &str) -> Result<(), CgroupError> {
     let controllers_path = format!("{}/cgroup.controllers", path);
@@ -328,5 +352,14 @@ mod tests {
         assert_eq!(limits.memory_high.unwrap().to_string(), "2147483648");
         assert_eq!(limits.memory_max.unwrap().to_string(), "4294967296");
         assert_eq!(limits.cpu_weight.unwrap().to_string(), "100");
+    }
+
+    #[test]
+    fn test_cgroup_events_frozen_value() {
+        let events = "populated 1\nfrozen 1\n";
+        assert!(cgroup_events_value(events, "frozen"));
+        assert!(cgroup_events_value(events, "populated"));
+        assert!(!cgroup_events_value("populated 1\nfrozen 0\n", "frozen"));
+        assert!(!cgroup_events_value(events, "missing"));
     }
 }

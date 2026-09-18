@@ -1,6 +1,7 @@
 # mesh-init environment variables
 
-Runtime variables read by the `mesh-init` daemon, CLI, and service activation code.
+Runtime variables read by the `mesh-init` supervisor, foreground execution
+mode, and service activation code.
 
 Common variables inherited from the `mesh` crate are documented in
 [`../mesh/ENV.md`](../mesh/ENV.md). That includes `MESH_HOME`,
@@ -91,13 +92,13 @@ Specialized:
 
 Config and identity:
 
-| `MESH_INIT_DIR` | root: `/opt/system/etc/mesh-init`, then `/home/system/etc/mesh-init`; non-root: `./etc/mesh-init` | Full replacement directory for core service configs. When unset, root loads `/opt` first and `/home` second, so `/home` overrides packaged configs. |
+| `MESH_INIT_DIR` | root: `/home/system/etc/mesh-init`; non-root: `$HOME/etc/mesh-init` | Full replacement directory for core service configs. |
 | `MESH_INIT_SOCK` | `/run/mesh/mesh-init/mesh.sock` for root systems | Exact mesh-init control/API socket path. |
 | `MESH_INIT_UIDMAP` | `/home/system/etc/uidmap` | Persistent root-mode on-demand app UID/GID map. |
 | `MESH_INIT_UID_MIN` | `2000` | First UID/GID mesh-init may allocate for root-mode on-demand apps. |
 | `MESH_INIT_UID_MAX` | `59999` | Last UID/GID mesh-init may allocate for root-mode on-demand apps. |
 | `MESH_RUN_USER_BASE` | `/run/user` | Advanced/test override for the root-mode on-demand app runtime directory base. |
-| `USER_INIT` | root: `/opt/<name>/etc/mesh-init/<name>.toml`, then `/home/<name>/etc/mesh-init/<name>.toml`; non-root: `./etc/mesh-init/<name>.toml` | Legacy replacement base for on-demand configs. When set, lookup is `<USER_INIT>/<name>/init.toml`. |
+| `USER_INIT` | root: `/opt/<name>/etc/mesh-init/<name>.toml`, then `/home/<name>/etc/mesh-init/<name>.toml`; non-root: `$HOME/etc/mesh-init/<name>.toml` | Legacy replacement base for on-demand configs. When set, lookup is `<USER_INIT>/<name>/init.toml`. |
 
 Deprecated - use explicit socket/config envs:
 

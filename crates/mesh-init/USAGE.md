@@ -29,7 +29,7 @@ export RUST_LOG="info"
 ```
 
 As a regular user, `$HOME/etc/mesh-init` is used for configs and
-`$HOME/run/mesh-init` for sockets. The top cgroup slice is
+`$HOME/.local/run/<service>/mesh.sock` for service sockets. The top cgroup slice is
 `/sys/fs/cgroup/mesh.slice` and must be writable by the user running
 `mesh-init`.
 
@@ -48,12 +48,12 @@ Use the `mesh` binary for service-control requests. The `mesh-init` binary is
 the supervisor daemon, not the operator-facing service-control CLI.
 
 ```bash
-./target/debug/mesh mesh-init status
-./target/debug/mesh mesh-init start echo-service
-./target/debug/mesh mesh-init status echo-service
-./target/debug/mesh mesh-init stop echo-service
-./target/debug/mesh mesh-init reload
-./target/debug/mesh mesh-init shutdown
+./target/debug/mesh mesh-init mesh-init status
+./target/debug/mesh mesh-init mesh-init start echo-service
+./target/debug/mesh mesh-init mesh-init status echo-service
+./target/debug/mesh mesh-init mesh-init stop echo-service
+./target/debug/mesh mesh-init mesh-init reload
+./target/debug/mesh mesh-init mesh-init shutdown
 ```
 
 ## Socket Activation
@@ -98,8 +98,10 @@ Address = "/run/hybrid_svc/public.sock"
 
 ## Execution Mode
 
-If you run `mesh-init` with arguments, it executes the command in the foreground,
-then cleans up and exits.
+If you run `mesh-init` with arguments, it acts as a container supervisor. It
+starts configured and socket-activated secondary services, exposes its normal
+mesh control socket, and executes the command as its main child. When the main
+child exits, mesh-init shuts down the remaining services and exits.
 
 ```bash
 ./target/debug/mesh-init sleep 5
@@ -125,8 +127,12 @@ RUST_LOG = "info"
 ```
 
 Files named `init-*.toml` run before the main command and regular services.
-Use `Type = "oneshot"` when `mesh-init` should wait for completion and avoid
-restarting the init service.
+Oneshot init services are setup work: `mesh-init` waits for them to finish
+(they are started concurrently, but the main command starts only after they
+all reach `Stopped`; a wedged setup service is skipped after 120 seconds with
+a warning). Long-running init services are dependencies that stay up and do
+not block the main command. Use `Type = "oneshot"` when `mesh-init` should
+wait for completion and avoid restarting the init service.
 
 ```toml
 # $MESH_INIT_DIR/init-setup.toml
@@ -147,7 +153,7 @@ MeshPersisted = true
 MeshSaveResult = true
 
 [Service]
-ExecStart = "mesh mesh-init start sync-service"
+ExecStart = "mesh mesh-init mesh-init start sync-service"
 OOMScoreAdjust = -700
 
 [Schedule]

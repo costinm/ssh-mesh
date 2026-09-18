@@ -12,20 +12,24 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 /// resource and use this shared parser for shell, JSONL, and JNI ingress.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ResourceSchemaFile {
-    #[serde(default)] pub methods: Vec<ResourceMethod>,
+    #[serde(default)]
+    pub methods: Vec<ResourceMethod>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResourceMethod {
     pub name: String,
-    #[serde(default)] pub fields: Vec<ResourceField>,
+    #[serde(default)]
+    pub fields: Vec<ResourceField>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResourceField {
     pub name: String,
-    #[serde(default)] pub kind: Option<String>,
-    #[serde(default)] pub values: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub values: BTreeMap<String, u64>,
 }
 
 /// Schema-backed human command parser shared by every mesh ingress.
@@ -56,15 +60,21 @@ impl ResourceSchema {
         let mut fields = Map::new();
         for word in words {
             let (name, raw) = word.split_once('=').unwrap_or((word, "true"));
-            let field = schema.and_then(|schema| schema.fields.iter().find(|field| field.name == name));
+            let field =
+                schema.and_then(|schema| schema.fields.iter().find(|field| field.name == name));
             let value = match field.and_then(|field| field.kind.as_deref()) {
-                Some("bool") => raw.parse::<bool>().map(Value::Bool)
+                Some("bool") => raw
+                    .parse::<bool>()
+                    .map(Value::Bool)
                     .with_context(|| format!("{method}.{name} must be bool"))?,
-                Some("u8") | Some("u16") | Some("u32") | Some("u64") => raw.parse::<u64>()
-                    .map(Value::from).with_context(|| format!("{method}.{name} must be integer"))?,
+                Some("u8") | Some("u16") | Some("u32") | Some("u64") => raw
+                    .parse::<u64>()
+                    .map(Value::from)
+                    .with_context(|| format!("{method}.{name} must be integer"))?,
                 Some("enum") => Value::from(match field.expect("enum field").values.get(raw) {
                     Some(value) => *value,
-                    None => raw.parse::<u64>()
+                    None => raw
+                        .parse::<u64>()
                         .with_context(|| format!("unknown {method}.{name}={raw}"))?,
                 }),
                 _ => Value::String(raw.to_owned()),

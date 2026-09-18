@@ -15,6 +15,7 @@ pub struct MeshInitStatusRequest {
     /// API field `name`.
     /// mesh-api-field: index = 1
     /// mesh-api-field: required = false
+    /// mesh-api-field: position = 1
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -184,6 +185,65 @@ pub struct MeshInitReloadRequest;
 /// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitReloadResponse;
+
+/// Reconcile managed services after host resume or recovery
+/// mesh-api: summary = "Reconcile managed services after host resume or recovery"
+/// mesh-api: id = "mesh-init.reconcile"
+/// mesh-api: component = "mesh-init"
+/// mesh-api: method = "reconcile"
+/// mesh-api: visibility = "public"
+/// mesh-api: component-index = 3
+/// mesh-api: method-index = 14
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitReconcileRequest;
+
+/// Reconcile managed services after host resume or recovery
+/// mesh-api: summary = "Reconcile managed services after host resume or recovery"
+/// mesh-api: id = "mesh-init.reconcile"
+/// mesh-api: component = "mesh-init"
+/// mesh-api: method = "reconcile"
+/// mesh-api: visibility = "public"
+/// mesh-api: component-index = 3
+/// mesh-api: method-index = 14
+/// mesh-api: shape = "response"
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitReconcileResponse {
+    /// API field `checked`.
+    /// mesh-api-field: index = 1
+    /// mesh-api-field: required = true
+    pub checked: u64,
+    /// API field `reconciled`.
+    /// mesh-api-field: index = 2
+    /// mesh-api-field: required = true
+    pub reconciled: u64,
+    /// API field `failed`.
+    /// mesh-api-field: index = 3
+    /// mesh-api-field: required = true
+    pub failed: u64,
+}
+
+/// Gracefully stop all services and shut down mesh-init
+/// mesh-api: summary = "Gracefully stop all services and shut down mesh-init"
+/// mesh-api: id = "mesh-init.shutdown"
+/// mesh-api: component = "mesh-init"
+/// mesh-api: method = "shutdown"
+/// mesh-api: visibility = "public"
+/// mesh-api: component-index = 3
+/// mesh-api: method-index = 15
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitShutdownRequest;
+
+/// Gracefully stop all services and shut down mesh-init
+/// mesh-api: summary = "Gracefully stop all services and shut down mesh-init"
+/// mesh-api: id = "mesh-init.shutdown"
+/// mesh-api: component = "mesh-init"
+/// mesh-api: method = "shutdown"
+/// mesh-api: visibility = "public"
+/// mesh-api: component-index = 3
+/// mesh-api: method-index = 15
+/// mesh-api: shape = "response"
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitShutdownResponse;
 
 /// List observed processes from the process observer
 /// mesh-api: summary = "List observed processes from the process observer"
@@ -381,4 +441,3 @@ pub struct MeshInitMoveProcessRequest {
 /// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitMoveProcessResponse;
-

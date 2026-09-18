@@ -319,6 +319,7 @@ fn evict_by_priority(services: &Arc<Mutex<HashMap<String, ManagedProcess>>>, lev
                         );
                         let _ = crate::process::send_signal(pid, libc::SIGTERM);
                         proc.state = ServiceState::Stopping;
+                        proc.stopping_since = Some(std::time::Instant::now());
                     }
                     PressureLevel::None => unreachable!(),
                 }

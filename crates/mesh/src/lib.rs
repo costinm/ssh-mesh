@@ -1,3 +1,6 @@
+/// Generated API data types from the normative mesh API.md catalog.
+#[doc(hidden)]
+pub mod api;
 pub mod auth;
 pub mod cbor;
 /// Transport-neutral outgoing mesh stream client contract.
@@ -5,11 +8,9 @@ pub mod client;
 pub mod config;
 /// Generated numeric IDs from the normative mesh API.md catalog.
 pub mod generated_api_ids;
-/// Generated API data types from the normative mesh API.md catalog.
-#[doc(hidden)]
-pub mod api;
 pub mod jobs;
 pub mod jsonl;
+pub mod lifecycle;
 pub mod local_trace;
 pub mod message;
 pub mod mux;

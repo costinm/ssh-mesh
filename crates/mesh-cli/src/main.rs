@@ -157,9 +157,7 @@ fn service_address(service: &str) -> Result<Option<String>> {
         return Ok(Some(section.address.unwrap_or_else(|| {
             format!(
                 "unix://{}",
-                mesh::paths::AppPaths::for_app(service)
-                    .mesh_socket()
-                    .display()
+                mesh::paths::resolve_service_socket(service).display()
             )
         })));
     }
@@ -186,14 +184,19 @@ fn service_address(service: &str) -> Result<Option<String>> {
         .into_iter()
         .any(|path| path.is_file())
     {
-        return Ok(Some(format!("unix:///run/mesh/{service}/mesh.sock")));
+        return Ok(Some(format!(
+            "unix://{}",
+            mesh::paths::resolve_service_socket(service).display()
+        )));
     }
-    if std::env::var_os("MESH_SERVICE_DIR").is_none() {
-        let default = match service {
-            "mesh-init" => "/run/mesh/mesh-init/mesh.sock",
-            _ => return Ok(None),
-        };
-        return Ok(Some(format!("unix://{default}")));
+    if mesh::paths::service_socket_candidates(service)
+        .into_iter()
+        .any(|path| path.exists())
+    {
+        return Ok(Some(format!(
+            "unix://{}",
+            mesh::paths::resolve_service_socket(service).display()
+        )));
     }
     Ok(None)
 }
@@ -207,7 +210,6 @@ fn service_config_candidates(service: &str) -> Vec<PathBuf> {
         }];
     }
     vec![
-        PathBuf::from(format!("/opt/system/etc/mesh-init/{service}.toml")),
         PathBuf::from(format!("/home/system/etc/mesh-init/{service}.toml")),
         PathBuf::from(format!("etc/mesh-init/{service}.toml")),
     ]

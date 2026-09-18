@@ -373,6 +373,7 @@ pub fn text_record_to_request(record: TextRecord) -> Result<crate::protocol::Req
         "unfreeze" => Ok(Request::Unfreeze {
             name: required_field(&record, "name")?,
         }),
+        "reconcile" => Ok(Request::Reconcile),
         "reload" => Ok(Request::Reload),
         "shutdown" => Ok(Request::Shutdown),
         command => Err(anyhow!("unsupported text command {command}")),
