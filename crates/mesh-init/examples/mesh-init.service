@@ -1,12 +1,14 @@
-# mesh-init systemd unit (temporary local-build installation).
+# mesh-init systemd unit (production installation).
 #
-# Build the binary first:
-#   cd /ws/rust/ssh-mesh
-#   source env.sh
-#   cargo build --release --target x86_64-unknown-linux-musl -p mesh-init
+# Install the ssh-mesh Nix package first so /opt/ssh-mesh/bin resolves, or
+# install release binaries under /opt/ssh-mesh/bin manually:
+#   source env.sh && cargo build --release --target x86_64-unknown-linux-musl
+#   install -Dm0755 target/x86_64-unknown-linux-musl/release/mesh-init /opt/ssh-mesh/bin/mesh-init
+#   install -Dm0755 target/x86_64-unknown-linux-musl/release/mesh /opt/ssh-mesh/bin/mesh
+#   install -Dm0755 target/x86_64-unknown-linux-musl/release/ssh-mesh /opt/ssh-mesh/bin/ssh-mesh
 #
 # Install this unit as root:
-#   install -Dm0644 /ws/rust/ssh-mesh/crates/mesh-init/examples/mesh-init.service \
+#   install -Dm0644 crates/mesh-init/examples/mesh-init.service \
 #     /etc/systemd/system/mesh-init.service
 #
 # Enable and start it:
@@ -19,7 +21,7 @@
 #
 # Install the post-resume hook on Debian and similar systems:
 #   install -Dm0755 \
-#     /ws/rust/ssh-mesh/crates/mesh-init/examples/mesh-init-system-sleep \
+#     crates/mesh-init/examples/mesh-init-system-sleep \
 #     /usr/lib/systemd/system-sleep/mesh-init-reconcile
 #
 # NixOS should use the declarative mesh-init-resume.nix example instead.
@@ -33,14 +35,14 @@ After=local-fs.target
 # default systemd process model is the correct one. It does not fork or send
 # systemd readiness notifications.
 Type=simple
-ExecStart=/ws/rust/ssh-mesh/target/x86_64-unknown-linux-musl/release/mesh-init
+ExecStart=/opt/ssh-mesh/bin/mesh-init
 WorkingDirectory=/home/system
 Environment=HOME=/home/system
-# Keep the executable/tool lookup environment used by /home/system/meshroot.sh.
-# systemd does not expand $PATH in Environment= assignments, so include the
-# normal system directories explicitly. The Nix profile paths are listed with
-# their bin directories because PATH entries must point at executable files.
-Environment="PATH=/ws/dmesh/target/x86_64-unknown-linux-musl/release:/ws/rust/ssh-mesh/target/x86_64-unknown-linux-musl/release:/ws/rust/ssh-mesh/target/x86_64-unknown-linux-musl/debug:/opt/ssh-mesh/bin:/ws/rust/ssh-mesh/target/nix/profile/bin:/ws/dmesh/target/nix/profile/bin:/home/system/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/etc/profiles/per-user/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# PATH starts with /opt/ssh-mesh/bin so every shipped default executable
+# resolves through the stable /opt/ssh-mesh symlink. systemd does not
+# expand $PATH in Environment= assignments, so include the normal system
+# directories explicitly.
+Environment="PATH=/opt/ssh-mesh/bin:/home/system/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/etc/profiles/per-user/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment=RUST_LOG=INFO
 Environment=MESH_LOG_DIR=/home/mesh-init/logs
 Restart=on-failure

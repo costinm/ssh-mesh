@@ -15,6 +15,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use std::path::Path;
 use tracing::info;
 
 use mesh_init::daemon::{Daemon, DaemonConfig};
@@ -45,7 +46,55 @@ async fn main() -> Result<()> {
         Some(args.command)
     };
 
+    if let Some(command) = &command
+        && command[0] == "seed"
+    {
+        return seed_command(&command[1..], &config_dirs);
+    }
+
     run(config_dirs, socket_path, command).await
+}
+
+/// Operator command: preview or copy newly shipped default configuration.
+///
+/// Startup seeding only runs on first start; this command is how operators
+/// merge defaults from a newer package without touching existing files.
+fn seed_command(args: &[String], config_dirs: &[String]) -> Result<()> {
+    let preview = args.iter().any(|arg| arg == "--preview");
+    let Some(dest) = config_dirs.first() else {
+        anyhow::bail!("no mesh-init configuration directory configured");
+    };
+    let Some(defaults) = mesh_init::seed::defaults_dir() else {
+        anyhow::bail!("no packaged mesh-init defaults found; set MESH_INIT_DEFAULTS_DIR");
+    };
+
+    if preview {
+        let missing = mesh_init::seed::preview_seed(Path::new(dest), &defaults)?;
+        if missing.is_empty() {
+            println!("up to date: all default files present in {}", dest);
+        } else {
+            println!("{} default file(s) missing in {}:", missing.len(), dest);
+            for path in &missing {
+                println!("  {}", path.display());
+            }
+        }
+        return Ok(());
+    }
+
+    let result = mesh_init::seed::seed_operator(Path::new(dest), &defaults)?;
+    println!(
+        "seeded {} file(s), kept {} existing file(s) in {}",
+        result.seeded.len(),
+        result.skipped.len(),
+        dest
+    );
+    for path in &result.seeded {
+        println!("  copied {}", path.display());
+    }
+    for path in &result.skipped {
+        println!("  kept {}", path.display());
+    }
+    Ok(())
 }
 
 /// Common startup: create the supervisor and optionally run its main child.
@@ -57,6 +106,10 @@ async fn run(
     // Collect systemd socket activation file descriptors before the daemon
     // creates its own listeners. This must happen before start_background_tasks.
     mesh_init::activation::collect_systemd_fds();
+
+    // Seed first-start default configuration before any config is loaded, so
+    // the seeded services participate in the normal startup sequence.
+    mesh_init::seed::seed_on_startup(&config_dirs);
 
     let config = DaemonConfig {
         config_dirs,

@@ -1,14 +1,12 @@
 # Build-user repo WPA supplicant for lmesh NAN/USD tests.
 #
-# Service name from filename: wpa-supplicant-nan
-# Control dir: /run/mesh/wpa-supplicant-nan
-# mesh-init creates /run/mesh/wpa-supplicant-nan and chowns it to User/Group.
+# Service name from filename: wpa-supplicant
+# Control dir: /run/mesh/wpa-supplicant
+# mesh-init creates /run/mesh/wpa-supplicant and chowns it to User/Group.
 
 [Service]
 Type = "exec"
-# mesh-init should be started with PATH containing the NAN-enabled
-# wpa_supplicant build, for example from .#radio-deps.
-ExecStart = "wpa_supplicant -g /run/mesh/wpa-supplicant/global -G plugdev -c /ws/rust/ssh-mesh/crates/mesh-init/examples/wpa-supplicant-nan.conf -dd"
+ExecStart = "wpa_supplicant -g /run/mesh/wpa-supplicant/global -G plugdev -c /home/system/etc/wpa-supplicant.conf -dd"
 WorkingDirectory = "target"
 User = "build"
 Group = "plugdev"

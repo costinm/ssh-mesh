@@ -1,10 +1,10 @@
-# Minimal NixOS host configuration for ssh-mesh.
+# Usage example for the ssh-mesh NixOS module.
 #
 # In a flake-based NixOS configuration, import the module with:
 #
-#   imports = [ ssh-mesh.nixosModules.default ];
+#   imports = [ ssh-mesh.nixosModules.mesh-init ];
 #
-# and set package to:
+# and set the package to:
 #
 #   ssh-mesh.packages.${pkgs.system}.ssh-mesh
 
@@ -18,7 +18,7 @@
 {
   imports = [ ./module.nix ];
 
-  services.ssh-mesh = {
+  services.mesh-init = {
     enable = true;
     package = sshMesh.packages.${pkgs.system}.ssh-mesh;
     authorizedKeys = [

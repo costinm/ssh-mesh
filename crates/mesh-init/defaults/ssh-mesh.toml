@@ -1,0 +1,51 @@
+# ssh-mesh default service configuration.
+#
+# This file is shipped in /opt/ssh-mesh/share/mesh-init/defaults and copied by
+# mesh-init into /home/system/etc/mesh-init on first start. First-start seeding
+# never overwrites, deletes, or relinks an existing file; later package
+# upgrades do not merge changes automatically. Operators can preview or copy
+# newly shipped defaults explicitly with `mesh-init seed`.
+#
+# The service identity is not pinned here: as root, mesh-init allocates and
+# persists a UID/GID for "ssh-mesh" in /home/system/etc/uidmap and creates
+# /home/ssh-mesh for it. Operator secrets such as
+# /home/ssh-mesh/etc/authorized_keys are mutable state and are intentionally
+# not packaged in the defaults.
+
+[Service]
+ExecStart = "/opt/ssh-mesh/bin/ssh-mesh"
+OOMScoreAdjust = -900
+
+[Resources]
+MemoryMax = "1G"
+CPUWeight = 100
+
+[Socket]
+Accept = false
+SocketMode = 0o666
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:15022"
+Name = "ssh"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:8080"
+Name = "http"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "/run/mesh/ssh-mesh/mesh.sock"
+Name = "jsonl"
+
+[Environment]
+RUST_LOG = "info"
+SSH_PORT = "15022"
+HTTP_PORT = "8080"
+SSH_BASEDIR = "/home/ssh-mesh/.ssh"
+SSH_MUX = "/home/ssh-mesh/run/ssh-mesh/mux"
+MESH_HOME_BASE = "/home"
+MESH_OPT_BASE = "/opt"
+MESH_RUN_BASE = "/run/mesh"
+MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock"

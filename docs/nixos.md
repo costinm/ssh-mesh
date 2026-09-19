@@ -32,7 +32,7 @@ Then enable the service in `configuration.nix`:
 { pkgs, sshMesh, ... }:
 
 {
-  services.ssh-mesh = {
+  services.mesh-init = {
     enable = true;
     package = sshMesh.packages.${pkgs.system}.ssh-mesh;
     authorizedKeys = [
@@ -45,7 +45,7 @@ Then enable the service in `configuration.nix`:
 ## Runtime Shape
 
 - systemd starts `mesh-init.service`.
-- `mesh-init` runs as root and uses the code defaults:
+- `mesh-init` runs as root and uses the default runtime paths:
   `/home/system/etc/mesh-init` for service files and
   `/run/mesh/mesh-init/mesh.sock` for its local mesh endpoint.
 - `/home/system/etc/mesh-init/ssh-mesh.toml` defines named activation sockets:
@@ -55,7 +55,8 @@ Then enable the service in `configuration.nix`:
   protocol-neutral; current apps may speak line JSON, JSON-RPC/MCP-shaped
   requests, or text protocols on the same endpoint.
 - `ssh-mesh` runs as UID `150` with mutable state under `/home/ssh-mesh`.
-  It reads keys and SSH authorization from `/home/ssh-mesh/etc`.
+  It reads keys and SSH authorization from `$SSH_BASEDIR`
+  (`/home/ssh-mesh/.ssh/authorized_keys` in the packaged defaults).
 - `/opt/ssh-mesh` points at the configured Nix store package. It is a friendly
   read-only profile path for service configs and examples.
 - The module does not use `/etc/ssh-mesh`, `/etc/mesh-init`, or

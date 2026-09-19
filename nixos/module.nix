@@ -1,67 +1,64 @@
-{ config, lib, pkgs, ... }:
+# Reusable NixOS module for mesh-init and the ssh-mesh service.
+#
+# mesh-init runs as a foreground systemd service and supervises the ssh-mesh
+# service itself (ssh-mesh is a child of mesh-init, never a systemd unit).
+# Service configuration lives in mutable operator state under
+# /home/system/etc/mesh-init and is seeded on first start from the packaged
+# defaults in /opt/ssh-mesh/share/mesh-init/defaults; this module deliberately
+# does not render or replace files there.
+#
+# Usage:
+#
+#   imports = [ ssh-mesh.nixosModules.mesh-init ];
+#   services.mesh-init = {
+#     enable = true;
+#     package = ssh-mesh.packages.${pkgs.system}.ssh-mesh;
+#     authorizedKeys = [ "ssh-ed25519 AAAA..." ];
+#   };
+#
+# mesh-init without the ssh-mesh service is supported by removing
+# ssh-mesh.toml from /home/system/etc/mesh-init; the supervisor and control
+# socket keep running.
+
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 with lib;
 
 let
-  cfg = config.services.ssh-mesh;
-  lines = concatStringsSep "\n";
-  sshMeshToml = pkgs.writeText "ssh-mesh.toml" ''
-    [Service]
-    ExecStart = "/opt/ssh-mesh/bin/ssh-mesh"
-    User = "150"
-    Group = "150"
-    WorkingDirectory = "/home/ssh-mesh"
-    OOMScoreAdjust = -900
-    StandardOutput = "inherit"
-    StandardError = "inherit"
-
-    [Resources]
-    MemoryMax = "1G"
-    CPUWeight = 100
-
-    [Environment]
-    RUST_LOG = "info"
-    MESH_HOME_BASE = "/home"
-    MESH_OPT_BASE = "/opt"
-    MESH_RUN_BASE = "/run/mesh"
-    MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock"
-    SSH_MUX = "/home/ssh-mesh/run/ssh-mesh/mux"
-
-    [Socket]
-    Accept = false
-    SocketMode = 0o666
-
-    [[Socket.Listen]]
-    Type = "stream"
-    Address = "0.0.0.0:15022"
-    Name = "ssh"
-
-    [[Socket.Listen]]
-    Type = "stream"
-    Address = "0.0.0.0:8080"
-    Name = "http"
-
-    [[Socket.Listen]]
-    Type = "stream"
-    Address = "/run/mesh/ssh-mesh/mesh.sock"
-    Name = "jsonl"
-  '';
+  cfg = config.services.mesh-init;
   authorizedKeysFile = pkgs.writeText "authorized_keys" (
-    lines cfg.authorizedKeys + optionalString (cfg.authorizedKeys != []) "\n"
+    concatStringsSep "\n" cfg.authorizedKeys + optionalString (cfg.authorizedKeys != [ ]) "\n"
   );
-in {
-  options.services.ssh-mesh = {
-    enable = mkEnableOption "ssh-mesh L4 proxy and activation daemon";
+  meshPath = "/opt/ssh-mesh/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin";
+in
+{
+  options.services.mesh-init = {
+    enable = mkEnableOption "the mesh-init service supervisor (with the ssh-mesh L4 proxy as its managed child)";
 
     package = mkOption {
       type = types.package;
-      description = "The ssh-mesh package to use.";
+      description = "The ssh-mesh package providing mesh-init, mesh, and ssh-mesh.";
     };
 
     authorizedKeys = mkOption {
       type = types.listOf types.str;
-      default = [];
-      description = "Public keys allowed to authenticate to the ssh-mesh SSH server.";
+      default = [ ];
+      description = ''
+        Public keys allowed to authenticate to the ssh-mesh SSH server.
+        Installed at /home/ssh-mesh/.ssh/authorized_keys; mutable operator
+        state, so leave empty to manage the file by hand.
+      '';
+    };
+
+    resumeReconcile = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Run a bounded mesh-init reconcile after suspend/resume.";
     };
 
     openFirewall = mkOption {
@@ -72,8 +69,8 @@ in {
   };
 
   config = mkIf cfg.enable {
-    # Create the users expected by mesh-init and ssh-mesh.
-    # system user (UID 1000)
+    # Identities expected by mesh-init and ssh-mesh. /home/system is mutable
+    # operator state and is not treated as NixOS configuration data.
     users.users.system = {
       isNormalUser = true;
       uid = 1000;
@@ -102,48 +99,19 @@ in {
     };
     users.groups.ssh-mesh = { gid = 150; };
 
-    # Systemd Slice for cgroup delegation
-    systemd.slices.mesh = {
-      description = "Mesh Slice";
-      sliceConfig = {
-        Delegate = true;
-      };
-    };
-
-    # Systemd Service for mesh-init
-    systemd.services.mesh-init = {
-      description = "Mesh Init Daemon";
-      after = [ "network.target" ];
-      wantedBy = [ "multi-user.target" ];
-      environment = {
-        RUST_LOG = "info";
-        MESH_RUN_BASE = "/run/mesh";
-        MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock";
-      };
-      serviceConfig = {
-        ExecStart = "/opt/ssh-mesh/bin/mesh-init";
-        WorkingDirectory = "/home/system";
-        Slice = "mesh.slice";
-        Delegate = true;
-        Type = "simple";
-        Restart = "always";
-        StandardOutput = "journal";
-        StandardError = "journal";
-      };
-    };
-
-    system.activationScripts.ssh-mesh-layout = {
+    # Stable /opt/ssh-mesh symlink plus the directory skeletons the services
+    # need. Files under /home/system/etc/mesh-init are created by mesh-init
+    # from the packaged defaults, never by activation scripts.
+    system.activationScripts.mesh-init = {
       text = ''
         mkdir -p /opt
         ln -sfn ${cfg.package} /opt/ssh-mesh
 
         install -d -m 0755 -o root -g root /run/mesh
-        install -d -m 0755 -o system -g system /home/system
-        install -d -m 0750 -o ssh-mesh -g ssh-mesh /home/ssh-mesh
-        install -d -m 0755 -o system -g system /home/system/etc/mesh-init /home/system/run /home/system/logs
-        install -d -m 0750 -o ssh-mesh -g ssh-mesh /home/ssh-mesh/etc /home/ssh-mesh/run/ssh-mesh /home/ssh-mesh/run/ssh-mesh/mux /home/ssh-mesh/logs
-        install -m 0644 -o system -g system ${sshMeshToml} /home/system/etc/mesh-init/ssh-mesh.toml
-        install -m 0644 -o ssh-mesh -g ssh-mesh ${authorizedKeysFile} /home/ssh-mesh/etc/authorized_keys
+        install -d -m 0750 -o ssh-mesh -g ssh-mesh /home/ssh-mesh/.ssh \
+          /home/ssh-mesh/etc /home/ssh-mesh/run/ssh-mesh /home/ssh-mesh/run/ssh-mesh/mux
+        install -m 0644 -o ssh-mesh -g ssh-mesh ${authorizedKeysFile} \
+          /home/ssh-mesh/.ssh/authorized_keys
       '';
     };
 
@@ -151,7 +119,46 @@ in {
       "d /run/mesh 0755 root root -"
     ];
 
-    # Allow default ports in firewall
-    networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [ 15022 8080 ];
+    # Cgroup subtree delegated to mesh-init for service resource control.
+    systemd.slices.mesh = {
+      description = "Mesh cgroup slice";
+      sliceConfig = {
+        Delegate = true;
+      };
+    };
+
+    systemd.services.mesh-init = {
+      description = "mesh-init service supervisor and ssh-mesh host";
+      after = [ "local-fs.target" ];
+      wantedBy = [ "multi-user.target" ];
+      environment = {
+        HOME = "/home/system";
+        RUST_LOG = "info";
+        PATH = mkForce meshPath;
+        MESH_RUN_BASE = "/run/mesh";
+        MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock";
+      };
+      serviceConfig = {
+        ExecStart = "/opt/ssh-mesh/bin/mesh-init";
+        WorkingDirectory = "/home/system";
+        Slice = "mesh.slice";
+        Type = "simple";
+        Restart = "on-failure";
+        RestartSec = "2s";
+        StandardOutput = "journal";
+        StandardError = "journal";
+      };
+    };
+
+    powerManagement.resumeCommands = mkIf cfg.resumeReconcile (mkAfter ''
+      PATH=${meshPath}
+      export PATH
+      timeout 5 mesh mesh-init mesh-init reconcile
+    '');
+
+    networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [
+      15022
+      8080
+    ];
   };
 }

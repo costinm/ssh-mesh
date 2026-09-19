@@ -10,4 +10,5 @@ pub mod observer;
 pub mod process;
 pub use mesh::protocol;
 pub mod resource;
+pub mod seed;
 pub mod server;

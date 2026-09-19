@@ -83,6 +83,8 @@
               mkdir -p "$out/share/ssh-mesh/nixos"
               cp ${./nixos/module.nix} "$out/share/ssh-mesh/nixos/module.nix"
               cp ${./nixos/example.nix} "$out/share/ssh-mesh/nixos/example.nix"
+              mkdir -p "$out/share/mesh-init/defaults"
+              cp -rL ${./crates}/mesh-init/defaults/. "$out/share/mesh-init/defaults/"
               for app in ssh-mesh mesh-init; do
                 if [ -d "${./crates}/$app/resources" ]; then
                   mkdir -p "$out/opt/$app/resources"
@@ -155,10 +157,9 @@
         # ── Docker image ──────────────────────────────────────────
 
         sshm-opt-bin = pkgs.runCommand "sshm-opt-bin" {} ''
-          mkdir -p $out/opt/ssh-mesh/bin
-          for f in ${ssh-mesh}/bin/*; do
-            ln -s $f $out/opt/ssh-mesh/bin/$(basename $f)
-          done
+          mkdir -p $out/opt/ssh-mesh
+          ln -s ${ssh-mesh}/bin $out/opt/ssh-mesh/bin
+          ln -s ${ssh-mesh}/share $out/opt/ssh-mesh/share
         '';
 
         sshm-busybox-opt = pkgs.runCommand "sshm-busybox-opt" {} ''
@@ -169,35 +170,14 @@
           ${pkgs.pkgsStatic.busybox}/bin/busybox --install -s $out/opt/busybox/bin
         '';
 
+        # Baked-in configuration for users who prefer a pre-seeded image. It
+        # reuses the canonical packaged defaults so the image cannot diverge
+        # from first-start seeding; the image itself ships only the defaults
+        # and lets mesh-init seed /home/system/etc/mesh-init at first start.
         sshm-config = pkgs.runCommand "sshm-config" {} ''
           mkdir -p $out/home/system/etc/mesh-init
-          cat > $out/home/system/etc/mesh-init/ssh-mesh.toml <<'EOF'
-[Service]
-ExecStart = "/opt/ssh-mesh/bin/ssh-mesh"
-User = "1001"
-Group = "1001"
-OOMScoreAdjust = -900
-
-[Socket]
-Accept = false
-
-[[Socket.Listen]]
-Type = "stream"
-Address = "15022"
-Name = "ssh"
-
-[[Socket.Listen]]
-Type = "stream"
-Address = "8080"
-Name = "http"
-
-[Environment]
-SSH_BASEDIR = "/home/ssh-mesh/.ssh"
-SSH_PORT = "15022"
-HTTP_PORT = "8080"
-MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock"
-RUST_LOG = "info"
-EOF
+          cp ${ssh-mesh}/share/mesh-init/defaults/ssh-mesh.toml \
+            $out/home/system/etc/mesh-init/ssh-mesh.toml
         '';
 
         sshm = pkgs.dockerTools.buildLayeredImage {
@@ -256,6 +236,7 @@ EOF
         };
       }
     )) // {
+      nixosModules.mesh-init = ./nixos/module.nix;
       nixosModules.default = ./nixos/module.nix;
 
       nixosConfigurations = {
@@ -264,7 +245,7 @@ EOF
           modules = [
             ./nixos/module.nix
             ({ pkgs, ... }: {
-              services.ssh-mesh = {
+              services.mesh-init = {
                 enable = true;
                 package = self.packages.x86_64-linux.ssh-mesh;
                 authorizedKeys = [
