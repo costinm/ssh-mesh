@@ -20,6 +20,28 @@ use tracing::info;
 
 use mesh_init::daemon::{Daemon, DaemonConfig};
 
+/// Wait for the termination signals used by service managers and interactive
+/// supervisors. Keeping this separate lets both daemon and command mode stop
+/// their managed children through `Daemon::shutdown`.
+async fn termination_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => Ok("SIGINT"),
+            _ = sigterm.recv() => Ok("SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok("SIGINT")
+    }
+}
+
 #[derive(Parser, Debug)]
 #[clap(name = "mesh-init", version = "0.1.0", trailing_var_arg = true)]
 struct Args {
@@ -183,6 +205,11 @@ async fn run(
                 daemon.shutdown().await;
                 wait_for_service_exit(&daemon, app_name).await;
             }
+            signal = termination_signal() => {
+                info!(signal = %signal?, "termination_signal_received");
+                daemon.shutdown().await;
+                server_run.await?;
+            }
         }
     } else {
         // Start all background tasks: load configs, start init-* services,
@@ -207,12 +234,22 @@ async fn run(
             }
         });
 
-        // Daemon mode: run the control server in the foreground (blocks until shutdown).
+        // Daemon mode: the control server runs in the foreground until a
+        // control-plane shutdown or a service-manager termination signal.
         let server = mesh_init::server::ControlServer::new(
             daemon.config.socket_path.clone(),
             daemon.clone(),
         );
-        server.run().await?;
+        let server_run = server.run();
+        tokio::pin!(server_run);
+        tokio::select! {
+            result = &mut server_run => result?,
+            signal = termination_signal() => {
+                info!(signal = %signal?, "termination_signal_received");
+                daemon.shutdown().await;
+                server_run.await?;
+            }
+        }
     }
 
     Ok(())

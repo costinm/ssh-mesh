@@ -233,14 +233,26 @@ pub fn start_mock_mesh_init(
                 }
                 let line = String::from_utf8_lossy(&line_bytes).into_owned();
 
-                // Parse the request
+                // Match mesh-init's JSON-RPC envelope, then work with its
+                // request parameters. This intentionally rejects the old flat
+                // JSON shape so SSH tests cover the production wire protocol.
                 let val: serde_json::Value =
                     serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
-                let command_opt = val
+                if val.get("jsonrpc") != Some(&serde_json::json!("2.0"))
+                    || val.get("method").and_then(|value| value.as_str()) != Some("start_terminal")
+                {
+                    return;
+                }
+                let params = val
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let command_opt = params
                     .get("command")
                     .and_then(|c| c.as_str())
                     .map(|s| s.to_string());
-                let _fd_count = val.get("fd_count").and_then(|f| f.as_u64()).unwrap_or(1) as usize;
+                let _fd_count =
+                    params.get("fd_count").and_then(|f| f.as_u64()).unwrap_or(1) as usize;
 
                 // Receive the file descriptor
                 let mut std_stream = match stream.into_std() {
@@ -306,7 +318,7 @@ pub fn start_mock_mesh_init(
                         .stderr(std::process::Stdio::from(fd.try_clone().unwrap()));
                 }
 
-                if let Some(env_obj) = val.get("env").and_then(|e| e.as_object()) {
+                if let Some(env_obj) = params.get("env").and_then(|e| e.as_object()) {
                     for (k, v) in env_obj {
                         if let Some(v_str) = v.as_str() {
                             cmd.env(k, v_str);
@@ -322,8 +334,9 @@ pub fn start_mock_mesh_init(
                 let pid = child.id();
 
                 let response = serde_json::json!({
-                    "success": true,
-                    "data": {
+                    "jsonrpc": "2.0",
+                    "id": val.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    "result": {
                         "pid": pid,
                         "terminal_id": "term-0"
                     }

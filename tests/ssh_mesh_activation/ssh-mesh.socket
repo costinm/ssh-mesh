@@ -1,0 +1,6 @@
+[Socket]
+ListenStream=0.0.0.0:19422
+ListenStream=0.0.0.0:19480
+FileDescriptorName=ssh http
+Accept=false
+Service=ssh-mesh

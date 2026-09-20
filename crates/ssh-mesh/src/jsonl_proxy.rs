@@ -72,6 +72,18 @@ mod tests {
     }
 
     #[test]
+    fn unwraps_array_json_rpc_result_without_a_mesh_wrapper() {
+        let payload = jsonl_response_payload(json!({
+            "jsonrpc": "2.0",
+            "id": "request-1",
+            "result": [{"pid": 42}],
+        }))
+        .unwrap();
+
+        assert_eq!(payload, json!([{"pid": 42}]));
+    }
+
+    #[test]
     fn json_rpc_error_remains_an_error() {
         let error = jsonl_response_payload(json!({
             "jsonrpc": "2.0",

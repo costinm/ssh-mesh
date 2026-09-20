@@ -832,22 +832,22 @@ pub fn default_trace_socket_path(app_name: &str) -> Option<std::path::PathBuf> {
 /// this and then (optionally) [`serve`] to expose the buffer over UDS.
 ///
 /// `app` is the producer's short name (e.g. `"ssh-mesh"`, `"mesh-tun"`).
-/// It is used as the directory-based log file's basename (`<dir>/<app>.log`).
+/// It is used as the directory-based log file's basename unless mesh-init
+/// supplies the supervised service identity in `MESH_SERVICE_NAME`.
 ///
 /// The initial filter admits info so generic `event_type` records can be
 /// counted. `LogBufferLayer` still retains and streams only watched types; the
 /// output sinks below keep ordinary info records out of operational logs. Set
 /// `MESH_TRACE_LEVEL` to add diagnostic directives when needed.
 ///
-/// If `MESH_LOG_FILE` or `MESH_LOG_DIR` is set, a non-blocking JSON `fmt`
+/// A non-blocking JSON `fmt`
 /// layer is also installed that writes every event (subject to the same
-/// `EnvFilter`) to that path. `MESH_LOG_FILE` is an exact file path;
-/// `MESH_LOG_DIR` writes a daily-rotated `<dir>/<app>.log` file. Parent
+/// `EnvFilter`) to a file. `MESH_LOG_FILE` is an exact file path; otherwise,
+/// logs rotate daily in `MESH_LOG_DIR`, or in `./logs` beneath the process
+/// working directory when that variable is unset. Parent
 /// directories are created if missing. The returned `WorkerGuard` must be kept alive for the lifetime of
 /// the process (dropping it stops the background writer thread and flushes
-/// pending events); bind it to a named variable in `main` to be safe. If none
-/// of the file env vars is set, no file is written and the second tuple element
-/// is `None`.
+/// pending events); bind it to a named variable in `main` to be safe.
 ///
 /// This calls `tracing_subscriber`'s global `.init()`, so it can only be
 /// called once per process.
@@ -922,9 +922,7 @@ pub fn init(
 
 /// Build the optional non-blocking JSON file writer.
 ///
-/// Returns `Some((writer, guard))` when `MESH_LOG_FILE` or `MESH_LOG_DIR` is
-/// set and usable. Returns `None` when no file output is configured or the path
-/// cannot be created (logged as a warning; the buffer still works).
+/// Returns `Some((writer, guard))` when the log path can be created.
 fn build_file_writer(
     app: &str,
 ) -> Option<(
@@ -934,8 +932,16 @@ fn build_file_writer(
     let log_path = if let Some(path) = std::env::var_os("MESH_LOG_FILE").filter(|s| !s.is_empty()) {
         std::path::PathBuf::from(path)
     } else {
-        let dir = std::env::var_os("MESH_LOG_DIR").filter(|s| !s.is_empty())?;
-        std::path::PathBuf::from(dir).join(format!("{}.log", app))
+        let dir = std::env::var_os("MESH_LOG_DIR")
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join("logs")
+            });
+        let service = std::env::var("MESH_SERVICE_NAME").unwrap_or_else(|_| app.to_string());
+        dir.join(format!("{service}.log"))
     };
 
     let parent = log_path
@@ -953,9 +959,15 @@ fn build_file_writer(
     let dir = parent;
     let file_name = log_path.file_name()?.to_string_lossy();
     prune_log_files(dir, &file_name, 512 * 1024 * 1024);
-    // Keep one current file per day. This bounds each file without requiring
-    // a second logging process and works for both mesh-init and child apps.
-    let appender = tracing_appender::rolling::daily(dir, file_name.as_ref());
+    // `MESH_LOG_FILE` is an exact path: open it as-is without rotation so
+    // special files such as /dev/stderr keep working. All directory logs get
+    // one current file per day, which bounds each file without requiring a
+    // second logging process and works for mesh-init and child apps.
+    let appender = if std::env::var_os("MESH_LOG_FILE").is_some_and(|s| !s.is_empty()) {
+        tracing_appender::rolling::never(dir, file_name.as_ref())
+    } else {
+        tracing_appender::rolling::daily(dir, file_name.as_ref())
+    };
     Some(tracing_appender::non_blocking(appender))
 }
 

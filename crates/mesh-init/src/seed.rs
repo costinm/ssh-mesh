@@ -19,6 +19,8 @@
 //!
 //! Every seeded or skipped file is logged.
 
+// TODO: move to mesh-cli, add a template function. This doesn't need to run at all times in mesh-init.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

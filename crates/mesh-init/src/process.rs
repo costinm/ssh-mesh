@@ -933,6 +933,9 @@ pub fn spawn_process(
     for (key, value) in &config.env {
         cmd.env(key, value);
     }
+    // Let common runtime facilities, including the default log writer, use
+    // the supervised service identity rather than the executable name.
+    cmd.env("MESH_SERVICE_NAME", &config.name);
     let sandbox = build_sandbox_plan(config)?;
 
     // A2: Privilege drop and hardening — all in pre_exec, in the correct

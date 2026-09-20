@@ -163,6 +163,23 @@ mod tests {
         assert!(!jump_route_matches(&route, "vm-nonet.example.m", 22));
         assert!(!jump_route_matches(&route, "bwrap-nonet.example.m", 2222));
     }
+
+    #[test]
+    fn mesh_init_terminal_request_uses_json_rpc() {
+        let request = mesh::protocol::Request::TerminalCommand {
+            terminal_id: "term-7".to_string(),
+            command: "close".to_string(),
+            data: serde_json::json!({}),
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_str(&serialize_mesh_init_request(&request).unwrap()).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 1);
+        assert_eq!(value["method"], "terminal_command");
+        assert_eq!(value["params"]["terminal_id"], "term-7");
+        assert!(value["params"].get("method").is_none());
+    }
 }
 
 impl SshHandler {
@@ -1381,7 +1398,7 @@ fn send_start_terminal_to_mesh_init_blocking(
         command,
         fd_count: Some(fds.len() as u32),
     };
-    let line = serde_json::to_string(&request)?;
+    let line = serialize_mesh_init_request(&request)?;
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -1417,7 +1434,7 @@ fn send_mesh_init_control_request_blocking(
     stream: &mut std::os::unix::net::UnixStream,
     request: &mesh::protocol::Request,
 ) -> Result<mesh::protocol::Response, anyhow::Error> {
-    let line = serde_json::to_string(request)?;
+    let line = serialize_mesh_init_request(request)?;
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -1453,8 +1470,39 @@ fn read_mesh_init_response_blocking(
     if response.is_empty() {
         anyhow::bail!("empty response from mesh-init");
     }
-    let response = String::from_utf8(response)?;
-    Ok(serde_json::from_str(response.trim())?)
+    let response: serde_json::Value = serde_json::from_slice(&response)?;
+    if response.get("jsonrpc") != Some(&serde_json::json!("2.0")) {
+        anyhow::bail!("mesh-init response is not JSON-RPC 2.0");
+    }
+    if let Some(result) = response.get("result") {
+        return Ok(mesh::protocol::Response::ok_with_data(result.clone()));
+    }
+    let error = response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown error")
+        .to_string();
+    Ok(mesh::protocol::Response::err(error))
+}
+
+/// Terminal requests use JSON-RPC so mesh-init can keep the request and
+/// response format stable; the SCM_RIGHTS payload follows this line separately.
+pub(crate) fn serialize_mesh_init_request(
+    request: &mesh::protocol::Request,
+) -> Result<String, anyhow::Error> {
+    let mut params = serde_json::to_value(request)?;
+    let method = params
+        .as_object_mut()
+        .and_then(|params| params.remove("method"))
+        .and_then(|method| method.as_str().map(str::to_owned))
+        .ok_or_else(|| anyhow::anyhow!("mesh-init request omitted method"))?;
+    Ok(serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }))?)
 }
 
 /// Handler deals with one SSH connection, after crypto and

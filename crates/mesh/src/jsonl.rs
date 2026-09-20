@@ -778,7 +778,14 @@ pub fn format_response(response: Response, format: &ProtocolFormat) -> anyhow::R
             let mut map = serde_json::Map::new();
             map.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
             if response.success {
-                map.insert("result".to_string(), response_object(response.data));
+                // JSON-RPC permits every JSON value as `result`; preserve
+                // array and scalar handler values exactly. A no-payload mesh
+                // response remains the established empty-object result so
+                // callers can safely inspect it.
+                map.insert(
+                    "result".to_string(),
+                    response.data.unwrap_or_else(|| serde_json::json!({})),
+                );
             } else {
                 let mut err_map = serde_json::Map::new();
                 err_map.insert("code".to_string(), serde_json::json!(-32603));
@@ -804,16 +811,6 @@ pub fn format_response(response: Response, format: &ProtocolFormat) -> anyhow::R
             response.error.as_deref(),
             response.data.as_ref(),
         )),
-    }
-}
-
-/// RPC result payloads are always objects. Legacy scalar/no-content handlers
-/// are made explicit rather than leaking a second response shape.
-fn response_object(data: Option<serde_json::Value>) -> serde_json::Value {
-    match data {
-        Some(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
-        None | Some(serde_json::Value::Null) => serde_json::json!({}),
-        Some(value) => serde_json::json!({"value": value}),
     }
 }
 
@@ -923,6 +920,32 @@ mod tests {
         assert_eq!(val["jsonrpc"], "2.0");
         assert_eq!(val["result"]["pid"], 42);
         assert_eq!(val["id"], 100);
+    }
+
+    #[test]
+    fn preserves_array_json_rpc_result() {
+        let formatted = format_response(
+            Response::ok_with_data(serde_json::json!([{"pid": 42}])),
+            &ProtocolFormat::JsonRpc {
+                id: Some(serde_json::json!(100)),
+            },
+        )
+        .unwrap();
+        let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(val["result"], serde_json::json!([{"pid": 42}]));
+    }
+
+    #[test]
+    fn formats_no_payload_json_rpc_response_as_empty_object() {
+        let formatted = format_response(
+            Response::ok(),
+            &ProtocolFormat::JsonRpc {
+                id: Some(serde_json::json!(100)),
+            },
+        )
+        .unwrap();
+        let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(val["result"], serde_json::json!({}));
     }
 
     #[tokio::test]

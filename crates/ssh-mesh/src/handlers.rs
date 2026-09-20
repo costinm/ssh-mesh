@@ -495,7 +495,7 @@ fn send_mesh_init_exec_fd_blocking(
         command: Some(cmd),
         fd_count: None,
     };
-    let line = serde_json::to_string(&request)?;
+    let line = crate::sshd::serialize_mesh_init_request(&request)?;
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -518,16 +518,21 @@ fn send_mesh_init_exec_fd_blocking(
         }
     }
     anyhow::ensure!(!response.is_empty(), "empty response from mesh-init");
-    let response = String::from_utf8(response)?;
-    let response: mesh::protocol::Response = serde_json::from_str(response.trim())?;
-    if response.success {
+    let response: serde_json::Value = serde_json::from_slice(&response)?;
+    anyhow::ensure!(
+        response.get("jsonrpc") == Some(&serde_json::json!("2.0")),
+        "mesh-init response is not JSON-RPC 2.0"
+    );
+    if response.get("result").is_some() {
         Ok(())
     } else {
         Err(anyhow::anyhow!(
             "mesh-init exec failed: {}",
             response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error")
         ))
     }
 }
@@ -886,5 +891,30 @@ mod tests {
             .await
             .expect("prefixed admin response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn embeds_mesh_init_process_and_cgroup_pages() {
+        for asset in ["mesh/mesh.js", "mesh/processes.html", "mesh/cgroups.html"] {
+            assert!(
+                Assets::get(asset).is_some(),
+                "missing embedded asset {asset}"
+            );
+        }
+        assert!(Assets::get("dashboard.html").is_none());
+        assert!(Assets::get("discovery.html").is_none());
+        assert!(Assets::get("probe.html").is_none());
+        let helper = Assets::get("mesh/mesh.js").expect("mesh-init helper asset");
+        let helper = std::str::from_utf8(&helper.data).expect("helper is UTF-8");
+        assert!(helper.contains("proxy/jsonrpc/mesh-init"));
+        assert!(helper.contains("jsonrpc: '2.0'"));
+        let processes = Assets::get("mesh/processes.html").expect("processes asset");
+        let processes = std::str::from_utf8(&processes.data).expect("processes is UTF-8");
+        assert!(processes.contains("escapeHtml(process.cmdline"));
+        assert!(!processes.contains("fonts.googleapis.com"));
+        let cgroups = Assets::get("mesh/cgroups.html").expect("cgroups asset");
+        let cgroups = std::str::from_utf8(&cgroups.data).expect("cgroups is UTF-8");
+        assert!(cgroups.contains("escapeHtml(p.cmdline"));
+        assert!(!cgroups.contains("fonts.googleapis.com"));
     }
 }

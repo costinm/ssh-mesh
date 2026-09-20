@@ -1,108 +1,45 @@
-# Build stage using Rust with MUSL for static linking
-FROM rust:slim-bookworm AS base
+# Build static Linux binaries for the standalone container image. Android
+# artifacts belong to the DMesh build and are intentionally not built here.
+FROM rust:slim-bookworm AS build
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     musl-tools \
-    clang \
-    curl \
-    gcc-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
-
 RUN rustup target add x86_64-unknown-linux-musl
-RUN rustup target add aarch64-unknown-linux-musl
-
-# Build otel with glibc instead of musl
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /src
-
-# -----------------------
-FROM base AS build
-
-# Copy workspace configuration and sources
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-
-# Build mesh-init and ssh-mesh targets for MUSL, built individually
-# Less efficient (duplicate builds of common deps), but want to evaluate each
-RUN cargo build --target x86_64-unknown-linux-musl --release -p mesh-init
-RUN cargo build --target x86_64-unknown-linux-musl --release -p mesh-cli
-RUN cargo build --target x86_64-unknown-linux-musl --release -p ssh-mesh
-
-RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    cargo build --target aarch64-unknown-linux-musl --release -p ssh-mesh
-RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    cargo build --target aarch64-unknown-linux-musl --release -p mesh-init
-RUN CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    cargo build --target aarch64-unknown-linux-musl --release -p mesh-cli
-
-# -----------------------
-FROM rust:slim-bookworm AS build-android
-
-# Install dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Download and install Android NDK
-ENV ANDROID_NDK_VERSION=r27b
-ENV ANDROID_NDK_HOME=/opt/android-ndk
-RUN curl -o ndk.zip https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip && \
-    unzip -q ndk.zip && \
-    rm ndk.zip && \
-    mv android-ndk-${ANDROID_NDK_VERSION} ${ANDROID_NDK_HOME}
-
-# Add Rust Android targets
-RUN rustup target add aarch64-linux-android
-RUN rustup target add x86_64-linux-android
-
-# Set up environment variables for Android NDK toolchains
-ENV PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
-ENV CC_aarch64_linux_android=aarch64-linux-android34-clang
-ENV CXX_aarch64_linux_android=aarch64-linux-android34-clang++
-ENV AR_aarch64_linux_android=llvm-ar
-ENV CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android34-clang
-ENV CC_x86_64_linux_android=x86_64-linux-android34-clang
-ENV CXX_x86_64_linux_android=x86_64-linux-android34-clang++
-ENV AR_x86_64_linux_android=llvm-ar
-ENV CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=x86_64-linux-android34-clang
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build for aarch64-linux-android
-RUN cargo build --target aarch64-linux-android --release -p ssh-mesh
+# Build the packages that provide the runtime binaries in one
+# dependency-sharing invocation.
+RUN cargo build --target x86_64-unknown-linux-musl --release \
+    -p mesh-init -p mesh-cli -p ssh-mesh
 
-# Build for x86_64-linux-android
-RUN cargo build --target x86_64-linux-android --release -p ssh-mesh
+# Assemble a stable /opt layout once so the scratch and diagnostic images use
+# identical binaries and canonical mesh-init defaults.
+FROM scratch AS runtime-root
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh-init /opt/ssh-mesh/bin/mesh-init
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh /opt/ssh-mesh/bin/ssh-mesh
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh /opt/ssh-mesh/bin/mesh
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/h2t /opt/ssh-mesh/bin/h2t
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/meshkeys /opt/ssh-mesh/bin/meshkeys
+COPY crates/mesh-init/defaults /opt/ssh-mesh/share/mesh-init/defaults
 
+# This is mutable container state. It begins with the canonical default, and
+# mesh-init preserves any later operator edit instead of overwriting it.
+COPY crates/mesh-init/defaults/ssh-mesh.toml /home/system/etc/mesh-init/ssh-mesh.toml
 
-# -----------------------
-# Use with 
-# docker build --progress=plain --output /z/build/.cache/OUT --target bin .
-FROM scratch as bin
+FROM runtime-root AS scratch
+ENV PATH=/opt/ssh-mesh/bin
+EXPOSE 15022 8080
+ENTRYPOINT ["/opt/ssh-mesh/bin/mesh-init"]
 
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh .
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/h2t .
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/meshkeys .
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh .
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh-init .
-
-COPY --from=build /src/target/aarch64-unknown-linux-musl/release/mesh-init aarch64/
-COPY --from=build /src/target/aarch64-unknown-linux-musl/release/ssh-mesh aarch64/
-
-# ------------------------
-# Final stage for creating a test docker image with various utils.
-FROM nicolaka/netshoot
-
-# Copy the statically linked binaries from the build stage
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ssh-mesh /usr/local/bin/ssh-mesh
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/mesh-init /usr/local/bin/mesh-init
-
-# Use ssh-mesh as the default entrypoint
-ENTRYPOINT ["/usr/local/bin/ssh-mesh"]
+# A diagnostics-friendly variant for ordinary Docker/Podman use. It has the
+# same rootfs payload and supervisor entrypoint as the scratch target.
+FROM nicolaka/netshoot AS netshoot
+COPY --from=runtime-root /opt /opt
+COPY --from=runtime-root /home /home
+ENV PATH=/opt/ssh-mesh/bin:${PATH}
+EXPOSE 15022 8080
+ENTRYPOINT ["/opt/ssh-mesh/bin/mesh-init"]

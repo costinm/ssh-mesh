@@ -22,6 +22,8 @@ use crate::protocol::{Request, Response};
 use mesh::tagged::{TaggedCatalog, TaggedRecord};
 use mesh::wire::{TaggedRecordHandler, response_ok, serve_cbor_session};
 
+// TODO: move CBOR related code to mesh - not specific to mesh-init
+
 // ============================================================================
 // Control Server
 // ============================================================================
