@@ -89,9 +89,6 @@ pub struct MeshSection {
     /// Optional OpenSSH-compatible local ControlMaster socket path.
     #[serde(rename = "ControlPath")]
     pub control_path: Option<String>,
-    /// Optional generated tools catalog used for tagged conversion.
-    #[serde(rename = "Tools")]
-    pub tools: Option<String>,
     /// Default outbound encoding: `auto`, `cbor`, `json`, `text`, or `mux`.
     #[serde(rename = "DestinationFormat")]
     pub destination_format: Option<String>,
@@ -1550,5 +1547,18 @@ AllowDangerousEnv = ["PATH", "LD_LIBRARY_PATH"]
             )
             .is_ok()
         ); // empty type is omitted/ignored and is OK
+    }
+
+    #[test]
+    fn legacy_mesh_tools_setting_does_not_affect_endpoint_parsing() {
+        let config = parse_service(
+            "[Service]\nExecStart = \"/bin/true\"\n\n[Mesh]\nAddress = \"unix:///run/mesh/demo/mesh.sock\"\nTools = \"/old/tools.json\"\n",
+            Some("demo"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.mesh.unwrap().address.as_deref(),
+            Some("unix:///run/mesh/demo/mesh.sock")
+        );
     }
 }

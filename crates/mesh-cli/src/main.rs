@@ -451,8 +451,7 @@ async fn rpc_destination(cli: &Cli, catalog_destination: &str) -> Result<()> {
     }
     // Service-name resolution may already have replaced `cli.destination`
     // with a Unix address. Catalog lookup stays tied to the logical service
-    // name so its [Mesh].Tools entry (or packaged generated catalog) remains
-    // available after transport resolution.
+    // name so its installed catalog remains available after transport resolution.
     let catalog = catalog(catalog_destination)?;
     let mut record = record_from_argv(&cli.arguments, catalog.as_deref())?;
     // CLI invocations are request/reply exchanges. One-way events are emitted
@@ -610,6 +609,16 @@ mod tests {
             to_json(&record, None),
             json!({"method": "mesh-init.stop", "name": "demo"})
         );
+    }
+
+    #[test]
+    fn positional_rpc_argument_is_rejected_without_a_catalog() {
+        let arguments = vec![
+            "mesh-init".to_owned(),
+            "start".to_owned(),
+            "radio".to_owned(),
+        ];
+        assert!(record_from_argv(&arguments, None).is_err());
     }
 
     #[test]

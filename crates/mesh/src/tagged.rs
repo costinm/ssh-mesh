@@ -108,8 +108,6 @@ pub struct MethodSchema {
 #[derive(Clone, Debug)]
 pub struct FieldSchema {
     pub tag: u32,
-    /// One-based, at most three slots for readable text invocations.
-    pub positional: Option<u8>,
 }
 
 /// Catalog used for format translation. It intentionally permits unknown values.
@@ -174,23 +172,9 @@ impl TaggedCatalog {
                                 .and_then(Value::as_u64)
                         })
                     {
-                        let positional = property
-                            .get("x-cli-position")
-                            .and_then(Value::as_u64)
-                            .or_else(|| {
-                                annotation
-                                    .and_then(|value| value.get("positional"))
-                                    .and_then(Value::as_u64)
-                            })
-                            .and_then(|slot| u8::try_from(slot).ok())
-                            .filter(|slot| (1..=3).contains(slot));
-                        schema.fields.insert(
-                            field.clone(),
-                            FieldSchema {
-                                tag: tag as u32,
-                                positional,
-                            },
-                        );
+                        schema
+                            .fields
+                            .insert(field.clone(), FieldSchema { tag: tag as u32 });
                     }
                 }
             }
@@ -233,7 +217,7 @@ impl TaggedCatalog {
         Ok(self.to_jsonl(record))
     }
 
-    /// Parse `component.method name=value positional...` into a tagged record.
+    /// Parse `component.method name=value ...` into a tagged record.
     pub fn parse_text(&self, line: &str) -> Result<TaggedRecord> {
         let tokens = text_tokens(line)?;
         self.parse_tokens(&tokens)
@@ -332,13 +316,8 @@ impl TaggedCatalog {
             method,
             ..Default::default()
         };
-        let mut options = true;
         for &token in rest {
-            if options && token == "--" {
-                options = false;
-                continue;
-            }
-            if options && token.starts_with('-') {
+            if token.starts_with('-') {
                 let option = token.trim_start_matches('-');
                 let (name, value) = option
                     .split_once('=')
@@ -352,8 +331,7 @@ impl TaggedCatalog {
                     .map(|field| NameOrTag::Tag(field.tag))
                     .unwrap_or_else(|| NameOrTag::parse(name));
                 record.env.insert(key, text_value(value));
-            } else if options
-                && let Some((name, value)) = token.split_once('=')
+            } else if let Some((name, value)) = token.split_once('=')
                 && !name.is_empty()
             {
                 if name == "to" {
@@ -366,16 +344,7 @@ impl TaggedCatalog {
                     .unwrap_or_else(|| NameOrTag::parse(name));
                 record.env.insert(key, text_value(value));
             } else {
-                record.params.push(text_value(token));
-            }
-        }
-        if let Some(schema) = schema {
-            for field in schema.fields.values() {
-                if let Some(slot) = field.positional {
-                    if let Some(value) = record.params.get(usize::from(slot - 1)).cloned() {
-                        record.env.entry(NameOrTag::Tag(field.tag)).or_insert(value);
-                    }
-                }
+                bail!("argument {token:?} must be name=value");
             }
         }
         Ok(record)
@@ -549,23 +518,19 @@ pub fn record_from_argv(
         method: NameOrTag::parse(method),
         ..Default::default()
     };
-    let mut options = true;
     for value in invocation_args {
-        if options && value == "--" {
-            options = false;
-        } else if options && value.starts_with('-') {
+        if value.starts_with('-') {
             let (key, value) = value
                 .trim_start_matches('-')
                 .split_once('=')
                 .ok_or_else(|| anyhow!("option {value} requires =value"))?;
             record.env.insert(NameOrTag::parse(key), text_value(value));
-        } else if options
-            && let Some((key, value)) = value.split_once('=')
+        } else if let Some((key, value)) = value.split_once('=')
             && !key.is_empty()
         {
             record.env.insert(NameOrTag::parse(key), text_value(value));
         } else {
-            record.params.push(text_value(&value));
+            bail!("argument {value:?} must be name=value");
         }
     }
     Ok(record)
@@ -756,17 +721,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn text_options_and_positional_values_share_tagged_env() {
+    fn text_arguments_require_named_fields() {
         let catalog = TaggedCatalog::from_tools_json(&json!([{
             "name":"wifi.listen", "x-mesh-wire":{"component":"wifi","method":"listen"},
-            "inputSchema":{"properties":{"iface":{"x-mesh-wire":{"tag":1,"positional":1}},"listen_sec":{"x-mesh-wire":{"tag":2,"positional":2}}}}
+            "inputSchema":{"properties":{"iface":{"x-mesh-wire":{"tag":1}},"listen_sec":{"x-mesh-wire":{"tag":2}}}}
         }])).unwrap();
         let record = catalog
-            .parse_text("wifi.listen -listen_sec=1 wlan0")
+            .parse_text("wifi.listen -listen_sec=1 iface=wlan0")
             .unwrap();
-        assert_eq!(record.params, vec![json!("wlan0")]);
+        assert!(record.params.is_empty());
         assert_eq!(record.env.get(&NameOrTag::Tag(1)), Some(&json!("wlan0")));
         assert_eq!(record.env.get(&NameOrTag::Tag(2)), Some(&json!(1)));
+        assert!(catalog.parse_text("wifi.listen wlan0").is_err());
     }
 
     #[test]
@@ -908,14 +874,14 @@ mod tests {
             "x-method-index": 72,
             "inputSchema": {"properties": {
                 "channel": {"x-protobuf-index": 2},
-                "promiscuous": {"x-protobuf-index": 10, "x-cli-position": 1}
+                "promiscuous": {"x-protobuf-index": 10}
             }}
         }]))
         .unwrap();
         let record = catalog
             .parse_argv(
                 "radio.control",
-                &["channel=6".to_owned(), "true".to_owned()],
+                &["channel=6".to_owned(), "promiscuous=true".to_owned()],
             )
             .unwrap();
         assert_eq!(record.component, NameOrTag::Tag(0));
@@ -927,9 +893,13 @@ mod tests {
             json!({
                 "method": "radio.control",
                 "channel": 6,
-                "promiscuous": true,
-                "params": [true]
+                "promiscuous": true
             })
+        );
+        assert!(
+            catalog
+                .parse_argv("radio.control", &["true".to_owned()])
+                .is_err()
         );
     }
 }

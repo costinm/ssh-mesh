@@ -55,7 +55,6 @@ pub struct ApiField {
     pub value_type: String,
     pub required: bool,
     pub default: Option<Value>,
-    pub position: Option<u8>,
     pub max: Option<String>,
 }
 
@@ -454,7 +453,6 @@ fn parse_field_table(lines: &[&str], start: usize) -> Result<(Vec<ApiField>, usi
             default: (!default.is_empty())
                 .then(|| parse_default(default))
                 .transpose()?,
-            position: None,
             max: (!get("Max").is_empty()).then(|| unquote(get("Max"))),
         });
         index += 1;
@@ -778,9 +776,6 @@ fn shape_schema(shape: &ApiShape) -> Value {
             "x-protobuf-type".to_owned(),
             Value::String(field.value_type.clone()),
         );
-        if let Some(position) = field.position {
-            property.insert("x-cli-position".to_owned(), Value::from(position));
-        }
         if let Some(default) = &field.default {
             property.insert("default".to_owned(), default.clone());
         }
@@ -894,21 +889,12 @@ fn validate(methods: &[ApiMethod]) -> Result<()> {
 
 fn validate_fields(id: &str, fields: &[ApiField]) -> Result<()> {
     let mut indices = BTreeSet::new();
-    let mut positions = BTreeSet::new();
     for field in fields {
         if field.index == 0 || !indices.insert(field.index) {
             bail!("{id} has duplicate or zero field index {}", field.index);
         }
         if field.value_type.is_empty() {
             bail!("{id}.{} has an empty type", field.name);
-        }
-        if let Some(position) = field.position {
-            if !(1..=3).contains(&position) || !positions.insert(position) {
-                bail!(
-                    "{id}.{} has invalid or duplicate CLI position {position}",
-                    field.name
-                );
-            }
         }
     }
     Ok(())

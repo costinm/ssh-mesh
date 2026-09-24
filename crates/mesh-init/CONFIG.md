@@ -10,7 +10,7 @@ Non-root `mesh-init` defaults to `$HOME/etc/mesh-init`.
 
 Service definitions are node-local client policy: they describe how processes
 on this node connect to a logical FQDN, including `[Mesh].Address`, transport,
-encoding, and the local static `Tools` catalog. `ExecStart` is the local-exec
+and encoding. `ExecStart` is the local-exec
 connection mechanism, comparable to invoking a remote serverless service over
 HTTPS. Existing lifecycle, socket, environment, network, and resource fields
 remain unchanged. A future `[Workload]` section will make provider-side

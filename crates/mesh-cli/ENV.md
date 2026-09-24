@@ -4,7 +4,7 @@
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `MESH_DEST_FORMAT` | `auto` | Encoding override. `auto` uses tagged-CBOR for a `.cbor` seqpacket endpoint and JSON-RPC for other current RPC endpoints. Catalog presence does not select the transport or encoding. `cbor` requires numeric tags; `mux` is a transport selector and is rejected here. |
-| `MESH_TOOLS` | unset | Exact `tools.json` override for numeric tags, documentation, and option/positional mapping. Failure to load an explicit override is an error. |
+| `MESH_TOOLS` | unset | Exact `tools.json` override for numeric tags, documentation, and named field mapping. Failure to load an explicit override is an error. |
 | `MESH_SCHEMA_DIR` | unset | Common schema root. For logical service `S`, `mesh` checks `$MESH_SCHEMA_DIR/S/tools.json` before installed package locations. |
 | `MESH_SERVICE_DIR` | unset | Common mesh service TOML file, or directory containing `<service>.toml`. A bare service name resolves its `[Mesh].Address` or standard mesh socket from this definition. |
 | `MESH_SSH_COMMAND` | `/usr/bin/ssh` | Real OpenSSH binary used for an unresolved bare host. This avoids recursion when `mesh` is symlinked as `ssh`. |

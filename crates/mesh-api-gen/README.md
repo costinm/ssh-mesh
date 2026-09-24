@@ -116,8 +116,8 @@ field in a table needs one:
 | 2 | `cursor` | `bytes` | | Opaque continuation token. |
 ```
 
-Table order is the default CLI argument and documentation order. Wire readers
-and writers use the tags, not the row positions or field names.
+Table order is documentation order. CLI callers name fields, for example
+`mesh mesh-init start name=radio`. Wire readers and writers use the tags.
 
 ## Method behavior, limits, and access
 
