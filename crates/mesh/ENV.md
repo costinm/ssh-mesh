@@ -17,6 +17,8 @@ prefer the common helper when possible.
 | `MESH_APP_OPT` | `<opt_base>/<app>` | Overrides the full packaged/read-only app path used by `AppPaths::for_app`. |
 | `MESH_RUN_BASE` | `$HOME/.local/run` for non-root, `/run/mesh` for root | Base directory for public mesh IPC endpoints. App endpoints are `<MESH_RUN_BASE>/<app>/mesh.sock`. An explicit `MESH_HOME` retains the pseudo-root layout at `<MESH_HOME>/run/mesh`. |
 | `MESH_RES_DIR` | `<app_home>/etc/resources`, then `<app_opt>/resources` | Replaces the normal resource lookup overlay with one explicit resource directory. |
+| `MESH_TOOLS` | unset | Exact client-owned `tools.json` override used by the shared catalog resolver. |
+| `MESH_SCHEMA_DIR` | unset | Common schema root; service `S` resolves as `$MESH_SCHEMA_DIR/S/tools.json` before `$HOME/opt/S/etc/schemas/tools.json` and `/opt/S/etc/schemas/tools.json`. |
 
 Deprecated:
 | `MESH_HOME_BASE` | `<MESH_HOME>/home` for non-root, `/home` for root | Base directory for mutable app homes when `MESH_APP_HOME` is unset. Takes precedence over `MESH_HOME`. |
@@ -27,7 +29,6 @@ Deprecated:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `MESH_ENFORCE_DELEGATION` | `false` | When `1`, `true`, or `yes`, `MeshListener` requires trusted delegate peers to send a valid delegation envelope before serving a UDS connection. |
-| `MESH_TRUSTED_SSHD_UID` | `103` | UID trusted as the local sshd delegate. Set to a numeric UID, or `none`/`off`/empty to disable this builtin trust entry. |
 | `MESH_SYSTEM_UID` | `1000` | UID of the "system" service account. Root-equivalent for all mesh-init permissions, including system-wide observer methods. Set to `none`/`off` to disable. |
 | `MESH_SSH_MESH_UID` | `150` | UID of the ssh-mesh service account. Trusted for terminal/start operations and impersonation, but NOT for observer methods. Set to `none`/`off` to disable. |
 | `LISTEN_FDS` | unset | Number of inherited listener FDs starting at fd 3, systemd-style. |

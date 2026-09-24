@@ -5,7 +5,6 @@
       "properties": {
         "method_name": {
           "type": "string",
-          "x-cli-position": 2,
           "x-protobuf-index": 2,
           "x-protobuf-type": "string"
         },
@@ -16,15 +15,11 @@
         },
         "socket_path": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
-      "required": [
-        "socket_path",
-        "method_name"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "ssh-mesh.jsonl_call",
@@ -34,6 +29,17 @@
       "type": "object"
     },
     "x-component-index": 4,
-    "x-method-index": 1
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   }
 ]

@@ -87,8 +87,13 @@
               cp -rL ${./crates}/mesh-init/defaults/. "$out/share/mesh-init/defaults/"
               for app in ssh-mesh mesh-init; do
                 if [ -d "${./crates}/$app/resources" ]; then
-                  mkdir -p "$out/opt/$app/resources"
-                  cp -rL "${./crates}/$app/resources/." "$out/opt/$app/resources/"
+                  mkdir -p "$out/opt/$app/etc/schemas"
+                  for schema in tools.json schema.json; do
+                    if [ -f "${./crates}/$app/resources/$schema" ]; then
+                      cp -L "${./crates}/$app/resources/$schema" \
+                        "$out/opt/$app/etc/schemas/$schema"
+                    fi
+                  done
                 fi
               done
               chmod -R +w "$out"
@@ -131,14 +136,14 @@
 
         runtime-deps = pkgs.symlinkJoin {
           name = "ssh-mesh-runtime-deps";
-          paths = with pkgs; [
-            bubblewrap
-            busybox
-            iperf3
-            iproute2
-            netcat
-            nftables
-            util-linux
+          paths = [
+            sshm-busybox-opt
+            pkgs.bubblewrap
+            pkgs.iperf3
+            pkgs.iproute2
+            pkgs.netcat
+            pkgs.nftables
+            pkgs.util-linux
           ];
         };
 

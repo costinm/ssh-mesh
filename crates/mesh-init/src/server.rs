@@ -31,9 +31,17 @@ use mesh::wire::{TaggedRecordHandler, response_ok, serve_cbor_session};
 /// Default maximum number of concurrent control-socket connections.
 const DEFAULT_MAX_CONTROL_CONNECTIONS: usize = 32;
 
-/// Public, generated schema used to translate numeric CBOR tags back into the
-/// existing serde `Request` enum. The schema is embedded with the daemon so a
-/// client and server cannot silently disagree because a runtime file changed.
+/// The packet-preserving tagged-CBOR endpoint corresponding to a legacy
+/// stream control socket.  It is intentionally separate: Unix permits only
+/// one socket type at a pathname, and the stream endpoint is a stable ABI.
+pub fn seqpacket_socket_path(socket_path: &str) -> String {
+    std::env::var("MESH_INIT_SEQPACKET_SOCK").unwrap_or_else(|_| format!("{socket_path}.cbor"))
+}
+
+/// Public, generated schema used to translate tagged-CBOR identities back into
+/// the existing serde `Request` enum. The schema is embedded with the daemon
+/// so a client and server cannot silently disagree because a runtime file
+/// changed.
 static CONTROL_CATALOG: LazyLock<TaggedCatalog> = LazyLock::new(|| {
     TaggedCatalog::from_tools_json(
         &serde_json::from_str(include_str!("../resources/tools.json"))
@@ -111,11 +119,7 @@ impl ControlServer {
                 && let Ok(path) = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())
             {
                 let _ = unsafe {
-                    libc::chown(
-                        path.as_ptr(),
-                        u32::MAX,
-                        mesh::auth::DEFAULT_TRUSTED_SSHD_UID,
-                    )
+                    libc::chown(path.as_ptr(), u32::MAX, mesh::auth::DEFAULT_SSH_MESH_UID)
                 };
             }
             if let Ok(metadata) = std::fs::metadata(parent) {
@@ -135,13 +139,8 @@ impl ControlServer {
         if unsafe { libc::getuid() } == 0
             && let Ok(path) = std::ffi::CString::new(self.socket_path.as_str())
         {
-            let _ = unsafe {
-                libc::chown(
-                    path.as_ptr(),
-                    u32::MAX,
-                    mesh::auth::DEFAULT_TRUSTED_SSHD_UID,
-                )
-            };
+            let _ =
+                unsafe { libc::chown(path.as_ptr(), u32::MAX, mesh::auth::DEFAULT_SSH_MESH_UID) };
         }
 
         // The socket is locally discoverable/connectable; requests are
@@ -157,7 +156,60 @@ impl ControlServer {
             )
         })?;
 
-        info!(path = %self.socket_path, "control_server_listening");
+        let seqpacket_path = seqpacket_socket_path(&self.socket_path);
+        if let Err(error) = std::fs::remove_file(&seqpacket_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| {
+                format!("remove stale mesh-init seqpacket socket {seqpacket_path}")
+            });
+        }
+        let seqpacket_listener = mesh::seqpacket::UnixSeqpacketListener::bind(&seqpacket_path)?;
+        if unsafe { libc::getuid() } == 0
+            && let Ok(path) = std::ffi::CString::new(seqpacket_path.as_str())
+        {
+            let _ =
+                unsafe { libc::chown(path.as_ptr(), u32::MAX, mesh::auth::DEFAULT_SSH_MESH_UID) };
+        }
+        let mut seqpacket_perms = std::fs::metadata(&seqpacket_path)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut seqpacket_perms, 0o666);
+        std::fs::set_permissions(&seqpacket_path, seqpacket_perms)?;
+        let seqpacket_daemon = self.daemon.clone();
+        let seqpacket_slots = self.connection_slots.clone();
+        tokio::spawn(async move {
+            let mut shutdown_rx = seqpacket_daemon.shutdown_tx.subscribe();
+            loop {
+                let stream = tokio::select! {
+                    result = seqpacket_listener.accept() => match result {
+                        Ok(stream) => stream,
+                        Err(error) => { error!(%error, "seqpacket_control_accept_failed"); continue; }
+                    },
+                    _ = shutdown_rx.changed() => { if *shutdown_rx.borrow() { break; } continue; }
+                };
+                let (peer_uid, peer_gid) = match stream.peer_cred() {
+                    Ok(cred) => cred,
+                    Err(error) => {
+                        warn!(%error, "seqpacket_peer_credentials_failed");
+                        continue;
+                    }
+                };
+                let permit = match seqpacket_slots.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
+                let daemon = seqpacket_daemon.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        handle_seqpacket_connection(stream, daemon, peer_uid, peer_gid).await
+                    {
+                        error!(%error, "seqpacket_control_connection_error");
+                    }
+                    drop(permit);
+                });
+            }
+        });
+
+        info!(path = %self.socket_path, seqpacket_path, "control_server_listening");
 
         let current_uid = unsafe { libc::getuid() };
 
@@ -227,6 +279,60 @@ impl ControlServer {
         }
         Ok(())
     }
+}
+
+async fn handle_seqpacket_connection(
+    stream: mesh::seqpacket::UnixSeqpacket,
+    daemon: Arc<Daemon>,
+    peer_uid: u32,
+    peer_gid: u32,
+) -> Result<()> {
+    while let Some((record, fds)) = stream.recv_cbor_record().await? {
+        let id = record
+            .id
+            .clone()
+            .context("tagged-CBOR request missing id")?;
+        let request = match decode_tagged_request(&record) {
+            Ok(request) => request,
+            Err(error) => {
+                let response = response_ok(
+                    id,
+                    serde_json::to_value(Response::err(format!("invalid request: {error}")))?,
+                );
+                stream.send_cbor_record(&response, &[]).await?;
+                continue;
+            }
+        };
+        let response = match request {
+            Request::Shutdown => {
+                if !fds.is_empty() {
+                    Response::err("shutdown does not accept passed file descriptors")
+                } else {
+                    let daemon = daemon.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        daemon.shutdown().await;
+                    });
+                    Response::ok()
+                }
+            }
+            request @ (Request::StartTerminal { .. } | Request::RegisterNamespace { .. }) => {
+                daemon
+                    .handle_request_with_fds(request, fds, peer_uid, peer_gid)
+                    .await
+            }
+            request => {
+                if !fds.is_empty() {
+                    Response::err("request does not accept passed file descriptors")
+                } else {
+                    daemon.handle_request(request, peer_uid, peer_gid).await
+                }
+            }
+        };
+        let response = response_ok(id, serde_json::to_value(response)?);
+        stream.send_cbor_record(&response, &[]).await?;
+    }
+    Ok(())
 }
 
 /// Handle a single control connection.
@@ -396,13 +502,10 @@ impl TaggedRecordHandler for CborControlHandler {
 }
 
 /// Reconstruct the stable public method and field names before invoking the
-/// existing serde-based service handler. Numeric tags never leak into service
-/// code; the generated catalog is the sole translation boundary.
+/// existing serde-based service handler. The shared catalog accepts both
+/// compact numeric IDs and public names, then keeps tags out of service code.
 fn decode_tagged_request(record: &TaggedRecord) -> Result<Request> {
-    if CONTROL_CATALOG.method_name(record).is_none() {
-        anyhow::bail!("tagged-CBOR method is outside the mesh-init public catalog");
-    }
-    let mut value = CONTROL_CATALOG.to_jsonl(record);
+    let mut value = CONTROL_CATALOG.documented_request(record)?;
     let method = value
         .get("method")
         .and_then(serde_json::Value::as_str)
@@ -604,19 +707,30 @@ mod tests {
     }
 
     #[test]
+    fn tagged_cbor_accepts_public_names_for_generated_numeric_catalog() {
+        let request = decode_tagged_request(&TaggedRecord {
+            component: NameOrTag::Name("mesh-init".to_owned()),
+            method: NameOrTag::Name("stop".to_owned()),
+            id: Some(json!(9)),
+            env: [(NameOrTag::Name("name".to_owned()), json!("radio"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(request, Request::Stop { name, signal: None } if name == "radio"));
+    }
+
+    #[test]
     fn tagged_cbor_rejects_methods_outside_generated_public_catalog() {
         let error = decode_tagged_request(&TaggedRecord {
             component: NameOrTag::Name("mesh-init".to_owned()),
-            method: NameOrTag::Name("start_terminal".to_owned()),
+            method: NameOrTag::Name("not_a_method".to_owned()),
             id: Some(json!(9)),
             ..Default::default()
         })
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("outside the mesh-init public catalog")
-        );
+        assert!(error.to_string().contains("outside the public catalog"));
     }
 
     #[tokio::test]

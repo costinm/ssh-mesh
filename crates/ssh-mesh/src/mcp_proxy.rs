@@ -31,11 +31,9 @@ async fn handle_mcp_json_rpc(Json(payload): Json<Value>) -> impl IntoResponse {
                 .into_response();
         }
     };
-    let registry = mesh::jsonl::McpRegistry::new("ssh-mesh");
-    let (format, response) = mesh::jsonl::dispatch_request::<SshMeshMcpRequest, _, _>(
-        &line,
-        &registry,
-        |request| async {
+    let registry = mesh::registry::ServiceRegistry::new("ssh-mesh");
+    let (format, response) =
+        mesh_mcp::dispatch_request::<SshMeshMcpRequest, _, _>(&line, &registry, |request| async {
             match request {
                 SshMeshMcpRequest::JsonlCall {
                     socket_path,
@@ -52,9 +50,8 @@ async fn handle_mcp_json_rpc(Json(payload): Json<Value>) -> impl IntoResponse {
                     }
                 }
             }
-        },
-    )
-    .await;
+        })
+        .await;
 
     let Some(response) = response else {
         return StatusCode::NO_CONTENT.into_response();

@@ -5,7 +5,6 @@
       "properties": {
         "name": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
@@ -20,7 +19,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 1
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Start a configured service by name",
@@ -38,14 +48,11 @@
         },
         "name": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
-      "required": [
-        "name"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.start",
@@ -55,7 +62,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 2
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Gracefully terminate or signal a running service",
@@ -63,7 +81,6 @@
       "properties": {
         "name": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         },
@@ -73,9 +90,7 @@
           "x-protobuf-type": "i32"
         }
       },
-      "required": [
-        "name"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.stop",
@@ -85,7 +100,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 3
+    "x-method-index": 3,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Suspend a running service",
@@ -93,14 +119,11 @@
       "properties": {
         "name": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
-      "required": [
-        "name"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.freeze",
@@ -110,7 +133,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 4
+    "x-method-index": 4,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Resume a frozen service",
@@ -118,14 +152,11 @@
       "properties": {
         "name": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
-      "required": [
-        "name"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.unfreeze",
@@ -135,7 +166,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 5
+    "x-method-index": 5,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Reload service configuration from disk",
@@ -151,7 +193,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 6
+    "x-method-index": 6,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Reconcile managed services after host resume or recovery",
@@ -179,15 +232,22 @@
           "x-protobuf-type": "u64"
         }
       },
-      "required": [
-        "checked",
-        "reconciled",
-        "failed"
-      ],
+      "required": [],
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 14
+    "x-method-index": 14,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Gracefully stop all services and shut down mesh-init",
@@ -203,7 +263,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 15
+    "x-method-index": 15,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "List observed processes from the process observer",
@@ -219,7 +290,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 7
+    "x-method-index": 7,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Return detailed information for one process",
@@ -227,14 +309,11 @@
       "properties": {
         "pid": {
           "type": "integer",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "u32"
         }
       },
-      "required": [
-        "pid"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.process",
@@ -244,7 +323,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 8
+    "x-method-index": 8,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Return all observed cgroups",
@@ -260,7 +350,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 9
+    "x-method-index": 9,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Return detailed information for one cgroup path",
@@ -268,14 +369,11 @@
       "properties": {
         "path": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
-      "required": [
-        "path"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.cgroup",
@@ -285,7 +383,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 10
+    "x-method-index": 10,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Return pressure watch state",
@@ -301,7 +410,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 11
+    "x-method-index": 11,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Set memory.high for a cgroup based on current memory usage",
@@ -323,11 +443,7 @@
           "x-protobuf-type": "f64"
         }
       },
-      "required": [
-        "path",
-        "percentage",
-        "interval"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.cgroup_high",
@@ -337,7 +453,18 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 12
+    "x-method-index": 12,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
     "description": "Move a process to a named cgroup",
@@ -350,14 +477,11 @@
         },
         "pid": {
           "type": "integer",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "u32"
         }
       },
-      "required": [
-        "pid"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "mesh-init.move_process",
@@ -367,6 +491,133 @@
       "type": "object"
     },
     "x-component-index": 3,
-    "x-method-index": 13
+    "x-method-index": 13,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Start a terminal with descriptors attached to its CBOR seqpacket request",
+    "inputSchema": {
+      "properties": {
+        "command": {
+          "type": "string",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "string"
+        },
+        "context": {
+          "type": "object",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "object"
+        },
+        "env": {
+          "type": "object",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "object"
+        },
+        "fd_count": {
+          "type": "integer",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "u32"
+        },
+        "gid": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u32"
+        },
+        "home": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "pty": {
+          "type": "boolean",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "bool"
+        },
+        "uid": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.start_terminal",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 16,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Register a namespace descriptor attached to its CBOR seqpacket request",
+    "inputSchema": {
+      "properties": {
+        "kind": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "target_pid": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "mesh-init.register_namespace",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 17,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   }
 ]

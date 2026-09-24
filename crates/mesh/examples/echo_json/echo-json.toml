@@ -1,0 +1,4 @@
+[Service]
+ExecStart = "mesh-echo-json"
+
+[Socket]

@@ -887,9 +887,16 @@ fn socket_to_activation_configs(
         && socket.listen_streams.is_empty()
         && socket.listen_datagrams.is_empty()
     {
-        return Err(ConfigError::Invalid(
-            "[Socket] requires Listen, ListenStream, or ListenDatagram".to_string(),
-        ));
+        let paths = crate::paths::AppPaths::for_app(service_name);
+        return Ok(vec![ActivationConfig {
+            socket: Some(paths.mesh_socket.to_string_lossy().into_owned()),
+            wait: !socket.accept,
+            fd_name: Some(service_name.to_string()),
+            socket_mode: socket.socket_mode,
+            socket_user: socket.socket_user.clone(),
+            socket_group: socket.socket_group.clone(),
+            ..Default::default()
+        }]);
     }
 
     let mut activations: Vec<(ActivationConfig, Option<String>)> = Vec::new();

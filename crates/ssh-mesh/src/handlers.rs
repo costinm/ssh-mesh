@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     Router,
     body::Body,
@@ -10,10 +11,8 @@ use axum::{
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use log::{debug, info};
-use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use russh::server::Server;
 use rust_embed::RustEmbed;
-use std::io::{IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use tokio::net::{TcpStream, UnixStream};
@@ -474,65 +473,102 @@ fn send_mesh_init_exec_fd_blocking(
     fd: OwnedFd,
 ) -> Result<(), anyhow::Error> {
     let socket_path = mesh_init_socket_path();
-    let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)?;
-    // The admin interface impersonates the 'system' user (UID 1000) when
-    // calling mesh-init. ssh-mesh itself runs as the ssh-mesh service UID
-    // (default 150, see mesh::auth::ssh_mesh_uid), which is in
-    // privileged_uids() and therefore allowed to target any UID. We
-    // explicitly request UID 1000 (system) so the exec'd command runs as
-    // the system service account, not as root.
+    // TEMPORARY compatibility path. The final HTTP exec target is resolved
+    // from the authenticated request, exactly like SSH exec: an ordinary
+    // command uses that user's UID/GID/home; a registered service uses its
+    // mesh-init configuration and is admitted only after service-specific
+    // authorization. Do not use ssh-mesh's own HOME for a different target
+    // UID: mesh-init intentionally verifies that the requested home belongs
+    // to the target identity.
+    //
+    // Until HTTP authentication and target resolution are wired here, this
+    // legacy admin endpoint asks for system rather than root. It is not the
+    // intended long-term authorization model.
     let system_uid = mesh::auth::system_uid().unwrap_or(1000);
     let system_gid = system_uid; // system user's primary GID matches UID
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let request = mesh::protocol::Request::StartTerminal {
-        name: "system".to_string(),
-        home,
-        uid: system_uid,
-        gid: Some(system_gid),
-        pty: false,
-        env,
-        context: None,
-        command: Some(cmd),
-        fd_count: None,
-    };
-    let line = crate::sshd::serialize_mesh_init_request(&request)?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-
-    let iov = [IoSlice::new(b"F")];
     let fds = [fd.as_raw_fd()];
-    let cmsg = [ControlMessage::ScmRights(&fds)];
-    sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)?;
-
-    let mut response = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            break;
-        }
-        response.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
-    anyhow::ensure!(!response.is_empty(), "empty response from mesh-init");
-    let response: serde_json::Value = serde_json::from_slice(&response)?;
-    anyhow::ensure!(
-        response.get("jsonrpc") == Some(&serde_json::json!("2.0")),
-        "mesh-init response is not JSON-RPC 2.0"
-    );
-    if response.get("result").is_some() {
+    // Duplicated constants are acceptable: the mesh-init control API is
+    // stable, and these numeric identities (component/method/field tags from
+    // crates/mesh-init/API.md, mirrored by mesh-init's generated catalog) are
+    // exactly what this seqpacket start_terminal request and mesh-init
+    // expect. No runtime schema load at this boundary; mesh::tagged::
+    // load_service_catalog stays the gateway/CLI translation path for
+    // generic, on-demand method translation.
+    let request_env = env
+        .clone()
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let record = mesh::tagged::TaggedRecord {
+        component: mesh::tagged::NameOrTag::Tag(mesh_api::mesh_init_ids::COMPONENT_MESH_INIT),
+        method: mesh::tagged::NameOrTag::Tag(
+            mesh_api::mesh_init_ids::METHOD_MESH_INIT_START_TERMINAL,
+        ),
+        id: Some(serde_json::json!(1)),
+        env: [
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_NAME,
+                serde_json::Value::String("system".to_string()),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_HOME,
+                serde_json::json!(home),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_UID,
+                serde_json::json!(system_uid),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_GID,
+                serde_json::json!(system_gid),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_PTY,
+                serde_json::json!(false),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_ENV,
+                serde_json::Value::Object(request_env),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_COMMAND,
+                serde_json::json!(Some(cmd.clone())),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_FD_COUNT,
+                serde_json::json!(1),
+            ),
+        ]
+        .into_iter()
+        .map(|(tag, value)| (mesh::tagged::NameOrTag::Tag(tag), value))
+        .collect(),
+        ..Default::default()
+    };
+    let response = tokio::runtime::Handle::current().block_on(async {
+        let stream =
+            mesh::seqpacket::UnixSeqpacket::connect(mesh_init_seqpacket_socket_path(&socket_path))
+                .await?;
+        stream.send_cbor_record(&record, &fds).await?;
+        let (response, returned_fds) = stream
+            .recv_cbor_record()
+            .await?
+            .context("mesh-init closed seqpacket control socket")?;
+        anyhow::ensure!(
+            returned_fds.is_empty(),
+            "mesh-init returned unexpected file descriptors"
+        );
+        response
+            .result
+            .context("mesh-init seqpacket response omitted result")
+    })?;
+    let response: mesh::protocol::Response = serde_json::from_value(response)?;
+    if response.success {
         Ok(())
     } else {
         Err(anyhow::anyhow!(
             "mesh-init exec failed: {}",
-            response
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown error")
+            response.error.as_deref().unwrap_or("unknown error")
         ))
     }
 }
@@ -551,9 +587,19 @@ fn mesh_init_socket_path() -> String {
         .into_owned()
 }
 
-/// Execute a shell command and stream stdin/stdout over the HTTP/2 body.
+fn mesh_init_seqpacket_socket_path(stream_path: &str) -> String {
+    std::env::var("MESH_INIT_SEQPACKET_SOCK").unwrap_or_else(|_| format!("{stream_path}.cbor"))
+}
+
+/// Execute an authenticated command and stream stdin/stdout over the HTTP/2 body.
 ///
 /// Environment variables can be passed via `X-E-<NAME>` request headers.
+/// The completed HTTP exec protocol also carries requested PTY metadata in
+/// headers. It shares SSH exec's identity and service-authorization policy:
+/// ordinary commands use the authenticated user's home; registered services
+/// use their mesh-init service home. This handler's current system-account
+/// request is a temporary compatibility implementation and must be replaced
+/// by authenticated target resolution before exposing it beyond an admin path.
 ///
 /// * `cmd` — Shell command to execute via `sh -c`.
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), cmd = %cmd))]

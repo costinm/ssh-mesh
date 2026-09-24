@@ -8,11 +8,24 @@ Any application using stdin/stdout/stderr or UDS can be used with no changes by 
 
 ## Core service - networking
 
-In many cases H2C is overkill - many apps can just expose
-an MCP-like JSON-RPC or plain JSON over stdin/stdout or UDS. In this case the mesh proxy can handle HTTP2 or SSH forwarding, with headers and metadata exposed as either env variables or in the json sent to the app.
+In many cases H2C is overkill - many apps can just expose their generated mesh
+API over stdin/stdout or UDS. In this case the mesh proxy can handle HTTP2 or
+SSH forwarding, with headers and metadata exposed as environment variables or
+structured request fields.
 The app will not include a HTTP or H2 library, keeping deps small.
 
+A runnable, activation-only tagged-CBOR worker is in
+[`examples/echo`](examples/echo), with its own `API.md`, generated catalog,
+common mesh handlers, tracing, and matching mesh-init configuration.
+[`examples/echo_json`](examples/echo_json) shows the equivalent
+newline-delimited JSON-RPC and Serde adapter.
+
 ## Baseline protocols and binary framing
+
+Tagged binary records are the primary programmatic interface. Tagged-CBOR is
+the current encoding; canonical protobuf or another schema-driven tagged
+encoding can reuse the same registry and handlers. JSON-RPC and text are
+gateway/operator adapters over that dispatch surface.
 
 `mesh::message::LineProtocolSession` provides the shared connection-level
 protocol selector for line-capable control sockets and stdio services. The
@@ -72,7 +85,8 @@ If HTTP is needed, it belongs in `ssh-mesh` or the application itself. The `mesh
 Services that expose a mesh command surface should keep structured `mesh-api`
 blocks in their human-readable `API.md`. Generated `resources/tools.json`
 catalogs are used by
-`tools/list`, ssh-mesh web/admin pages, and the `mesh` CLI:
+`mesh.tools`, optional protocol adapters, ssh-mesh web/admin pages, and the
+`mesh` CLI:
 
 Mesh-init service definitions are node-local client connection policy. Their
 `[Mesh]` section selects address, transport, encoding, and a local static tools
@@ -96,7 +110,10 @@ The core catalog is checked in at `resources/tools.json`, with matching
 `resources/schema.json` and `src/generated_api_ids.rs`. The `mesh-cli` build
 gate runs `mesh-api-gen --check` against all three artifacts.
 During local development,
-`MESH_RES_DIR` can point at a crate's `resources/` directory; packaged runs use
+`MESH_RES_DIR` can point at a crate's `resources/` directory for service-owned
+runtime resources. Client-side schema resolution is separate: `MESH_TOOLS` is
+an exact override, `MESH_SCHEMA_DIR` is a multi-service root, and packages put
+catalogs under `/opt/<service>/etc/schemas/tools.json`. Packaged services use
 the normal `MESH_OPT_BASE`/`MESH_APP_OPT` resource lookup.
 
 If the app is exposing HTTP over TCP without TLS - ideally localhost
@@ -145,8 +162,10 @@ getting access to recent events and the buffer and new logs.
 
 ## MCP and Open-API
 
-To reduce dependencies and complexity, it's useful to generate static files with the schemas - 'skills' and 
-'agents' as well. 
+Workers ship static generated schemas and need no MCP library. The optional
+`mesh-mcp` gateway adapter loads that metadata and translates MCP discovery and
+tool calls to the worker's ordinary handler locally or through a forwarding
+gateway. Static skills and agent documentation can use the same API source.
 
 ## Multi-codec
 

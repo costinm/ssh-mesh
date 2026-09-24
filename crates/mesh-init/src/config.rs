@@ -359,9 +359,6 @@ fn allocate_app_identity(
     if let Some(uid) = mesh::auth::system_uid() {
         used.insert(uid);
     }
-    if let Some(uid) = mesh::auth::trusted_sshd_uid() {
-        used.insert(uid);
-    }
     if let Some(uid) = mesh::auth::ssh_mesh_uid() {
         used.insert(uid);
     }
@@ -772,6 +769,28 @@ Name = "vsock"
         assert_eq!(config.activation[3].vsock_port, Some(5000));
         assert!(!config.activation[3].datagram);
         assert_eq!(config.activation[3].fd_name.as_deref(), Some("vsock"));
+    }
+
+    #[test]
+    fn empty_socket_section_uses_service_mesh_socket() {
+        let config = parse_service(
+            "[Service]\nExecStart = \"mesh-echo\"\n\n[Socket]\n",
+            Some("echo"),
+        )
+        .unwrap();
+        assert_eq!(config.command, "mesh-echo");
+        assert_eq!(config.activation.len(), 1);
+        assert_eq!(
+            config.activation[0].socket.as_deref(),
+            Some(
+                mesh::paths::AppPaths::for_app("echo")
+                    .mesh_socket
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(config.activation[0].wait);
+        assert_eq!(config.activation[0].fd_name.as_deref(), Some("echo"));
     }
 
     #[test]

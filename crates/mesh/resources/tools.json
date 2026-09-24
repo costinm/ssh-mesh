@@ -1,6 +1,6 @@
 [
   {
-    "description": "Return MCP initialization info",
+    "description": "Return common service identity and descriptive metadata",
     "inputSchema": {
       "properties": {},
       "required": [],
@@ -8,31 +8,80 @@
     },
     "name": "mesh.initialize",
     "outputSchema": {
-      "properties": {},
+      "properties": {
+        "instructions": {
+          "type": "string",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "string"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "title": {
+          "type": "string",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "string"
+        },
+        "version": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        }
+      },
       "required": [],
       "type": "object"
     },
     "x-component-index": 1,
-    "x-method-index": 1
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
-    "description": "List registered MCP tools from catalog",
+    "description": "Return the service's generated method catalog",
     "inputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "name": "mesh.tools/list",
+    "name": "mesh.tools",
     "outputSchema": {
-      "properties": {},
+      "properties": {
+        "tools": {
+          "type": "array",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "array"
+        }
+      },
       "required": [],
       "type": "object"
     },
     "x-component-index": 1,
-    "x-method-index": 2
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
-    "description": "Subscribe to live trace log event stream",
+    "description": "Acknowledge trace-subscription capability on this control endpoint",
     "inputSchema": {
       "properties": {},
       "required": [],
@@ -45,22 +94,30 @@
       "type": "object"
     },
     "x-component-index": 2,
-    "x-method-index": 1
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
-    "description": "Dynamically update tracing filter level",
+    "description": "Set this process's reloadable tracing EnvFilter",
     "inputSchema": {
       "properties": {
         "level": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
-      "required": [
-        "level"
-      ],
+      "required": [],
       "type": "object"
     },
     "name": "trace.set_level",
@@ -70,10 +127,21 @@
       "type": "object"
     },
     "x-component-index": 2,
-    "x-method-index": 2
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   },
   {
-    "description": "Get current tracing filter level info",
+    "description": "Return this process's current configured tracing EnvFilter",
     "inputSchema": {
       "properties": {},
       "required": [],
@@ -86,6 +154,17 @@
       "type": "object"
     },
     "x-component-index": 2,
-    "x-method-index": 3
+    "x-method-index": 3,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   }
 ]

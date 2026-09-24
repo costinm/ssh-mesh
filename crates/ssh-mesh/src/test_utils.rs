@@ -203,154 +203,252 @@ pub fn start_mock_mesh_init(
 
     // 3. Remove any stale UDS socket
     let _ = std::fs::remove_file(&socket_path);
+    let seqpacket_path = PathBuf::from(format!("{}.cbor", socket_path.display()));
+    let _ = std::fs::remove_file(&seqpacket_path);
 
     tokio::spawn(async move {
-        let listener = match tokio::net::UnixListener::bind(&socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Mock mesh-init failed to bind: {}", e);
+        let seqpacket_listener = match mesh::seqpacket::UnixSeqpacketListener::bind(&seqpacket_path)
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("Mock mesh-init failed to bind seqpacket socket: {error}");
                 return;
             }
         };
+        tokio::spawn(async move {
+            while let Ok(stream) = seqpacket_listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(Some((record, mut passed_fds))) = stream.recv_cbor_record().await else {
+                        return;
+                    };
+                    // The production mesh-init accepts only records built
+                    // from its generated public-catalog identities, and this
+                    // mock must mirror that contract: start_terminal with
+                    // numeric tags (component 3, method 16).
+                    use mesh::tagged::NameOrTag;
+                    let field_name = |key: &NameOrTag| -> String {
+                        match key {
+                            NameOrTag::Name(value) => value.clone(),
+                            NameOrTag::Tag(tag) => match *tag {
+                                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_COMMAND => {
+                                    "command".to_string()
+                                }
+                                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_ENV => {
+                                    "env".to_string()
+                                }
+                                _ => key.text(),
+                            },
+                        }
+                    };
+                    const METHOD_START_TERMINAL: u32 =
+                        mesh_api::mesh_init_ids::METHOD_MESH_INIT_START_TERMINAL;
+                    match &record.method {
+                        NameOrTag::Tag(method) if *method == METHOD_START_TERMINAL => {}
+                        NameOrTag::Name(method) if method == "start_terminal" => {}
+                        _ => return,
+                    }
 
-        while let Ok((mut stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                // Read the JSON request line byte-by-byte to avoid buffering and
-                // consuming the ScmRights normal data payload.
-                use tokio::io::AsyncReadExt;
-                let mut line_bytes = Vec::new();
-                let mut byte = [0u8; 1];
-                loop {
-                    match stream.read_exact(&mut byte).await {
-                        Ok(_) => {
-                            line_bytes.push(byte[0]);
-                            if byte[0] == b'\n' {
-                                break;
+                    let command = record
+                        .env
+                        .iter()
+                        .find(|(key, _)| field_name(key) == "command")
+                        .and_then(|(_key, value)| value.as_str())
+                        .unwrap_or("printf ok");
+                    let mut cmd = std::process::Command::new("/bin/sh");
+                    cmd.args(["-c", command]);
+                    if passed_fds.len() >= 3 {
+                        cmd.stdin(std::process::Stdio::from(passed_fds.remove(0)))
+                            .stdout(std::process::Stdio::from(passed_fds.remove(0)))
+                            .stderr(std::process::Stdio::from(passed_fds.remove(0)));
+                    } else {
+                        let fd = passed_fds.remove(0);
+                        cmd.stdin(std::process::Stdio::from(fd.try_clone().unwrap()))
+                            .stdout(std::process::Stdio::from(fd.try_clone().unwrap()))
+                            .stderr(std::process::Stdio::from(fd));
+                    }
+                    if let Some(env) = record
+                        .env
+                        .iter()
+                        .find(|(key, _)| key.text() == "env")
+                        .and_then(|(_key, value)| value.as_object())
+                    {
+                        for (key, value) in env {
+                            if let Some(value) = value.as_str() {
+                                cmd.env(key, value);
                             }
                         }
+                    }
+                    let mut child = match cmd.spawn() {
+                        Ok(child) => child,
                         Err(_) => return,
-                    }
-                }
-                let line = String::from_utf8_lossy(&line_bytes).into_owned();
-
-                // Match mesh-init's JSON-RPC envelope, then work with its
-                // request parameters. This intentionally rejects the old flat
-                // JSON shape so SSH tests cover the production wire protocol.
-                let val: serde_json::Value =
-                    serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
-                if val.get("jsonrpc") != Some(&serde_json::json!("2.0"))
-                    || val.get("method").and_then(|value| value.as_str()) != Some("start_terminal")
-                {
-                    return;
-                }
-                let params = val
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let command_opt = params
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.to_string());
-                let _fd_count =
-                    params.get("fd_count").and_then(|f| f.as_u64()).unwrap_or(1) as usize;
-
-                // Receive the file descriptor
-                let mut std_stream = match stream.into_std() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                if std_stream.set_nonblocking(false).is_err() {
-                    return;
-                }
-
-                use nix::cmsg_space;
-                use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
-                use std::io::IoSliceMut;
-                use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-                let mut buf = [0u8; 1];
-                let mut iov = [IoSliceMut::new(&mut buf)];
-
-                let mut cmsgspace = cmsg_space!([std::os::fd::RawFd; 3]);
-                let msg = match recvmsg::<()>(
-                    std_stream.as_raw_fd(),
-                    &mut iov,
-                    Some(&mut cmsgspace),
-                    MsgFlags::empty(),
-                ) {
-                    Ok(m) => m,
-                    Err(_) => return,
-                };
-
-                let mut passed_fds = Vec::new();
-                for cmsg in msg.cmsgs().unwrap() {
-                    if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                        for fd in fds {
-                            passed_fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
-                        }
-                    }
-                }
-
-                if passed_fds.is_empty() {
-                    return;
-                }
-
-                // Spawn the command
-                let cmd_str = command_opt.unwrap_or_else(|| "printf ok".to_string());
-
-                let mut cmd = std::process::Command::new("/bin/sh");
-                cmd.args(&["-c", &cmd_str]);
-
-                if passed_fds.len() >= 3 {
-                    cmd.stdin(std::process::Stdio::from(
-                        passed_fds[0].try_clone().unwrap(),
-                    ))
-                    .stdout(std::process::Stdio::from(
-                        passed_fds[1].try_clone().unwrap(),
-                    ))
-                    .stderr(std::process::Stdio::from(
-                        passed_fds[2].try_clone().unwrap(),
-                    ));
-                } else {
-                    let fd = &passed_fds[0];
-                    cmd.stdin(std::process::Stdio::from(fd.try_clone().unwrap()))
-                        .stdout(std::process::Stdio::from(fd.try_clone().unwrap()))
-                        .stderr(std::process::Stdio::from(fd.try_clone().unwrap()));
-                }
-
-                if let Some(env_obj) = params.get("env").and_then(|e| e.as_object()) {
-                    for (k, v) in env_obj {
-                        if let Some(v_str) = v.as_str() {
-                            cmd.env(k, v_str);
-                        }
-                    }
-                }
-
-                let mut child = match cmd.spawn() {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-
-                let pid = child.id();
-
-                let response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": val.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                    "result": {
-                        "pid": pid,
-                        "terminal_id": "term-0"
+                    };
+                    let pid = child.id();
+                    let response = mesh::tagged::TaggedRecord {
+                        id: record.id,
+                        result: Some(serde_json::json!({
+                            "success": true,
+                            "data": {"pid": pid, "terminal_id": "term-0"}
+                        })),
+                        ..Default::default()
+                    };
+                    if stream.send_cbor_record(&response, &[]).await.is_ok() {
+                        tokio::task::spawn_blocking(move || {
+                            let _ = child.wait();
+                        });
                     }
                 });
+            }
+        });
 
-                let response_str = format!("{}\n", response.to_string());
-                use std::io::Write;
-                let _ = std_stream.write_all(response_str.as_bytes());
-                let _ = std_stream.flush();
+        tokio::spawn(async move {
+            let listener = match tokio::net::UnixListener::bind(&socket_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Mock mesh-init failed to bind: {}", e);
+                    return;
+                }
+            };
 
-                tokio::task::spawn_blocking(move || {
-                    let _ = child.wait();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read the JSON request line byte-by-byte to avoid buffering and
+                    // consuming the ScmRights normal data payload.
+                    use tokio::io::AsyncReadExt;
+                    let mut line_bytes = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        match stream.read_exact(&mut byte).await {
+                            Ok(_) => {
+                                line_bytes.push(byte[0]);
+                                if byte[0] == b'\n' {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&line_bytes).into_owned();
+
+                    // Match mesh-init's JSON-RPC envelope, then work with its
+                    // request parameters. This intentionally rejects the old flat
+                    // JSON shape so SSH tests cover the production wire protocol.
+                    let val: serde_json::Value =
+                        serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                    if val.get("jsonrpc") != Some(&serde_json::json!("2.0"))
+                        || val.get("method").and_then(|value| value.as_str())
+                            != Some("start_terminal")
+                    {
+                        return;
+                    }
+                    let params = val
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let command_opt = params
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string());
+                    let _fd_count =
+                        params.get("fd_count").and_then(|f| f.as_u64()).unwrap_or(1) as usize;
+
+                    // Receive the file descriptor
+                    let mut std_stream = match stream.into_std() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    if std_stream.set_nonblocking(false).is_err() {
+                        return;
+                    }
+
+                    use nix::cmsg_space;
+                    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+                    use std::io::IoSliceMut;
+                    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+                    let mut buf = [0u8; 1];
+                    let mut iov = [IoSliceMut::new(&mut buf)];
+
+                    let mut cmsgspace = cmsg_space!([std::os::fd::RawFd; 3]);
+                    let msg = match recvmsg::<()>(
+                        std_stream.as_raw_fd(),
+                        &mut iov,
+                        Some(&mut cmsgspace),
+                        MsgFlags::empty(),
+                    ) {
+                        Ok(m) => m,
+                        Err(_) => return,
+                    };
+
+                    let mut passed_fds = Vec::new();
+                    for cmsg in msg.cmsgs().unwrap() {
+                        if let ControlMessageOwned::ScmRights(fds) = cmsg {
+                            for fd in fds {
+                                passed_fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                            }
+                        }
+                    }
+
+                    if passed_fds.is_empty() {
+                        return;
+                    }
+
+                    // Spawn the command
+                    let cmd_str = command_opt.unwrap_or_else(|| "printf ok".to_string());
+
+                    let mut cmd = std::process::Command::new("/bin/sh");
+                    cmd.args(&["-c", &cmd_str]);
+
+                    if passed_fds.len() >= 3 {
+                        cmd.stdin(std::process::Stdio::from(
+                            passed_fds[0].try_clone().unwrap(),
+                        ))
+                        .stdout(std::process::Stdio::from(
+                            passed_fds[1].try_clone().unwrap(),
+                        ))
+                        .stderr(std::process::Stdio::from(
+                            passed_fds[2].try_clone().unwrap(),
+                        ));
+                    } else {
+                        let fd = &passed_fds[0];
+                        cmd.stdin(std::process::Stdio::from(fd.try_clone().unwrap()))
+                            .stdout(std::process::Stdio::from(fd.try_clone().unwrap()))
+                            .stderr(std::process::Stdio::from(fd.try_clone().unwrap()));
+                    }
+
+                    if let Some(env_obj) = params.get("env").and_then(|e| e.as_object()) {
+                        for (k, v) in env_obj {
+                            if let Some(v_str) = v.as_str() {
+                                cmd.env(k, v_str);
+                            }
+                        }
+                    }
+
+                    let mut child = match cmd.spawn() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+
+                    let pid = child.id();
+
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": val.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "result": {
+                            "pid": pid,
+                            "terminal_id": "term-0"
+                        }
+                    });
+
+                    let response_str = format!("{}\n", response.to_string());
+                    use std::io::Write;
+                    let _ = std_stream.write_all(response_str.as_bytes());
+                    let _ = std_stream.flush();
+
+                    tokio::task::spawn_blocking(move || {
+                        let _ = child.wait();
+                    });
                 });
-            });
-        }
+            }
+        });
     })
 }

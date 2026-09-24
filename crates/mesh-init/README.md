@@ -91,23 +91,22 @@ Testing can also be done with bubblewrap and user namespaces.
 
 ## Required service users (root equivalent)
 
-mesh-init assumes a non-root system service and sidecar (ssh) users that are
+mesh-init assumes a non-root system service and ssh-mesh sidecar user that are
 trusted to perform service lifecycle on behalf of any user. By default
-**three privileged UIDs** are root-equivalent for the purposes of starting,
+**two non-root privileged UIDs** are trusted for the purposes of starting,
 stopping, freezing, and impersonating services:
 
 | UID  | Identity     | Env var                  | Purpose                          |
 |------|--------------|--------------------------|----------------------------------|
 | 0    | root         | —                        | Unrestricted, always trusted.    |
 | 1000 | system       | `MESH_SYSTEM_UID`        | Root-equivalent for all permissions including observer methods. |
-| 103  | sshd         | `MESH_TRUSTED_SSHD_UID`  | sshd service account (Debian).   |
 | 150  | ssh-mesh     | `MESH_SSH_MESH_UID`      | ssh-mesh service account.        |
 
 Disabling any of these is not supported as a core feature — mesh-init's
-design assumes sshd, ssh-mesh, and the system service account can be
+design assumes ssh-mesh and the system service account can be
 trusted to perform service lifecycle on behalf of any user. Operators
 who need to override them must set the corresponding env var
-(`MESH_SYSTEM_UID`, `MESH_TRUSTED_SSHD_UID`, `MESH_SSH_MESH_UID`) to the
+(`MESH_SYSTEM_UID`, `MESH_SSH_MESH_UID`) to the
 correct UID for their distribution, or use `MESH_INIT_PRIVILEGED_UIDS`
 to provide a custom list.
 

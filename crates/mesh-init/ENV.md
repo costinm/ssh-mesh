@@ -6,7 +6,7 @@ mode, and service activation code.
 Common variables inherited from the `mesh` crate are documented in
 [`../mesh/ENV.md`](../mesh/ENV.md). That includes `MESH_HOME`,
 `MESH_HOME_BASE`, `MESH_OPT_BASE`, `MESH_APP_HOME`, `MESH_APP_OPT`,
-`MESH_RES_DIR`, `MESH_TRUSTED_SSHD_UID`, `MESH_SYSTEM_UID`,
+`MESH_RES_DIR`, `MESH_SYSTEM_UID`,
 `MESH_SSH_MESH_UID`, `RUST_LOG`, `MESH_LOG_FILE`, `MESH_LOG_DIR`,
 `LISTEN_FD`, `LISTEN_FDS`, and `LISTEN_FDNAMES`.
 
@@ -14,18 +14,18 @@ Common variables inherited from the `mesh` crate are documented in
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MESH_INIT_PRIVILEGED_UIDS` | `0,1000,103,150` | Comma-separated UIDs allowed to operate on services for other UIDs/GIDs. If set to a non-empty parsed list, it fully replaces the default (root, system, sshd, ssh-mesh). |
+| `MESH_INIT_PRIVILEGED_UIDS` | `0,1000,150` | Comma-separated UIDs allowed to operate on services for other UIDs/GIDs. If set to a non-empty parsed list, it fully replaces the default (root, system, ssh-mesh). |
 | `MESH_INIT_MAX_ACTIVATION_CHILDREN` | `64` | Maximum concurrent inetd-style activation children. Invalid, zero, or unset values use `64`. |
 | `MESH_INIT_REAP_ALL` | `false` unless running as PID 1 | When `1` or `true`, the child reaper uses `waitpid(-1)` even when not PID 1. |
 | `MESH_INIT_MAX_CONTROL_CONNECTIONS` | `32` | Maximum concurrent control-socket connections. Excess connections wait for a slot to free up. Invalid, zero, or unset values use `32`. |
 
 ## Privileged UIDs
 
-mesh-init requires a non-root system and sidecar (ssh) users. The four
+mesh-init requires a non-root system and ssh-mesh sidecar user. The three
 privileged service UIDs below ship enabled by default and can be disabled
 by setting their env var to `none` or `off`. Disabling any of them is not
-supported as a core feature — mesh-init's design assumes sshd, ssh-mesh, and
-the system service account can be trusted to perform service lifecycle on
+supported as a core feature — mesh-init's design assumes ssh-mesh and the
+system service account can be trusted to perform service lifecycle on
 behalf of any user.
 
 ## Privileged UIDs
@@ -37,7 +37,6 @@ setting its env var to `none` or `off`:
 |------|--------------------------|---------|------------------------------------------------------|
 | 0    | (root)                   | —       | Unrestricted, always trusted.                        |
 | 1000 | `MESH_SYSTEM_UID`        | 1000    | "system" service account; **root-equivalent** for all permissions including observer methods. |
-| 103  | `MESH_TRUSTED_SSHD_UID`  | 103     | sshd service account (Debian convention). Trusted for terminal/start operations and impersonation. |
 | 150  | `MESH_SSH_MESH_UID`      | 150     | ssh-mesh service account. Trusted for terminal/start operations and impersonation. **Not** authorized for system-wide observer methods (`freeze_process`, `move_process`, `cgroup_high`, `clear_refs`, `freeze_cgroup`) — those require root or system. |
 
 ## Socket Activation Syntax
@@ -94,6 +93,7 @@ Config and identity:
 
 | `MESH_INIT_DIR` | root: `/home/system/etc/mesh-init`; non-root: `$HOME/etc/mesh-init` | Full replacement directory for core service configs. |
 | `MESH_INIT_SOCK` | `/run/mesh/mesh-init/mesh.sock` for root systems | Exact mesh-init control/API socket path. |
+| `MESH_INIT_SEQPACKET_SOCK` | `${MESH_INIT_SOCK}.cbor` | Tagged-CBOR `SOCK_SEQPACKET` control socket; pairs each CBOR record with any `SCM_RIGHTS` descriptors. |
 | `MESH_INIT_UIDMAP` | `/home/system/etc/uidmap` | Persistent root-mode on-demand app UID/GID map. |
 | `MESH_INIT_UID_MIN` | `2000` | First UID/GID mesh-init may allocate for root-mode on-demand apps. |
 | `MESH_INIT_UID_MAX` | `59999` | Last UID/GID mesh-init may allocate for root-mode on-demand apps. |
@@ -124,3 +124,10 @@ Generated variables passed to child processes or activated services.
 | `SSH_MESH_ROUTE_CERTIFICATE_USER` | unset | Certificate principal/user from SSH activation context, when present. |
 | `SSH_MESH_ROUTE_PEER_KEY_SHA` | unset | Authenticated peer key fingerprint from SSH activation context, when present. |
 | `SSH_MESH_ROUTE_CLIENT_ID` | unset | Caller connection ID from SSH activation context, when present. |
+
+Every service receives `HOME` for its service home and a deterministic `PATH`
+beginning with `$HOME/bin`, `$HOME/.local/bin`, and
+`$HOME/.nix-profile/bin`, followed by the system Nix profile,
+`/run/current-system/sw/bin`, and conventional `/usr` paths. Explicit
+`[Environment] HOME` or `PATH` values override these defaults. The default
+working directory is `HOME`.

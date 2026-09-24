@@ -6,14 +6,15 @@
 # upgrades do not merge changes automatically. Operators can preview or copy
 # newly shipped defaults explicitly with `mesh-init seed`.
 #
-# The service identity is not pinned here: as root, mesh-init allocates and
-# persists a UID/GID for "ssh-mesh" in /home/system/etc/uidmap and creates
-# /home/ssh-mesh for it. Operator secrets such as
+# ssh-mesh has a stable non-root service identity. mesh-init creates
+# /home/ssh-mesh with this ownership before the service starts. Operator secrets such as
 # /home/ssh-mesh/etc/authorized_keys are mutable state and are intentionally
 # not packaged in the defaults.
 
 [Service]
 ExecStart = "/opt/ssh-mesh/bin/ssh-mesh"
+User = "150"
+Group = "150"
 OOMScoreAdjust = -900
 
 [Resources]

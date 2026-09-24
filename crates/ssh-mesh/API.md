@@ -1,22 +1,15 @@
-# ssh-mesh API
+# `ssh-mesh` API (4)
 
-This file is the machine-readable contract for ssh-mesh's local MCP surface.
+This is the machine-readable contract for ssh-mesh's local service surface.
 HTTP route descriptions, proxy behavior, and operational guidance live in
 [README.md](README.md).
 
-```mesh-api
-id = "ssh-mesh.jsonl_call"
-component = "ssh-mesh"
-method = "jsonl_call"
-component-index = 4
-method-index = 1
-visibility = "public"
-summary = "Send a JSON-RPC request to a component Unix socket and return the unwrapped result"
+## 1. `jsonl_call` — Send a JSON-RPC request to a component Unix socket and return the unwrapped result
 
-[request]
-fields = [
-  { name = "socket_path", index = 1, type = "string", required = true, position = 1 },
-  { name = "method_name", index = 2, type = "string", required = true, position = 2 },
-  { name = "params", index = 3, type = "object" },
-]
-```
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `socket_path` | `string` | |
+| 2 | `method_name` | `string` | |
+| 3 | `params` | `object` | |

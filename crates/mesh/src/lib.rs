@@ -2,6 +2,7 @@
 #[doc(hidden)]
 pub mod api;
 pub mod auth;
+pub mod catalog;
 pub mod cbor;
 /// Transport-neutral outgoing mesh stream client contract.
 pub mod client;
@@ -17,7 +18,9 @@ pub mod mux;
 pub mod mux_client;
 pub mod paths;
 pub mod protocol;
+pub mod registry;
 pub mod schema;
+pub mod seqpacket;
 pub mod server;
 pub mod tagged;
 pub mod tun;

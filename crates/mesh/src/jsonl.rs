@@ -32,14 +32,14 @@ pub struct RawRequest {
     pub params: serde_json::Map<String, Value>,
 }
 
-/// Static or file-backed JSON payload used by built-in MCP-style methods.
+/// Static or file-backed structured metadata.
 #[derive(Debug, Clone)]
 pub enum JsonSource {
     File(PathBuf),
     Static(Value),
 }
 
-/// A resource exposed through the lightweight MCP-compatible JSONL methods.
+/// A resource exposed through the service registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSpec {
     pub uri: String,
@@ -63,20 +63,19 @@ enum ResourceSource {
     StaticJson(Value),
 }
 
-/// Lightweight MCP registry for JSONL/JSON-RPC services.
+/// Encoding- and transport-neutral metadata registry for a mesh service.
 #[derive(Debug, Clone)]
-pub struct McpRegistry {
+pub struct ServiceRegistry {
     server_name: String,
     server_title: Option<String>,
     server_version: String,
-    protocol_version: String,
     instructions: Option<String>,
     res_dirs: Vec<PathBuf>,
     tools: JsonSource,
     resources: Vec<ResourceSpec>,
 }
 
-impl McpRegistry {
+impl ServiceRegistry {
     /// Create a registry using `MESH_RES_DIR` or the standard per-app overlay.
     pub fn new(server_name: impl Into<String>) -> Self {
         let server_name = server_name.into();
@@ -86,7 +85,6 @@ impl McpRegistry {
             server_name,
             server_title: None,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol_version: "2025-06-18".to_string(),
             instructions: None,
             res_dirs,
             tools,
@@ -109,7 +107,7 @@ impl McpRegistry {
         self
     }
 
-    /// Set static `tools/list` content.
+    /// Set a static generated tools catalog.
     pub fn with_tools_json(mut self, tools: Value) -> Self {
         self.tools = JsonSource::Static(tools);
         self
@@ -121,13 +119,13 @@ impl McpRegistry {
         self
     }
 
-    /// Set server version reported by `initialize`.
+    /// Set the version reported by the common service initialization method.
     pub fn with_server_version(mut self, version: impl Into<String>) -> Self {
         self.server_version = version.into();
         self
     }
 
-    /// Set optional instructions reported by `initialize`.
+    /// Set optional service instructions.
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(instructions.into());
         self
@@ -198,29 +196,14 @@ impl McpRegistry {
         self
     }
 
-    async fn initialize(&self, params: &serde_json::Map<String, Value>) -> Response {
-        let requested = params
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.protocol_version);
-        let protocol_version = if requested == self.protocol_version {
-            requested
-        } else {
-            &self.protocol_version
-        };
+    /// Return common service identity independent of the calling protocol.
+    pub fn initialize(&self) -> Response {
         let mut result = json!({
-            "protocolVersion": protocol_version,
-            "capabilities": {
-                "resources": { "listChanged": false },
-                "tools": { "listChanged": false }
-            },
-            "serverInfo": {
-                "name": self.server_name,
-                "version": self.server_version
-            }
+            "name": self.server_name,
+            "version": self.server_version,
         });
         if let Some(title) = &self.server_title {
-            result["serverInfo"]["title"] = json!(title);
+            result["title"] = json!(title);
         }
         if let Some(instructions) = &self.instructions {
             result["instructions"] = json!(instructions);
@@ -228,7 +211,8 @@ impl McpRegistry {
         Response::ok_with_data(result)
     }
 
-    async fn tools_list(&self) -> Response {
+    /// Load the generated service tool catalog.
+    pub async fn tools(&self) -> Response {
         match self.read_json_source(&self.tools).await {
             Ok(value) => {
                 if value.get("tools").is_some() {
@@ -241,7 +225,8 @@ impl McpRegistry {
         }
     }
 
-    async fn resources_list(&self) -> Response {
+    /// List resources registered with this service.
+    pub async fn resources(&self) -> Response {
         let mut resources = Vec::new();
         for resource in &self.resources {
             resources.push(resource_public_json(resource));
@@ -252,7 +237,8 @@ impl McpRegistry {
         Response::ok_with_data(json!({ "resources": resources }))
     }
 
-    async fn resources_read(&self, uri: &str) -> Response {
+    /// Read one registered resource by URI.
+    pub async fn read_resource(&self, uri: &str) -> Response {
         for resource in &self.resources {
             if resource.uri == uri {
                 return match read_registered_resource(resource).await {
@@ -272,6 +258,22 @@ impl McpRegistry {
             Ok(content) => Response::ok_with_data(json!({ "contents": [content] })),
             Err(e) => Response::err(e),
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.server_name
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.server_title.as_deref()
+    }
+
+    pub fn version(&self) -> &str {
+        &self.server_version
+    }
+
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 
     async fn read_json_source(&self, source: &JsonSource) -> Result<Value, String> {
@@ -454,10 +456,10 @@ fn raw_from_value(val: Value) -> (ProtocolFormat, Result<RawRequest, String>) {
     )
 }
 
-/// Dispatch built-in MCP-style methods or a component-specific request.
+/// Dispatch common mesh methods or a component-specific request.
 pub async fn dispatch_request<T, F, Fut>(
     trimmed: &str,
-    registry: &McpRegistry,
+    registry: &ServiceRegistry,
     handler: F,
 ) -> (ProtocolFormat, Option<Response>)
 where
@@ -480,71 +482,9 @@ where
         raw.method = raw.method[service_prefix.len()..].to_string();
     }
 
-    let response = match raw.method.as_str() {
-        "mesh.lifecycle" | "lifecycle" => {
-            match serde_json::from_value::<crate::lifecycle::LifecycleEvent>(Value::Object(
-                raw.params.clone(),
-            )) {
-                Ok(event) => Response::ok_with_data(json!({
-                    "subscribers": crate::lifecycle::publish(event),
-                })),
-                Err(error) => Response::err(format!("invalid mesh.lifecycle event: {error}")),
-            }
-        }
-        "initialize" => registry.initialize(&raw.params).await,
-        "notifications/initialized" => return (format, None),
-        "tools/list" => registry.tools_list().await,
-        "resources/list" => registry.resources_list().await,
-        "resources/read" => match raw.params.get("uri").and_then(Value::as_str) {
-            Some(uri) => registry.resources_read(uri).await,
-            None => Response::err("resources/read requires uri"),
-        },
-        "tools/call" => {
-            let Some(name) = raw.params.get("name").and_then(Value::as_str) else {
-                return (format, Some(Response::err("tools/call requires name")));
-            };
-            let arguments = raw
-                .params
-                .get("arguments")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let mut direct = serde_json::Map::new();
-            direct.insert("method".to_string(), json!(name));
-            for (key, value) in arguments {
-                direct.insert(key, value);
-            }
-            match serde_json::from_value::<T>(Value::Object(direct)) {
-                Ok(request) => tool_response(handler(request).await),
-                Err(e) => Response::err(format!("tools/call request mapping failed: {e}")),
-            }
-        }
-        "trace.set_level" | "set_level" | "set_trace_level" | "set_source_level" => {
-            let level = raw
-                .params
-                .get("level")
-                .and_then(Value::as_str)
-                .unwrap_or("info");
-            let req = crate::local_trace::TraceLevelRequest {
-                level: level.to_string(),
-            };
-            match crate::local_trace::set_trace_level(&req) {
-                Ok(resp) => Response::ok_with_data(serde_json::to_value(resp).unwrap_or_default()),
-                Err(resp) => Response::err(
-                    resp.message
-                        .unwrap_or_else(|| "Failed to set trace level".to_string()),
-                ),
-            }
-        }
-        "trace.get_level" | "get_level" | "get_trace_level" => {
-            let resp = crate::local_trace::get_trace_level();
-            Response::ok_with_data(serde_json::to_value(resp).unwrap_or_default())
-        }
-        "trace.subscribe" | "subscribe" => Response::ok_with_data(json!({
-            "subscribed": true,
-            "service": registry.server_name
-        })),
-        _ => {
+    let response = match registry.dispatch(&raw.method, &raw.params).await {
+        crate::registry::CommonDispatch::Response(response) => response,
+        crate::registry::CommonDispatch::NotHandled => {
             let mut direct = raw.params;
             direct.insert("method".to_string(), json!(raw.method));
             match serde_json::from_value::<T>(Value::Object(direct)) {
@@ -562,35 +502,6 @@ fn first_resource_dir(res_dirs: &[PathBuf]) -> PathBuf {
         .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("/opt/mesh/resources"))
-}
-
-fn tool_response(response: Response) -> Response {
-    if response.success {
-        let structured = response.data.unwrap_or(Value::Null);
-        Response::ok_with_data(json!({
-            "content": [
-                {
-                    "type": "text",
-                    "text": serde_json::to_string(&structured).unwrap_or_else(|_| "null".to_string())
-                }
-            ],
-            "structuredContent": structured,
-            "isError": false
-        }))
-    } else {
-        let error = response
-            .error
-            .unwrap_or_else(|| "tool call failed".to_string());
-        Response::ok_with_data(json!({
-            "content": [
-                {
-                    "type": "text",
-                    "text": error
-                }
-            ],
-            "isError": true
-        }))
-    }
 }
 
 fn resource_public_json(resource: &ResourceSpec) -> Value {
@@ -880,8 +791,6 @@ mod tests {
     enum TestRequest {
         #[serde(rename = "status")]
         Status { name: Option<String> },
-        #[serde(rename = "echo")]
-        Echo { value: String },
     }
 
     #[test]
@@ -900,10 +809,8 @@ mod tests {
         assert!(
             matches!(format, ProtocolFormat::JsonRpc { id: Some(serde_json::Value::Number(ref n)) } if n.as_i64() == Some(100))
         );
-        match parsed.unwrap() {
-            TestRequest::Status { name } => assert_eq!(name.as_deref(), Some("x")),
-            TestRequest::Echo { .. } => panic!("unexpected request"),
-        }
+        let TestRequest::Status { name } = parsed.unwrap();
+        assert_eq!(name.as_deref(), Some("x"));
     }
 
     #[test]
@@ -950,9 +857,9 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_initialize() {
-        let registry = McpRegistry::new("test-service");
+        let registry = ServiceRegistry::new("test-service");
         let (format, response) = dispatch_request::<TestRequest, _, _>(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"mesh.initialize","params":{}}"#,
             &registry,
             |_| async { Response::err("should not call direct handler") },
         )
@@ -960,14 +867,13 @@ mod tests {
         let response = response.unwrap();
         let formatted = format_response(response, &format).unwrap();
         let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
-        assert_eq!(val["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(val["result"]["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(val["result"]["serverInfo"]["name"], "test-service");
+        assert_eq!(val["result"]["name"], "test-service");
+        assert_eq!(val["result"]["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
-    async fn dispatches_tools_list_from_static_json() {
-        let registry = McpRegistry::new("test-service").with_tools_json(serde_json::json!([
+    async fn dispatches_tools_from_static_json() {
+        let registry = ServiceRegistry::new("test-service").with_tools_json(serde_json::json!([
             {
                 "name": "echo",
                 "description": "Echo a value",
@@ -975,7 +881,7 @@ mod tests {
             }
         ]));
         let (_format, response) = dispatch_request::<TestRequest, _, _>(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"mesh.tools","params":{}}"#,
             &registry,
             |_| async { Response::err("should not call direct handler") },
         )
@@ -985,29 +891,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatches_tools_call_to_native_handler() {
-        let registry = McpRegistry::new("test-service");
-        let (_format, response) = dispatch_request::<TestRequest, _, _>(
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{"value":"hello"}}}"#,
-            &registry,
-            |request| async move {
-                match request {
-                    TestRequest::Echo { value } => {
-                        Response::ok_with_data(serde_json::json!({"echo": value}))
-                    }
-                    TestRequest::Status { .. } => Response::err("unexpected request"),
-                }
-            },
-        )
-        .await;
-        let data = response.unwrap().data.unwrap();
-        assert_eq!(data["structuredContent"]["echo"], "hello");
-        assert_eq!(data["isError"], false);
-    }
-
-    #[tokio::test]
     async fn lifecycle_requests_publish_to_service_subscribers() {
-        let registry = McpRegistry::new("test-service");
+        let registry = ServiceRegistry::new("test-service");
         let mut lifecycle = crate::lifecycle::subscribe();
         let (format, response) = dispatch_request::<TestRequest, _, _>(
             r#"{"jsonrpc":"2.0","id":9,"method":"mesh.lifecycle","params":{"action":"unfreeze","cause":"external","observed":false}}"#,
@@ -1065,7 +950,7 @@ mod tests {
                 std::env::set_var("MESH_HOME_BASE", &home_base);
                 std::env::set_var("MESH_OPT_BASE", &opt_base);
             }
-            let registry = McpRegistry::new("demo");
+            let registry = ServiceRegistry::new("demo");
             unsafe {
                 std::env::remove_var("MESH_RES_DIR");
                 std::env::remove_var("MESH_HOME_BASE");
@@ -1073,7 +958,7 @@ mod tests {
             }
             registry
         };
-        let response = registry.tools_list().await;
+        let response = registry.tools().await;
 
         assert!(response.success);
         let data = response.data.unwrap();
@@ -1101,14 +986,14 @@ mod tests {
                 std::env::set_var("MESH_HOME_BASE", &home_base);
                 std::env::set_var("MESH_OPT_BASE", &opt_base);
             }
-            let registry = McpRegistry::new("demo");
+            let registry = ServiceRegistry::new("demo");
             unsafe {
                 std::env::remove_var("MESH_HOME_BASE");
                 std::env::remove_var("MESH_OPT_BASE");
             }
             registry
         };
-        let response = registry.tools_list().await;
+        let response = registry.tools().await;
 
         assert!(response.success);
         let data = response.data.unwrap();
@@ -1131,14 +1016,14 @@ mod tests {
                 std::env::set_var("MESH_HOME_BASE", &home_base);
                 std::env::set_var("MESH_OPT_BASE", &opt_base);
             }
-            let registry = McpRegistry::new("lmesh");
+            let registry = ServiceRegistry::new("lmesh");
             unsafe {
                 std::env::remove_var("MESH_HOME_BASE");
                 std::env::remove_var("MESH_OPT_BASE");
             }
             registry
         };
-        let response = registry.resources_list().await;
+        let response = registry.resources().await;
 
         assert!(response.success);
         let data = response.data.unwrap();

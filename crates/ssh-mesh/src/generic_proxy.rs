@@ -132,7 +132,7 @@ async fn proxy_mcp(
         }
     };
 
-    let mut registry = mesh::jsonl::McpRegistry::new(&app);
+    let mut registry = mesh::registry::ServiceRegistry::new(&app);
     if let Some(tools_path) = query.tools.as_deref()
         && let Some(asset) = Assets::get(tools_path.trim_start_matches('/'))
         && let Ok(tools) = serde_json::from_slice::<Value>(&asset.data)
@@ -222,10 +222,8 @@ async fn proxy_mcp(
         };
     }
 
-    let (format, response) = mesh::jsonl::dispatch_request::<GenericMcpRequest, _, _>(
-        &line,
-        &registry,
-        move |request| {
+    let (format, response) =
+        mesh_mcp::dispatch_request::<GenericMcpRequest, _, _>(&line, &registry, move |request| {
             let app = app.clone();
             let socket = socket.clone();
             async move {
@@ -252,9 +250,8 @@ async fn proxy_mcp(
                     }
                 }
             }
-        },
-    )
-    .await;
+        })
+        .await;
 
     let Some(response) = response else {
         return StatusCode::NO_CONTENT.into_response();

@@ -33,11 +33,9 @@ use crate::resource::ResourceManager;
 ///
 /// - `1000` — the `system` service account
 ///
-/// In addition, the configurable sshd UID (resolved via
-/// `mesh::auth::trusted_sshd_uid`, env var `MESH_TRUSTED_SSHD_UID`, default
-/// 103) and the ssh-mesh UID (resolved via `mesh::auth::ssh_mesh_uid`, env var
-/// `MESH_SSH_MESH_UID`, default 150) are included, since both must spawn
-/// shells as other users.
+/// The ssh-mesh UID (resolved via `mesh::auth::ssh_mesh_uid`, env var
+/// `MESH_SSH_MESH_UID`, default 150) is included because it must spawn shells
+/// as other users.
 ///
 /// Root (UID 0) is always privileged. The full list can be overridden with the
 /// `MESH_INIT_PRIVILEGED_UIDS` env var (comma-separated).
@@ -60,11 +58,6 @@ fn privileged_uids() -> Vec<u32> {
     if let Some(sys) = mesh::auth::system_uid() {
         uids.push(sys);
     }
-    if let Some(sshd) = mesh::auth::trusted_sshd_uid() {
-        if !uids.contains(&sshd) {
-            uids.push(sshd);
-        }
-    }
     if let Some(mesh) = mesh::auth::ssh_mesh_uid() {
         if !uids.contains(&mesh) {
             uids.push(mesh);
@@ -77,7 +70,7 @@ fn privileged_uids() -> Vec<u32> {
 ///
 /// Used by system-wide observer methods (`freeze_process`, `move_process`,
 /// `cgroup_high`, `clear_refs`, `freeze_cgroup`) that operate on arbitrary
-/// PIDs or cgroup paths. The ssh-mesh UID and the sshd UID are **not**
+/// PIDs or cgroup paths. The ssh-mesh UID is **not**
 /// sufficient for these operations — they must use the named-service APIs
 /// (`start`/`stop`/`freeze`/`unfreeze`) instead.
 fn require_system_or_root(peer_uid: u32) -> Result<(), Response> {
@@ -1062,7 +1055,7 @@ impl Daemon {
             return Response::err(format!("home directory '{}' does not exist", home));
         }
         // A16: Validate that the home directory is owned by the target
-        // UID. Otherwise a privileged peer (sshd, ssh-mesh) could set HOME
+        // UID. Otherwise a privileged ssh-mesh peer could set HOME
         // to any directory, influencing the child's startup scripts.
         if let Ok(metadata) = std::fs::metadata(home_path) {
             use std::os::unix::fs::MetadataExt;
@@ -3172,17 +3165,13 @@ OOMScoreAdjust = -700
     }
 
     #[tokio::test]
-    async fn test_privileged_uids_default_includes_root_system_sshd_and_mesh() {
+    async fn test_privileged_uids_default_includes_root_system_and_mesh() {
         let _guard = ENV_MUTEX.lock();
         // Ensure no override env var leaks from another test.
         unsafe { std::env::remove_var("MESH_INIT_PRIVILEGED_UIDS") };
         let uids = privileged_uids();
         assert!(uids.contains(&0), "root must be privileged");
         assert!(uids.contains(&1000), "system (1000) must be privileged");
-        assert!(
-            uids.contains(&103),
-            "default sshd uid (103) must be privileged"
-        );
         assert!(
             uids.contains(&150),
             "default ssh-mesh uid (150) must be privileged"

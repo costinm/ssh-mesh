@@ -1,16 +1,18 @@
 //! Generic mesh command client.
 //!
-//! The binary intentionally has no `mesh-init`, SSH implementation, or HTTP
-//! stack dependency. Explicit RPC endpoints use mesh baseline codecs; a bare
-//! host falls back to the system OpenSSH client, while `mux://` uses the shared
-//! local ControlMaster implementation.
+//! The binary intentionally has no `mesh-init` or embedded SSH implementation.
+//! Explicit RPC endpoints use mesh baseline codecs over UDS, TCP, or HTTP; a
+//! bare host falls back to the system OpenSSH client, while `mux://` uses the
+//! shared local ControlMaster implementation.
 
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use mesh::catalog::service_catalog_resolver;
 use mesh::cbor::{decode_record, decode_stream_frame, encode_record, encode_stream_frame};
 use mesh::mux_client::MuxClient;
 use mesh::tagged::{TaggedCatalog, TaggedRecord, record_from_argv, to_json};
@@ -42,8 +44,8 @@ struct Cli {
     /// Maximum time to wait for an RPC response or streaming subscription.
     #[arg(long, default_value_t = 9)]
     timeout_sec: u64,
-    /// RPC codec: auto (numeric catalog selects tagged-CBOR), cbor, or
-    /// json-rpc. Environment `MESH_DEST_FORMAT` supplies the same default.
+    /// RPC codec: auto (selected by endpoint), cbor, or json-rpc. Environment
+    /// `MESH_DEST_FORMAT` supplies the same default.
     #[arg(long, value_parser = ["auto", "cbor", "json-rpc"])]
     rpc_format: Option<String>,
     /// Destination endpoint, host, service name, or URI.
@@ -61,19 +63,19 @@ enum DestinationFormat {
 }
 
 impl DestinationFormat {
-    fn from_cli(value: Option<&str>, has_numeric_tags: bool) -> Result<Self> {
+    fn from_cli(value: Option<&str>, destination: &str, has_numeric_tags: bool) -> Result<Self> {
         let value = value.map(str::to_owned).unwrap_or_else(|| {
             std::env::var("MESH_DEST_FORMAT").unwrap_or_else(|_| "auto".to_owned())
         });
-        Self::from_value(&value, has_numeric_tags)
+        Self::from_value(&value, destination, has_numeric_tags)
     }
 
-    fn from_value(value: &str, has_numeric_tags: bool) -> Result<Self> {
+    fn from_value(value: &str, destination: &str, has_numeric_tags: bool) -> Result<Self> {
         match value {
-            // CBOR is intentionally the *tagged* wire format. Without a
-            // generated catalog JSON-RPC is less ambiguous than inventing a
-            // second, text-named CBOR compatibility dialect.
-            "auto" if has_numeric_tags => Ok(Self::Cbor),
+            "auto" if destination.ends_with(".cbor") && has_numeric_tags => Ok(Self::Cbor),
+            "auto" if destination.ends_with(".cbor") => {
+                anyhow::bail!("tagged-CBOR endpoint requires an installed schema with numeric tags")
+            }
             "auto" => Ok(Self::JsonRpc),
             "cbor" if has_numeric_tags => Ok(Self::Cbor),
             "cbor" => anyhow::bail!(
@@ -135,6 +137,8 @@ fn is_rpc_endpoint(destination: &str) -> bool {
         || destination.starts_with("./")
         || destination.starts_with("unix://")
         || destination.starts_with("tcp://")
+        || destination.starts_with("http://")
+        || destination.starts_with("https://")
 }
 
 fn unix_path(destination: &str) -> Option<&str> {
@@ -233,46 +237,12 @@ fn service_mesh_config(service: &str) -> Result<Option<(mesh::config::MeshSectio
     Ok(None)
 }
 
-fn tools_path(destination: &str) -> Result<Option<PathBuf>> {
-    if let Some(path) = std::env::var_os("MESH_TOOLS") {
-        return Ok(Some(PathBuf::from(path)));
-    }
-    if let Some((section, config_path)) = service_mesh_config(destination)? {
-        return Ok(section.tools.map(|tools| {
-            let path = PathBuf::from(tools);
-            if path.is_absolute() {
-                path
-            } else {
-                config_path.parent().unwrap_or(Path::new(".")).join(path)
-            }
-        }));
-    }
-    // A packaged service can expose its generated catalog even before a local
-    // service-definition file is installed. This is especially useful for the
-    // mesh-init bootstrap endpoint. Do not manufacture a schema: absence
-    // remains a JSON-RPC selection, exactly like a remote/gateway endpoint.
-    Ok(packaged_tools_path(
-        mesh::paths::AppPaths::for_app(destination).resource_dirs(),
-    ))
-}
-
-fn packaged_tools_path(resource_dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    resource_dirs
-        .into_iter()
-        .map(|resource_dir| resource_dir.join("tools.json"))
-        .find(|candidate| candidate.is_file())
-}
-
 fn print_local_help(destination: &str, command: Option<&str>) -> Result<()> {
-    let path = tools_path(destination)?.with_context(|| {
-        format!(
-            "no local Tools catalog configured for {destination}; set [Mesh].Tools in its node-local service config"
-        )
-    })?;
-    let value: Value = serde_json::from_str(
-        &std::fs::read_to_string(&path)
-            .with_context(|| format!("read tools catalog {}", path.display()))?,
-    )?;
+    let resolved = service_catalog_resolver()
+        .resolve(destination)
+        .transpose()?
+        .with_context(|| format!("no installed tools catalog for {destination}"))?;
+    let value = resolved.tools.as_ref();
     let tools = value
         .as_array()
         .or_else(|| value.get("tools").and_then(Value::as_array))
@@ -312,15 +282,56 @@ fn print_local_help(destination: &str, command: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn catalog(destination: &str) -> Result<Option<TaggedCatalog>> {
-    let Some(path) = tools_path(destination)? else {
-        return Ok(None);
-    };
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("read tools catalog {}", path.display()))?;
-    Ok(Some(TaggedCatalog::from_tools_json(
-        &serde_json::from_str(&contents)?,
-    )?))
+fn catalog(destination: &str) -> Result<Option<Arc<TaggedCatalog>>> {
+    Ok(service_catalog_resolver()
+        .resolve(destination)
+        .transpose()?
+        .map(|resolved| resolved.catalog.clone()))
+}
+
+async fn rpc_seqpacket(
+    path: &str,
+    record: TaggedRecord,
+    catalog: Option<&TaggedCatalog>,
+) -> Result<()> {
+    let socket = mesh::seqpacket::UnixSeqpacket::connect(path).await?;
+    socket.send_cbor_record(&record, &[]).await?;
+    let (response, fds) = socket
+        .recv_cbor_record()
+        .await?
+        .context("tagged-CBOR endpoint closed without a response")?;
+    if !fds.is_empty() {
+        anyhow::bail!("unexpected file descriptors in mesh CLI response")
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&to_json(&response, catalog))?
+    );
+    Ok(())
+}
+
+async fn rpc_http(
+    destination: &str,
+    record: &TaggedRecord,
+    catalog: Option<&TaggedCatalog>,
+) -> Result<()> {
+    let response = reqwest::Client::new()
+        .post(destination)
+        .json(&json_rpc_request(record, catalog))
+        .send()
+        .await
+        .with_context(|| format!("send JSON-RPC request to {destination}"))?;
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "HTTP gateway returned {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    }
+    let value: Value = serde_json::from_slice(&bytes).context("decode HTTP JSON response")?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }
 
 async fn rpc<S>(
@@ -443,12 +454,13 @@ async fn rpc_destination(cli: &Cli, catalog_destination: &str) -> Result<()> {
     // name so its [Mesh].Tools entry (or packaged generated catalog) remains
     // available after transport resolution.
     let catalog = catalog(catalog_destination)?;
-    let mut record = record_from_argv(&cli.arguments, catalog.as_ref())?;
+    let mut record = record_from_argv(&cli.arguments, catalog.as_deref())?;
     // CLI invocations are request/reply exchanges. One-way events are emitted
     // by service code, not fabricated by a command-line client.
     record.id = Some(Value::from(1_u64));
     let format = DestinationFormat::from_cli(
         cli.rpc_format.as_deref(),
+        &cli.destination,
         matches!(
             (&record.component, &record.method),
             (
@@ -457,10 +469,34 @@ async fn rpc_destination(cli: &Cli, catalog_destination: &str) -> Result<()> {
             )
         ),
     )?;
+    if cli.destination.starts_with("http://") || cli.destination.starts_with("https://") {
+        if format != DestinationFormat::JsonRpc {
+            anyhow::bail!("HTTP RPC currently uses JSON-RPC encoding")
+        }
+        timeout(
+            Duration::from_secs(cli.timeout_sec),
+            rpc_http(&cli.destination, &record, catalog.as_deref()),
+        )
+        .await
+        .context("mesh HTTP RPC timed out")??;
+        return Ok(());
+    }
+    if format == DestinationFormat::Cbor
+        && let Some(path) = unix_path(&cli.destination)
+        && cli.destination.ends_with(".cbor")
+    {
+        timeout(
+            Duration::from_secs(cli.timeout_sec),
+            rpc_seqpacket(path, record, catalog.as_deref()),
+        )
+        .await
+        .context("mesh RPC timed out")??;
+        return Ok(());
+    }
     let stream = connect_rpc(&cli.destination).await?;
     timeout(
         Duration::from_secs(cli.timeout_sec),
-        rpc(stream, record, catalog.as_ref(), format),
+        rpc(stream, record, catalog.as_deref(), format),
     )
     .await
     .context("mesh RPC timed out")??;
@@ -623,41 +659,28 @@ mod tests {
     }
 
     #[test]
-    fn automatic_codec_requires_numeric_tags_for_cbor() {
+    fn automatic_codec_follows_endpoint_instead_of_catalog_presence() {
         assert_eq!(
-            DestinationFormat::from_value("auto", true).unwrap(),
+            DestinationFormat::from_value("auto", "unix:///run/mesh/demo.sock.cbor", true).unwrap(),
             DestinationFormat::Cbor
         );
         assert_eq!(
-            DestinationFormat::from_value("auto", false).unwrap(),
+            DestinationFormat::from_value("auto", "unix:///run/mesh/demo.sock", true).unwrap(),
             DestinationFormat::JsonRpc
         );
-        assert!(DestinationFormat::from_value("cbor", false).is_err());
+        assert!(
+            DestinationFormat::from_value("auto", "unix:///run/mesh/demo.sock.cbor", false)
+                .is_err()
+        );
+        assert!(DestinationFormat::from_value("cbor", "unused", false).is_err());
     }
 
     #[test]
     fn explicit_cli_codec_overrides_environment_selection() {
         assert_eq!(
-            DestinationFormat::from_cli(Some("json-rpc"), true).unwrap(),
+            DestinationFormat::from_cli(Some("json-rpc"), "unused", true).unwrap(),
             DestinationFormat::JsonRpc
         );
-    }
-
-    #[test]
-    fn packaged_generated_catalog_is_discoverable_without_service_toml() {
-        let directory = std::env::temp_dir().join(format!(
-            "mesh-cli-generated-tools-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let catalog = directory.join("tools.json");
-        std::fs::write(&catalog, "[]").unwrap();
-        assert_eq!(packaged_tools_path(vec![directory.clone()]), Some(catalog));
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

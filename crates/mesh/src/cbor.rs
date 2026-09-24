@@ -212,6 +212,28 @@ fn encode_name_or_tag(encoder: &mut Encoder<&mut Vec<u8>>, value: &NameOrTag) ->
     Ok(())
 }
 
+/// Encode only a record's tagged field map for a native minicbor handler.
+pub fn encode_record_fields(record: &TaggedRecord) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::new(&mut bytes);
+    encoder.map(record.env.len() as u64)?;
+    for (key, value) in &record.env {
+        encode_name_or_tag(&mut encoder, key)?;
+        encode_value(&mut encoder, value)?;
+    }
+    Ok(bytes)
+}
+
+/// Decode one native minicbor value into the generic response envelope.
+pub fn decode_value_bytes(bytes: &[u8]) -> Result<Value> {
+    let mut decoder = Decoder::new(bytes);
+    let value = decode_value(&mut decoder)?;
+    if decoder.position() != bytes.len() {
+        bail!("trailing CBOR value data");
+    }
+    Ok(value)
+}
+
 fn decode_name_or_tag(value: &Value) -> Result<NameOrTag> {
     match value {
         Value::String(value) => Ok(NameOrTag::parse(value)),

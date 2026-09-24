@@ -37,15 +37,16 @@ Service files are TOML documents. The required table is `[Service]`.
 
 Systemd-compatible fields:
 
-- `ExecStart` (string, required): command line. The first word is the executable;
-  remaining words become argv. Single quotes, double quotes, and backslash
-  escaping are supported.
+- `ExecStart` (string, required): command line. The first word is resolved from
+  the service PATH when it is not an absolute path; remaining words become
+  argv. Single quotes, double quotes, and backslash escaping are supported.
 - `ExecStartPre`, `ExecStartPost`, `ExecStop`, `ExecReload` (string or string
   list): hook commands run through `/bin/sh -c`.
 - `Type` (string): supported values are `oneshot` (runs once at startup), and `exec` (starts as a daemon at boot). If omitted or empty, the service does not auto-start at boot and is only started on-demand via socket activation or an explicit start command.
 - `User` (string): user name or numeric UID string. Names are resolved with passwd.
 - `Group` (string): group name or numeric GID string. Names are resolved with the group database. When omitted, a named `User` uses its primary passwd GID.
-- `WorkingDirectory` (string): child working directory.
+- `WorkingDirectory` (string): child working directory. Defaults to the
+  service home, normally `/home/<service>`.
 - `Restart` (string): `no`, `always`, `on-success`, `on-failure`,
   `on-abnormal`, or `on-abort`.
 - `RestartSec`, `TimeoutStartSec`, `TimeoutStopSec` (duration string): seconds
@@ -206,6 +207,10 @@ Job extension tables:
 
 Optional systemd-compatible socket activation table in the same TOML document
 as `[Service]`.
+
+An otherwise empty `[Socket]` declares one `Accept=false` stream listener at
+the service's standard mesh socket, normally
+`/run/mesh/<service>/mesh.sock`.
 
 Systemd-compatible fields:
 

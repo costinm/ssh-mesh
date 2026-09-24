@@ -1,92 +1,73 @@
-# mesh API
+# `mesh` API (1)
 
-This file is the machine-readable contract for mesh's public control methods.
-Protocol framing, gateway behavior, and examples live in [README.md](README.md).
+Core methods supplied by `mesh::registry::ServiceRegistry`. They are common
+service discovery, lifecycle, and trace controls; each service documents its
+own component methods separately. Transport and encoding rules are in
+[mesh-api/PROTOCOLS.md](../mesh-api/PROTOCOLS.md). The generated public catalog
+is `resources/tools.json` and can be adapted by CBOR, JSON-RPC, CLI, or MCP
+gateways without changing these handlers.
 
-Every service using `jsonl::McpRegistry` accepts the private `mesh.lifecycle`
-method before component-specific request decoding. A service that needs to
-reconnect hardware, rebuild listeners, or restore other state calls
-`mesh::lifecycle::subscribe()` before it starts accepting requests, then
-consumes `LifecycleEvent` values from the returned broadcast receiver. Services
-that do not subscribe still acknowledge the notification and require no custom
-request-enum variant.
+`mesh.lifecycle` is private supervisor-to-service traffic. Services that need
+to react call `mesh::lifecycle::subscribe()` before accepting requests. Public
+`mesh.initialize` returns common identity and metadata, while `mesh.tools`
+returns the generated method catalog.
 
-An intentional freeze is announced before mesh-init freezes the service. Its
-matching unfreeze is announced after the process can run again. If an external
-host freezer prevented advance notice, mesh-init sends an observed external
-freeze followed by the external unfreeze after it repairs the service cgroup.
+## 3. `lifecycle` — Receive a supervisor freeze or unfreeze notification
 
-```mesh-api
-id = "mesh.lifecycle"
-component = "mesh"
-method = "lifecycle"
-component-index = 1
-method-index = 3
-visibility = "private"
-summary = "Receive a supervisor freeze or unfreeze notification"
-[request]
-fields = [
-  { name = "action", index = 1, type = "string", required = true },
-  { name = "cause", index = 2, type = "string", required = true },
-  { name = "observed", index = 3, type = "bool", required = true },
-]
-[response]
-fields = [{ name = "subscribers", index = 1, type = "u64", required = true }]
-```
+**Visibility:** private
 
-```mesh-api
-id = "mesh.mcp.initialize"
-component = "mesh"
-method = "initialize"
-component-index = 1
-method-index = 1
-visibility = "public"
-summary = "Return MCP initialization info"
-```
+### Request
 
-```mesh-api
-id = "mesh.mcp.tools_list"
-component = "mesh"
-method = "tools/list"
-component-index = 1
-method-index = 2
-visibility = "public"
-summary = "List registered MCP tools from catalog"
-```
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `action` | `string` | |
+| 2 | `cause` | `string` | |
+| 3 | `observed` | `bool` | |
 
-```mesh-api
-id = "mesh.trace.subscribe"
-component = "trace"
-method = "subscribe"
-component-index = 2
-method-index = 1
-visibility = "public"
-summary = "Subscribe to live trace log event stream"
-```
+### Response
 
-```mesh-api
-id = "mesh.trace.set_level"
-component = "trace"
-method = "set_level"
-component-index = 2
-method-index = 2
-visibility = "public"
-summary = "Dynamically update tracing filter level"
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `subscribers` | `u64` | |
 
-[[request.fields]]
-name = "level"
-index = 1
-type = "string"
-required = true
-position = 1
-```
+## 1. `initialize` — Return common service identity and descriptive metadata
 
-```mesh-api
-id = "mesh.trace.get_level"
-component = "trace"
-method = "get_level"
-component-index = 2
-method-index = 3
-visibility = "public"
-summary = "Get current tracing filter level info"
-```
+### Response
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+| 2 | `version` | `string` | |
+| 3 | `title` | `string` | |
+| 4 | `instructions` | `string` | |
+
+## 2. `tools` — Return the service's generated method catalog
+
+### Response
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `tools` | `array` | |
+
+
+# `trace` API (2)
+
+## 1. `subscribe` — Acknowledge trace-subscription capability on this control endpoint
+
+This acknowledges trace capability only. Live trace delivery uses the separate
+local-trace subscription protocol.
+
+## 2. `set_level` — Set this process's reloadable tracing EnvFilter
+
+Updates the reloadable process-wide tracing filter. An empty level restores
+the configured default.
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `level` | `string` | |
+
+## 3. `get_level` — Return this process's current configured tracing EnvFilter
+
+Returns the last successfully configured filter.

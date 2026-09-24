@@ -1,3 +1,4 @@
+use anyhow::Context;
 use log::{error, info};
 use tracing::{debug, instrument, trace};
 
@@ -7,7 +8,7 @@ use russh::keys::{Certificate, HashAlg, PublicKey, PublicKeyBase64};
 use russh::{ChannelId, MethodKind, server};
 
 use std::collections::HashMap;
-use std::io::{IoSlice, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::process::Stdio;
@@ -15,7 +16,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use hyper::body::Bytes;
-use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
@@ -1377,7 +1377,6 @@ fn send_start_terminal_to_mesh_init_blocking(
     extra_env: std::collections::HashMap<String, String>,
     context: Option<mesh::protocol::ActivationContext>,
 ) -> Result<MeshInitTerminalControl, anyhow::Error> {
-    let mut stream = std::os::unix::net::UnixStream::connect(&terminal.socket_path)?;
     let home = terminal.home.clone();
     let user = terminal.user.clone();
     let mut env = std::collections::HashMap::from([
@@ -1387,27 +1386,86 @@ fn send_start_terminal_to_mesh_init_blocking(
         ("TERM".to_string(), term),
     ]);
     env.extend(extra_env);
-    let request = mesh::protocol::Request::StartTerminal {
-        name: user.clone(),
-        home: home.clone(),
-        uid: terminal.uid,
-        gid: terminal.gid,
-        pty,
-        env,
-        context,
-        command,
-        fd_count: Some(fds.len() as u32),
+    // Duplicated constants are acceptable: the mesh-init control API is
+    // stable, and the numeric identities (component/method/field tags from
+    // crates/mesh-init/API.md, mirrored by mesh-init's generated catalog) are
+    // exactly what this seqpacket request expects. No runtime schema load: a
+    // catalog translation via mesh::tagged::load_service_catalog is the
+    // gateway/CLI path for arbitrary methods, not the peer-to-peer terminal
+    // delegation path.
+    let record = mesh::tagged::TaggedRecord {
+        component: mesh::tagged::NameOrTag::Tag(mesh_api::mesh_init_ids::COMPONENT_MESH_INIT),
+        method: mesh::tagged::NameOrTag::Tag(
+            mesh_api::mesh_init_ids::METHOD_MESH_INIT_START_TERMINAL,
+        ),
+        id: Some(serde_json::json!(1)),
+        env: [
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_NAME,
+                serde_json::json!(user.clone()),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_HOME,
+                serde_json::json!(home),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_UID,
+                serde_json::json!(terminal.uid),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_GID,
+                serde_json::json!(terminal.gid),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_PTY,
+                serde_json::json!(pty),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_ENV,
+                serde_json::Value::Object(
+                    env.clone()
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect(),
+                ),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_CONTEXT,
+                serde_json::json!(context),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_COMMAND,
+                serde_json::json!(command),
+            ),
+            (
+                mesh_api::mesh_init_ids::FIELD_MESH_INIT_START_TERMINAL_FD_COUNT,
+                serde_json::json!(fds.len() as u32),
+            ),
+        ]
+        .into_iter()
+        .map(|(tag, value)| (mesh::tagged::NameOrTag::Tag(tag), value))
+        .collect(),
+        ..Default::default()
     };
-    let line = serialize_mesh_init_request(&request)?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-
-    let iov = [IoSlice::new(b"F")];
-    let cmsg = [ControlMessage::ScmRights(fds)];
-    sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)?;
-
-    let response = read_mesh_init_response_blocking(&mut stream)?;
+    let response = tokio::runtime::Handle::current().block_on(async {
+        let stream = mesh::seqpacket::UnixSeqpacket::connect(mesh_init_seqpacket_socket_path(
+            &terminal.socket_path,
+        ))
+        .await?;
+        stream.send_cbor_record(&record, fds).await?;
+        let (response, returned_fds) = stream
+            .recv_cbor_record()
+            .await?
+            .context("mesh-init closed seqpacket control socket")?;
+        anyhow::ensure!(
+            returned_fds.is_empty(),
+            "mesh-init returned unexpected file descriptors"
+        );
+        response
+            .result
+            .context("mesh-init seqpacket response omitted result")
+    })?;
+    let response: mesh::protocol::Response = serde_json::from_value(response)?;
     if !response.success {
         Err(anyhow::anyhow!(
             "mesh-init rejected terminal: {}",
@@ -1425,9 +1483,18 @@ fn send_start_terminal_to_mesh_init_blocking(
             .to_string();
         Ok(MeshInitTerminalControl {
             terminal_id,
-            stream: Arc::new(std::sync::Mutex::new(stream)),
+            // Terminal resize/close traffic retains the old stream protocol
+            // until those calls migrate too; descriptor transfer itself is
+            // now atomically paired with CBOR on SOCK_SEQPACKET.
+            stream: Arc::new(std::sync::Mutex::new(
+                std::os::unix::net::UnixStream::connect(&terminal.socket_path)?,
+            )),
         })
     }
+}
+
+fn mesh_init_seqpacket_socket_path(stream_path: &str) -> String {
+    std::env::var("MESH_INIT_SEQPACKET_SOCK").unwrap_or_else(|_| format!("{stream_path}.cbor"))
 }
 
 fn send_mesh_init_control_request_blocking(
@@ -2707,11 +2774,11 @@ impl server::Handler for SshHandler {
     }
 
     // ---------- Exec and FTP ----------
-    // This functionality is mainly for the admin, when user as a regular
-    // user.
-
-    // TODO: change the code to allow other users (authenticated with cert)
-    // to run - in isolated containers.
+    // SSH exec is the reference command-execution path for both SSH and the
+    // authenticated HTTP exec adapter. The authenticated identity supplies
+    // the ordinary command UID/GID/home. A later command-target resolver will
+    // recognize registered mesh-init services and use their configured home
+    // and execution context only after service-specific authorization.
 
     /// Exec_request is the last message in a 'session', after pty is setup and
     /// env variables are sent. May have a pty (if -t is used on client).

@@ -6,14 +6,13 @@
 //!
 //! # Privileged UIDs
 //!
-//! Three service UIDs have hardcoded defaults that mesh-init treats as
+//! Two non-root service UIDs have hardcoded defaults that mesh-init treats as
 //! root-equivalent for the purpose of spawning and controlling services:
 //!
 //! | UID  | Constant                | Env var                  | Purpose                |
 //! |------|-------------------------|--------------------------|------------------------|
 //! | 0    | (root)                  | —                        | Unrestricted           |
 //! | 1000 | [`DEFAULT_SYSTEM_UID`]  | `MESH_SYSTEM_UID`        | "system" service acct  |
-//! | 103  | [`DEFAULT_TRUSTED_SSHD_UID`] | `MESH_TRUSTED_SSHD_UID` | sshd (Debian)     |
 //! | 150  | [`DEFAULT_SSH_MESH_UID`]     | `MESH_SSH_MESH_UID`     | ssh-mesh service acct  |
 //!
 //! **UID 1000 (system) is trusted and equivalent to root for all permissions.**
@@ -35,15 +34,6 @@
 //!   and email addresses `@example.com` or `@*.example.com`
 
 use serde::{Deserialize, Serialize};
-
-/// Hardcoded UID commonly assigned to the `sshd` service account (Debian).
-///
-/// This is only a fallback default. Operators should override it via the
-/// `MESH_TRUSTED_SSHD_UID` environment variable (see [`trusted_sshd_uid`]) to
-/// match their distribution's sshd UID, or set it to `none`/`off` to disable
-/// the builtin sshd-UID allowlist entirely. Relying on this hardcoded default
-/// is insecure on systems where UID 103 belongs to an unrelated account.
-pub const DEFAULT_TRUSTED_SSHD_UID: u32 = 103;
 
 /// Hardcoded UID for the `system` service account.
 ///
@@ -68,21 +58,6 @@ pub const DEFAULT_SYSTEM_UID: u32 = 1000;
 /// Override with the `MESH_SSH_MESH_UID` environment variable.
 pub const DEFAULT_SSH_MESH_UID: u32 = 150;
 use tracing::warn;
-
-/// Resolve the trusted sshd UID.
-///
-/// Reads the `MESH_TRUSTED_SSHD_UID` environment variable:
-/// - unset → falls back to [`DEFAULT_TRUSTED_SSHD_UID`] (backward compat)
-/// - a number → that UID
-/// - `none` or `off` → `None` (disables the builtin sshd-UID allowlist)
-/// - invalid value → falls back to the default with a warning
-///
-/// Returning `None` means no UID other than root (0) and the daemon's own UID
-/// is trusted by the builtin allowlist; all other UIDs must be listed in
-/// `[[peer]]` entries.
-pub fn trusted_sshd_uid() -> Option<u32> {
-    resolve_privileged_uid("MESH_TRUSTED_SSHD_UID", DEFAULT_TRUSTED_SSHD_UID)
-}
 
 /// Resolve the `system` service UID.
 ///
@@ -223,22 +198,20 @@ impl AuthConfig {
     /// Check the built-in local UDS peer allowlist.
     ///
     /// Root (UID 0), the daemon's own UID (`current_uid`), the system UID
-    /// (default 1000, see [`system_uid`]), the sshd UID (default 103, see
-    /// [`trusted_sshd_uid`]), and the ssh-mesh UID (default 150, see
-    /// [`ssh_mesh_uid`]) are always authorized. Each can be disabled by
+    /// (default 1000, see [`system_uid`]), and the ssh-mesh UID (default 150,
+    /// see [`ssh_mesh_uid`]) are always authorized. Each can be disabled by
     /// setting its env var to `none`/`off`.
     pub fn is_builtin_uid_authorized(uid: u32, current_uid: u32) -> bool {
         uid == 0
             || uid == current_uid
             || system_uid().is_some_and(|sys| uid == sys)
-            || trusted_sshd_uid().is_some_and(|sshd| uid == sshd)
             || ssh_mesh_uid().is_some_and(|mesh| uid == mesh)
     }
 
     /// Check if a UID is authorized to connect directly.
     ///
     /// Root (UID 0), the daemon's own UID (`current_uid`), and the hardcoded
-    /// sshd service UID are always authorized. Otherwise the UID must appear in
+    /// ssh-mesh service UID are always authorized. Otherwise the UID must appear in
     /// a `[[peer]]` entry.
     pub fn is_uid_authorized(&self, uid: u32, current_uid: u32) -> bool {
         if Self::is_builtin_uid_authorized(uid, current_uid) {
@@ -501,12 +474,6 @@ mod tests {
     fn test_auth_self_always_authorized() {
         let config = AuthConfig::default();
         assert!(config.is_uid_authorized(5000, 5000));
-    }
-
-    #[test]
-    fn test_auth_default_sshd_uid_always_authorized() {
-        let config = AuthConfig::default();
-        assert!(config.is_uid_authorized(DEFAULT_TRUSTED_SSHD_UID, 5000));
     }
 
     #[test]

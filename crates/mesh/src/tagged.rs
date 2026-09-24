@@ -204,15 +204,33 @@ impl TaggedCatalog {
     }
 
     /// Resolve a numeric or textual record identity to its documented method
-    /// name. Service dispatchers use this when an inbound tagged-CBOR request
-    /// needs to enter an existing typed serde handler.
+    /// name. A catalog's compact numeric IDs and its public names are
+    /// interchangeable identities at this boundary: host callers may retain
+    /// self-describing names while constrained links use tags.
+    ///
+    /// Service dispatchers use this when an inbound tagged-CBOR request needs
+    /// to enter an existing typed serde handler.
     pub fn method_name(&self, record: &TaggedRecord) -> Option<&str> {
         self.methods
             .iter()
-            .find(|(_, schema)| {
-                schema.component == record.component && schema.method == record.method
+            .find(|(name, schema)| {
+                let (component_name, method_name) =
+                    name.split_once('.').unwrap_or(("", name.as_str()));
+                identity_matches(&record.component, &schema.component, component_name)
+                    && identity_matches(&record.method, &schema.method, method_name)
             })
             .map(|(name, _)| name.as_str())
+    }
+
+    /// Translate a documented request to the JSON object expected by a typed
+    /// service handler. Unlike [`Self::to_jsonl`], this rejects unknown
+    /// methods, so a service can use its generated catalog as its public API
+    /// boundary without duplicating identity checks.
+    pub fn documented_request(&self, record: &TaggedRecord) -> Result<Value> {
+        if self.method_name(record).is_none() {
+            bail!("tagged-CBOR method is outside the public catalog");
+        }
+        Ok(self.to_jsonl(record))
     }
 
     /// Parse `component.method name=value positional...` into a tagged record.
@@ -420,6 +438,13 @@ impl TaggedCatalog {
     }
 }
 
+/// Match either spelling of a catalog identity. `wire` is normally a tag for
+/// an embedded-capable API, while `name` is retained by the catalog key for
+/// host-native callers.
+fn identity_matches(actual: &NameOrTag, wire: &NameOrTag, name: &str) -> bool {
+    actual == wire || matches!(actual, NameOrTag::Name(actual_name) if actual_name == name)
+}
+
 fn name_or_index(value: Option<&Value>, fallback: &str) -> NameOrTag {
     match value {
         Some(Value::Number(value)) => value
@@ -430,6 +455,57 @@ fn name_or_index(value: Option<&Value>, fallback: &str) -> NameOrTag {
         Some(Value::String(value)) => NameOrTag::parse(value),
         _ => NameOrTag::Name(fallback.to_owned()),
     }
+}
+
+/// Compatibility wrapper around the shared lazy schema resolver.
+///
+/// New callers that also need documentation or source provenance should use
+/// [`crate::catalog::CatalogResolver`] directly. Successful parses are retained
+/// by the process-wide resolver.
+pub fn load_service_catalog(component: &str) -> Option<Result<TaggedCatalog>> {
+    crate::catalog::service_catalog_resolver()
+        .resolve(component)
+        .map(|result| result.map(|resolved| (*resolved.catalog).clone()))
+}
+
+/// Build a [`TaggedRecord`] from one typed request value, preferring the
+/// generated catalog's numeric encoding but keeping the self-describing
+/// textual encoding when no catalog is discoverable.
+///
+/// Client-owned translation helper (`mesh-init.start_terminal` style callers in
+/// ssh-mesh bridges, JSONL/seqpacket callers): the client owns the wire for its
+/// single encoding, loading the component's `tools.json` on demand and never
+/// embedding or manufacturing a schema. With a catalog the record carries
+/// numeric identity from `x-component-index` / `x-method-index` plus field
+/// keys; without one `component`/`method` stay textual per the documented
+/// name-based fallback. A service can still reject either representation;
+/// the catalog simply makes the compact form available when installed.
+pub fn record_from_value_translated(
+    component: &str,
+    method: &str,
+    value: &Value,
+    catalog: Option<&TaggedCatalog>,
+) -> Result<TaggedRecord> {
+    let Some(catalog) = catalog else {
+        let record = TaggedRecord {
+            component: NameOrTag::Name(component.to_string()),
+            method: NameOrTag::Name(method.to_string()),
+            ..Default::default()
+        };
+        let mut env = BTreeMap::new();
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("request must be a JSON object"))?;
+        for (key, field) in object {
+            if key == "method" {
+                continue;
+            }
+            env.insert(NameOrTag::Name(key.clone()), field.clone());
+        }
+        return Ok(TaggedRecord { env, ..record });
+    };
+    let qualified = format!("{component}.{method}");
+    catalog.record_from_value(&qualified, value)
 }
 
 /// Convert CLI `COMPONENT METHOD key=value` arguments into a common record.
@@ -736,6 +812,33 @@ mod tests {
         assert_eq!(record.component, NameOrTag::Tag(5));
         assert_eq!(record.method, NameOrTag::Tag(1));
         assert_eq!(record.env.get(&NameOrTag::Tag(1)), Some(&json!("wlan0")));
+    }
+
+    #[test]
+    fn catalog_accepts_names_for_numeric_method_identity() {
+        let catalog = TaggedCatalog::from_tools_json(&json!([{
+            "name":"mesh-init.start_terminal",
+            "x-component-index":3,
+            "x-method-index":16,
+            "inputSchema":{"properties":{"name":{"x-protobuf-index":1}}}
+        }]))
+        .unwrap();
+        let record = TaggedRecord {
+            component: NameOrTag::Name("mesh-init".to_owned()),
+            method: NameOrTag::Name("start_terminal".to_owned()),
+            env: [(NameOrTag::Name("name".to_owned()), json!("alice"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            catalog.method_name(&record),
+            Some("mesh-init.start_terminal")
+        );
+        assert_eq!(
+            catalog.documented_request(&record).unwrap(),
+            json!({"method":"mesh-init.start_terminal", "name":"alice"})
+        );
     }
 
     #[test]

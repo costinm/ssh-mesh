@@ -1,583 +1,141 @@
-# `mesh-init` — UDS Control Protocol API
-
-`mesh-init` exposes its control interface over a Unix Domain Socket (UDS) located at `/run/mesh/mesh-init/mesh.sock` on root-run systems. The first byte of the first packet selects the protocol for the whole connection.
-
-* `{` selects line JSON or JSON-RPC-shaped requests.
-* An ASCII letter selects the shared text-record protocol (`kind key=value`).
-* `0x00` selects a 4-byte-length-framed tagged-CBOR session. Programmatic
-  clients with this document's generated numeric catalog use this form.
-
-The endpoint does not re-detect protocol per line.
-
-The CBOR session handles the generated public catalog below. Operations that
-transfer file descriptors (`start_terminal`, `register_namespace`) remain an
-explicit JSON/text UDS + `SCM_RIGHTS` operation: CBOR never hides descriptor
-passing inside a normal request record.
-
-JSON clients use JSON-RPC 2.0, with a `method`, object `params`, and request `id`. Text records remain supported for human and script clients. The protocol supports standard control requests as well as file descriptor-passing requests via Unix domain socket ancillary data (`SCM_RIGHTS`).
-
-`resources/tools.json` is generated from the normative `mesh-api` blocks in
-this document. The blocks intentionally cover only the public subset of
-`mesh::protocol::Request`; descriptor-passing terminal operations and internal
-observer controls are not silently exposed merely because their serde variants
-exist. Stable numeric tags let programmatic callers select tagged CBOR, while
-the JSON-RPC gateway remains available for clients without this catalog.
-
-## Generated tagged-CBOR catalog
-
-The `mesh-init` component owns numeric component index 3. Field indexes are
-stable wire identifiers, not Rust field order. Regenerate the checked-in
-catalog after changing a block:
-
-```sh
-cargo run -p mesh-api-gen -- --api crates/mesh-init/API.md \
-  --out-tools crates/mesh-init/resources/tools.json \
-  --out-rust crates/mesh-init/src/api.rs
-```
-
-```mesh-api
-id = "mesh-init.status"
-component = "mesh-init"
-method = "status"
-component-index = 3
-method-index = 1
-summary = "Query status for one service or all loaded services"
-[request]
-fields = [{ name = "name", index = 1, type = "string", position = 1 }]
-```
-
-```mesh-api
-id = "mesh-init.start"
-component = "mesh-init"
-method = "start"
-component-index = 3
-method-index = 2
-summary = "Start a configured service by name"
-[request]
-fields = [
-  { name = "name", index = 1, type = "string", required = true, position = 1 },
-  { name = "args", index = 2, type = "array" },
-  { name = "env", index = 3, type = "object" },
-]
-```
-
-```mesh-api
-id = "mesh-init.stop"
-component = "mesh-init"
-method = "stop"
-component-index = 3
-method-index = 3
-summary = "Gracefully terminate or signal a running service"
-[request]
-fields = [
-  { name = "name", index = 1, type = "string", required = true, position = 1 },
-  { name = "signal", index = 2, type = "i32" },
-]
-```
-
-```mesh-api
-id = "mesh-init.freeze"
-component = "mesh-init"
-method = "freeze"
-component-index = 3
-method-index = 4
-summary = "Suspend a running service"
-[request]
-fields = [{ name = "name", index = 1, type = "string", required = true, position = 1 }]
-```
-
-```mesh-api
-id = "mesh-init.unfreeze"
-component = "mesh-init"
-method = "unfreeze"
-component-index = 3
-method-index = 5
-summary = "Resume a frozen service"
-[request]
-fields = [{ name = "name", index = 1, type = "string", required = true, position = 1 }]
-```
-
-```mesh-api
-id = "mesh-init.reload"
-component = "mesh-init"
-method = "reload"
-component-index = 3
-method-index = 6
-summary = "Reload service configuration from disk"
-```
-
-```mesh-api
-id = "mesh-init.reconcile"
-component = "mesh-init"
-method = "reconcile"
-component-index = 3
-method-index = 14
-summary = "Reconcile managed services after host resume or recovery"
-[response]
-fields = [
-  { name = "checked", index = 1, type = "u64", required = true },
-  { name = "reconciled", index = 2, type = "u64", required = true },
-  { name = "failed", index = 3, type = "u64", required = true },
-]
-```
-
-```mesh-api
-id = "mesh-init.shutdown"
-component = "mesh-init"
-method = "shutdown"
-component-index = 3
-method-index = 15
-summary = "Gracefully stop all services and shut down mesh-init"
-```
-
-```mesh-api
-id = "mesh-init.processes"
-component = "mesh-init"
-method = "processes"
-component-index = 3
-method-index = 7
-summary = "List observed processes from the process observer"
-```
-
-```mesh-api
-id = "mesh-init.process"
-component = "mesh-init"
-method = "process"
-component-index = 3
-method-index = 8
-summary = "Return detailed information for one process"
-[request]
-fields = [{ name = "pid", index = 1, type = "u32", required = true, position = 1 }]
-```
-
-```mesh-api
-id = "mesh-init.cgroups"
-component = "mesh-init"
-method = "cgroups"
-component-index = 3
-method-index = 9
-summary = "Return all observed cgroups"
-```
-
-```mesh-api
-id = "mesh-init.cgroup"
-component = "mesh-init"
-method = "cgroup"
-component-index = 3
-method-index = 10
-summary = "Return detailed information for one cgroup path"
-[request]
-fields = [{ name = "path", index = 1, type = "string", required = true, position = 1 }]
-```
-
-```mesh-api
-id = "mesh-init.pressure"
-component = "mesh-init"
-method = "pressure"
-component-index = 3
-method-index = 11
-summary = "Return pressure watch state"
-```
-
-```mesh-api
-id = "mesh-init.cgroup_high"
-component = "mesh-init"
-method = "cgroup_high"
-component-index = 3
-method-index = 12
-summary = "Set memory.high for a cgroup based on current memory usage"
-[request]
-fields = [
-  { name = "path", index = 1, type = "string", required = true },
-  { name = "percentage", index = 2, type = "f64", required = true },
-  { name = "interval", index = 3, type = "u64", required = true },
-]
-```
-
-```mesh-api
-id = "mesh-init.move_process"
-component = "mesh-init"
-method = "move_process"
-component-index = 3
-method-index = 13
-summary = "Move a process to a named cgroup"
-[request]
-fields = [
-  { name = "pid", index = 1, type = "u32", required = true, position = 1 },
-  { name = "cgroup_name", index = 2, type = "string" },
-]
-```
-
----
-
-## Response Structure
-
-Every request returns a single JSON object line with the following shape:
-
-```json
-{
-  "success": true,
-  "error": "Error message string if success is false",
-  "data": { ... } // Optional key-value payload returned by the method
-}
-```
-
-For text-selected connections, responses use logfmt-style records:
-
-```text
-response name=ssh-mesh state=running pid=42 success=true
-error message="service not found"
-```
-
----
-
-## 1. Core Service Lifecycle Methods
-
-### `start`
-Start a configured service by name. If not already running, loads config and spawns.
-*   **Parameters:**
-    *   `name` (String, Required): Name of the service (e.g. `ssh-mesh`).
-    *   `args` (Array of Strings, Optional): Additional arguments to append to the command.
-    *   `env` (Object of key-value String pairs, Optional): Additional environment variables.
-    *   `context` (Object, Optional): Caller's activation context.
-
-### `stop`
-Gracefully terminate or forcibly kill a running service.
-*   **Parameters:**
-    *   `name` (String, Required): Name of the service.
-    *   `signal` (Integer, Optional): Specific signal to send (defaults to `SIGTERM`).
-
-### `freeze`
-Freeze (suspend) a running service via SIGSTOP or cgroup.freeze.
-*   **Parameters:**
-    *   `name` (String, Required): Name of the service.
-
-### `unfreeze`
-Unfreeze (resume) a suspended service.
-*   **Parameters:**
-    *   `name` (String, Required): Name of the service.
-
-### `status`
-Query status of a specific service or list all loaded services.
-*   **Parameters:**
-    *   `name` (String, Optional): If omitted, returns statuses for all services.
-*   **Returns:**
-    *   `data`: Map of service names to service state and PID information.
-
-### `reload`
-Reload all service configurations from disk and restart modified services.
-
-### `reconcile`
-Reconcile managed services with their desired lifecycle state after host resume
-or another external recovery event. Only services recorded as both current and
-desired `Running` are considered; deliberately frozen services remain frozen.
-This method requires the root or system UID.
-
-For every service that should be running, mesh-init sends `mesh.lifecycle`
-events to its standard mesh endpoint: first an observed external `freeze`, then
-an external `unfreeze`. This also covers services whose cgroup was thawed
-correctly by the host but which still need to restore interfaces. Explicit
-`freeze` and `unfreeze` control requests send the same events with cause
-`requested`; the requested freeze notification is sent before the cgroup is
-frozen. If that transition fails, mesh-init sends a compensating requested
-`unfreeze` event. A successful requested unfreeze resets watchdog and idle
-deadlines, giving the application its configured interval to resume.
-
-Lifecycle notifications for different services run concurrently while event
-order is preserved within each service. **Returns:** counts named `checked`,
-`reconciled`, and `failed`; `failed` includes cgroup operations and individual
-lifecycle notifications that could not be delivered.
-
-### `shutdown`
-Gracefully shut down all services and exit the daemon.
-
----
-
-## 1b. Impersonation Protocol
-
-Trusted peers (sshd, ssh-mesh, system) may start processes running as a
-different UID than their own. This is how SSH users get shells as their
-target UID, and how the ssh-mesh admin web UI runs commands as `system`.
-
-### Connection-level authentication
-
-When a UDS connection is accepted, mesh-init reads the peer's UID/GID via
-`SO_PEERCRED` (kernel-verified, unforgeable). The peer UID must be in the
-builtin allowlist:
-
-| UID  | Identity     | Env var                | Capabilities                                     |
-|------|--------------|------------------------|--------------------------------------------------|
-| 0    | root         | —                      | All operations, any target UID                   |
-| 1000 | system       | `MESH_SYSTEM_UID`      | All operations, any target UID (root-equivalent) |
-| 103  | sshd         | `MESH_TRUSTED_SSHD_UID`| Terminal/start/stop/freeze, any target UID       |
-| 150  | ssh-mesh     | `MESH_SSH_MESH_UID`    | Terminal/start/stop/freeze, any target UID       |
-
-**UID 1000 (system) is root-equivalent.** It can call system-wide observer
-methods (`freeze_process`, `move_process`, `cgroup_high`, `clear_refs`,
-`freeze_cgroup`) on any PID or cgroup. The sshd and ssh-mesh UIDs are
-**not** authorized for those methods — they must use the named-service APIs
-(`start`/`stop`/`freeze`/`unfreeze`).
-
-Each env var can be set to `none` or `off` to disable that UID. The full
-list can be overridden with `MESH_INIT_PRIVILEGED_UIDS` (comma-separated).
-
-### Per-request impersonation
-
-Impersonation is specified in the request body, not in the connection. The
-peer's UID (from `SO_PEERCRED`) is the *acting* identity; the request's
-`uid`/`gid` fields are the *target* identity. mesh-init verifies that the
-acting UID is in `privileged_uids()` before allowing a target that differs.
-
-#### `start_terminal` — impersonation fields
-
-| Field       | Type   | Purpose                                         |
-|-------------|--------|-------------------------------------------------|
-| `uid`       | u32    | Target UID to run the shell/command as.         |
-| `gid`       | u32?   | Target GID. If `None`, uses the target UID.     |
-| `name`      | String | Service/config name (also used as `USER`/`LOGNAME`). |
-| `home`      | String | Home directory (must exist; becomes `HOME`).    |
-| `command`   | String?| Shell command (`sh -c <command>`). If `None`, interactive shell. |
-| `context`   | Object?| `ActivationContext` carrying provenance (see below). |
-| `env`       | Object?| Additional caller env filtered by mesh-init policy, then merged into the child. |
-| `pty`       | bool?  | If `true`, the passed fd becomes the controlling terminal. |
-| `fd_count`  | u32?   | Number of FDs passed via `SCM_RIGHTS` (default 1). |
-
-#### `start` — impersonation fields
-
-| Field      | Type   | Purpose                                              |
-|------------|--------|------------------------------------------------------|
-| `name`     | String | Service name. The service config's `User=` determines the target UID. |
-| `args`     | [String]? | Extra args appended to `ExecStart`.               |
-| `env`      | Object?| Additional caller env filtered by mesh-init policy, then merged with the config's environment. |
-| `context`  | Object?| `ActivationContext` carrying provenance (see below). |
-
-For `start`, the target UID comes from the service config (`User=` field),
-not from the request. mesh-init re-checks `check_impersonation` after
-reloading the config from disk to prevent TOCTOU escalation.
-
-#### `prepare_activation` — pre-staging context for socket activation
-
-When a socket-activated service is triggered by an incoming connection
-(rather than an explicit `start` call), the trusted peer can pre-stage an
-`ActivationContext` so that the service receives provenance information when
-it spawns:
-
-```json
-{"jsonrpc":"2.0","id":1,"method":"prepare_activation","params":{"name":"my-service","context":{...}}}
-```
-
-The context is queued (max 32 per service) and consumed by the next
-socket-activation spawn for that service.
-
-### `ActivationContext` fields
-
-The `context` object carries **provenance** — who triggered the activation
-and why. It does not affect the target UID (that's `uid`/`gid` in the
-request, or `User=` in the config). It is metadata that gets injected as
-environment variables into the child process.
-
-| Field               | Type    | Set by     | Env var(s) generated                          |
-|---------------------|---------|------------|-----------------------------------------------|
-| `kind`              | String  | ssh-mesh   | `MESH_INIT_CONTEXT_KIND`                      |
-| `user`              | String  | ssh-mesh   | `MESH_INIT_CONTEXT_USER`, `SSH_MESH_ROUTE_USER` |
-| `command`           | String? | ssh-mesh   | `MESH_INIT_CONTEXT_COMMAND`, `SSH_MESH_ROUTE_COMMAND` |
-| `certificate_user`  | String? | ssh-mesh   | `SSH_MESH_ROUTE_CERTIFICATE_USER`             |
-| `peer_key_sha`      | String? | ssh-mesh   | `SSH_MESH_ROUTE_PEER_KEY_SHA`                 |
-| `client_id`         | u64?    | ssh-mesh   | `SSH_MESH_ROUTE_CLIENT_ID`                    |
-| `env`               | Object? | caller     | Filtered by mesh-init policy, then merged into child env |
-
-The full context is also serialized as `MESH_INIT_CONTEXT_JSON`.
-
-Caller-supplied env is accepted by default except for dangerous names. The
-default dangerous list includes loader, shell startup, language/runtime
-injection, `BASH_FUNC_*`, and `PATH` variables. A service may allow specific
-dangerous names with `AllowDangerousEnv`; mesh-init's global dangerous list can
-be replaced with the comma-separated `MESH_DANGEROUS_ENV` environment variable.
-
-When `kind = "ssh"`, `user` is the SSH-authenticated username (from the
-certificate principal or `authorized_keys`), `certificate_user` is the
-cert principal (if any), and `peer_key_sha` is the SHA-256 fingerprint of
-the peer's public key.
-
-### Concrete flows
-
-#### sshd → mesh-init (SSH terminal)
-
-sshd (UID 103) authenticates an SSH user, then sends `start_terminal` with
-the user's UID/GID:
-
-```json
-{
-  "method": "start_terminal",
-  "name": "alice",
-  "home": "/home/alice",
-  "uid": 1001,
-  "gid": 1001,
-  "pty": true,
-  "env": {"TERM": "xterm-256color"},
-  "context": {
-    "kind": "ssh",
-    "user": "alice",
-    "certificate_user": "alice@corp.example.com",
-    "peer_key_sha": "SHA256:abc123...",
-    "client_id": 42
-  },
-  "fd_count": 1
-}
-```
-
-mesh-init verifies `check_impersonation(peer_uid=103, target_uid=1001)` →
-allowed (103 is in `privileged_uids`). The child runs as UID 1001 with
-`SSH_MESH_ROUTE_USER=alice` in its environment.
-
-#### ssh-mesh admin web UI → mesh-init (exec as system)
-
-The ssh-mesh admin HTTP interface (`POST /_m/_exec/<cmd>`) impersonates
-`system` (UID 1000) when calling mesh-init:
-
-```json
-{
-  "method": "start_terminal",
-  "name": "system",
-  "home": "/tmp",
-  "uid": 1000,
-  "gid": 1000,
-  "pty": false,
-  "env": {},
-  "context": null,
-  "command": "ls -la /data"
-}
-```
-
-mesh-init verifies `check_impersonation(peer_uid=150, target_uid=1000)` →
-allowed (150 is in `privileged_uids`). The child runs as UID 1000 (system).
-
-#### system (UID 1000) → mesh-init (direct control)
-
-A process running as `system` connects to the control socket directly. It
-can start/stop/freeze any service, call observer methods, and manage
-cgroups — it is root-equivalent.
-
-#### Non-privileged peer → mesh-init
-
-A non-privileged peer (e.g., UID 5000) can only connect if listed in a
-`[[peer]]` entry in `default.service` or `auth.toml`. Once connected, it
-may only `start`/`stop`/`freeze` services whose config UID matches its own
-(`check_impersonation` rejects UID mismatch). It cannot call observer
-methods (`require_system_or_root` rejects).
-
----
-
-## 2. File Descriptor-Passing Methods
-
-These requests must be sent over the UDS accompanied by a file descriptor using `SCM_RIGHTS` ancillary data.
-
-### `start_terminal`
-Spawns a shell or command with its stdin/stdout/stderr attached to a passed PTY descriptor.
-*   **Parameters:**
-    *   `name` (String, Required): Name of the target configuration or service.
-    *   `home` (String, Required): Shell home directory path.
-    *   `uid` (Integer, Required): Run-as User ID.
-    *   `gid` (Integer, Optional): Run-as Group ID.
-    *   `pty` (Boolean, Optional): Treat the passed fd as a controlling terminal.
-    *   `env` (Object, Optional): Environment variables.
-    *   `command` (String, Optional): Execution command.
-*   **Returns:**
-    *   `data`: `{"pid": <child_pid>}`
-
-### `register_namespace`
-Exposes the network namespace descriptor of an in-container `mesh-init` process to the host.
-*   **Parameters:**
-    *   `name` (String, Required): Service name.
-    *   `kind` (String, Optional): Namespace kind (`net` / `user`).
-    *   `target_pid` (Integer, Optional): PID context of the container.
-
----
-
-## 3. Terminal Control Methods
-
-### `terminal_resize`
-Resize the dimensions of a PTY associated with an active terminal session.
-*   **Parameters:**
-    *   `terminal_id` (String, Required): Terminal session ID.
-    *   `col_width` (Integer, Required): Columns.
-    *   `row_height` (Integer, Required): Rows.
-    *   `pix_width` (Integer, Required): Pixels width.
-    *   `pix_height` (Integer, Required): Pixels height.
-
-### `terminal_command`
-Send a control instruction (e.g. `close`, `hup`, `signal`) to a terminal session.
-*   **Parameters:**
-    *   `terminal_id` (String, Required): Terminal session ID.
-    *   `command` (String, Required): Command verb.
-    *   `data` (JSON value, Optional): Command parameters.
-
----
-
-## 4. Process Observer Methods
-
-These endpoints expose system diagnostics from the process observer.
-
-### `processes` (Alias: `list_processes`)
-Retrieve a snapshot of all observed processes.
-*   **Returns:**
-    *   `data`: Array of process records.
-
-### `process` (Alias: `get_process`)
-Retrieve comprehensive details for a single PID including cgroup association.
-*   **Parameters:**
-    *   `pid` (Integer, Required): Process ID.
-
-### `process_only` (Alias: `ps_one`)
-Retrieve a fast process record without cgroup structure expansion.
-*   **Parameters:**
-    *   `pid` (Integer, Required): Process ID.
-
-### `cgroups` (Alias: `list_cgroups`)
-List all active control groups.
-*   **Returns:**
-    *   `data`: Array of cgroups.
-
-### `cgroup` (Alias: `get_cgroup`)
-Retrieve resource consumption details for a specific cgroup.
-*   **Parameters:**
-    *   `path` (String, Required): Cgroup v2 folder path.
-
-### `pressure` (Aliases: `psi`, `psi_watches`)
-Retrieve memory pressure watch registers and current classifications.
-
-### `cgroup_high`
-Set `memory.high` limit on a cgroup for a specific period.
-*   **Parameters:**
-    *   `path` (String, Required): Target cgroup path.
-    *   `percentage` (Float, Required): Memory threshold percentage.
-    *   `interval` (Integer, Required): Duration in seconds before resetting.
-
-### `cgroup_procs`
-List processes currently running in a target cgroup path.
-*   **Parameters:**
-    *   `path` (String, Required): Cgroup path.
-
-### `move_process`
-Migrate a process into a target cgroup slice.
-*   **Parameters:**
-    *   `pid` (Integer, Required): Target process ID.
-    *   `cgroup_name` (String, Optional): Target cgroup folder name.
-
-### `clear_refs`
-Instruct kernel to clear memory reference tables (`/proc/<pid>/clear_refs`).
-*   **Parameters:**
-    *   `pid` (Integer, Required): Process ID.
-    *   `value` (String, Required): Reference clear type ("1"-"5" or "7").
-
-### `freeze_process`
-Suspend or resume a single process.
-*   **Parameters:**
-    *   `pid` (Integer, Required): Target process ID.
-    *   `freeze` (Boolean, Required): True to freeze, False to thaw.
-
-### `freeze_cgroup`
-Suspend or resume all processes inside a cgroup.
-*   **Parameters:**
-    *   `path` (String, Required): Cgroup path.
-    *   `freeze` (Boolean, Required): True to freeze, False to thaw.
+# `mesh-init` API (3)
+
+Transport, framing, JSON-RPC, tagged-CBOR, and descriptor-passing rules are
+shared in [mesh-api/PROTOCOLS.md](../mesh-api/PROTOCOLS.md). Root-run mesh-init
+exposes the legacy stream endpoint at `/run/mesh/mesh-init/mesh.sock` and its
+tagged-CBOR seqpacket endpoint at `/run/mesh/mesh-init/mesh.sock.cbor`.
+
+Field tags are stable wire identities. The generated public catalog is
+`resources/tools.json`; regenerate it and `src/api.rs` after changing this
+document.
+
+## 1. `status` — Query status for one service or all loaded services
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+
+## 2. `start` — Start a configured service by name
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+| 2 | `args` | `array` | |
+| 3 | `env` | `object` | |
+
+## 3. `stop` — Gracefully terminate or signal a running service
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+| 2 | `signal` | `i32` | |
+
+## 4. `freeze` — Suspend a running service
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+
+## 5. `unfreeze` — Resume a frozen service
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+
+## 6. `reload` — Reload service configuration from disk
+
+## 14. `reconcile` — Reconcile managed services after host resume or recovery
+
+### Response
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `checked` | `u64` | |
+| 2 | `reconciled` | `u64` | |
+| 3 | `failed` | `u64` | |
+
+## 15. `shutdown` — Gracefully stop all services and shut down mesh-init
+
+## 7. `processes` — List observed processes from the process observer
+
+## 8. `process` — Return detailed information for one process
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `pid` | `u32` | |
+
+## 9. `cgroups` — Return all observed cgroups
+
+## 10. `cgroup` — Return detailed information for one cgroup path
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `path` | `string` | |
+
+## 11. `pressure` — Return pressure watch state
+
+## 12. `cgroup_high` — Set memory.high for a cgroup based on current memory usage
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `path` | `string` | |
+| 2 | `percentage` | `f64` | |
+| 3 | `interval` | `u64` | |
+
+## 13. `move_process` — Move a process to a named cgroup
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `pid` | `u32` | |
+| 2 | `cgroup_name` | `string` | |
+
+## 16. `start_terminal` — Start a terminal with descriptors attached to its CBOR seqpacket request
+
+The caller supplies an already-authorized target identity and its home. For a
+user command this is the authenticated user's UID/GID/home. When a gateway has
+resolved a registered service and authorized the caller for it, the target is
+that service's configured identity and service home. mesh-init verifies that
+the supplied home belongs to the requested UID before spawning; it does not
+silently substitute the control client's home.
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+| 2 | `home` | `string` | |
+| 3 | `uid` | `u32` | |
+| 4 | `gid` | `u32` | |
+| 5 | `pty` | `bool` | |
+| 6 | `env` | `object` | |
+| 7 | `context` | `object` | |
+| 8 | `command` | `string` | |
+| 9 | `fd_count` | `u32` | |
+
+## 17. `register_namespace` — Register a namespace descriptor attached to its CBOR seqpacket request
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | |
+| 2 | `kind` | `string` | |
+| 3 | `target_pid` | `u32` | |

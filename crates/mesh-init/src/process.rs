@@ -7,7 +7,7 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -511,10 +511,6 @@ fn cap_mask(caps: &[i32], word: usize) -> u32 {
     })
 }
 
-fn service_runtime_dir(name: &str) -> PathBuf {
-    Path::new("/run/mesh").join(name)
-}
-
 fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL byte")
@@ -527,15 +523,19 @@ fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     }
 }
 
-fn prepare_service_runtime_dir(config: &AppConfig) -> Result<(), ProcessError> {
-    let dir = service_runtime_dir(&config.name);
+fn prepare_service_directory(
+    config: &AppConfig,
+    dir: &Path,
+    mode: u32,
+    directory: &str,
+) -> Result<(), ProcessError> {
     let uid = config.uid.unwrap_or(0);
     let gid = config.gid.unwrap_or(0);
     let prepare = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
         if unsafe { libc::geteuid() } == 0 {
-            chown_path(&dir, uid, gid)?;
+            chown_path(dir, uid, gid)?;
         }
         Ok(())
     };
@@ -547,8 +547,9 @@ fn prepare_service_runtime_dir(config: &AppConfig) -> Result<(), ProcessError> {
                 path = %dir.display(),
                 uid,
                 gid,
-                mode = "0777",
-                "service_runtime_dir_ready"
+                mode,
+                directory,
+                "service_directory_ready"
             );
             Ok(())
         }
@@ -557,12 +558,45 @@ fn prepare_service_runtime_dir(config: &AppConfig) -> Result<(), ProcessError> {
                 service = %config.name,
                 path = %dir.display(),
                 error = %error,
-                "service_runtime_dir_prepare_skipped_non_root"
+                directory,
+                "service_directory_prepare_skipped_non_root"
             );
             Ok(())
         }
         Err(error) => Err(ProcessError::Io(error)),
     }
+}
+
+fn prepare_service_directories(config: &AppConfig) -> Result<(), ProcessError> {
+    let paths = mesh::paths::AppPaths::for_app(&config.name);
+    prepare_service_directory(config, &paths.home, 0o755, "home")?;
+    prepare_service_directory(config, &paths.mesh_ipc_dir, 0o755, "runtime")
+}
+
+fn service_home(config: &AppConfig) -> String {
+    config.env.get("HOME").cloned().unwrap_or_else(|| {
+        mesh::paths::AppPaths::for_app(&config.name)
+            .home
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// Deterministic executable search path for supervised services. Service-local
+/// mutable and per-user Nix profiles take precedence over host profiles.
+fn service_path(config: &AppConfig) -> String {
+    let home = service_home(config);
+    [
+        format!("{home}/bin"),
+        format!("{home}/.local/bin"),
+        format!("{home}/.nix-profile/bin"),
+        "/nix/var/nix/profiles/default/bin".to_string(),
+        "/run/current-system/sw/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+    ]
+    .join(":")
 }
 
 unsafe fn apply_capset(caps: &[i32], include_setpcap: bool) -> std::io::Result<()> {
@@ -921,18 +955,28 @@ pub fn spawn_process(
         "spawning_service"
     );
 
-    prepare_service_runtime_dir(config)?;
+    prepare_service_directories(config)?;
 
     let mut cmd = std::process::Command::new(&config.command);
     cmd.args(&config.args);
-    if let Some(working_directory) = &config.working_directory {
-        cmd.current_dir(working_directory);
-    }
+    let home = service_home(config);
+    cmd.current_dir(config.working_directory.as_deref().unwrap_or(&home));
 
     // Set environment
     for (key, value) in &config.env {
         cmd.env(key, value);
     }
+    // Every service receives its own mutable home by default. A config may
+    // deliberately override HOME in [Environment] for an exceptional layout.
+    cmd.env("HOME", &home);
+    cmd.env(
+        "PATH",
+        config
+            .env
+            .get("PATH")
+            .cloned()
+            .unwrap_or_else(|| service_path(config)),
+    );
     // Let common runtime facilities, including the default log writer, use
     // the supervised service identity rather than the executable name.
     cmd.env("MESH_SERVICE_NAME", &config.name);
@@ -1169,14 +1213,23 @@ pub fn run_service_command(
     command: &str,
     timeout_secs: Option<u64>,
 ) -> Result<i32, ProcessError> {
+    prepare_service_directories(config)?;
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c").arg(command);
     for (key, value) in &config.env {
         cmd.env(key, value);
     }
-    if let Some(working_directory) = &config.working_directory {
-        cmd.current_dir(working_directory);
-    }
+    let home = service_home(config);
+    cmd.env("HOME", &home);
+    cmd.env(
+        "PATH",
+        config
+            .env
+            .get("PATH")
+            .cloned()
+            .unwrap_or_else(|| service_path(config)),
+    );
+    cmd.current_dir(config.working_directory.as_deref().unwrap_or(&home));
 
     #[cfg(unix)]
     {
@@ -1497,6 +1550,26 @@ mod tests {
     }
 
     #[test]
+    fn default_service_path_prefers_service_local_bins() {
+        let config = test_config("echo");
+        let paths = mesh::paths::AppPaths::for_app("echo");
+        let path = service_path(&config);
+        assert!(path.starts_with(&format!("{}/bin:", paths.home.display())));
+        assert!(path.contains(&format!("{}/.nix-profile/bin", paths.home.display())));
+        assert!(path.contains(":/run/current-system/sw/bin:"));
+        assert!(path.contains(":/usr/bin:"));
+    }
+
+    #[test]
+    fn configured_home_controls_service_path() {
+        let mut config = test_config("echo");
+        config
+            .env
+            .insert("HOME".to_string(), "/srv/echo".to_string());
+        assert!(service_path(&config).starts_with("/srv/echo/bin:"));
+    }
+
+    #[test]
     fn test_pty_activation_gives_child_terminal() {
         let mut config = test_config("pty-test");
         config.command = "/bin/sh".to_string();
@@ -1575,10 +1648,28 @@ mod tests {
     }
 
     #[test]
-    fn service_runtime_dir_uses_service_name_under_run_mesh() {
+    fn service_directories_use_service_name_under_standard_bases() {
+        let paths = mesh::paths::AppPaths::for_app("example-service");
+        assert_eq!(paths.home.file_name().unwrap(), "example-service");
+        assert_eq!(paths.mesh_ipc_dir.file_name().unwrap(), "example-service");
+    }
+
+    #[test]
+    fn ssh_mesh_default_has_a_non_root_identity_and_inherits_its_home() {
+        let config = crate::config::parse_service(
+            include_str!("../defaults/ssh-mesh.toml"),
+            Some("ssh-mesh"),
+        )
+        .unwrap();
+        assert_eq!(config.uid, Some(150));
+        assert_eq!(config.gid, Some(150));
+        assert!(!config.env.contains_key("HOME"));
         assert_eq!(
-            service_runtime_dir("example-service"),
-            PathBuf::from("/run/mesh/example-service")
+            mesh::paths::AppPaths::for_app(&config.name)
+                .home
+                .file_name()
+                .unwrap(),
+            "ssh-mesh"
         );
     }
 

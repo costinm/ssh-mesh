@@ -3,163 +3,84 @@
 use serde::{Deserialize, Serialize};
 
 /// Receive a supervisor freeze or unfreeze notification
-/// mesh-api: summary = "Receive a supervisor freeze or unfreeze notification"
-/// mesh-api: id = "mesh.lifecycle"
-/// mesh-api: component = "mesh"
-/// mesh-api: method = "lifecycle"
-/// mesh-api: visibility = "private"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 3
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshLifecycleRequest {
     /// API field `action`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
     /// API field `cause`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = true
-    pub cause: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
     /// API field `observed`.
-    /// mesh-api-field: index = 3
-    /// mesh-api-field: required = true
-    pub observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<bool>,
 }
 
 /// Receive a supervisor freeze or unfreeze notification
-/// mesh-api: summary = "Receive a supervisor freeze or unfreeze notification"
-/// mesh-api: id = "mesh.lifecycle"
-/// mesh-api: component = "mesh"
-/// mesh-api: method = "lifecycle"
-/// mesh-api: visibility = "private"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 3
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshLifecycleResponse {
     /// API field `subscribers`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    pub subscribers: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribers: Option<u64>,
 }
 
-/// Return MCP initialization info
-/// mesh-api: summary = "Return MCP initialization info"
-/// mesh-api: id = "mesh.mcp.initialize"
-/// mesh-api: component = "mesh"
-/// mesh-api: method = "initialize"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 1
+/// Return common service identity and descriptive metadata
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitializeRequest;
 
-/// Return MCP initialization info
-/// mesh-api: summary = "Return MCP initialization info"
-/// mesh-api: id = "mesh.mcp.initialize"
-/// mesh-api: component = "mesh"
-/// mesh-api: method = "initialize"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 1
-/// mesh-api: shape = "response"
+/// Return common service identity and descriptive metadata
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MeshInitializeResponse;
+pub struct MeshInitializeResponse {
+    /// API field `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// API field `version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// API field `title`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// API field `instructions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
 
-/// List registered MCP tools from catalog
-/// mesh-api: summary = "List registered MCP tools from catalog"
-/// mesh-api: id = "mesh.mcp.tools_list"
-/// mesh-api: component = "mesh"
-/// mesh-api: method = "tools/list"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 2
+/// Return the service's generated method catalog
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MeshToolsListRequest;
+pub struct MeshToolsRequest;
 
-/// List registered MCP tools from catalog
-/// mesh-api: summary = "List registered MCP tools from catalog"
-/// mesh-api: id = "mesh.mcp.tools_list"
-/// mesh-api: component = "mesh"
-/// mesh-api: method = "tools/list"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 2
-/// mesh-api: shape = "response"
+/// Return the service's generated method catalog
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MeshToolsListResponse;
+pub struct MeshToolsResponse {
+    /// API field `tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+}
 
-/// Subscribe to live trace log event stream
-/// mesh-api: summary = "Subscribe to live trace log event stream"
-/// mesh-api: id = "mesh.trace.subscribe"
-/// mesh-api: component = "trace"
-/// mesh-api: method = "subscribe"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 2
-/// mesh-api: method-index = 1
+/// Acknowledge trace-subscription capability on this control endpoint
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceSubscribeRequest;
 
-/// Subscribe to live trace log event stream
-/// mesh-api: summary = "Subscribe to live trace log event stream"
-/// mesh-api: id = "mesh.trace.subscribe"
-/// mesh-api: component = "trace"
-/// mesh-api: method = "subscribe"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 2
-/// mesh-api: method-index = 1
-/// mesh-api: shape = "response"
+/// Acknowledge trace-subscription capability on this control endpoint
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceSubscribeResponse;
 
-/// Dynamically update tracing filter level
-/// mesh-api: summary = "Dynamically update tracing filter level"
-/// mesh-api: id = "mesh.trace.set_level"
-/// mesh-api: component = "trace"
-/// mesh-api: method = "set_level"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 2
-/// mesh-api: method-index = 2
+/// Set this process's reloadable tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceSetLevelRequest {
     /// API field `level`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub level: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
 }
 
-/// Dynamically update tracing filter level
-/// mesh-api: summary = "Dynamically update tracing filter level"
-/// mesh-api: id = "mesh.trace.set_level"
-/// mesh-api: component = "trace"
-/// mesh-api: method = "set_level"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 2
-/// mesh-api: method-index = 2
-/// mesh-api: shape = "response"
+/// Set this process's reloadable tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceSetLevelResponse;
 
-/// Get current tracing filter level info
-/// mesh-api: summary = "Get current tracing filter level info"
-/// mesh-api: id = "mesh.trace.get_level"
-/// mesh-api: component = "trace"
-/// mesh-api: method = "get_level"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 2
-/// mesh-api: method-index = 3
+/// Return this process's current configured tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceGetLevelRequest;
 
-/// Get current tracing filter level info
-/// mesh-api: summary = "Get current tracing filter level info"
-/// mesh-api: id = "mesh.trace.get_level"
-/// mesh-api: component = "trace"
-/// mesh-api: method = "get_level"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 2
-/// mesh-api: method-index = 3
-/// mesh-api: shape = "response"
+/// Return this process's current configured tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceGetLevelResponse;

@@ -2,14 +2,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use mesh_api_gen::{
-    api_markdown_from_rust, api_markdown_from_tools_json_for_component, json_schema,
-    merge_tools_json, parse_api_markdown, parse_required_path, rust_api, rust_ids, tools_json,
+    api_markdown_from_tools_json_for_component, json_schema, merge_tools_json, parse_api_markdown,
+    parse_required_path, rust_api, rust_ids, tools_json,
 };
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut api = None;
-    let mut rust = None;
     let mut tools = None;
     let mut out_api = None;
     let mut out_tools = None;
@@ -22,7 +21,6 @@ fn main() -> Result<()> {
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--api" => api = Some(args.next().context("--api requires a path")?),
-            "--rust" => rust = Some(args.next().context("--rust requires a path")?),
             "--tools" => tools = Some(args.next().context("--tools requires a path")?),
             "--out-api" => out_api = Some(args.next().context("--out-api requires a path")?),
             "--out-tools" => out_tools = Some(args.next().context("--out-tools requires a path")?),
@@ -38,7 +36,7 @@ fn main() -> Result<()> {
             "--check" => check = true,
             "--help" | "-h" => {
                 println!(
-                    "mesh-api-gen --api API.md [--base-tools legacy-tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--check]\nmesh-api-gen --rust api.rs --out-api generated.md\nmesh-api-gen --tools legacy-tools.json --component service --out-api migration.md"
+                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--check]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
                 );
                 return Ok(());
             }
@@ -46,15 +44,6 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Some(rust) = rust {
-        let generated = api_markdown_from_rust(&std::fs::read_to_string(&rust)?)?;
-        write_or_check(
-            &parse_required_path(out_api, "--out-api")?,
-            &generated,
-            check,
-        )?;
-        return Ok(());
-    }
     if let Some(tools) = tools {
         let generated = api_markdown_from_tools_json_for_component(
             &serde_json::from_str(&std::fs::read_to_string(tools)?)?,

@@ -8,7 +8,6 @@
         },
         "method_name": {
           "type": "string",
-          "x-cli-position": 2,
           "x-protobuf-index": 2,
           "x-protobuf-type": "string"
         },
@@ -19,15 +18,12 @@
         },
         "socket_path": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
       "required": [
-        "method",
-        "socket_path",
-        "method_name"
+        "method"
       ],
       "type": "object",
       "x-component-index": 4,

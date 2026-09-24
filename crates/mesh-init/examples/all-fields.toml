@@ -159,6 +159,8 @@ SupplementaryGroups = ["0"]
 # Applies to: caller-supplied child process environment.
 # Dangerous env vars are normally dropped from client requests. This list
 # allows specific dangerous names or trailing-* prefixes for this service.
+# Without an explicit PATH, mesh-init supplies service-local, user Nix profile,
+# system Nix profile, NixOS system, and conventional /usr executable paths.
 AllowDangerousEnv = ["PATH"]
 
 # Applies to: Linux OOM killer and mesh resource priority.
@@ -252,6 +254,9 @@ DestinationFormat = "auto"
 Tools = "/opt/example/resources/tools.json"
 
 [Socket]
+# An empty [Socket] is valid shorthand for one Accept=false Unix stream at the
+# service's standard /run/mesh/SERVICE_NAME/mesh.sock path. Explicit listeners
+# below replace that default.
 # Applies to: socket activation.
 # false passes listener fds to the service using LISTEN_FDS; true accepts each
 # connection in mesh-init and activates the service per accepted connection.

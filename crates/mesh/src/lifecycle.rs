@@ -8,7 +8,29 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, timeout};
 
-pub use mesh_api::{LifecycleAction, LifecycleCause, LifecycleEvent};
+/// Linux supervisor transition delivered to a managed mesh service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleAction {
+    Freeze,
+    Unfreeze,
+}
+
+/// Why a Linux supervisor reported a lifecycle transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleCause {
+    Requested,
+    External,
+}
+
+/// Linux supervisor lifecycle event delivered over the local mesh service API.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct LifecycleEvent {
+    pub action: LifecycleAction,
+    pub cause: LifecycleCause,
+    pub observed: bool,
+}
 
 fn lifecycle_bus() -> &'static broadcast::Sender<LifecycleEvent> {
     static BUS: OnceLock<broadcast::Sender<LifecycleEvent>> = OnceLock::new();

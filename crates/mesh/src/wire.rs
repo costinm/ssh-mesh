@@ -138,6 +138,35 @@ where
     serde_json::from_value(catalog.to_jsonl(record)).context("deserialize tagged request")
 }
 
+/// Deserialize a tagged request using a small handler-local field-tag table.
+///
+/// Host services normally keep component and method names on the wire. Only
+/// request fields need numeric tags for compact CBOR, so a worker can use this
+/// helper without embedding the generated discovery catalog. Gateways may
+/// still load `tools.json` to translate other encodings and CLI arguments.
+pub fn decode_typed_request_with_tags<T>(
+    record: &TaggedRecord,
+    field_tags: &[(&str, u32)],
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match record.kind()? {
+        RecordKind::Request | RecordKind::Message => {}
+        RecordKind::Response | RecordKind::Error => bail!("record is not a request"),
+    }
+    let mut value = crate::tagged::to_json(record, None);
+    let fields = value
+        .as_object_mut()
+        .context("tagged request must decode to an object")?;
+    for (name, tag) in field_tags {
+        if let Some(value) = fields.remove(&format!("@{tag}")) {
+            fields.entry((*name).to_string()).or_insert(value);
+        }
+    }
+    serde_json::from_value(value).context("deserialize tagged request")
+}
+
 /// Serialize a typed handler response into the correlated tagged envelope.
 pub fn encode_typed_response<T>(request: &TaggedRecord, result: &T) -> Result<TaggedRecord>
 where
@@ -148,6 +177,58 @@ where
         .clone()
         .context("one-way tagged message cannot receive a response")?;
     Ok(response_ok(id, serde_json::to_value(result)?))
+}
+
+/// Serialize a typed response and replace selected object field names with
+/// their numeric CBOR tags. This is the response-side counterpart to
+/// [`decode_typed_request_with_tags`].
+pub fn encode_typed_response_with_tags<T>(
+    request: &TaggedRecord,
+    result: &T,
+    field_tags: &[(&str, u32)],
+) -> Result<TaggedRecord>
+where
+    T: serde::Serialize,
+{
+    let id = request
+        .id
+        .clone()
+        .context("one-way tagged message cannot receive a response")?;
+    let mut value = serde_json::to_value(result)?;
+    if let Some(fields) = value.as_object_mut() {
+        for (name, tag) in field_tags {
+            if let Some(value) = fields.remove(*name) {
+                fields.insert(tag.to_string(), value);
+            }
+        }
+    }
+    Ok(response_ok(id, value))
+}
+
+/// Decode a request field map directly with a minicbor-derived type.
+pub fn decode_minicbor_request<T>(record: &TaggedRecord) -> Result<T>
+where
+    T: for<'bytes> minicbor::Decode<'bytes, ()>,
+{
+    match record.kind()? {
+        RecordKind::Request | RecordKind::Message => {}
+        RecordKind::Response | RecordKind::Error => bail!("record is not a request"),
+    }
+    minicbor::decode(&crate::cbor::encode_record_fields(record)?)
+        .context("decode native minicbor request")
+}
+
+/// Encode a minicbor-derived response into the correlated mesh envelope.
+pub fn encode_minicbor_response<T>(request: &TaggedRecord, result: T) -> Result<TaggedRecord>
+where
+    T: minicbor::Encode<()>,
+{
+    let id = request
+        .id
+        .clone()
+        .context("one-way tagged message cannot receive a response")?;
+    let bytes = minicbor::to_vec(result).context("encode native minicbor response")?;
+    Ok(response_ok(id, crate::cbor::decode_value_bytes(&bytes)?))
 }
 
 /// Read one length-framed tagged-CBOR record. A clean EOF before a header is
@@ -350,5 +431,67 @@ mod tests {
         let response = encode_typed_response(&request, &json!({"ok": true})).unwrap();
         assert_eq!(response.id, Some(json!(4)));
         assert_eq!(response.result, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn named_method_decodes_tagged_fields_without_a_catalog() {
+        let request = TaggedRecord {
+            component: NameOrTag::Name("radio".to_string()),
+            method: NameOrTag::Name("check".to_string()),
+            id: Some(json!(4)),
+            env: [(NameOrTag::Tag(1), json!(6))].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_typed_request_with_tags::<DemoRequest>(&request, &[("channel", 1)]).unwrap(),
+            DemoRequest::Check { channel: 6 }
+        );
+        let response = encode_typed_response_with_tags(
+            &request,
+            &serde_json::json!({"accepted": true}),
+            &[("accepted", 1)],
+        )
+        .unwrap();
+        assert_eq!(response.result, Some(json!({"1": true})));
+    }
+
+    #[derive(Debug, PartialEq, minicbor::Decode)]
+    #[cbor(map)]
+    struct NativeRequest {
+        #[n(1)]
+        value: String,
+    }
+
+    #[derive(minicbor::Encode)]
+    #[cbor(map)]
+    struct NativeResponse {
+        #[n(1)]
+        value: String,
+    }
+
+    #[test]
+    fn minicbor_adapter_uses_derived_field_tags() {
+        let request = TaggedRecord {
+            component: NameOrTag::Name("echo".to_string()),
+            method: NameOrTag::Name("echo".to_string()),
+            id: Some(json!(9)),
+            env: [(NameOrTag::Tag(1), json!("hello"))].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_minicbor_request::<NativeRequest>(&request).unwrap(),
+            NativeRequest {
+                value: "hello".to_string()
+            }
+        );
+        let response = encode_minicbor_response(
+            &request,
+            NativeResponse {
+                value: "hello".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(response.id, Some(json!(9)));
+        assert_eq!(response.result, Some(json!({"1": "hello"})));
     }
 }

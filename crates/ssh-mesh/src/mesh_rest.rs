@@ -23,29 +23,42 @@ use axum::{
     routing::{get, post},
 };
 use mesh::{
+    catalog::{ResolvedCatalog, service_catalog_resolver},
     cbor::{decode_record, encode_record},
     message::format_text_response,
-    tagged::{RecordKind, TaggedCatalog, TaggedRecord, record_from_json, to_json},
+    tagged::{RecordKind, TaggedRecord, record_from_json, to_json},
     wire::{TaggedRecordHandler, read_cbor_record, write_cbor_record},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::net::UnixStream;
+use serde_json::{Map, Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
+};
 
 use crate::AppState;
 
 #[derive(Clone)]
 pub enum MeshServiceBackend {
     Direct(Arc<dyn TaggedRecordHandler>),
-    Uds(PathBuf),
+    UdsStream(PathBuf),
+    UdsSeqpacket(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MeshServiceEncoding {
+    TaggedCbor,
+    JsonRpc,
 }
 
 #[derive(Clone)]
 pub struct MeshService {
     pub backend: MeshServiceBackend,
-    /// An optional generated `tools.json` value.  Raw numeric JSON and CBOR
-    /// remain usable when this is absent.
-    pub catalog: Option<Value>,
+    /// Native service encoding from the explicit gateway route.
+    pub encoding: MeshServiceEncoding,
+    /// Component used for lazy client-side schema lookup. Raw numeric JSON and
+    /// CBOR remain usable when no catalog is installed.
+    pub component: String,
 }
 
 #[derive(Clone)]
@@ -131,6 +144,12 @@ impl MeshServiceRegistry {
         }
     }
 
+    fn catalog(&self, service: &MeshService) -> Result<Option<Arc<ResolvedCatalog>>> {
+        service_catalog_resolver()
+            .resolve(&service.component)
+            .transpose()
+    }
+
     fn describe(&self) -> Value {
         let mut services = self
             .services
@@ -142,9 +161,14 @@ impl MeshServiceRegistry {
                     "name": name,
                     "backend": match &service.backend {
                         MeshServiceBackend::Direct(_) => "direct",
-                        MeshServiceBackend::Uds(_) => "uds",
+                        MeshServiceBackend::UdsStream(_) => "uds-stream",
+                        MeshServiceBackend::UdsSeqpacket(_) => "uds-seqpacket",
                     },
-                    "catalog": service.catalog.is_some(),
+                    "encoding": match service.encoding {
+                        MeshServiceEncoding::TaggedCbor => "tagged-cbor",
+                        MeshServiceEncoding::JsonRpc => "json-rpc",
+                    },
+                    "catalog_component": service.component,
                 })
             })
             .collect::<Vec<_>>();
@@ -378,21 +402,114 @@ async fn dispatch(service: &MeshService, record: TaggedRecord) -> Result<Option<
                 handler.handle_record(record).await
             }
         }
-        MeshServiceBackend::Uds(path) => {
+        MeshServiceBackend::UdsStream(path) => {
             let mut stream = UnixStream::connect(path)
                 .await
-                .with_context(|| format!("connect tagged-CBOR UDS {}", path.display()))?;
+                .with_context(|| format!("connect UDS stream {}", path.display()))?;
             let one_way = matches!(record.kind()?, RecordKind::Message);
-            write_cbor_record(&mut stream, &record).await?;
+            match service.encoding {
+                MeshServiceEncoding::TaggedCbor => {
+                    write_cbor_record(&mut stream, &record).await?;
+                    if one_way {
+                        Ok(None)
+                    } else {
+                        read_cbor_record(&mut stream)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("UDS closed before tagged-CBOR response")
+                            })
+                            .map(Some)
+                    }
+                }
+                MeshServiceEncoding::JsonRpc => {
+                    let catalog = service_catalog_resolver()
+                        .resolve(&service.component)
+                        .transpose()?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "JSON-RPC route requires an installed catalog for {}",
+                                service.component
+                            )
+                        })?;
+                    let request = json_rpc_request(&record, catalog.catalog.as_ref())?;
+                    stream
+                        .write_all(serde_json::to_string(&request)?.as_bytes())
+                        .await?;
+                    stream.write_all(b"\n").await?;
+                    if one_way {
+                        return Ok(None);
+                    }
+                    let mut line = String::new();
+                    BufReader::new(stream).read_line(&mut line).await?;
+                    let response: Value = serde_json::from_str(line.trim())
+                        .context("decode JSON-RPC service response")?;
+                    json_rpc_response(response).map(Some)
+                }
+            }
+        }
+        MeshServiceBackend::UdsSeqpacket(path) => {
+            if service.encoding != MeshServiceEncoding::TaggedCbor {
+                bail!("UDS seqpacket route requires tagged-CBOR encoding")
+            }
+            let socket = mesh::seqpacket::UnixSeqpacket::connect(path).await?;
+            let one_way = matches!(record.kind()?, RecordKind::Message);
+            socket.send_cbor_record(&record, &[]).await?;
             if one_way {
                 Ok(None)
             } else {
-                read_cbor_record(&mut stream)
+                let (response, fds) = socket
+                    .recv_cbor_record()
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("UDS closed before tagged-CBOR response"))
-                    .map(Some)
+                    .ok_or_else(|| anyhow::anyhow!("UDS closed before tagged-CBOR response"))?;
+                if !fds.is_empty() {
+                    bail!("gateway route received unexpected file descriptors")
+                }
+                Ok(Some(response))
             }
         }
+    }
+}
+
+fn json_rpc_request(record: &TaggedRecord, catalog: &mesh::tagged::TaggedCatalog) -> Result<Value> {
+    let mut value = to_json(record, Some(catalog));
+    let object = value
+        .as_object_mut()
+        .context("tagged request did not project to a JSON object")?;
+    let method = object
+        .remove("method")
+        .context("tagged request lacks method")?;
+    let id = object.remove("id").unwrap_or(Value::Null);
+    let mut request = Map::new();
+    request.insert("jsonrpc".to_owned(), Value::String("2.0".to_owned()));
+    request.insert("id".to_owned(), id);
+    request.insert("method".to_owned(), method);
+    request.insert("params".to_owned(), Value::Object(std::mem::take(object)));
+    Ok(Value::Object(request))
+}
+
+fn json_rpc_response(value: Value) -> Result<TaggedRecord> {
+    let object = value
+        .as_object()
+        .context("JSON-RPC response must be an object")?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        bail!("JSON-RPC response lacks jsonrpc=2.0")
+    }
+    let id = object
+        .get("id")
+        .cloned()
+        .context("JSON-RPC response lacks id")?;
+    match (object.get("result"), object.get("error")) {
+        (Some(result), None) => Ok(TaggedRecord {
+            id: Some(id),
+            result: Some(result.clone()),
+            ..Default::default()
+        }),
+        (None, Some(error)) => Ok(TaggedRecord {
+            id: Some(id),
+            error: Some(error.clone()),
+            ..Default::default()
+        }),
+        _ => bail!("JSON-RPC response must contain exactly one of result or error"),
     }
 }
 
@@ -514,13 +631,13 @@ async fn post_call(
     };
     let result = async {
         let service = state.mesh_services.service(&service_name)?;
-        let catalog = service
-            .catalog
-            .as_ref()
+        let resolved = state
+            .mesh_services
+            .catalog(&service)?
             .ok_or_else(|| anyhow::anyhow!("service has no catalog; use records"))?;
+        let catalog = resolved.catalog.as_ref();
         let arguments: Value =
             serde_json::from_slice(&body).context("decode JSON call arguments")?;
-        let catalog = TaggedCatalog::from_tools_json(catalog)?;
         if catalog.method(&method).is_none() {
             bail!("method is not present in the service catalog; use records for raw calls")
         }
@@ -557,7 +674,7 @@ async fn post_call(
         } else {
             StatusCode::OK
         };
-        Ok((status, to_json(&response, Some(&catalog)), Some(response)))
+        Ok((status, to_json(&response, Some(catalog)), Some(response)))
     }
     .await;
     let response = match result {
@@ -603,20 +720,21 @@ async fn get_tools(
         Err(error) => return error_response(StatusCode::UNAUTHORIZED, error),
     };
     match state.mesh_services.service(&service_name) {
-        Ok(service) => match service.catalog {
-            Some(catalog) => persist_api_key(
-                match catalog_for_view(&catalog, query.view.as_deref()) {
+        Ok(service) => match state.mesh_services.catalog(&service) {
+            Ok(Some(catalog)) => persist_api_key(
+                match catalog_for_view(catalog.tools.as_ref(), query.view.as_deref()) {
                     Ok(catalog) => Json(catalog).into_response(),
                     Err(error) => error_response(StatusCode::BAD_REQUEST, error),
                 },
                 query.apikey.as_deref(),
                 persist,
             ),
-            None => persist_api_key(
+            Ok(None) => persist_api_key(
                 StatusCode::NO_CONTENT.into_response(),
                 query.apikey.as_deref(),
                 persist,
             ),
+            Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
         },
         Err(error) => error_response(StatusCode::NOT_FOUND, error),
     }
@@ -657,7 +775,8 @@ mod tests {
     async fn direct_backend_dispatches_request_without_a_stream() {
         let service = MeshService {
             backend: MeshServiceBackend::Direct(Arc::new(Echo)),
-            catalog: None,
+            encoding: MeshServiceEncoding::TaggedCbor,
+            component: "test-echo".to_owned(),
         };
         let record = TaggedRecord {
             component: NameOrTag::Tag(1),
@@ -679,8 +798,9 @@ mod tests {
             serve_cbor_session(&mut stream, &Echo).await.unwrap();
         });
         let service = MeshService {
-            backend: MeshServiceBackend::Uds(socket),
-            catalog: None,
+            backend: MeshServiceBackend::UdsStream(socket),
+            encoding: MeshServiceEncoding::TaggedCbor,
+            component: "test-echo".to_owned(),
         };
         let response = dispatch(
             &service,
@@ -697,6 +817,81 @@ mod tests {
         assert_eq!(response.id, Some(json!(7)));
         assert_eq!(response.result, Some(json!({"local": true})));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn seqpacket_backend_uses_one_record_per_packet() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("mesh.sock.cbor");
+        let listener = mesh::seqpacket::UnixSeqpacketListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let connection = listener.accept().await.unwrap();
+            let (request, fds) = connection.recv_cbor_record().await.unwrap().unwrap();
+            assert!(fds.is_empty());
+            connection
+                .send_cbor_record(
+                    &response_ok(request.id.unwrap(), json!({"local": true})),
+                    &[],
+                )
+                .await
+                .unwrap();
+        });
+        let service = MeshService {
+            backend: MeshServiceBackend::UdsSeqpacket(socket),
+            encoding: MeshServiceEncoding::TaggedCbor,
+            component: "test-echo".to_owned(),
+        };
+        let response = dispatch(
+            &service,
+            TaggedRecord {
+                component: NameOrTag::Tag(1),
+                method: NameOrTag::Tag(2),
+                id: Some(json!(7)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.result, Some(json!({"local": true})));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn json_rpc_route_translates_the_common_record_envelope() {
+        let catalog = mesh::tagged::TaggedCatalog::from_tools_json(&json!([{
+            "name": "demo.ping",
+            "x-component-index": 1,
+            "x-method-index": 2,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer", "x-protobuf-index": 3}
+                }
+            }
+        }]))
+        .unwrap();
+        let request = json_rpc_request(
+            &TaggedRecord {
+                component: NameOrTag::Tag(1),
+                method: NameOrTag::Tag(2),
+                id: Some(json!(9)),
+                env: [(NameOrTag::Tag(3), json!(4))].into_iter().collect(),
+                ..Default::default()
+            },
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(request["method"], "demo.ping");
+        assert_eq!(request["params"]["value"], 4);
+        let response = json_rpc_response(json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {"ok": true}
+        }))
+        .unwrap();
+        assert_eq!(response.id, Some(json!(9)));
+        assert_eq!(response.result, Some(json!({"ok": true})));
     }
 
     #[test]

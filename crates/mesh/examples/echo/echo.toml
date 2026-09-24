@@ -1,0 +1,7 @@
+# Activation-only mesh-init configuration for this example. mesh-init searches
+# /home/echo/bin and the service's Nix profile before host executable paths.
+
+[Service]
+ExecStart = "mesh-echo"
+
+[Socket]

@@ -2088,9 +2088,7 @@ name = "mesh-api-gen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "serde",
  "serde_json",
- "toml",
 ]
 
 [[package]]
@@ -2100,6 +2098,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mesh",
+ "reqwest",
  "serde_json",
  "tokio",
 ]
@@ -2125,6 +2124,16 @@ dependencies = [
  "toml",
  "tracing",
  "users",
+]
+
+[[package]]
+name = "mesh-mcp"
+version = "0.1.0"
+dependencies = [
+ "mesh",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2168,9 +2177,23 @@ dependencies = [
 
 [[package]]
 name = "minicbor"
-version = "2.2.2"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b7a5041e12946f8b7d3f5a9d96383a19d694b9335457c522be7815b9abafb02"
+checksum = "c12b4033ffaa92fbf9df03df38d19324f52bad130dd223f811734a8006dd2d69"
+dependencies = [
+ "minicbor-derive",
+]
+
+[[package]]
+name = "minicbor-derive"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84f5ad8dfe10176465fe33f19ecfcf08783ba66630fdb40b2e4542547c1046f0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "minimal-lexical"
@@ -2809,9 +2832,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.103"
+version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
@@ -2873,9 +2896,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.40"
+version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
@@ -3038,6 +3061,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3877,6 +3901,8 @@ dependencies = [
  "libc",
  "log",
  "mesh",
+ "mesh-api",
+ "mesh-mcp",
  "mime_guess",
  "nix 0.29.0",
  "once_cell",
@@ -3939,9 +3965,9 @@ checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
 
 [[package]]
 name = "syn"
-version = "2.0.106"
+version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ede7c438028d4436d71104916910f5bb611972c5cfd7f89b8300a8186e6fada6"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
 dependencies = [
  "proc-macro2",
  "quote",

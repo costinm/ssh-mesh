@@ -1,0 +1,41 @@
+[
+  {
+    "description": "Return the supplied string",
+    "inputSchema": {
+      "properties": {
+        "value": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "echo.echo",
+    "outputSchema": {
+      "properties": {
+        "value": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 10,
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  }
+]

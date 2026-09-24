@@ -84,16 +84,16 @@ find_busybox() {
         printf '%s\n' "$busybox"
         return 0
     fi
+    if [ -n "${NIX_PROFILE:-}" ] && [ -x "${NIX_PROFILE}/opt/busybox/bin/busybox" ]; then
+        printf '%s\n' "${NIX_PROFILE}/opt/busybox/bin/busybox"
+        return 0
+    fi
+    if [ -x "$PWD/target/nix/profile/opt/busybox/bin/busybox" ]; then
+        printf '%s\n' "$PWD/target/nix/profile/opt/busybox/bin/busybox"
+        return 0
+    fi
     if command -v busybox >/dev/null 2>&1; then
         command -v busybox
-        return 0
-    fi
-    if [ -n "${NIX_PROFILE:-}" ] && [ -x "${NIX_PROFILE}/bin/busybox" ]; then
-        printf '%s\n' "${NIX_PROFILE}/bin/busybox"
-        return 0
-    fi
-    if [ -x "$PWD/target/nix/profile/bin/busybox" ]; then
-        printf '%s\n' "$PWD/target/nix/profile/bin/busybox"
         return 0
     fi
     if [ -x "/usr/bin/busybox" ]; then
@@ -473,7 +473,7 @@ test_cmd() {
     local name="${1:-}"
     if [ -z "$name" ]; then
         echo "Usage: scripts/build.sh test NAME" >&2
-        echo "Known tests: examples, ssh_mesh_activation, trace" >&2
+        echo "Known tests: examples, ssh_mesh_activation, trace, cert_terminal_mesh_init" >&2
         echo "Note: VM tests (test_vm_*) have moved to the initos repo." >&2
         return 2
     fi
@@ -496,6 +496,12 @@ test_cmd() {
             stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
             export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
             tests/test_trace.sh "$@"
+            ;;
+        cert_terminal_mesh_init)
+            rust
+            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            python3 tests/test_cert_terminal_mesh_init.py "$@"
             ;;
         *)
             echo "Unknown test: $name" >&2

@@ -3,441 +3,239 @@
 use serde::{Deserialize, Serialize};
 
 /// Query status for one service or all loaded services
-/// mesh-api: summary = "Query status for one service or all loaded services"
-/// mesh-api: id = "mesh-init.status"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "status"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 1
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitStatusRequest {
     /// API field `name`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = false
-    /// mesh-api-field: position = 1
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
 /// Query status for one service or all loaded services
-/// mesh-api: summary = "Query status for one service or all loaded services"
-/// mesh-api: id = "mesh-init.status"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "status"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 1
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitStatusResponse;
 
 /// Start a configured service by name
-/// mesh-api: summary = "Start a configured service by name"
-/// mesh-api: id = "mesh-init.start"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "start"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 2
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitStartRequest {
     /// API field `name`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// API field `args`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<serde_json::Value>>,
     /// API field `env`.
-    /// mesh-api-field: index = 3
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<serde_json::Value>,
 }
 
 /// Start a configured service by name
-/// mesh-api: summary = "Start a configured service by name"
-/// mesh-api: id = "mesh-init.start"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "start"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 2
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitStartResponse;
 
 /// Gracefully terminate or signal a running service
-/// mesh-api: summary = "Gracefully terminate or signal a running service"
-/// mesh-api: id = "mesh-init.stop"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "stop"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 3
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitStopRequest {
     /// API field `name`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// API field `signal`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
 }
 
 /// Gracefully terminate or signal a running service
-/// mesh-api: summary = "Gracefully terminate or signal a running service"
-/// mesh-api: id = "mesh-init.stop"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "stop"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 3
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitStopResponse;
 
 /// Suspend a running service
-/// mesh-api: summary = "Suspend a running service"
-/// mesh-api: id = "mesh-init.freeze"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "freeze"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 4
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitFreezeRequest {
     /// API field `name`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Suspend a running service
-/// mesh-api: summary = "Suspend a running service"
-/// mesh-api: id = "mesh-init.freeze"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "freeze"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 4
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitFreezeResponse;
 
 /// Resume a frozen service
-/// mesh-api: summary = "Resume a frozen service"
-/// mesh-api: id = "mesh-init.unfreeze"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "unfreeze"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 5
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitUnfreezeRequest {
     /// API field `name`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Resume a frozen service
-/// mesh-api: summary = "Resume a frozen service"
-/// mesh-api: id = "mesh-init.unfreeze"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "unfreeze"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 5
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitUnfreezeResponse;
 
 /// Reload service configuration from disk
-/// mesh-api: summary = "Reload service configuration from disk"
-/// mesh-api: id = "mesh-init.reload"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "reload"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 6
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitReloadRequest;
 
 /// Reload service configuration from disk
-/// mesh-api: summary = "Reload service configuration from disk"
-/// mesh-api: id = "mesh-init.reload"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "reload"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 6
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitReloadResponse;
 
 /// Reconcile managed services after host resume or recovery
-/// mesh-api: summary = "Reconcile managed services after host resume or recovery"
-/// mesh-api: id = "mesh-init.reconcile"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "reconcile"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 14
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitReconcileRequest;
 
 /// Reconcile managed services after host resume or recovery
-/// mesh-api: summary = "Reconcile managed services after host resume or recovery"
-/// mesh-api: id = "mesh-init.reconcile"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "reconcile"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 14
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitReconcileResponse {
     /// API field `checked`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    pub checked: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<u64>,
     /// API field `reconciled`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = true
-    pub reconciled: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled: Option<u64>,
     /// API field `failed`.
-    /// mesh-api-field: index = 3
-    /// mesh-api-field: required = true
-    pub failed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<u64>,
 }
 
 /// Gracefully stop all services and shut down mesh-init
-/// mesh-api: summary = "Gracefully stop all services and shut down mesh-init"
-/// mesh-api: id = "mesh-init.shutdown"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "shutdown"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 15
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitShutdownRequest;
 
 /// Gracefully stop all services and shut down mesh-init
-/// mesh-api: summary = "Gracefully stop all services and shut down mesh-init"
-/// mesh-api: id = "mesh-init.shutdown"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "shutdown"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 15
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitShutdownResponse;
 
 /// List observed processes from the process observer
-/// mesh-api: summary = "List observed processes from the process observer"
-/// mesh-api: id = "mesh-init.processes"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "processes"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 7
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitProcessesRequest;
 
 /// List observed processes from the process observer
-/// mesh-api: summary = "List observed processes from the process observer"
-/// mesh-api: id = "mesh-init.processes"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "processes"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 7
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitProcessesResponse;
 
 /// Return detailed information for one process
-/// mesh-api: summary = "Return detailed information for one process"
-/// mesh-api: id = "mesh-init.process"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "process"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 8
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitProcessRequest {
     /// API field `pid`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// Return detailed information for one process
-/// mesh-api: summary = "Return detailed information for one process"
-/// mesh-api: id = "mesh-init.process"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "process"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 8
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitProcessResponse;
 
 /// Return all observed cgroups
-/// mesh-api: summary = "Return all observed cgroups"
-/// mesh-api: id = "mesh-init.cgroups"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "cgroups"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 9
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitCgroupsRequest;
 
 /// Return all observed cgroups
-/// mesh-api: summary = "Return all observed cgroups"
-/// mesh-api: id = "mesh-init.cgroups"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "cgroups"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 9
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitCgroupsResponse;
 
 /// Return detailed information for one cgroup path
-/// mesh-api: summary = "Return detailed information for one cgroup path"
-/// mesh-api: id = "mesh-init.cgroup"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "cgroup"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 10
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitCgroupRequest {
     /// API field `path`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Return detailed information for one cgroup path
-/// mesh-api: summary = "Return detailed information for one cgroup path"
-/// mesh-api: id = "mesh-init.cgroup"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "cgroup"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 10
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitCgroupResponse;
 
 /// Return pressure watch state
-/// mesh-api: summary = "Return pressure watch state"
-/// mesh-api: id = "mesh-init.pressure"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "pressure"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 11
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitPressureRequest;
 
 /// Return pressure watch state
-/// mesh-api: summary = "Return pressure watch state"
-/// mesh-api: id = "mesh-init.pressure"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "pressure"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 11
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitPressureResponse;
 
 /// Set memory.high for a cgroup based on current memory usage
-/// mesh-api: summary = "Set memory.high for a cgroup based on current memory usage"
-/// mesh-api: id = "mesh-init.cgroup_high"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "cgroup_high"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 12
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitCgroupHighRequest {
     /// API field `path`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// API field `percentage`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = true
-    pub percentage: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<f64>,
     /// API field `interval`.
-    /// mesh-api-field: index = 3
-    /// mesh-api-field: required = true
-    pub interval: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u64>,
 }
 
 /// Set memory.high for a cgroup based on current memory usage
-/// mesh-api: summary = "Set memory.high for a cgroup based on current memory usage"
-/// mesh-api: id = "mesh-init.cgroup_high"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "cgroup_high"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 12
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitCgroupHighResponse;
 
 /// Move a process to a named cgroup
-/// mesh-api: summary = "Move a process to a named cgroup"
-/// mesh-api: id = "mesh-init.move_process"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "move_process"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 13
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitMoveProcessRequest {
     /// API field `pid`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    /// mesh-api-field: position = 1
-    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     /// API field `cgroup_name`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgroup_name: Option<String>,
 }
 
 /// Move a process to a named cgroup
-/// mesh-api: summary = "Move a process to a named cgroup"
-/// mesh-api: id = "mesh-init.move_process"
-/// mesh-api: component = "mesh-init"
-/// mesh-api: method = "move_process"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 3
-/// mesh-api: method-index = 13
-/// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeshInitMoveProcessResponse;
+
+/// Start a terminal with descriptors attached to its CBOR seqpacket request
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitStartTerminalRequest {
+    /// API field `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// API field `home`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// API field `uid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// API field `gid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+    /// API field `pty`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty: Option<bool>,
+    /// API field `env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<serde_json::Value>,
+    /// API field `context`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+    /// API field `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// API field `fd_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_count: Option<u32>,
+}
+
+/// Start a terminal with descriptors attached to its CBOR seqpacket request
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitStartTerminalResponse;
+
+/// Register a namespace descriptor attached to its CBOR seqpacket request
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitRegisterNamespaceRequest {
+    /// API field `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// API field `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// API field `target_pid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pid: Option<u32>,
+}
+
+/// Register a namespace descriptor attached to its CBOR seqpacket request
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeshInitRegisterNamespaceResponse;

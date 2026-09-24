@@ -2,6 +2,7 @@
 
 //! Portable mesh contracts shared by firmware and host implementations.
 //!
+//! WIP: more code will move here, as needed for the ESP32/no_std implementation.
 //! `mesh-api` intentionally has no executor, socket, QUIC, SSH, HTTP, or
 //! platform dependency. QUIC-lite implements its association boundary here;
 //! the host `mesh` crate adds Tokio stream adapters above it.
@@ -10,36 +11,18 @@ extern crate alloc;
 
 use alloc::string::String;
 
-/// A supervisor transition delivered to a managed mesh service.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum LifecycleAction {
-    Freeze,
-    Unfreeze,
-}
-
-/// Why the supervisor is reporting a lifecycle transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum LifecycleCause {
-    /// A mesh-init control request intentionally caused the transition.
-    Requested,
-    /// An external supervisor or host lifecycle caused the transition.
-    External,
-}
-
-/// Portable lifecycle event accepted by every mesh JSON-RPC service.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-pub struct LifecycleEvent {
-    pub action: LifecycleAction,
-    pub cause: LifecycleCause,
-    /// True when the transition had already happened before mesh-init could
-    /// notify the service, as with a host-wide freezer during suspend.
-    pub observed: bool,
-}
+/// Generated numeric wire identity for the `mesh-init` control surface
+/// (component/method and by-method field tags).
+///
+/// The constants are the stable wire identities documented in
+/// `crates/mesh-init/API.md`; `mesh-api-gen --api crates/mesh-init/API.md`
+/// regenerates this module. Host and peer implementations that speak the
+/// mesh-init control protocol directly (its own seqpacket decoder, and
+/// sibling clients such as the ssh-mesh terminal delegation bridge) build
+/// records against these constants instead of translating through the
+/// loaded public catalog. The generated catalog file stays the shared
+/// source of truth for regenerating both sides.
+pub mod mesh_init_ids;
 
 /// Logical peer identity and an optional one-call egress-path request.
 ///

@@ -37,32 +37,6 @@ with MeshClient("mesh-init") as init, MeshClient("lmesh") as radio:
     nodes = radio.request("nodes")
 ```
 
-## Firmware radio tests
-
-`RadioClient` drives one lmesh-owned firmware stream without opening the
-physical TTY. `LabConfig`, `PowerCollector`, and `PresubmitSuite` provide the
-shared local/forwarded-node test driver used by ESP firmware pre-submit runs.
-
-```python
-from dmesh import RadioClient
-
-with RadioClient("lora1.lmesh") as radio:
-    radio.wake(120)
-    status = radio.command("status")
-    print(status.record("status")["fields"])
-```
-
-Run the checked-in lab topology with:
-
-```bash
-target/nix/profile/bin/python fw/esp32/rust/tools/presubmit.py \
-  --topology fw/esp32/rust/tools/lab.example.json --profile quick
-```
-
-Each run writes a manifest, raw command records, phase-tagged power samples,
-counter deltas, and a machine-readable summary under
-`target/esp32-presubmit/`.
-
 ## Passenger descriptors
 
 Mesh calls that carry non-JSON data use Unix `SCM_RIGHTS` ancillary data. The

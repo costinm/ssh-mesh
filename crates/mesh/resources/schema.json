@@ -17,7 +17,7 @@
     {
       "properties": {
         "method": {
-          "const": "mesh.tools/list"
+          "const": "mesh.tools"
         }
       },
       "required": [
@@ -44,7 +44,6 @@
       "properties": {
         "level": {
           "type": "string",
-          "x-cli-position": 1,
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         },
@@ -53,8 +52,7 @@
         }
       },
       "required": [
-        "method",
-        "level"
+        "method"
       ],
       "type": "object",
       "x-component-index": 2,

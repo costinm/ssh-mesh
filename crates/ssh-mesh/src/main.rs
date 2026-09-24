@@ -514,7 +514,7 @@ async fn handle_jsonl_stream(
     stream: tokio::net::UnixStream,
     manager: Arc<ssh_mesh::sshc::SshClientManager>,
 ) -> anyhow::Result<()> {
-    let registry = mesh::jsonl::McpRegistry::new("ssh-mesh");
+    let registry = mesh::registry::ServiceRegistry::new("ssh-mesh");
     let (read, mut write) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read);
     let mut line = String::new();
