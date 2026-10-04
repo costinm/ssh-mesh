@@ -91,6 +91,76 @@ impl MeshServiceRegistry {
             .insert(name.into(), service);
     }
 
+    /// Serve an external service that speaks tagged CBOR over a `SOCK_SEQPACKET` socket.
+    ///
+    /// `catalog` names the installed tools catalog of the service (for example `lmesh`).
+    /// Every component that catalog declares (`discovery` for `discovery.nodes`) is
+    /// registered as a HTTP service routed to `socket`, the same shape an embedding
+    /// application registers its own handlers in, so a client addresses a component
+    /// identically whichever process serves it. Returns the component names.
+    pub fn register_seqpacket_catalog(
+        &self,
+        catalog: &str,
+        socket: impl Into<PathBuf>,
+    ) -> Result<Vec<String>> {
+        let resolved = service_catalog_resolver().require(catalog)?;
+        Ok(self.register_catalog_components(&resolved, socket))
+    }
+
+    /// [`Self::register_seqpacket_catalog`] for an already resolved catalog.
+    pub fn register_catalog_components(
+        &self,
+        resolved: &ResolvedCatalog,
+        socket: impl Into<PathBuf>,
+    ) -> Vec<String> {
+        let socket = socket.into();
+        let catalog = resolved.component.as_str();
+        let mut components: Vec<String> = resolved
+            .tools
+            .as_array()
+            .map(|tools| tools.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .filter_map(|name| name.split_once('.').map(|(component, _)| component.to_owned()))
+            .collect();
+        components.sort();
+        components.dedup();
+        for component in &components {
+            self.register(
+                component.clone(),
+                MeshService {
+                    backend: MeshServiceBackend::UdsSeqpacket(socket.clone()),
+                    encoding: MeshServiceEncoding::TaggedCbor,
+                    component: catalog.to_owned(),
+                },
+            );
+        }
+        components
+    }
+
+    /// Register the services named by `SSH_MESH_MESH_SERVICES`: comma-separated
+    /// `catalog=/path/to/mesh.sock.cbor` entries. An entry that cannot be loaded is
+    /// reported and skipped, so one absent service does not stop the others.
+    pub fn register_from_env(&self) -> Vec<(String, Result<Vec<String>>)> {
+        let Some(value) = std::env::var("SSH_MESH_MESH_SERVICES")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Vec::new();
+        };
+        value
+            .split(',')
+            .filter_map(|entry| entry.trim().split_once('='))
+            .map(|(catalog, socket)| {
+                (
+                    catalog.trim().to_owned(),
+                    self.register_seqpacket_catalog(catalog.trim(), socket.trim()),
+                )
+            })
+            .collect()
+    }
+
     /// Configure the optional localhost bootstrap key.  Strong identity and
     /// policy remain separate mesh features; this prevents accidental access
     /// through a local browser/forward during the initial admin phase.
@@ -817,6 +887,32 @@ mod tests {
         assert_eq!(response.id, Some(json!(7)));
         assert_eq!(response.result, Some(json!({"local": true})));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn a_catalog_registers_one_http_service_per_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let tools = directory.path().join("tools.json");
+        std::fs::write(
+            &tools,
+            json!([
+                {"name": "discovery.nodes", "x-component-index": 6, "x-method-index": 9},
+                {"name": "discovery.active", "x-component-index": 6, "x-method-index": 10},
+                {"name": "telemetry.quic", "x-component-index": 7, "x-method-index": 7}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let resolved = service_catalog_resolver()
+            .load_path("test-catalog", &tools)
+            .unwrap();
+        let registry = MeshServiceRegistry::default();
+        let components = registry.register_catalog_components(&resolved, "/run/x/mesh.sock.cbor");
+        assert_eq!(components, ["discovery", "telemetry"]);
+        let service = registry.service("telemetry").unwrap();
+        assert!(matches!(service.backend, MeshServiceBackend::UdsSeqpacket(_)));
+        assert_eq!(service.component, "test-catalog");
+        assert!(registry.service("status").is_err());
     }
 
     #[tokio::test]

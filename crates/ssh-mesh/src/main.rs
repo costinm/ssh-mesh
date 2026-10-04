@@ -147,6 +147,14 @@ async fn main() -> Result<(), anyhow::Error> {
         web_root: std::env::var_os("MESH_HTTP_WEB_DIR").map(std::path::PathBuf::from),
     };
 
+    // Mesh services reached over a CBOR seqpacket socket (lmesh): SSH_MESH_MESH_SERVICES.
+    for (catalog, result) in app_state.mesh_services.register_from_env() {
+        match result {
+            Ok(components) => info!("HTTP serves {catalog} components {components:?}"),
+            Err(error) => tracing::warn!("HTTP cannot serve {catalog}: {error:#}"),
+        }
+    }
+
     // Start configured SSH client connections from config
     let configured_clients = ssh_server.cfg.clients.clone();
     if !configured_clients.is_empty() {

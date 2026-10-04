@@ -232,6 +232,16 @@ pub fn encode_record_fields(record: &TaggedRecord) -> Result<Vec<u8>> {
 }
 
 /// Decode one native minicbor value into the generic response envelope.
+/// Encode one JSON value as a CBOR item: the inverse of [`decode_value_bytes`],
+/// with the same conventions (numeric string keys become integer keys, and a
+/// `_hex` or `_b64` key suffix marks a byte string).
+pub fn encode_value_bytes(value: &Value) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::new(&mut bytes);
+    encode_value(&mut encoder, value)?;
+    Ok(bytes)
+}
+
 pub fn decode_value_bytes(bytes: &[u8]) -> Result<Value> {
     let mut decoder = Decoder::new(bytes);
     let value = decode_value(&mut decoder)?;

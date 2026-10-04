@@ -165,6 +165,18 @@ pub struct LogEntry {
     /// Optional fields (key-value pairs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<serde_json::Value>,
+    /// Sequence number assigned by the retaining [`LogBuffer`], increasing by
+    /// one per retained entry; 0 for an entry that was never retained.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seq: u64,
+    /// Milliseconds since the retaining buffer was created, which is process
+    /// start for the global buffer; 0 when not retained.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uptime_ms: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl LogEntry {
@@ -217,6 +229,8 @@ struct LogBufferInner {
     buffer: VecDeque<LogEntry>,
     max_size: usize,
     tx: broadcast::Sender<LogEntry>,
+    next_seq: u64,
+    started: std::time::Instant,
 }
 
 impl LogBuffer {
@@ -228,13 +242,18 @@ impl LogBuffer {
                 buffer: VecDeque::with_capacity(max_size),
                 max_size,
                 tx,
+                next_seq: 1,
+                started: std::time::Instant::now(),
             })),
         }
     }
 
     /// Add a log entry to the buffer
-    pub fn push(&self, entry: LogEntry) {
+    pub fn push(&self, mut entry: LogEntry) {
         let mut inner = self.inner.write();
+        entry.seq = inner.next_seq;
+        inner.next_seq += 1;
+        entry.uptime_ms = u64::try_from(inner.started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // Add to circular buffer
         if inner.buffer.len() >= inner.max_size {
@@ -250,6 +269,26 @@ impl LogBuffer {
     pub fn get_all(&self) -> Vec<LogEntry> {
         let inner = self.inner.read();
         inner.buffer.iter().cloned().collect()
+    }
+
+    /// Retained entries with `seq > since`, oldest first, and how many entries
+    /// after `since` have already left the buffer.
+    pub fn read_since(&self, since: u64) -> (Vec<LogEntry>, u64) {
+        let inner = self.inner.read();
+        let oldest = inner.buffer.front().map_or(inner.next_seq, |entry| entry.seq);
+        let dropped = oldest.saturating_sub(since.saturating_add(1));
+        let entries = inner
+            .buffer
+            .iter()
+            .filter(|entry| entry.seq > since)
+            .cloned()
+            .collect();
+        (entries, dropped)
+    }
+
+    /// Milliseconds since this buffer was created.
+    pub fn uptime_ms(&self) -> u64 {
+        u64::try_from(self.inner.read().started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Subscribe to new log entries
@@ -334,6 +373,8 @@ where
                 // TODO: maybe delay json conversion until it is needed.
                 Some(serde_json::to_value(&visitor.fields).unwrap_or(serde_json::Value::Null))
             },
+            seq: 0,
+            uptime_ms: 0,
         };
 
         // Event type, not severity, is the subscription key. Conventional
@@ -1479,6 +1520,32 @@ mod tests {
     }
 
     #[test]
+    fn retained_entries_get_a_sequence_and_report_what_was_lost() {
+        let buffer = LogBuffer::new(3);
+        let entry = |message: &str| LogEntry {
+            timestamp: String::new(),
+            level: "warn".to_string(),
+            target: "t".to_string(),
+            message: message.to_string(),
+            fields: None,
+            seq: 0,
+            uptime_ms: 0,
+        };
+        for index in 0..5 {
+            buffer.push(entry(&format!("m{index}")));
+        }
+        let (entries, dropped) = buffer.read_since(0);
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            entries.iter().map(|e| (e.seq, e.message.as_str())).collect::<Vec<_>>(),
+            vec![(3, "m2"), (4, "m3"), (5, "m4")]
+        );
+        assert_eq!(buffer.read_since(4).0.len(), 1);
+        let (rest, lost) = buffer.read_since(5);
+        assert!(rest.is_empty() && lost == 0);
+    }
+
+    #[test]
     fn log_entry_formats_as_text_record() {
         let entry = LogEntry {
             timestamp: "2026-07-10T00:00:00Z".to_string(),
@@ -1486,6 +1553,8 @@ mod tests {
             target: "mesh_test".to_string(),
             message: "hello trace".to_string(),
             fields: Some(serde_json::json!({"answer": 42, "ok": true})),
+            seq: 0,
+            uptime_ms: 0,
         };
 
         let line = entry.to_text_line();
