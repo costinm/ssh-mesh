@@ -132,15 +132,6 @@ fn parse_forward(value: &str, remote: bool) -> Result<ForwardSpec> {
     })
 }
 
-fn is_rpc_endpoint(destination: &str) -> bool {
-    destination.starts_with('/')
-        || destination.starts_with("./")
-        || destination.starts_with("unix://")
-        || destination.starts_with("tcp://")
-        || destination.starts_with("http://")
-        || destination.starts_with("https://")
-}
-
 fn unix_path(destination: &str) -> Option<&str> {
     destination.strip_prefix("unix://").or_else(|| {
         (destination.starts_with('/') || destination.starts_with("./")).then_some(destination)
@@ -151,90 +142,33 @@ fn tcp_address(destination: &str) -> Option<&str> {
     destination.strip_prefix("tcp://")
 }
 
-/// Resolve a logical service name through the common mesh-init service format.
+/// Resolve a destination to an endpoint URL the RPC code below can open, or `None` when it is an
+/// ssh destination (a host name, `user@host`, an IP with no scheme).
 ///
-/// `MESH_SERVICE_DIR` may name either one TOML file or a directory containing
-/// `<service>.toml`. This is deliberately separate from the old SSH config
-/// parser: the CLI only understands common `mesh::config` service definitions.
-fn service_address(service: &str) -> Result<Option<String>> {
-    if let Some((section, _)) = service_mesh_config(service)? {
-        return Ok(Some(section.address.unwrap_or_else(|| {
-            format!(
-                "unix://{}",
-                mesh::paths::resolve_service_socket(service).display()
-            )
-        })));
+/// The resolvers are `mesh::resolve`'s: a local service name, then an explicit endpoint (a path or
+/// `scheme://...`). Saved discovery, bare IP defaults and DNS are available to an embedding
+/// application (see `Resolvers::standard`) but are not enabled here, so that `mesh HOST` keeps
+/// meaning ssh. An endpoint whose protocol this CLI cannot open (QUIC) is an error naming it.
+fn resolve_destination(destination: &str) -> Result<Option<String>> {
+    use mesh::resolve::{Address, ExplicitResolver, LocalServiceResolver, PortMap, Protocol, Resolvers};
+    let resolvers = Resolvers::new()
+        .push(LocalServiceResolver { ports: PortMap::default() })
+        .push(ExplicitResolver { ports: PortMap::default() });
+    let endpoints = resolvers.resolve(destination)?;
+    let Some(endpoint) = endpoints.first() else {
+        return Ok(None);
+    };
+    // Without a scheme or a path, a network-looking destination is still an ssh host.
+    if !matches!(endpoint.address(), Address::Unix(_)) && !destination.contains("://") {
+        return Ok(None);
     }
-    if let Some((endpoint, namespace)) = service.split_once('.')
-        && !endpoint.is_empty()
-        && !namespace.is_empty()
-        && !endpoint.contains('.')
-        && !namespace.contains('.')
-        && endpoint
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        && namespace
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Ok(Some(format!(
-            "unix:///run/mesh/{namespace}/{endpoint}.sock"
-        )));
+    match endpoint.protocol() {
+        Protocol::Jsonl | Protocol::Cbor | Protocol::Http | Protocol::Https => Ok(Some(endpoint.url())),
+        Protocol::Ssh => Ok(None),
+        Protocol::Quic => anyhow::bail!(
+            "{destination} is a QUIC endpoint; mesh has no QUIC opener (an embedding application registers one)"
+        ),
     }
-    // A conventional mesh-init service without a [Mesh] section still owns
-    // the standard per-service control socket.  This lets `mesh lmesh ...`
-    // select the local service without conflating it with an SSH host.
-    if service_config_candidates(service)
-        .into_iter()
-        .any(|path| path.is_file())
-    {
-        return Ok(Some(format!(
-            "unix://{}",
-            mesh::paths::resolve_service_socket(service).display()
-        )));
-    }
-    if mesh::paths::service_socket_candidates(service)
-        .into_iter()
-        .any(|path| path.exists())
-    {
-        return Ok(Some(format!(
-            "unix://{}",
-            mesh::paths::resolve_service_socket(service).display()
-        )));
-    }
-    Ok(None)
-}
-
-fn service_config_candidates(service: &str) -> Vec<PathBuf> {
-    if let Some(source) = std::env::var_os("MESH_SERVICE_DIR").map(PathBuf::from) {
-        return vec![if source.is_dir() {
-            source.join(format!("{service}.toml"))
-        } else {
-            source
-        }];
-    }
-    vec![
-        PathBuf::from(format!("/home/system/etc/mesh-init/{service}.toml")),
-        PathBuf::from(format!("etc/mesh-init/{service}.toml")),
-    ]
-}
-
-fn service_mesh_config(service: &str) -> Result<Option<(mesh::config::MeshSection, PathBuf)>> {
-    for path in service_config_candidates(service).into_iter().rev() {
-        if !path.is_file() {
-            continue;
-        }
-        let config = mesh::config::parse_service(
-            &std::fs::read_to_string(&path)
-                .with_context(|| format!("read service definition {}", path.display()))?,
-            Some(service),
-        )
-        .with_context(|| format!("parse service definition {}", path.display()))?;
-        if let Some(section) = config.mesh {
-            return Ok(Some((section, path)));
-        }
-    }
-    Ok(None)
 }
 
 fn print_local_help(destination: &str, command: Option<&str>) -> Result<()> {
@@ -903,21 +837,23 @@ mod tests {
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
     let catalog_destination = cli.destination.clone();
-    if !is_rpc_endpoint(&cli.destination)
-        && cli.arguments.first().map(String::as_str) == Some("help")
-    {
+    // `help` for a logical name (not an explicit path or URL) prints its installed catalog.
+    let explicit = cli.destination.contains("://")
+        || cli.destination.starts_with('/')
+        || cli.destination.starts_with("./");
+    if !explicit && cli.arguments.first().map(String::as_str) == Some("help") {
         return print_local_help(&cli.destination, cli.arguments.get(1).map(String::as_str));
     }
-    if !is_rpc_endpoint(&cli.destination)
-        && !cli.destination.starts_with("mux://")
-        && let Some(address) = service_address(&cli.destination)?
-    {
+    let resolved = if cli.destination.starts_with("mux://") {
+        None
+    } else {
+        resolve_destination(&cli.destination)?
+    };
+    if let Some(address) = resolved {
         // The logical destination selects a service endpoint.  RPC components
         // remain command arguments, so a catalog-backed call reads naturally
         // as `mesh lmesh esp serial.command ...`.
         cli.destination = address;
-    }
-    if is_rpc_endpoint(&cli.destination) {
         return rpc_destination(&cli, &catalog_destination).await;
     }
     if let Some(path) = cli.destination.strip_prefix("mux://") {

@@ -347,8 +347,15 @@ impl TaggedSchema {
                     record.data = Some(bytes);
                 }
                 _ => {
+                    let field = field_schema(schema, name);
+                    // A declared `to` with the envelope's tag is the destination, not a field of
+                    // the method: the node that runs the method (see `ENVELOPE_TO_TAG`).
+                    if field.is_some_and(|field| field.tag == ENVELOPE_TO_TAG) {
+                        record.to = Some(value.clone());
+                        continue;
+                    }
                     let key = field_key(schema, name);
-                    record.env.insert(key, value.clone());
+                    record.env.insert(key, coerce_to_kind(field, value));
                 }
             }
         }
@@ -423,7 +430,43 @@ impl TaggedSchema {
                 bail!("argument {token:?} must be name=value");
             }
         }
+        // A declared `to` with the envelope's tag is the destination, as in `record_from_value`.
+        if schema.is_some_and(|schema| {
+            schema.fields.get("to").is_some_and(|field| field.tag == ENVELOPE_TO_TAG)
+        }) && let Some(to) = record.env.remove(&NameOrTag::Tag(ENVELOPE_TO_TAG))
+        {
+            record.to = Some(to);
+        }
         Ok(record)
+    }
+
+    /// Encode a request record as tagged CBOR, applying the catalog's field kinds that JSON and
+    /// text cannot carry: a `hex` field becomes a CBOR byte string (it stays `hex:` text in every
+    /// text and JSON form, and `hex:` text in an unrelated field stays text).
+    pub fn encode_request(&self, record: &TaggedRecord) -> Result<Vec<u8>> {
+        let schema = self
+            .method_name(record)
+            .and_then(|name| self.methods.get(name));
+        let mut record = record.clone();
+        let hex_tags: Vec<u32> = schema
+            .map(|schema| {
+                schema
+                    .fields
+                    .values()
+                    .filter(|field| field.kind.as_deref() == Some("hex"))
+                    .map(|field| field.tag)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tag in hex_tags {
+            if let Some(Value::String(text)) = record.env.remove(&NameOrTag::Tag(tag)) {
+                let digits = text.trim_start_matches("hex:").to_owned();
+                record
+                    .env
+                    .insert(NameOrTag::Name(format!("{tag}_hex")), Value::String(digits));
+            }
+        }
+        crate::cbor::encode_record(&record)
     }
 
     /// Produce the method-and-fields JSON object used for local dispatch.
@@ -529,6 +572,26 @@ fn field_schema<'a>(schema: Option<&'a MethodSchema>, name: &str) -> Option<&'a 
     })
 }
 
+/// Field tag that a catalog gives to a method's `to` field when it is really the envelope's
+/// destination (the node that runs the method), as in `probe.start`.
+pub const ENVELOPE_TO_TAG: u32 = 15;
+
+/// A declared text field stays text whatever a JSON or shell front end parsed it as
+/// (`ssid=123`, a numeric setting value): the same rule `field_text_value` applies to `key=value`.
+fn coerce_to_kind(field: Option<&FieldSchema>, value: &Value) -> Value {
+    match (field.and_then(|field| field.kind.as_deref()), value) {
+        (Some("string" | "text"), Value::Number(_) | Value::Bool(_)) => {
+            Value::String(value.to_string())
+        }
+        // Same normalized spelling as `field_text_value`: `hex:` plus the digits.
+        (Some("hex"), Value::String(text)) => Value::String(format!(
+            "hex:{}",
+            text.trim_start_matches("hex:").replace(':', "")
+        )),
+        _ => value.clone(),
+    }
+}
+
 fn field_key(schema: Option<&MethodSchema>, name: &str) -> NameOrTag {
     field_schema(schema, name)
         .map(|field| NameOrTag::Tag(field.tag))
@@ -551,7 +614,7 @@ fn field_text_value(schema: Option<&MethodSchema>, name: &str, value: &str) -> R
                 .unwrap_or_else(|| value.parse::<u64>())?,
         )),
         // A declared string stays text, whatever it looks like (`ssid=123`).
-        Some("string") => Ok(Value::String(value.to_owned())),
+        Some("string" | "text") => Ok(Value::String(value.to_owned())),
         Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
         Some("hex") => Ok(Value::String(format!(
             "hex:{}",
@@ -1261,4 +1324,57 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn a_structured_request_applies_the_same_field_rules_as_key_value_arguments() {
+        let tools = serde_json::json!({"tools": [{
+            "name": "demo.set",
+            "x-component-index": 9, "x-method-index": 1,
+            "inputSchema": {"properties": {
+                "value": {"type": "string", "x-protobuf-index": 2, "x-dmesh-kind": "text"},
+                "count": {"type": "integer", "x-protobuf-index": 3, "x-dmesh-kind": "u32"},
+                "to": {"type": "string", "x-protobuf-index": 15, "x-dmesh-kind": "text"}
+            }}
+        }]});
+        let schema = TaggedSchema::from_tools_json(&tools).unwrap();
+        // The JSON path (HTTP) and the argv path agree: text stays text, numbers stay numbers.
+        let from_json = schema
+            .record_from_value("demo.set", &serde_json::json!({"value": 123, "count": 4, "to": "e8"}))
+            .unwrap();
+        let from_argv = schema
+            .parse_argv("demo.set", &["value=123".into(), "count=4".into(), "to=e8".into()])
+            .unwrap();
+        assert_eq!(from_argv.to, Some(Value::String("e8".into())));
+        assert_eq!(from_json.env.get(&NameOrTag::Tag(2)), Some(&Value::String("123".into())));
+        assert_eq!(from_json.env.get(&NameOrTag::Tag(3)), Some(&Value::from(4)));
+        assert_eq!(from_json.env, from_argv.env);
+        // A declared field with the envelope tag is the destination in the JSON path.
+        assert_eq!(from_json.to, Some(Value::String("e8".into())));
+        assert!(!from_json.env.contains_key(&NameOrTag::Tag(ENVELOPE_TO_TAG)));
+    }
+
+    #[test]
+    fn a_hex_field_is_a_byte_string_on_the_wire_and_text_elsewhere() {
+        let tools = serde_json::json!({"tools": [{
+            "name": "demo.tx",
+            "x-component-index": 9, "x-method-index": 2,
+            "inputSchema": {"properties": {
+                "frame": {"type": "string", "x-protobuf-index": 1, "x-dmesh-kind": "hex"},
+                "note": {"type": "string", "x-protobuf-index": 2, "x-dmesh-kind": "text"}
+            }}
+        }]});
+        let schema = TaggedSchema::from_tools_json(&tools).unwrap();
+        for record in [
+            schema.parse_argv("demo.tx", &["frame=d0:01ff".into(), "note=hex:ab".into()]).unwrap(),
+            schema
+                .record_from_value("demo.tx", &serde_json::json!({"frame": "hex:D001FF", "note": "hex:ab"}))
+                .unwrap(),
+        ] {
+            let wire = schema.encode_request(&record).unwrap();
+            let decoded = crate::cbor::decode_record(&wire).unwrap();
+            // CBOR bytes decode to `base64:` text in the generic view; the note stays text.
+            assert_eq!(decoded.env.get(&NameOrTag::Tag(1)), Some(&Value::String("base64:0AH/".into())));
+            assert_eq!(decoded.env.get(&NameOrTag::Tag(2)), Some(&Value::String("hex:ab".into())));
+        }
+    }
 }

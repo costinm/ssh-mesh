@@ -101,6 +101,19 @@ pub fn encode_record(record: &TaggedRecord) -> Result<Vec<u8>> {
     if !record.env.is_empty() {
         encoder.u8(5)?.map(record.env.len() as u64)?;
         for (key, value) in &record.env {
+            // A `_hex`/`_b64` name suffix marks a byte string, as for nested keys (see
+            // `encode_value`); `TaggedSchema::encode_request` sets it for `hex`-kind fields.
+            if let NameOrTag::Name(name) = key
+                && let Some((stripped, bytes)) = encoded_byte_field(name, value)?
+            {
+                if let Ok(tag) = stripped.parse::<u32>() {
+                    encoder.u32(tag)?;
+                } else {
+                    encoder.str(stripped)?;
+                }
+                encoder.bytes(&bytes)?;
+                continue;
+            }
             encode_name_or_tag(&mut encoder, key)?;
             encode_value(&mut encoder, value)?;
         }

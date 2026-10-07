@@ -10,6 +10,7 @@ pub mod client;
 pub mod config;
 /// Generated numeric IDs from the normative mesh API.md catalog.
 pub mod generated_api_ids;
+pub mod http_ids;
 pub mod jobs;
 pub mod jsonl;
 pub mod lifecycle;
@@ -21,6 +22,7 @@ pub mod mux_client;
 pub mod paths;
 pub mod protocol;
 pub mod registry;
+pub mod resolve;
 pub mod route;
 pub mod schema;
 pub mod seqpacket;

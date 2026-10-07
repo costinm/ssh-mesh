@@ -35,6 +35,9 @@ pub struct ApiMethod {
     pub execution: Option<String>,
     pub recommended_timeout: Option<String>,
     pub access: Option<String>,
+    /// Exposure tier: `core` (the public control-plane surface), `debug` or `internal`. A method
+    /// without one has no tier; a catalog consumer decides whether that is an error.
+    pub tier: Option<String>,
     /// Generate no-std Rust structs with fixed-buffer CBOR codecs.
     pub rust_cbor: bool,
     pub errors: Vec<ApiError>,
@@ -602,6 +605,7 @@ pub fn parse_api_markdown(markdown: &str) -> Result<Vec<ApiMethod>> {
                 execution: None,
                 recommended_timeout: None,
                 access: None,
+                tier: None,
                 rust_cbor: false,
                 errors: Vec::new(),
                 request: ApiShape::default(),
@@ -637,6 +641,7 @@ pub fn parse_api_markdown(markdown: &str) -> Result<Vec<ApiMethod>> {
                     "Execution" => current.execution = Some(value.to_owned()),
                     "Recommended timeout" => current.recommended_timeout = Some(unquote(value)),
                     "Access" => current.access = Some(value.to_owned()),
+                    "Tier" => current.tier = Some(value.to_owned()),
                     "Rust CBOR" => current.rust_cbor = value == "generated",
                     "Max encoded size" => match shape {
                         Some("request") => current.request.max_encoded_size = Some(unquote(value)),
@@ -1025,6 +1030,9 @@ pub fn tools_json(methods: &[ApiMethod]) -> Value {
                 if let Some(access) = &method.access {
                     tool.insert("x-access".to_owned(), Value::String(access.clone()));
                 }
+                if let Some(tier) = &method.tier {
+                    tool.insert("x-tier".to_owned(), Value::String(tier.clone()));
+                }
                 tool.insert(
                     "x-standard-errors".to_owned(),
                     Value::Array(
@@ -1262,6 +1270,11 @@ fn validate(methods: &[ApiMethod]) -> Result<()> {
         if !matches!(method.visibility.as_str(), "public" | "private") {
             bail!("{} has invalid visibility {}", method.id, method.visibility);
         }
+        if let Some(tier) = &method.tier
+            && !matches!(tier.as_str(), "core" | "debug" | "internal")
+        {
+            bail!("{} has invalid tier {tier} (core, debug or internal)", method.id);
+        }
         if let Some(component_index) = method.component_index
             && let Some(previous) = components.insert(component_index, &method.component)
             && previous != &method.component
@@ -1354,6 +1367,24 @@ mod tests {
             list["outputSchema"]["properties"]["entries"]["type"],
             "array"
         );
+    }
+
+    #[test]
+    fn a_tier_line_becomes_x_tier_and_an_unknown_tier_is_rejected() {
+        let methods = parse_api_markdown(
+            "# `service` API (1)\n\n## 1. `get` — Read\n\n**Tier:** core\n\n## 2. `poke` — Poke\n",
+        )
+        .unwrap();
+        assert_eq!(methods[0].tier.as_deref(), Some("core"));
+        assert_eq!(methods[1].tier, None);
+        let tools = tools_json(&methods);
+        assert_eq!(tools[0]["x-tier"], "core");
+        assert!(tools[1].get("x-tier").is_none());
+        let error = parse_api_markdown(
+            "# `service` API (1)\n\n## 1. `get` — Read\n\n**Tier:** public\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid tier"), "{error}");
     }
 
     #[test]

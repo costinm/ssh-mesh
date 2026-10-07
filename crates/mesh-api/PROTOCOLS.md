@@ -185,6 +185,53 @@ one. There is no second kind of handler for long-running or data-moving
 methods, and no ingress may dispatch a method itself instead of calling the
 registry.
 
+## HTTP component: REST-style requests
+
+Component `2002` (`http`), reserved beside `mesh` (2000) and `trace` (2001), carries ordinary
+resource requests in the same envelope instead of one bespoke method per operation. It adds no
+envelope key: the path is `params`, the headers are `fields`, and the body is the handler stream's
+body.
+
+| Part | Where | Form |
+|---|---|---|
+| Verb | `method` | `1` GET, `2` POST, `3` PUT, `4` DELETE, `5` FETCH, `6` PATCH (the CoAP request codes); the names `get`, `post`, ... are the text spelling |
+| Path | `params` (key 4) | An array of segments. Each segment is an unsigned number (a resource id, the numbers-over-strings form) or a text string, and a segment is matched exactly as sent: a resource that answers to both spellings registers both |
+| Headers | `fields` (key 5) | A map. A key is an unsigned number or a text string, as in HTTP/2 and HTTP/3 where a name may be indexed or literal; a name and its number are the same header and may not both appear |
+| Body | stream body | Raw bytes after the header, ended by FIN; its length is the `content-length` header |
+| Response | response header | `id` plus `result` (success) or `error` (failure), and `fields` with the response headers |
+
+Reserved header keys are `0`..`63`: `0` `status` (response only: an HTTP status number), `1`
+`content-length`, `2` `content-type`. A resource defines its own headers from `64` upward, or as text
+keys, and documents them in its `API.md`. A receiver rejects a header it does not know on a resource
+that has not declared it; it never ignores one silently.
+
+A successful response (`status` below 400) carries `result` (normally null); a failed one carries
+`error` (a short text) and the same `status`. Because the request is the ordinary envelope, `id`,
+`to` (forwarding) and `timeout` apply unchanged, and the request is dispatched by the registry like
+every other method: a service registers `http` `post`, `get`, ... and routes by path.
+
+### Dispatch key
+
+A handler is registered under a **key**: the list `[component, method, path...]` of numbers or text, read
+like the prefix of a URL. The dispatcher has no second routing layer (no per-verb router or map of
+paths behind a handler): a request's key is its `component`, `method` and `params` in order, and the
+**longest registered prefix** wins.
+
+| Key | Serves |
+|---|---|
+| `[http, post, FLASH]` | exactly the resources under that prefix: `POST /flash` |
+| `[http, get, "service.namespace.example.com", "path1"]` | every `GET` of that host below `path1`, for example a static-file handler that reads the rest of the path from `params` |
+| `[component, method]` | a plain numbered method (the existing form), and the fallback for any longer path under it |
+
+A handler registered at a prefix receives the whole request, including the full `params`, and reads
+what follows its own prefix itself. A key may be registered once. A request that matches no key is
+answered with the shared numeric error, as for any unregistered method. The same key serves a
+datagram, a message or a stream; nothing about the key depends on the delivery form.
+
+Gateways translate mechanically: an HTTP request `POST /flash` with `Content-Length` becomes verb
+`2`, path `["flash"]`, header `1`, and the request body becomes the stream body. The numbers are
+defined in `mesh::http_ids`.
+
 ## Delivery forms of one handler
 
 A handler is registered once, by component and method, and the same
