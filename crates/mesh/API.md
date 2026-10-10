@@ -5,13 +5,13 @@ service discovery, lifecycle, and trace controls; each service documents its
 own component methods separately. These components use the reserved numbers
 2000 (`mesh`), 2001 (`trace`) and 2002 (`http`), outside any service's own range, so a
 service can register them beside its own numbered methods. They dispatch by
-number and CBOR; the name-keyed JSON dispatch remains for JSON-RPC/MCP
-gateways. Transport and encoding rules are in
+number; a gateway that addresses methods by name translates them to the numbers at the
+edge. Transport and encoding rules are in
 [mesh-api/PROTOCOLS.md](../mesh-api/PROTOCOLS.md); handler streams (a header, then an
 optional body) are defined in its
 [Handler streams](../mesh-api/PROTOCOLS.md#handler-streams-header-and-body) section. The generated public catalog
-is `resources/tools.json` and can be adapted by CBOR, JSON-RPC, CLI, or MCP
-gateways without changing these handlers.
+is `resources/tools.json` and can be adapted by any gateway (CLI, HTTP, RPC or MCP)
+without changing these handlers.
 
 `mesh.lifecycle` is private supervisor-to-service traffic. Services that need
 to react call `mesh::lifecycle::subscribe()` before accepting requests. Public

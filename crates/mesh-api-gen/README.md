@@ -192,8 +192,8 @@ A row record that appears as an array element can instead be declared under
 the method that returns it. A line `` `Name` fields: `` followed by a field
 table defines it, and a field typed `Name[]` becomes `Vec<Name>` with its own
 tagged CBOR codec, so no array travels as JSON. Arrays of scalars (`string[]`,
-`u64[]`) are typed the same way. The type `cbor` is one already-encoded CBOR item
-for a value whose shape depends on the data (carried as its bytes, never JSON).
+`u64[]`) are typed the same way. The type `encoded` is one already-encoded value
+for a value whose shape depends on the data (carried as its bytes in the wire encoding, never JSON).
 
 ```markdown
 ### Response

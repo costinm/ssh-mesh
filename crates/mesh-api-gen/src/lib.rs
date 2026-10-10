@@ -327,7 +327,7 @@ fn cbor_kind(value_type: &str) -> CborKind {
         "string" => CborKind::Text,
         "bytes" => CborKind::Bytes,
         value if value.starts_with("bytes[") => CborKind::Bytes,
-        "cbor" => CborKind::Raw,
+        "encoded" => CborKind::Raw,
         _ => CborKind::Value,
     }
 }
@@ -523,7 +523,7 @@ fn rust_value_type(value_type: &str, required: bool, rows: &[String]) -> String 
         "string" => "String",
         "bytes" => "Vec<u8>",
         value if value.starts_with("bytes[") => "Vec<u8>",
-        "cbor" => "Vec<u8>",
+        "encoded" => "Vec<u8>",
         "array" => "Vec<serde_json::Value>",
         "object" => "serde_json::Value",
         value if value.starts_with("map<") => {
@@ -642,7 +642,7 @@ pub fn parse_api_markdown(markdown: &str) -> Result<Vec<ApiMethod>> {
                     "Recommended timeout" => current.recommended_timeout = Some(unquote(value)),
                     "Access" => current.access = Some(value.to_owned()),
                     "Tier" => current.tier = Some(value.to_owned()),
-                    "Rust CBOR" => current.rust_cbor = value == "generated",
+                    "Rust codec" => current.rust_cbor = value == "generated",
                     "Max encoded size" => match shape {
                         Some("request") => current.request.max_encoded_size = Some(unquote(value)),
                         Some("response") => {
@@ -1210,7 +1210,7 @@ fn json_type(value_type: &str) -> &'static str {
         "f32" | "f64" => "number",
         "bytes" => "string",
         "array" => "array",
-        "object" | "cbor" => "object",
+        "object" | "encoded" => "object",
         _ => "string",
     }
 }
@@ -1399,7 +1399,7 @@ mod tests {
     #[test]
     fn generates_fixed_buffer_cbor_for_required_numeric_response() {
         let methods = parse_api_markdown(
-            "# `telemetry` API (7)\n\n## 7. `quic_metrics` — Read QUIC counters\n\n**Platforms:** E\n\n**Rust CBOR:** generated\n\n### Response\n\n| Tag | Field | Type | Required | Description |\n|---:|---|---|---|---|\n| 1 | `received_packets` | `u64` | yes | Packets. |\n",
+            "# `telemetry` API (7)\n\n## 7. `quic_metrics` — Read QUIC counters\n\n**Platforms:** E\n\n**Rust codec:** generated\n\n### Response\n\n| Tag | Field | Type | Required | Description |\n|---:|---|---|---|---|\n| 1 | `received_packets` | `u64` | yes | Packets. |\n",
         )
         .unwrap();
         assert!(methods[0].response.fields[0].required);
