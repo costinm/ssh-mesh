@@ -1,14 +1,30 @@
 # mesh-api-gen
 
-`mesh-api-gen` turns a human-readable `API.md` into the checked-in catalogs,
-schemas, numeric identifiers, and Rust types used by mesh services and their
-gateways. It is a standalone host build tool; it is not linked into services,
-firmware, or gateways.
+There are many schemas, usually tied to a specific encoding - proto, 
+cbor, ASN, aidl, xml and json schemas, and too many others to list. The main 
+problem is that they're either too tied to a specific encoding or too complex.
 
-This README defines the Markdown-first `API.md` contract implemented by the
-parser and generators. See [API.md](API.md) for the complete fixture and the
-[implementation plan](../../notes/ai/mesh-api-markdown-plan.md) for migration
-scope and validation.
+`ssh-mesh` is based on flexible encodings and transports - with gateways and 
+libraries converting between equivalent representations or internal structs, 
+either dynamically or via generated stubs or a mix. 
+
+The same is true for the schema - the core is what a method and its parameter
+do, and how implementations should map to types if they generate stubs - but 
+without rigidity.
+
+Usually the solution for this is to invent a new schema format. That's not what 
+we are doing. Instead we are trying to map existing schemas and sources into
+a common internal representation and map the internal representation into multiple
+scheams and stubs.
+
+The main ways to express the method and parameters are a markdown file (API.md)
+or a rust file. Others may be added.
+
+The intermediary for is an extended form of tools.json - which can be converted to
+tools.json by removing the extra attributes, and can be converted to API.md
+or rust files (or other schema definitions).
+
+
 
 ## Design goals
 
@@ -24,6 +40,14 @@ scope and validation.
 - The schema stays deliberately small: tagged records, enums, scalar values,
   repeated values, and named types. It does not try to reproduce all of CDDL,
   JSON Schema, or Protobuf.
+
+## Device manifest
+
+`--out-manifest FILE [--autostart REQUEST]` writes the compact CBOR form of one component's catalog (names, indices, field
+lists with tag/name/kind, row types, an optional start-at-boot request) that a constrained device carries in a module image
+or serves for discovery, so a console or gateway needs no identifier compiled into it. The format is documented on
+`manifest_cbor` and written identically by esp-xip-modules' `tools/mkmod.py`; both are tested against the one fixture in
+`tests/data`.
 
 ## Components and methods
 
@@ -275,6 +299,46 @@ integer tags for CBOR. Examples therefore remain useful across transports.
 
 Method-specific errors may be documented as prose or a table under `###
 Errors`.
+
+## `api.json`: the full form, and a native layout
+
+`--out-api-json FILE` writes the lossless, generated form of an API (never edited): everything `tools.json` leaves out, so
+the other forms can be derived from it. It holds the components (with their prose), the methods (`summary`, the long
+`doc`, access, errors, request and response by field list or by named type), the named records and row types with
+per-field descriptions, the enums with their values, and the native layout (`x-c`) of the types and functions the API maps
+onto. `tools.json` stays small for LLM and MCP clients; it is a projection of the same model.
+
+The prose, descriptions and enums are scanned from the Markdown by `document.rs` with the heading rules above, so nothing
+in `API.md` is lost: the text under a method heading is its `doc`, an `## enum `Name`` table gives values, and the
+`Description` column of every field table is kept.
+
+A native host implements some of an API as C structs and a table of function pointers. `--rustdoc FILE` reads the JSON
+that rustdoc writes for the crate that declares them (`RUSTC_BOOTSTRAP=1 cargo rustdoc --lib -- -Z unstable-options
+--output-format json`, format 57; a developer step with checked-in output, not a build dependency) and computes the
+`repr(C)` layout for `--pointer-width N` bytes. Two lines in `API.md` connect the two:
+
+```markdown
+## 2. `set` — State what the radio should do
+
+**C function:** wifi/Wifi.set
+
+# Types
+
+## `Intent`
+
+**C type:** WifiIntent
+```
+
+`**C type:** T` names a `#[repr(C)]` struct: each field of the record must exist in it under the same name and have a
+compatible type (an enum or `bool` is a small integer, `string` and `bytes` a `[u8; N]` with an optional `<name>_len`
+field). A mismatch is an error, so the two descriptions cannot drift apart. `x-c` then records the size, alignment, and
+each field's offset, size, kind and length field; an empty description is filled from the Rust doc comment.
+`**C function:** component/Table.member` names a member of a table struct: `x-c` gets the `get_component` name, the
+table, the member's offset, and its parameters (`ctx`, `in`, `out`), checked against the request and response types. With
+this a console, a gateway or a JSON converter can call the function from data alone.
+
+`--api` may be repeated with `--out-console-catalog FILE`: the C header of the flattened method and field catalog a
+constrained console compiles in (integers and one string pool). Several APIs are merged; row types are shared by name.
 
 ## Generated artifacts
 

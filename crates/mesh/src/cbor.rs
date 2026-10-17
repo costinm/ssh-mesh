@@ -298,10 +298,15 @@ impl Catalog {
                 continue;
             };
             let annotation = tool.get("x-mesh-cbor").or_else(|| tool.get("x-cbor"));
-            let Some(annotation) = annotation else {
+            // mesh-api-gen writes the method number as `x-method-index` and each field's tag as `x-protobuf-index`.
+            let method_id = annotation
+                .and_then(|a| a.get("id"))
+                .and_then(Value::as_u64)
+                .or_else(|| tool.get("x-method-index").and_then(Value::as_u64));
+            if annotation.is_none() && method_id.is_none() {
                 continue;
-            };
-            if let Some(id) = annotation.get("id").and_then(Value::as_u64) {
+            }
+            if let Some(id) = method_id {
                 let id = u16::try_from(id).context("CBOR method id exceeds u16")?;
                 catalog.methods.insert(name.to_owned(), id);
                 catalog.method_names.insert(id, name.to_owned());
@@ -316,6 +321,7 @@ impl Catalog {
                         .get("x-mesh-cbor")
                         .and_then(|x| x.get("id"))
                         .and_then(Value::as_u64)
+                        .or_else(|| schema.get("x-protobuf-index").and_then(Value::as_u64))
                     {
                         fields.insert(
                             field.clone(),

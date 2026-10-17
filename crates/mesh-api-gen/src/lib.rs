@@ -8,7 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+pub mod apijson;
+pub mod console;
+pub mod document;
 pub mod java;
+pub mod rustdoc;
 
 const STANDARD_ERRORS: &[&str] = &[
     "unauthenticated",
@@ -1311,6 +1315,165 @@ fn validate_fields(id: &str, fields: &[ApiField]) -> Result<()> {
     Ok(())
 }
 
+/// The compact device catalog of one component: what a constrained device carries inside a module image (or serves for
+/// discovery) so that a console, gateway or web front end can turn `component.method name=value` into the tagged request
+/// and a response back into text without any identifier compiled into it. It is the information of `tools.json`
+/// (without the prose) as definite-length CBOR; the esp-xip-modules `tools/mkmod.py` writes the same bytes from the same
+/// `API.md`, and both are tested against one fixture (`tests/data/manifest-demo.hex`).
+///
+/// ```text
+/// {1: component name, 2: component index,
+///  3: [{1: method index, 2: method name, 3: request field list, 4: response field list}, ...],
+///  4: [[type name, [field, ...]], ...],        only if named types exist
+///  5: [[field, ...], ...],                      the field lists the methods refer to by position, each stored once
+///  6: start request}                            only for a module that starts at boot (text, may be empty)
+/// field = [tag, name, kind] or [tag, name, kind, type name]
+/// kind  = 0 any, 1 text, 2 bool, 3 unsigned, 4 signed, 5 bytes, 6 map, 7 array
+/// ```
+///
+/// Methods of the first component with both indices are listed, in document order.
+pub fn manifest_cbor(methods: &[ApiMethod], autostart: Option<&str>) -> Result<Vec<u8>> {
+    let first = methods
+        .iter()
+        .find(|method| method.component_index.is_some() && method.method_index.is_some())
+        .context("a manifest needs a component index and method indices")?;
+    let component = &first.component;
+    let methods: Vec<&ApiMethod> = methods
+        .iter()
+        .filter(|method| &method.component == component && method.method_index.is_some())
+        .collect();
+
+    let mut types: BTreeMap<&str, &RowType> = BTreeMap::new();
+    for method in &methods {
+        for row in &method.row_types {
+            types.entry(row.name.as_str()).or_insert(row);
+        }
+    }
+    let record_names: Vec<&str> = types.keys().copied().collect();
+
+    type Field = (u32, String, u8, Option<String>);
+    let fields = |rows: &[ApiField]| -> Vec<Field> {
+        rows.iter()
+            .map(|field| {
+                let (kind, record) = manifest_kind(&field.value_type, &record_names);
+                (field.index, field.name.clone(), kind, record)
+            })
+            .collect()
+    };
+    let mut lists: Vec<Vec<Field>> = Vec::new();
+    let mut index = |rows: Vec<Field>| -> usize {
+        if let Some(position) = lists.iter().position(|list| *list == rows) {
+            return position;
+        }
+        lists.push(rows);
+        lists.len() - 1
+    };
+    let mut method_entries = Vec::new();
+    for method in &methods {
+        let request = index(fields(&method.request.fields));
+        let response = index(fields(&method.response.fields));
+        method_entries.push((method.method_index.unwrap_or(0), method.method.clone(), request, response));
+    }
+
+    let mut out = Vec::new();
+    let keys = 4 + usize::from(!types.is_empty()) + usize::from(autostart.is_some());
+    cbor_head(&mut out, 5, keys as u64);
+    cbor_uint(&mut out, 1);
+    cbor_text(&mut out, component);
+    cbor_uint(&mut out, 2);
+    cbor_uint(&mut out, u64::from(first.component_index.unwrap_or(0)));
+    cbor_uint(&mut out, 3);
+    cbor_head(&mut out, 4, method_entries.len() as u64);
+    for (id, name, request, response) in &method_entries {
+        cbor_head(&mut out, 5, 4);
+        cbor_uint(&mut out, 1);
+        cbor_uint(&mut out, u64::from(*id));
+        cbor_uint(&mut out, 2);
+        cbor_text(&mut out, name);
+        cbor_uint(&mut out, 3);
+        cbor_uint(&mut out, *request as u64);
+        cbor_uint(&mut out, 4);
+        cbor_uint(&mut out, *response as u64);
+    }
+    let write_fields = |out: &mut Vec<u8>, list: &[Field]| {
+        cbor_head(out, 4, list.len() as u64);
+        for (tag, name, kind, record) in list {
+            cbor_head(out, 4, if record.is_some() { 4 } else { 3 });
+            cbor_uint(out, u64::from(*tag));
+            cbor_text(out, name);
+            cbor_uint(out, u64::from(*kind));
+            if let Some(record) = record {
+                cbor_text(out, record);
+            }
+        }
+    };
+    if !types.is_empty() {
+        cbor_uint(&mut out, 4);
+        cbor_head(&mut out, 4, types.len() as u64);
+        for (name, row) in &types {
+            cbor_head(&mut out, 4, 2);
+            cbor_text(&mut out, name);
+            write_fields(&mut out, &fields(&row.fields));
+        }
+    }
+    cbor_uint(&mut out, 5);
+    cbor_head(&mut out, 4, lists.len() as u64);
+    for list in &lists {
+        write_fields(&mut out, list);
+    }
+    if let Some(request) = autostart {
+        cbor_uint(&mut out, 6);
+        cbor_text(&mut out, request);
+    }
+    Ok(out)
+}
+
+/// `(kind, record type name)` of an API type cell, in the kinds of [`manifest_cbor`].
+fn manifest_kind(value_type: &str, records: &[&str]) -> (u8, Option<String>) {
+    let (array, name) = match value_type.strip_suffix("[]") {
+        Some(name) => (true, name),
+        None => (false, value_type),
+    };
+    if records.contains(&name) {
+        return (if array { 7 } else { 6 }, Some(name.to_owned()));
+    }
+    if array || name == "array" {
+        return (7, None);
+    }
+    let kind = match name {
+        "string" | "text" => 1,
+        "bool" => 2,
+        "bytes" | "hex" => 5,
+        "map" => 6,
+        "int" | "i8" | "i16" | "i32" | "i64" => 4,
+        _ if name.starts_with('u') || name == "enum" => 3,
+        _ => 0,
+    };
+    (kind, None)
+}
+
+fn cbor_head(out: &mut Vec<u8>, major: u8, n: u64) {
+    let m = major << 5;
+    match n {
+        0..=23 => out.push(m | n as u8),
+        24..=0xff => out.extend([m | 24, n as u8]),
+        0x100..=0xffff => out.extend([m | 25, (n >> 8) as u8, n as u8]),
+        _ => {
+            out.push(m | 26);
+            out.extend((n as u32).to_be_bytes());
+        }
+    }
+}
+
+fn cbor_uint(out: &mut Vec<u8>, n: u64) {
+    cbor_head(out, 0, n);
+}
+
+fn cbor_text(out: &mut Vec<u8>, text: &str) {
+    cbor_head(out, 3, text.len() as u64);
+    out.extend(text.as_bytes());
+}
+
 pub fn parse_required_path(value: Option<String>, name: &str) -> Result<String> {
     value.ok_or_else(|| anyhow!("{name} is required"))
 }
@@ -1318,6 +1481,19 @@ pub fn parse_required_path(value: Option<String>, name: &str) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_manifest_is_byte_identical_to_the_one_esp_xip_modules_writes() {
+        // the same API.md and the same expected bytes as esp-xip-modules/tests/data (tools/mkmod.py writes them)
+        let api = include_str!("../tests/data/manifest-demo-API.md");
+        let methods = parse_api_markdown(api).unwrap();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(&manifest_cbor(&methods, None).unwrap()), include_str!("../tests/data/manifest-demo.hex").trim());
+        assert_eq!(
+            hex(&manifest_cbor(&methods, Some("")).unwrap()),
+            include_str!("../tests/data/manifest-demo-autostart.hex").trim()
+        );
+    }
 
     #[test]
     fn parses_the_complete_markdown_fixture() {

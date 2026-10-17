@@ -3,8 +3,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use mesh_api_gen::{
     api_markdown_from_tools_json_for_component, java::java_api, json_schema, merge_tools_json,
-    parse_api_markdown, parse_required_path, rust_api, rust_api_tagged, rust_cbor_api, rust_ids,
-    tools_json,
+    manifest_cbor, parse_api_markdown, parse_required_path, rust_api, rust_api_tagged, rust_cbor_api,
+    rust_ids, tools_json,
 };
 
 fn main() -> Result<()> {
@@ -17,6 +17,14 @@ fn main() -> Result<()> {
     let mut out_ids = None;
     let mut out_rust = None;
     let mut out_rust_cbor = None;
+    let mut out_manifest = None;
+    let mut more_apis: Vec<String> = Vec::new();
+    let mut out_console_catalog = None;
+    let mut out_console_native = None;
+    let mut out_api_json = None;
+    let mut rustdoc_json = None;
+    let mut pointer_width = 4u32;
+    let mut autostart = None;
     let mut selected_method = None;
     let mut out_java = None;
     let mut java_package = None;
@@ -26,7 +34,16 @@ fn main() -> Result<()> {
     let mut rust_tags = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--api" => api = Some(args.next().context("--api requires a path")?),
+            "--api" => {
+                let path = args.next().context("--api requires a path")?;
+                if api.is_none() {
+                    api = Some(path);
+                } else {
+                    more_apis.push(path);
+                }
+            }
+            "--out-console-native" => out_console_native = Some(args.next().context("--out-console-native requires a path")?),
+            "--out-console-catalog" => out_console_catalog = Some(args.next().context("--out-console-catalog requires a path")?),
             "--tools" => tools = Some(args.next().context("--tools requires a path")?),
             "--out-api" => out_api = Some(args.next().context("--out-api requires a path")?),
             "--out-tools" => out_tools = Some(args.next().context("--out-tools requires a path")?),
@@ -38,6 +55,13 @@ fn main() -> Result<()> {
             "--out-rust-cbor" => {
                 out_rust_cbor = Some(args.next().context("--out-rust-cbor requires a path")?)
             }
+            "--out-manifest" => {
+                out_manifest = Some(args.next().context("--out-manifest requires a path")?)
+            }
+            "--out-api-json" => out_api_json = Some(args.next().context("--out-api-json requires a path")?),
+            "--rustdoc" => rustdoc_json = Some(args.next().context("--rustdoc requires the path of a rustdoc JSON file")?),
+            "--pointer-width" => pointer_width = args.next().context("--pointer-width requires bytes")?.parse().context("--pointer-width")?,
+            "--autostart" => autostart = Some(args.next().context("--autostart requires a start request (may be empty)")?),
             "--method" => selected_method = Some(args.next().context("--method requires a name")?),
             "--out-java" => out_java = Some(args.next().context("--out-java requires a path")?),
             "--java-package" => {
@@ -51,7 +75,7 @@ fn main() -> Result<()> {
             "--rust-tags" => rust_tags = true,
             "--help" | "-h" => {
                 println!(
-                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--rust-tags] [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
+                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--rust-tags] [--api more/API.md ... --out-console-catalog catalog.h] [--out-console-native native.h --rustdoc crate.json] [--out-api-json api.json [--rustdoc crate.json] [--pointer-width 4]] [--out-manifest module.manifest [--autostart REQUEST]] [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
                 );
                 return Ok(());
             }
@@ -117,6 +141,65 @@ fn main() -> Result<()> {
     }
     if let Some(path) = out_rust_cbor {
         write_or_check(&path, &rust_cbor_api(&methods), check)?;
+    }
+    if let Some(path) = out_manifest {
+        // binary CBOR, written as is (the check compares bytes)
+        let bytes = manifest_cbor(&methods, autostart.as_deref())?;
+        if check {
+            if std::fs::read(&path).with_context(|| format!("read generated artifact {path}"))? != bytes {
+                bail!("generated artifact is stale: {path}");
+            }
+        } else {
+            if let Some(parent) = Path::new(&path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, bytes).with_context(|| format!("write generated artifact {path}"))?;
+        }
+    }
+    if let Some(path) = out_console_catalog {
+        let mut sources = vec![api.clone()];
+        sources.extend(more_apis.iter().cloned());
+        let mut parsed = vec![methods.clone()];
+        for extra in &more_apis {
+            parsed.push(parse_api_markdown(&std::fs::read_to_string(extra)?)?);
+        }
+        let names: Vec<String> = sources.iter().map(|s| s.rsplit('/').next().unwrap_or(s).to_owned()).collect();
+        write_or_check(&path, &mesh_api_gen::console::console_catalog(&names, &parsed), check)?;
+    }
+    if let Some(path) = out_console_native {
+        let catalog = match &rustdoc_json {
+            Some(file) => mesh_api_gen::rustdoc::RustCatalog::from_rustdoc(
+                &serde_json::from_str(&std::fs::read_to_string(file)?)?,
+                pointer_width,
+            )?,
+            None => bail!("--out-console-native requires --rustdoc"),
+        };
+        let mut sources = vec![api.clone()];
+        sources.extend(more_apis.iter().cloned());
+        let mut documents = Vec::new();
+        for source in &sources {
+            let markdown = std::fs::read_to_string(source)?;
+            documents.push(mesh_api_gen::apijson::api_json(
+                &parse_api_markdown(&markdown)?,
+                &mesh_api_gen::document::scan(&markdown)?,
+                Some(&catalog),
+            )?);
+        }
+        let names: Vec<String> = sources.iter().map(|s| s.rsplit('/').next().unwrap_or(s).to_owned()).collect();
+        write_or_check(&path, &mesh_api_gen::console::console_native(&documents, &names, u64::from(pointer_width))?, check)?;
+    }
+    if let Some(path) = out_api_json {
+        let markdown = std::fs::read_to_string(&api)?;
+        let docs = mesh_api_gen::document::scan(&markdown)?;
+        let catalog = match &rustdoc_json {
+            Some(file) => Some(mesh_api_gen::rustdoc::RustCatalog::from_rustdoc(
+                &serde_json::from_str(&std::fs::read_to_string(file)?)?,
+                pointer_width,
+            )?),
+            None => None,
+        };
+        let generated = mesh_api_gen::apijson::api_json(&methods, &docs, catalog.as_ref())?;
+        write_or_check(&path, &format!("{}\n", serde_json::to_string_pretty(&generated)?), check)?;
     }
     if let Some(path) = out_java {
         let class_name = java_class_name(&path)?;
