@@ -158,6 +158,8 @@
 
         # Aggregate: main runtime binaries built in a single cargo invocation.
         ssh-mesh = mkPackage "ssh-mesh" mainCargoExtraArgs;
+        # The API generator used by esp-xip-modules (scripts/gen.sh): a tool, not part of the ssh-mesh binary.
+        mesh-api-gen = mkPackage "mesh-api-gen" "--package mesh-api-gen";
 
         # ── Docker image ──────────────────────────────────────────
 
@@ -220,7 +222,7 @@
       in
       {
         packages = {
-            inherit ssh-mesh sshm sshm-config musl-toolchain build-deps runtime-deps python-tools;
+            inherit ssh-mesh mesh-api-gen sshm sshm-config musl-toolchain build-deps runtime-deps python-tools;
             default = ssh-mesh;
         };
 

@@ -10,6 +10,10 @@ socket-activated containers, bubblewrap sandboxes, or virtual machines.
 
 ---
 
+## Device connectivity
+
+[DMesh](https://github.com/costinm/dmesh) adds QUIC and Android connectivity. [esp-xip-modules](https://github.com/costinm/esp-xip-modules) provides modules for low-end devices such as lights, sensors and packet relays.
+
 ## What it is
 
 The design borrows from several existing systems:

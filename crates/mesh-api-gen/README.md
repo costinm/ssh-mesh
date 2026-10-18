@@ -337,6 +337,12 @@ each field's offset, size, kind and length field; an empty description is filled
 table, the member's offset, and its parameters (`ctx`, `in`, `out`), checked against the request and response types. With
 this a console, a gateway or a JSON converter can call the function from data alone.
 
+`--out-console-native FILE` (with `--rustdoc`) writes the C header a console needs to call those functions from text: for each
+method with `x-c`, the table to look up with `get_component`, the function's slot in it (the byte offset depends on the
+pointer width, so the console computes it), its parameters, and the layout of the structs they point at (field tag, offset,
+size, kind, length field). The console fills the request struct from the tagged fields of a line, calls through the table and
+renders the output struct as tagged fields: no code per function.
+
 `--api` may be repeated with `--out-console-catalog FILE`: the C header of the flattened method and field catalog a
 constrained console compiles in (integers and one string pool). Several APIs are merged; row types are shared by name.
 
