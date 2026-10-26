@@ -276,30 +276,7 @@ impl SshHandler {
         activation_service: &str,
         context: mesh::protocol::ActivationContext,
     ) -> Result<(), anyhow::Error> {
-        let stream = UnixStream::connect(mesh_init_socket_path()).await?;
-        let mut stream = BufReader::new(stream);
-        let request = mesh::protocol::Request::PrepareActivation {
-            name: activation_service.to_string(),
-            context,
-        };
-        let mut line = serde_json::to_vec(&request)?;
-        line.push(b'\n');
-        stream.get_mut().write_all(&line).await?;
-        stream.get_mut().flush().await?;
-
-        let mut response = String::new();
-        stream.read_line(&mut response).await?;
-        let response: mesh::protocol::Response = serde_json::from_str(response.trim())?;
-        if response.success {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "mesh-init rejected activation prepare: {}",
-                response
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ))
-        }
+        prepare_activation(activation_service, context).await
     }
 
     fn route_activation_uds_path(route: &SshRouteConfig) -> Option<&std::path::Path> {
@@ -1142,6 +1119,45 @@ impl SshHandler {
                 Ok(false) // Reject the channel if we can't connect
             }
         }
+    }
+}
+
+/// Queue an activation context for the next socket-activated connection to
+/// `name`. Shared by SSH route activation and the router's activator.
+pub(crate) async fn prepare_activation(
+    name: &str,
+    context: mesh::protocol::ActivationContext,
+) -> Result<(), anyhow::Error> {
+    mesh_init_request(&mesh::protocol::Request::PrepareActivation {
+        name: name.to_string(),
+        context,
+    })
+    .await
+}
+
+/// Send one JSON-line request to mesh-init and check its response.
+pub(crate) async fn mesh_init_request(
+    request: &mesh::protocol::Request,
+) -> Result<(), anyhow::Error> {
+    let stream = UnixStream::connect(mesh_init_socket_path()).await?;
+    let mut stream = BufReader::new(stream);
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+    stream.get_mut().write_all(&line).await?;
+    stream.get_mut().flush().await?;
+
+    let mut response = String::new();
+    stream.read_line(&mut response).await?;
+    let response: mesh::protocol::Response = serde_json::from_str(response.trim())?;
+    if response.success {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "mesh-init rejected request: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 }
 

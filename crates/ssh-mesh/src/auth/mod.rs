@@ -1,12 +1,14 @@
 // Auth module - provides authentication for both SSH and mTLS
 
 mod keys;
+mod master;
 mod ssh;
 mod tls;
 mod x509;
 
 // Re-export commonly used items
 pub use keys::*;
+pub use master::*;
 pub use ssh::*;
 pub use tls::*;
 pub use x509::*;

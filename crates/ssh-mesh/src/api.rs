@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Send a JSON-RPC request to a component Unix socket and return the unwrapped result
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct SshMeshJsonlCallRequest {
     /// API field `socket_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -17,5 +17,21 @@ pub struct SshMeshJsonlCallRequest {
 }
 
 /// Send a JSON-RPC request to a component Unix socket and return the unwrapped result
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct SshMeshJsonlCallResponse;
+
+/// Reload the HTTPS certificate files without restarting
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct SshMeshCertsReloadRequest {
+    /// API field `certificates`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificates: Option<Vec<String>>,
+}
+
+/// Reload the HTTPS certificate files without restarting
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct SshMeshCertsReloadResponse {
+    /// API field `loaded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded: Option<u32>,
+}

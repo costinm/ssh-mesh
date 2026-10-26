@@ -636,6 +636,19 @@ MeshGID = 1000
     }
 
     #[test]
+    fn test_parse_acme_defaults() {
+        let service = parse_service(include_str!("../defaults/acme.toml"), Some("acme")).unwrap();
+        assert_eq!(service.name, "acme");
+        assert_eq!(service.uid, Some(151));
+        assert_eq!(service.gid, Some(150));
+
+        let job = parse_service(include_str!("../defaults/jobs/acme.toml"), Some("acme")).unwrap();
+        assert_eq!(job.name, "acme");
+        assert_eq!(job.schedule.as_ref().unwrap().periodic_secs, Some(43200));
+        assert_eq!(job.backoff.max_retries, Some(5));
+    }
+
+    #[test]
     fn test_parse_all_fields_example() {
         let toml = include_str!("../examples/all-fields.toml");
         let config = parse_service(toml, Some("all-fields")).unwrap();

@@ -74,6 +74,7 @@ fn confine_to_web_dir(root: &std::path::Path, request_path: &str) -> Option<std:
     }
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// appCore is the core handler for H2C - for example in CloudRun
 /// or K8S with a Gateway/ztunnel.
 ///
@@ -87,6 +88,7 @@ pub fn app_core(app_state: AppState) -> Router {
     router.with_state(app_state)
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// "Mesh" like function, like Istio but using POST.
 /// Should be exposed over mTLS (H2 proper).
 ///
@@ -98,7 +100,6 @@ pub fn app_mesh(app_state: AppState) -> Router {
         .route("/_m/_ssh", any(handle_ssh_request))
         .route("/_m/_tcp/:host/:port", any(handle_tcp_proxy))
         // This could be restricted to a prefix.
-        .route("/_m/_uds", any(handle_uds_proxy))
         .route("/_m/_uds/*path", any(handle_uds_proxy))
         // This could be replaced with a configured host:port
         .route("/_m/_exec/*cmd", any(handle_exec))
@@ -107,19 +108,93 @@ pub fn app_mesh(app_state: AppState) -> Router {
     router.with_state(app_state)
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// Admin app. Exposed over SSH for admin/authorized_keys.
 /// For devel can be exposed locally. Should be on different port
 /// from the H2C - and not exposed on H2 directly.
 /// Has all other features - for testing.
 pub fn app(app_state: AppState) -> Router {
+    // The same routes also answer under one or two leading segments
+    // (`/proxy/15080/_m/...`), for a gateway that forwards under a prefix. They
+    // are not mounted again with path parameters for the prefix: that handed
+    // every handler extra parameters. The fallback strips the prefix instead.
+    let mesh = mesh_routes(&app_state).with_state(app_state.clone());
     let router = Router::new()
         .route("/", get(redirect_admin))
         .nest("/_m", mesh_routes(&app_state))
-        .nest("/:prefix1/_m", mesh_routes(&app_state))
-        .nest("/:prefix1/:prefix2/_m", mesh_routes(&app_state))
-        .fallback(handle_proxy_request);
+        .fallback(
+            move |State(state): State<AppState>, req: axum::extract::Request| {
+                let mesh = mesh.clone();
+                async move { handle_prefixed_or_proxy(mesh, state, req).await }
+            },
+        );
 
     router.with_state(app_state)
+}
+
+/// Where a path names the mesh routes: the part before the `_m` segment (at
+/// most two segments, or empty) and the part after it (`/` when none).
+///
+/// `/_m/adm/` gives `("", "/adm/")` and `/a/b/_m/adm/` gives `("/a/b",
+/// "/adm/")`. Three or more leading segments are not a prefix of ours, so
+/// they stay with the upstream app.
+fn split_mesh_path(path: &str) -> Option<(&str, &str)> {
+    let mut off = 1;
+    let mut rest = path.strip_prefix('/')?;
+    for depth in 0..=2 {
+        if let Some(after) = rest.strip_prefix("_m")
+            && (after.is_empty() || after.starts_with('/'))
+        {
+            let after = if after.is_empty() { "/" } else { after };
+            return Some((&path[..off - 1], after));
+        }
+        if depth == 2 {
+            break;
+        }
+        let (segment, tail) = rest.split_once('/')?;
+        if segment.is_empty() {
+            return None;
+        }
+        off += segment.len() + 1;
+        rest = tail;
+    }
+    None
+}
+
+/// Fallback of [`app`]: a prefixed mesh path is served by the mesh routes with
+/// the prefix removed (and the full URI kept as `OriginalUri`, so redirects
+/// keep the prefix); anything else goes to the upstream proxy.
+async fn handle_prefixed_or_proxy(
+    mut mesh: Router,
+    state: AppState,
+    mut req: axum::extract::Request,
+) -> Response {
+    use tower::Service;
+
+    if let Some((prefix, rest)) = split_mesh_path(req.uri().path())
+        && !prefix.is_empty()
+    {
+        let target = match req.uri().query() {
+            Some(query) => format!("{rest}?{query}"),
+            None => rest.to_string(),
+        };
+        let original = req.uri().clone();
+        let mut parts = original.clone().into_parts();
+        parts.path_and_query = target.parse().ok();
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            if req.extensions().get::<OriginalUri>().is_none() {
+                req.extensions_mut().insert(OriginalUri(original));
+            }
+            *req.uri_mut() = uri;
+            return match mesh.call(req).await {
+                Ok(response) => response,
+                Err(never) => match never {},
+            };
+        }
+    }
+    handle_proxy_request(State(state), req)
+        .await
+        .into_response()
 }
 
 async fn redirect_admin() -> Redirect {
@@ -134,7 +209,6 @@ fn mesh_routes(app_state: &AppState) -> Router<AppState> {
         .route("/adm/*path", get(handle_web_request))
         .route("/_ssh", any(handle_ssh_request))
         .route("/_tcp/:host/:port", any(handle_tcp_proxy))
-        .route("/_uds", any(handle_uds_proxy))
         .route("/_uds/*path", any(handle_uds_proxy))
         .route("/_exec/*cmd", any(handle_exec))
         .route("/_ssh/*rest", any(handle_ssh_request))
@@ -311,7 +385,7 @@ pub async fn handle_ssh_request(
 }
 
 /// Pipe frames from an HTTP body into an MPSC sender.
-async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Error>>) {
+pub(crate) async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Error>>) {
     let mut body = body;
     while let Some(frame_res) = body.frame().await {
         match frame_res {
@@ -335,6 +409,7 @@ async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Err
     }
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// TCP proxy handler.
 ///
 /// Connects to `host:port` via TCP and bridges the connection over the HTTP/2 body stream.
@@ -344,7 +419,7 @@ async fn pipe_body_to_tx(body: Body, tx: mpsc::Sender<Result<Bytes, std::io::Err
 #[instrument(skip(req, _state), fields(method = %req.method(), uri = %req.uri(), host = %host, port = %port))]
 pub async fn handle_tcp_proxy(
     State(_state): State<AppState>,
-    AxumPath((host, port)): AxumPath<(String, u32)>,
+    AxumPath((host, port)): AxumPath<(String, u16)>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     let method = req.method().clone();
@@ -393,6 +468,7 @@ pub async fn handle_tcp_proxy(
     response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// Unix domain socket proxy handler.
 ///
 /// Connects to a UDS at the given path and bridges it over the HTTP/2 body stream.
@@ -591,6 +667,7 @@ fn mesh_init_seqpacket_socket_path(stream_path: &str) -> String {
     std::env::var("MESH_INIT_SEQPACKET_SOCK").unwrap_or_else(|_| format!("{stream_path}.cbor"))
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// Execute an authenticated command and stream stdin/stdout over the HTTP/2 body.
 ///
 /// Environment variables can be passed via `X-E-<NAME>` request headers.
@@ -667,6 +744,7 @@ pub async fn handle_exec(
     response_with_status(StatusCode::OK, Body::from_stream(response_stream)).into_response()
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// WebSocket handler for SSH-over-WS at `/_m/_ws/_ssh`.
 pub struct SshWsHandler {
     pub ssh_server: Arc<crate::MeshNode>,
@@ -710,6 +788,7 @@ impl mesh::StreamHandler for SshWsHandler {
     }
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// WebSocket handler for TCP proxy at `/_m/_ws/_tcp/*path`.
 pub struct TcpProxyWsHandler;
 
@@ -748,6 +827,7 @@ impl mesh::StreamHandler for TcpProxyWsHandler {
     }
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// WebSocket handler for UDS proxy at `/_m/_ws/_uds/*path`.
 pub struct UdsProxyWsHandler;
 
@@ -781,6 +861,7 @@ impl mesh::StreamHandler for UdsProxyWsHandler {
     }
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// WebSocket handler for command execution at `/_m/_ws/_exec/*cmd`.
 pub struct ExecWsHandler;
 
@@ -814,6 +895,26 @@ impl mesh::StreamHandler for ExecWsHandler {
     }
 }
 
+type ProxyClient = hyper_util::client::legacy::Client<
+    hyper_util::client::legacy::connect::HttpConnector,
+    axum::body::Body,
+>;
+
+/// The client of the fallback proxy. It is shared, so connections to the
+/// upstream are pooled and reused instead of a new client (and connection)
+/// being created for every request.
+fn proxy_client() -> &'static ProxyClient {
+    static CLIENT: std::sync::OnceLock<ProxyClient> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            // Without a timer, idle pooled connections are never expired.
+            .pool_timer(hyper_util::rt::TokioTimer::new())
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .build(hyper_util::client::legacy::connect::HttpConnector::new())
+    })
+}
+
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 /// Fallback reverse proxy handler.
 ///
 /// Forwards unmatched requests to `target_http_address` if configured.
@@ -877,36 +978,31 @@ pub async fn handle_proxy_request(
 
     let proxy_req = hyper::Request::from_parts(parts, body);
 
-    use hyper_util::client::legacy::Client;
-    use hyper_util::client::legacy::connect::HttpConnector;
-    let client: Client<HttpConnector, axum::body::Body> =
-        Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
-
-    match client.request(proxy_req).await {
+    match proxy_client().request(proxy_req).await {
         Ok(res) => res.into_response(),
         Err(err) => (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", err)).into_response(),
     }
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 async fn prefixed_admin_response(
     path: &str,
     dev_root: Option<&std::path::Path>,
 ) -> Option<Response> {
-    let marker = "/_m/adm";
-    let idx = path.find(marker)?;
-    let prefix = &path[..idx];
-    let admin_path = &path[idx..];
+    // At most two leading segments: a longer path is an upstream app's own.
+    let (prefix, rest) = split_mesh_path(path)?;
 
-    if admin_path == marker {
-        return Some(Redirect::temporary(&format!("{prefix}{marker}/")).into_response());
+    if rest == "/adm" {
+        return Some(Redirect::temporary(&format!("{prefix}/_m/adm/")).into_response());
     }
-    if admin_path == format!("{marker}/") {
+    if rest == "/adm/" {
         return Some(serve_index_asset(dev_root));
     }
-    let asset_path = admin_path.strip_prefix("/_m/adm/")?;
+    let asset_path = rest.strip_prefix("/adm/")?;
     Some(handle_web_asset(dev_root, asset_path))
 }
 
+// Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
 fn prefixed_admin_location(path: &str) -> Option<String> {
     if path == "/" {
         return Some("/_m/adm/".to_string());
@@ -929,6 +1025,28 @@ mod tests {
             Some("/proxy/15080/_m/adm/")
         );
         assert_eq!(prefixed_admin_location("/favicon.ico"), None);
+    }
+
+    #[test]
+    fn mesh_path_has_at_most_two_prefix_segments() {
+        assert_eq!(split_mesh_path("/_m"), Some(("", "/")));
+        assert_eq!(split_mesh_path("/_m/adm/"), Some(("", "/adm/")));
+        assert_eq!(split_mesh_path("/a/_m"), Some(("/a", "/")));
+        assert_eq!(split_mesh_path("/a/_m/adm/x"), Some(("/a", "/adm/x")));
+        assert_eq!(
+            split_mesh_path("/a/b/_m/_tcp/h/1"),
+            Some(("/a/b", "/_tcp/h/1"))
+        );
+        assert_eq!(split_mesh_path("/a/b/c/_m/adm/"), None);
+        assert_eq!(split_mesh_path("/a/_mx/adm/"), None);
+        assert_eq!(split_mesh_path("//_m/adm/"), None);
+        assert_eq!(split_mesh_path("/a"), None);
+        assert_eq!(split_mesh_path("/"), None);
+    }
+
+    #[test]
+    fn proxy_client_is_shared() {
+        assert!(std::ptr::eq(proxy_client(), proxy_client()));
     }
 
     #[tokio::test]

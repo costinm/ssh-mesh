@@ -229,17 +229,63 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let web_app = public_web_app(app_paths.home.join("web"));
+
+    // ACME: HTTP-01 challenges written by `meshkeys acme` are served on every HTTP
+    // listener, and its certificates are served on 443 by SNI.
+    let (_, acme_www, cert_dir) = ssh_mesh::certs::acme_paths(
+        ssh_server.cfg.acme_home.as_deref(),
+        ssh_server.cfg.cert_dir.as_deref(),
+    );
+    let app = app.merge(ssh_mesh::certs::acme_challenge_routes(acme_www.clone()));
+    // What a listener reachable from the network may serve: the SSH-over-HTTP
+    // entry point and the upstream proxy, but not the admin routes (`_exec`,
+    // `_tcp`, `_uds`, the SSH client API, ...), which have no authorization of
+    // their own. The full `app` goes only to loopback-bound listeners, to the
+    // explicit `admin` listener, and to mTLS listeners that verify client
+    // certificates.
+    let public_app = public_http_app(app_state.clone())
+        .merge(ssh_mesh::certs::acme_challenge_routes(acme_www.clone()));
+    let certificates = Arc::new(ssh_mesh::certs::ReloadableCertificates::load(&cert_dir));
+
+    // Authentication per listener (`http_auth` in the config). Credentials are
+    // derived from the host key, so nothing is stored. The `:80` listener only
+    // serves ACME challenges and static files, and is not authenticated.
+    let http_auth = &ssh_server.cfg.http_auth;
+    // Generated on first start, next to the SSH host key.
+    let master = ssh_mesh::auth::MasterSecret::load_or_generate(&base_dir)?;
+    let secrets = ssh_mesh::httpauth::Secrets::from_master(&master);
+    let auth_for = |listener: &str, secure_cookie: bool| {
+        let mode = http_auth.mode_for(listener);
+        log::info!("{} listener authentication: {:?}", listener, mode);
+        ssh_mesh::httpauth::HttpAuth::new(secrets.clone(), mode, http_auth, secure_cookie)
+    };
+    let (auth_http, auth_mesh, auth_admin, auth_https) = (
+        auth_for("http", false),
+        auth_for("mesh", true),
+        auth_for("admin", false),
+        auth_for("https", true),
+    );
+
+    let (http80_app, https_app) = public_web_listener_apps(web_app, &auth_https, acme_www);
+    start_http_listener_if_present(&["http80"], "HTTP :80", http80_app, None, false)?;
     start_tls_listener_if_present(
         &base_dir,
         &["h2", "mesh", "mesh-mtls", "mtls"],
         "mesh H2/mTLS",
-        app.clone(),
+        auth_mesh.apply(app.clone()),
+        Some(auth_mesh.apply(public_app.clone())),
         true,
     )?;
-    start_http_listener_if_present(&["http", "h2c"], "HTTP", app.clone(), true)?;
-    start_tls_listener_if_present(&base_dir, &["https"], "HTTPS", web_app, true)?;
-    start_admin_listener_if_present(app.clone())?;
-    start_jsonl_listener_if_present(app_state.ssh_client_manager.clone())?;
+    start_http_listener_if_present(
+        &["http", "h2c"],
+        "HTTP",
+        auth_http.apply(app.clone()),
+        Some(auth_http.apply(public_app)),
+        true,
+    )?;
+    start_acme_https_listener(&base_dir, &["https"], certificates.clone(), https_app)?;
+    start_admin_listener_if_present(auth_admin.apply(app.clone()))?;
+    start_jsonl_listener_if_present(app_state.ssh_client_manager.clone(), certificates)?;
 
     if let Some(listener) =
         take_named_or_next_unix_listener(&["ssh-uds", "trusted-ssh-uds"], "trusted SSH UDS")?
@@ -412,10 +458,29 @@ fn has_activated_listener_names() -> bool {
     !mesh::server::activated_listener_names().is_empty()
 }
 
+/// The router for a listener bound to `bind`: `full` only for a loopback
+/// address, `public` for anything reachable from the network.
+///
+/// This uses the bind address, not the peer address: a reverse proxy on this
+/// host connects from loopback, and must not make network traffic look local.
+fn router_for_bind(
+    bind: Option<std::net::SocketAddr>,
+    full: &axum::Router,
+    public: &axum::Router,
+) -> axum::Router {
+    match bind {
+        Some(addr) if addr.ip().is_loopback() => full.clone(),
+        _ => public.clone(),
+    }
+}
+
+/// Serve `app` on the listener named `names`. With `public`, a listener that
+/// is not bound to loopback serves `public` instead (see [`router_for_bind`]).
 fn start_http_listener_if_present(
     names: &[&str],
     label: &'static str,
     app: axum::Router,
+    public: Option<axum::Router>,
     allow_order_fallback: bool,
 ) -> anyhow::Result<()> {
     let listener = if allow_order_fallback {
@@ -424,6 +489,24 @@ fn start_http_listener_if_present(
         take_named_tcp_listener(names)?
     };
     if let Some(listener) = listener {
+        let app = match &public {
+            Some(public) => {
+                let bind = listener.local_addr().ok();
+                let app = router_for_bind(bind, &app, public);
+                let admin = bind.is_some_and(|addr| addr.ip().is_loopback());
+                log::info!(
+                    "{} listener serves {} routes",
+                    label,
+                    if admin {
+                        "all (loopback)"
+                    } else {
+                        "public only"
+                    }
+                );
+                app
+            }
+            None => app,
+        };
         tokio::spawn(async move {
             let addr = listener
                 .local_addr()
@@ -483,10 +566,11 @@ fn start_admin_listener_if_present(app: axum::Router) -> anyhow::Result<()> {
 
 fn start_jsonl_listener_if_present(
     manager: Arc<ssh_mesh::sshc::SshClientManager>,
+    certificates: Arc<ssh_mesh::certs::ReloadableCertificates>,
 ) -> anyhow::Result<()> {
     if let Some(listener) = take_named_or_next_unix_listener(&["jsonl"], "JSONL")? {
         tokio::spawn(async move {
-            if let Err(e) = run_jsonl_listener(listener, manager).await {
+            if let Err(e) = run_jsonl_listener(listener, manager, certificates).await {
                 log::error!("JSONL listener failed: {}", e);
             }
         });
@@ -499,6 +583,8 @@ fn start_jsonl_listener_if_present(
 enum SshMeshJsonlRequest {
     #[serde(rename = "sshc/connect")]
     SshcConnect(ssh_mesh::sshc::ConnectRequest),
+    #[serde(rename = "certs/reload")]
+    CertsReload(ssh_mesh::api::SshMeshCertsReloadRequest),
     #[serde(other)]
     Unknown,
 }
@@ -506,12 +592,14 @@ enum SshMeshJsonlRequest {
 async fn run_jsonl_listener(
     listener: tokio::net::UnixListener,
     manager: Arc<ssh_mesh::sshc::SshClientManager>,
+    certificates: Arc<ssh_mesh::certs::ReloadableCertificates>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let manager = manager.clone();
+        let certificates = certificates.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_jsonl_stream(stream, manager).await {
+            if let Err(e) = handle_jsonl_stream(stream, manager, certificates).await {
                 log::debug!("JSONL connection failed: {}", e);
             }
         });
@@ -521,8 +609,11 @@ async fn run_jsonl_listener(
 async fn handle_jsonl_stream(
     stream: tokio::net::UnixStream,
     manager: Arc<ssh_mesh::sshc::SshClientManager>,
+    certificates: Arc<ssh_mesh::certs::ReloadableCertificates>,
 ) -> anyhow::Result<()> {
-    let registry = mesh::registry::ServiceRegistry::new("ssh-mesh");
+    let registry = mesh::registry::ServiceRegistry::new("ssh-mesh").with_tools_json(
+        serde_json::from_str(include_str!("../resources/tools.json"))?,
+    );
     let (read, mut write) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read);
     let mut line = String::new();
@@ -540,7 +631,7 @@ async fn handle_jsonl_stream(
         let (format, response) = mesh::jsonl::dispatch_request::<SshMeshJsonlRequest, _, _>(
             trimmed,
             &registry,
-            |request| handle_jsonl_request(manager.clone(), request),
+            |request| handle_jsonl_request(manager.clone(), certificates.clone(), request),
         )
         .await;
         if let Some(response) = response {
@@ -555,6 +646,7 @@ async fn handle_jsonl_stream(
 
 async fn handle_jsonl_request(
     manager: Arc<ssh_mesh::sshc::SshClientManager>,
+    certificates: Arc<ssh_mesh::certs::ReloadableCertificates>,
     request: SshMeshJsonlRequest,
 ) -> mesh::protocol::Response {
     match request {
@@ -565,17 +657,35 @@ async fn handle_jsonl_request(
             Ok(id) => mesh::protocol::Response::ok_with_data(serde_json::json!({ "id": id })),
             Err(e) => mesh::protocol::Response::err(e.to_string()),
         },
+        SshMeshJsonlRequest::CertsReload(req) => match tokio::task::spawn_blocking(move || {
+            certificates.reload(
+                req.certificates
+                    .map(|paths| paths.into_iter().map(PathBuf::from).collect()),
+            )
+        })
+        .await
+        {
+            Ok(Ok(loaded)) => {
+                mesh::protocol::Response::ok_with_data(serde_json::json!({ "loaded": loaded }))
+            }
+            Ok(Err(e)) => mesh::protocol::Response::err(e.to_string()),
+            Err(e) => mesh::protocol::Response::err(e.to_string()),
+        },
         SshMeshJsonlRequest::Unknown => {
             mesh::protocol::Response::err("unknown ssh-mesh JSONL method")
         }
     }
 }
 
+/// Serve `app` over TLS on the listener named `names`. Without client-cert
+/// authentication (no CA configured), `without_mtls` is served instead when
+/// given, so unauthenticated clients never reach the routes of `app`.
 fn start_tls_listener_if_present(
     base_dir: &std::path::Path,
     names: &[&str],
     label: &'static str,
     app: axum::Router,
+    without_mtls: Option<axum::Router>,
     allow_order_fallback: bool,
 ) -> anyhow::Result<()> {
     let listener = if allow_order_fallback {
@@ -611,10 +721,19 @@ fn start_tls_listener_if_present(
         Some(ca_path.as_path())
     } else {
         log::warn!(
-            "{} starting without client-cert authentication; provide authorized_cas or SSH_MESH_HTTPS_CA to enable mTLS",
-            label
+            "{} starting without client-cert authentication; provide authorized_cas or SSH_MESH_HTTPS_CA to enable mTLS{}",
+            label,
+            if without_mtls.is_some() {
+                " (serving public routes only until then)"
+            } else {
+                ""
+            }
         );
         None
+    };
+    let app = match (ca_arg, without_mtls) {
+        (None, Some(public)) => public,
+        _ => app,
     };
     let bind_label = listener
         .local_addr()
@@ -629,6 +748,76 @@ fn start_tls_listener_if_present(
         }
     });
     Ok(())
+}
+
+/// Serve `app` over TLS with the ACME certificates chosen by SNI.
+fn start_acme_https_listener(
+    base_dir: &Path,
+    names: &[&str],
+    certificates: Arc<ssh_mesh::certs::ReloadableCertificates>,
+    app: axum::Router,
+) -> anyhow::Result<()> {
+    let Some(listener) = take_named_or_next_tcp_listener(names, "HTTPS")? else {
+        return Ok(());
+    };
+    // Preserve the previous TLS configuration until explicit certificate reload
+    // installs the first ACME certificates. Even without a legacy key, keep
+    // listening so first issuance does not need a process restart.
+    let fallback = if certificates.is_empty()
+        && base_dir.join("id_ecdsa.crt").exists()
+        && base_dir.join("id_ecdsa").exists()
+    {
+        let ca = std::env::var("SSH_MESH_HTTPS_CA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| base_dir.join("authorized_cas"));
+        Some(
+            ssh_mesh::auth::TlsServer::new(
+                &base_dir.join("id_ecdsa.crt"),
+                &base_dir.join("id_ecdsa"),
+                ca.exists().then_some(ca.as_path()),
+                "HTTPS",
+            )?
+            .acceptor,
+        )
+    } else {
+        None
+    };
+    let acceptor = certificates.acceptor(fallback);
+    log::info!(
+        "HTTPS listener serving ACME certificates on {}",
+        listener
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "activated".to_string())
+    );
+    tokio::spawn(async move {
+        if let Err(e) = ssh_mesh::auth::run_axum_https_listener(listener, acceptor, app).await {
+            log::error!("HTTPS server failed: {}", e);
+        }
+    });
+    Ok(())
+}
+
+/// Public remote transports that authenticate their own callers.
+fn public_http_app(state: ssh_mesh::AppState) -> axum::Router {
+    let app = ssh_mesh::handlers::app_core(state.clone());
+    #[cfg(feature = "ws")]
+    let app = app.merge(ws::stream_proxy_routes(vec![(
+        "/_m/_ws/_ssh".to_string(),
+        Arc::new(ssh_mesh::handlers::SshWsHandler {
+            ssh_server: state.ssh_server,
+        }),
+    )]));
+    app
+}
+
+fn public_web_listener_apps(
+    web: axum::Router,
+    https_auth: &ssh_mesh::httpauth::HttpAuth,
+    www: PathBuf,
+) -> (axum::Router, axum::Router) {
+    let plain = ssh_mesh::certs::acme_challenge_routes(www).merge(web.clone());
+    (plain, https_auth.apply(web))
 }
 
 fn public_web_app(web_dir: PathBuf) -> axum::Router {
@@ -733,5 +922,189 @@ async fn run_axum_over_mesh_stream_listener(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{Request, StatusCode};
+    use axum::{body::Body, routing::get};
+    use tower::Service;
+
+    async fn status(mut router: axum::Router, path: &str) -> StatusCode {
+        let request = Request::get(path).body(Body::empty()).unwrap();
+        router.call(request).await.unwrap().status()
+    }
+
+    fn auth() -> ssh_mesh::httpauth::HttpAuth {
+        use ssh_mesh::{
+            auth::MasterSecret,
+            httpauth::{AuthMode, HttpAuth, HttpAuthConfig, Secrets},
+        };
+        HttpAuth::new(
+            Secrets::from_master(&MasterSecret::from_bytes([7; 32])),
+            AuthMode::Login,
+            &HttpAuthConfig::default(),
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn port80_does_not_inherit_https_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "public").unwrap();
+        let www = dir.path().join("www");
+        std::fs::create_dir_all(www.join(".well-known/acme-challenge")).unwrap();
+        std::fs::write(www.join(".well-known/acme-challenge/token"), "proof").unwrap();
+        let (plain, secure) =
+            public_web_listener_apps(public_web_app(dir.path().to_owned()), &auth(), www);
+        assert_eq!(status(plain.clone(), "/").await, StatusCode::OK);
+        assert_eq!(
+            status(plain.clone(), "/.well-known/acme-challenge/token").await,
+            StatusCode::OK
+        );
+        // The web root has an SPA fallback; this path serves the public index,
+        // not a login form, and posting a credential never issues a cookie.
+        let response = plain
+            .clone()
+            .call(
+                Request::post("/_m/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("key=alice:secret"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.headers().contains_key("set-cookie"));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"public");
+        assert_eq!(status(secure.clone(), "/").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(secure, "/_m/login").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn local_admin_dispatches_certificate_reload() {
+        let setup = ssh_mesh::test_utils::setup_test_environment(None, false)
+            .await
+            .unwrap();
+        let manager = Arc::new(ssh_mesh::sshc::SshClientManager::new(
+            setup.mesh_node.private_key().clone(),
+            vec![],
+            None,
+            None,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let certs = Arc::new(ssh_mesh::certs::ReloadableCertificates::load(dir.path()));
+        let path = dir.path().join("first.crt");
+        let ck = rcgen::generate_simple_self_signed(vec!["first.example.org".into()]).unwrap();
+        std::fs::write(&path, ck.cert.pem()).unwrap();
+        std::fs::write(path.with_extension("key"), ck.signing_key.serialize_pem()).unwrap();
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let service = tokio::spawn(handle_jsonl_stream(server, manager, certs.clone()));
+        let request = serde_json::json!({"jsonrpc":"2.0", "id":7,
+            "method":"certs/reload", "params":{"certificates":[path]}});
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut client = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        client.read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"]["loaded"], 1, "{response}");
+        assert!(!certs.is_empty());
+        drop(client);
+        service.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn public_ssh_websocket_is_exempt_but_admin_routes_stay_absent() {
+        let setup = ssh_mesh::test_utils::setup_test_environment(None, false)
+            .await
+            .unwrap();
+        let state = ssh_mesh::AppState {
+            ssh_server: setup.mesh_node.clone(),
+            target_http_address: None,
+            ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new(
+                setup.mesh_node.private_key().clone(),
+                vec![],
+                None,
+                None,
+            )),
+            mesh_services: Default::default(),
+            web_root: None,
+        };
+        let app = auth().apply(public_http_app(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/_m/_ws/_ssh"))
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let public = public_http_app(ssh_mesh::AppState {
+            ssh_server: setup.mesh_node.clone(),
+            target_http_address: None,
+            ssh_client_manager: Arc::new(ssh_mesh::sshc::SshClientManager::new(
+                setup.mesh_node.private_key().clone(),
+                vec![],
+                None,
+                None,
+            )),
+            mesh_services: Default::default(),
+            web_root: None,
+        });
+        for path in [
+            "/_m/api/clients",
+            "/_m/_ws/_tcp/localhost/80",
+            "/_m/_exec/ls",
+        ] {
+            assert_eq!(status(public.clone(), path).await, StatusCode::NOT_FOUND);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_loopback_binds_get_the_full_router() {
+        let full = axum::Router::new().route("/full", get(|| async { "x" }));
+        let public = axum::Router::new().route("/public", get(|| async { "x" }));
+        let binds = [
+            (Some("127.0.0.1:8080"), true),
+            (Some("[::1]:8080"), true),
+            (Some("0.0.0.0:8080"), false),
+            (Some("[::]:8080"), false),
+            (Some("10.0.0.5:8080"), false),
+            (None, false),
+        ];
+        for (bind, loopback) in binds {
+            let bind = bind.map(|b| b.parse().unwrap());
+            let router = router_for_bind(bind, &full, &public);
+            let (served, other) = if loopback {
+                ("/full", "/public")
+            } else {
+                ("/public", "/full")
+            };
+            assert_eq!(
+                status(router.clone(), served).await,
+                StatusCode::OK,
+                "{bind:?}"
+            );
+            assert_eq!(
+                status(router, other).await,
+                StatusCode::NOT_FOUND,
+                "{bind:?}"
+            );
+        }
     }
 }

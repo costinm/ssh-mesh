@@ -195,7 +195,7 @@ impl MeshServiceRegistry {
         }
     }
 
-    fn service(&self, name: &str) -> Result<MeshService> {
+    pub(crate) fn service(&self, name: &str) -> Result<MeshService> {
         self.services
             .read()
             .expect("mesh service registry lock poisoned")

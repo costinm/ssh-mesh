@@ -115,3 +115,10 @@ RPC codecs instead of service-specific client code.
 
 Currently standalone - but may be turned into a service, using the common
 client for interactions. Mostly equivalent to openssh/openssl, focused on certs.
+
+`meshkeys acme renew|add` manages Let's Encrypt certificates (HTTP-01) through
+the `mesh-acme` library. `renew [--home DIR] [--config FILE] [--staging]
+[--force] [--dry-run]` renews the names in `<home>/etc/mesh-acme.toml` and is
+what the mesh-init `acme` job runs. `add <DOMAIN>...` validates the names,
+appends them to the config's `domains` (comments are preserved) and issues
+their certificates immediately; wildcards are rejected (DNS-01 is unsupported).

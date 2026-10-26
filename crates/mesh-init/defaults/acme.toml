@@ -1,0 +1,16 @@
+# `meshkeys acme renew`: certificate renewal, run by the `acme` job (jobs/acme.toml) and
+# once at startup. It is a no-op until /home/acme/etc/mesh-acme.toml lists
+# domains.
+#
+# Runs as UID 151 with the ssh-mesh group (150); no passwd entry is needed.
+# mesh-init creates /home/acme with this ownership before the first start.
+# Everything it writes stays under /home/acme, in Caddy's layout
+# (.local/share/caddy/{certificates,acme}); ssh-mesh reads the certificates
+# and serves the HTTP-01 challenges from /home/acme/www on port 80.
+
+[Service]
+Type = "oneshot"
+ExecStart = "/opt/ssh-mesh/bin/meshkeys acme renew"
+User = "151"
+Group = "150"
+OOMScoreAdjust = -500

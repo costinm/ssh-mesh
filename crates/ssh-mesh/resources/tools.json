@@ -41,5 +41,44 @@
       "unavailable",
       "internal"
     ]
+  },
+  {
+    "description": "Reload the HTTPS certificate files without restarting",
+    "inputSchema": {
+      "properties": {
+        "certificates": {
+          "type": "array",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string[]"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "ssh-mesh.certs/reload",
+    "outputSchema": {
+      "properties": {
+        "loaded": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 4,
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
   }
 ]

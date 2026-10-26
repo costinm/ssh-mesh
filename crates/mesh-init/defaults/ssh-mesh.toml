@@ -35,6 +35,21 @@ Type = "stream"
 Address = "0.0.0.0:8080"
 Name = "http"
 
+# Public web ports, bound by mesh-init (root) and passed to ssh-mesh. Port 80
+# serves ACME HTTP-01 challenges written by `meshkeys acme` (plus the public web
+# root); 443 serves the ACME certificates chosen by SNI. Without root the
+# bind fails: mesh-init logs bind_inet_socket_failed for that listener only,
+# and the others still start.
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:80"
+Name = "http80"
+
+[[Socket.Listen]]
+Type = "stream"
+Address = "0.0.0.0:443"
+Name = "https"
+
 [[Socket.Listen]]
 Type = "stream"
 Address = "/run/mesh/ssh-mesh/mesh.sock"

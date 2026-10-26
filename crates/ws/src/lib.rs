@@ -405,7 +405,7 @@ where
 }
 
 pub fn app_ws(ws_state: WsAppState) -> axum::Router {
-    let mut router = axum::Router::new()
+    let router = axum::Router::new()
         .route("/_m/ws", axum::routing::get(handle_websocket_upgrade))
         .route("/_m/api/clients", axum::routing::get(handle_list_clients))
         .route(
@@ -418,17 +418,23 @@ pub fn app_ws(ws_state: WsAppState) -> axum::Router {
         )
         .route("/_m/api/broadcast", axum::routing::post(handle_broadcast));
 
-    for (route, handler) in ws_state.stream_handlers.clone() {
-        let h = handler.clone();
+    let proxies = stream_proxy_routes(ws_state.stream_handlers.clone());
+    router.with_state(ws_state).merge(proxies)
+}
+
+/// Serve only the supplied stream proxies, without client-management routes.
+pub fn stream_proxy_routes(handlers: Vec<(String, Arc<dyn mesh::StreamHandler>)>) -> axum::Router {
+    let mut router = axum::Router::new();
+    for (route, handler) in handlers {
         router = router.route(
             &route,
-            axum::routing::get(move |req: axum::extract::Request| async move {
-                handle_ws_proxy(req, h).await
+            axum::routing::get(move |req: axum::extract::Request| {
+                let handler = handler.clone();
+                async move { handle_ws_proxy(req, handler).await }
             }),
         );
     }
-
-    router.with_state(ws_state)
+    router
 }
 
 async fn handle_ws_proxy(

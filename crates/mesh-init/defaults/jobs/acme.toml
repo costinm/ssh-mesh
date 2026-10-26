@@ -1,0 +1,20 @@
+# The cron replacement: twice a day, mesh-init starts the `acme` service
+# (acme.toml) by this file's name. Renewal only happens within the config's
+# renew_days of expiry.
+
+[Service]
+# Required by the job parser; the scheduler starts the `acme` service by
+# name rather than running this command.
+ExecStart = "/opt/ssh-mesh/bin/meshkeys acme renew"
+
+[Schedule]
+periodic_secs = 43200
+flex_secs = 3600
+
+[Constraints]
+network_type = "any"
+
+[Backoff]
+initial_secs = 300
+policy = "exponential"
+max_retries = 5

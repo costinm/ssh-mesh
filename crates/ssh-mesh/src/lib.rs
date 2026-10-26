@@ -24,14 +24,18 @@ use tracing::{debug, instrument};
 #[doc(hidden)]
 pub mod api;
 pub mod auth;
+pub mod certs;
 pub mod config_provider;
 pub mod generic_proxy;
 pub mod handlers;
+pub mod http_ingress;
+pub mod httpauth;
 pub mod jsonl_proxy;
 pub mod mcp_proxy;
 pub mod mesh_rest;
 pub mod mux;
 pub mod route_ssh;
+pub mod router;
 pub mod sshc;
 pub mod sshd;
 pub mod sshmuxc;
@@ -308,6 +312,20 @@ pub struct MeshNodeConfig {
     /// trusted, isolated networks.
     #[serde(default)]
     pub allow_direct_tcpip: bool,
+    /// Home of the ACME tool's user (default `/home/acme`). ssh-mesh only
+    /// reads it: `www/.well-known/acme-challenge/` is served for HTTP-01, and
+    /// `.local/share/caddy/certificates/` holds the certificates unless
+    /// `cert_dir` is set. See [`certs`].
+    #[serde(default)]
+    pub acme_home: Option<PathBuf>,
+    /// Directory of certificates for this host. Their DNS names, read at
+    /// startup, are the domains this host terminates; there is no separate
+    /// list. Defaults to `<acme_home>/.local/share/caddy/certificates`.
+    #[serde(default)]
+    pub cert_dir: Option<PathBuf>,
+    /// Authentication of the HTTP(S) listeners. See [`httpauth`].
+    #[serde(default)]
+    pub http_auth: httpauth::HttpAuthConfig,
 }
 
 pub trait MeshListener: Send + Sync {
@@ -358,6 +376,7 @@ pub struct ConnectedClientInfo {
 #[derive(Clone)]
 pub struct AppState {
     pub ssh_server: Arc<MeshNode>,
+    // Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
     pub target_http_address: Option<String>,
     pub ssh_client_manager: Arc<sshc::SshClientManager>,
     /// Generic mesh-service backends exposed by the localhost/admin REST API.
@@ -936,6 +955,29 @@ clients:
         assert!(backup.keys.is_empty()); // default - use TOFU
         assert!(backup.local_forward.is_empty());
         assert!(backup.remote_forward.is_empty());
+    }
+
+    #[test]
+    fn test_mesh_node_config_http_auth() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("mesh_cfg_auth")
+            .tempdir()
+            .expect("Failed to create temp dir");
+        std::fs::write(
+            temp_dir.path().join("mesh.yaml"),
+            "http_auth:\n  default: login\n  listeners:\n    admin: apikey\n    https: none\n  exempt: [\"/status\"]\n",
+        )
+        .unwrap();
+        let cfg = MeshNode::load_config(temp_dir.path());
+        use httpauth::AuthMode;
+        assert_eq!(cfg.http_auth.mode_for("http"), AuthMode::Login);
+        assert_eq!(cfg.http_auth.mode_for("admin"), AuthMode::ApiKey);
+        assert_eq!(cfg.http_auth.mode_for("https"), AuthMode::None);
+        assert_eq!(cfg.http_auth.exempt, vec!["/status"]);
+        // Absent: nothing is authenticated, as before.
+        let empty = tempfile::tempdir().unwrap();
+        let cfg = MeshNode::load_config(empty.path());
+        assert_eq!(cfg.http_auth.mode_for("http"), AuthMode::None);
     }
 
     #[test]
