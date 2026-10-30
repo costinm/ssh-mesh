@@ -32,6 +32,11 @@ fn main() -> Result<()> {
     let mut component = None;
     let mut check = false;
     let mut rust_tags = false;
+    let mut vtable_conf = None;
+    let mut out_vtable_schema = None;
+    let mut out_vtable_shims = None;
+    let mut out_tables_json = None;
+    let mut tables_json = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--api" => {
@@ -71,11 +76,16 @@ fn main() -> Result<()> {
                 base_tools = Some(args.next().context("--base-tools requires a path")?)
             }
             "--component" => component = Some(args.next().context("--component requires a name")?),
+            "--vtable-conf" => vtable_conf = Some(args.next().context("--vtable-conf requires a path")?),
+            "--out-vtable-schema" => out_vtable_schema = Some(args.next().context("--out-vtable-schema requires a path")?),
+            "--out-vtable-shims" => out_vtable_shims = Some(args.next().context("--out-vtable-shims requires a path")?),
+            "--out-tables-json" => out_tables_json = Some(args.next().context("--out-tables-json requires a path")?),
+            "--tables-json" => tables_json = Some(args.next().context("--tables-json requires a path")?),
             "--check" => check = true,
             "--rust-tags" => rust_tags = true,
             "--help" | "-h" => {
                 println!(
-                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--rust-tags] [--api more/API.md ... --out-console-catalog catalog.h] [--out-console-native native.h --rustdoc crate.json] [--out-api-json api.json [--rustdoc crate.json] [--pointer-width 4]] [--out-manifest module.manifest [--autostart REQUEST]] [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
+                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--rust-tags] [--api more/API.md ... --out-console-catalog catalog.h] [--out-console-native native.h --rustdoc crate.json] [--out-api-json api.json [--rustdoc crate.json] [--pointer-width 4]] [--out-manifest module.manifest [--autostart REQUEST]] [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --vtable-conf vtables.conf --rustdoc crate.json --out-tables-json tables.api.json\nmesh-api-gen --tables-json tables.api.json --out-vtable-schema schema_data.rs [--out-vtable-shims vt_shims.rs]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
                 );
                 return Ok(());
             }
@@ -93,6 +103,30 @@ fn main() -> Result<()> {
             &generated,
             check,
         )?;
+        return Ok(());
+    }
+    // function tables: the Rust declarations into an api.json (--vtable-conf, --rustdoc, --out-tables-json), and from such an api.json the
+    // schema and the module-side stubs (--tables-json, --out-vtable-schema, --out-vtable-shims)
+    if let Some(conf) = vtable_conf {
+        let catalog = mesh_api_gen::rustdoc::RustCatalog::from_rustdoc(
+            &serde_json::from_str(&std::fs::read_to_string(rustdoc_json.context("--vtable-conf requires --rustdoc")?)?)?,
+            pointer_width,
+        )?;
+        let config = mesh_api_gen::vtable::Config::parse(&std::fs::read_to_string(conf)?)?;
+        let tables = mesh_api_gen::vtable::tables_json(&config, &catalog)?;
+        let path = out_tables_json.context("--vtable-conf requires --out-tables-json")?;
+        write_or_check(&path, &format!("{}\n", serde_json::to_string_pretty(&tables)?), check)?;
+        return Ok(());
+    }
+    if let Some(file) = tables_json {
+        let tables: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file)?)?;
+        let (schema, shims) = mesh_api_gen::vtable::generate(&tables, "mesh-api-gen")?;
+        if let Some(path) = out_vtable_schema {
+            write_or_check(&path, &schema, check)?;
+        }
+        if let Some(path) = out_vtable_shims {
+            write_or_check(&path, &shims, check)?;
+        }
         return Ok(());
     }
     let api = parse_required_path(api, "--api")?;

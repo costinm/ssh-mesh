@@ -390,3 +390,25 @@ cargo run -p mesh-api-gen -- \
 Import cannot reconstruct prose, examples, access policy, limits, or numeric
 IDs that were absent from the catalog. API definitions have one direction of
 authority: `API.md` to generated artifacts.
+
+## Function tables from Rust
+
+A crate that declares its function tables as `#[repr(C)]` structs of `Option<unsafe extern "C" fn(ctx, ...)>` can be the source of an
+`api.json` without an `API.md`:
+
+```sh
+mesh-api-gen --vtable-conf vtables.conf --rustdoc crate.json --out-tables-json tables.api.json   # Rust (rustdoc layout) into api.json
+mesh-api-gen --tables-json tables.api.json --out-vtable-schema schema_data.rs --out-vtable-shims vt_shims.rs   # api.json into the outputs
+```
+
+`vtables.conf` only lists the table structs (`component NAME STRUCT VERSION-CONST|- shims|host|hosted`). Each method gets its position in the
+table (there are no component numbers; a component is found by name and the order and version of the table keep callers compatible) and the
+shape of its arguments: a word, a pointer-free struct in or out, a string, bytes or an array out. The schema output is a compact `no_std` byte
+string per component that a module can carry; the stubs forward a wasm32 module's table calls to the host.
+
+Anything else is written in the doc comments of the Rust declarations, as `key=value` lines of their own, which are not part of the prose
+that is carried on:
+
+- `note=WHY` on a table function: it does not fit the parcel model and needs a decision (the schema carries it).
+- `cbor=map` on a struct, and `tag=N` on its fields: the struct has a CBOR form keyed by tags. A field without `tag=` is keyed by its name.
+  A duplicate tag, a `tag=` in a struct that is not `cbor=map`, or another `cbor=` value is an error.

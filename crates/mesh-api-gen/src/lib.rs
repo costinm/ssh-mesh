@@ -13,6 +13,7 @@ pub mod console;
 pub mod document;
 pub mod java;
 pub mod rustdoc;
+pub mod vtable;
 
 const STANDARD_ERRORS: &[&str] = &[
     "unauthenticated",
