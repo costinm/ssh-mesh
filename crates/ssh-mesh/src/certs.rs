@@ -23,7 +23,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-/// Default home of the ACME tool's user (`meshkeys acme`).
+/// Preferred shared home of the ACME tool, used when readable.
 pub const DEFAULT_ACME_HOME: &str = "/home/acme";
 
 /// The ACME home, `<acme_home>/www` (the web root) and the certificate
@@ -34,7 +34,16 @@ pub fn acme_paths(
 ) -> (PathBuf, PathBuf, PathBuf) {
     let home = acme_home
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ACME_HOME));
+        .or_else(|| std::env::var_os("MESH_ACME_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            if std::fs::read_dir(DEFAULT_ACME_HOME).is_ok() {
+                PathBuf::from(DEFAULT_ACME_HOME)
+            } else {
+                mesh::paths::AppPaths::for_accessible_app("ssh-mesh")
+                    .home
+                    .join("acme")
+            }
+        });
     let certs = cert_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(".local/share/caddy/certificates"));
@@ -432,12 +441,8 @@ mod tests {
     #[test]
     fn acme_paths_defaults() {
         let (home, www, certs) = acme_paths(None, None);
-        assert_eq!(home, PathBuf::from("/home/acme"));
-        assert_eq!(www, PathBuf::from("/home/acme/www"));
-        assert_eq!(
-            certs,
-            PathBuf::from("/home/acme/.local/share/caddy/certificates")
-        );
+        assert_eq!(www, home.join("www"));
+        assert_eq!(certs, home.join(".local/share/caddy/certificates"));
         let (_, _, certs) = acme_paths(Some(Path::new("/srv/a")), Some(Path::new("/c")));
         assert_eq!(certs, PathBuf::from("/c"));
     }

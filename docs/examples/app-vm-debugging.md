@@ -107,7 +107,7 @@ cat /src/app3-crosvm/vm/console.log
 From the host, if the default state root is used, the same files are under:
 
 ```bash
-target/examples/app2-qemu/vm/
-target/examples/app3-crosvm/vm/
-target/examples/logs/host3-vm.log
+$HOME/.local/share/ssh-mesh/examples/app2-qemu/vm/
+$HOME/.local/share/ssh-mesh/examples/app3-crosvm/vm/
+$HOME/.local/share/ssh-mesh/examples/logs/host3-vm.log
 ```

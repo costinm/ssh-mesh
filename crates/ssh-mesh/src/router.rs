@@ -147,6 +147,22 @@ pub enum RouteTarget {
     Handler(Arc<dyn StreamHandler>),
 }
 
+impl RouteTarget {
+    /// The first configured forwarding address, shared by stream and HTTP adapters.
+    /// Selection currently uses the first trail, hop and address for both ingress types.
+    pub(crate) fn first_trail_node(&self) -> Result<String> {
+        let Self::Trails(trails) = self else {
+            bail!("route is not a forwarding trail");
+        };
+        let address = trails
+            .first()
+            .and_then(|trail| trail.hops.first())
+            .and_then(|hop| hop.addresses.first())
+            .ok_or_else(|| anyhow!("route has no trail address"))?;
+        trail_node(address)
+    }
+}
+
 /// Who may use a route. Empty means anyone who reached the listener.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RoutePolicy {
@@ -329,6 +345,19 @@ impl RouteTable {
     /// Replace all static entries (startup and reload).
     pub fn set_static(&self, entries: Vec<RouteEntry>) {
         self.inner.write().unwrap().statics = entries;
+    }
+
+    /// Replace one configuration source's entries, retaining other static routes
+    /// and all verified dynamic claims in the shared table.
+    pub fn set_static_source(&self, file: &str, mut entries: Vec<RouteEntry>) {
+        for entry in &mut entries {
+            entry.source = RouteSource::Static {
+                file: file.to_owned(),
+            };
+        }
+        let mut inner = self.inner.write().unwrap();
+        inner.statics.retain(|entry| !matches!(&entry.source, RouteSource::Static { file: source } if source == file));
+        inner.statics.extend(entries);
     }
 
     /// Install a chained connection ID allocated by this node.
@@ -612,38 +641,61 @@ impl Router {
         }
     }
 
-    /// Look up the destination, check the policy, and hand the stream to the
-    /// target. Returns an error (for the ingress to report) when there is no
-    /// route or the caller is not allowed.
-    pub async fn route_stream(
-        &self,
-        request: StreamRequest,
-        stream: Box<dyn MeshStream>,
-    ) -> Result<()> {
-        let entry = self.check(&request).map_err(|e| match e {
+    fn checked_entry(&self, request: &StreamRequest) -> Result<RouteEntry> {
+        self.check(request).map_err(|error| match error {
             RouteError::NoRoute => anyhow!("no route for {}", describe(&request.destination)),
             RouteError::Denied => anyhow!(
                 "caller not allowed to reach {}",
                 describe(&request.destination)
             ),
-        })?;
-        match entry.target {
-            RouteTarget::Handler(h) => h.handle(request, stream).await,
-            RouteTarget::Trails(trails) => {
-                // Failover across trails (and other hops/addresses) is not
-                // needed yet: only the first trail's first hop's first address.
-                let address = trails
-                    .first()
-                    .and_then(|t| t.hops.first())
-                    .and_then(|h| h.addresses.first())
-                    .ok_or_else(|| {
-                        anyhow!("route for {} has no trail", describe(&request.destination))
-                    })?;
-                let target = MeshTarget::node(trail_node(address)?);
-                let upstream = self.client.open_stream(&target).await?;
-                crate::utils::bridge(stream, upstream, &describe(&request.destination)).await;
-                Ok(())
+        })
+    }
+
+    /// Open a policy-checked target for an ingress that owns its framing.
+    /// Direct targets are connected before returning; in-process handlers run
+    /// behind a bounded duplex stream and report later failures through EOF.
+    pub async fn open_stream(&self, request: StreamRequest) -> Result<Box<dyn MeshStream>> {
+        let entry = self.checked_entry(&request)?;
+        match self.open_target(request, entry.target).await? {
+            ResolvedTarget::Stream(stream) => Ok(stream),
+            target => {
+                let (peer, server) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    if let Err(error) = target.serve(Box::new(server), "opened route").await {
+                        log::debug!("routed handler session ended: {error:#}");
+                    }
+                });
+                Ok(Box::new(peer))
             }
+        }
+    }
+
+    /// Route a bidirectional stream through the node's shared table and policy.
+    pub async fn route_stream(
+        &self,
+        request: StreamRequest,
+        stream: Box<dyn MeshStream>,
+    ) -> Result<()> {
+        let entry = self.checked_entry(&request)?;
+        let label = describe(&request.destination);
+        self.open_target(request, entry.target)
+            .await?
+            .serve(stream, &label)
+            .await
+    }
+
+    async fn open_target(
+        &self,
+        request: StreamRequest,
+        target: RouteTarget,
+    ) -> Result<ResolvedTarget> {
+        match target {
+            RouteTarget::Handler(handler) => Ok(ResolvedTarget::Handler(handler, request)),
+            target @ RouteTarget::Trails(_) => self
+                .client
+                .open_stream(&MeshTarget::node(target.first_trail_node()?))
+                .await
+                .map(ResolvedTarget::Stream),
             RouteTarget::Local { vhost, component } => {
                 let vhost = vhost.or_else(|| match &request.destination {
                     Destination::Host { name, .. } => Some(name.clone()),
@@ -685,36 +737,49 @@ impl Router {
                         addr.component
                     );
                 }
-                self.serve_endpoint(endpoint, &addr, stream).await
+                self.open_endpoint(endpoint, &addr).await
             }
         }
     }
 
-    async fn serve_endpoint(
-        &self,
-        endpoint: Endpoint,
-        addr: &Address,
-        mut stream: Box<dyn MeshStream>,
-    ) -> Result<()> {
+    async fn open_endpoint(&self, endpoint: Endpoint, addr: &Address) -> Result<ResolvedTarget> {
         match endpoint {
-            Endpoint::InProcess(handler) => {
-                mesh::wire::serve_cbor_session(&mut stream, &DynHandler(handler)).await
-            }
-            // A seqpacket socket keeps record boundaries; bridging it as a
-            // byte stream would lose them. Needs a record-by-record bridge.
+            Endpoint::InProcess(handler) => Ok(ResolvedTarget::Component(handler)),
             Endpoint::Seqpacket(_) => {
                 bail!("seqpacket endpoints not supported by route_stream yet")
             }
-            Endpoint::UdsStream(path) => {
-                let upstream = tokio::net::UnixStream::connect(&path).await?;
-                crate::utils::bridge(stream, upstream, &addr.component).await;
-                Ok(())
-            }
+            Endpoint::UdsStream(path) => Ok(ResolvedTarget::Stream(Box::new(
+                tokio::net::UnixStream::connect(path).await?,
+            ))),
             Endpoint::Forward(client) => {
                 let node = addr.vhost.as_deref().unwrap_or(&addr.component);
-                let upstream = client.open_stream(&MeshTarget::node(node)).await?;
-                crate::utils::bridge(stream, upstream, &addr.component).await;
+                client
+                    .open_stream(&MeshTarget::node(node))
+                    .await
+                    .map(ResolvedTarget::Stream)
+            }
+        }
+    }
+}
+
+// Resolution is shared by channel-based ingresses and ingresses that already
+// own a stream. The latter retain synchronous handler/session error propagation.
+enum ResolvedTarget {
+    Stream(Box<dyn MeshStream>),
+    Handler(Arc<dyn StreamHandler>, StreamRequest),
+    Component(Arc<dyn TaggedRecordHandler>),
+}
+
+impl ResolvedTarget {
+    async fn serve(self, mut stream: Box<dyn MeshStream>, label: &str) -> Result<()> {
+        match self {
+            Self::Stream(upstream) => {
+                crate::utils::bridge(stream, upstream, label).await;
                 Ok(())
+            }
+            Self::Handler(handler, request) => handler.handle(request, stream).await,
+            Self::Component(handler) => {
+                mesh::wire::serve_cbor_session(&mut stream, &DynHandler(handler)).await
             }
         }
     }
@@ -767,6 +832,8 @@ impl Locator for ConventionLocator {
                 MeshServiceBackend::UdsSeqpacket(path) => Endpoint::Seqpacket(path),
             }));
         }
+        mesh::config::validate_service_name(&to.component)
+            .map_err(|reason| anyhow!("invalid routed component: {reason}"))?;
         let path = mesh::paths::AppPaths::for_app(&to.component)
             .mesh_socket()
             .clone();
@@ -1199,6 +1266,22 @@ mod tests {
 
     fn router() -> Router {
         router_with(MeshServiceRegistry::default(), Arc::new(NoClient))
+    }
+
+    #[tokio::test]
+    async fn component_lookup_rejects_paths_outside_the_service_namespace() {
+        let locator = ConventionLocator {
+            services: Default::default(),
+            local_names: vec![],
+        };
+        for component in ["..", "../mesh-init", "/run/mesh/mesh-init"] {
+            assert!(
+                locator
+                    .locate(&Address::new(None, component))
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     /// A registry serving `name` in process with [`Pong`].

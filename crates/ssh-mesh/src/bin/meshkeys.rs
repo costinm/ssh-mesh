@@ -59,7 +59,7 @@ enum Commands {
         /// Who the key is for: 1-64 characters from [A-Za-z0-9._@-]
         id: String,
         /// Directory holding the master secret `mesh_secret`, next to the host key
-        /// (default: $SSH_BASEDIR, else ./)
+        /// (default: $SSH_BASEDIR, then readable /home/ssh-mesh/etc, else $HOME/etc)
         #[arg(long)]
         keydir: Option<PathBuf>,
     },
@@ -95,7 +95,7 @@ enum AcmeCommands {
 
 #[derive(clap::Args)]
 struct AcmeCommon {
-    /// Home directory (default: $HOME)
+    /// ACME home (default: $MESH_ACME_HOME, then the gateway's ACME home)
     #[arg(long)]
     home: Option<PathBuf>,
     /// Config file (default: <home>/etc/mesh-acme.toml)
@@ -110,8 +110,7 @@ impl AcmeCommon {
     fn options(self, force: bool, dry_run: bool) -> Result<mesh_acme::Options> {
         let home = self
             .home
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .context("no --home and $HOME is not set")?;
+            .unwrap_or_else(|| ssh_mesh::certs::acme_paths(None, None).0);
         Ok(mesh_acme::Options {
             config: self
                 .config
@@ -193,7 +192,7 @@ fn main() -> Result<std::process::ExitCode> {
         Commands::Apikey { id, keydir } => {
             let dir = keydir
                 .or_else(|| std::env::var_os("SSH_BASEDIR").map(PathBuf::from))
-                .unwrap_or_else(|| PathBuf::from("."));
+                .unwrap_or_else(|| mesh::paths::AppPaths::for_accessible_app("ssh-mesh").etc);
             // Reads only: a secret created here would belong to the wrong user,
             // and the server must be the one that generates it.
             let master = auth::MasterSecret::load(&dir)?;

@@ -16,7 +16,7 @@ Required binaries:
 `scripts/build.sh` creates distributable artifacts under `target/dist`:
 `target/dist/opt` is the package tree used as `/opt`, and
 `target/dist/img/ssh-mesh.erofs` embeds that same `/opt` for VMs. By default
-`start_all.sh` uses `target/examples` only for mutable state.
+`start_all.sh` uses `$HOME/.local/share/ssh-mesh/examples` for mutable state.
 
 ## Model
 
@@ -109,10 +109,10 @@ open directly without following a template generator.
 
 ## Runtime Layout
 
-By default writable state is created under:
+By default writable state is created under (or `$SSH_MESH_STATE_ROOT` when set):
 
 ```bash
-target/examples
+$HOME/.local/share/ssh-mesh/examples
 ```
 
 Override it with:
@@ -124,7 +124,7 @@ export SSH_MESH_STATE_ROOT=/path/to/state
 Runtime state is staged like this:
 
 ```text
-target/examples/
+$HOME/.local/share/ssh-mesh/examples/
   host1/home/system/
   host2/home/system/
   host3-vm/home/system/

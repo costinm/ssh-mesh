@@ -97,7 +97,6 @@ async fn public_router_does_not_serve_admin_routes() -> Result<()> {
             None,
             None,
         )),
-        mesh_services: ssh_mesh::mesh_rest::MeshServiceRegistry::default(),
         web_root: None,
     };
     let public = serve(ssh_mesh::handlers::app_core(state())).await;

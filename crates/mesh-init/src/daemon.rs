@@ -185,6 +185,9 @@ pub struct Daemon {
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub service_exit_tx: tokio::sync::broadcast::Sender<String>,
     scheduler_tx: tokio::sync::watch::Sender<u64>,
+    pub(crate) activation_listeners: tokio::sync::Mutex<crate::activation::ListenerSet>,
+    reload_lock: tokio::sync::Mutex<()>,
+    reloading_services: Mutex<Vec<String>>,
     /// Notify channels by service, bound before each spawn (phase 2b).
     notify_receivers: Arc<Mutex<HashMap<String, NotifyReceiverHandle>>>,
 }
@@ -466,6 +469,9 @@ impl Daemon {
             shutdown_tx,
             service_exit_tx,
             scheduler_tx,
+            activation_listeners: tokio::sync::Mutex::new(Default::default()),
+            reload_lock: tokio::sync::Mutex::new(()),
+            reloading_services: Mutex::new(Vec::new()),
             notify_receivers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -620,9 +626,18 @@ impl Daemon {
         init_configs.sort_by_key(|c| c.priority);
         other_configs.sort_by_key(|c| c.priority);
 
+        let listener_daemon = self.clone();
+        tokio::spawn(async move {
+            let configs: Vec<_> = listener_daemon.configs.lock().values().cloned().collect();
+            listener_daemon
+                .activation_listeners
+                .lock()
+                .await
+                .reconcile(listener_daemon.clone(), &configs)
+                .await;
+        });
         for cfg in init_configs.iter().chain(other_configs.iter()) {
             if !cfg.activation.is_empty() {
-                crate::activation::start_listeners(self.clone(), cfg);
                 if is_exec_service(cfg) {
                     start_exec_service_with_activation(self.clone(), cfg.clone());
                 }
@@ -720,7 +735,12 @@ impl Daemon {
     }
 
     /// Handle a control protocol request.
-    pub async fn handle_request(&self, request: Request, peer_uid: u32, peer_gid: u32) -> Response {
+    pub async fn handle_request(
+        self: &Arc<Self>,
+        request: Request,
+        peer_uid: u32,
+        peer_gid: u32,
+    ) -> Response {
         match request {
             Request::Start {
                 name,
@@ -768,7 +788,7 @@ impl Daemon {
             Request::Reconcile => self.handle_reconcile(peer_uid).await,
             Request::Status { name } => self.handle_status(name.as_deref()),
             Request::Shutdown => self.handle_shutdown().await,
-            Request::Reload => self.handle_reload(),
+            Request::Reload => self.handle_reload().await,
             Request::Processes => self.handle_observer_processes(),
             Request::Process { pid } => self.handle_observer_process(pid),
             Request::ProcessOnly { pid } => self.handle_observer_process_only(pid),
@@ -2182,79 +2202,210 @@ impl Daemon {
         std::process::exit(0);
     }
 
-    fn handle_reload(&self) -> Response {
+    async fn handle_reload(self: &Arc<Self>) -> Response {
+        let _reload = self.reload_lock.lock().await;
         info!("reloading_configurations");
-
-        // Reload from disk
         let dirs: Vec<&str> = self.config.config_dirs.iter().map(|s| s.as_str()).collect();
-        let loaded_configs = config::load_system_configs(&dirs);
-
-        let mut changed = 0;
-        let mut configs = self.configs.lock();
-        let mut services = self.services.lock();
-        let mut reload_commands = Vec::new();
-
-        for new_cfg in loaded_configs {
-            let name = new_cfg.name.clone();
-            let is_changed = match configs.get(&name) {
-                Some(old_cfg) => {
-                    if *old_cfg == new_cfg {
-                        if services
-                            .get(&name)
-                            .is_some_and(|proc| proc.protocol_state() == ServiceState::Running)
-                        {
-                            reload_commands.push(new_cfg.clone());
-                        }
-                        false
-                    } else {
-                        true
-                    }
-                }
-                None => true,
-            };
-
-            if is_changed {
-                info!(service = %name, "config_changed_or_new_during_reload");
-                configs.insert(name.clone(), new_cfg.clone());
-                changed += 1;
-
-                // Stop active process so it restarts with new config
-                if let Some(proc) = services.get_mut(&name)
-                    && proc.protocol_state() == ServiceState::Running
+        // A malformed or unreadable file must not look like a removed service.
+        let loaded = match config::load_system_configs_for_reload(&dirs) {
+            Ok(configs) => configs,
+            Err(e) => return Response::err(format!("reload config: {e}")),
+        };
+        let previous = self.configs.lock().clone();
+        let mut replacement = previous.clone();
+        let loaded: HashMap<_, _> = loaded.into_iter().map(|c| (c.name.clone(), c)).collect();
+        let removed: Vec<_> = previous
+            .iter()
+            .filter(|(name, cfg)| {
+                !loaded.contains_key(*name)
+                    && cfg.source_path.as_ref().is_some_and(|source| {
+                        std::path::Path::new(source).parent().is_some_and(|parent| {
+                            dirs.iter().any(|dir| parent == std::path::Path::new(dir))
+                        })
+                    })
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut changed = removed.clone();
+        for (name, cfg) in &loaded {
+            if previous.get(name) != Some(cfg) {
+                changed.push(name.clone());
+                replacement.insert(name.clone(), cfg.clone());
+            }
+        }
+        for name in &removed {
+            replacement.remove(name);
+        }
+        // Validate stop policy and capture stable process identities before
+        // changing any child, handler or configuration. Reload must not hand a
+        // listener to a new owner while an old process can still use its copy.
+        let mut stopping = HashMap::new();
+        {
+            let services = self.services.lock();
+            for name in &changed {
+                let Some(proc) = services.get(name) else {
+                    continue;
+                };
+                let Some(pid) = proc.pid else {
+                    continue;
+                };
+                if proc.config.kill_mode == crate::config::KillMode::None
+                    || !proc.config.send_sigkill
                 {
-                    proc.config = new_cfg.clone();
-                    let _ = states::transition(
-                        proc,
-                        states::LifecycleEvent::StopRequested {
-                            initiator: states::StopInitiator::Requested,
-                        },
-                    );
-                    // Keep target_state running so it gets restarted!
-                    proc.target_state = states::ServiceState::Running;
-                    proc.stop_reason = None;
-                    proc.consecutive_failures = 0;
-                    proc.next_restart_at = None;
-                    if let Some(pid) = proc.pid {
-                        let _ = process::send_signal(pid, libc::SIGTERM);
+                    return Response::err(format!(
+                        "reload cannot replace running service '{name}' with KillMode=none or SendSIGKILL=false; stop it first"
+                    ));
+                }
+                let fd = match proc.pidfd.as_ref() {
+                    Some(fd) => fd.try_clone().map_err(|e| e.to_string()),
+                    None => process::open_pidfd(pid).map_err(|e| e.to_string()),
+                };
+                match fd {
+                    Ok(fd) => {
+                        stopping.insert(name.clone(), (pid, fd));
+                    }
+                    Err(e) => {
+                        return Response::err(format!("reload cannot track process '{name}': {e}"));
                     }
                 }
             }
         }
-        drop(services);
-        drop(configs);
+        *self.reloading_services.lock() = changed.clone();
+        self.activation_listeners.lock().await.pause(&changed).await;
 
-        for config in reload_commands {
-            if let Err(e) = run_service_commands(
-                &config,
-                &config.exec_reload,
-                "ExecReload",
-                config.timeout_start_sec,
-            ) {
-                warn!(service = %config.name, error = %e, "exec_reload_failed");
+        let mut restart = Vec::new();
+        for name in &changed {
+            let active = self
+                .services
+                .lock()
+                .get(name)
+                .is_some_and(|p| p.pid.is_some());
+            if active {
+                let mut reply = self.handle_stop(name, None, 0, 0).await;
+                if reply.success {
+                    if let Some((_, fd)) = stopping.get(name) {
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        loop {
+                            let mut poll = libc::pollfd {
+                                fd: fd.as_raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            // SAFETY: the captured pidfd remains open and refers
+                            // to this exact child even if its PID is recycled.
+                            let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                            if ready > 0 && poll.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                reply = Response::err(
+                                    "child has not exited; listener ownership retained",
+                                );
+                                if let Some((pid, fd)) = stopping.remove(name) {
+                                    if let Some(proc) = self.services.lock().get_mut(name) {
+                                        proc.pid = Some(pid);
+                                        proc.pidfd = Some(fd);
+                                        proc.state = states::ServiceState::Running;
+                                        proc.target_state = states::ServiceState::Running;
+                                    }
+                                }
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+                if !reply.success {
+                    self.reloading_services.lock().clear();
+                    let configs: Vec<_> = previous.values().cloned().collect();
+                    self.activation_listeners
+                        .lock()
+                        .await
+                        .reconcile(self.clone(), &configs)
+                        .await;
+                    return Response::err(format!("reload stop {name}: {:?}", reply.error));
+                }
+                if replacement.contains_key(name) {
+                    restart.push(name.clone());
+                }
             }
         }
-
-        Response::ok_with_data(serde_json::json!({"reloaded": true, "changed": changed}))
+        *self.configs.lock() = replacement.clone();
+        {
+            let mut services = self.services.lock();
+            for name in &changed {
+                if let Some(cfg) = replacement.get(name) {
+                    if let Some(proc) = services.get_mut(name) {
+                        proc.config = cfg.clone();
+                        proc.target_state = states::ServiceState::Stopped;
+                        proc.next_restart_at = None;
+                    }
+                } else {
+                    services.remove(name);
+                    self.pending_activation_contexts.lock().remove(name);
+                }
+            }
+        }
+        for name in &removed {
+            crate::activation::discard_service_listener_fds(name);
+            let receiver = self.notify_receivers.lock().remove(name);
+            if let Some(mut receiver) = receiver {
+                receiver.stop();
+            }
+        }
+        self.reloading_services.lock().clear();
+        let configs: Vec<_> = replacement.values().cloned().collect();
+        let mut errors = self
+            .activation_listeners
+            .lock()
+            .await
+            .reconcile(self.clone(), &configs)
+            .await;
+        for name in &changed {
+            let Some(cfg) = replacement.get(name) else {
+                continue;
+            };
+            let autostart = cfg.activation.is_empty()
+                && cfg
+                    .service_type
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty());
+            if restart.contains(name) || autostart || is_exec_service(cfg) {
+                // A service that failed to bind must not start with an incomplete
+                // LISTEN_FDS set. A later reload retries the missing binding.
+                if !errors
+                    .iter()
+                    .any(|error| error.starts_with(&format!("{name}:")))
+                {
+                    let fds = crate::activation::service_listener_fds(name);
+                    let activation =
+                        (!fds.is_empty()).then_some(crate::process::ActivationFd::Listen(fds));
+                    if let Err(e) = self.start_service_with_config(cfg.clone(), activation) {
+                        errors.push(format!("{name}: start: {e}"));
+                    }
+                }
+            }
+        }
+        for (name, cfg) in &loaded {
+            if !changed.contains(name)
+                && self
+                    .services
+                    .lock()
+                    .get(name)
+                    .is_some_and(|p| p.protocol_state() == ServiceState::Running)
+            {
+                if let Err(e) =
+                    run_service_commands(cfg, &cfg.exec_reload, "ExecReload", cfg.timeout_start_sec)
+                {
+                    errors.push(format!("{name}: ExecReload: {e}"));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Response::ok_with_data(serde_json::json!({"reloaded": true, "changed": changed.len()}))
+        } else {
+            Response::err(format!("reload incomplete: {}", errors.join("; ")))
+        }
     }
 
     // ========================================================================
@@ -3190,17 +3341,6 @@ impl Daemon {
                             .cloned()
                             .ok_or_else(|| anyhow::anyhow!("no config for '{}'", name))?,
                     };
-                    {
-                        let mut services = self.services.lock();
-                        let Some(proc) = services.get_mut(name) else {
-                            return Err(anyhow::anyhow!(
-                                "service '{}' is not loaded; start it via start_service_with_config",
-                                name
-                            ));
-                        };
-                        states::transition(proc, states::LifecycleEvent::StartRequested);
-                        proc.target_state = states::ServiceState::Running;
-                    }
                     return self
                         .start_service_with_config(config, passed_fd)
                         .map(EnsureRunningOutcome::Started);
@@ -3261,6 +3401,10 @@ impl Daemon {
         mut config: AppConfig,
         passed_fd: Option<crate::process::ActivationFd>,
     ) -> Result<u32> {
+        if self.reloading_services.lock().contains(&config.name) {
+            anyhow::bail!("service '{}' is being reloaded", config.name);
+        }
+
         let name = config.name.clone();
 
         // Phase 2b: bind the per-service notify channel and publish
@@ -3462,6 +3606,8 @@ impl Daemon {
     /// Gracefully shut down all services.
     pub async fn shutdown(&self) {
         info!("shutting_down_all_services");
+        let names: Vec<_> = self.configs.lock().keys().cloned().collect();
+        self.activation_listeners.lock().await.pause(&names).await;
 
         let names: Vec<String> = self.services.lock().keys().cloned().collect();
 
@@ -4724,5 +4870,410 @@ OOMScoreAdjust = -700
             let proc = services.get("idle-svc").unwrap();
             assert_eq!(proc.target_state, states::ServiceState::Stopped);
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+
+    fn daemon(dir: &Path) -> Arc<Daemon> {
+        Daemon::new(DaemonConfig {
+            config_dirs: vec![dir.display().to_string()],
+            socket_path: dir.join("control.sock").display().to_string(),
+        })
+    }
+
+    fn port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn write_service(dir: &Path, name: &str, sockets: &[(u16, &str)]) {
+        let mut text = format!(
+            "[Service]\nExecStart = \"/bin/sleep 60\"\n[Environment]\nHOME = {:?}\n",
+            dir.display().to_string()
+        );
+        for (port, name) in sockets {
+            text.push_str(&format!("[[Socket.Listen]]\nType = \"stream\"\nAddress = \"127.0.0.1:{port}\"\nName = {name:?}\n"));
+        }
+        std::fs::write(dir.join(format!("{name}.toml")), text).unwrap();
+    }
+
+    fn fd_identity(fd: &OwnedFd) -> (u64, u64) {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) }, 0);
+        let stat = unsafe { stat.assume_init() };
+        (stat.st_dev as u64, stat.st_ino as u64)
+    }
+
+    async fn close(daemon: &Arc<Daemon>) {
+        let errors = daemon
+            .activation_listeners
+            .lock()
+            .await
+            .reconcile(daemon.clone(), &[])
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for reload activation test"]
+    fn reload_activation_child() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        assert_eq!(
+            std::env::var("MESH_INIT_TEST_FD_REPLY").as_deref(),
+            Ok("yes")
+        );
+        // Only run in the explicitly selected subprocess with LISTEN_FDS=1.
+        assert_eq!(
+            std::env::var("LISTEN_FDS").unwrap(),
+            std::env::var("MESH_INIT_TEST_LISTEN_FDS").unwrap_or_else(|_| "1".to_string())
+        );
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(3) };
+        listener.set_nonblocking(false).unwrap();
+        let (mut connection, _) = listener.accept().unwrap();
+        connection.write_all(b"activated").unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_added_listener_activates_new_and_stopped_service() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        let p = port();
+        write_service(dir.path(), "reload-activate", &[(p, "http")]);
+        let path = dir.path().join("reload-activate.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(
+                "/bin/sleep 60",
+                &format!(
+                    "{} --ignored --exact daemon::reload_tests::reload_activation_child",
+                    std::env::current_exe().unwrap().display()
+                ),
+            )
+            .replace(
+                "[Environment]",
+                "[Environment]\nMESH_INIT_TEST_FD_REPLY = \"yes\"",
+            );
+        std::fs::write(path, text).unwrap();
+        let reply = daemon.handle_reload().await;
+        assert!(reply.success, "{reply:?}");
+        for _ in 0..2 {
+            let mut connection = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, p))
+                .await
+                .unwrap();
+            let mut reply = [0; 9];
+            tokio::time::timeout(Duration::from_secs(5), connection.read_exact(&mut reply))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&reply, b"activated");
+            let pid = daemon
+                .services
+                .lock()
+                .get("reload-activate")
+                .unwrap()
+                .pid
+                .unwrap();
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+                pid as libc::pid_t
+            );
+            assert_eq!(status, 0);
+            daemon.handle_child_exit(pid, 0);
+            assert_eq!(
+                daemon
+                    .services
+                    .lock()
+                    .get("reload-activate")
+                    .unwrap()
+                    .protocol_state(),
+                ServiceState::Stopped
+            );
+        }
+        close(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn reload_transfers_queued_socket_and_retires_removed_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        let p = port();
+        write_service(dir.path(), "reload-old", &[(p, "before")]);
+        assert!(daemon.handle_reload().await.success);
+        let old = crate::activation::service_listener_fds("reload-old").remove(0);
+        let identity = fd_identity(&old.fd);
+        drop(old);
+        // Keep a connection queued across ownership transfer. The async handler
+        // has not run yet on this current-thread runtime.
+        let connection = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, p)).unwrap();
+        std::fs::remove_file(dir.path().join("reload-old.toml")).unwrap();
+        write_service(dir.path(), "reload-new", &[(p, "after")]);
+        let reply = daemon.handle_reload().await;
+        assert!(reply.success, "{reply:?}");
+        assert!(!daemon.configs.lock().contains_key("reload-old"));
+        assert!(crate::activation::service_listener_fds("reload-old").is_empty());
+        let new = crate::activation::service_listener_fds("reload-new").remove(0);
+        assert_eq!(fd_identity(&new.fd), identity);
+        assert_eq!(new.name.as_deref(), Some("after"));
+        assert!(crate::activation::has_pending_connection(
+            new.fd.as_raw_fd()
+        ));
+        drop(new);
+        drop(connection);
+        std::fs::remove_file(dir.path().join("reload-new.toml")).unwrap();
+        assert!(daemon.handle_reload().await.success);
+        assert!(crate::activation::service_listener_fds("reload-new").is_empty());
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, p)),
+                Duration::from_millis(100),
+            )
+            .is_err()
+        );
+        close(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn reload_preserves_descriptors_when_names_and_order_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        let (a, b) = (port(), port());
+        write_service(dir.path(), "reload-order", &[(a, "a"), (b, "b")]);
+        assert!(daemon.handle_reload().await.success);
+        let original = crate::activation::service_listener_fds("reload-order");
+        let identities: Vec<_> = original.iter().map(|f| fd_identity(&f.fd)).collect();
+        drop(original);
+        write_service(dir.path(), "reload-order", &[(b, "second"), (a, "first")]);
+        assert!(daemon.handle_reload().await.success);
+        let updated = crate::activation::service_listener_fds("reload-order");
+        assert_eq!(fd_identity(&updated[0].fd), identities[1]);
+        assert_eq!(fd_identity(&updated[1].fd), identities[0]);
+        assert_eq!(updated[0].name.as_deref(), Some("second"));
+        assert_eq!(updated[1].name.as_deref(), Some("first"));
+        drop(updated);
+        close(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_malformed_config_before_changing_live_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        write_service(dir.path(), "reload-malformed", &[(port(), "http")]);
+        assert!(daemon.handle_reload().await.success);
+        let before = daemon
+            .configs
+            .lock()
+            .get("reload-malformed")
+            .unwrap()
+            .clone();
+        let original = crate::activation::service_listener_fds("reload-malformed");
+        let identity = fd_identity(&original[0].fd);
+        drop(original);
+        std::fs::write(dir.path().join("reload-malformed.toml"), "[Service\n").unwrap();
+        assert!(!daemon.handle_reload().await.success);
+        assert_eq!(daemon.configs.lock().get("reload-malformed"), Some(&before));
+        let after = crate::activation::service_listener_fds("reload-malformed");
+        assert_eq!(fd_identity(&after[0].fd), identity);
+        drop(after);
+        close(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn reload_transfers_unix_path_and_does_not_unlink_replacement() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        let path = dir.path().join("service.sock");
+        let socket = format!(
+            "[[Socket.Listen]]\nType = \"stream\"\nAddress = {:?}\nName = \"jsonl\"\n",
+            path.display().to_string()
+        );
+        write_service(dir.path(), "reload-unix-old", &[]);
+        let old = dir.path().join("reload-unix-old.toml");
+        let text = std::fs::read_to_string(&old).unwrap() + &socket;
+        std::fs::write(&old, &text).unwrap();
+        assert!(daemon.handle_reload().await.success);
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::remove_file(&old).unwrap();
+        let new = dir.path().join("reload-unix-new.toml");
+        std::fs::write(&new, text).unwrap();
+        assert!(daemon.handle_reload().await.success);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert!(crate::activation::service_listener_fds("reload-unix-old").is_empty());
+        assert_eq!(
+            crate::activation::service_listener_fds("reload-unix-new").len(),
+            1
+        );
+        // Another owner replaces the pathname after our bind. Retiring our old
+        // descriptor must not unlink that new socket.
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::remove_file(new).unwrap();
+        assert!(daemon.handle_reload().await.success);
+        assert!(path.exists());
+        drop(replacement);
+        close(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn reload_bind_failure_keeps_partial_service_inactive_until_retry() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        let available = port();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let blocked = occupied.local_addr().unwrap().port();
+        write_service(
+            dir.path(),
+            "reload-partial",
+            &[(available, "one"), (blocked, "two")],
+        );
+        let path = dir.path().join("reload-partial.toml");
+        let text = std::fs::read_to_string(&path).unwrap()
+            .replace("/bin/sleep 60", &format!("{} --ignored --exact daemon::reload_tests::reload_activation_child", std::env::current_exe().unwrap().display()))
+            .replace("[Environment]", "[Environment]\nMESH_INIT_TEST_FD_REPLY = \"yes\"\nMESH_INIT_TEST_LISTEN_FDS = \"2\"");
+        std::fs::write(path, text).unwrap();
+        assert!(!daemon.handle_reload().await.success);
+        let mut connection =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, available))
+                .await
+                .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!daemon.services.lock().contains_key("reload-partial"));
+        drop(occupied);
+        assert!(daemon.handle_reload().await.success);
+        let mut reply = [0; 9];
+        tokio::time::timeout(Duration::from_secs(5), connection.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"activated");
+        let pid = daemon
+            .services
+            .lock()
+            .get("reload-partial")
+            .unwrap()
+            .pid
+            .unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+        assert_eq!(status, 0);
+        daemon.handle_child_exit(pid, 0);
+        close(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn reload_reports_bind_failure_and_retries_unchanged_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = occupied.local_addr().unwrap().port();
+        write_service(dir.path(), "reload-bind", &[(p, "http")]);
+        let reply = daemon.handle_reload().await;
+        assert!(!reply.success);
+        assert!(reply.error.unwrap().contains("reload-bind"));
+        assert!(crate::activation::service_listener_fds("reload-bind").is_empty());
+        drop(occupied);
+        let reply = daemon.handle_reload().await;
+        assert!(reply.success, "{reply:?}");
+        assert_eq!(
+            crate::activation::service_listener_fds("reload-bind").len(),
+            1
+        );
+        close(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn reload_refuses_transfer_when_old_child_stop_policy_cannot_guarantee_exit() {
+        for (index, policy) in ["KillMode = \"none\"", "SendSIGKILL = false"]
+            .iter()
+            .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let daemon = daemon(dir.path());
+            let name = format!("reload-stop-proof-{index}");
+            let replacement = format!("reload-stop-new-{index}");
+            let p = port();
+            write_service(dir.path(), &name, &[(p, "old")]);
+            let path = dir.path().join(format!("{name}.toml"));
+            let text = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("[Service]", &format!("[Service]\n{policy}"));
+            std::fs::write(&path, text).unwrap();
+            assert!(daemon.handle_reload().await.success);
+            let cfg = daemon.configs.lock().get(&name).unwrap().clone();
+            let fds = crate::activation::service_listener_fds(&name);
+            let identity = fd_identity(&fds[0].fd);
+            let pid = daemon
+                .start_service_with_config(
+                    cfg.clone(),
+                    Some(crate::process::ActivationFd::Listen(fds)),
+                )
+                .unwrap();
+            let pidfd = process::open_pidfd(pid).unwrap();
+            std::fs::remove_file(path).unwrap();
+            write_service(dir.path(), &replacement, &[(p, "new")]);
+            let reply = daemon.handle_reload().await;
+            assert!(!reply.success);
+            assert!(reply.error.unwrap().contains("stop it first"));
+            assert_eq!(daemon.configs.lock().get(&name), Some(&cfg));
+            assert!(!daemon.configs.lock().contains_key(&replacement));
+            assert!(crate::activation::service_listener_fds(&replacement).is_empty());
+            let old = crate::activation::service_listener_fds(&name);
+            assert_eq!(fd_identity(&old[0].fd), identity);
+            drop(old);
+            let mut poll = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut poll, 1, 0) },
+                0,
+                "old child must still be alive"
+            );
+            process::send_signal_pidfd(Some(&pidfd), pid, libc::SIGKILL).unwrap();
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+                pid as libc::pid_t
+            );
+            daemon.handle_child_exit(pid, -libc::SIGKILL);
+            close(&daemon).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_stops_removed_child_before_releasing_its_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(dir.path());
+        let p = port();
+        write_service(dir.path(), "reload-running", &[(p, "http")]);
+        assert!(daemon.handle_reload().await.success);
+        let cfg = daemon.configs.lock().get("reload-running").unwrap().clone();
+        let fds = crate::activation::service_listener_fds("reload-running");
+        let pid = daemon
+            .start_service_with_config(cfg, Some(crate::process::ActivationFd::Listen(fds)))
+            .unwrap();
+        std::fs::remove_file(dir.path().join("reload-running.toml")).unwrap();
+        let reply = daemon.handle_reload().await;
+        assert!(reply.success, "{reply:?}");
+        assert!(!daemon.services.lock().contains_key("reload-running"));
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).is_ok());
+        close(&daemon).await;
     }
 }

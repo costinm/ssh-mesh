@@ -27,7 +27,7 @@ set -euo pipefail
 examples_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace_dir="$(cd "${examples_dir}/../.." 2>/dev/null && pwd)"
 target_dir="${SSH_MESH_TARGET_DIR:-${workspace_dir}/target}"
-root_dir="${1:-${SSH_MESH_STATE_ROOT:-${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}}}"
+root_dir="${1:-${SSH_MESH_STATE_ROOT:-${SSH_MESH_EXAMPLE_ROOT:-${HOME}/.local/share/ssh-mesh/examples}}}"
 artifact_dir="${target_dir}/dist"
 default_nix_profile="${target_dir}/nix/profile"
 nix_profile="${NIX_PROFILE:-${default_nix_profile}}"
@@ -38,7 +38,7 @@ pid_file="${run_dir}/start_all.pids"
 
 export NIX_PROFILE="${nix_profile}"
 export SSH_MESH_STATE_ROOT="${root_dir}"
-export PATH="${staged_opt}/ssh-mesh/bin:${staged_opt}/busybox/bin:${NIX_PROFILE}/bin:${PATH}"
+export PATH="${staged_opt}/ssh-mesh/bin:${NIX_PROFILE}/bin:${PATH}:${staged_opt}/busybox/bin"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {

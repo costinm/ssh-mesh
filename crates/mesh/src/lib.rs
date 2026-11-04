@@ -16,6 +16,8 @@ pub mod jsonl;
 pub mod lifecycle;
 pub mod local_trace;
 pub mod logfmt;
+/// Shared operational log files and output capture.
+pub mod logging;
 pub mod message;
 pub mod mux;
 pub mod mux_client;

@@ -22,7 +22,7 @@
 //! entry points (which authenticate themselves) are exempt.
 //!
 //! Revoking one key is not possible without storage. Replacing the master
-//! secret revokes all of them. A key never expires; a session token does.
+//! secret revokes all of them. Session expiry is optional and configured per listener.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -80,10 +80,12 @@ pub struct HttpAuthConfig {
     /// H2/mTLS listener), `admin`, `https` (the public TLS web listener).
     /// The `:80` listener serves ACME challenges and is not authenticated.
     pub listeners: HashMap<String, AuthMode>,
+    /// Exact virtual host overrides on the HTTPS web listener (without ports).
+    pub hosts: HashMap<String, AuthMode>,
     /// More paths that skip authentication: a prefix ending in `/`, or an
     /// exact path (and what is below it).
     pub exempt: Vec<String>,
-    /// Lifetime of a session token and its cookie.
+    /// Inactivity lifetime in seconds, renewed on use; zero means no expiry.
     pub session_ttl_secs: u64,
 }
 
@@ -92,8 +94,9 @@ impl Default for HttpAuthConfig {
         Self {
             default: AuthMode::None,
             listeners: HashMap::new(),
+            hosts: HashMap::new(),
             exempt: Vec::new(),
-            session_ttl_secs: 12 * 3600,
+            session_ttl_secs: 0,
         }
     }
 }
@@ -182,6 +185,10 @@ fn sanitize_next(next: &str) -> String {
     let ok = next.starts_with('/')
         && !next.starts_with("//")
         && !next.contains('\\')
+        && !matches!(
+            next.split(['?', '#']).next(),
+            Some(LOGIN_PATH | LOGOUT_PATH)
+        )
         && next.len() <= 2048
         && next.bytes().all(|b| (0x21..0x7f).contains(&b));
     if ok { next.to_owned() } else { "/".to_owned() }
@@ -209,7 +216,8 @@ pub struct Secrets {
 struct Claims {
     sub: String,
     iat: u64,
-    exp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exp: Option<u64>,
 }
 
 fn unix(t: SystemTime) -> u64 {
@@ -255,12 +263,12 @@ impl Secrets {
         hmac::verify(&self.apikey, user.as_bytes(), &tag).is_ok()
     }
 
-    /// A session token for `sub`, valid for `ttl` from `now`.
+    /// A session token for `sub`, valid for `ttl` from `now`; zero means no expiry.
     pub fn issue_token(&self, sub: &str, ttl: Duration, now: SystemTime) -> String {
         let claims = Claims {
             sub: sub.to_owned(),
             iat: unix(now),
-            exp: unix(now) + ttl.as_secs(),
+            exp: (!ttl.is_zero()).then(|| unix(now).saturating_add(ttl.as_secs())),
         };
         let header = b64_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
         let payload = b64_encode(&serde_json::to_vec(&claims).expect("claims serialize"));
@@ -283,7 +291,8 @@ impl Secrets {
         let input = format!("{header}.{payload}");
         hmac::verify(&self.session, input.as_bytes(), &b64_decode(sig)?).ok()?;
         let claims: Claims = serde_json::from_slice(&b64_decode(payload)?).ok()?;
-        (claims.exp > unix(now) && !claims.sub.is_empty()).then_some(claims.sub)
+        (claims.exp.is_none_or(|exp| exp > unix(now)) && !claims.sub.is_empty())
+            .then_some(claims.sub)
     }
 }
 
@@ -302,13 +311,29 @@ pub struct Identity {
     pub method: AuthMethod,
 }
 
+/// Headers verified as gateway credentials, rather than application credentials.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GatewayCredentials {
+    pub authorization: bool,
+    pub api_key: bool,
+    cookie: bool,
+}
+
+/// Public web hosts bypass gateway auth only for their HTTP upstream, not stream RPC.
+#[derive(Clone, Copy)]
+pub(crate) struct PublicWebHost;
+
 fn header_str(headers: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {
     headers.get(name)?.to_str().ok()
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    header_str(headers, header::COOKIE)?
-        .split(';')
+    // HTTP/2 permits Cookie to be split across multiple header fields.
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
         .find_map(|part| {
             let (n, v) = part.trim().split_once('=')?;
             (n == name).then_some(v)
@@ -320,6 +345,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 struct Inner {
     secrets: Secrets,
     mode: AuthMode,
+    hosts: HashMap<String, AuthMode>,
     exempt: Vec<String>,
     ttl: Duration,
     secure_cookie: bool,
@@ -331,6 +357,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct HttpAuth {
     inner: Arc<Inner>,
+    login_command: String,
 }
 
 fn path_matches(path: &str, pattern: &str) -> bool {
@@ -353,9 +380,15 @@ impl HttpAuth {
         secure_cookie: bool,
     ) -> Self {
         Self {
+            login_command: "meshkeys apikey YOUR_ID --keydir /path/to/ssh-mesh/etc".to_string(),
             inner: Arc::new(Inner {
                 secrets,
                 mode,
+                hosts: config
+                    .hosts
+                    .iter()
+                    .map(|(host, mode)| (host.trim_end_matches('.').to_ascii_lowercase(), *mode))
+                    .collect(),
                 exempt: config.exempt.clone(),
                 ttl: Duration::from_secs(config.session_ttl_secs),
                 secure_cookie,
@@ -369,9 +402,11 @@ impl HttpAuth {
     pub fn with_fail_delay(self, delay: Duration) -> Self {
         let inner = &*self.inner;
         Self {
+            login_command: self.login_command.clone(),
             inner: Arc::new(Inner {
                 secrets: inner.secrets.clone(),
                 mode: inner.mode,
+                hosts: inner.hosts.clone(),
                 exempt: inner.exempt.clone(),
                 ttl: inner.ttl,
                 secure_cookie: inner.secure_cookie,
@@ -379,6 +414,12 @@ impl HttpAuth {
                 failures: Mutex::new(VecDeque::new()),
             }),
         }
+    }
+
+    /// Set the host-specific command shown on the login page (HTML escaped).
+    pub fn with_login_command(mut self, command: String) -> Self {
+        self.login_command = command;
+        self
     }
 
     pub fn mode(&self) -> AuthMode {
@@ -395,6 +436,15 @@ impl HttpAuth {
 
     /// The caller named by the request credentials, if they are valid.
     pub fn authenticate(&self, headers: &HeaderMap, now: SystemTime) -> Option<Identity> {
+        self.authenticate_request(headers, now)
+            .map(|(identity, _)| identity)
+    }
+
+    fn authenticate_request(
+        &self,
+        headers: &HeaderMap,
+        now: SystemTime,
+    ) -> Option<(Identity, GatewayCredentials)> {
         let secrets = &self.inner.secrets;
         let api_key = |key: &str| {
             secrets.verify_api_key(key).map(|name| Identity {
@@ -409,37 +459,62 @@ impl HttpAuth {
             })
         };
 
-        if let Some((scheme, value)) =
+        let authorization = if let Some((scheme, value)) =
             header_str(headers, header::AUTHORIZATION).and_then(|v| v.split_once(' '))
         {
             let value = value.trim();
             if scheme.eq_ignore_ascii_case("bearer") {
                 // An API key has a ':'; a JWT never does.
-                let found = if value.contains(':') {
+                if value.contains(':') {
                     api_key(value)
                 } else {
                     token(value)
-                };
-                if found.is_some() {
-                    return found;
                 }
             } else if scheme.eq_ignore_ascii_case("basic")
                 && let Some(decoded) = b64_decode(value).and_then(|b| String::from_utf8(b).ok())
                 && let Some(found) = api_key(&decoded)
             {
-                return Some(found);
+                Some(found)
+            } else {
+                None
             }
-        }
-        if let Some(found) = header_str(headers, "x-api-key").and_then(|k| api_key(k.trim())) {
-            return Some(found);
-        }
-        cookie_value(headers, SESSION_COOKIE).and_then(token)
+        } else {
+            None
+        };
+        let key = header_str(headers, "x-api-key").and_then(|k| api_key(k.trim()));
+        let cookie = cookie_value(headers, SESSION_COOKIE).and_then(token);
+        let credentials = GatewayCredentials {
+            authorization: authorization.is_some(),
+            api_key: key.is_some(),
+            cookie: authorization.is_none() && key.is_none() && cookie.is_some(),
+        };
+        authorization
+            .or(key)
+            .or(cookie)
+            .map(|identity| (identity, credentials))
     }
 
     /// Wrap `router` with this authentication, and add the login page. With
     /// mode `none` the router is returned unchanged.
     pub fn apply(&self, router: Router) -> Router {
-        if self.inner.mode == AuthMode::None {
+        self.apply_with_exemptions(router, false)
+    }
+
+    /// Authenticate a web backend, exempting only the gateway login/logout pages.
+    /// Transport and metadata exclusions must not expose upstream application paths.
+    pub fn apply_web(&self, router: Router) -> Router {
+        self.apply_with_exemptions(router, true)
+    }
+
+    fn apply_with_exemptions(&self, router: Router, web: bool) -> Router {
+        if self.inner.mode == AuthMode::None
+            && (!web
+                || self
+                    .inner
+                    .hosts
+                    .values()
+                    .all(|mode| *mode == AuthMode::None))
+        {
             return router;
         }
         let login = Router::new()
@@ -449,12 +524,19 @@ impl HttpAuth {
         router
             .merge(login)
             .layer(axum::middleware::from_fn_with_state(
-                self.clone(),
+                (self.clone(), web),
                 require_auth,
             ))
     }
 
     fn session_cookie(&self, token: &str, max_age: u64) -> String {
+        // Browsers bound persistent-cookie retention. Non-expiring sessions use
+        // a year-long cookie and renew that retention window whenever used.
+        let max_age = if max_age == 0 && !token.is_empty() {
+            365 * 24 * 3600
+        } else {
+            max_age
+        };
         format!(
             "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
             if self.inner.secure_cookie {
@@ -485,10 +567,26 @@ impl HttpAuth {
             .push_back(Instant::now());
     }
 
-    fn reject(&self, req: &Request) -> Response {
+    fn web_mode(&self, request: &Request) -> AuthMode {
+        let authority = request.uri().authority().cloned().or_else(|| {
+            header_str(request.headers(), header::HOST)?
+                .parse::<axum::http::uri::Authority>()
+                .ok()
+        });
+        authority
+            .and_then(|authority| {
+                self.inner
+                    .hosts
+                    .get(&authority.host().trim_end_matches('.').to_ascii_lowercase())
+                    .copied()
+            })
+            .unwrap_or(self.inner.mode)
+    }
+
+    fn reject(&self, req: &Request, mode: AuthMode) -> Response {
         let browser = matches!(*req.method(), Method::GET | Method::HEAD)
             && header_str(req.headers(), header::ACCEPT).is_some_and(|a| a.contains("text/html"));
-        if self.inner.mode == AuthMode::Login && browser {
+        if mode == AuthMode::Login && browser {
             let target = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
             return Redirect::to(&format!(
                 "{LOGIN_PATH}?next={}",
@@ -502,24 +600,60 @@ impl HttpAuth {
             header::WWW_AUTHENTICATE,
             HeaderValue::from_static("Bearer realm=\"ssh-mesh\""),
         );
-        headers.append(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"ssh-mesh\", charset=\"UTF-8\""),
-        );
+        // Login-mode API requests must not open a browser's native password
+        // dialog when the session expires. Navigation uses the login form.
+        if mode == AuthMode::ApiKey {
+            headers.append(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=\"ssh-mesh\", charset=\"UTF-8\""),
+            );
+        }
         response
     }
 }
 
-async fn require_auth(State(auth): State<HttpAuth>, mut req: Request, next: Next) -> Response {
-    if auth.is_exempt(req.uri().path()) {
+async fn require_auth(
+    State((auth, web)): State<(HttpAuth, bool)>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let mode = if web {
+        auth.web_mode(&req)
+    } else {
+        auth.inner.mode
+    };
+    if mode == AuthMode::None {
+        if web {
+            req.extensions_mut().insert(PublicWebHost);
+        }
         return next.run(req).await;
     }
-    match auth.authenticate(req.headers(), SystemTime::now()) {
-        Some(identity) => {
+    if (web && matches!(path, LOGIN_PATH | LOGOUT_PATH)) || (!web && auth.is_exempt(path)) {
+        return next.run(req).await;
+    }
+    match auth.authenticate_request(req.headers(), SystemTime::now()) {
+        Some((identity, credentials)) => {
+            let renewed_cookie = credentials.cookie.then(|| {
+                let token = auth.inner.secrets.issue_token(
+                    &identity.name,
+                    auth.inner.ttl,
+                    SystemTime::now(),
+                );
+                auth.session_cookie(&token, auth.inner.ttl.as_secs())
+            });
             req.extensions_mut().insert(identity);
-            next.run(req).await
+            req.extensions_mut().insert(credentials);
+            let mut response = next.run(req).await;
+            // Login/logout bypass this branch and manage their own cookies.
+            if let Some(cookie) = renewed_cookie
+                && let Ok(cookie) = HeaderValue::from_str(&cookie)
+            {
+                response.headers_mut().append(header::SET_COOKIE, cookie);
+            }
+            response
         }
-        None => auth.reject(&req),
+        None => auth.reject(&req, mode),
     }
 }
 
@@ -534,23 +668,31 @@ const LOGIN_HTML: &str = r#"<!doctype html>
 body { font: 16px system-ui, sans-serif; max-width: 22rem; margin: 20vh auto; padding: 0 1rem; }
 input, button { font: inherit; width: 100%; box-sizing: border-box; margin: .4rem 0; padding: .5rem; }
 .err { color: #b42318; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; }
 </style>
 <h1>ssh-mesh</h1>
 {{ERR}}
-<form method="post" action="/_m/login">
+<p>Generate a mesh API key on this server:</p>
+<pre>{{COMMAND}}</pre>
+<p>Replace YOUR_ID with your user name. Paste the full <code>ID:SECRET</code>
+output below. This is separate from an application's password.</p>
+<form method="post" action="/_m/login" autocomplete="off">
 <input type="hidden" name="next" value="{{NEXT}}">
+<label>Gateway account
+<input type="text" name="username" value="ssh-mesh" autocomplete="username" readonly></label>
 <label>API key (ID:SECRET)
-<input type="password" name="key" autocomplete="current-password" autofocus required></label>
+<input type="password" name="key" autocomplete="off" autofocus required></label>
 <button>Sign in</button>
 </form>
 "#;
 
-fn login_html(next: &str, error: Option<&str>) -> Html<String> {
+fn login_html(auth: &HttpAuth, next: &str, error: Option<&str>) -> Html<String> {
     let err = error.map_or(String::new(), |e| {
         format!("<p class=\"err\">{}</p>", html_escape(e))
     });
     Html(
         LOGIN_HTML
+            .replace("{{COMMAND}}", &html_escape(&auth.login_command))
             .replace("{{ERR}}", &err)
             .replace("{{NEXT}}", &html_escape(&sanitize_next(next))),
     )
@@ -559,10 +701,33 @@ fn login_html(next: &str, error: Option<&str>) -> Html<String> {
 #[derive(Deserialize)]
 struct LoginQuery {
     next: Option<String>,
+    check: Option<u8>,
 }
 
-async fn login_page(Query(query): Query<LoginQuery>) -> Response {
-    let mut response = login_html(query.next.as_deref().unwrap_or("/"), None).into_response();
+async fn login_page(
+    State(auth): State<HttpAuth>,
+    Query(query): Query<LoginQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let next = sanitize_next(query.next.as_deref().unwrap_or("/"));
+    if cookie_value(&headers, SESSION_COOKIE)
+        .and_then(|token| auth.inner.secrets.verify_token(token, SystemTime::now()))
+        .is_some()
+    {
+        let mut response = Redirect::to(&next).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    let error = if query.check == Some(1) {
+        Some(
+            "Sign-in succeeded, but the browser did not return a valid session cookie. Allow cookies for this site and try again.",
+        )
+    } else {
+        None
+    };
+    let mut response = login_html(&auth, &next, error).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -578,11 +743,17 @@ struct LoginForm {
 
 async fn login_submit(State(auth): State<HttpAuth>, Form(form): Form<LoginForm>) -> Response {
     if auth.too_many_failures() {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed logins; wait a minute\n",
+        let mut response = login_html(
+            &auth,
+            &form.next,
+            Some("Too many failed logins. Wait a minute and try again."),
         )
-            .into_response();
+        .into_response();
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
     }
     match auth.inner.secrets.verify_api_key(form.key.trim()) {
         Some(id) => {
@@ -591,7 +762,16 @@ async fn login_submit(State(auth): State<HttpAuth>, Form(form): Form<LoginForm>)
                 .secrets
                 .issue_token(&id, auth.inner.ttl, SystemTime::now());
             let cookie = auth.session_cookie(&token, auth.inner.ttl.as_secs());
-            let mut response = Redirect::to(&sanitize_next(&form.next)).into_response();
+            // Verify cookie acceptance before entering the application, so a
+            // rejected cookie produces an error instead of a silent login loop.
+            let mut response = Redirect::to(&format!(
+                "{LOGIN_PATH}?next={}&check=1",
+                percent_encode(&sanitize_next(&form.next))
+            ))
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             if let Ok(value) = HeaderValue::from_str(&cookie) {
                 response.headers_mut().insert(header::SET_COOKIE, value);
             }
@@ -600,8 +780,11 @@ async fn login_submit(State(auth): State<HttpAuth>, Form(form): Form<LoginForm>)
         None => {
             auth.record_failure();
             tokio::time::sleep(auth.inner.fail_delay).await;
-            let mut response = login_html(&form.next, Some("Invalid API key.")).into_response();
+            let mut response = login_html(&auth, &form.next, Some("Invalid API key. Paste the full ID:SECRET output of the command above; an application password will not work here.")).into_response();
             *response.status_mut() = StatusCode::UNAUTHORIZED;
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             response
         }
     }
@@ -699,6 +882,34 @@ mod tests {
         for bad in ["", "a:b", "a b", &"x".repeat(65), "a/b"] {
             assert!(s.api_key(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn non_expiring_sessions_remain_signed_and_split_cookies_authenticate() {
+        let s = secrets();
+        let token = s.issue_token("alice", Duration::ZERO, at(1000));
+        assert_eq!(
+            s.verify_token(&token, at(10_000_000_000)).as_deref(),
+            Some("alice")
+        );
+        assert!(
+            Secrets::from_master(&master(2))
+                .verify_token(&token, at(1000))
+                .is_none()
+        );
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("app=value"));
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={token}")).unwrap(),
+        );
+        assert_eq!(
+            auth(AuthMode::Login)
+                .authenticate(&headers, at(1000))
+                .unwrap()
+                .name,
+            "alice"
+        );
     }
 
     #[test]
@@ -822,6 +1033,9 @@ mod tests {
             "javascript:alert(1)",
             "/a\r\nSet-Cookie: x=y",
             "/a b",
+            "/_m/login",
+            "/_m/login?next=%2F",
+            "/_m/logout",
             &format!("/{}", "x".repeat(2100)),
         ] {
             assert_eq!(sanitize_next(bad), "/", "{bad:?}");
@@ -885,6 +1099,6 @@ mod tests {
             HttpAuthConfig::default().mode_for("anything"),
             AuthMode::None
         );
-        assert_eq!(HttpAuthConfig::default().session_ttl_secs, 43200);
+        assert_eq!(HttpAuthConfig::default().session_ttl_secs, 0);
     }
 }

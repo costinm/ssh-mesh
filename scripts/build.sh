@@ -482,31 +482,31 @@ test_cmd() {
     case "$name" in
         examples)
             build
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:${PATH:-}:$PWD/target/dist/opt/busybox/bin"
             tests/test_examples.sh
             ;;
         ssh_mesh_activation)
             rust
             stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:${PATH:-}:$PWD/target/dist/opt/busybox/bin"
             tests/test_ssh_mesh_activation.sh
             ;;
         trace)
             rust
             stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:${PATH:-}:$PWD/target/dist/opt/busybox/bin"
             tests/test_trace.sh "$@"
             ;;
         cert_terminal_mesh_init)
             rust
             stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:${PATH:-}:$PWD/target/dist/opt/busybox/bin"
             python3 tests/test_cert_terminal_mesh_init.py "$@"
             ;;
         docker)
             rust
             stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:${PATH:-}:$PWD/target/dist/opt/busybox/bin"
             tests/test_docker.sh "$@"
             ;;
         *)

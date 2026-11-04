@@ -20,6 +20,27 @@ Config `<home>/etc/mesh-acme.toml` (missing file or empty `domains` => exit 0):
     domains = ["dev1.h.webinf.info"]   # one certificate per name
     renew_days = 30                    # optional
 
+## Development homes and HTTP serving
+
+The CLI and ssh-mesh use one shared ACME home and select the same
+default: `MESH_ACME_HOME`, readable `/home/acme`, or `<ssh-mesh home>/acme`.
+The ssh-mesh home prefers readable `/home/ssh-mesh/etc`, otherwise `$HOME/etc`.
+
+    meshkeys acme add example.org
+    meshkeys acme renew --dry-run
+
+Use `--home` and `acme_home` only for an explicit alternative. mesh-init must pass the plain HTTP socket
+with name `http80` and the TLS socket with name `https`; the CLI does not
+bind either port. HTTP-01 writes files, not DNS records. Verify a test file
+under `www/.well-known/acme-challenge/` is readable over the domain's port 80
+before requesting a certificate.
+
+After issuance, ssh-mesh's `certs/reload` command installs certificates without
+a restart. Supply the explicit certificate paths for a newly added domain;
+reload without paths only rereads the previously installed set. Issuance and
+renewal do not call reload automatically. Scheduling `renew` is separate from
+adding a domain.
+
 ## Layout (D = `<home>/.local/share/caddy`, ISSUER = e.g. `acme-v02.api.letsencrypt.org-directory`)
 
 - `D/certificates/ISSUER/NAME/NAME.{crt,key,json}` (dirs 0750, files 0640; `*.x` is `wildcard_.x`)

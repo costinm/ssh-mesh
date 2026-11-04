@@ -25,7 +25,7 @@ async fn main() -> Result<(), anyhow::Error> {
         AppState, ExecConfig, MeshNode, MeshNodeConfig, handlers, run_ssh_server_on_listener,
     };
 
-    let app_paths = mesh::paths::AppPaths::for_app("ssh-mesh");
+    let app_paths = mesh::paths::AppPaths::for_accessible_app("ssh-mesh");
     let host_ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
 
     // Get base directory from environment variable SSH_BASEDIR. If not set,
@@ -143,12 +143,13 @@ async fn main() -> Result<(), anyhow::Error> {
             )
             .with_discovery_dir(Some(base_dir.clone())),
         ),
-        mesh_services: ssh_mesh::mesh_rest::MeshServiceRegistry::default(),
         web_root: std::env::var_os("MESH_HTTP_WEB_DIR").map(std::path::PathBuf::from),
     };
 
+    ssh_mesh::http_proxy::configure(&ssh_server.router, &ssh_server.cfg.http_proxies)?;
+
     // Mesh services reached over a CBOR seqpacket socket (lmesh): SSH_MESH_MESH_SERVICES.
-    for (catalog, result) in app_state.mesh_services.register_from_env() {
+    for (catalog, result) in app_state.mesh_services().register_from_env() {
         match result {
             Ok(components) => info!("HTTP serves {catalog} components {components:?}"),
             Err(error) => tracing::warn!("HTTP cannot serve {catalog}: {error:#}"),
@@ -254,10 +255,19 @@ async fn main() -> Result<(), anyhow::Error> {
     // Generated on first start, next to the SSH host key.
     let master = ssh_mesh::auth::MasterSecret::load_or_generate(&base_dir)?;
     let secrets = ssh_mesh::httpauth::Secrets::from_master(&master);
+    let shell_path =
+        |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    let meshkeys_path = env::current_exe()?.with_file_name("meshkeys");
+    let login_command = format!(
+        "sudo {} apikey YOUR_ID --keydir {}",
+        shell_path(&meshkeys_path),
+        shell_path(&base_dir),
+    );
     let auth_for = |listener: &str, secure_cookie: bool| {
         let mode = http_auth.mode_for(listener);
         log::info!("{} listener authentication: {:?}", listener, mode);
         ssh_mesh::httpauth::HttpAuth::new(secrets.clone(), mode, http_auth, secure_cookie)
+            .with_login_command(login_command.clone())
     };
     let (auth_http, auth_mesh, auth_admin, auth_https) = (
         auth_for("http", false),
@@ -266,7 +276,8 @@ async fn main() -> Result<(), anyhow::Error> {
         auth_for("https", true),
     );
 
-    let (http80_app, https_app) = public_web_listener_apps(web_app, &auth_https, acme_www);
+    let (http80_app, https_app) =
+        public_web_listener_apps(web_app, &auth_https, acme_www, ssh_server.router.clone());
     start_http_listener_if_present(&["http80"], "HTTP :80", http80_app, None, false)?;
     start_tls_listener_if_present(
         &base_dir,
@@ -815,9 +826,11 @@ fn public_web_listener_apps(
     web: axum::Router,
     https_auth: &ssh_mesh::httpauth::HttpAuth,
     www: PathBuf,
+    router: Arc<ssh_mesh::router::Router>,
 ) -> (axum::Router, axum::Router) {
     let plain = ssh_mesh::certs::acme_challenge_routes(www).merge(web.clone());
-    (plain, https_auth.apply(web))
+    let secure = https_auth.apply_web(ssh_mesh::http_proxy::routes(router, web));
+    (plain, secure)
 }
 
 fn public_web_app(web_dir: PathBuf) -> axum::Router {
@@ -951,15 +964,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn port80_does_not_inherit_https_authentication() {
+    async fn port80_does_not_inherit_https_authentication_or_proxy() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "public").unwrap();
         let www = dir.path().join("www");
         std::fs::create_dir_all(www.join(".well-known/acme-challenge")).unwrap();
         std::fs::write(www.join(".well-known/acme-challenge/token"), "proof").unwrap();
-        let (plain, secure) =
-            public_web_listener_apps(public_web_app(dir.path().to_owned()), &auth(), www);
+        let node = ssh_mesh::MeshNode::new(Some(dir.path().join("keys")), Some(Default::default()));
+        ssh_mesh::http_proxy::configure(
+            &node.router,
+            &std::collections::HashMap::from([(
+                "oc.example.org".to_string(),
+                "127.0.0.1:9".to_string(),
+            )]),
+        )
+        .unwrap();
+        let (plain, secure) = public_web_listener_apps(
+            public_web_app(dir.path().to_owned()),
+            &auth(),
+            www,
+            node.router.clone(),
+        );
         assert_eq!(status(plain.clone(), "/").await, StatusCode::OK);
+        let response = plain
+            .clone()
+            .call(
+                Request::get("/")
+                    .header("host", "oc.example.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             status(plain.clone(), "/.well-known/acme-challenge/token").await,
             StatusCode::OK
@@ -1036,7 +1073,6 @@ mod tests {
                 None,
                 None,
             )),
-            mesh_services: Default::default(),
             web_root: None,
         };
         let app = auth().apply(public_http_app(state));
@@ -1062,7 +1098,6 @@ mod tests {
                 None,
                 None,
             )),
-            mesh_services: Default::default(),
             web_root: None,
         });
         for path in [

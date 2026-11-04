@@ -44,10 +44,20 @@ Deprecated:
 | --- | --- | --- |
 | `RUST_LOG` | tracing subscriber default | Initial tracing filter for `local_trace::init` and binaries using `EnvFilter::from_default_env`. |
 | `MESH_LOG_FILE` | unset | Exact JSON trace log path for `local_trace::init`, for example `/dev/stderr` or `/tmp/ssh-mesh.log`. Takes precedence over `MESH_LOG_DIR`. Regular files rotate by size (`MESH_LOG_FILE_MAX_BYTES`); special files under `/dev` are opened as-is and never rotate. |
-| `MESH_LOG_DIR` | `./logs` | Directory for `local_trace::init` JSON trace logs; writes `<MESH_LOG_DIR>/<service>.log` with size-based rotation. With mesh-init, `service` is the unit name; otherwise it is the application name. If unset, `./logs` is relative to the process working directory. |
+| `MESH_LOG_DIR` | writable `/home/<app>/logs`, otherwise `$HOME/logs` | Directory for `local_trace::init` JSON trace logs; writes `<MESH_LOG_DIR>/<service>.log` with size-based rotation. With mesh-init, `service` is the unit name; otherwise it is the application name. Explicit mesh app-home overrides retain their configured log directory. |
 | `MESH_LOG_FILE_MAX_BYTES` | `8m` | Size at which the active log file rotates to `<file>.1` (backups shift to `.2`, ...). Suffixes k/m/g (or kib/mib/gib) are accepted. `0` disables rotation. |
 | `MESH_LOG_MAX_TOTAL_BYTES` | `64m` | Maximum combined size kept for rotated `<file>.*` backups; oldest backups are removed first so backups plus one full active file fit within the cap. Also bounds legacy rotated files at startup. |
 | `TRACE_SOCKET_DIR` | `<mesh_home>/run/mesh` | Shared directory for local trace sockets; producer sockets are `<TRACE_SOCKET_DIR>/<app>.sock`. |
+
+`mesh::logging` owns operational file opening, rotation and optional stdio
+capture. `local_trace::init_with_log_access` accepts an owner/group and mode
+policy; regular-file rotation reapplies it, or preserves existing access when
+no policy is provided. `local_trace::init` uses the same implementation with
+default access. Device destinations duplicate the original stdout/stderr FDs
+where applicable and are never chmod/chowned or rotated. Captured supervisor
+console output uses the same size limits as structured logs, independently for
+each log file. Ordinary event writes stay intact at rotation boundaries; writes
+larger than a whole file cap are split to keep bulk console output bounded.
 
 ## Generated Variables
 

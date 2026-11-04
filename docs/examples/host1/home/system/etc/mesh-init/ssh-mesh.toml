@@ -16,7 +16,7 @@ MemoryMax = "512M"
 CPUWeight = 100
 
 [Environment]
-PATH = "/opt/ssh-mesh/bin:/opt/busybox/bin:/usr/bin"
+PATH = "/opt/ssh-mesh/bin:/usr/bin:/opt/busybox/bin"
 RUST_LOG = "info"
 SSH_PORT = "18422"
 HTTP_PORT = "18480"

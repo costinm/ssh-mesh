@@ -41,4 +41,16 @@ the final HTTP exec authorization model.
 
 ## Local routing
 
-For inbound streams, the routing is delegated to mesh-init.
+`MeshNode` owns one stream router and one component registry. HTTPS reverse-proxy
+selection, authenticated HTTPS stream tunnels, and SSH direct-tcpip channels use
+that same routing table and caller policy. HTTP forwarding continues to use the
+shared pooled reverse proxy; byte streams use the router's common target opener.
+The HTTPS adapter holds an `Arc` to the node router and creates no private table.
+
+The authenticated HTTPS `/_m/stream[/component/method]` surface wires the existing
+stream ingress to `Router::route_stream`. Local component lookup uses the same
+node registry exposed by the admin API. mesh-init owns activation and process
+identity changes; ssh-mesh owns route selection. Unmatched SSH destinations retain
+the existing configured-jump and explicit open-relay behavior, while a denied
+shared route cannot fall through to it. See [ENV.md](ENV.md) for configuration
+and the distinction between browser reverse proxying and byte-stream tunnels.

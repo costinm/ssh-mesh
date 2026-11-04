@@ -137,7 +137,6 @@ pub async fn setup_test_environment(
                     )
                     .with_discovery_dir(Some(base_dir_for_server.clone())),
                 ),
-                mesh_services: crate::mesh_rest::MeshServiceRegistry::default(),
                 web_root: None,
             };
 

@@ -27,6 +27,45 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    /// Prefer readable shared app configuration, otherwise use `$HOME/etc`.
+    /// Logs use the shared app directory when writable (or creatable), otherwise
+    /// `$HOME/logs`. Explicit mesh home overrides retain their existing meaning.
+    pub fn for_accessible_app(app: impl Into<String>) -> Self {
+        let app = app.into();
+        if ["MESH_APP_HOME", "MESH_HOME_BASE", "MESH_HOME"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        {
+            return Self::for_app(app);
+        }
+        let shared = PathBuf::from("/home").join(&app);
+        let personal = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let home = accessible_home(&shared, &personal);
+        let mut paths = Self::for_app_with_env_and_context(
+            app,
+            |key| {
+                if key == "MESH_APP_HOME" {
+                    Some(home.clone().into_os_string())
+                } else {
+                    std::env::var_os(key)
+                }
+            },
+            || std::env::current_dir().ok(),
+            current_uid(),
+        );
+        let logs = shared.join("logs");
+        paths.logs = if directory_access(&logs, true)
+            || (!logs.exists() && directory_access(&shared, true))
+        {
+            logs
+        } else {
+            personal.join("logs")
+        };
+        paths
+    }
+
     /// Resolve standard paths for an app.
     ///
     /// Defaults are `/home/<app>` for mutable state and `/opt/<app>` for
@@ -166,6 +205,34 @@ impl AppPaths {
     }
 }
 
+fn accessible_home(shared: &std::path::Path, personal: &std::path::Path) -> PathBuf {
+    if directory_access(&shared.join("etc"), false) {
+        shared.to_path_buf()
+    } else {
+        personal.to_path_buf()
+    }
+}
+
+fn directory_access(path: &std::path::Path, write: bool) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path_string) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let mode = libc::X_OK | if write { libc::W_OK } else { libc::R_OK };
+        path.is_dir()
+            && unsafe {
+                libc::faccessat(libc::AT_FDCWD, path_string.as_ptr(), mode, libc::AT_EACCESS)
+            } == 0
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_dir()
+            && (!write || std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly()))
+    }
+}
+
 /// Conventional mesh socket for a system service.
 pub fn system_service_socket(service: impl AsRef<str>) -> PathBuf {
     PathBuf::from("/run/mesh")
@@ -256,6 +323,21 @@ mod tests {
     fn paths_with(vars: &[(&str, &str)]) -> AppPaths {
         let map: HashMap<&str, &str> = vars.iter().copied().collect();
         AppPaths::for_app_with_env("demo", |key| map.get(key).map(OsString::from))
+    }
+
+    #[test]
+    fn accessible_home_uses_shared_config_then_personal_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        let personal = root.path().join("personal");
+        assert_eq!(accessible_home(&shared, &personal), personal);
+        std::fs::create_dir_all(shared.join("etc")).unwrap();
+        assert_eq!(accessible_home(&shared, &personal), shared);
+        assert!(directory_access(&shared, true));
+        // A regular file is not a usable configuration directory.
+        std::fs::remove_dir(shared.join("etc")).unwrap();
+        std::fs::write(shared.join("etc"), "not a directory").unwrap();
+        assert_eq!(accessible_home(&shared, &personal), personal);
     }
 
     #[test]

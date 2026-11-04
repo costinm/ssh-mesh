@@ -12,6 +12,31 @@ Common variables inherited from the `mesh` crate are documented in
 
 ## mesh-init
 
+Root supervisors default to `<system_home>/logs` (`/home/system/logs`), and
+non-root supervisors to `$HOME/logs`. `MESH_LOG_DIR` overrides the directory.
+`mesh-init.log` contains structured supervisor warnings/errors; in daemon mode,
+inherited stdout/stderr from the supervisor and its children append to
+`mesh-init-console.log`, including startup panics before tracing initializes.
+Both files are created before services start, with mode `0640`; root assigns
+them and newly created log directories (`0750`) to the configured system account
+and its primary group. Existing directory ownership/permissions are preserved;
+an operator-selected directory must already allow the system user to traverse it.
+This works with mesh-init as PID 1 and without systemd.
+Explicit service `StandardOutput`/`StandardError` settings still take precedence.
+`MESH_LOG_FILE` overrides the structured log only; the console log remains in
+`MESH_LOG_DIR`. Both files use the common `mesh::logging` writer and rotate with
+`MESH_LOG_FILE_MAX_BYTES` and `MESH_LOG_MAX_TOTAL_BYTES` (per log). Ownership and
+mode are retained on replacement files. A bounded pipe collects inherited
+output, so long-running children do not keep writing to a renamed old file.
+`MESH_SERVICE_NAME` also controls the structured filename through the common
+path resolver; mesh-init does not pre-create a separate structured file.
+`--help` and `seed` output stay
+on the invoking terminal. Foreground command mode (`mesh-init COMMAND ...`)
+retains the caller's stdout/stderr; its structured supervisor logs still go to
+the file, but command output is not captured in the console file.
+A failure to prepare logs is reported on the original
+stderr and does not prevent the supervisor from starting.
+
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `MESH_INIT_PRIVILEGED_UIDS` | `0,1000,150` | Comma-separated UIDs allowed to operate on services for other UIDs/GIDs. If set to a non-empty parsed list, it fully replaces the default (root, system, ssh-mesh). |

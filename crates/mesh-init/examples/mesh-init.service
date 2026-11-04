@@ -17,7 +17,7 @@
 #
 # Check the daemon:
 #   systemctl status mesh-init.service
-#   journalctl -u mesh-init.service
+#   tail -f /home/system/logs/mesh-init.log /home/system/logs/mesh-init-console.log
 #
 # Install the post-resume hook on Debian and similar systems:
 #   install -Dm0755 \
@@ -44,7 +44,9 @@ Environment=HOME=/home/system
 # directories explicitly.
 Environment="PATH=/opt/ssh-mesh/bin:/home/system/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/etc/profiles/per-user/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment=RUST_LOG=INFO
-Environment=MESH_LOG_DIR=/home/mesh-init/logs
+# This is also the root supervisor's default without systemd. The console file
+# captures inherited service stdout/stderr, including panics before tracing starts.
+Environment=MESH_LOG_DIR=/home/system/logs
 Restart=on-failure
 RestartSec=2s
 

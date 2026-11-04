@@ -9,7 +9,7 @@ set -euo pipefail
 examples_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace_dir="$(cd "${examples_dir}/../.." 2>/dev/null && pwd)"
 target_dir="${SSH_MESH_TARGET_DIR:-${workspace_dir}/target}"
-root_dir="${SSH_MESH_STATE_ROOT:-${SSH_MESH_EXAMPLE_ROOT:-${target_dir}/examples}}"
+root_dir="${SSH_MESH_STATE_ROOT:-${SSH_MESH_EXAMPLE_ROOT:-${HOME}/.local/share/ssh-mesh/examples}}"
 log_dir="${root_dir}/logs/ssh-ls-dev"
 
 ssh_config="${SSH_MESH_SSH_CONFIG:-${examples_dir}/ssh_config}"

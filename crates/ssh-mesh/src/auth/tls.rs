@@ -127,32 +127,7 @@ pub async fn run_axum_https_server(
 ) -> Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await?;
-    info!("HTTPS server listening on {}", addr);
-
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TLS handshake failed from {}: {}", peer_addr, e);
-                    return;
-                }
-            };
-
-            let io = TokioIo::new(tls_stream);
-
-            if let Err(err) = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(io, hyper_util::service::TowerToHyperService::new(app))
-                .await
-            {
-                warn!("Error serving HTTPS connection from {}: {}", peer_addr, err);
-            }
-        });
-    }
+    run_axum_https_listener(listener, acceptor, app).await
 }
 
 pub async fn run_axum_https_listener(
@@ -171,18 +146,30 @@ pub async fn run_axum_https_listener(
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!("TLS handshake failed from {}: {}", peer_addr, e);
+                    warn!("TLS handshake failed from {}: {:?}", peer_addr, e);
                     return;
                 }
             };
 
+            let connection = tls_stream.get_ref().1;
+            let server_name = connection.server_name().unwrap_or("(none)").to_owned();
+            let protocol = connection
+                .alpn_protocol()
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .unwrap_or_else(|| "(none)".to_owned());
             let io = TokioIo::new(tls_stream);
 
             if let Err(err) = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(io, hyper_util::service::TowerToHyperService::new(app))
+                .serve_connection_with_upgrades(
+                    io,
+                    hyper_util::service::TowerToHyperService::new(app),
+                )
                 .await
             {
-                warn!("Error serving HTTPS connection from {}: {}", peer_addr, err);
+                warn!(
+                    "Error serving HTTPS connection from {} (sni={}, alpn={}): {:?}",
+                    peer_addr, server_name, protocol, err
+                );
             }
         });
     }

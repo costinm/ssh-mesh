@@ -43,7 +43,7 @@ if [ -z "${app}" ]; then
   exit 2
 fi
 app_home="${SSH_MESH_APP_HOME:-${app}}"
-root_dir="${SSH_MESH_STATE_ROOT:-${PWD}/target/ssh-mesh-state}"
+root_dir="${SSH_MESH_STATE_ROOT:-${HOME}/.local/share/ssh-mesh/state}"
 template_dir="${SSH_MESH_APP_TEMPLATE_DIR:-}"
 state_dir="${SSH_MESH_APP_STATE_DIR:-${root_dir}/${app}}"
 home_dir="${SSH_MESH_APP_HOME_DIR:-${state_dir}/home/${app_home}}"
@@ -174,7 +174,7 @@ exec bwrap \
   --setenv HOME "/home/${app_home}" \
   --setenv USER "${app_home}" \
   --setenv LOGNAME "${app_home}" \
-  --setenv PATH "/opt/ssh-mesh/bin:/opt/busybox/bin:${inner_nix_profile}/bin" \
+  --setenv PATH "/opt/ssh-mesh/bin:${inner_nix_profile}/bin:/opt/busybox/bin" \
   --setenv RUST_LOG "${RUST_LOG:-info}" \
   --setenv NIX_PROFILE "${inner_nix_profile}" \
   --setenv SSH_MESH_STATE_ROOT "${state_mount}" \

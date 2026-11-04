@@ -29,6 +29,7 @@ pub mod config_provider;
 pub mod generic_proxy;
 pub mod handlers;
 pub mod http_ingress;
+pub mod http_proxy;
 pub mod httpauth;
 pub mod jsonl_proxy;
 pub mod mcp_proxy;
@@ -312,7 +313,7 @@ pub struct MeshNodeConfig {
     /// trusted, isolated networks.
     #[serde(default)]
     pub allow_direct_tcpip: bool,
-    /// Home of the ACME tool's user (default `/home/acme`). ssh-mesh only
+    /// ACME home (MESH_ACME_HOME, readable /home/acme, or app-home/acme). ssh-mesh only
     /// reads it: `www/.well-known/acme-challenge/` is served for HTTP-01, and
     /// `.local/share/caddy/certificates/` holds the certificates unless
     /// `cert_dir` is set. See [`certs`].
@@ -326,6 +327,11 @@ pub struct MeshNodeConfig {
     /// Authentication of the HTTP(S) listeners. See [`httpauth`].
     #[serde(default)]
     pub http_auth: httpauth::HttpAuthConfig,
+
+    /// Exact HTTPS virtual hosts mapped to HTTP upstream authorities (`host:port`).
+    /// Routes use HTTPS listener authentication with per-host overrides; port 80 never proxies.
+    #[serde(default)]
+    pub http_proxies: HashMap<String, String>,
 }
 
 pub trait MeshListener: Send + Sync {
@@ -347,6 +353,10 @@ pub trait MeshListener: Send + Sync {
 #[derive(Clone)]
 pub struct MeshNode {
     pub cfg: MeshNodeConfig,
+    /// One routing table and endpoint resolver shared by every ingress.
+    pub router: Arc<router::Router>,
+    /// Component registry used by both the router and HTTP administration.
+    pub mesh_services: mesh_rest::MeshServiceRegistry,
     pub keys: PrivateKey,
     pub clients: Arc<tokio::sync::Mutex<Vec<SshClientConfig>>>,
     pub id_counter: Arc<std::sync::Mutex<u64>>,
@@ -379,11 +389,16 @@ pub struct AppState {
     // Deprecated: replaced by router::Router / http_ingress; kept until the new path is validated.
     pub target_http_address: Option<String>,
     pub ssh_client_manager: Arc<sshc::SshClientManager>,
-    /// Generic mesh-service backends exposed by the localhost/admin REST API.
-    pub mesh_services: mesh_rest::MeshServiceRegistry,
     /// Optional development asset root, confined by the admin asset handler.
     /// Embedded assets remain the production fallback.
     pub web_root: Option<std::path::PathBuf>,
+}
+
+impl AppState {
+    /// The node-owned component registry, also used by stream routing.
+    pub fn mesh_services(&self) -> &mesh_rest::MeshServiceRegistry {
+        &self.ssh_server.mesh_services
+    }
 }
 
 // TODO: move the env vars to main
@@ -574,8 +589,22 @@ impl MeshNode {
             .with_discovery_dir(Some(base_dir.clone())),
         );
 
+        let mesh_services = mesh_rest::MeshServiceRegistry::default();
+        let (_, _, cert_dir) = certs::acme_paths(cfg.acme_home.as_deref(), cfg.cert_dir.as_deref());
+        let router = Arc::new(router::Router {
+            table: Arc::new(router::RouteTable::new()),
+            client: Arc::new(mesh::route::TcpClient),
+            locator: Arc::new(router::ConventionLocator {
+                services: mesh_services.clone(),
+                local_names: certs::cert_dir_names(&cert_dir),
+            }),
+            activator: Some(Arc::new(router::MeshInitActivator)),
+        });
+
         MeshNode {
             cfg,
+            router,
+            mesh_services,
             keys,
             clients: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             id_counter: Arc::new(std::sync::Mutex::new(0)),
@@ -637,7 +666,7 @@ impl MeshNode {
             .config_dir
             .clone()
             .or_else(|| std::env::var("SSH_MESH_CONFIG").ok().map(PathBuf::from))
-            .unwrap_or_else(|| mesh::paths::AppPaths::for_app("ssh-mesh").etc)
+            .unwrap_or_else(|| mesh::paths::AppPaths::for_accessible_app("ssh-mesh").etc)
     }
 
     /// Convenience accessor for ssh_port from config.

@@ -14,8 +14,9 @@
 //!   connection in mesh-init and forwards the accepted fd to a service JSONL
 //!   Unix socket using SCM_RIGHTS.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{AppConfig, ServiceActivationMode};
+use crate::config::{ActivationConfig, AppConfig, ServiceActivationMode};
 use crate::daemon::{Daemon, apply_activation_context_env};
 use crate::process::{ActivationFd, ActivationListenFd};
 use crate::protocol::ServiceState;
@@ -100,6 +101,13 @@ pub(crate) fn register_service_listener_fd(
     } else {
         listeners.push((order, fd_clone, fd_name));
         listeners.sort_by_key(|(idx, _, _)| *idx);
+    }
+}
+
+/// Release all stored listener FDs when a configured service is removed.
+pub(crate) fn discard_service_listener_fds(service: &str) {
+    if let Some(registry) = SERVICE_LISTENER_FDS.get() {
+        registry.lock().remove(service);
     }
 }
 
@@ -607,171 +615,305 @@ async fn connect_activation_socket(path: &str) -> anyhow::Result<StdUnixStream> 
 // Start listeners
 // ============================================================================
 
-/// Start activation listeners for a given service.
-pub fn start_listeners(daemon: Arc<Daemon>, config: &AppConfig) {
-    for (order, act) in config.activation.iter().enumerate() {
-        if let Some(port) = act.port {
-            // Check for pre-bound systemd socket activation FD
-            if let Some(fd) = take_systemd_tcp_fd(port, act.datagram) {
-                info!(
-                    service = %config.name,
-                    port,
-                    datagram = act.datagram,
-                    "using_systemd_tcp_activation_fd"
-                );
-                let daemon_clone = daemon.clone();
-                let name = config.name.clone();
-                let wait = act.wait;
-                if wait {
-                    register_service_listener_fd(&name, order, &fd.fd, fd.name.clone());
-                }
-                tokio::spawn(async move {
-                    handle_listener(fd.fd, name, wait, daemon_clone).await;
-                });
-                continue;
-            }
-            let daemon_clone = daemon.clone();
-            let name = config.name.clone();
-            let wait = act.wait;
-            let bind = act.bind.clone();
-            let fd_name = act.fd_name.clone();
-            let datagram = act.datagram;
-            tokio::spawn(async move {
-                run_inet_listener(
-                    port,
-                    bind,
-                    fd_name,
-                    datagram,
-                    name,
-                    wait,
-                    order,
-                    daemon_clone,
-                )
-                .await;
-            });
+/// Bound sockets survive handler replacement, so reload can move a socket to a
+/// different service without rebinding it or losing queued connections.
+#[derive(Default)]
+pub(crate) struct ListenerSet {
+    listeners: Vec<ManagedListener>,
+}
+
+struct ManagedListener {
+    owner: String,
+    order: usize,
+    config: ActivationConfig,
+    fd: OwnedFd,
+    fd_name: Option<String>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    path_identity: Option<(u64, u64)>,
+}
+
+fn same_socket(a: &ActivationConfig, b: &ActivationConfig) -> bool {
+    fn bind(act: &ActivationConfig) -> &str {
+        act.bind
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .unwrap_or("::")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+    }
+    a.port == b.port
+        && a.socket == b.socket
+        && a.vsock_port == b.vsock_port
+        && a.vsock_cid == b.vsock_cid
+        && a.datagram == b.datagram
+        && bind(a) == bind(b)
+}
+
+impl ManagedListener {
+    async fn pause(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
         }
-        if let Some(ref path) = act.socket {
-            // Check for pre-bound systemd socket activation FD
-            if let Some(fd) = take_systemd_uds_fd(path, act.datagram) {
-                info!(service = %config.name, path = %path, "using_systemd_uds_activation_fd");
-                let daemon_clone = daemon.clone();
-                let name = config.name.clone();
-                let wait = act.wait;
-                if wait {
-                    register_service_listener_fd(&name, order, &fd.fd, fd.name.clone());
-                }
-                tokio::spawn(async move {
-                    handle_listener(fd.fd, name, wait, daemon_clone).await;
-                });
-                continue;
+    }
+
+    fn remove_path(&self) {
+        if let (Some(path), Some(identity)) = (&self.config.socket, self.path_identity) {
+            if std::fs::symlink_metadata(path)
+                .ok()
+                .is_some_and(|m| (m.dev(), m.ino()) == identity)
+            {
+                let _ = std::fs::remove_file(path);
             }
-            let daemon_clone = daemon.clone();
-            let name = config.name.clone();
-            let path_clone = path.clone();
-            let wait = act.wait;
-            let fd_name = act.fd_name.clone();
-            let socket_mode = act.socket_mode;
-            let socket_user = act.socket_user.clone();
-            let socket_group = act.socket_group.clone();
-            let datagram = act.datagram;
-            tokio::spawn(async move {
-                run_uds_listener(
-                    path_clone,
-                    name,
-                    wait,
-                    order,
-                    datagram,
-                    socket_mode,
-                    socket_user,
-                    socket_group,
-                    fd_name,
-                    daemon_clone,
-                )
-                .await;
-            });
-        }
-        if let Some(vsock_port) = act.vsock_port {
-            if act.datagram {
-                error!(
-                    service = %config.name,
-                    port = vsock_port,
-                    "vsock_datagram_activation_not_supported"
-                );
-                continue;
-            }
-            let daemon_clone = daemon.clone();
-            let name = config.name.clone();
-            let wait = act.wait;
-            let cid = act.vsock_cid;
-            let fd_name = act.fd_name.clone();
-            tokio::spawn(async move {
-                run_vsock_listener(cid, vsock_port, fd_name, name, wait, order, daemon_clone).await;
-            });
         }
     }
 }
 
-// ============================================================================
-// Internet listeners
-// ============================================================================
-
-async fn run_inet_listener(
-    port: u16,
-    bind: Option<String>,
-    fd_name: Option<String>,
-    datagram: bool,
-    service_name: String,
-    wait: bool,
-    order: usize,
-    daemon: Arc<Daemon>,
-) {
-    let bind_addr = bind
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| "[::]".to_string());
-    let addr = format!("{}:{}", bind_addr, port);
-
-    info!(
-        proto = if datagram { "UDP" } else { "TCP" },
-        service = %service_name,
-        address = %addr,
-        wait,
-        "starting_inet_listener"
-    );
-
-    if datagram && !wait {
-        error!(service = %service_name, "udp_datagram_activation_accept_true_not_supported");
-        return;
-    }
-
-    if wait {
-        let has_auth = daemon
-            .configs
-            .lock()
-            .get(&service_name)
-            .is_some_and(|c| c.auth.is_some());
-        if has_auth {
-            error!(service = %service_name, "listener_activation_auth_conflict");
-            return;
+impl ListenerSet {
+    /// Pause activation while a service's process/configuration is replaced.
+    pub(crate) async fn pause(&mut self, names: &[String]) {
+        for listener in &mut self.listeners {
+            if names.contains(&listener.owner) {
+                listener.pause().await;
+            }
         }
     }
 
-    let fd = match bind_inet_socket(&bind_addr, port, datagram) {
-        Ok(fd) => fd,
-        Err(e) => {
-            error!(
-                proto = if datagram { "UDP" } else { "TCP" },
-                port,
-                service = %service_name,
-                error = %e,
-                "bind_inet_socket_failed"
-            );
-            return;
+    /// Reconcile configured sockets, retaining bound FDs across ownership,
+    /// name and order changes. Binding errors are returned for the reload reply.
+    pub(crate) async fn reconcile(
+        &mut self,
+        daemon: Arc<Daemon>,
+        configs: &[AppConfig],
+    ) -> Vec<String> {
+        let mut old = std::mem::take(&mut self.listeners);
+        let previous_keys: Vec<_> = old.iter().map(|l| (l.owner.clone(), l.order)).collect();
+        let mut affected = HashSet::new();
+        for listener in &old {
+            if !configs.iter().any(|cfg| {
+                cfg.name == listener.owner
+                    && cfg.activation.get(listener.order) == Some(&listener.config)
+            }) {
+                affected.insert(listener.owner.clone());
+            }
         }
-    };
-    if wait {
-        register_service_listener_fd(&service_name, order, &fd, fd_name);
+        for cfg in configs {
+            if cfg.activation.iter().enumerate().any(|(order, act)| {
+                !old.iter()
+                    .any(|l| l.owner == cfg.name && l.order == order && l.config == *act)
+            }) {
+                affected.insert(cfg.name.clone());
+            }
+        }
+        // Pause every sibling of a changed listener before editing that
+        // service's registry. Untouched services keep their complete FD set.
+        for listener in &mut old {
+            if affected.contains(&listener.owner) {
+                listener.pause().await;
+            }
+        }
+        // Retire addresses absent from the new snapshot before binding any
+        // additions (a replacement bind may overlap an old wildcard address).
+        let mut retained = Vec::new();
+        for mut listener in old {
+            if configs.iter().any(|cfg| {
+                cfg.name != "default"
+                    && cfg
+                        .activation
+                        .iter()
+                        .any(|act| same_socket(&listener.config, act))
+            }) {
+                retained.push(listener);
+            } else {
+                listener.pause().await;
+                // Release the configured registry clone too, before an
+                // overlapping replacement address is bound.
+                if let Some(registry) = SERVICE_LISTENER_FDS.get() {
+                    if let Some(fds) = registry.lock().get_mut(&listener.owner) {
+                        fds.retain(|(order, _, _)| *order != listener.order);
+                    }
+                }
+                listener.remove_path();
+            }
+        }
+        let mut old = retained;
+        let mut errors = Vec::new();
+        let mut failed = HashSet::new();
+        for config in configs.iter().filter(|c| c.name != "default") {
+            for (order, act) in config.activation.iter().enumerate() {
+                if self.listeners.iter().any(|l| same_socket(&l.config, act)) {
+                    failed.insert(config.name.clone());
+                    errors.push(format!("{}: duplicate activation socket", config.name));
+                    continue;
+                }
+                if (act.datagram && !act.wait) || (act.wait && config.auth.is_some()) {
+                    failed.insert(config.name.clone());
+                    errors.push(format!(
+                        "{}: unsupported activation/auth combination",
+                        config.name
+                    ));
+                    continue;
+                }
+                let previous = old.iter().position(|l| same_socket(&l.config, act));
+                let mut listener = if let Some(index) = previous {
+                    let mut listener = old.remove(index);
+                    if listener.owner != config.name
+                        || listener.config != *act
+                        || listener.order != order
+                    {
+                        listener.pause().await;
+                    }
+                    if listener.owner != config.name || listener.config.fd_name != act.fd_name {
+                        listener.fd_name = act.fd_name.clone();
+                    }
+                    listener.owner = config.name.clone();
+                    listener.order = order;
+                    listener.config = act.clone();
+                    if let Some(path) = &act.socket {
+                        apply_uds_permissions(path, act, &config.name);
+                    }
+                    listener
+                } else {
+                    match bind_activation_listener(act, &config.name) {
+                        Ok((fd, fd_name)) => ManagedListener {
+                            owner: config.name.clone(),
+                            order,
+                            config: act.clone(),
+                            fd,
+                            fd_name,
+                            task: None,
+                            path_identity: act.socket.as_ref().and_then(|path| {
+                                std::fs::symlink_metadata(path)
+                                    .ok()
+                                    .map(|m| (m.dev(), m.ino()))
+                            }),
+                        },
+                        Err(e) => {
+                            error!(service = %config.name, error = %e, "bind_activation_socket_failed");
+                            failed.insert(config.name.clone());
+                            errors.push(format!("{}: {:?}: {}", config.name, act, e));
+                            continue;
+                        }
+                    }
+                };
+                if listener
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.is_finished())
+                {
+                    listener.pause().await;
+                }
+                self.listeners.push(listener);
+            }
+        }
+        for mut listener in old {
+            listener.pause().await;
+            listener.remove_path();
+        }
+        let mut registrations = Vec::new();
+        let mut handlers = Vec::new();
+        for (index, listener) in self.listeners.iter().enumerate() {
+            if listener.config.wait {
+                match listener.fd.try_clone() {
+                    Ok(fd) => registrations.push((
+                        listener.owner.clone(),
+                        listener.order,
+                        fd,
+                        listener.fd_name.clone(),
+                    )),
+                    Err(e) => {
+                        failed.insert(listener.owner.clone());
+                        errors.push(format!("{}: clone listener: {}", listener.owner, e));
+                    }
+                }
+            }
+            if listener.task.is_none() {
+                match listener.fd.try_clone() {
+                    Ok(fd) => handlers.push((index, fd)),
+                    Err(e) => {
+                        failed.insert(listener.owner.clone());
+                        errors.push(format!("{}: clone handler: {}", listener.owner, e));
+                    }
+                }
+            }
+        }
+        for listener in &mut self.listeners {
+            if failed.contains(&listener.owner) {
+                listener.pause().await;
+            }
+        }
+        // Replace configured registrations in one critical section. An
+        // untouched handler on another worker must never observe a partial set.
+        let registry = SERVICE_LISTENER_FDS.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut registry = registry.lock();
+            for (name, order) in previous_keys {
+                if let Some(fds) = registry.get_mut(&name) {
+                    fds.retain(|(index, _, _)| *index != order);
+                }
+            }
+            for (name, order, fd, fd_name) in registrations {
+                let fds = registry.entry(name).or_default();
+                fds.retain(|(index, _, _)| *index != order);
+                fds.push((order, fd, fd_name));
+                fds.sort_by_key(|(index, _, _)| *index);
+            }
+            registry.retain(|_, fds| !fds.is_empty());
+        }
+        // A queued request may activate only after its complete listener set
+        // has bound successfully. A later reload retries failed services.
+        for (index, fd) in handlers {
+            let listener = &mut self.listeners[index];
+            if !failed.contains(&listener.owner) {
+                let name = listener.owner.clone();
+                let wait = listener.config.wait;
+                let daemon = daemon.clone();
+                listener.task = Some(tokio::spawn(async move {
+                    handle_listener(fd, name, wait, daemon).await;
+                }));
+            }
+        }
+        errors
     }
-    handle_listener(fd, service_name, wait, daemon).await;
+}
+
+fn bind_activation_listener(
+    act: &ActivationConfig,
+    service: &str,
+) -> std::io::Result<(OwnedFd, Option<String>)> {
+    if let Some(port) = act.port {
+        if let Some(fd) = take_systemd_tcp_fd(port, act.datagram) {
+            return Ok((fd.fd, fd.name));
+        }
+        let bind = act
+            .bind
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("[::]");
+        return bind_inet_socket(bind, port, act.datagram).map(|fd| (fd, act.fd_name.clone()));
+    }
+    if let Some(path) = &act.socket {
+        if let Some(fd) = take_systemd_uds_fd(path, act.datagram) {
+            return Ok((fd.fd, fd.name));
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::remove_file(path);
+        let fd = bind_unix_socket(path, act.datagram)?;
+        apply_uds_permissions(path, act, service);
+        return Ok((fd, act.fd_name.clone()));
+    }
+    if let Some(port) = act.vsock_port {
+        if !act.datagram {
+            return bind_vsock_listener(act.vsock_cid.unwrap_or(VMADDR_CID_ANY), port)
+                .map(|fd| (fd, act.fd_name.clone()));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "unsupported activation socket",
+    ))
 }
 
 fn bind_inet_socket(bind_addr: &str, port: u16, datagram: bool) -> std::io::Result<OwnedFd> {
@@ -906,55 +1048,6 @@ fn bind_ipv6_dual_stack(
 // AF_VSOCK listener
 // ============================================================================
 
-async fn run_vsock_listener(
-    cid: Option<u32>,
-    port: u32,
-    fd_name: Option<String>,
-    service_name: String,
-    wait: bool,
-    order: usize,
-    daemon: Arc<Daemon>,
-) {
-    let cid = cid.unwrap_or(VMADDR_CID_ANY);
-    info!(
-        service = %service_name,
-        cid,
-        port,
-        wait,
-        "starting_vsock_listener"
-    );
-
-    if wait {
-        let has_auth = daemon
-            .configs
-            .lock()
-            .get(&service_name)
-            .is_some_and(|c| c.auth.is_some());
-        if has_auth {
-            error!(service = %service_name, "listener_activation_auth_conflict");
-            return;
-        }
-    }
-
-    let fd = match bind_vsock_listener(cid, port) {
-        Ok(fd) => fd,
-        Err(e) => {
-            error!(
-                cid,
-                port,
-                service = %service_name,
-                error = %e,
-                "bind_vsock_listener_failed"
-            );
-            return;
-        }
-    };
-    if wait {
-        register_service_listener_fd(&service_name, order, &fd, fd_name);
-    }
-    handle_listener(fd, service_name, wait, daemon).await;
-}
-
 #[cfg(target_os = "linux")]
 const VMADDR_CID_ANY: u32 = 0xffff_ffff;
 
@@ -1018,65 +1111,18 @@ fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
 // UDS listener
 // ============================================================================
 
-async fn run_uds_listener(
-    path: String,
-    service_name: String,
-    wait: bool,
-    order: usize,
-    datagram: bool,
-    socket_mode: Option<u32>,
-    socket_user: Option<String>,
-    socket_group: Option<String>,
-    fd_name: Option<String>,
-    daemon: Arc<Daemon>,
-) {
-    info!(
-        proto = if datagram { "UDS datagram" } else { "UDS stream" },
-        service = %service_name,
-        path = %path,
-        "starting_uds_listener"
-    );
-    if datagram && !wait {
-        error!(service = %service_name, "uds_datagram_activation_accept_true_not_supported");
-        return;
-    }
-    if let Some(parent) = std::path::Path::new(&path).parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        error!(
-            directory = %parent.display(),
-            service = %service_name,
-            error = %e,
-            "create_uds_directory_failed"
-        );
-        return;
-    }
-    let _ = std::fs::remove_file(&path);
-
-    let fd = match bind_unix_socket(&path, datagram) {
-        Ok(fd) => fd,
-        Err(e) => {
-            error!(
-                path = %path,
-                service = %service_name,
-                error = %e,
-                "bind_unix_socket_failed"
-            );
-            return;
-        }
-    };
-
+fn apply_uds_permissions(path: &str, act: &ActivationConfig, service: &str) {
     // Apply socket permissions from config, or default to public local IPC.
     // Apps authenticate requests at the protocol layer.
     if let Ok(metadata) = std::fs::metadata(&path) {
-        let mode = socket_mode.unwrap_or(0o666);
+        let mode = act.socket_mode.unwrap_or(0o666);
         let mut perms = metadata.permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, mode);
         let _ = std::fs::set_permissions(&path, perms);
     }
 
     // Apply socket ownership from config
-    if let Some(user) = socket_user {
+    if let Some(user) = &act.socket_user {
         if unsafe { libc::getuid() } == 0 {
             let uid = match user.parse::<u32>() {
                 Ok(n) => n,
@@ -1087,15 +1133,16 @@ async fn run_uds_listener(
                         // chown the socket to root. Leave ownership unchanged.
                         warn!(
                             user = %user,
-                            service = %service_name,
+                            service = %service,
                             "resolve_socket_user_failed"
                         );
                         u32::MAX
                     }
                 },
             };
-            let c_path = std::ffi::CString::new(path.as_str()).unwrap_or_default();
-            let gid = socket_group
+            let c_path = std::ffi::CString::new(path).unwrap_or_default();
+            let gid = act
+                .socket_group
                 .as_ref()
                 .and_then(|g| {
                     if g.is_empty() {
@@ -1108,7 +1155,7 @@ async fn run_uds_listener(
                                 None => {
                                     warn!(
                                         group = %g,
-                                        service = %service_name,
+                                        service = %service,
                                         "resolve_socket_group_failed"
                                     );
                                     u32::MAX
@@ -1124,7 +1171,7 @@ async fn run_uds_listener(
         } else {
             warn!(path = %path, "cannot_chown_non_root");
         }
-    } else if let Some(group) = socket_group
+    } else if let Some(group) = &act.socket_group
         && unsafe { libc::getuid() } == 0
     {
         let gid = match group.parse::<u32>() {
@@ -1134,23 +1181,18 @@ async fn run_uds_listener(
                 None => {
                     warn!(
                         group = %group,
-                        service = %service_name,
+                        service = %service,
                         "resolve_socket_group_failed"
                     );
                     u32::MAX
                 }
             },
         };
-        let c_path = std::ffi::CString::new(path.as_str()).unwrap_or_default();
+        let c_path = std::ffi::CString::new(path).unwrap_or_default();
         unsafe {
             libc::chown(c_path.as_ptr() as *const _, u32::MAX, gid);
         }
     }
-
-    if wait {
-        register_service_listener_fd(&service_name, order, &fd, fd_name);
-    }
-    handle_listener(fd, service_name, wait, daemon).await;
 }
 
 fn bind_unix_socket(path: &str, datagram: bool) -> std::io::Result<OwnedFd> {
@@ -1220,6 +1262,7 @@ async fn handle_listener(
                         guard.clear_ready();
                         continue;
                     }
+                    crate::states::ServiceState::Stopped => {}
                     // Starting/Running/Stopping: already tracked by the daemon.
                     _ => {
                         guard.clear_ready();

@@ -54,11 +54,59 @@ struct Args {
 // containers. It is far more tolerant - can run as any PID, fallbacks if it can't
 // handle cgroups, etc. It is also using /home
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let (_log_buffer, _trace_guard) = mesh::local_trace::init("mesh-init");
-
+fn main() -> Result<()> {
     let args = Args::parse();
+    // Operator commands keep their preview/help output on the invoking terminal.
+    let operator_command = args
+        .command
+        .first()
+        .is_some_and(|command| command == "seed");
+    let logging = if operator_command {
+        None
+    } else {
+        match mesh_init::logging::prepare_process_logging(args.command.is_empty()) {
+            Ok(logging) => {
+                if std::env::var_os("MESH_LOG_DIR").is_none_or(|value| value.is_empty()) {
+                    // SAFETY: runtime, trace writer and capture threads have not started.
+                    unsafe { std::env::set_var("MESH_LOG_DIR", &logging.directory) };
+                }
+                Some(logging)
+            }
+            Err(error) => {
+                eprintln!("mesh-init: log policy unavailable: {error}");
+                None
+            }
+        }
+    };
+    let _capture = logging
+        .as_ref()
+        .and_then(|logging| match logging.capture() {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!("mesh-init: output capture unavailable: {error}");
+                None
+            }
+        });
+    let access = logging
+        .as_ref()
+        .map(|logging| logging.access)
+        .unwrap_or_default();
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(async_main(args, access)));
+    if let Err(error) = &result {
+        // Report while capture is alive; Rust's Termination report runs after
+        // local guards have dropped and the original descriptors are restored.
+        eprintln!("mesh-init: {error:#}");
+    }
+    result
+}
+
+async fn async_main(args: Args, access: mesh::logging::LogFileAccess) -> Result<()> {
+    let (_log_buffer, _trace_guard) = mesh::local_trace::init_with_log_access("mesh-init", access);
+
     let socket_path = get_socket_path();
     let config_dirs = get_config_dirs();
 

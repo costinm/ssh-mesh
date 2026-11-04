@@ -69,7 +69,29 @@ SIGSTOP fallback.
 |---:|---|---|---|
 | 1 | `name` | `string` | |
 
-## 6. `reload` — Reload service configuration from disk
+## 6. `reload` — Reload configuration and activation sockets without restarting
+
+Rescan the core config directories. Added, removed, renamed and reordered
+TCP/UDP, Unix and VSOCK listeners take effect without restarting mesh-init,
+including when it is PID 1. Unchanged bound sockets and their queued connections
+are retained; an address can move between services. Changed running services
+are stopped and restarted with the new ordered `LISTEN_FDS`/`LISTEN_FDNAMES`.
+Removed core services are stopped and their stored listener FDs are released.
+On-demand service configs outside the core directories remain loaded.
+
+Unreadable or malformed config files reject the reload before changing live
+state. Binding, stopping, starting or `ExecReload` failures return an error;
+a bind failure can leave other successfully reconciled sockets active. After
+fixing a failed bind, call `reload` again even if the config is unchanged.
+Unchanged running services still run their configured `ExecReload` commands.
+Reload refuses to replace a running service whose old config has `KillMode=none`
+or `SendSIGKILL=false`; stop that service before reloading. Other replaced
+children must have exited, confirmed through captured pidfds, before their
+listeners can be transferred or released.
+
+Success returns `{"reloaded":true,"changed":N}`, where `N` counts added,
+changed and removed core services. No method-specific push messages are sent;
+normal service lifecycle and listener diagnostics are traced.
 
 ## 14. `reconcile` — Reconcile managed services after host resume or recovery
 

@@ -166,8 +166,12 @@ Known differences from systemd:
 - Full `KillMode=control-group` and `KillMode=mixed` semantics. The current
   implementation is main-process oriented, with `KillMode=none` honored.
 - `StandardOutput=journal`/`kmsg` and related console aliases inherit
-  mesh-init's own stdout/stderr destination; mesh-init does not provide a
-  separate journal backend.
+  mesh-init's own stdout/stderr destination. By default, these append to
+  `/home/system/logs/mesh-init-console.log` for root supervisors, including
+  service startup panics; structured supervisor warnings/errors go to
+  `mesh-init.log` in the same directory. The system user owns these logs.
+  See [ENV.md](ENV.md) for overrides and non-root defaults. No journal backend
+  or systemd installation is required.
 
 Useful systemd fields not supported yet, in likely implementation order:
 

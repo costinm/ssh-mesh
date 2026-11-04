@@ -8,6 +8,25 @@ When started as root and `MESH_INIT_DIR` is unset, core config is loaded from
 `/home/system/etc/mesh-init`. `MESH_INIT_DIR` replaces that default directory.
 Non-root `mesh-init` defaults to `$HOME/etc/mesh-init`.
 
+After editing, adding or removing a core service file, call the `reload` RPC
+(`mesh --rpc-format json-rpc unix:///run/mesh/mesh-init/mesh.sock mesh-init reload`).
+Reload reconciles the activation sockets in place, so it also works when
+mesh-init is PID 1. Unchanged sockets retain their bound descriptors and queued
+connections. Moving a port or Unix socket to another service stops the old
+service and transfers the listener to the new one; changing a running service
+restarts that service with its updated configuration. Removed core services are
+stopped and unloaded. Unchanged running services execute `ExecReload`.
+A running service with `KillMode=none` or `SendSIGKILL=false` must be stopped
+before its config can be replaced; reload rejects that policy before making
+changes. Other replaced children are confirmed exited through captured pidfds
+before any listener ownership is transferred or released.
+
+A malformed or unreadable file rejects the whole config snapshot. A later
+socket bind or child start failure is returned to the caller; successfully
+applied changes remain in effect. Fix the reported error and call `reload`
+again; failed sockets are retried even if their config did not change. Reload
+does not replace the mesh-init executable or its own control socket.
+
 Service definitions are node-local client policy: they describe how processes
 on this node connect to a logical FQDN, including `[Mesh].Address`, transport,
 and encoding. `ExecStart` is the local-exec

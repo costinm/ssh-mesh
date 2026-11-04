@@ -147,6 +147,31 @@ struct MeshInitTerminal {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bracketed_ipv6_cannot_bypass_shared_route_policy() {
+        use crate::router::{RouteEntry, RouteMatch, RoutePolicy, RouteSource, RouteTarget};
+        let directory = tempfile::tempdir().unwrap();
+        let node = MeshNode::new(Some(directory.path().to_owned()), Some(Default::default()));
+        node.router.table.set_static(vec![RouteEntry {
+            matches: RouteMatch::IpPrefix {
+                addr: "::1".parse().unwrap(),
+                len: 128,
+            },
+            target: RouteTarget::Trails(vec![]),
+            policy: RoutePolicy {
+                allow: vec!["different-user".into()],
+                local_only: false,
+            },
+            source: RouteSource::Static {
+                file: "test".into(),
+            },
+        }]);
+        let mut handler = SshHandler::new(1, node);
+        handler.user = "alice".into();
+        assert!(handler.mesh_routed_stream("::1", 443).await.is_err());
+        assert!(handler.mesh_routed_stream("[::1]", 443).await.is_err());
+    }
+
     #[test]
     fn jump_route_matches_direct_tcpip_host_and_port() {
         let route = SshRouteConfig {
@@ -221,6 +246,46 @@ impl SshHandler {
             .iter()
             .find(|route| jump_route_matches(route, host, port))
             .cloned()
+    }
+
+    async fn mesh_routed_stream(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> anyhow::Result<Option<Box<dyn mesh::MeshStream>>> {
+        use crate::router::{Caller, Destination, Ingress, StreamRequest};
+        // Parse the host itself first so bracketed and unbracketed IPv6
+        // select the same policy instead of falling through to legacy dialing.
+        let Some(mut destination) = Destination::from_authority(host) else {
+            return Ok(None);
+        };
+        match &mut destination {
+            Destination::Host {
+                port: target_port, ..
+            }
+            | Destination::Ip {
+                port: target_port, ..
+            } => {
+                *target_port = Some(port);
+            }
+            Destination::ConnId(_) => return Ok(None),
+        }
+        if self.server.router.table.lookup(&destination).is_none() {
+            return Ok(None);
+        }
+        let request = StreamRequest {
+            destination,
+            caller: Caller {
+                identity: self
+                    .cert_user
+                    .clone()
+                    .or_else(|| (!self.user.is_empty()).then(|| self.user.clone())),
+                ingress: Ingress::Ssh,
+                local: self.trusted_transport,
+            },
+            header: Default::default(),
+        };
+        self.server.router.open_stream(request).await.map(Some)
     }
 
     fn activation_context(&self, command: Option<String>) -> mesh::protocol::ActivationContext {
@@ -1967,6 +2032,29 @@ impl server::Handler for SshHandler {
             let mut sessions_lock = sessions.lock().await;
             sessions_lock.insert(channel_id, channel_session);
             drop(sessions_lock);
+
+            if host != "local" && host != "dmesh-msg" {
+                if let Ok(port) = u16::try_from(port) {
+                    match me.mesh_routed_stream(&host, port).await {
+                        Ok(Some(stream)) => {
+                            Self::bridge_stream_to_channel(
+                                stream,
+                                channel_id,
+                                me.channel_writers.clone(),
+                                session_handle,
+                                format!("mesh route {host}:{port}"),
+                            )
+                            .await;
+                            return Ok(true);
+                        }
+                        Ok(None) => {} // preserve legacy jump/open-relay handling for unmatched targets
+                        Err(error) => {
+                            error!("SSH route {host}:{port} rejected: {error:#}");
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
 
             if let (Some(route), Some(context), Ok(incoming_port)) =
                 (jump_route, jump_context, u16::try_from(port))

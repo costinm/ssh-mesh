@@ -692,7 +692,6 @@ fn set_nonblocking(fd: std::os::fd::RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{MeshNode, MeshNodeConfig};
 
@@ -744,16 +743,12 @@ mod tests {
     #[tokio::test]
     async fn trusted_duplex_exec_uses_none_auth_and_none_crypto() {
         let _guard = crate::test_utils::TEST_MUTEX.lock().await;
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base_dir = std::env::temp_dir().join(format!(
-            "ssh-mesh-trusted-duplex-{}-{}",
-            std::process::id(),
-            unique
-        ));
-        std::fs::create_dir_all(&base_dir).unwrap();
+        // Leave room for the mock control socket suffix within AF_UNIX's limit.
+        let directory = tempfile::Builder::new()
+            .prefix("ssh-trust-")
+            .tempdir()
+            .unwrap();
+        let base_dir = directory.path().to_path_buf();
 
         let mock_socket = base_dir.join("mesh-init-control.sock");
         let _mock_handle = crate::test_utils::start_mock_mesh_init(mock_socket, base_dir.clone());
@@ -789,16 +784,12 @@ mod tests {
     #[tokio::test]
     async fn configured_client_can_maintain_trusted_uds_connection() {
         let _guard = crate::test_utils::TEST_MUTEX.lock().await;
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base_dir = std::env::temp_dir().join(format!(
-            "ssh-mesh-trusted-uds-{}-{}",
-            std::process::id(),
-            unique
-        ));
-        std::fs::create_dir_all(&base_dir).unwrap();
+        // Leave room for the mock control socket suffix within AF_UNIX's limit.
+        let directory = tempfile::Builder::new()
+            .prefix("ssh-trust-")
+            .tempdir()
+            .unwrap();
+        let base_dir = directory.path().to_path_buf();
         let socket_path = base_dir.join("trusted.sock");
 
         let mock_socket = base_dir.join("mesh-init-control.sock");

@@ -36,7 +36,7 @@ fn destination(req: &Request<Body>) -> Option<Destination> {
 }
 
 /// The header record for a request: `/component/method` and `x-m-*` headers.
-fn header_record(req: &Request<Body>) -> TaggedRecord {
+pub(crate) fn header_record(req: &Request<Body>) -> TaggedRecord {
     let mut record = TaggedRecord::default();
     let segments: Vec<&str> = req.uri().path().split('/').collect();
     // A leading empty segment from the first `/`, then exactly two names.

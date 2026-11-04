@@ -57,16 +57,26 @@ http_auth:
     http: login
     admin: apikey
   exempt: ["/status"]    # more paths that skip authentication
-  session_ttl_secs: 43200
+  session_ttl_secs: 0  # no server-side expiry; positive values set an inactivity timeout
 ```
 
 - `apikey`: a request needs a valid credential, otherwise 401 with
   `WWW-Authenticate` for Bearer and Basic.
 - `login`: like `apikey`, and a browser navigation (GET or HEAD accepting
-  `text/html`) is redirected to `/_m/login?next=...`. The page exchanges an
+  `text/html`) is redirected to `/_m/login?next=...`. Other rejected requests
+  receive 401 with only a Bearer challenge, so expired sessions do not trigger
+  native browser password dialogs. Basic credentials are still accepted.
+  The page exchanges an
   API key for the `mesh_session` cookie (`HttpOnly`, `SameSite=Strict`, and
   `Secure` on TLS listeners). `/_m/logout` clears it. After 10 failed logins
   in a minute, login answers 429 for all callers until the minute passes.
+  Sessions default to no server-side expiry. Persistent cookies use a one-year
+  retention window renewed on every cookie-authenticated request; browsers may
+  still clear them. A positive `session_ttl_secs` sets a sliding inactivity timeout.
+  The login page shows the server-specific key-generation command and verifies
+  cookie acceptance before returning to the app. Invalid keys, blocked cookies,
+  and rate limits produce visible errors. Its explicit `ssh-mesh` account name
+  distinguishes the gateway credential from upstream application passwords.
 - Built-in auth exclusions: `/.well-known/`, `/_m/login`, `/_m/logout`,
   `/_m/_ssh`, and `/_m/_ws/_ssh` (SSH authenticates itself). A trailing `/`
   matches a prefix; other entries match the exact path and descendants on a
@@ -75,6 +85,51 @@ http_auth:
 - The `http80` listener serves ACME challenges and static files without auth.
   HTTPS auth settings never install login or logout handlers on port 80.
 
+### Authenticated HTTPS backends
+
+The HTTPS web listener supports exact host mappings in `mesh.toml`:
+
+```toml
+[http_proxies]
+"oc.example.org" = "127.0.0.1:49374"
+
+[http_auth.listeners]
+https = "login"
+```
+
+Upstreams are HTTP `host:port` authorities. Names are case-insensitive and match
+the incoming authority/Host without its optional port. Unmatched names retain
+the static web fallback. These mappings populate the node-owned router's static
+table, shared with authenticated stream ingress and SSH direct-tcpip. Updating
+the HTTP mapping source preserves other static sources and dynamic claims.
+Its destination selection and caller policy check run before the existing
+pooled HTTP reverse proxy forwards the request. Request paths, queries, methods
+and streaming bodies are preserved; responses stream, including SSE, and HTTP/1.1 upgrades such as
+WebSockets are bridged in both directions. The original Host is preserved and
+`X-Forwarded-Host`/`X-Forwarded-Proto: https` are set. Gateway credentials
+(verified gateway `Authorization`/`X-Api-Key` values and the `mesh_session`
+cookie) are removed before forwarding. Application credentials and cookies
+remain, allowing a gateway session and separate upstream authentication.
+
+When HTTPS web authentication is enabled, only the gateway login/logout pages are exempt:
+transport/metadata exclusions and `http_auth.exempt` cannot bypass backend
+authentication. Browser navigations redirect to `/_m/login`; API requests get
+401 without a valid key or session. Plain `http80` never serves the proxy and
+continues serving ACME files publicly. Config changes require restarting the
+ssh-mesh service, for example through mesh-init reload after updating its service
+configuration. Obtain a login key with `meshkeys apikey ID --keydir SSH_BASEDIR`
+as a user allowed to read that directory's `mesh_secret`.
+
+`POST /_m/stream[/component/method]` and `CONNECT /_m/stream[...]` on HTTPS use
+the existing `http_ingress::handle` and full shared stream router. The authority
+selects the destination and the optional suffix supplies component/method
+metadata. Request-body bytes flow to the target and response-body bytes flow
+back; this is a byte-stream tunnel, distinct from browser HTTP reverse proxying.
+Keep the request body open while receiving when the target protocol requires
+full duplex; ending it closes the target's write half. These routes use the
+same web authentication and per-route caller policy. Local registered components,
+handler targets and mesh-init activation are available through stream routing.
+
 **Credentials need no storage.** They are derived from one master secret,
 `<SSH_BASEDIR>/mesh_secret`: 32 random bytes as 64 hex characters, mode 0600,
 generated on first start next to the SSH host key. An existing file that is not
@@ -82,13 +137,13 @@ generated on first start next to the SSH host key. An existing file that is not
 invalidate every issued key. An API key is `ID:SECRET`; print one with:
 
 ```sh
-meshkeys apikey alice@example.m --keydir /home/ssh-mesh/.ssh
+meshkeys apikey alice@example.m
 ```
 
 (`meshkeys` only reads the secret; the server creates it.) Send the key as
 `Authorization: Bearer ID:SECRET`, as `X-Api-Key`, as a Basic user and password
 (`ID` and `SECRET`), or type it at the login page. A session token (HS256 JWT,
-expiring after `session_ttl_secs`) is accepted as `Authorization: Bearer
+with optional expiry configured by `session_ttl_secs`) is accepted as `Authorization: Bearer
 <token>` or in the cookie, which are equivalent. A key does not expire, and one
 key cannot be revoked on its own: replacing `mesh_secret` revokes all of them,
 and all session tokens. Back the file up; it is the only secret. The SSH host
@@ -157,3 +212,43 @@ set of certificate paths to serve. A failed reload preserves the active set;
 existing connections stay open. There is no periodic certificate scan and no
 process restart is needed. The HTTPS listener remains available for explicit
 first-certificate installation even if no certificate was present at startup.
+
+## Shared configuration and per-host web authentication
+
+Without overrides, ssh-mesh and meshkeys use `/home/ssh-mesh/etc` when it is
+readable by the caller (including supplementary-group access), otherwise
+`$HOME/etc`. Logs prefer writable `/home/ssh-mesh/logs`, otherwise `$HOME/logs`.
+`SSH_BASEDIR`, `SSH_MESH_CONFIG`, mesh app-home overrides, `MESH_LOG_FILE`,
+and `MESH_LOG_DIR` still take precedence. `env.sh` preserves the real HOME and
+normal XDG directories; only build toolchains and caches remain under `target/`.
+
+The ACME client and gateway share one default: `MESH_ACME_HOME`, readable
+`/home/acme`, or `<ssh-mesh home>/acme`. `--home`/`acme_home` override it.
+Moving an ACME home preserves its account, certificates, and HTTP-01 web root.
+
+Exact HTTPS host overrides use `http_auth.hosts`; host matching ignores DNS
+case, a trailing dot, and the request port. They do not affect other listeners.
+A public web host forwards `/_m/stream` to its own upstream instead of exposing
+the internal stream RPC. Gateway cookies are removed even on public forwards;
+application Authorization headers remain intact.
+
+```toml
+[http_proxies]
+"oc.h.i.webinf.info" = "127.0.0.1:49374"
+"admin.h.i.webinf.info" = "127.0.0.1:7080"
+
+[http_auth]
+session_ttl_secs = 0
+
+[http_auth.listeners]
+https = "login"
+admin = "none" # listener bound exclusively to 127.0.0.1; HTTPS enforces login
+
+[http_auth.hosts]
+"oc.h.i.webinf.info" = "none" # backend authenticates its own users
+"admin.h.i.webinf.info" = "login"
+```
+
+The admin listener must remain loopback-only when using this configuration.
+Unknown HTTPS hosts inherit the listener's login requirement. Generate the
+admin login key with `meshkeys apikey admin`; it is the full ID:SECRET value.

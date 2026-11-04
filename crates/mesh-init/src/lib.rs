@@ -5,6 +5,7 @@ pub mod api;
 pub mod cgroup;
 pub mod config;
 pub mod daemon;
+pub mod logging;
 pub mod network;
 pub mod notify;
 pub mod observer;

@@ -122,7 +122,10 @@ impl MeshServiceRegistry {
             .unwrap_or_default()
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .filter_map(|name| name.split_once('.').map(|(component, _)| component.to_owned()))
+            .filter_map(|name| {
+                name.split_once('.')
+                    .map(|(component, _)| component.to_owned())
+            })
             .collect();
         components.sort();
         components.dedup();
@@ -591,7 +594,7 @@ async fn post_record(
     body: Bytes,
 ) -> Response {
     let persist = match state
-        .mesh_services
+        .mesh_services()
         .authorize(query.apikey.as_deref(), &headers)
     {
         Ok(persist) => persist,
@@ -632,8 +635,8 @@ async fn post_record(
             }
             record.to = Some(Value::String(to.clone()));
         }
-        let one_way = prepare_delivery(&state.mesh_services, &query, &mut record)?;
-        let service = state.mesh_services.service(&service_name)?;
+        let one_way = prepare_delivery(state.mesh_services(), &query, &mut record)?;
+        let service = state.mesh_services().service(&service_name)?;
         let response = dispatch(&service, record.clone()).await?;
         if one_way {
             if response.is_some() {
@@ -689,7 +692,7 @@ async fn post_call(
     body: Bytes,
 ) -> Response {
     let persist = match state
-        .mesh_services
+        .mesh_services()
         .authorize(query.apikey.as_deref(), &headers)
     {
         Ok(persist) => persist,
@@ -700,9 +703,9 @@ async fn post_call(
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
     let result = async {
-        let service = state.mesh_services.service(&service_name)?;
+        let service = state.mesh_services().service(&service_name)?;
         let resolved = state
-            .mesh_services
+            .mesh_services()
             .catalog(&service)?
             .ok_or_else(|| anyhow::anyhow!("service has no catalog; use records"))?;
         let catalog = resolved.catalog.as_ref();
@@ -718,7 +721,7 @@ async fn post_call(
             }
             record.to = Some(Value::String(to.clone()));
         }
-        let one_way = prepare_delivery(&state.mesh_services, &query, &mut record)?;
+        let one_way = prepare_delivery(state.mesh_services(), &query, &mut record)?;
         let response = dispatch(&service, record.clone()).await?;
         if one_way {
             if response.is_some() {
@@ -764,11 +767,11 @@ async fn list_services(
     headers: HeaderMap,
 ) -> Response {
     match state
-        .mesh_services
+        .mesh_services()
         .authorize(query.apikey.as_deref(), &headers)
     {
         Ok(persist) => persist_api_key(
-            Json(state.mesh_services.describe()).into_response(),
+            Json(state.mesh_services().describe()).into_response(),
             query.apikey.as_deref(),
             persist,
         ),
@@ -783,14 +786,14 @@ async fn get_tools(
     headers: HeaderMap,
 ) -> Response {
     let persist = match state
-        .mesh_services
+        .mesh_services()
         .authorize(query.apikey.as_deref(), &headers)
     {
         Ok(persist) => persist,
         Err(error) => return error_response(StatusCode::UNAUTHORIZED, error),
     };
-    match state.mesh_services.service(&service_name) {
-        Ok(service) => match state.mesh_services.catalog(&service) {
+    match state.mesh_services().service(&service_name) {
+        Ok(service) => match state.mesh_services().catalog(&service) {
             Ok(Some(catalog)) => persist_api_key(
                 match catalog_for_view(catalog.tools.as_ref(), query.view.as_deref()) {
                     Ok(catalog) => Json(catalog).into_response(),
@@ -910,7 +913,10 @@ mod tests {
         let components = registry.register_catalog_components(&resolved, "/run/x/mesh.sock.cbor");
         assert_eq!(components, ["discovery", "telemetry"]);
         let service = registry.service("telemetry").unwrap();
-        assert!(matches!(service.backend, MeshServiceBackend::UdsSeqpacket(_)));
+        assert!(matches!(
+            service.backend,
+            MeshServiceBackend::UdsSeqpacket(_)
+        ));
         assert_eq!(service.component, "test-catalog");
         assert!(registry.service("status").is_err());
     }

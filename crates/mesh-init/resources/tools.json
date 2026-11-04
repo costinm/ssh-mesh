@@ -185,7 +185,7 @@
     ]
   },
   {
-    "description": "Reload service configuration from disk",
+    "description": "Reload configuration and activation sockets without restarting",
     "inputSchema": {
       "properties": {},
       "required": [],

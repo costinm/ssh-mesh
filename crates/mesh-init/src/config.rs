@@ -94,6 +94,26 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
     configs
 }
 
+/// Read a complete reload snapshot, failing before live state changes if any
+/// present configuration file cannot be read or parsed.
+pub(crate) fn load_system_configs_for_reload(dirs: &[&str]) -> Result<Vec<AppConfig>, ConfigError> {
+    let mut configs = Vec::new();
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                configs.push(load_app_config(&path)?);
+            }
+        }
+    }
+    Ok(configs)
+}
+
 /// Resolve core config directories in load order.
 ///
 /// Later directories override earlier ones when the same service name appears

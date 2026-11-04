@@ -28,6 +28,9 @@ use tracing::{error as tracing_error, instrument};
 pub struct Assets;
 
 use crate::AppState;
+use crate::httpauth::{GatewayCredentials, Identity, SESSION_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, Version, header};
+use hyper_util::rt::TokioIo;
 
 /// Serve a JSON file from the `web/` directory by path.
 ///
@@ -938,49 +941,170 @@ pub async fn handle_proxy_request(
         }
     };
 
-    let path = req.uri().path();
-    let query = req
-        .uri()
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
+    reverse_proxy_request(target_addr, req, ProxyOptions::default()).await
+}
 
-    let uri_str = if target_addr.contains(':') {
-        format!("http://{}{}{}", target_addr, path, query)
+#[derive(Default)]
+pub(crate) struct ProxyOptions {
+    /// Keep the incoming virtual host for name-based web backends.
+    pub preserve_host: bool,
+    /// Scheme established by a trusted ingress, rather than a caller header.
+    pub forwarded_proto: Option<&'static str>,
+}
+
+/// Forward HTTP through the existing pooled proxy client, preserving streaming
+/// bodies and bridging protocol upgrades. All HTTP ingress adapters share this.
+pub(crate) async fn reverse_proxy_request(
+    target: &str,
+    mut request: axum::extract::Request,
+    options: ProxyOptions,
+) -> Response {
+    // Preserve APP_HTTP_PORT's port-only form for legacy callers.
+    let target = if target.contains(':') {
+        target.to_owned()
     } else {
-        format!("http://127.0.0.1:{}{}{}", target_addr, path, query)
+        format!("127.0.0.1:{target}")
     };
-
-    let (mut parts, body) = req.into_parts();
-    parts.uri = match uri_str.parse() {
-        Ok(uri) => uri,
-        Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("invalid proxy target URI {uri_str}: {error}"),
-            )
-                .into_response();
-        }
+    let target = target.as_str();
+    let upgrade = request.headers().contains_key(header::UPGRADE)
+        && connection_tokens(request.headers())
+            .iter()
+            .any(|s| s == "upgrade");
+    let downstream = upgrade.then(|| hyper::upgrade::on(&mut request));
+    let original_host = request
+        .uri()
+        .authority()
+        .and_then(|a| HeaderValue::from_str(a.as_str()).ok())
+        .or_else(|| request.headers().get(header::HOST).cloned());
+    let credentials = if request.extensions().get::<Identity>().is_some() {
+        request.extensions().get::<GatewayCredentials>().copied()
+    } else {
+        Some(GatewayCredentials::default())
     };
-
-    // Update Host header
-    let host = match target_addr.parse() {
+    strip_gateway_credentials(request.headers_mut(), credentials);
+    strip_hop_headers(request.headers_mut(), upgrade);
+    request.headers_mut().remove("forwarded");
+    request.headers_mut().remove("x-forwarded-for");
+    request.headers_mut().remove("x-forwarded-proto");
+    if let Some(proto) = options.forwarded_proto {
+        request
+            .headers_mut()
+            .insert("x-forwarded-proto", HeaderValue::from_static(proto));
+    }
+    let upstream_host = match HeaderValue::from_str(target) {
         Ok(host) => host,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let host = if options.preserve_host {
+        original_host.clone().unwrap_or(upstream_host)
+    } else {
+        upstream_host
+    };
+    request.headers_mut().insert(header::HOST, host);
+    if let Some(host) = original_host {
+        request.headers_mut().insert("x-forwarded-host", host);
+    }
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |path| path.as_str());
+    let uri = format!("http://{target}{path}");
+    *request.uri_mut() = match uri.parse() {
+        Ok(uri) => uri,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    // Upstream connections use HTTP/1.1, including browser WebSocket upgrades.
+    *request.version_mut() = Version::HTTP_11;
+    let mut response = match proxy_client().request(request).await {
+        Ok(response) => response,
         Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("invalid proxy host header {target_addr}: {error}"),
-            )
-                .into_response();
+            log::warn!("HTTP proxy upstream {target} failed: {error}");
+            return StatusCode::BAD_GATEWAY.into_response();
         }
     };
-    parts.headers.insert(hyper::header::HOST, host);
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let Some(downstream) = downstream else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        let upstream = hyper::upgrade::on(&mut response);
+        tokio::spawn(async move {
+            match tokio::try_join!(downstream, upstream) {
+                Ok((downstream, upstream)) => {
+                    let _ = tokio::io::copy_bidirectional(
+                        &mut TokioIo::new(downstream),
+                        &mut TokioIo::new(upstream),
+                    )
+                    .await;
+                }
+                Err(error) => log::debug!("HTTP proxy upgrade failed: {error}"),
+            }
+        });
+    } else {
+        strip_hop_headers(response.headers_mut(), false);
+    }
+    response.into_response()
+}
 
-    let proxy_req = hyper::Request::from_parts(parts, body);
+fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect()
+}
 
-    match proxy_client().request(proxy_req).await {
-        Ok(res) => res.into_response(),
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", err)).into_response(),
+fn strip_hop_headers(headers: &mut HeaderMap, upgrade: bool) {
+    for token in connection_tokens(headers) {
+        if !(upgrade && token == "upgrade") {
+            headers.remove(token);
+        }
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        if !(upgrade && matches!(name, "connection" | "upgrade")) {
+            headers.remove(name);
+        }
+    }
+}
+
+fn strip_gateway_credentials(headers: &mut HeaderMap, credentials: Option<GatewayCredentials>) {
+    // Legacy identity producers do not identify credential carriers: retain
+    // their conservative stripping behavior. Cookie-authenticated requests can
+    // carry independent upstream credentials in these headers.
+    if credentials.is_none_or(|credentials| credentials.authorization) {
+        headers.remove(header::AUTHORIZATION);
+    }
+    if credentials.is_none_or(|credentials| credentials.api_key) {
+        headers.remove("x-api-key");
+    }
+    let cookies: Vec<_> = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .map(str::trim)
+        .filter(|cookie| {
+            cookie
+                .split_once('=')
+                .is_some_and(|(name, _)| name.trim() != SESSION_COOKIE)
+        })
+        .collect();
+    let cookies = cookies.join("; ");
+    headers.remove(header::COOKIE);
+    if let Ok(value) = HeaderValue::from_str(&cookies) {
+        if !cookies.is_empty() {
+            headers.insert(header::COOKIE, value);
+        }
     }
 }
 
