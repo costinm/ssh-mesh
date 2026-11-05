@@ -3868,6 +3868,15 @@ fn spawn_stderr_reader(
 // Tests
 // ============================================================================
 
+/// Serializes the unit tests that bind loopback TCP ports. `port()`
+/// reserves an ephemeral port by binding and immediately dropping the
+/// listener, so while one test's daemon rebinds that port a concurrently
+/// running test can claim the same number and satisfy (or defeat) its
+/// connect assertions. Cross-test-binary races do not apply because
+/// `cargo test` runs one test binary at a time.
+#[cfg(test)]
+static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3962,7 +3971,7 @@ mod tests {
         );
 
         let outcome = daemon
-            .freeze_for_idle_with("echo", Duration::from_millis(300))
+            .freeze_for_idle_with("echo", Duration::from_secs(2))
             .await;
         assert!(matches!(outcome, Ok(Some(1))), "{outcome:?}");
         let services = daemon.services.lock();
@@ -4944,6 +4953,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_added_listener_activates_new_and_stopped_service() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         use tokio::io::AsyncReadExt;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(dir.path());
@@ -5005,6 +5015,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_transfers_queued_socket_and_retires_removed_service() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(dir.path());
         let p = port();
@@ -5045,6 +5056,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_preserves_descriptors_when_names_and_order_change() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(dir.path());
         let (a, b) = (port(), port());
@@ -5066,6 +5078,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_rejects_malformed_config_before_changing_live_sockets() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(dir.path());
         write_service(dir.path(), "reload-malformed", &[(port(), "http")]);
@@ -5127,6 +5140,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_bind_failure_keeps_partial_service_inactive_until_retry() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         use tokio::io::AsyncReadExt;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(dir.path());
@@ -5177,6 +5191,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_reports_bind_failure_and_retries_unchanged_config() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(dir.path());
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5198,6 +5213,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_refuses_transfer_when_old_child_stop_policy_cannot_guarantee_exit() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         for (index, policy) in ["KillMode = \"none\"", "SendSIGKILL = false"]
             .iter()
             .enumerate()
@@ -5258,6 +5274,7 @@ mod reload_tests {
 
     #[tokio::test]
     async fn reload_stops_removed_child_before_releasing_its_listener() {
+        let _net = NETWORK_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(dir.path());
         let p = port();
