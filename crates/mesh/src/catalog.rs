@@ -5,15 +5,22 @@
 //! resolver assembles one catalog per service from every JSON file found in
 //! the standard schema directories, searched in priority order:
 //!
-//! 1. `$MESH_SCHEMA_DIR/<service>/` when `MESH_SCHEMA_DIR` is set;
-//! 2. `/opt/<service>/etc/schemas/` — installed with the service package;
-//! 3. `$HOME/opt/<service>/etc/schemas/` — per-user installed catalog;
-//! 4. `$HOME/etc/schemas/` — user-installed schemas shared across services.
+//! 1. `$MESH_SCHEMA_DIR/<service>/` when `MESH_SCHEMA_DIR` is set, plus its
+//!    `VERSION` subdirectory with the highest numeric name;
+//! 2. `$HOME/.cache/schemas/<service>/` — the default cache that projects
+//!    publish generated catalogs into, plus its highest numeric `VERSION`
+//!    subdirectory;
+//! 3. installed packages: `/opt/PACKAGE/etc/schemas/<service>/<VERSION>` and
+//!    `$HOME/opt/PACKAGE/etc/schemas/<service>/<VERSION>`; every package is
+//!    searched and the highest numeric `VERSION` wins;
+//! 4. `/opt/<service>/etc/schemas/`, `$HOME/opt/<service>/etc/schemas/` and
+//!    `$HOME/etc/schemas/` — the direct-file package and user layout.
 //!
 //! Within one directory, files load in sorted file-name order. A tool name
 //! that appears in more than one file keeps the definition from the
 //! higher-priority location, so a user file can extend but not shadow a
-//! packaged catalog.
+//! packaged catalog. JSON Schema files (top-level objects with `$schema`)
+//! are inspection artifacts: they are skipped, not parsed as catalogs.
 //!
 //! The ssh-mesh admin gateway serves the same catalog for operator
 //! discovery: `GET /_m/mesh/services` lists the registered services and
@@ -60,8 +67,10 @@ impl CatalogResolver {
         self.resolve(component).ok_or_else(|| {
             anyhow!(
                 "no {component} catalog found; install a .json schema under \
-                 /opt/{component}/etc/schemas, $HOME/opt/{component}/etc/schemas, \
-                 or $HOME/etc/schemas, or set MESH_SCHEMA_DIR/MESH_TOOLS"
+                 $HOME/.cache/schemas/{component}/, /opt/PACKAGE/etc/schemas/{component}/VERSION, \
+                 $HOME/opt/PACKAGE/etc/schemas/{component}/VERSION, /opt/{component}/etc/schemas, \
+                 $HOME/opt/{component}/etc/schemas, or $HOME/etc/schemas, \
+                 or set MESH_SCHEMA_DIR/MESH_TOOLS"
             )
         })?
     }
@@ -131,6 +140,11 @@ impl CatalogResolver {
                 .with_context(|| format!("read schema catalog {}", path.display()))?;
             let value: Value = serde_json::from_str(&contents)
                 .with_context(|| format!("parse schema catalog {}", path.display()))?;
+            // JSON Schema files (the full-fidelity `schema.json` artifacts)
+            // are not tool catalogs; they are inspection artifacts, skipped.
+            if value.get("$schema").is_some() {
+                continue;
+            }
             let tools = value
                 .as_array()
                 .cloned()
@@ -195,18 +209,30 @@ fn catalog_dirs_with<F>(component: &str, env: &mut F) -> Vec<PathBuf>
 where
     F: FnMut(&str) -> Option<OsString>,
 {
+    let home = env("HOME").map(PathBuf::from);
     let mut dirs = Vec::new();
     if let Some(root) = env("MESH_SCHEMA_DIR") {
-        dirs.push(PathBuf::from(root).join(component));
+        let root = PathBuf::from(root).join(component);
+        dirs.push(root.clone());
+        dirs.extend(highest_version_dir(&root));
+    }
+    if let Some(home) = &home {
+        let cache = home.join(".cache").join("schemas").join(component);
+        dirs.push(cache.clone());
+        dirs.extend(highest_version_dir(&cache));
+    }
+    for base in [Some(PathBuf::from("/opt")), home.as_ref().map(|h| h.join("opt"))] {
+        let Some(base) = base else { continue };
+        dirs.extend(best_package_version_dir(&base, component));
     }
     dirs.push(
         PathBuf::from("/opt")
             .join(component)
             .join("etc/schemas"),
     );
-    if let Some(home) = env("HOME") {
+    if let Some(home) = &home {
         dirs.push(
-            PathBuf::from(&home)
+            PathBuf::from(home)
                 .join("opt")
                 .join(component)
                 .join("etc/schemas"),
@@ -214,6 +240,47 @@ where
         dirs.push(PathBuf::from(home).join("etc/schemas"));
     }
     dirs
+}
+
+/// The `VERSION` subdirectory of one schema root with the highest numeric name.
+fn highest_version_dir(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let Ok(version) = entry.file_name().to_string_lossy().parse::<u64>() else {
+            continue;
+        };
+        let path = entry.path();
+        if path.is_dir() && best.as_ref().is_none_or(|(v, _)| version > *v) {
+            best = Some((version, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// `BASE/PACKAGE/etc/schemas/COMPONENT/VERSION`, searching every installed
+/// package under `BASE` and keeping only the highest numeric `VERSION`.
+fn best_package_version_dir(base: &Path, component: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let package = entry.path();
+        if !package.is_dir() {
+            continue;
+        }
+        let dir = highest_version_dir(&package.join("etc").join("schemas").join(component));
+        let Some(dir) = dir else { continue };
+        let version = dir
+            .file_name()
+            .and_then(|name| name.to_string_lossy().parse::<u64>().ok())
+            .unwrap_or(0);
+        if best.as_ref().is_none_or(|(v, _)| version > *v) {
+            best = Some((version, dir));
+        }
+    }
+    best.map(|(_, dir)| vec![dir]).unwrap_or_default()
 }
 
 fn catalog_files_with<F>(component: &str, env: F) -> Vec<PathBuf>
@@ -247,7 +314,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_dirs_use_schema_root_then_opt_then_home() {
+    fn catalog_dirs_use_schema_root_then_cache_then_opt_then_home() {
         let dirs = catalog_dirs_with("demo", &mut |key| match key {
             "MESH_SCHEMA_DIR" => Some(OsString::from("/schemas")),
             "HOME" => Some(OsString::from("/home/client")),
@@ -257,6 +324,7 @@ mod tests {
             dirs,
             vec![
                 PathBuf::from("/schemas/demo"),
+                PathBuf::from("/home/client/.cache/schemas/demo"),
                 PathBuf::from("/opt/demo/etc/schemas"),
                 PathBuf::from("/home/client/opt/demo/etc/schemas"),
                 PathBuf::from("/home/client/etc/schemas"),
@@ -295,6 +363,79 @@ mod tests {
                 home.join("etc/schemas/user.json"),
             ]
         );
+    }
+
+    #[test]
+    fn versioned_schema_root_keeps_the_highest_numeric_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("schemas");
+        for version in ["1", "7", "20", "abc"] {
+            std::fs::create_dir_all(root.join("demo").join(version)).unwrap();
+        }
+        std::fs::write(root.join("demo").join("7").join("tools.json"), "[]").unwrap();
+        std::fs::write(root.join("demo").join("20").join("tools.json"), "[]").unwrap();
+        std::fs::write(root.join("demo").join("direct.json"), "[]").unwrap();
+        let files = catalog_files_with("demo", |key| match key {
+            "MESH_SCHEMA_DIR" => Some(root.as_os_str().to_os_string()),
+            _ => None,
+        });
+        // Direct files first, then the highest numeric VERSION directory.
+        assert_eq!(
+            files,
+            vec![
+                root.join("demo").join("direct.json"),
+                root.join("demo").join("20").join("tools.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn package_int_version_search_keeps_the_highest_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        for (package, version) in [("dmesh", "3"), ("ssh-mesh", "11"), ("esp-xip-modules", "8")] {
+            std::fs::create_dir_all(home.join("opt").join(package).join("etc/schemas/demo/7")).unwrap();
+            std::fs::create_dir_all(
+                home.join("opt").join(package).join("etc/schemas/demo").join(version),
+            )
+            .unwrap();
+            std::fs::write(
+                home.join("opt").join(package).join("etc/schemas/demo").join(version).join("tools.json"),
+                format!("[{{\"name\":\"demo.{package}\",\"x-component-index\":1,\"x-method-index\":2}}]"),
+            )
+            .unwrap();
+        }
+        let resolver = CatalogResolver::default();
+        let resolved = resolver
+            .resolve_with("demo", |key| match key {
+                "HOME" => Some(home.as_os_str().to_os_string()),
+                _ => None,
+            })
+            .unwrap()
+            .unwrap();
+        // Only the highest numeric VERSION (11, ssh-mesh) contributes.
+        assert!(resolved.catalog.method("demo.ssh-mesh").is_some());
+        assert!(resolved.catalog.method("demo.dmesh").is_none());
+        assert!(resolved.catalog.method("demo.esp-xip-modules").is_none());
+    }
+
+    #[test]
+    fn json_schema_files_are_skipped_as_inspection_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = temp.path().join("schema.json");
+        std::fs::write(&schema, r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[]}"#)
+            .unwrap();
+        let tools = temp.path().join("tools.json");
+        std::fs::write(
+            &tools,
+            r#"[{"name":"demo.ping","x-component-index":1,"x-method-index":2}]"#,
+        )
+        .unwrap();
+        let resolver = CatalogResolver::default();
+        let resolved = resolver
+            .load_files("demo", vec![schema, tools])
+            .unwrap();
+        assert!(resolved.catalog.method("demo.ping").is_some());
     }
 
     #[test]

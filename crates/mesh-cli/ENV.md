@@ -34,8 +34,12 @@ The same rule applies to every runtime directory. Longer names such as
 `service1.example.host.example` are reserved for remote
 namespace routing and are not treated as local sockets.
 
-`mesh FQDN help` is local discovery. It checks `MESH_TOOLS`, then all `.json`
-files under `MESH_SCHEMA_DIR/FQDN/`, `/opt/FQDN/etc/schemas/`,
+`mesh FQDN help` is local discovery. It checks `MESH_TOOLS`, then
+`MESH_SCHEMA_DIR/FQDN/` (files and the highest numeric `VERSION/`
+subdirectory), `$HOME/.cache/schemas/FQDN/` (same), the numeric
+`VERSION/` directories under `/opt/PACKAGE/etc/schemas/FQDN/` and
+`$HOME/opt/PACKAGE/etc/schemas/FQDN/` for every installed package (highest
+version wins), the direct-file locations `/opt/FQDN/etc/schemas/`,
 `$HOME/opt/FQDN/etc/schemas/`, and `$HOME/etc/schemas/`. It does not connect
 to, activate, or query the service. `mesh FQDN help COMMAND` prints the
 complete static descriptor for one command.
