@@ -1,104 +1,82 @@
 """Mesh framed-CBOR baseline: ``length | 00 cb 00 00 | tagged CBOR``."""
 
+import io
 import socket
 import struct
+
+try:
+    import cbor2
+except ModuleNotFoundError as exc:
+    if exc.name != "cbor2":
+        raise
+    raise ModuleNotFoundError(
+        "BinaryClient requires cbor2; install dmesh with 'python -m pip install -e .' from the python directory"
+    ) from exc
 
 MESH_RPC_META = b"\x00\xcb\x00\x00"
 MAX_FRAME = 64 * 1024
 
 
-def _head(major, value):
-    if value < 24:
-        return bytes([(major << 5) | value])
-    if value < 256:
-        return bytes([(major << 5) | 24, value])
-    if value < 65536:
-        return bytes([(major << 5) | 25]) + struct.pack(">H", value)
-    return bytes([(major << 5) | 26]) + struct.pack(">I", value)
+def _validate_value(value, *, encoding):
+    """Validate the decoded RPC value types without interpreting CBOR bytes."""
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > 64:
+            raise ValueError("CBOR nesting exceeds 64 levels")
+        kind = type(item)
+        if item is None or kind in (bool, bytes, str, float):
+            continue
+        if kind is int:
+            if not -(1 << 64) <= item < (1 << 64):
+                raise ValueError("integer outside CBOR 64-bit range")
+        elif kind in ((list, tuple) if encoding else (list,)):
+            stack.extend((child, depth + 1) for child in item)
+        elif kind is dict:
+            for key, child in item.items():
+                stack.append((key, depth + 1))
+                stack.append((child, depth + 1))
+        else:
+            error = TypeError if encoding else ValueError
+            raise error(f"unsupported CBOR value: {kind!r}")
+
+
+class _RejectSemanticTags(dict):
+    """Override all backend tag decoders, including built-in semantic tags."""
+
+    def __missing__(self, key):
+        def reject(decoder):
+            raise ValueError("CBOR semantic tags are unsupported")
+        return reject
 
 
 def cbor_encode(value):
-    """Encode the JSON-shaped CBOR subset used by mesh tagged records."""
-    if value is None:
-        return b"\xf6"
-    if value is False:
-        return b"\xf4"
-    if value is True:
-        return b"\xf5"
-    if isinstance(value, int):
-        return _head(0, value) if value >= 0 else _head(1, -1 - value)
-    if isinstance(value, bytes):
-        return _head(2, len(value)) + value
-    if isinstance(value, str):
-        data = value.encode()
-        return _head(3, len(data)) + data
-    if isinstance(value, (list, tuple)):
-        return _head(4, len(value)) + b"".join(cbor_encode(item) for item in value)
-    if isinstance(value, dict):
-        return _head(5, len(value)) + b"".join(cbor_encode(key) + cbor_encode(item) for key, item in value.items())
-    if isinstance(value, float):
-        return b"\xfb" + struct.pack(">d", value)
-    raise TypeError(f"unsupported CBOR value: {type(value)!r}")
+    """Encode the mesh CBOR value profile using shortest integer widths."""
+    _validate_value(value, encoding=True)
+    return cbor2.dumps(value)
 
 
 def cbor_decode(data):
-    def take(offset, count):
-        end = offset + count
-        if end > len(data):
-            raise ValueError("truncated CBOR")
-        return data[offset:end], end
-
-    def length(extra, offset):
-        if extra < 24:
-            return extra, offset
-        sizes = {24: 1, 25: 2, 26: 4, 27: 8}
-        size = sizes.get(extra)
-        if size is None:
-            raise ValueError("indefinite-length CBOR is unsupported")
-        raw, offset = take(offset, size)
-        return int.from_bytes(raw, "big"), offset
-
-    def read(offset):
-        initial, offset = take(offset, 1)
-        initial = initial[0]
-        major, extra = initial >> 5, initial & 31
-        if major in (0, 1):
-            value, offset = length(extra, offset)
-            return (value if major == 0 else -1 - value), offset
-        if major in (2, 3):
-            size, offset = length(extra, offset)
-            raw, offset = take(offset, size)
-            return (raw if major == 2 else raw.decode()), offset
-        if major == 4:
-            size, offset = length(extra, offset)
-            result = []
-            for _ in range(size):
-                value, offset = read(offset)
-                result.append(value)
-            return result, offset
-        if major == 5:
-            size, offset = length(extra, offset)
-            result = {}
-            for _ in range(size):
-                key, offset = read(offset)
-                value, offset = read(offset)
-                result[key] = value
-            return result, offset
-        if major == 7 and extra in (20, 21, 22):
-            return ({20: False, 21: True, 22: None}[extra]), offset
-        if major == 7 and extra == 27:
-            raw, offset = take(offset, 8)
-            return struct.unpack(">d", raw)[0], offset
-        raise ValueError("unsupported CBOR value")
-
-    result, offset = read(0)
-    if offset != len(data):
+    """Decode exactly one finite, duplicate-free mesh CBOR value."""
+    if len(data) > MAX_FRAME:
+        raise ValueError("CBOR value exceeds maximum frame size")
+    stream = io.BytesIO(data)
+    try:
+        decoder = cbor2.CBORDecoder(
+            stream, read_size=1, max_depth=64, allow_indefinite=False,
+            allow_duplicate_keys=False, semantic_decoders=_RejectSemanticTags(),
+        )
+        result = decoder.decode()
+    except (cbor2.CBORDecodeError, UnicodeError, OverflowError, RecursionError) as exc:
+        raise ValueError(f"invalid CBOR: {exc}") from exc
+    if stream.read(1):
         raise ValueError("trailing CBOR data")
+    _validate_value(result, encoding=False)
     return result
 
 
 class BinaryClient:
-    """Client for mesh's framed CBOR RPC records, without external packages."""
+    """Client for mesh's framed CBOR RPC records."""
 
     def __init__(self, socket_path):
         self.socket_path = socket_path
@@ -141,6 +119,8 @@ class BinaryClient:
             record[5] = fields
         payload = cbor_encode(record)
         frame = MESH_RPC_META + payload
+        if len(frame) > MAX_FRAME:
+            raise ValueError(f"mesh frame length {len(frame)} exceeds maximum {MAX_FRAME}")
         self.connect()
         self.sock.sendall(struct.pack(">I", len(frame)) + frame)
         return self.read_record()

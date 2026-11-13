@@ -27,6 +27,23 @@ python -m dmesh /run/user/1000/ssh-control --mux-alive
 python -m dmesh /run/user/1000/ssh-control --forward-local 8080:127.0.0.1:80
 ```
 
+For isolated development and tests, use a Python 3.10+ virtual environment
+and install the package rather than relying on `PYTHONPATH` alone:
+
+```bash
+cd python
+python3 -m venv .venv
+.venv/bin/python -m pip install -e . pytest
+.venv/bin/python -m pytest tests
+```
+
+The flake's `python-tools` output provides Python, pip, and pytest, but the
+locked nixpkgs has cbor2 5.8.0, which does not satisfy this client's
+`cbor2>=6.2.1,<6.3` requirement. It is therefore not a standalone runtime
+for this client: use an isolated pip installation as above. Providing the
+dependency directly in `python-tools` requires a compatible nixpkgs update or
+another compatible Nix package; do not substitute the older codec.
+
 ## Python use
 
 ```python
@@ -69,8 +86,19 @@ request, which also supports subscriptions and sequential control operations.
 
 `BinaryClient` implements the mesh binary baseline: a big-endian length,
 `00 cb 00 00` mesh-RPC metadata, and the tagged CBOR envelope used by
-`crates/mesh`. It includes a dependency-free CBOR implementation for the
-JSON-shaped values used by these records. `MuxClient` implements the OpenSSH
+`crates/mesh`. It uses the maintained `cbor2>=6.2.1,<6.3` codec, installed
+with the package, without a fallback codec. Python 3.10+ is required by this
+chosen cbor2 version, which provides the strict decoder options used here;
+the minimum was raised intentionally. The RPC value profile permits finite
+arrays/maps, bytes, UTF-8 text, booleans, null, floats (including non-finite
+values), and integers from -2^64 through 2^64-1. JSON gateways may reject
+non-finite floats separately.
+Python text is UTF-8; arbitrary octets must use bytes. Undefined, semantic
+tags, indefinite-length values, duplicate map keys, trailing bytes, and
+nesting deeper than 64 levels are rejected. Frames are limited to 64 KiB,
+including metadata but excluding the length prefix.
+
+`MuxClient` implements the OpenSSH
 ControlMaster version-4 handshake, alive check, and local/remote forwarding
 requests. It intentionally has no SSH cryptography: it talks to an already
 authenticated local mux master, exactly like `mesh-cli -S`.
