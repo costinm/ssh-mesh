@@ -9,11 +9,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 pub mod apijson;
+pub mod component;
 pub mod console;
 pub mod document;
 pub mod java;
 pub mod rustdoc;
 pub mod vtable;
+pub mod xip_vtable;
+
+pub use component::{rust_component, rust_specs};
 
 const STANDARD_ERRORS: &[&str] = &[
     "unauthenticated",
@@ -483,7 +487,7 @@ fn render_cbor_codec(output: &mut String, name: &str, fields: &[ApiField], rows:
     ));
 }
 
-fn pascal_identifier(value: &str) -> String {
+pub(crate) fn pascal_identifier(value: &str) -> String {
     value
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())
@@ -497,7 +501,7 @@ fn pascal_identifier(value: &str) -> String {
         .collect()
 }
 
-fn rust_field_name(value: &str) -> String {
+pub(crate) fn rust_field_name(value: &str) -> String {
     match value {
         "type" | "match" | "ref" | "self" | "super" | "crate" => format!("r#{value}"),
         _ => value.to_owned(),
@@ -1248,7 +1252,7 @@ pub fn rust_ids(methods: &[ApiMethod]) -> String {
     output
 }
 
-fn identifier(value: &str) -> String {
+pub(crate) fn identifier(value: &str) -> String {
     value
         .chars()
         .map(|character| {

@@ -2,9 +2,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use mesh_api_gen::{
-    api_markdown_from_tools_json_for_component, java::java_api, json_schema, merge_tools_json,
-    manifest_cbor, parse_api_markdown, parse_required_path, rust_api, rust_api_tagged, rust_cbor_api,
-    rust_ids, tools_json,
+    api_markdown_from_tools_json_for_component, java::java_api, json_schema, manifest_cbor,
+    merge_tools_json, parse_api_markdown, parse_required_path, rust_api, rust_api_tagged,
+    rust_cbor_api, rust_component, rust_ids, rust_specs, tools_json,
 };
 
 fn main() -> Result<()> {
@@ -15,12 +15,15 @@ fn main() -> Result<()> {
     let mut out_tools = None;
     let mut out_schema = None;
     let mut out_ids = None;
+    let mut out_specs = None;
+    let mut out_component = None;
     let mut out_rust = None;
     let mut out_rust_cbor = None;
     let mut out_manifest = None;
     let mut more_apis: Vec<String> = Vec::new();
     let mut out_console_catalog = None;
     let mut out_console_native = None;
+    let mut out_console_native_rs = None;
     let mut out_api_json = None;
     let mut rustdoc_json = None;
     let mut pointer_width = 4u32;
@@ -37,6 +40,13 @@ fn main() -> Result<()> {
     let mut out_vtable_shims = None;
     let mut out_tables_json = None;
     let mut tables_json = None;
+    let mut xip_types = None;
+    let mut out_xip_vtable = None;
+    let mut out_xip_module = None;
+    let mut xip_local_only = false;
+    let mut xip_dispatch_only = false;
+    let mut xip_methods: Option<String> = None;
+    let mut xip_table_methods: Option<String> = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--api" => {
@@ -48,6 +58,7 @@ fn main() -> Result<()> {
                 }
             }
             "--out-console-native" => out_console_native = Some(args.next().context("--out-console-native requires a path")?),
+            "--out-console-native-rs" => out_console_native_rs = Some(args.next().context("--out-console-native-rs requires a path")?),
             "--out-console-catalog" => out_console_catalog = Some(args.next().context("--out-console-catalog requires a path")?),
             "--tools" => tools = Some(args.next().context("--tools requires a path")?),
             "--out-api" => out_api = Some(args.next().context("--out-api requires a path")?),
@@ -56,6 +67,10 @@ fn main() -> Result<()> {
                 out_schema = Some(args.next().context("--out-schema requires a path")?)
             }
             "--out-ids" => out_ids = Some(args.next().context("--out-ids requires a path")?),
+            "--out-specs" => out_specs = Some(args.next().context("--out-specs requires a path")?),
+            "--out-component" => {
+                out_component = Some(args.next().context("--out-component requires a path")?)
+            }
             "--out-rust" => out_rust = Some(args.next().context("--out-rust requires a path")?),
             "--out-rust-cbor" => {
                 out_rust_cbor = Some(args.next().context("--out-rust-cbor requires a path")?)
@@ -81,11 +96,18 @@ fn main() -> Result<()> {
             "--out-vtable-shims" => out_vtable_shims = Some(args.next().context("--out-vtable-shims requires a path")?),
             "--out-tables-json" => out_tables_json = Some(args.next().context("--out-tables-json requires a path")?),
             "--tables-json" => tables_json = Some(args.next().context("--tables-json requires a path")?),
+            "--xip-types" => xip_types = Some(args.next().context("--xip-types requires a path")?),
+            "--out-xip-vtable" => out_xip_vtable = Some(args.next().context("--out-xip-vtable requires a path")?),
+            "--out-xip-module" => out_xip_module = Some(args.next().context("--out-xip-module requires a path")?),
+            "--xip-local-only" => xip_local_only = true,
+            "--xip-dispatch-only" => xip_dispatch_only = true,
+            "--xip-methods" => xip_methods = Some(args.next().context("--xip-methods requires a list")?),
+            "--xip-table-methods" => xip_table_methods = Some(args.next().context("--xip-table-methods requires a list")?),
             "--check" => check = true,
             "--rust-tags" => rust_tags = true,
             "--help" | "-h" => {
                 println!(
-                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--rust-tags] [--api more/API.md ... --out-console-catalog catalog.h] [--out-console-native native.h --rustdoc crate.json] [--out-api-json api.json [--rustdoc crate.json] [--pointer-width 4]] [--out-manifest module.manifest [--autostart REQUEST]] [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --vtable-conf vtables.conf --rustdoc crate.json --out-tables-json tables.api.json\nmesh-api-gen --tables-json tables.api.json --out-vtable-schema schema_data.rs [--out-vtable-shims vt_shims.rs]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
+                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--rust-tags] [--api more/API.md ... --out-console-catalog catalog.h] [--out-console-native native.h --rustdoc crate.json] [--out-console-native-rs tables.rs --rustdoc crate.json] [--out-api-json api.json [--rustdoc crate.json] [--pointer-width 4]] [--out-manifest module.manifest [--autostart REQUEST]] [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --vtable-conf vtables.conf --rustdoc crate.json --out-tables-json tables.api.json\nmesh-api-gen --tables-json tables.api.json --out-vtable-schema schema_data.rs [--out-vtable-shims vt_shims.rs]\nmesh-api-gen --api API.md --xip-types types.rs [--out-xip-vtable component_vtable.rs] [--out-xip-module api_gen.rs] [--xip-local-only] [--xip-dispatch-only] [--xip-methods a,b] [--xip-table-methods a,b]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
                 );
                 return Ok(());
             }
@@ -165,6 +187,12 @@ fn main() -> Result<()> {
     if let Some(path) = out_ids {
         write_or_check(&path, &rust_ids(&methods), check)?;
     }
+    if let Some(path) = out_specs {
+        write_or_check(&path, &rust_specs(&methods), check)?;
+    }
+    if let Some(path) = out_component {
+        write_or_check(&path, &rust_component(&methods), check)?;
+    }
     if let Some(path) = out_rust {
         let generated = if rust_tags {
             rust_api_tagged(&methods)
@@ -200,13 +228,13 @@ fn main() -> Result<()> {
         let names: Vec<String> = sources.iter().map(|s| s.rsplit('/').next().unwrap_or(s).to_owned()).collect();
         write_or_check(&path, &mesh_api_gen::console::console_catalog(&names, &parsed), check)?;
     }
-    if let Some(path) = out_console_native {
+    if out_console_native.is_some() || out_console_native_rs.is_some() {
         let catalog = match &rustdoc_json {
             Some(file) => mesh_api_gen::rustdoc::RustCatalog::from_rustdoc(
                 &serde_json::from_str(&std::fs::read_to_string(file)?)?,
                 pointer_width,
             )?,
-            None => bail!("--out-console-native requires --rustdoc"),
+            None => bail!("--out-console-native / --out-console-native-rs requires --rustdoc"),
         };
         let mut sources = vec![api.clone()];
         sources.extend(more_apis.iter().cloned());
@@ -219,8 +247,54 @@ fn main() -> Result<()> {
                 Some(&catalog),
             )?);
         }
-        let names: Vec<String> = sources.iter().map(|s| s.rsplit('/').next().unwrap_or(s).to_owned()).collect();
-        write_or_check(&path, &mesh_api_gen::console::console_native(&documents, &names, u64::from(pointer_width))?, check)?;
+        let names: Vec<String> = sources
+            .iter()
+            .map(|s| s.rsplit('/').next().unwrap_or(s).to_owned())
+            .collect();
+        if let Some(path) = out_console_native {
+            write_or_check(
+                &path,
+                &mesh_api_gen::console::console_native(&documents, &names, u64::from(pointer_width))?,
+                check,
+            )?;
+        }
+        if let Some(path) = out_console_native_rs {
+            write_or_check(
+                &path,
+                &mesh_api_gen::console::console_native_rs(&documents, &names, u64::from(pointer_width))?,
+                check,
+            )?;
+        }
+    }
+    if out_xip_vtable.is_some() || out_xip_module.is_some() {
+        let types_path = xip_types.as_deref().context("--out-xip-vtable / --out-xip-module requires --xip-types")?;
+        let selected_methods = xip_table_methods
+            .or(xip_methods)
+            .map(|list| {
+                list.split(',')
+                    .map(|item| item.trim().to_owned())
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+            });
+        let generated = mesh_api_gen::xip_vtable::generate_xip_vtable(
+            Path::new(&api),
+            Path::new(types_path),
+            &mesh_api_gen::xip_vtable::XipVtableOptions {
+                dispatch_only: xip_dispatch_only,
+                local_only: xip_local_only,
+                selected_methods,
+            },
+        )?;
+        if let Some(path) = out_xip_vtable {
+            let abi = generated
+                .abi_rs
+                .as_deref()
+                .context("--out-xip-vtable cannot be used with --xip-dispatch-only")?;
+            write_or_check(&path, abi, check)?;
+        }
+        if let Some(path) = out_xip_module {
+            write_or_check(&path, &generated.module_rs, check)?;
+        }
     }
     if let Some(path) = out_api_json {
         let markdown = std::fs::read_to_string(&api)?;
