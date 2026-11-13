@@ -1,0 +1,26 @@
+[package]
+name = "quic-mux"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+btree = []
+std = ["quic-base/std"]
+tokio = ["std", "dep:tokio"]
+
+[dependencies]
+quic-base = { path = "../quic-base", default-features = false }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+
+[dev-dependencies]
+quic-base = { path = "../quic-base", default-features = false, features = ["host-pools"] }
+futures-util = { version = "0.3", default-features = false, features = ["io"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+yamux = "0.14"
+
+[lib]
+name = "quic_mux"
+path = "src/lib.rs"

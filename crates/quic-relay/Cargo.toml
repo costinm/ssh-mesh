@@ -1,0 +1,21 @@
+[package]
+name = "quic-relay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+std = ["quic-base/std"]
+
+[dependencies]
+quic-base = { path = "../quic-base", default-features = false }
+
+[dev-dependencies]
+quic-base = { path = "../quic-base", default-features = false, features = ["host-pools"] }
+quic-link = { path = "../quic-link", default-features = false }
+quic-mux = { path = "../quic-mux", default-features = false }
+
+[lib]
+name = "quic_relay"
+path = "src/lib.rs"

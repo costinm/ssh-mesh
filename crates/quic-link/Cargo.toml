@@ -1,0 +1,29 @@
+[package]
+name = "quic-link"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+btree = []
+std = ["quic-base/std"]
+tokio = ["std", "dep:tokio", "dep:libc"]
+stateless-reset = ["std", "dep:hmac", "dep:sha2"]
+rust-crypto = ["quic-base/rust-crypto"]
+
+[dependencies]
+quic-base = { path = "../quic-base", default-features = false }
+hmac = { version = "0.13", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false, optional = true }
+libc = { version = "0.2", optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+
+[dev-dependencies]
+quic-base = { path = "../quic-base", default-features = false, features = ["host-pools"] }
+quic-mux = { path = "../quic-mux", default-features = false, features = ["tokio"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[lib]
+name = "quic_link"
+path = "src/lib.rs"

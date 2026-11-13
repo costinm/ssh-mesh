@@ -1,0 +1,19 @@
+[package]
+name = "quic-tools"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+std = ["tokio"]
+tokio = ["dep:tokio", "dep:quic-mux", "quic-mux/tokio"]
+
+[dependencies]
+mesh-api = { path = "../mesh-api", default-features = false }
+quic-mux = { path = "../quic-mux", default-features = false, optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt", "sync", "time"], optional = true }
+
+[lib]
+name = "quic_tools"
+path = "src/lib.rs"
