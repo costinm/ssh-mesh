@@ -215,10 +215,17 @@ pub struct PressureHistory {
 }
 
 impl PressureHistory {
+    /// Whether the cooldown window since the last executed action is still active.
+    pub fn in_cooldown(&self, now: std::time::Instant, policy: &PressurePolicy) -> bool {
+        self.last_action_at.is_some_and(|at| {
+            now.saturating_duration_since(at) < Duration::from_secs(policy.cooldown_secs)
+        })
+    }
+
     /// The current level held at least `hold` while under the exit value.
     fn eligible_for_exit(&self, now: std::time::Instant, hold: Duration) -> bool {
         self.level_since
-            .is_some_and(|since| now.duration_since(since) >= hold)
+            .is_some_and(|since| now.saturating_duration_since(since) >= hold)
     }
 }
 
@@ -268,18 +275,28 @@ pub fn plan(
     let level = classify(snapshot, policy);
 
     // Cooldown: one action per window so its effect can be observed.
-    if let Some(at) = history.last_action_at
-        && now.duration_since(at) < Duration::from_secs(policy.cooldown_secs)
-    {
+    if history.in_cooldown(now, policy) {
         return vec![];
     }
 
+    let hold = Duration::from_secs(policy.hold_secs);
+    let has_pressure_frozen = snapshot.services.iter().any(|proc| {
+        proc.freeze_reason == Some(FreezeReason::Pressure)
+            && match proc.state {
+                ServiceState::Frozen { since, .. } => now.saturating_duration_since(since) >= hold,
+                _ => history.eligible_for_exit(now, hold),
+            }
+    });
+
     // Hysteresis exit: hold under the exit threshold for the hold time after
-    // a real pressure level. With no previous level there is nothing to exit.
+    // a real pressure level (or once a pressure-frozen service has held past
+    // the window and both memory and CPU pressure are clear).
     if level == PressureLevel::None
-        && history.previous_level != PressureLevel::None
-        && snapshot.memory_avg60 < policy.exit_avg60
-        && history.eligible_for_exit(now, Duration::from_secs(policy.hold_secs))
+        && snapshot.cpu_avg10 < policy.cpu_freeze_avg10
+        && ((history.previous_level != PressureLevel::None
+            && snapshot.memory_avg60 < policy.exit_avg60
+            && history.eligible_for_exit(now, hold))
+            || (has_pressure_frozen && snapshot.memory_avg60 < policy.entry_low))
     {
         return vec![Action::Noop];
     }
@@ -683,6 +700,36 @@ mod tests {
         let mut pending = entered(now);
         pending.previous_level = PressureLevel::Medium;
         assert!(plan(&snapshot, &policy(), &pending, now).is_empty());
+    }
+
+    #[test]
+    fn pressure_frozen_service_thaws_after_hold_when_pressure_is_lower() {
+        let now = std::time::Instant::now();
+        let mut svc = service(
+            "bg",
+            600,
+            ServiceState::Frozen {
+                reason: FreezeReason::Pressure,
+                since: now - Duration::from_secs(120),
+            },
+            false,
+        );
+        svc.freeze_reason = Some(FreezeReason::Pressure);
+
+        // Even with previous_level == None (e.g. CPU pressure freeze), a
+        // pressure-frozen service triggers Noop (thaw) once pressure is low.
+        let mut snapshot = snapshot_with(vec![svc], 0.5);
+        snapshot.memory_avg60 = 1.0;
+        snapshot.cpu_avg10 = 10.0;
+        let history = PressureHistory::default();
+        assert_eq!(
+            plan(&snapshot, &policy(), &history, now),
+            vec![Action::Noop]
+        );
+
+        // While CPU pressure is still above cpu_freeze_avg10, do not thaw.
+        snapshot.cpu_avg10 = 60.0;
+        assert!(plan(&snapshot, &policy(), &history, now).is_empty());
     }
 
     #[test]

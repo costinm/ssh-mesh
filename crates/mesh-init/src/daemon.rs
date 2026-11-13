@@ -2928,48 +2928,94 @@ impl Daemon {
             loop {
                 let now = Instant::now();
                 let snapshot = daemon.pressure_snapshot(&policy);
-                let previous_level = crate::pressure::classify(&snapshot, &policy);
-                let actions = crate::pressure::plan(&snapshot, &policy, &history, now);
-                match actions.into_iter().next() {
-                    Some(crate::pressure::Action::Noop) => {
-                        // Pressure cleared: thaw pressure-frozen services in
-                        // priority order, one per cooldown.
-                        if let Some(name) = daemon.next_pressure_thaw_candidate(&policy) {
-                            daemon
-                                .thaw_service(&name, states::UnfreezeCause::PressureCleared)
-                                .await;
-                            history.last_action = Some("thaw_pressure");
-                            history.last_action_at = Some(now);
-                        } else if history.previous_level != crate::pressure::PressureLevel::None {
-                            history.previous_level = crate::pressure::PressureLevel::None;
-                            history.level_since = Some(now);
-                        }
-                    }
-                    Some(action) => {
-                        daemon.execute_pressure_action(&action).await;
-                        history.last_action = Some(action.name());
-                        history.last_action_at = Some(now);
-                    }
-                    None => {
-                        // No memory action this pass; CPU pressure is
-                        // handled on its own branch (memory not involved).
-                        if snapshot.cpu_avg10 >= policy.cpu_freeze_avg10
-                            && let Some(name) = daemon.next_cpu_pressure_freeze_candidate()
-                        {
-                            let _ = daemon.freeze_for_pressure(&name).await;
-                            history.last_action = Some("cpu_freeze");
-                            history.last_action_at = Some(now);
-                        }
-                    }
-                }
-                // Track level entry for hysteresis.
-                if history.previous_level != previous_level {
-                    history.level_since = Some(Instant::now());
-                    history.previous_level = previous_level;
-                }
+                daemon
+                    .run_pressure_policy_pass(&policy, &mut history, &snapshot, now)
+                    .await;
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
+    }
+
+    /// Execute one pass of the pressure policy and update hysteresis state.
+    pub(crate) async fn run_pressure_policy_pass(
+        &self,
+        policy: &crate::pressure::PressurePolicy,
+        history: &mut crate::pressure::PressureHistory,
+        snapshot: &crate::pressure::PressureSnapshot,
+        now: Instant,
+    ) {
+        let current_level = crate::pressure::classify(snapshot, policy);
+        let actions = crate::pressure::plan(snapshot, policy, history, now);
+        match actions.into_iter().next() {
+            Some(crate::pressure::Action::Noop) => {
+                if snapshot.cpu_avg10 >= policy.cpu_freeze_avg10 {
+                    if let Some(name) = self.next_cpu_pressure_freeze_candidate()
+                        && self.freeze_for_pressure(&name).await.is_ok()
+                    {
+                        history.last_action = Some("cpu_freeze");
+                        history.last_action_at = Some(now);
+                        history.level_since = Some(now);
+                    }
+                } else if let Some(name) = self.next_pressure_thaw_candidate(policy) {
+                    // Pressure cleared: thaw pressure-frozen services in
+                    // priority order, one per cooldown.
+                    self.thaw_service(&name, states::UnfreezeCause::PressureCleared)
+                        .await;
+                    history.last_action = Some("thaw_pressure");
+                    history.last_action_at = Some(now);
+                    if self.next_pressure_thaw_candidate(policy).is_none()
+                        && history.previous_level != crate::pressure::PressureLevel::None
+                    {
+                        history.previous_level = crate::pressure::PressureLevel::None;
+                        history.level_since = Some(now);
+                    }
+                } else if history.previous_level != crate::pressure::PressureLevel::None {
+                    history.previous_level = crate::pressure::PressureLevel::None;
+                    history.level_since = Some(now);
+                }
+            }
+            Some(action) => {
+                self.execute_pressure_action(&action).await;
+                history.last_action = Some(action.name());
+                history.last_action_at = Some(now);
+            }
+            None => {
+                // No memory action this pass; CPU pressure is
+                // handled on its own branch (memory not involved).
+                if !history.in_cooldown(now, policy) {
+                    if snapshot.cpu_avg10 >= policy.cpu_freeze_avg10 {
+                        if let Some(name) = self.next_cpu_pressure_freeze_candidate()
+                            && self.freeze_for_pressure(&name).await.is_ok()
+                        {
+                            history.last_action = Some("cpu_freeze");
+                            history.last_action_at = Some(now);
+                            if history.previous_level == crate::pressure::PressureLevel::None {
+                                history.previous_level = crate::pressure::PressureLevel::High;
+                                history.level_since = Some(now);
+                            }
+                        }
+                    } else if current_level == crate::pressure::PressureLevel::None
+                        && history
+                            .level_since
+                            .is_none_or(|since| now.duration_since(since) >= Duration::from_secs(policy.hold_secs))
+                        && let Some(name) = self.next_pressure_thaw_candidate(policy)
+                    {
+                        self.thaw_service(&name, states::UnfreezeCause::PressureCleared)
+                            .await;
+                        history.last_action = Some("thaw_pressure");
+                        history.last_action_at = Some(now);
+                    }
+                }
+            }
+        }
+        // Track active level entry for hysteresis; clearing back to None is
+        // handled by the Noop branch once all pressure-frozen services thaw.
+        if current_level != crate::pressure::PressureLevel::None
+            && history.previous_level != current_level
+        {
+            history.level_since = Some(now);
+            history.previous_level = current_level;
+        }
     }
 
     /// Build one full snapshot from cgroup state and PSI files.
@@ -3031,8 +3077,10 @@ impl Daemon {
         let mut frozen: Vec<(u32, String)> = locked
             .values()
             .filter(|proc| {
-                proc.freeze_reason == Some(FreezeReason::Pressure)
-                    || proc.freeze_reason == Some(FreezeReason::Idle)
+                matches!(proc.state, states::ServiceState::Frozen { .. })
+                    && (proc.freeze_reason == Some(FreezeReason::Pressure)
+                        || (proc.freeze_reason == Some(FreezeReason::Idle)
+                            && proc.config.idle_action != crate::config::IdleAction::Freeze))
             })
             .map(|proc| (proc.config.priority, proc.config.name.clone()))
             .collect();
@@ -3116,7 +3164,29 @@ impl Daemon {
                 }
             }
             A::Freeze { name } => {
-                let _ = self.freeze_for_idle(name).await;
+                let has_socket = {
+                    let services = self.services.lock();
+                    services
+                        .get(name)
+                        .and_then(|proc| lifecycle_socket(&proc.config))
+                        .is_some_and(|path| path.exists())
+                };
+                if has_socket {
+                    if let Ok(Some(_)) = self.freeze_for_idle(name).await {
+                        let mut services = self.services.lock();
+                        if let Some(proc) = services.get_mut(name) {
+                            proc.freeze_reason = Some(FreezeReason::Pressure);
+                            if let states::ServiceState::Frozen { since, .. } = proc.state {
+                                proc.state = states::ServiceState::Frozen {
+                                    reason: FreezeReason::Pressure,
+                                    since,
+                                };
+                            }
+                        }
+                    }
+                } else {
+                    let _ = self.freeze_for_pressure(name).await;
+                }
             }
             A::StopEvict { name } => {
                 info!(service = %name, "pressure_stop_evict");
@@ -4047,6 +4117,208 @@ mod tests {
             daemon.services.lock().get("echo").unwrap().protocol_state(),
             ServiceState::Running
         );
+    }
+
+    #[tokio::test]
+    async fn pressure_policy_freezes_and_unfreezes_when_pressure_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg_path = fake_cgroup(dir.path(), "worker");
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-pressure-thaw.sock".to_string(),
+        });
+        let mut proc = idle_service("worker", cg_path.clone(), None);
+        proc.config.priority = 600;
+        proc.idle_since = Some(Instant::now() - Duration::from_secs(30));
+        daemon.services.lock().insert("worker".to_string(), proc);
+
+        let policy = crate::pressure::PressurePolicy::default();
+        let mut history = crate::pressure::PressureHistory::default();
+        let t0 = Instant::now();
+
+        // 1. High memory pressure freezes the idle worker.
+        let mut high_snap = daemon.pressure_snapshot(&policy);
+        high_snap.memory_avg10 = 45.0;
+        high_snap.memory_avg60 = 45.0;
+        daemon
+            .run_pressure_policy_pass(&policy, &mut history, &high_snap, t0)
+            .await;
+
+        {
+            let services = daemon.services.lock();
+            let worker = services.get("worker").unwrap();
+            assert_eq!(worker.protocol_state(), ServiceState::Frozen);
+            assert_eq!(worker.freeze_reason, Some(states::FreezeReason::Pressure));
+        }
+        assert_eq!(
+            std::fs::read_to_string(format!("{cg_path}/cgroup.freeze"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+
+        // 2. avg10 drops to None right away, while avg60 is still decaying:
+        // previous_level must be preserved so hysteresis can exit later.
+        let mut decaying_snap = daemon.pressure_snapshot(&policy);
+        decaying_snap.memory_avg10 = 0.5;
+        decaying_snap.memory_avg60 = 15.0;
+        daemon
+            .run_pressure_policy_pass(
+                &policy,
+                &mut history,
+                &decaying_snap,
+                t0 + Duration::from_secs(15),
+            )
+            .await;
+        assert_eq!(
+            history.previous_level,
+            crate::pressure::PressureLevel::High,
+            "previous_level must not be cleared before thaw completes"
+        );
+        assert_eq!(
+            daemon
+                .services
+                .lock()
+                .get("worker")
+                .unwrap()
+                .protocol_state(),
+            ServiceState::Frozen
+        );
+
+        // 3. Once hold_secs elapses and pressure is low, the service is unfrozen.
+        let mut clear_snap = daemon.pressure_snapshot(&policy);
+        clear_snap.memory_avg10 = 0.0;
+        clear_snap.memory_avg60 = 0.5;
+        daemon
+            .run_pressure_policy_pass(
+                &policy,
+                &mut history,
+                &clear_snap,
+                t0 + Duration::from_secs(70),
+            )
+            .await;
+
+        {
+            let services = daemon.services.lock();
+            let worker = services.get("worker").unwrap();
+            assert_eq!(worker.protocol_state(), ServiceState::Running);
+            assert_eq!(worker.freeze_reason, None);
+        }
+        assert_eq!(
+            std::fs::read_to_string(format!("{cg_path}/cgroup.freeze"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        assert_eq!(history.previous_level, crate::pressure::PressureLevel::None);
+    }
+
+    #[tokio::test]
+    async fn cpu_pressure_freezes_with_cooldown_and_unfreezes_when_lower() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg_low = fake_cgroup(dir.path(), "low");
+        let cg_mid = fake_cgroup(dir.path(), "mid");
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-test-cpu-pressure-thaw.sock".to_string(),
+        });
+        let mut low = idle_service("low", cg_low.clone(), None);
+        low.config.priority = 800;
+        let mut mid = idle_service("mid", cg_mid.clone(), None);
+        mid.config.priority = 300;
+        {
+            let mut services = daemon.services.lock();
+            services.insert("low".to_string(), low);
+            services.insert("mid".to_string(), mid);
+        }
+
+        let policy = crate::pressure::PressurePolicy::default();
+        let mut history = crate::pressure::PressureHistory::default();
+        let t0 = Instant::now();
+
+        // Pass 1 under high CPU pressure freezes lowest importance ("low").
+        let mut cpu_high = daemon.pressure_snapshot(&policy);
+        cpu_high.cpu_avg10 = 60.0;
+        daemon
+            .run_pressure_policy_pass(&policy, &mut history, &cpu_high, t0)
+            .await;
+        assert_eq!(
+            daemon.services.lock().get("low").unwrap().protocol_state(),
+            ServiceState::Frozen
+        );
+        assert_eq!(
+            daemon.services.lock().get("mid").unwrap().protocol_state(),
+            ServiceState::Running
+        );
+
+        // Pass 2 within cooldown (+2s) does not freeze "mid".
+        let mut cpu_high = daemon.pressure_snapshot(&policy);
+        cpu_high.cpu_avg10 = 60.0;
+        daemon
+            .run_pressure_policy_pass(
+                &policy,
+                &mut history,
+                &cpu_high,
+                t0 + Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(
+            daemon.services.lock().get("mid").unwrap().protocol_state(),
+            ServiceState::Running
+        );
+
+        // Pass 3 after cooldown (+11s) freezes "mid".
+        let mut cpu_high = daemon.pressure_snapshot(&policy);
+        cpu_high.cpu_avg10 = 60.0;
+        daemon
+            .run_pressure_policy_pass(
+                &policy,
+                &mut history,
+                &cpu_high,
+                t0 + Duration::from_secs(11),
+            )
+            .await;
+        assert_eq!(
+            daemon.services.lock().get("mid").unwrap().protocol_state(),
+            ServiceState::Frozen
+        );
+
+        // Once CPU pressure drops and hold_secs elapses, services thaw in
+        // priority order ("mid" first, then "low" after cooldown).
+        let mut cpu_low = daemon.pressure_snapshot(&policy);
+        cpu_low.cpu_avg10 = 5.0;
+        daemon
+            .run_pressure_policy_pass(
+                &policy,
+                &mut history,
+                &cpu_low,
+                t0 + Duration::from_secs(75),
+            )
+            .await;
+        assert_eq!(
+            daemon.services.lock().get("mid").unwrap().protocol_state(),
+            ServiceState::Running
+        );
+        assert_eq!(
+            daemon.services.lock().get("low").unwrap().protocol_state(),
+            ServiceState::Frozen
+        );
+
+        let mut cpu_low = daemon.pressure_snapshot(&policy);
+        cpu_low.cpu_avg10 = 5.0;
+        daemon
+            .run_pressure_policy_pass(
+                &policy,
+                &mut history,
+                &cpu_low,
+                t0 + Duration::from_secs(86),
+            )
+            .await;
+        assert_eq!(
+            daemon.services.lock().get("low").unwrap().protocol_state(),
+            ServiceState::Running
+        );
+        assert_eq!(history.previous_level, crate::pressure::PressureLevel::None);
     }
 
     #[tokio::test]
