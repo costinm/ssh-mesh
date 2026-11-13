@@ -43,6 +43,11 @@ pub enum MeshStream {
         /// Activity held for the lifetime of a stdio-activated instance.
         _guard: Option<crate::activity::ConnectionGuard>,
     },
+    /// A multiplexed stream over a [`quic_mux::tokio_mux::TokioMux`] session.
+    QuicMux(
+        quic_mux::tokio_mux::MuxStream,
+        Option<crate::activity::ConnectionGuard>,
+    ),
 }
 
 impl AsyncRead for MeshStream {
@@ -55,6 +60,7 @@ impl AsyncRead for MeshStream {
             MeshStream::Uds(s, _) => Pin::new(s).poll_read(cx, buf),
             MeshStream::UdsBuf(s, _) => Pin::new(s).poll_read(cx, buf),
             MeshStream::Stdio { stdin, .. } => Pin::new(stdin).poll_read(cx, buf),
+            MeshStream::QuicMux(s, _) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -69,6 +75,7 @@ impl AsyncWrite for MeshStream {
             MeshStream::Uds(s, _) => Pin::new(s).poll_write(cx, buf),
             MeshStream::UdsBuf(s, _) => Pin::new(s).poll_write(cx, buf),
             MeshStream::Stdio { stdout, .. } => Pin::new(stdout).poll_write(cx, buf),
+            MeshStream::QuicMux(s, _) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -77,6 +84,7 @@ impl AsyncWrite for MeshStream {
             MeshStream::Uds(s, _) => Pin::new(s).poll_flush(cx),
             MeshStream::UdsBuf(s, _) => Pin::new(s).poll_flush(cx),
             MeshStream::Stdio { stdout, .. } => Pin::new(stdout).poll_flush(cx),
+            MeshStream::QuicMux(s, _) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -85,6 +93,7 @@ impl AsyncWrite for MeshStream {
             MeshStream::Uds(s, _) => Pin::new(s).poll_shutdown(cx),
             MeshStream::UdsBuf(s, _) => Pin::new(s).poll_shutdown(cx),
             MeshStream::Stdio { stdout, .. } => Pin::new(stdout).poll_shutdown(cx),
+            MeshStream::QuicMux(s, _) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -300,6 +309,35 @@ impl MeshListener {
         }
 
         Ok(buf_stream)
+    }
+
+    /// Spawn a server [`quic_mux::tokio_mux::TokioMux`] session over `stream` (`UnixStream`,
+    /// `TcpStream`, or `MeshStream`) with default [`quic_mux::tokio_mux::TokioMuxConfig`].
+    pub fn spawn_quic_mux<S>(
+        stream: S,
+    ) -> (
+        quic_mux::tokio_mux::TokioMux,
+        quic_mux::tokio_mux::TokioMuxAcceptor,
+    )
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        quic_mux::tokio_mux::TokioMux::server(
+            stream,
+            quic_mux::tokio_mux::TokioMuxConfig::default(),
+        )
+    }
+
+    /// Accept the next peer-initiated stream from `acceptor` as a server [`MeshStream::QuicMux`]
+    /// holding an active connection guard.
+    pub async fn accept_quic_mux_stream(
+        acceptor: &mut quic_mux::tokio_mux::TokioMuxAcceptor,
+    ) -> Option<MeshStream> {
+        let mux_stream = acceptor.accept().await?;
+        Some(MeshStream::QuicMux(
+            mux_stream,
+            Some(crate::activity::connection()),
+        ))
     }
 }
 

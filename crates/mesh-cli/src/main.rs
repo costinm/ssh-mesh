@@ -142,6 +142,10 @@ fn tcp_address(destination: &str) -> Option<&str> {
     destination.strip_prefix("tcp://")
 }
 
+fn qmux_address(destination: &str) -> Option<&str> {
+    destination.strip_prefix("qmux://")
+}
+
 /// Resolve a destination to an endpoint URL the RPC code below can open, or `None` when it is an
 /// ssh destination (a host name, `user@host`, an IP with no scheme).
 ///
@@ -150,6 +154,9 @@ fn tcp_address(destination: &str) -> Option<&str> {
 /// application (see `Resolvers::standard`) but are not enabled here, so that `mesh HOST` keeps
 /// meaning ssh. An endpoint whose protocol this CLI cannot open (QUIC) is an error naming it.
 fn resolve_destination(destination: &str) -> Result<Option<String>> {
+    if destination.starts_with("qmux://") {
+        return Ok(Some(destination.to_owned()));
+    }
     use mesh::resolve::{Address, ExplicitResolver, LocalServiceResolver, PortMap, Protocol, Resolvers};
     let resolvers = Resolvers::new()
         .push(LocalServiceResolver { ports: PortMap::default() })
@@ -494,6 +501,15 @@ async fn rpc_destination(cli: &Cli, catalog_destination: &str) -> Result<()> {
 }
 
 async fn connect_rpc(destination: &str) -> Result<Box<dyn AsyncReadWrite>> {
+    if let Some(target) = qmux_address(destination) {
+        let (client, _acceptor) = if target.starts_with('/') || target.starts_with("./") {
+            mesh::client::QuicMuxClient::connect_uds(target).await?
+        } else {
+            mesh::client::QuicMuxClient::connect_tcp(target).await?
+        };
+        let stream = client.open_mux_stream().await?;
+        return Ok(Box::new(stream));
+    }
     if let Some(path) = unix_path(destination) {
         return Ok(Box::new(tokio::net::UnixStream::connect(path).await?));
     }

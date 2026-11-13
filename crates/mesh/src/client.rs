@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub use mesh_api::MeshTarget;
+pub use quic_mux::tokio_mux::{MuxStream, TokioMux, TokioMuxAcceptor, TokioMuxConfig};
 
 /// A reliable bidirectional byte stream selected by a [`MeshClient`].
 ///
@@ -23,6 +24,83 @@ pub use mesh_api::MeshTarget;
 pub trait MeshStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T> MeshStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+
+/// [`MeshClient`] backed by a [`quic_mux::tokio_mux::TokioMux`] session.
+///
+/// Multiplexes concurrent bidirectional [`MeshStream`]s (`MuxStream`) over one or more
+/// underlying byte streams (UDS, TCP, TLS) or packet links attached to the `TokioMux`.
+#[derive(Clone)]
+pub struct QuicMuxClient {
+    mux: TokioMux,
+}
+
+impl QuicMuxClient {
+    /// Wrap an existing [`TokioMux`] handle as a [`MeshClient`].
+    pub fn new(mux: TokioMux) -> Self {
+        Self { mux }
+    }
+
+    /// Spawn a client [`TokioMux`] session over `stream` (`UnixStream`, `TcpStream`, etc.)
+    /// with default [`TokioMuxConfig`].
+    pub fn over_stream<S>(stream: S) -> (Self, TokioMuxAcceptor)
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        Self::over_stream_with_config(stream, TokioMuxConfig::default())
+    }
+
+    /// Spawn a client [`TokioMux`] session over `stream` with explicit [`TokioMuxConfig`].
+    pub fn over_stream_with_config<S>(
+        stream: S,
+        config: TokioMuxConfig,
+    ) -> (Self, TokioMuxAcceptor)
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (mux, acceptor) = TokioMux::client(stream, config);
+        (Self { mux }, acceptor)
+    }
+
+    /// Connect to a Unix domain stream socket at `path` and initialize a client [`TokioMux`].
+    pub async fn connect_uds(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(Self, TokioMuxAcceptor)> {
+        let stream = tokio::net::UnixStream::connect(path.as_ref())
+            .await
+            .with_context(|| format!("connect quic-mux UDS {}", path.as_ref().display()))?;
+        Ok(Self::over_stream(stream))
+    }
+
+    /// Connect to a TCP address and initialize a client [`TokioMux`].
+    pub async fn connect_tcp(addr: &str) -> Result<(Self, TokioMuxAcceptor)> {
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connect quic-mux TCP {addr}"))?;
+        let _ = stream.set_nodelay(true);
+        Ok(Self::over_stream(stream))
+    }
+
+    /// Borrow the underlying [`TokioMux`] handle.
+    pub fn mux(&self) -> &TokioMux {
+        &self.mux
+    }
+
+    /// Open a bidirectional [`MuxStream`] directly on the underlying [`TokioMux`].
+    pub async fn open_mux_stream(&self) -> Result<MuxStream> {
+        self.mux
+            .open_bidi()
+            .await
+            .context("open quic-mux bidirectional stream")
+    }
+}
+
+#[async_trait::async_trait]
+impl MeshClient for QuicMuxClient {
+    async fn open_stream(&self, _target: &MeshTarget) -> Result<Box<dyn MeshStream>> {
+        let stream = self.open_mux_stream().await?;
+        Ok(Box::new(stream))
+    }
+}
 
 /// Opens ordinary bidirectional streams to named mesh nodes.
 ///
@@ -222,5 +300,77 @@ mod tests {
             serde_json::to_value(&target).expect("target JSON"),
             json!({"node": "e7", "path": "udp://[fe80::1%br-lan]"})
         );
+    }
+
+    #[tokio::test]
+    async fn quic_mux_client_multiplexes_concurrent_cbor_streams_over_single_uds() {
+        use crate::server::MeshListener;
+        use crate::wire::{TaggedRecordHandler, serve_cbor_session};
+
+        struct EchoHandler;
+
+        #[async_trait::async_trait]
+        impl TaggedRecordHandler for EchoHandler {
+            async fn handle_record(&self, record: TaggedRecord) -> Result<Option<TaggedRecord>> {
+                let seq = record
+                    .env
+                    .get(&NameOrTag::Name("seq".to_owned()))
+                    .cloned()
+                    .unwrap_or(json!(null));
+                Ok(Some(response_ok(
+                    record.id.expect("request id"),
+                    json!({"echo_seq": seq, "method": record.method.text()}),
+                )))
+            }
+        }
+
+        let (client_uds, server_uds) = tokio::net::UnixStream::pair().expect("UnixStream::pair");
+        let (client, _client_acceptor) = QuicMuxClient::over_stream(client_uds);
+        let (_server_mux, mut server_acceptor) = MeshListener::spawn_quic_mux(server_uds);
+
+        let server_task = tokio::spawn(async move {
+            let mut stream_tasks = Vec::new();
+            for _ in 0..8 {
+                let mut stream = MeshListener::accept_quic_mux_stream(&mut server_acceptor)
+                    .await
+                    .expect("accept quic-mux stream");
+                stream_tasks.push(tokio::spawn(async move {
+                    serve_cbor_session(&mut stream, &EchoHandler)
+                        .await
+                        .expect("serve cbor session on mux stream");
+                }));
+            }
+            for task in stream_tasks {
+                task.await.expect("stream task");
+            }
+        });
+
+        let mut call_tasks = Vec::new();
+        for seq in 0..8u64 {
+            let client = client.clone();
+            call_tasks.push(tokio::spawn(async move {
+                let req = TaggedRecord {
+                    component: NameOrTag::Name("telemetry".to_owned()),
+                    method: NameOrTag::Name("ping".to_owned()),
+                    id: Some(json!(100 + seq)),
+                    to: Some(json!("local-node")),
+                    env: [(NameOrTag::Name("seq".to_owned()), json!(seq))]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                };
+                let resp = call_record(&client, req).await.expect("call_record");
+                assert_eq!(resp.id, Some(json!(100 + seq)));
+                assert_eq!(
+                    resp.result,
+                    Some(json!({"echo_seq": seq, "method": "ping"}))
+                );
+            }));
+        }
+
+        for task in call_tasks {
+            task.await.expect("call task");
+        }
+        server_task.await.expect("server task");
     }
 }

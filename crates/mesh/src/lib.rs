@@ -7,7 +7,11 @@ pub mod catalog;
 pub mod cbor;
 /// Transport-neutral outgoing mesh stream client contract.
 pub mod client;
+/// Passive component directory and lazy on-demand handler activation.
+pub mod component;
 pub mod config;
+/// Tier-2 `AsyncRead + AsyncWrite` stream framing over self-delimiting envelope headers.
+pub mod framed_stream;
 /// Generated numeric IDs from the normative mesh API.md catalog.
 pub mod generated_api_ids;
 pub mod http_ids;
@@ -33,7 +37,17 @@ pub mod tagged;
 pub mod tun;
 pub mod wire;
 
-pub use client::{MeshClient, MeshStream, MeshTarget};
+pub use client::{MeshClient, MeshStream, MeshTarget, QuicMuxClient};
+pub use component::{
+    ComponentDirectory, ComponentHandler, DynamicComponentSpec, DynamicMethodSpec, MethodCall,
+    ModuleLoader, StaticComponent,
+};
+pub use framed_stream::{
+    FramedStream, OwnedEnvelope, read_envelope_prefix, rewind_envelope, write_envelope,
+};
+pub use mesh_api;
+pub use mesh_api::{ComponentSpec, MethodExecution, MethodSpec};
+pub use quic_mux;
 
 use std::sync::Arc;
 
