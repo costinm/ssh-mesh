@@ -1,4 +1,5 @@
-//! Minimal definite-length CBOR, shared by firmware and host implementations.
+//! Bounded CBOR codec shared by firmware and host implementations.
+//! Generic skipping supports extended CBOR without allocation; typed reads remain definite-only.
 //!
 //! This is the no-alloc, `Option`-based codec that DMesh firmware and
 //! `dmesh-server` use for tagged envelopes and object manifests. It performs
@@ -11,6 +12,14 @@
 //!
 //! Names ending in `_value`/`_ref` or taking an output slice keep the
 //! original DMesh forms for fixed-buffer, borrow-only callers.
+
+mod compat;
+pub use compat::{Item, Reader, Writer, get, get_int, get_text};
+
+/// Maximum nested container/tag frames accepted by [`Decoder::skip`].
+pub const DEFAULT_MAX_DEPTH: usize = 64;
+/// Maximum item headers (including breaks) processed by [`Decoder::skip`].
+pub const DEFAULT_MAX_ITEMS: usize = 65536;
 
 /// Fixed-capacity CBOR writer over a caller-owned buffer. Every method
 /// returns `None` when the remaining capacity is insufficient.
@@ -31,7 +40,8 @@ impl<'a> Encoder<'a> {
         self.pos += 1;
         Some(())
     }
-    fn raw(&mut self, bytes: &[u8]) -> Option<()> {
+    /// Append unvalidated encoded fragments.
+    pub fn raw(&mut self, bytes: &[u8]) -> Option<()> {
         let end = self.pos.checked_add(bytes.len())?;
         self.out.get_mut(self.pos..end)?.copy_from_slice(bytes);
         self.pos = end;
@@ -42,6 +52,9 @@ impl<'a> Encoder<'a> {
             self.put((major << 5) | value as u8)
         } else if value <= u8::MAX as u64 {
             self.raw(&[(major << 5) | 24, value as u8])
+        } else if value <= u16::MAX as u64 {
+            self.put((major << 5) | 25)?;
+            self.raw(&(value as u16).to_be_bytes())
         } else if value <= u32::MAX as u64 {
             self.put((major << 5) | 26)?;
             self.raw(&(value as u32).to_be_bytes())
@@ -49,6 +62,14 @@ impl<'a> Encoder<'a> {
             self.put((major << 5) | 27)?;
             self.raw(&value.to_be_bytes())
         }
+    }
+    /// Return the bytes written so far.
+    pub fn finish(self) -> &'a [u8] {
+        &self.out[..self.pos]
+    }
+    /// Encode CBOR null.
+    pub fn null(&mut self) -> Option<()> {
+        self.put(0xf6)
     }
     pub fn map(&mut self, count: u64) -> Option<()> {
         self.head(5, count)
@@ -141,7 +162,6 @@ impl<'a> Decoder<'a> {
             25 => u16::from_be_bytes(self.take(2)?.try_into().ok()?) as u64,
             26 => u32::from_be_bytes(self.take(4)?.try_into().ok()?) as u64,
             27 => u64::from_be_bytes(self.take(8)?.try_into().ok()?),
-            31 => u64::MAX,
             _ => return None,
         };
         Some((major, value))
@@ -172,10 +192,7 @@ impl<'a> Decoder<'a> {
         let (major, value) = self.head()?;
         match major {
             0 => i64::try_from(value).ok(),
-            1 => value
-                .checked_add(1)
-                .and_then(|value| i64::try_from(value).ok())
-                .map(|value| -value),
+            1 => i64::try_from(value).ok().map(|value| -1 - value),
             _ => None,
         }
     }
@@ -185,7 +202,9 @@ impl<'a> Decoder<'a> {
     }
     pub fn bytes_ref(&mut self) -> Option<&'a [u8]> {
         let (major, len) = self.head()?;
-        (major == 2).then(|| self.take(len as usize)).flatten()
+        (major == 2)
+            .then(|| self.take(usize::try_from(len).ok()?))
+            .flatten()
     }
     pub fn bytes(&mut self, dst: &mut [u8]) -> Option<usize> {
         let bytes = self.bytes_ref()?;
@@ -197,10 +216,10 @@ impl<'a> Decoder<'a> {
     }
     pub fn text(&mut self, dst: &mut [u8]) -> Option<usize> {
         let (major, len) = self.head()?;
-        if major != 3 || len as usize > dst.len() {
+        if major != 3 || usize::try_from(len).ok()? > dst.len() {
             return None;
         }
-        let bytes = self.take(len as usize)?;
+        let bytes = self.take(usize::try_from(len).ok()?)?;
         dst[..bytes.len()].copy_from_slice(bytes);
         Some(bytes.len())
     }
@@ -210,7 +229,9 @@ impl<'a> Decoder<'a> {
     }
     pub fn text_ref(&mut self) -> Option<&'a [u8]> {
         let (major, len) = self.head()?;
-        (major == 3).then(|| self.take(len as usize)).flatten()
+        (major == 3)
+            .then(|| self.take(usize::try_from(len).ok()?))
+            .flatten()
     }
     /// `minicbor`-style alias for [`Decoder::text_ref`].
     pub fn str_ref(&mut self) -> Option<&'a [u8]> {
@@ -269,34 +290,119 @@ impl<'a> Decoder<'a> {
         }
         Some(value)
     }
+    /// Skip one complete item with the default depth and item-work limits.
     pub fn skip(&mut self) -> Option<()> {
-        let (major, len) = self.head()?;
-        match major {
-            0 | 1 | 7 => Some(()),
-            2 | 3 => {
-                self.take(len as usize)?;
-                Some(())
-            }
-            4 => {
-                let mut index = 0;
-                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len)
-                {
-                    index += 1;
-                    self.skip()?;
+        self.skip_with_limits(DEFAULT_MAX_DEPTH, DEFAULT_MAX_ITEMS)
+    }
+
+    /// Skip one extended CBOR item without recursion or allocation. Depth is
+    /// limited to at most [`DEFAULT_MAX_DEPTH`]; work counts headers and breaks.
+    pub fn skip_with_limits(&mut self, max_depth: usize, max_items: usize) -> Option<()> {
+        // A definite frame counts children; indefinite maps track key/value parity.
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Def(u64),
+            Array,
+            Map(bool),
+            String(u8),
+        }
+        let mut stack = [Frame::Def(0); DEFAULT_MAX_DEPTH];
+        let mut depth = 0usize;
+        let mut work = 0usize;
+        let mut pending = true;
+        loop {
+            if !pending {
+                if depth == 0 {
+                    return Some(());
                 }
-                Some(())
-            }
-            5 => {
-                let mut index = 0;
-                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len)
-                {
-                    index += 1;
-                    self.skip()?;
-                    self.skip()?;
+                match &mut stack[depth - 1] {
+                    Frame::Def(n) if *n == 0 => {
+                        depth -= 1;
+                        continue;
+                    }
+                    Frame::Def(n) => {
+                        *n -= 1;
+                    }
+                    Frame::Map(odd) => {
+                        if self.data.get(self.pos) == Some(&0xff) {
+                            if *odd {
+                                return None;
+                            }
+                            work = work.checked_add(1)?;
+                            if work > max_items {
+                                return None;
+                            }
+                            self.pos += 1;
+                            depth -= 1;
+                            continue;
+                        }
+                        *odd = !*odd;
+                    }
+                    Frame::Array | Frame::String(_) => {
+                        if self.data.get(self.pos) == Some(&0xff) {
+                            work = work.checked_add(1)?;
+                            if work > max_items {
+                                return None;
+                            }
+                            self.pos += 1;
+                            depth -= 1;
+                            continue;
+                        }
+                    }
                 }
-                Some(())
             }
-            _ => None,
+            pending = false;
+            work = work.checked_add(1)?;
+            if work > max_items {
+                return None;
+            }
+            let first = *self.data.get(self.pos)?;
+            let major = first >> 5;
+            let ai = first & 31;
+            if depth > 0 {
+                if let Frame::String(expected) = stack[depth - 1] {
+                    if major != expected || ai == 31 {
+                        return None;
+                    }
+                }
+            }
+            if ai == 31 {
+                self.pos += 1;
+                let frame = match major {
+                    2 | 3 => Frame::String(major),
+                    4 => Frame::Array,
+                    5 => Frame::Map(false),
+                    _ => return None,
+                };
+                if depth >= max_depth || depth >= DEFAULT_MAX_DEPTH {
+                    return None;
+                }
+                stack[depth] = frame;
+                depth += 1;
+                continue;
+            }
+            if major == 7 && ai == 24 && *self.data.get(self.pos + 1)? < 32 {
+                return None;
+            }
+            let (_, value) = self.head()?;
+            let frame = match major {
+                0 | 1 | 7 => None,
+                2 | 3 => {
+                    self.take(usize::try_from(value).ok()?)?;
+                    None
+                }
+                4 => Some(Frame::Def(value)),
+                5 => Some(Frame::Def(value.checked_mul(2)?)),
+                6 => Some(Frame::Def(1)),
+                _ => return None,
+            };
+            if let Some(frame) = frame {
+                if depth >= max_depth || depth >= DEFAULT_MAX_DEPTH {
+                    return None;
+                }
+                stack[depth] = frame;
+                depth += 1;
+            }
         }
     }
 }
@@ -310,6 +416,9 @@ pub mod encode {
             out.push(value as u8);
         } else if value <= u8::MAX as u64 {
             out.extend_from_slice(&[24, value as u8]);
+        } else if value <= u16::MAX as u64 {
+            out.push(0x19);
+            out.extend_from_slice(&(value as u16).to_be_bytes());
         } else if value <= u32::MAX as u64 {
             out.push(0x1a);
             out.extend_from_slice(&(value as u32).to_be_bytes());
@@ -336,9 +445,15 @@ pub mod encode {
             out.push((major << 5) | len as u8);
         } else if len <= u8::MAX as u64 {
             out.extend_from_slice(&[(major << 5) | 24, len as u8]);
-        } else {
+        } else if len <= u16::MAX as u64 {
+            out.push((major << 5) | 25);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        } else if len <= u32::MAX as u64 {
             out.push((major << 5) | 26);
             out.extend_from_slice(&(len as u32).to_be_bytes());
+        } else {
+            out.push((major << 5) | 27);
+            out.extend_from_slice(&len.to_be_bytes());
         }
     }
 }
@@ -346,6 +461,32 @@ pub mod encode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_rejects_malformed_and_out_of_range_values() {
+        for input in [
+            &[0x1f][..],
+            &[0x3f][..],
+            &[0x1c][..],
+            &[0x3c][..],
+            &[0x1b, 0, 0, 0, 0, 0, 0, 0][..],
+            &[0x3b, 0, 0, 0, 0, 0, 0, 0][..],
+        ] {
+            assert_eq!(Decoder::new(input).uint(), None);
+            assert_eq!(Decoder::new(input).int(), None);
+        }
+
+        // These are valid CBOR integers, but not all are representable as i64.
+        let unsigned_max = [0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(Decoder::new(&unsigned_max).uint(), Some(u64::MAX));
+        assert_eq!(Decoder::new(&unsigned_max).int(), None);
+        let negative_overflow = [0x3b, 0x80, 0, 0, 0, 0, 0, 0, 0];
+        let negative_max = [0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(Decoder::new(&negative_overflow).int(), None);
+        assert_eq!(Decoder::new(&negative_max).int(), None);
+        let negative_min = [0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(Decoder::new(&negative_min).int(), Some(i64::MIN));
+    }
 
     #[test]
     fn encoder_and_decoder_round_trip_minicbor_named_methods() {

@@ -15,6 +15,42 @@ use alloc::string::String;
 /// with `minicbor`-compatible method names where signatures agree.
 pub mod cbor;
 
+/// Passive, compile-time component and method descriptors (`ComponentSpec`, `MethodSpec`).
+pub mod component;
+
+/// Borrowed single-pass request/response envelope codec (`Record`, `Envelope`, `Name`,
+/// and `decode_envelope_prefix`).
+pub mod envelope;
+
+/// Zero-copy packet pool traits (`PoolPacket`, `PacketPool`), capacity policy (`PacketPoolPolicy`),
+/// and pool implementations (`StaticPacketPool`, `HeapPacketPool`, `XipLazyPool`).
+pub mod pool;
+
+/// Zero-copy packet-borrow stream primitives (`RxStreamChunk`, `RxOutcome`, `TxStreamData`,
+/// and `PacketStreamHandler`).
+pub mod stream;
+
+pub use component::{ComponentSpec, MethodExecution, MethodSpec, find_component, resolve_method};
+
+pub use envelope::{
+    DevicePrefixDecode, DeviceRecord, Envelope, MAX_ENVELOPE_BYTES, Name, PrefixDecode, Record,
+    decode, decode_any, decode_device, decode_device_envelope_prefix, decode_device_prefix,
+    decode_envelope_prefix, decode_prefix, destination, encode_error_header,
+    encode_numeric_data_response, encode_numeric_empty_request, encode_numeric_error,
+    encode_numeric_response,
+};
+pub use pool::{
+    DEFAULT_HEADROOM, DEFAULT_MAX_PAYLOAD, DEFAULT_SLOT_SIZE, DEFAULT_TAIL, PacketPool,
+    PacketPoolPolicy, PoolError, PoolPacket,
+};
+#[cfg(any(feature = "std", feature = "host-pools", test))]
+pub use pool::{
+    HEAP_PACKET_SLOT_OVERHEAD, HeapPacketAllocator, HeapPacketLease, HeapPacketPool,
+    HeapPacketPoolError, SlabPacket, SlabPool, StaticPacketLease, StaticPacketPool, XipLazyPacket,
+    XipLazyPool, XipPacketRef,
+};
+pub use stream::{PacketStreamHandler, RxOutcome, RxStreamChunk, TxStreamData};
+
 /// Generated numeric wire identity for the `mesh-init` control surface
 /// (component/method and by-method field tags).
 ///

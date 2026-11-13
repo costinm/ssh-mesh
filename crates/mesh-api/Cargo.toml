@@ -6,6 +6,8 @@ publish = false
 
 [features]
 default = []
+std = []
+host-pools = []
 serde = ["dep:serde"]
 
 [dependencies]
