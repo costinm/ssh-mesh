@@ -22,6 +22,9 @@ pub mod component;
 /// and `decode_envelope_prefix`).
 pub mod envelope;
 
+/// Transport-neutral link-layer traits and metadata (`PeerL2Address`, `LinkInfo`, `PacketLink`).
+pub mod link;
+
 /// Zero-copy packet pool traits (`PoolPacket`, `PacketPool`), capacity policy (`PacketPoolPolicy`),
 /// and pool implementations (`StaticPacketPool`, `HeapPacketPool`, `XipLazyPool`).
 pub mod pool;
@@ -39,6 +42,7 @@ pub use envelope::{
     encode_numeric_data_response, encode_numeric_empty_request, encode_numeric_error,
     encode_numeric_response,
 };
+pub use link::{LinkInfo, LinkIngress, LinkMeta, LinkName, LinkTxOutcome, PacketLink, PeerL2Address};
 pub use pool::{
     DEFAULT_HEADROOM, DEFAULT_MAX_PAYLOAD, DEFAULT_SLOT_SIZE, DEFAULT_TAIL, PacketPool,
     PacketPoolPolicy, PoolError, PoolPacket,
