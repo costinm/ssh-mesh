@@ -11,6 +11,10 @@ extern crate alloc;
 
 use alloc::string::String;
 
+/// Transport-independent component call correlation table and envelope validation.
+#[deny(missing_docs)]
+pub mod call;
+
 /// Minimal definite-length CBOR shared by firmware and host implementations,
 /// with `minicbor`-compatible method names where signatures agree.
 pub mod cbor;
@@ -33,6 +37,8 @@ pub mod pool;
 /// and `PacketStreamHandler`).
 pub mod stream;
 
+/// Compatibility re-export for callers migrating from the former `component-call` crate.
+pub use call as component_call;
 pub use component::{ComponentSpec, MethodExecution, MethodSpec, find_component, resolve_method};
 
 pub use envelope::{
@@ -42,7 +48,9 @@ pub use envelope::{
     encode_numeric_data_response, encode_numeric_empty_request, encode_numeric_error,
     encode_numeric_response,
 };
-pub use link::{LinkInfo, LinkIngress, LinkMeta, LinkName, LinkTxOutcome, PacketLink, PeerL2Address};
+pub use link::{
+    LinkInfo, LinkIngress, LinkMeta, LinkName, LinkTxOutcome, PacketLink, PeerL2Address,
+};
 pub use pool::{
     DEFAULT_HEADROOM, DEFAULT_MAX_PAYLOAD, DEFAULT_SLOT_SIZE, DEFAULT_TAIL, PacketPool,
     PacketPoolPolicy, PoolError, PoolPacket,

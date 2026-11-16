@@ -2280,6 +2280,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "micro-cel"
+version = "0.1.0"
+dependencies = [
+ "mesh-api",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2988,10 +2997,12 @@ version = "0.1.0"
 dependencies = [
  "hmac 0.13.0",
  "libc",
+ "mesh-api",
  "quic-base",
  "quic-mux",
  "sha2 0.11.0",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

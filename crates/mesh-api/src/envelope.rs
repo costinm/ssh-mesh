@@ -363,7 +363,11 @@ fn parse_record_map<'a>(data: &'a [u8], pos: &mut usize) -> Result<Record<'a>, S
         return Err(StepError::Malformed);
     }
     let mut record = Record::default();
-    let apply_entry = |record: &mut Record<'a>, key: u64, data: &'a [u8], pos: &mut usize| -> Result<(), StepError> {
+    let apply_entry = |record: &mut Record<'a>,
+                       key: u64,
+                       data: &'a [u8],
+                       pos: &mut usize|
+     -> Result<(), StepError> {
         match key {
             1 => record.component = Some(read_name(data, pos)?),
             2 => record.method = Some(read_name(data, pos)?),

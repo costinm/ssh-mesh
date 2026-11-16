@@ -408,13 +408,13 @@ pub struct Routes {
     pub event_method: i32,
 }
 
-pub use component_call::{Pending as LegacyPending, envelope, reserve, take};
+pub use mesh_api::call::{Pending as LegacyPending, envelope, reserve, take};
 
 /// CEL adapter for the transport-independent correlation state.
-pub struct LegacyCalls<const N: usize>(component_call::PendingCalls<N>);
+pub struct LegacyCalls<const N: usize>(mesh_api::call::PendingCalls<N>);
 impl<const N: usize> Default for LegacyCalls<N> {
     fn default() -> Self {
-        Self(component_call::PendingCalls::default())
+        Self(mesh_api::call::PendingCalls::default())
     }
 }
 impl<const N: usize> LegacyCalls<N> {
@@ -514,7 +514,7 @@ pub fn prepare<'a, const N: usize>(
     out: &'a mut [u8],
     max_depth: u32,
 ) -> Result<&'a [u8], i32> {
-    component_call::prepare(pending, id, now, input, out, |value| {
+    mesh_api::call::prepare(pending, id, now, input, out, |value| {
         crate::validate_data(value, max_depth).map_err(|_| ERR_ARG)
     })
 }

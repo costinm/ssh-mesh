@@ -196,9 +196,12 @@ mod tests {
 
     #[test]
     fn resolves_string_only_components_and_rejects_unknowns() {
-        let (comp, meth) =
-            resolve_method(SPECS, Name::Text(b"host.diagnostics"), Name::Text(b"version"))
-                .unwrap();
+        let (comp, meth) = resolve_method(
+            SPECS,
+            Name::Text(b"host.diagnostics"),
+            Name::Text(b"version"),
+        )
+        .unwrap();
         assert_eq!(comp.name, "host.diagnostics");
         assert_eq!(comp.id, None);
         assert_eq!(meth.name, "version");

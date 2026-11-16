@@ -9,7 +9,7 @@ publish = false
 [features]
 translate = []
 program = []
-service = ["program", "dep:component-call"]
+service = ["program"]
 program-host = ["program", "translate", "dep:serde", "dep:toml"]
 
 [[bin]]
@@ -21,7 +21,6 @@ name = "measure"
 required-features = ["program-host"]
 
 [dependencies]
-component-call = { path = "../component-call", optional = true }
 mesh-api = { path = "../mesh-api", default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
