@@ -108,6 +108,7 @@ pub struct MethodSchema {
     pub component: NameOrTag,
     pub method: NameOrTag,
     pub fields: BTreeMap<String, FieldSchema>,
+    pub response_fields: BTreeMap<String, FieldSchema>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,58 +180,101 @@ impl TaggedSchema {
                 component,
                 method,
                 fields: BTreeMap::new(),
+                response_fields: BTreeMap::new(),
             };
-            if let Some(properties) = tool
-                .pointer("/inputSchema/properties")
-                .and_then(Value::as_object)
-            {
-                for (field, property) in properties {
-                    let annotation = property.get("x-mesh-wire");
-                    if let Some(tag) = property
-                        .get("x-protobuf-index")
-                        .and_then(Value::as_u64)
-                        .or_else(|| {
-                            property
-                                .get("x-mesh-cbor")
-                                .and_then(|value| value.get("id"))
-                                .and_then(Value::as_u64)
-                        })
-                        .or_else(|| {
-                            annotation
-                                .and_then(|value| value.get("tag"))
-                                .and_then(Value::as_u64)
-                        })
-                    {
-                        schema.fields.insert(
-                            field.clone(),
-                            FieldSchema {
-                                tag: tag as u32,
-                                kind: property
-                                    .get("x-mesh-cbor-type")
-                                    .or_else(|| property.get("x-dmesh-kind"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned),
-                                values: property
-                                    .get("x-mesh-values")
-                                    .or_else(|| property.get("x-dmesh-values"))
-                                    .and_then(Value::as_object)
-                                    .map(|values| {
-                                        values
-                                            .iter()
-                                            .filter_map(|(name, value)| {
-                                                value.as_u64().map(|value| (name.clone(), value))
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                            },
-                        );
+            for (pointer, dest) in [
+                ("/inputSchema/properties", &mut schema.fields),
+                ("/outputSchema/properties", &mut schema.response_fields),
+            ] {
+                if let Some(properties) = tool.pointer(pointer).and_then(Value::as_object) {
+                    for (field, property) in properties {
+                        let annotation = property.get("x-mesh-wire");
+                        if let Some(tag) = property
+                            .get("x-protobuf-index")
+                            .and_then(Value::as_u64)
+                            .or_else(|| {
+                                property
+                                    .get("x-mesh-cbor")
+                                    .and_then(|value| value.get("id"))
+                                    .and_then(Value::as_u64)
+                            })
+                            .or_else(|| {
+                                annotation
+                                    .and_then(|value| value.get("tag"))
+                                    .and_then(Value::as_u64)
+                            })
+                            .and_then(|tag| u32::try_from(tag).ok())
+                        {
+                            let kind = property
+                                .get("x-mesh-cbor-type")
+                                .or_else(|| property.get("x-dmesh-kind"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .or_else(|| {
+                                    let ptype =
+                                        property.get("x-protobuf-type").and_then(Value::as_str);
+                                    match ptype {
+                                        Some("bytes") => Some("hex".to_owned()),
+                                        Some(t) if t.starts_with("bytes[") => {
+                                            Some("hex".to_owned())
+                                        }
+                                        Some(t) => Some(t.to_owned()),
+                                        None => None,
+                                    }
+                                });
+                            dest.insert(
+                                field.clone(),
+                                FieldSchema {
+                                    tag,
+                                    kind,
+                                    values: property
+                                        .get("x-mesh-values")
+                                        .or_else(|| property.get("x-dmesh-values"))
+                                        .and_then(Value::as_object)
+                                        .map(|values| {
+                                            values
+                                                .iter()
+                                                .filter_map(|(name, value)| {
+                                                    value
+                                                        .as_u64()
+                                                        .map(|value| (name.clone(), value))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
+                                },
+                            );
+                        }
                     }
                 }
             }
             catalog.methods.insert(name.to_owned(), schema);
         }
         Ok(catalog)
+    }
+
+    /// Read a `mesh-api/1` catalog (`api.json` or decoded `api.cbor`).
+    pub fn from_api_json(value: &Value) -> Result<Self> {
+        let tools = crate::catalog::tools_from_api_json(value)?;
+        Self::from_tools_json(&Value::Array(tools))
+    }
+
+    /// Read a binary `api.cbor` catalog (`mesh-api/1` encoded as CBOR).
+    pub fn from_api_cbor(bytes: &[u8]) -> Result<Self> {
+        let value = crate::cbor::decode_value_bytes(bytes)?;
+        Self::from_api_json(&value)
+    }
+
+    /// Return all method names in this schema, in sorted order.
+    pub fn method_names(&self) -> impl Iterator<Item = &str> {
+        self.methods.keys().map(String::as_str)
+    }
+
+    /// Merge methods from `other` that are not already present in `self`.
+    pub fn extend_missing(&mut self, other: Self) {
+        for (name, method) in other.methods {
+            self.methods.entry(name).or_insert(method);
+        }
     }
 
     pub fn method(&self, name: &str) -> Option<&MethodSchema> {
@@ -432,7 +476,10 @@ impl TaggedSchema {
         }
         // A declared `to` with the envelope's tag is the destination, as in `record_from_value`.
         if schema.is_some_and(|schema| {
-            schema.fields.get("to").is_some_and(|field| field.tag == ENVELOPE_TO_TAG)
+            schema
+                .fields
+                .get("to")
+                .is_some_and(|field| field.tag == ENVELOPE_TO_TAG)
         }) && let Some(to) = record.env.remove(&NameOrTag::Tag(ENVELOPE_TO_TAG))
         {
             record.to = Some(to);
@@ -536,14 +583,18 @@ fn project_fields(value: &Value, schema: Option<&MethodSchema>) -> Value {
     let Some(schema) = schema else {
         return value.clone();
     };
+    let fields = if schema.response_fields.is_empty() {
+        &schema.fields
+    } else {
+        &schema.response_fields
+    };
     let mut projected = Map::new();
     for (key, value) in object {
         let name = key
             .parse::<u32>()
             .ok()
             .and_then(|tag| {
-                schema
-                    .fields
+                fields
                     .iter()
                     .find(|(_, field)| field.tag == tag)
                     .map(|(name, _)| name.clone())
@@ -1020,9 +1071,14 @@ mod tests {
             "name": "nan.wakeup", "x-component-index": 2, "x-method-index": 3,
             "inputSchema": {"properties": {
                 "to": {"x-protobuf-index": 1, "x-mesh-cbor-type": "mac"},
-                "mode": {"x-protobuf-index": 2, "x-mesh-cbor-type": "enum", "x-mesh-values": {"sta": 5}}
+                "mode": {
+                    "x-protobuf-index": 2,
+                    "x-mesh-cbor-type": "enum",
+                    "x-mesh-values": {"sta": 5}
+                }
             }}
-        }])).unwrap();
+        }]))
+        .unwrap();
         let record = catalog
             .parse_argv("nan.wakeup", &["--1=AA:BB".into(), "--mode=sta".into()])
             .unwrap();
@@ -1073,8 +1129,12 @@ mod tests {
     fn text_arguments_require_named_fields() {
         let catalog = TaggedCatalog::from_tools_json(&json!([{
             "name":"wifi.listen", "x-mesh-wire":{"component":"wifi","method":"listen"},
-            "inputSchema":{"properties":{"iface":{"x-mesh-wire":{"tag":1}},"listen_sec":{"x-mesh-wire":{"tag":2}}}}
-        }])).unwrap();
+            "inputSchema":{"properties":{
+                "iface":{"x-mesh-wire":{"tag":1}},
+                "listen_sec":{"x-mesh-wire":{"tag":2}}
+            }}
+        }]))
+        .unwrap();
         let record = catalog
             .parse_text("wifi.listen -listen_sec=1 iface=wlan0")
             .unwrap();
@@ -1324,7 +1384,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn a_structured_request_applies_the_same_field_rules_as_key_value_arguments() {
         let tools = serde_json::json!({"tools": [{
@@ -1338,14 +1397,19 @@ mod tests {
         }]});
         let schema = TaggedSchema::from_tools_json(&tools).unwrap();
         // The JSON path (HTTP) and the argv path agree: text stays text, numbers stay numbers.
-        let from_json = schema
-            .record_from_value("demo.set", &serde_json::json!({"value": 123, "count": 4, "to": "e8"}))
-            .unwrap();
+        let req = serde_json::json!({"value": 123, "count": 4, "to": "e8"});
+        let from_json = schema.record_from_value("demo.set", &req).unwrap();
         let from_argv = schema
-            .parse_argv("demo.set", &["value=123".into(), "count=4".into(), "to=e8".into()])
+            .parse_argv(
+                "demo.set",
+                &["value=123".into(), "count=4".into(), "to=e8".into()],
+            )
             .unwrap();
         assert_eq!(from_argv.to, Some(Value::String("e8".into())));
-        assert_eq!(from_json.env.get(&NameOrTag::Tag(2)), Some(&Value::String("123".into())));
+        assert_eq!(
+            from_json.env.get(&NameOrTag::Tag(2)),
+            Some(&Value::String("123".into()))
+        );
         assert_eq!(from_json.env.get(&NameOrTag::Tag(3)), Some(&Value::from(4)));
         assert_eq!(from_json.env, from_argv.env);
         // A declared field with the envelope tag is the destination in the JSON path.
@@ -1364,17 +1428,24 @@ mod tests {
             }}
         }]});
         let schema = TaggedSchema::from_tools_json(&tools).unwrap();
+        let json_req = serde_json::json!({"frame": "hex:D001FF", "note": "hex:ab"});
         for record in [
-            schema.parse_argv("demo.tx", &["frame=d0:01ff".into(), "note=hex:ab".into()]).unwrap(),
             schema
-                .record_from_value("demo.tx", &serde_json::json!({"frame": "hex:D001FF", "note": "hex:ab"}))
+                .parse_argv("demo.tx", &["frame=d0:01ff".into(), "note=hex:ab".into()])
                 .unwrap(),
+            schema.record_from_value("demo.tx", &json_req).unwrap(),
         ] {
             let wire = schema.encode_request(&record).unwrap();
             let decoded = crate::cbor::decode_record(&wire).unwrap();
             // CBOR bytes decode to `base64:` text in the generic view; the note stays text.
-            assert_eq!(decoded.env.get(&NameOrTag::Tag(1)), Some(&Value::String("base64:0AH/".into())));
-            assert_eq!(decoded.env.get(&NameOrTag::Tag(2)), Some(&Value::String("hex:ab".into())));
+            assert_eq!(
+                decoded.env.get(&NameOrTag::Tag(1)),
+                Some(&Value::String("base64:0AH/".into()))
+            );
+            assert_eq!(
+                decoded.env.get(&NameOrTag::Tag(2)),
+                Some(&Value::String("hex:ab".into()))
+            );
         }
     }
 }

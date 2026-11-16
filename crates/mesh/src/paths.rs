@@ -221,9 +221,13 @@ fn directory_access(path: &std::path::Path, write: bool) -> bool {
             return false;
         };
         let mode = libc::X_OK | if write { libc::W_OK } else { libc::R_OK };
+        #[cfg(target_os = "android")]
+        let flags = 0;
+        #[cfg(not(target_os = "android"))]
+        let flags = libc::AT_EACCESS;
         path.is_dir()
             && unsafe {
-                libc::faccessat(libc::AT_FDCWD, path_string.as_ptr(), mode, libc::AT_EACCESS)
+                libc::faccessat(libc::AT_FDCWD, path_string.as_ptr(), mode, flags)
             } == 0
     }
     #[cfg(not(unix))]

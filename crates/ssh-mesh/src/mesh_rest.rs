@@ -116,12 +116,8 @@ impl MeshServiceRegistry {
         let socket = socket.into();
         let catalog = resolved.component.as_str();
         let mut components: Vec<String> = resolved
-            .tools
-            .as_array()
-            .map(|tools| tools.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .catalog
+            .method_names()
             .filter_map(|name| {
                 name.split_once('.')
                     .map(|(component, _)| component.to_owned())

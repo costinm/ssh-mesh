@@ -622,9 +622,7 @@ async fn handle_jsonl_stream(
     manager: Arc<ssh_mesh::sshc::SshClientManager>,
     certificates: Arc<ssh_mesh::certs::ReloadableCertificates>,
 ) -> anyhow::Result<()> {
-    let registry = mesh::registry::ServiceRegistry::new("ssh-mesh").with_tools_json(
-        serde_json::from_str(include_str!("../resources/tools.json"))?,
-    );
+    let registry = mesh::registry::ServiceRegistry::new("ssh-mesh");
     let (read, mut write) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read);
     let mut line = String::new();

@@ -25,6 +25,8 @@ fn main() -> Result<()> {
     let mut out_console_native = None;
     let mut out_console_native_rs = None;
     let mut out_api_json = None;
+    let mut out_api_cbor = None;
+    let mut out_api_cbor_dir = None;
     let mut rustdoc_json = None;
     let mut pointer_width = 4u32;
     let mut autostart = None;
@@ -79,6 +81,8 @@ fn main() -> Result<()> {
                 out_manifest = Some(args.next().context("--out-manifest requires a path")?)
             }
             "--out-api-json" => out_api_json = Some(args.next().context("--out-api-json requires a path")?),
+            "--out-api-cbor" => out_api_cbor = Some(args.next().context("--out-api-cbor requires a path")?),
+            "--out-api-cbor-dir" => out_api_cbor_dir = Some(args.next().context("--out-api-cbor-dir requires a directory path")?),
             "--rustdoc" => rustdoc_json = Some(args.next().context("--rustdoc requires the path of a rustdoc JSON file")?),
             "--pointer-width" => pointer_width = args.next().context("--pointer-width requires bytes")?.parse().context("--pointer-width")?,
             "--autostart" => autostart = Some(args.next().context("--autostart requires a start request (may be empty)")?),
@@ -296,7 +300,7 @@ fn main() -> Result<()> {
             write_or_check(&path, &generated.module_rs, check)?;
         }
     }
-    if let Some(path) = out_api_json {
+    if out_api_json.is_some() || out_api_cbor.is_some() || out_api_cbor_dir.is_some() {
         let markdown = std::fs::read_to_string(&api)?;
         let docs = mesh_api_gen::document::scan(&markdown)?;
         let catalog = match &rustdoc_json {
@@ -306,8 +310,35 @@ fn main() -> Result<()> {
             )?),
             None => None,
         };
-        let generated = mesh_api_gen::apijson::api_json(&methods, &docs, catalog.as_ref())?;
-        write_or_check(&path, &format!("{}\n", serde_json::to_string_pretty(&generated)?), check)?;
+        if out_api_json.is_some() || out_api_cbor.is_some() {
+            let generated = mesh_api_gen::apijson::api_json(&methods, &docs, catalog.as_ref())?;
+            if let Some(path) = out_api_json {
+                write_or_check(&path, &format!("{}\n", serde_json::to_string_pretty(&generated)?), check)?;
+            }
+            if let Some(path) = out_api_cbor {
+                write_or_check_bytes(&path, &mesh_api_gen::apijson::api_cbor(&generated), check)?;
+            }
+        }
+        if let Some(dir) = out_api_cbor_dir {
+            let mut by_component: std::collections::BTreeMap<String, Vec<_>> =
+                std::collections::BTreeMap::new();
+            for method in &methods {
+                by_component
+                    .entry(method.component.clone())
+                    .or_default()
+                    .push(method.clone());
+            }
+            for (comp, comp_methods) in by_component {
+                let generated =
+                    mesh_api_gen::apijson::api_json(&comp_methods, &docs, catalog.as_ref())?;
+                let out_path = Path::new(&dir).join(&comp).join("api.cbor");
+                write_or_check_bytes(
+                    &out_path.to_string_lossy(),
+                    &mesh_api_gen::apijson::api_cbor(&generated),
+                    check,
+                )?;
+            }
+        }
     }
     if let Some(path) = out_java {
         let class_name = java_class_name(&path)?;
@@ -345,10 +376,14 @@ fn java_class_name(path: &str) -> Result<String> {
 }
 
 fn write_or_check(path: &str, contents: &str, check: bool) -> Result<()> {
+    write_or_check_bytes(path, contents.as_bytes(), check)
+}
+
+fn write_or_check_bytes(path: &str, bytes: &[u8], check: bool) -> Result<()> {
     if check {
-        let current = std::fs::read_to_string(path)
-            .with_context(|| format!("read generated artifact {path}"))?;
-        if current != contents {
+        let current =
+            std::fs::read(path).with_context(|| format!("read generated artifact {path}"))?;
+        if current != bytes {
             bail!("generated artifact is stale: {path}");
         }
         return Ok(());
@@ -356,5 +391,5 @@ fn write_or_check(path: &str, contents: &str, check: bool) -> Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents).with_context(|| format!("write generated artifact {path}"))
+    std::fs::write(path, bytes).with_context(|| format!("write generated artifact {path}"))
 }

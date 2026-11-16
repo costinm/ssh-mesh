@@ -221,7 +221,14 @@ impl ServiceRegistry {
                     Response::ok_with_data(json!({ "tools": value }))
                 }
             }
-            Err(e) => Response::err(e),
+            Err(e) => {
+                if let Some(Ok(resolved)) =
+                    crate::catalog::service_catalog_resolver().resolve(&self.server_name)
+                {
+                    return Response::ok_with_data(json!({ "tools": (*resolved.tools).clone() }));
+                }
+                Response::err(e)
+            }
         }
     }
 

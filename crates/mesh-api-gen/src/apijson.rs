@@ -1,7 +1,7 @@
-//! `api.json`: the full-fidelity, generated form of an API, from which the other forms are derived (the trimmed
-//! `tools.json` for MCP and LLM clients, the schema, the manifest, the Markdown). It carries what `tools.json` leaves out:
-//! prose, field descriptions, enums, named records, and the native layout of the types and functions a native host
-//! implements (`x-c`). It is never edited.
+//! `api.json`: the full-fidelity, generated form of an API, from which the other forms are derived
+//! (`tools.json` for MCP and LLM clients, the schema, the manifest, the Markdown). It carries what
+//! `tools.json` leaves out: prose, field descriptions, enums, named records, and the native layout
+//! of the types and functions a native host implements (`x-c`). It is never edited.
 
 use std::collections::BTreeSet;
 
@@ -17,7 +17,11 @@ pub const FORMAT: &str = "mesh-api/1";
 /// The native C prefix cbindgen puts before a Rust type name.
 const C_PREFIX: &str = "xip_";
 
-pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalog>) -> Result<Value> {
+pub fn api_json(
+    methods: &[ApiMethod],
+    docs: &DocIndex,
+    rust: Option<&RustCatalog>,
+) -> Result<Value> {
     let enums: BTreeSet<&str> = docs.enums.iter().map(|e| e.name.as_str()).collect();
     let mut problems = Vec::new();
 
@@ -30,7 +34,11 @@ pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalo
             if let Some(index) = method.component_index {
                 c.insert("index".into(), json!(index));
             }
-            if let Some(doc) = docs.component_docs.get(&method.component).filter(|d| !d.is_empty()) {
+            if let Some(doc) = docs
+                .component_docs
+                .get(&method.component)
+                .filter(|d| !d.is_empty())
+            {
                 c.insert("doc".into(), json!(doc));
             }
             components.push(Value::Object(c));
@@ -40,7 +48,10 @@ pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalo
     // named records, in order of first use
     let mut records: Vec<(String, &ApiShape)> = Vec::new();
     for method in methods {
-        for (names, shape) in [(&docs.request_types, &method.request), (&docs.response_types, &method.response)] {
+        for (names, shape) in [
+            (&docs.request_types, &method.request),
+            (&docs.response_types, &method.response),
+        ] {
             if let Some(name) = names.get(&method.id) {
                 if !records.iter().any(|(n, _)| n == name) {
                     records.push((name.clone(), shape));
@@ -60,20 +71,46 @@ pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalo
         let native = match docs.c_types.get(name) {
             Some(rust_name) => {
                 let Some(catalog) = rust else {
-                    bail!("{name} names the native type {rust_name}, but no rustdoc JSON was given");
+                    bail!(
+                        "{name} names the native type {rust_name}, but no rustdoc JSON was given"
+                    );
                 };
                 let Some(native) = catalog.structs.get(rust_name) else {
-                    bail!("{name}: native type {rust_name} is not in the rustdoc JSON{}", catalog.skipped.get(rust_name).map(|why| format!(" ({why})")).unwrap_or_default());
+                    let why = catalog
+                        .skipped
+                        .get(rust_name)
+                        .map(|w| format!(" ({w})"))
+                        .unwrap_or_default();
+                    bail!("{name}: native type {rust_name} is not in the rustdoc JSON{why}");
                 };
                 Some(native)
             }
             None => None,
         };
-        t.insert("fields".into(), fields_json(&shape.fields, docs.descriptions.get(&owner), native, &enums, name, &mut problems));
+        t.insert(
+            "fields".into(),
+            fields_json(
+                &shape.fields,
+                docs.descriptions.get(&owner),
+                native,
+                &enums,
+                name,
+                &mut problems,
+            ),
+        );
         if let Some(native) = native {
-            let mut x = json!({"rust": native.name, "c": c_name(&native.name, C_PREFIX), "size": native.size, "align": native.align});
+            let mut x = json!({
+                "rust": native.name,
+                "c": c_name(&native.name, C_PREFIX),
+                "size": native.size,
+                "align": native.align,
+            });
             // a leading `size` member (the caller sets sizeof, so the struct can grow)
-            if let Some(first) = native.fields.first().filter(|f| f.name == "size" && f.offset == 0 && f.size == 4) {
+            if let Some(first) = native
+                .fields
+                .first()
+                .filter(|f| f.name == "size" && f.offset == 0 && f.size == 4)
+            {
                 x["size_field"] = json!({"offset": first.offset, "size": first.size});
             }
             t.insert("x-c".into(), x);
@@ -83,10 +120,18 @@ pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalo
     for method in methods {
         for row in &method.row_types {
             let owner = format!("row:{}", row.name);
+            let fields = fields_json(
+                &row.fields,
+                docs.descriptions.get(&owner),
+                None,
+                &enums,
+                &row.name,
+                &mut problems,
+            );
             types.push(json!({
                 "kind": "row",
                 "name": row.name,
-                "fields": fields_json(&row.fields, docs.descriptions.get(&owner), None, &enums, &row.name, &mut problems),
+                "fields": fields,
             }));
         }
     }
@@ -143,15 +188,31 @@ pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalo
             }
         }
         if !method.errors.is_empty() {
-            m.insert("errors".into(), Value::Array(method.errors.iter().map(|e| json!({"name": e.name, "description": e.description})).collect()));
+            let errs: Vec<Value> = method
+                .errors
+                .iter()
+                .map(|e| json!({"name": e.name, "description": e.description}))
+                .collect();
+            m.insert("errors".into(), Value::Array(errs));
         }
-        for (key, names, shape) in [("request", &docs.request_types, &method.request), ("response", &docs.response_types, &method.response)] {
+        for (key, names, shape) in [
+            ("request", &docs.request_types, &method.request),
+            ("response", &docs.response_types, &method.response),
+        ] {
             let mut s = Map::new();
             if let Some(name) = names.get(&method.id) {
                 s.insert("type".into(), json!(name));
             } else {
                 let owner = format!("{}#{key}", method.id);
-                s.insert("fields".into(), fields_json(&shape.fields, docs.descriptions.get(&owner), None, &enums, &owner, &mut problems));
+                let fields = fields_json(
+                    &shape.fields,
+                    docs.descriptions.get(&owner),
+                    None,
+                    &enums,
+                    &owner,
+                    &mut problems,
+                );
+                s.insert("fields".into(), fields);
             }
             if let Some(max) = &shape.max_encoded_size {
                 s.insert("max_encoded_size".into(), json!(max));
@@ -160,7 +221,10 @@ pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalo
         }
         if let Some(spec) = docs.c_functions.get(&method.id) {
             let Some(catalog) = rust else {
-                bail!("{} names the native function {spec}, but no rustdoc JSON was given", method.id);
+                bail!(
+                    "{} names the native function {spec}, but no rustdoc JSON was given",
+                    method.id
+                );
             };
             match function_json(method, spec, docs, catalog) {
                 Ok(v) => {
@@ -172,9 +236,83 @@ pub fn api_json(methods: &[ApiMethod], docs: &DocIndex, rust: Option<&RustCatalo
         out_methods.push(Value::Object(m));
     }
     if !problems.is_empty() {
-        bail!("the API and its native layout disagree:\n  {}", problems.join("\n  "));
+        bail!(
+            "the API and its native layout disagree:\n  {}",
+            problems.join("\n  ")
+        );
     }
-    Ok(json!({"format": FORMAT, "components": components, "types": types, "methods": out_methods}))
+    Ok(json!({
+        "format": FORMAT,
+        "components": components,
+        "types": types,
+        "methods": out_methods,
+    }))
+}
+
+/// Encode the `mesh-api/1` JSON value as definite-length binary CBOR (`api.cbor`).
+pub fn api_cbor(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_cbor_value(&mut out, value);
+    out
+}
+
+fn write_cbor_value(out: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Null => out.push(0xf6),
+        Value::Bool(false) => out.push(0xf4),
+        Value::Bool(true) => out.push(0xf5),
+        Value::Number(num) => {
+            if let Some(u) = num.as_u64() {
+                cbor_head_u64(out, 0, u);
+            } else if let Some(i) = num.as_i64() {
+                if i >= 0 {
+                    cbor_head_u64(out, 0, i as u64);
+                } else {
+                    cbor_head_u64(out, 1, (-1 - i) as u64);
+                }
+            } else if let Some(f) = num.as_f64() {
+                out.push(0xfb);
+                out.extend(f.to_bits().to_be_bytes());
+            } else {
+                out.push(0xf6);
+            }
+        }
+        Value::String(text) => {
+            cbor_head_u64(out, 3, text.len() as u64);
+            out.extend(text.as_bytes());
+        }
+        Value::Array(items) => {
+            cbor_head_u64(out, 4, items.len() as u64);
+            for item in items {
+                write_cbor_value(out, item);
+            }
+        }
+        Value::Object(entries) => {
+            cbor_head_u64(out, 5, entries.len() as u64);
+            for (key, val) in entries {
+                cbor_head_u64(out, 3, key.len() as u64);
+                out.extend(key.as_bytes());
+                write_cbor_value(out, val);
+            }
+        }
+    }
+}
+
+fn cbor_head_u64(out: &mut Vec<u8>, major: u8, n: u64) {
+    let m = major << 5;
+    match n {
+        0..=23 => out.push(m | n as u8),
+        24..=0xff => out.extend([m | 24, n as u8]),
+        0x100..=0xffff => out.extend([m | 25, (n >> 8) as u8, n as u8]),
+        0x10000..=0xffff_ffff => {
+            out.push(m | 26);
+            out.extend((n as u32).to_be_bytes());
+        }
+        _ => {
+            out.push(m | 27);
+            out.extend(n.to_be_bytes());
+        }
+    }
 }
 
 fn fields_json(
@@ -193,20 +331,36 @@ fn fields_json(
                 o.insert("tag".into(), json!(f.index));
                 o.insert("name".into(), json!(f.name));
                 o.insert("type".into(), json!(f.value_type));
-                let mut description = descriptions.and_then(|d| d.get(&f.name)).cloned().unwrap_or_default();
+                let mut description = descriptions
+                    .and_then(|d| d.get(&f.name))
+                    .cloned()
+                    .unwrap_or_default();
                 if let Some(native) = native {
                     match native.fields.iter().find(|n| n.name == f.name) {
-                        None => problems.push(format!("{owner}.{}: no field of that name in {}", f.name, native.name)),
+                        None => problems.push(format!(
+                            "{owner}.{}: no field of that name in {}",
+                            f.name, native.name
+                        )),
                         Some(n) => {
                             if let Some(why) = incompatible(&f.value_type, &n.kind, n.size, enums) {
-                                problems.push(format!("{owner}.{}: {} is {why}", f.name, native.name));
+                                problems
+                                    .push(format!("{owner}.{}: {} is {why}", f.name, native.name));
                             }
                             if description.is_empty() {
                                 description = n.docs.clone();
                             }
-                            let mut c = json!({"offset": n.offset, "size": n.size, "kind": n.kind.name()});
-                            if let Some(len) = native.fields.iter().find(|l| l.name == format!("{}_len", f.name)) {
-                                c["len_field"] = json!({"name": len.name, "offset": len.offset, "size": len.size});
+                            let mut c = json!({
+                                "offset": n.offset,
+                                "size": n.size,
+                                "kind": n.kind.name(),
+                            });
+                            let len_name = format!("{}_len", f.name);
+                            if let Some(len) = native.fields.iter().find(|l| l.name == len_name) {
+                                c["len_field"] = json!({
+                                    "name": len.name,
+                                    "offset": len.offset,
+                                    "size": len.size,
+                                });
                             }
                             o.insert("x-c".into(), c);
                         }
@@ -241,8 +395,14 @@ fn incompatible(api: &str, native: &Kind, size: u32, enums: &BTreeSet<&str>) -> 
     };
     match (api, native) {
         ("string" | "bytes", Kind::Bytes) => None,
-        ("string" | "bytes", _) => Some(format!("{} bytes of {}, not a byte array", size, native.name())),
-        (_, Kind::Int { bits, .. }) if enums.contains(api) => (*bits > 32).then(|| format!("{bits} bits for an enum")),
+        ("string" | "bytes", _) => Some(format!(
+            "{} bytes of {}, not a byte array",
+            size,
+            native.name()
+        )),
+        (_, Kind::Int { bits, .. }) if enums.contains(api) => {
+            (*bits > 32).then(|| format!("{bits} bits for an enum"))
+        }
         (_, Kind::Int { bits, .. }) if want_bits == Some(*bits) => None,
         (_, Kind::Bool) if api == "bool" => None,
         (_, Kind::Int { bits, .. }) => Some(format!("{bits} bits, the API says {api}")),
@@ -251,13 +411,25 @@ fn incompatible(api: &str, native: &Kind, size: u32, enums: &BTreeSet<&str>) -> 
 }
 
 /// `component/Table.member`: where the native function is, and how it is called.
-fn function_json(method: &ApiMethod, spec: &str, docs: &DocIndex, catalog: &RustCatalog) -> Result<Value> {
-    let (component, rest) = spec.split_once('/').unwrap_or((method.component.as_str(), spec));
+fn function_json(
+    method: &ApiMethod,
+    spec: &str,
+    docs: &DocIndex,
+    catalog: &RustCatalog,
+) -> Result<Value> {
+    let (component, rest) = spec
+        .split_once('/')
+        .unwrap_or((method.component.as_str(), spec));
     let Some((table, member)) = rest.split_once('.') else {
         bail!("`{spec}` is not Table.member");
     };
     let Some(native) = catalog.structs.get(table) else {
-        bail!("native table {table} is not in the rustdoc JSON{}", catalog.skipped.get(table).map(|why| format!(" ({why})")).unwrap_or_default());
+        let why = catalog
+            .skipped
+            .get(table)
+            .map(|w| format!(" ({w})"))
+            .unwrap_or_default();
+        bail!("native table {table} is not in the rustdoc JSON{why}");
     };
     let Some(field) = native.fields.iter().find(|f| f.name == member) else {
         bail!("{table} has no member {member}");
@@ -269,15 +441,28 @@ fn function_json(method: &ApiMethod, spec: &str, docs: &DocIndex, catalog: &Rust
     for p in &field.params {
         let mut o = json!({"name": p.name, "role": p.role, "type": p.target});
         if p.role == "in" || p.role == "out" {
-            // a struct parameter is the request or the response record, a scalar one is a field of the response
+            // A struct parameter is the request or the response record;
+            // a scalar one is a field of the response.
             if let Some(s) = catalog.structs.get(&p.target) {
-                let (names, shape) = if p.role == "in" { (&docs.request_types, "request") } else { (&docs.response_types, "response") };
-                let ok = names.get(&method.id).and_then(|t| docs.c_types.get(t)).is_some_and(|c| *c == s.name);
+                let (names, shape) = if p.role == "in" {
+                    (&docs.request_types, "request")
+                } else {
+                    (&docs.response_types, "response")
+                };
+                let ok = names
+                    .get(&method.id)
+                    .and_then(|t| docs.c_types.get(t))
+                    .is_some_and(|c| *c == s.name);
                 if !ok {
-                    bail!("parameter {} is a {} but the {shape} of the method is not that C type", p.name, p.target);
+                    bail!(
+                        "parameter {} is a {} but the {shape} of the method is not that C type",
+                        p.name,
+                        p.target
+                    );
                 }
             } else if p.role == "out" && !method.response.fields.iter().any(|f| f.name == p.name) {
-                // a scalar output that the response does not carry (the generation of `get`) is not mapped
+                // A scalar output that the response does not carry (the
+                // generation of `get`) is not mapped.
                 o["mapped"] = json!(false);
             }
             o["kind"] = json!(p.target);
