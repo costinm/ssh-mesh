@@ -1,0 +1,5 @@
+[[responses]]
+component = 12
+method = 3
+delay_ms = 10
+result = 7

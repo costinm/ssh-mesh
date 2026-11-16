@@ -1,0 +1,8 @@
+version = 1
+[schema]
+count = 1
+result = 2
+[[lists]]
+name = "first"
+context = { count = 2 }
+rules = [{set = "result", expr = "count + 1"}, {after_ms = 25}, {break_if = "result == 3"}, {expr = "result"}]
