@@ -31,6 +31,8 @@ the measured transfer summary.
 | 13 | `peer` | `string` | Target destination URI (`mesh://...`, `udp://...`, `espnow://...`). |
 | 14 | `direction` | `string` | Optional `"download"` (default), `"upload"`, or `"both"`. |
 | 16 | `verify` | `bool` | Optional deterministic byte-pattern verification (`false` by default). |
+| 17 | `link` | `string` | Optional local link/bearer selector (`udp://...`, `uart`, `espnow://...`, `ble`). |
+| 18 | `via` | `string` | Optional relay hop or circuit selector (`FIRST_HOP:DCID` or relay URI). |
 
 ### Response
 
@@ -41,6 +43,8 @@ the measured transfer summary.
 | 3 | `requested_bytes` | `uint` | Requested payload bytes. |
 | 4 | `received_bytes` | `uint` | Verified payload bytes transferred. |
 | 5 | `elapsed_us` | `uint` | Total transfer duration in microseconds. |
+| 6 | `link` | `string` | Optional local link/bearer actually used for the probe. |
+| 7 | `via` | `string` | Optional relay hop or circuit used for the probe. |
 
 ## 2. `handler` — Stream probe responder
 
@@ -55,7 +59,7 @@ the responder answers with the response header followed by `bytes` of
 
 ### Request
 
-Uses the same field tags (`1..16`, with `peer` omitted) as `probe.start`.
+Uses field tags `1..16` (with client-side `peer`, `link`, and `via` omitted) from `probe.start`.
 
 ### Response
 

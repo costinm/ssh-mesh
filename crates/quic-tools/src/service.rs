@@ -4,7 +4,7 @@
 
 use alloc::vec::Vec;
 use mesh_api::cbor::{Decoder, Encoder};
-use mesh_api::envelope::{Name, PrefixDecode, decode_envelope_prefix};
+use mesh_api::envelope::{Name, PrefixDecode, Record, decode_envelope_prefix};
 
 use crate::probe::{
     MAX_BYTES as PROBE_MAX_BYTES, ProbePayload, ProbeRequest as ProbeWorkloadRequest,
@@ -19,9 +19,11 @@ pub const PROBE_START: u64 = 1;
 /// `probe.handler`: the probed node's stream handler.
 pub const PROBE_HANDLER: u64 = 2;
 /// Maximum byte capacity for one canonical `probe.start` or `probe.handler` request header.
-pub const PROBE_REQUEST_MAX: usize = 224;
+pub const PROBE_REQUEST_MAX: usize = 352;
 /// Default maximum stream payload size when planning a probe workload.
 pub const DEFAULT_PROBE_MAX_STREAM_PAYLOAD: usize = 1168;
+/// Maximum length in bytes of a client-side [`ProbeSelector`] (`link` or `via` string).
+pub const MAX_PROBE_SELECTOR_BYTES: usize = 96;
 
 /// Maximum duration in milliseconds a `probe.start` job may run: the caller's
 /// `timeout` envelope field when given, else a default scaled to the transfer
@@ -43,6 +45,44 @@ const FIELD_PARALLEL_STREAMS: u64 = 10;
 const FIELD_INITIAL_CONSUME_DELAY_MS: u64 = 11;
 const FIELD_CONSUME_DELAY_MS: u64 = 12;
 const FIELD_PEER: u64 = 13;
+const FIELD_DIRECTION: u64 = 14;
+const FIELD_VERIFY: u64 = 16;
+const FIELD_LINK: u64 = 17;
+const FIELD_VIA: u64 = 18;
+
+/// Fixed-capacity `#![no_std]` UTF-8 selector used for client-side `link` and `via`
+/// routing metadata on `probe.start` requests and responses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProbeSelector {
+    bytes: [u8; MAX_PROBE_SELECTOR_BYTES],
+    len: u8,
+}
+
+impl ProbeSelector {
+    /// Parse a non-empty printable ASCII/UTF-8 selector (no whitespace or control bytes).
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.is_empty()
+            || value.len() > MAX_PROBE_SELECTOR_BYTES
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return None;
+        }
+        let mut bytes = [0u8; MAX_PROBE_SELECTOR_BYTES];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Some(Self {
+            bytes,
+            len: value.len() as u8,
+        })
+    }
+
+    /// Borrow the selector string.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("parsed selector is valid UTF-8")
+    }
+}
 
 /// Maximum length in bytes of a normalized [`ProbeDestination`] URI.
 pub const MAX_PROBE_DESTINATION_URI: usize = 96;
@@ -146,6 +186,10 @@ pub struct ProbeServiceRequest {
     pub consume_delay_ms: Option<u32>,
     /// Responder destination URI or discovery-resolved mesh VIP.
     pub peer: Option<ProbeDestination>,
+    /// Optional client-side local link/bearer selector (`udp://...`, `uart`, `espnow`, `ble`).
+    pub link: Option<ProbeSelector>,
+    /// Optional client-side relay hop or circuit selector (`FIRST_HOP:DCID` or relay URI).
+    pub via: Option<ProbeSelector>,
 }
 
 impl ProbeServiceRequest {
@@ -164,7 +208,18 @@ impl ProbeServiceRequest {
             initial_consume_delay_ms: None,
             consume_delay_ms: None,
             peer: None,
+            link: None,
+            via: None,
         }
+    }
+
+    /// Return a copy with client-only routing selectors (`peer`, `link`, `via`) cleared
+    /// for forwarding as an inner `probe.handler` stream request.
+    pub const fn without_client_routing(mut self) -> Self {
+        self.peer = None;
+        self.link = None;
+        self.via = None;
+        self
     }
 
     /// Bytes sent from client to responder (`0` for download-only).
@@ -209,6 +264,8 @@ impl ProbeServiceRequest {
             && self.bytes != 0
             && self.bytes <= PROBE_MAX_BYTES
             && self.peer.is_none()
+            && self.link.is_none()
+            && self.via.is_none()
             && self.parallel_streams.is_none_or(|streams| streams == 1)
             && self.high_priority_bytes.is_none_or(|bytes| bytes == 0)
             && self.low_priority_bytes.is_none_or(|bytes| bytes == 0)
@@ -259,12 +316,13 @@ pub fn encode_probe_start_request(
 }
 
 /// Encode the correlated `probe.handler` request sent to the probed node.
+/// Client-only routing selectors (`peer`, `link`, `via`) are automatically stripped.
 pub fn encode_probe_handler_request(
     request: ProbeServiceRequest,
     id: u64,
     output: &mut [u8],
 ) -> Option<usize> {
-    encode_probe_request(PROBE_HANDLER, request, id, output)
+    encode_probe_request(PROBE_HANDLER, request.without_client_routing(), id, output)
 }
 
 fn encode_probe_request(
@@ -282,7 +340,9 @@ fn encode_probe_request(
         + usize::from(request.consume_delay_ms.is_some())
         + usize::from(request.peer.is_some())
         + usize::from(request.direction != ProbeDirection::Download)
-        + usize::from(request.verify);
+        + usize::from(request.verify)
+        + usize::from(request.link.is_some())
+        + usize::from(request.via.is_some());
     let mut e = Encoder::new(output);
     e.map(4)?;
     e.uint(1)?;
@@ -331,14 +391,49 @@ fn encode_probe_request(
         e.text_value(peer.as_str().as_bytes())?;
     }
     if request.direction != ProbeDirection::Download {
-        e.uint(14)?;
+        e.uint(FIELD_DIRECTION)?;
         e.text_value(request.direction.as_str().as_bytes())?;
     }
     if request.verify {
-        e.uint(16)?;
+        e.uint(FIELD_VERIFY)?;
         e.bool(true)?;
     }
+    if let Some(link) = request.link {
+        e.uint(FIELD_LINK)?;
+        e.text_value(link.as_str().as_bytes())?;
+    }
+    if let Some(via) = request.via {
+        e.uint(FIELD_VIA)?;
+        e.text_value(via.as_str().as_bytes())?;
+    }
     Some(e.len())
+}
+
+/// Decode a canonical `probe.start` request already extracted from an envelope.
+pub fn decode_probe_start_record(record: Record<'_>) -> Option<(u64, ProbeServiceRequest)> {
+    decode_probe_record(record, PROBE_START)
+}
+
+/// Decode a canonical `probe.handler` request already extracted from an envelope.
+pub fn decode_probe_handler_record(record: Record<'_>) -> Option<(u64, ProbeServiceRequest)> {
+    decode_probe_record(record, PROBE_HANDLER)
+}
+
+fn decode_probe_record(record: Record<'_>, method: u64) -> Option<(u64, ProbeServiceRequest)> {
+    if record.component != Some(Name::Tag(PROBE_COMPONENT))
+        || record.method != Some(Name::Tag(method))
+        || record.params.is_some()
+    {
+        return None;
+    }
+    if let Some(destination) = record.to {
+        match destination {
+            Name::Text(value) => ProbeDestination::parse(core::str::from_utf8(value).ok()?)?,
+            Name::Tag(_) | Name::Bytes(_) => return None,
+        };
+    }
+    let request = decode_probe_fields(record.fields?)?;
+    Some((record.id?, request))
 }
 
 /// Decode the CBOR `fields` map (`key 5` or `"fields"`) of a `probe.start` or
@@ -347,10 +442,10 @@ fn encode_probe_request(
 pub fn decode_probe_fields(fields: &[u8]) -> Option<ProbeServiceRequest> {
     let mut d = Decoder::new(fields);
     let (major, count) = d.head()?;
-    if major != 5 || count == u64::MAX || count > 16 {
+    if major != 5 || count == u64::MAX || count > 18 {
         return None;
     }
-    let mut seen = 0u16;
+    let mut seen = 0u32;
     let mut request = ProbeServiceRequest::new(0, 0);
     for _ in 0..count {
         let field = match d.head()? {
@@ -366,25 +461,37 @@ pub fn decode_probe_fields(fields: &[u8]) -> Option<ProbeServiceRequest> {
                 b"initial_consume_delay_ms" => FIELD_INITIAL_CONSUME_DELAY_MS,
                 b"consume_delay_ms" => FIELD_CONSUME_DELAY_MS,
                 b"peer" => FIELD_PEER,
-                b"direction" => 14,
-                b"verify" => 16,
+                b"direction" => FIELD_DIRECTION,
+                b"verify" => FIELD_VERIFY,
+                b"link" => FIELD_LINK,
+                b"via" => FIELD_VIA,
                 _ => return None,
             },
             _ => return None,
         };
-        if !(1..=16).contains(&field) || matches!(field, 3..=5 | 15) {
+        if !(1..=18).contains(&field) || matches!(field, 3..=5 | 15) {
             return None;
         }
-        let bit = 1u16.checked_shl((field - 1) as u32)?;
+        let bit = 1u32.checked_shl((field - 1) as u32)?;
         if seen & bit != 0 {
             return None;
         }
         seen |= bit;
         match field {
-            16 => request.verify = d.boolean()?,
-            14 => request.direction = ProbeDirection::parse(d.text_ref()?)?,
+            FIELD_VERIFY => request.verify = d.boolean()?,
+            FIELD_DIRECTION => request.direction = ProbeDirection::parse(d.text_ref()?)?,
             FIELD_PEER => {
                 request.peer = Some(ProbeDestination::parse(
+                    core::str::from_utf8(d.text_ref()?).ok()?,
+                )?)
+            }
+            FIELD_LINK => {
+                request.link = Some(ProbeSelector::parse(
+                    core::str::from_utf8(d.text_ref()?).ok()?,
+                )?)
+            }
+            FIELD_VIA => {
+                request.via = Some(ProbeSelector::parse(
                     core::str::from_utf8(d.text_ref()?).ok()?,
                 )?)
             }
@@ -445,8 +552,8 @@ fn encode_numeric_response(
 }
 
 /// Encode only the inner `result` CBOR map (`{1: status, 2: peer, 3: requested_bytes,
-/// 4: received_bytes, 5: elapsed_us}`) of a `probe.start` response, suitable for
-/// returning directly from `ComponentHandler::call_cbor`.
+/// 4: received_bytes, 5: elapsed_us, 6?: link, 7?: via}`) of a `probe.start` response,
+/// suitable for returning directly from `ComponentHandler::call_cbor`.
 pub fn encode_probe_result_value(
     request: ProbeServiceRequest,
     success: bool,
@@ -460,8 +567,9 @@ pub fn encode_probe_result_value(
     } else {
         b"error".as_slice()
     };
+    let count = 5 + u64::from(request.link.is_some()) + u64::from(request.via.is_some());
     let mut e = Encoder::new(output);
-    e.map(5)?;
+    e.map(count)?;
     e.uint(1)?;
     e.text_value(status)?;
     e.uint(2)?;
@@ -472,6 +580,14 @@ pub fn encode_probe_result_value(
     e.uint(received_bytes)?;
     e.uint(5)?;
     e.uint(elapsed_us)?;
+    if let Some(link) = request.link {
+        e.uint(6)?;
+        e.text_value(link.as_str().as_bytes())?;
+    }
+    if let Some(via) = request.via {
+        e.uint(7)?;
+        e.text_value(via.as_str().as_bytes())?;
+    }
     Some(e.len())
 }
 
@@ -485,10 +601,16 @@ pub fn encode_probe_result_response(
     elapsed_us: u64,
     output: &mut [u8],
 ) -> Option<usize> {
-    let mut value = [0u8; 160];
+    let mut value = [0u8; 384];
     let value_len =
         encode_probe_result_value(request, success, received_bytes, elapsed_us, &mut value)?;
-    encode_numeric_response(PROBE_COMPONENT, PROBE_START, id, &value[..value_len], output)
+    encode_numeric_response(
+        PROBE_COMPONENT,
+        PROBE_START,
+        id,
+        &value[..value_len],
+        output,
+    )
 }
 
 /// Encode the response header of `probe.handler`: the length of the payload that
@@ -507,7 +629,13 @@ pub fn encode_probe_handler_response(
     e.uint(2)?;
     e.uint(packet_size as u64)?;
     let value_len = e.len();
-    encode_numeric_response(PROBE_COMPONENT, PROBE_HANDLER, id, &value[..value_len], output)
+    encode_numeric_response(
+        PROBE_COMPONENT,
+        PROBE_HANDLER,
+        id,
+        &value[..value_len],
+        output,
+    )
 }
 
 /// Encode the response header of `probe.handler` when an upload was also verified.
@@ -531,7 +659,13 @@ pub fn encode_probe_handler_upload_response(
     e.uint(3)?;
     e.uint(upload_bytes)?;
     let value_len = e.len();
-    encode_numeric_response(PROBE_COMPONENT, PROBE_HANDLER, id, &value[..value_len], output)
+    encode_numeric_response(
+        PROBE_COMPONENT,
+        PROBE_HANDLER,
+        id,
+        &value[..value_len],
+        output,
+    )
 }
 
 /// Why a probe response was not a valid probe.
@@ -639,9 +773,8 @@ impl ProbeResponseReader {
                     if announced != self.expected {
                         return Err(ProbeClientError::Header);
                     }
-                    let packet_size =
-                        usize::try_from(packet_size.ok_or(ProbeClientError::Header)?)
-                            .map_err(|_| ProbeClientError::Header)?;
+                    let packet_size = usize::try_from(packet_size.ok_or(ProbeClientError::Header)?)
+                        .map_err(|_| ProbeClientError::Header)?;
                     self.payload = if announced == 0 {
                         None
                     } else {
@@ -745,6 +878,8 @@ mod tests {
             initial_consume_delay_ms: Some(500),
             consume_delay_ms: Some(11),
             peer: None,
+            link: None,
+            via: None,
         };
         let plan = ProbeServicePlan::from_request(request.workload(), 1168);
         assert_eq!(plan.packet_size, 1168);
@@ -755,5 +890,31 @@ mod tests {
         assert_eq!(plan.ack_frequency, 8);
         assert_eq!(plan.ack_delay_ms, 1);
         assert_eq!(plan.total_bytes(), 20);
+    }
+
+    #[test]
+    fn start_preserves_client_link_and_via_while_handler_strips_them() {
+        let mut request = ProbeServiceRequest::new(4096, 512);
+        request.peer = Some(ProbeDestination::parse("mesh://fc00::99").unwrap());
+        request.link = Some(ProbeSelector::parse("udp://[fe80::1%wlan0]:3339").unwrap());
+        request.via = Some(ProbeSelector::parse("udp://[fe80::2%wlan0]:3339:hex:01").unwrap());
+
+        let mut start_wire = [0u8; PROBE_REQUEST_MAX];
+        let start_len = encode_probe_start_request(request, 77, &mut start_wire).unwrap();
+        let start_record = mesh_api::envelope::decode(&start_wire[..start_len]).unwrap();
+        let (id, decoded_start) = decode_probe_start_record(start_record).unwrap();
+        assert_eq!(id, 77);
+        assert_eq!(decoded_start, request);
+        assert!(!decoded_start.is_accepted_by_handler());
+
+        let mut handler_wire = [0u8; PROBE_REQUEST_MAX];
+        let handler_len = encode_probe_handler_request(request, 78, &mut handler_wire).unwrap();
+        let handler_record = mesh_api::envelope::decode(&handler_wire[..handler_len]).unwrap();
+        let (hid, decoded_handler) = decode_probe_handler_record(handler_record).unwrap();
+        assert_eq!(hid, 78);
+        assert_eq!(decoded_handler.peer, None);
+        assert_eq!(decoded_handler.link, None);
+        assert_eq!(decoded_handler.via, None);
+        assert!(decoded_handler.is_accepted_by_handler());
     }
 }

@@ -2,26 +2,12 @@
 //! Q16 token-bucket pacing, and link scheduling metadata.
 
 use core::cmp::min;
+pub use mesh_api::link::LinkTxOutcome;
 use quic_base::StreamPriority;
 
 /// Identifier of an attached physical or logical link within an association.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LinkId(pub u16);
-
-/// Physical/transport completion outcome reported by a bearer when a packet transmission finishes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LinkTxOutcome {
-    /// Complete packet was handed to the physical medium (e.g. radio airtime finished or socket sent).
-    /// Note: For LoRa / multicast ESP-NOW / UDP, `Sent` means local transmission completed, NOT that
-    /// the peer received the packet (end-to-end SACKs confirm peer receipt).
-    Sent,
-    /// Local transport definitely failed to transmit the packet (e.g. link down, queue flushed, or
-    /// unicast MAC retry exhausted before airtime). Releases in-flight bytes on this link without
-    /// halving NewReno `cwnd` and immediately marks the packet for failover retransmission.
-    Failed,
-    /// Ambiguous outcome; packet remains in flight until SACK or PTO resolves it.
-    Indeterminate,
-}
 
 /// Link framing & encryption policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

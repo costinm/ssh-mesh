@@ -148,7 +148,14 @@ pub mod sack;
 pub mod sim;
 pub mod transport_path;
 #[cfg(feature = "tokio")]
+pub mod tokio_driver;
+#[cfg(feature = "tokio")]
 pub mod udp;
+
+pub use mesh_api::link::{
+    LinkInfo, LinkIngress, LinkMeta, LinkName, LinkTxOutcome as PacketSendOutcome, PacketLink,
+    PeerL2Address,
+};
 
 pub use assoc::{
     AssocConfig, DemuxOutcome, LinkRecvError, OutboundLinkPacket, QuicLinkAssoc,
@@ -170,6 +177,8 @@ pub use sack::{AckProcessOutcome, LinkRetransmitCandidate, MultiLinkSackLedger};
 pub use transport_path::{
     EgressPolicy, PacketPath, PathBindingTable, PeerPathHandle, TransportId, TransportMask,
 };
+#[cfg(feature = "tokio")]
+pub use tokio_driver::{TokioAssocDriver, TokioLinkIngress};
 #[cfg(feature = "tokio")]
 pub use udp::{
     HOST_UDP_SOCKET_BUFFER_BYTES, TokioUdpLink, UdpSocketConfig, parse_udp_peer,

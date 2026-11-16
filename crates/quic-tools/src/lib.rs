@@ -28,12 +28,13 @@ pub use probe::{
     ProbeRequest, ProbeResult, ProbeRun, ProbeSender,
 };
 pub use service::{
-    DEFAULT_PROBE_MAX_STREAM_PAYLOAD, MAX_PROBE_DESTINATION_URI, PROBE_COMPONENT, PROBE_HANDLER,
-    PROBE_REQUEST_MAX, PROBE_START, ProbeClientError, ProbeDestination, ProbeDirection,
-    ProbeResponseReader, ProbeServiceRequest, decode_probe_fields, encode_probe_handler_request,
-    encode_probe_handler_response, encode_probe_handler_upload_response,
-    encode_probe_result_response, encode_probe_result_value, encode_probe_start_request,
-    extract_envelope_id, probe_timeout_ms,
+    DEFAULT_PROBE_MAX_STREAM_PAYLOAD, MAX_PROBE_DESTINATION_URI, MAX_PROBE_SELECTOR_BYTES,
+    PROBE_COMPONENT, PROBE_HANDLER, PROBE_REQUEST_MAX, PROBE_START, ProbeClientError,
+    ProbeDestination, ProbeDirection, ProbeResponseReader, ProbeSelector, ProbeServiceRequest,
+    decode_probe_fields, decode_probe_handler_record, decode_probe_start_record,
+    encode_probe_handler_request, encode_probe_handler_response,
+    encode_probe_handler_upload_response, encode_probe_result_response, encode_probe_result_value,
+    encode_probe_start_request, extract_envelope_id, probe_timeout_ms,
 };
 #[cfg(feature = "tokio")]
 pub use stream_client::{

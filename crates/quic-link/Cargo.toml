@@ -7,16 +7,18 @@ publish = false
 [features]
 default = []
 btree = []
-std = ["quic-base/std"]
-tokio = ["std", "dep:tokio", "dep:libc"]
+std = ["quic-base/std", "mesh-api/std"]
+tokio = ["std", "dep:tokio", "dep:libc", "dep:tracing"]
 stateless-reset = ["std", "dep:hmac", "dep:sha2"]
 rust-crypto = ["quic-base/rust-crypto"]
 
 [dependencies]
+mesh-api = { path = "../mesh-api", default-features = false }
 quic-base = { path = "../quic-base", default-features = false }
 hmac = { version = "0.13", default-features = false, optional = true }
 sha2 = { version = "0.11", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
+tracing = { version = "0.1", default-features = false, optional = true }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
 
 [dev-dependencies]
