@@ -3476,6 +3476,13 @@ impl Daemon {
         }
 
         let name = config.name.clone();
+        // Keep socket-activated Accept=false services working on manual starts,
+        // crash restarts, and internal restarts by attaching their registered
+        // listener FDs whenever the caller did not supply an activation FD set.
+        let passed_fd = passed_fd.or_else(|| {
+            let fds = crate::activation::service_listener_fds(&name);
+            (!fds.is_empty()).then_some(crate::process::ActivationFd::Listen(fds))
+        });
 
         // Phase 2b: bind the per-service notify channel and publish
         // NOTIFY_SOCKET into the child environment. A "none" value disables
