@@ -505,9 +505,14 @@ impl TokioAssocDriver {
 
                 tokio::select! {
                     maybe_rx = rx_rx.recv(), if pending_to_mux.len() < cap => {
-                        let Some((link_id, _meta, pkt)) = maybe_rx else {
+                        let Some((link_id, meta, pkt)) = maybe_rx else {
                             continue;
                         };
+                        if meta.peer.get() > 1 {
+                            if let Some(link) = links.get_mut(&link_id) {
+                                link.peer = meta.peer;
+                            }
+                        }
                         handle_rx_packet(
                             &mut assoc,
                             link_id,
@@ -519,9 +524,14 @@ impl TokioAssocDriver {
                         );
                         let mut count = 1usize;
                         while count < MAX_RX_BATCH && pending_to_mux.len() < cap {
-                            let Ok((link_id, _meta, pkt)) = rx_rx.try_recv() else {
+                            let Ok((link_id, meta, pkt)) = rx_rx.try_recv() else {
                                 break;
                             };
+                            if meta.peer.get() > 1 {
+                                if let Some(link) = links.get_mut(&link_id) {
+                                    link.peer = meta.peer;
+                                }
+                            }
                             count += 1;
                             handle_rx_packet(
                                 &mut assoc,

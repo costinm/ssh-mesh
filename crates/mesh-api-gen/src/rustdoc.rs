@@ -87,8 +87,8 @@ impl RustCatalog {
     /// runs on).
     pub fn from_rustdoc(json: &Value, pointer_width: u32) -> Result<Self> {
         let version = json.get("format_version").and_then(Value::as_u64).unwrap_or(0);
-        if version != 57 {
-            bail!("rustdoc JSON format {version} is not supported (57)");
+        if !matches!(version, 57..=61) {
+            bail!("rustdoc JSON format {version} is not supported (expected 57..=61)");
         }
         let index = json.get("index").and_then(Value::as_object).context("rustdoc JSON has no index")?;
         let mut reader = Reader { index, pointer: pointer_width, cache: BTreeMap::new() };
