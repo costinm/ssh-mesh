@@ -13,11 +13,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use mesh::catalog::service_catalog_resolver;
-use mesh::cbor::{decode_record, decode_stream_frame, encode_record, encode_stream_frame};
 use mesh::mux_client::MuxClient;
 use mesh::tagged::{TaggedCatalog, TaggedRecord, record_from_argv, to_json};
+use mesh::wire::{read_cbor_record, write_cbor_stream_frame};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, timeout};
 
 #[derive(Clone, Parser, Debug)]
@@ -44,9 +44,9 @@ struct Cli {
     /// Maximum time to wait for an RPC response or streaming subscription.
     #[arg(long, default_value_t = 9)]
     timeout_sec: u64,
-    /// RPC codec: auto (selected by endpoint), cbor, or json-rpc. Environment
-    /// `MESH_DEST_FORMAT` supplies the same default.
-    #[arg(long, value_parser = ["auto", "cbor", "json-rpc"])]
+    /// RPC codec: auto (selected by endpoint), cbor, json-rpc, jsonl, or text.
+    /// Environment `MESH_DEST_FORMAT` supplies the same default.
+    #[arg(long, value_parser = ["auto", "cbor", "json-rpc", "jsonl", "text"])]
     rpc_format: Option<String>,
     /// Destination endpoint, host, service name, or URI.
     destination: String,
@@ -60,6 +60,7 @@ struct Cli {
 enum DestinationFormat {
     Cbor,
     JsonRpc,
+    Text,
 }
 
 impl DestinationFormat {
@@ -71,9 +72,12 @@ impl DestinationFormat {
     }
 
     fn from_value(value: &str, destination: &str, has_numeric_tags: bool) -> Result<Self> {
+        let is_cbor_endpoint = destination.ends_with(".cbor")
+            || destination.starts_with("qmux://")
+            || destination.ends_with(".mux.sock");
         match value {
-            "auto" if destination.ends_with(".cbor") && has_numeric_tags => Ok(Self::Cbor),
-            "auto" if destination.ends_with(".cbor") => {
+            "auto" if is_cbor_endpoint && has_numeric_tags => Ok(Self::Cbor),
+            "auto" if is_cbor_endpoint => {
                 anyhow::bail!("tagged-CBOR endpoint requires an installed schema with numeric tags")
             }
             "auto" => Ok(Self::JsonRpc),
@@ -81,10 +85,13 @@ impl DestinationFormat {
             "cbor" => anyhow::bail!(
                 "MESH_DEST_FORMAT=cbor requires a generated catalog with numeric tags"
             ),
-            "json-rpc" => Ok(Self::JsonRpc),
+            "json-rpc" | "jsonl" => Ok(Self::JsonRpc),
+            "text" => Ok(Self::Text),
             "mux" => anyhow::bail!("MESH_DEST_FORMAT=mux selects a transport, not an RPC codec"),
             value => {
-                anyhow::bail!("unsupported MESH_DEST_FORMAT={value}; use auto, cbor, or json-rpc")
+                anyhow::bail!(
+                    "unsupported MESH_DEST_FORMAT={value}; use auto, cbor, json-rpc, jsonl, or text"
+                )
             }
         }
     }
@@ -133,9 +140,17 @@ fn parse_forward(value: &str, remote: bool) -> Result<ForwardSpec> {
 }
 
 fn unix_path(destination: &str) -> Option<&str> {
-    destination.strip_prefix("unix://").or_else(|| {
-        (destination.starts_with('/') || destination.starts_with("./")).then_some(destination)
-    })
+    destination
+        .strip_prefix("unix://")
+        .or_else(|| {
+            destination
+                .strip_prefix("qmux://")
+                .or_else(|| destination.strip_prefix("mux+unix://"))
+                .filter(|rest| rest.starts_with('/') || rest.starts_with("./"))
+        })
+        .or_else(|| {
+            (destination.starts_with('/') || destination.starts_with("./")).then_some(destination)
+        })
 }
 
 fn tcp_address(destination: &str) -> Option<&str> {
@@ -254,10 +269,11 @@ fn catalog_components(destination: &str) -> Vec<String> {
     if let (Some(parent), Some(file)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
         && let Some(service) = parent.file_name().and_then(|n| n.to_str())
     {
-        if file == "mesh.sock" || file.starts_with("mesh.sock.") {
+        if file == "mesh.sock" || file == "mesh.mux.sock" || file.starts_with("mesh.sock.") {
             components.push(service.to_owned());
         } else if let Some(endpoint) = file
             .strip_suffix(".sock.cbor")
+            .or_else(|| file.strip_suffix(".mux.sock"))
             .or_else(|| file.strip_suffix(".sock"))
         {
             components.push(format!("{endpoint}.{service}"));
@@ -348,19 +364,32 @@ where
                 .write_all(serde_json::to_string(&json_rpc_request(&record, catalog))?.as_bytes())
                 .await?;
             write.write_all(b"\n").await?;
+            write.flush().await?;
+        }
+        DestinationFormat::Text => {
+            let line = mesh::wire::format_text_request_line(&record, catalog);
+            write.write_all(line.as_bytes()).await?;
+            write.flush().await?;
         }
         DestinationFormat::Cbor => {
-            write
-                .write_all(&encode_stream_frame(&encode_record(&record)?)?)
-                .await?
+            write_cbor_stream_frame(&mut write, &record, &[]).await?;
+            write.shutdown().await?;
         }
     }
-    write.flush().await?;
     let is_subscribe = record.method.text().ends_with("subscribe")
         || record.component.text().ends_with("subscribe");
     let mut reader = BufReader::new(read);
 
     if is_subscribe {
+        if format == DestinationFormat::Cbor {
+            while let Some(response) = read_cbor_record(&mut reader).await? {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&to_json(&response, catalog))?
+                );
+            }
+            return Ok(());
+        }
         let mut line = String::new();
         while reader.read_line(&mut line).await? > 0 {
             let trimmed = line.trim();
@@ -387,21 +416,24 @@ where
         .first()
         .copied()
         .context("empty RPC response")?;
-    if first == 0 {
-        let mut header = [0_u8; 4];
-        reader.read_exact(&mut header).await?;
-        let len = u32::from_be_bytes(header) as usize;
-        let mut frame = Vec::with_capacity(len + 4);
-        frame.extend_from_slice(&header);
-        frame.resize(len + 4, 0);
-        reader.read_exact(&mut frame[4..]).await?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&to_json(
-                &decode_record(decode_stream_frame(&frame)?)?,
-                catalog
-            ))?
-        );
+    if first == 0 || (first >> 5) == 5 {
+        let mut count = 0usize;
+        while let Some(next) = reader.fill_buf().await?.first().copied() {
+            if next != 0 && (next >> 5) != 5 {
+                break;
+            }
+            let Some(response) = read_cbor_record(&mut reader).await? else {
+                break;
+            };
+            count += 1;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&to_json(&response, catalog))?
+            );
+        }
+        if count == 0 {
+            anyhow::bail!("empty CBOR RPC response");
+        }
     } else {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
@@ -602,7 +634,7 @@ fn external_ssh() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn bare_named_rpc_argument_is_a_top_level_field() {
@@ -750,34 +782,100 @@ mod tests {
         record.id = Some(json!(1));
         let (client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
-            let mut header = [0_u8; 4];
-            server.read_exact(&mut header).await.unwrap();
-            let mut frame = vec![0_u8; u32::from_be_bytes(header) as usize + 4];
-            frame[..4].copy_from_slice(&header);
-            server.read_exact(&mut frame[4..]).await.unwrap();
-            let request = decode_record(decode_stream_frame(&frame).unwrap()).unwrap();
+            let request = read_cbor_record(&mut server).await.unwrap().unwrap();
             assert_eq!(request.component, mesh::tagged::NameOrTag::Tag(1));
             assert_eq!(request.method, mesh::tagged::NameOrTag::Tag(2));
             assert_eq!(
                 request.env.get(&mesh::tagged::NameOrTag::Tag(3)),
                 Some(&json!(true))
             );
-            server
-                .write_all(
-                    &encode_stream_frame(
-                        &encode_record(&TaggedRecord {
-                            id: Some(json!(1)),
-                            result: Some(json!({"ok": true})),
-                            ..Default::default()
-                        })
-                        .unwrap(),
-                    )
-                    .unwrap(),
+            write_cbor_stream_frame(
+                &mut server,
+                &TaggedRecord {
+                    id: Some(json!(1)),
+                    result: Some(json!({"ok": true})),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        });
+        rpc(client, record, Some(&catalog), DestinationFormat::Cbor)
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_reads_streaming_multi_record_cbor_responses() {
+        let record = TaggedRecord {
+            component: mesh::tagged::NameOrTag::Name("discovery".to_owned()),
+            method: mesh::tagged::NameOrTag::Name("nodes".to_owned()),
+            id: Some(json!(2)),
+            ..Default::default()
+        };
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let request = read_cbor_record(&mut server).await.unwrap().unwrap();
+            assert_eq!(request.id, Some(json!(2)));
+            for seq in 1..=2 {
+                write_cbor_stream_frame(
+                    &mut server,
+                    &TaggedRecord {
+                        id: Some(json!(2)),
+                        result: Some(json!({"seq": seq})),
+                        ..Default::default()
+                    },
+                    &[],
                 )
                 .await
                 .unwrap();
+            }
         });
-        rpc(client, record, Some(&catalog), DestinationFormat::Cbor)
+        rpc(client, record, None, DestinationFormat::Cbor)
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_uses_structured_text_lines_on_wire() {
+        assert_eq!(
+            DestinationFormat::from_cli(Some("text"), "tcp://127.0.0.1:9000", false).unwrap(),
+            DestinationFormat::Text
+        );
+        assert_eq!(
+            DestinationFormat::from_cli(Some("jsonl"), "tcp://127.0.0.1:9000", false).unwrap(),
+            DestinationFormat::JsonRpc
+        );
+
+        let (client, server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "mesh.status verbose=true\n");
+            write
+                .write_all(b"response ok=true success=true\n")
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        });
+        let record = TaggedRecord {
+            component: mesh::tagged::NameOrTag::Name("mesh".to_owned()),
+            method: mesh::tagged::NameOrTag::Name("status".to_owned()),
+            id: Some(json!(1)),
+            env: [(
+                mesh::tagged::NameOrTag::Name("verbose".to_owned()),
+                json!(true),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        rpc(client, record, None, DestinationFormat::Text)
             .await
             .unwrap();
         server_task.await.unwrap();
@@ -794,9 +892,22 @@ mod tests {
             catalog_components("unix:///run/mesh/lmesh/mesh.sock"),
             ["lmesh"]
         );
+        assert_eq!(
+            catalog_components("qmux:///run/mesh/lmesh/mesh.mux.sock"),
+            ["lmesh"]
+        );
+        assert_eq!(
+            DestinationFormat::from_value("auto", "qmux:///run/mesh/lmesh/mesh.mux.sock", true)
+                .unwrap(),
+            DestinationFormat::Cbor
+        );
         // Named activation socket under a namespace directory.
         assert_eq!(
             catalog_components("/run/mesh/example/demo.sock.cbor"),
+            ["demo.example", "example"]
+        );
+        assert_eq!(
+            catalog_components("qmux:///run/mesh/example/demo.mux.sock"),
             ["demo.example", "example"]
         );
         // A bare logical service name is its own component candidate.
