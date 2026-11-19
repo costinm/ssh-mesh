@@ -200,9 +200,18 @@ pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
     if decoder.position() != bytes.len() {
         bail!("trailing CBOR data");
     }
+    let is_reply = result.is_some() || error.is_some();
     let mut record = TaggedRecord {
-        component: component.ok_or_else(|| anyhow!("record lacks component"))?,
-        method: method.ok_or_else(|| anyhow!("record lacks method"))?,
+        component: match component {
+            Some(c) => c,
+            None if is_reply => NameOrTag::default(),
+            None => bail!("record lacks component"),
+        },
+        method: match method {
+            Some(m) => m,
+            None if is_reply => NameOrTag::default(),
+            None => bail!("record lacks method"),
+        },
         id,
         params,
         env,
@@ -216,7 +225,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
     // that selected the handler. The generic gateway response form leaves
     // both empty. They describe the same correlation result, so normalize
     // the former at this boundary before enforcing the generic envelope kind.
-    if record.result.is_some() || record.error.is_some() {
+    if is_reply {
         record.component = NameOrTag::default();
         record.method = NameOrTag::default();
     }

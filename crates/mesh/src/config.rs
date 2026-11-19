@@ -140,6 +140,9 @@ pub struct ServiceSection {
     pub group: Option<String>,
     #[serde(rename = "WorkingDirectory")]
     pub working_directory: Option<String>,
+    /// Operator-provided, already mounted application root.
+    #[serde(rename = "RootDirectory")]
+    pub root_directory: Option<String>,
     #[serde(default, rename = "Restart")]
     pub restart: RestartPolicy,
     #[serde(rename = "RestartSec")]
@@ -519,6 +522,7 @@ pub struct AppConfig {
     pub user: Option<String>,
     pub group: Option<String>,
     pub working_directory: Option<String>,
+    pub root_directory: Option<String>,
     pub restart: RestartPolicy,
     pub restart_sec: u64,
     pub timeout_start_sec: Option<u64>,
@@ -1181,6 +1185,18 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         .map(|group| resolve_group_required(group, "SupplementaryGroups"))
         .collect::<Result<Vec<_>, _>>()?;
 
+    if let Some(root) = &file.service.root_directory {
+        if !std::path::Path::new(root).is_absolute()
+            || root.contains('\0')
+            || std::path::Path::new(root)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(ConfigError::Invalid(
+                "RootDirectory must be an absolute path without '..' or NUL".into(),
+            ));
+        }
+    }
     let activation_socket = validate_activation_socket(file.service.activation_socket, &name)?;
     Ok(AppConfig {
         name,
@@ -1197,6 +1213,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         user: file.service.user,
         group: file.service.group,
         working_directory: file.service.working_directory,
+        root_directory: file.service.root_directory,
         restart: file.service.restart,
         restart_sec,
         timeout_start_sec,
