@@ -248,7 +248,7 @@ async fn node_component_registry_is_shared_with_http_and_ssh_stream_routing() ->
         id: Some(json!(1)),
         ..Default::default()
     };
-    let bytes = mesh::cbor::encode_stream_frame(&mesh::cbor::encode_record(&request)?)?;
+    let bytes = mesh::cbor::encode_record(&request)?;
     let (status, body) = http(
         &mut app,
         "127.0.0.2",
@@ -258,7 +258,7 @@ async fn node_component_registry_is_shared_with_http_and_ssh_stream_routing() ->
     )
     .await?;
     assert_eq!(status, StatusCode::OK);
-    let reply = mesh::cbor::decode_record(mesh::cbor::decode_stream_frame(&body)?)?;
+    let reply = mesh::cbor::decode_record(&body)?;
     assert_eq!(reply.result, Some(json!("node registry")));
     let manager = SshClientManager::new(
         ssh_mesh::auth::load_or_generate_key(&setup.base_dir),

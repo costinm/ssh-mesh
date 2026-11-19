@@ -49,6 +49,7 @@ pub enum MeshServiceBackend {
 pub enum MeshServiceEncoding {
     TaggedCbor,
     JsonRpc,
+    Text,
 }
 
 #[derive(Clone)]
@@ -236,6 +237,7 @@ impl MeshServiceRegistry {
                     "encoding": match service.encoding {
                         MeshServiceEncoding::TaggedCbor => "tagged-cbor",
                         MeshServiceEncoding::JsonRpc => "json-rpc",
+                        MeshServiceEncoding::Text => "text",
                     },
                     "catalog_component": service.component,
                 })
@@ -493,18 +495,16 @@ async fn dispatch(service: &MeshService, record: TaggedRecord) -> Result<Option<
                 MeshServiceEncoding::JsonRpc => {
                     let catalog = service_catalog_resolver()
                         .resolve(&service.component)
-                        .transpose()?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "JSON-RPC route requires an installed catalog for {}",
-                                service.component
-                            )
-                        })?;
-                    let request = json_rpc_request(&record, catalog.catalog.as_ref())?;
+                        .transpose()?;
+                    let request = json_rpc_request(
+                        &record,
+                        catalog.as_ref().map(|resolved| resolved.catalog.as_ref()),
+                    )?;
                     stream
                         .write_all(serde_json::to_string(&request)?.as_bytes())
                         .await?;
                     stream.write_all(b"\n").await?;
+                    stream.flush().await?;
                     if one_way {
                         return Ok(None);
                     }
@@ -513,6 +513,24 @@ async fn dispatch(service: &MeshService, record: TaggedRecord) -> Result<Option<
                     let response: Value = serde_json::from_str(line.trim())
                         .context("decode JSON-RPC service response")?;
                     json_rpc_response(response).map(Some)
+                }
+                MeshServiceEncoding::Text => {
+                    let catalog = service_catalog_resolver()
+                        .resolve(&service.component)
+                        .transpose()?;
+                    let line = mesh::wire::format_text_request_line(
+                        &record,
+                        catalog.as_ref().map(|resolved| resolved.catalog.as_ref()),
+                    );
+                    stream.write_all(line.as_bytes()).await?;
+                    stream.flush().await?;
+                    if one_way {
+                        return Ok(None);
+                    }
+                    let mut reply = String::new();
+                    BufReader::new(stream).read_line(&mut reply).await?;
+                    mesh::wire::parse_text_response_line(&reply, record.id.unwrap_or(Value::Null))
+                        .map(Some)
                 }
             }
         }
@@ -539,8 +557,11 @@ async fn dispatch(service: &MeshService, record: TaggedRecord) -> Result<Option<
     }
 }
 
-fn json_rpc_request(record: &TaggedRecord, catalog: &mesh::tagged::TaggedCatalog) -> Result<Value> {
-    let mut value = to_json(record, Some(catalog));
+fn json_rpc_request(
+    record: &TaggedRecord,
+    catalog: Option<&mesh::tagged::TaggedCatalog>,
+) -> Result<Value> {
+    let mut value = to_json(record, catalog);
     let object = value
         .as_object_mut()
         .context("tagged request did not project to a JSON object")?;
@@ -977,7 +998,7 @@ mod tests {
                 env: [(NameOrTag::Tag(3), json!(4))].into_iter().collect(),
                 ..Default::default()
             },
-            &catalog,
+            Some(&catalog),
         )
         .unwrap();
         assert_eq!(request["method"], "demo.ping");
@@ -1101,5 +1122,62 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn uds_backend_supports_json_rpc_and_text_line_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("line.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                mesh::wire::serve_line_session(&mut stream, &Echo, None)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let jsonrpc_service = MeshService {
+            backend: MeshServiceBackend::UdsStream(socket.clone()),
+            encoding: MeshServiceEncoding::JsonRpc,
+            component: "unregistered-line-service".to_owned(),
+        };
+        let rpc_reply = dispatch(
+            &jsonrpc_service,
+            TaggedRecord {
+                component: NameOrTag::Name("radio".to_owned()),
+                method: NameOrTag::Name("check".to_owned()),
+                id: Some(json!(21)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rpc_reply.id, Some(json!(21)));
+        assert_eq!(rpc_reply.result, Some(json!({"local": true})));
+
+        let text_service = MeshService {
+            backend: MeshServiceBackend::UdsStream(socket),
+            encoding: MeshServiceEncoding::Text,
+            component: "unregistered-line-service".to_owned(),
+        };
+        let text_reply = dispatch(
+            &text_service,
+            TaggedRecord {
+                component: NameOrTag::Name("radio".to_owned()),
+                method: NameOrTag::Name("check".to_owned()),
+                id: Some(json!(22)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(text_reply.id, Some(json!(22)));
+        assert_eq!(text_reply.result, Some(json!({"local": true})));
+
+        server.await.unwrap();
     }
 }
