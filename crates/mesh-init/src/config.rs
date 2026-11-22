@@ -49,6 +49,20 @@ pub fn load_app_config(path: &Path) -> Result<AppConfig, ConfigError> {
     let content = std::fs::read_to_string(path)?;
     let service_name = path.file_stem().and_then(|s| s.to_str());
     let mut config = parse_service(&content, service_name)?;
+    if config.root_directory.is_some() && unsafe { libc::geteuid() } == 0 {
+        // App-writable manifests cannot authorize privileged host mounts.
+        // Root policy belongs in an operator-owned config directory.
+        let canonical = std::fs::canonicalize(path)?;
+        for ancestor in path.ancestors().chain(canonical.ancestors()) {
+            let metadata = std::fs::metadata(ancestor)?;
+            if !matches!(metadata.uid(), 0 | 1000) || metadata.mode() & 0o022 != 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "RootDirectory requires operator-owned, non-group/world-writable config and ancestors: {}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
     config.source_path = Some(path.to_string_lossy().into_owned());
     Ok(config)
 }

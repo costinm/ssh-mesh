@@ -64,6 +64,13 @@ Systemd-compatible fields:
 - `Type` (string): supported values are `oneshot` (runs once at startup), and `exec` (starts as a daemon at boot). If omitted or empty, the service does not auto-start at boot and is only started on-demand via socket activation or an explicit start command.
 - `User` (string): user name or numeric UID string. Names are resolved with passwd.
 - `Group` (string): group name or numeric GID string. Names are resolved with the group database. When omitted, a named `User` uses its primary passwd GID.
+- `RootDirectory` (string, optional): absolute operator-prepared application
+  root; missing optional mount subdirs (`home`, `proc`, `sys`, `dev`, `nix`,
+  `z`, `z/composefs`) are skipped without overlay, created in the merged
+  upper with `RootOverlay`.
+- `RootOverlay` (bool, optional, default `false`): overlay `RootDirectory`
+  with a per-app writable upper at `$APP_HOME/rootfs/rw`; concurrent sessions
+  share the same upper (writes visible across sessions).
 - `WorkingDirectory` (string): child working directory. Defaults to the
   service home, normally `/home/<service>`.
 - `Restart` (string): `no`, `always`, `on-success`, `on-failure`,
@@ -278,3 +285,21 @@ them to the child in declaration order using the systemd convention:
 mixed stream/datagram ordering matters. The shorthand arrays are expanded as
 all `ListenStream` entries first, followed by UDP `ListenDatagram` entries and
 then Unix datagram entries.
+# Per-application roots
+
+`RootDirectory` (string, optional): absolute path to an operator-prepared application root. When set, the service runs with that directory as its filesystem root (chroot). When omitted, the service runs in the host filesystem.
+
+Requirements:
+- Absolute path; relative paths and `..` rejected
+- Root must exist and be a directory (not `/`)
+- Must contain real directories: `/home`, `/proc`, `/sys`, `/dev`, `/nix`, `/z` (build the image with these)
+- Missing mount points fail at launch; mesh-init does not create them
+
+Default mounts (inside the root):
+- `/home/APP` — read-write persistent app home (other `/home/*` hidden)
+- `/proc`, `/sys`, `/nix`, `/z/composefs` — read-only
+- `/dev` — minimal (null, zero, full, random, urandom, tty, pts, ptmx)
+
+`WorkingDirectory` and executable paths resolve **inside** the root. `HOME` is `/home/APP`. The image must provide binaries, loaders, libraries, `/etc`, and shell.
+
+Example: `examples/app-root.toml`

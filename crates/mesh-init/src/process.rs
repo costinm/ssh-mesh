@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::AppConfig;
 use crate::protocol::{FreezeReason, ServiceState, StopReason};
 use crate::states;
+mod root;
 
 pub use states::ServiceState as RuntimeState;
 
@@ -113,6 +114,7 @@ enum MaskKind {
 
 #[derive(Debug, Clone)]
 struct SandboxPlan {
+    root: Option<root::RootPlan>,
     private_tmp: bool,
     private_devices: bool,
     private_network: bool,
@@ -128,7 +130,8 @@ struct SandboxPlan {
 
 impl SandboxPlan {
     fn needs_mount_namespace(&self) -> bool {
-        self.private_tmp
+        self.root.is_some()
+            || self.private_tmp
             || self.private_devices
             || self.protect_system.is_some()
             || self.protect_home.is_some()
@@ -216,11 +219,17 @@ fn inaccessible_path_kind(path: &str) -> Result<MaskKind, ProcessError> {
     })
 }
 
-fn inaccessible_paths(paths: &[String]) -> Result<Vec<(CString, MaskKind)>, ProcessError> {
+fn inaccessible_paths(
+    paths: &[String],
+    root: Option<&str>,
+) -> Result<Vec<(CString, MaskKind)>, ProcessError> {
     paths
         .iter()
         .map(|path| {
-            let kind = inaccessible_path_kind(path)?;
+            let inspected = root.map(|root| Path::new(root).join(path.trim_start_matches('/')));
+            let kind = inaccessible_path_kind(
+                inspected.as_deref().and_then(Path::to_str).unwrap_or(path),
+            )?;
             Ok((path_to_cstring(path, "InaccessiblePaths")?, kind))
         })
         .collect()
@@ -292,6 +301,7 @@ fn build_sandbox_plan(config: &AppConfig) -> Result<SandboxPlan, ProcessError> {
     }
 
     Ok(SandboxPlan {
+        root: root::RootPlan::build(config)?,
         private_tmp: config.private_tmp,
         private_devices: config.private_devices,
         private_network: config.private_network,
@@ -300,7 +310,10 @@ fn build_sandbox_plan(config: &AppConfig) -> Result<SandboxPlan, ProcessError> {
         protect_home,
         read_write_paths: path_list_to_cstrings(&config.read_write_paths, "ReadWritePaths")?,
         read_only_paths: path_list_to_cstrings(&config.read_only_paths, "ReadOnlyPaths")?,
-        inaccessible_paths: inaccessible_paths(&config.inaccessible_paths)?,
+        inaccessible_paths: inaccessible_paths(
+            &config.inaccessible_paths,
+            config.root_directory.as_deref(),
+        )?,
         bounding_caps,
         ambient_caps,
     })
@@ -609,7 +622,11 @@ fn service_home(config: &AppConfig) -> String {
 /// Deterministic executable search path for supervised services. Service-local
 /// mutable and per-user Nix profiles take precedence over host profiles.
 fn service_path(config: &AppConfig) -> String {
-    let home = service_home(config);
+    let home = if config.root_directory.is_some() {
+        format!("/home/{}", config.name)
+    } else {
+        service_home(config)
+    };
     [
         format!("{home}/bin"),
         format!("{home}/.local/bin"),
@@ -674,12 +691,16 @@ unsafe fn apply_sandbox_before_identity(plan: &SandboxPlan) -> std::io::Result<(
                 libc::MS_REC | libc::MS_PRIVATE,
                 std::ptr::null(),
             )?;
-            apply_default_read_only_host_mounts()?;
+            if let Some(root) = &plan.root {
+                root.enter()?;
+            } else {
+                apply_default_read_only_host_mounts()?;
+            }
         }
         if plan.private_tmp {
             apply_private_tmp()?;
         }
-        if plan.private_devices {
+        if plan.private_devices && plan.root.is_none() {
             apply_private_devices()?;
         }
         if let Some(mode) = plan.protect_system {
@@ -1092,7 +1113,9 @@ pub fn spawn_process(
     let mut cmd = std::process::Command::new(&config.command);
     cmd.args(&config.args);
     let home = service_home(config);
-    cmd.current_dir(config.working_directory.as_deref().unwrap_or(&home));
+    if config.root_directory.is_none() {
+        cmd.current_dir(config.working_directory.as_deref().unwrap_or(&home));
+    }
 
     // Set environment
     for (key, value) in &config.env {
@@ -1100,7 +1123,14 @@ pub fn spawn_process(
     }
     // Every service receives its own mutable home by default. A config may
     // deliberately override HOME in [Environment] for an exceptional layout.
-    cmd.env("HOME", &home);
+    cmd.env(
+        "HOME",
+        if config.root_directory.is_some() {
+            format!("/home/{}", config.name)
+        } else {
+            home.clone()
+        },
+    );
     cmd.env(
         "PATH",
         config
@@ -1112,7 +1142,15 @@ pub fn spawn_process(
     // Let common runtime facilities, including the default log writer, use
     // the supervised service identity rather than the executable name.
     cmd.env("MESH_SERVICE_NAME", &config.name);
-    let sandbox = build_sandbox_plan(config)?;
+    let mut sandbox = build_sandbox_plan(config)?;
+
+    // Mount overlay in daemon namespace BEFORE fork if overlay is enabled.
+    // This ensures all child sessions share the same overlay mount.
+    if let Some(root_plan) = &mut sandbox.root {
+        if root_plan.overlay_enabled() {
+            root_plan.prepare_overlay()?;
+        }
+    }
 
     // A2: Privilege drop and hardening — all in pre_exec, in the correct
     // order. Rust's std applies cmd.uid()/cmd.gid() BEFORE pre_exec, which
@@ -1197,6 +1235,9 @@ pub fn spawn_process(
                     && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0
                 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if let Some(root) = &sandbox.root {
+                    root.chdir()?;
                 }
                 Ok(())
             });
@@ -1345,6 +1386,48 @@ pub fn run_service_command(
     command: &str,
     timeout_secs: Option<u64>,
 ) -> Result<i32, ProcessError> {
+    if config.root_directory.is_some() {
+        // Rooted hooks use exactly the service launch policy, including identity,
+        // namespaces, capabilities and root-relative cwd. Never run on the host.
+        let mut hook = config.clone();
+        hook.command = "/bin/sh".into();
+        hook.args = vec!["-c".into(), command.into()];
+        hook.ready_match = None;
+        hook.watchdog_sec = None;
+        hook.idle_termination_sec = None;
+        let (pid, _) = spawn_process(&hook, "/sys/fs/cgroup", None)?;
+        let deadline = timeout_secs
+            .filter(|s| *s > 0)
+            .map(|s| Instant::now() + Duration::from_secs(s));
+        loop {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if result > 0 {
+                return Ok(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    1
+                });
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                let _ = send_signal(pid, libc::SIGKILL);
+                unsafe {
+                    libc::waitpid(pid as i32, &mut status, 0);
+                }
+                return Err(ProcessError::SpawnFailed(
+                    "rooted service command timed out".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
     prepare_service_directories(config)?;
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c").arg(command);

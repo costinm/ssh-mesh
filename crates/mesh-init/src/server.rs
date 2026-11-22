@@ -450,7 +450,7 @@ async fn control_uses_tagged_cbor(stream: &tokio::net::UnixStream) -> Result<boo
     if read < 0 {
         return Err(std::io::Error::last_os_error()).context("peek control protocol byte");
     }
-    Ok(first[0] == 0)
+    Ok(first[0] == 0 || (first[0] >> 5) == 5)
 }
 
 struct CborControlHandler {

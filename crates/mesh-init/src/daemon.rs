@@ -1334,7 +1334,11 @@ impl Daemon {
         apply_activation_context_env(&mut config, context);
 
         if let Some(command) = command {
-            config.command = preferred_shell().to_string();
+            config.command = if config.root_directory.is_some() {
+                "/bin/sh".to_string()
+            } else {
+                preferred_shell().to_string()
+            };
             config.args = vec!["-c".to_string(), command];
             config.oneshot = true;
         }
@@ -2995,9 +2999,9 @@ impl Daemon {
                             }
                         }
                     } else if current_level == crate::pressure::PressureLevel::None
-                        && history
-                            .level_since
-                            .is_none_or(|since| now.duration_since(since) >= Duration::from_secs(policy.hold_secs))
+                        && history.level_since.is_none_or(|since| {
+                            now.duration_since(since) >= Duration::from_secs(policy.hold_secs)
+                        })
                         && let Some(name) = self.next_pressure_thaw_candidate(policy)
                     {
                         self.thaw_service(&name, states::UnfreezeCause::PressureCleared)
@@ -4517,6 +4521,58 @@ OOMScoreAdjust = -700
         };
         let daemon = Daemon::new(cfg);
         assert!(daemon.services.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_root_directory_terminal_policy_retained_for_pty_and_stdio() {
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![],
+            socket_path: "/tmp/mesh-init-root-policy-test.sock".into(),
+        });
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join("must-not-run-on-host");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        daemon.configs.lock().insert(
+            "root-policy".into(),
+            AppConfig {
+                name: "root-policy".into(),
+                command: "/bin/sh".into(),
+                root_directory: Some("/definitely-missing-mesh-root".into()),
+                uid: Some(uid),
+                gid: Some(gid),
+                ..Default::default()
+            },
+        );
+        for pty in [false, true] {
+            let (child, _parent) = std::os::unix::net::UnixStream::pair().unwrap();
+            let response = daemon
+                .handle_request_with_fd(
+                    Request::StartTerminal {
+                        name: "root-policy".into(),
+                        home: home.path().display().to_string(),
+                        uid,
+                        gid: Some(gid),
+                        pty,
+                        env: HashMap::from([("RootDirectory".into(), "/".into())]),
+                        context: None,
+                        command: Some(format!("echo escaped > '{}'", marker.display())),
+                        fd_count: Some(1),
+                    },
+                    OwnedFd::from(child),
+                    0,
+                    0,
+                )
+                .await;
+            assert!(!response.success, "missing named root must fail closed");
+            assert!(!marker.exists(), "terminal command must not run on host");
+            assert_eq!(
+                daemon.configs.lock()["root-policy"]
+                    .root_directory
+                    .as_deref(),
+                Some("/definitely-missing-mesh-root")
+            );
+        }
     }
 
     #[tokio::test]

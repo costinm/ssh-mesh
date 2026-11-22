@@ -45,6 +45,13 @@ MeshEstimatedUploadBytes = 65536
 MeshMinimumNetworkChunkBytes = 4096
 
 [Service]
+# Optional operator-prepared root; omit to retain host execution.
+# Missing optional subdirs (home/proc/sys/dev/nix/z) are skipped at launch.
+# HOME is /home/<service>; WorkingDirectory and executables are inside this root.
+RootDirectory = "/mnt/debian"
+# Optional overlay: per-app writable upper over the root image (default false).
+# Requires RootDirectory and a real /home in the image. Upper at $APP_HOME/rootfs/{rw,work}.
+RootOverlay = false
 # Applies to: service lifecycle before ExecStart.
 # Runs through /bin/sh -c before the main service command.
 ExecStartPre = ["/bin/true"]

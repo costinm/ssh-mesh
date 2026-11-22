@@ -1,0 +1,9 @@
+# Install as operator-owned demo.toml in the system config directory.
+[Service]
+ExecStart = "/bin/sh -c 'echo root-local service; sleep 60'"
+RootDirectory = "/mnt/debian"
+WorkingDirectory = "/home/demo"
+NoNewPrivileges = true
+CapabilityBoundingSet = []
+# The app UID/GID is resolved on the host, not from the root's passwd database.
+# Do not start systemd inside this root.
