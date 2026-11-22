@@ -26,6 +26,21 @@
           targets = [ muslTarget ];
         };
 
+        rust-sdk = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [ "rust-src" "rustfmt" "clippy" ];
+          targets = [
+            "x86_64-unknown-linux-gnu"
+            "x86_64-unknown-linux-musl"
+            "aarch64-linux-android"
+            "armv7-linux-androideabi"
+            "i686-linux-android"
+            "x86_64-linux-android"
+            "riscv32imc-unknown-none-elf"
+            "riscv32imac-unknown-none-elf"
+            "riscv32imafc-unknown-none-elf"
+          ];
+        };
+
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
         # Filter source to Cargo/Rust files plus compile-time resources used by
@@ -222,7 +237,7 @@
       in
       {
         packages = {
-            inherit ssh-mesh mesh-api-gen sshm sshm-config musl-toolchain build-deps runtime-deps python-tools;
+            inherit ssh-mesh mesh-api-gen sshm sshm-config musl-toolchain build-deps runtime-deps python-tools rust-sdk;
             default = ssh-mesh;
         };
 

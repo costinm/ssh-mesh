@@ -174,6 +174,20 @@ pub trait PoolPacket: Sized {
         slot[r.end..new_end].copy_from_slice(payload);
         self.set_range(r.start..new_end)
     }
+
+    /// Underlying runtime native packet handle when backed by an external shared pool
+    /// (used for zero-copy hardware/DMA packet-borrow AEAD transforms), or `None` for CPU pools.
+    #[inline]
+    fn native_packet_handle(&self) -> Option<u32> {
+        None
+    }
+
+    /// Replace this packet's underlying native handle and active byte range `[start .. end]`
+    /// atomically (releasing the previous reference), returning `InvalidRange` when unsupported.
+    #[inline]
+    fn swap_native_packet(&mut self, _handle: u32, _range: Range<usize>) -> Result<(), PoolError> {
+        Err(PoolError::InvalidRange)
+    }
 }
 
 /// Abstracted packet pool provider.

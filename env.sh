@@ -43,8 +43,24 @@ export SSH_MESH_STATE_ROOT="${SSH_MESH_STATE_ROOT:-${HOME}/.local/share/ssh-mesh
 if [ "${TMPDIR:-}" = "${REPO_ROOT}/target/tmp" ]; then unset TMPDIR; fi
 export TMPDIR="${SSH_MESH_TMPDIR:-${TMPDIR:-/tmp}}"
 
-export CARGO_HOME="${SSH_MESH_CARGO_HOME:-${REPO_ROOT}/target/cargo}"
-export RUSTUP_HOME="${SSH_MESH_RUSTUP_HOME:-${REPO_ROOT}/target/rustup}"
+export SSH_MESH_DEV="${SSH_MESH_DEV:-${HOME:-}/opt/ssh-mesh-dev}"
+if [ -d "${HOME:-}/opt/rust" ]; then
+    export RUSTUP_HOME="${SSH_MESH_RUSTUP_HOME:-${HOME}/opt/rust/rustup}"
+else
+    export RUSTUP_HOME="${SSH_MESH_RUSTUP_HOME:-${REPO_ROOT}/target/rustup}"
+fi
+if [ -d "${SSH_MESH_DEV}/cargo" ] || [ -d "${SSH_MESH_DEV}" ]; then
+    export CARGO_HOME="${SSH_MESH_CARGO_HOME:-${SSH_MESH_DEV}/cargo}"
+elif [ -d "${HOME:-}/opt/rust/cargo" ]; then
+    export CARGO_HOME="${SSH_MESH_CARGO_HOME:-${HOME}/opt/rust/cargo}"
+else
+    export CARGO_HOME="${SSH_MESH_CARGO_HOME:-${REPO_ROOT}/target/cargo}"
+fi
+if [ -d "${SSH_MESH_DEV}/etc/schemas" ] && [ -z "${MESH_SCHEMA_DIR:-}" ]; then
+    export MESH_SCHEMA_DIR="${SSH_MESH_DEV}/etc/schemas"
+elif [ -d "${HOME:-}/opt/rust/etc/schemas" ] && [ -z "${MESH_SCHEMA_DIR:-}" ]; then
+    export MESH_SCHEMA_DIR="${HOME}/opt/rust/etc/schemas"
+fi
 
 mkdir -p \
     "${HOME}" \
@@ -75,13 +91,18 @@ _path_force_prepend() {
 
 _path_prepend "/nix/var/nix/profiles/default/bin"
 _path_prepend "${NIX_PROFILE}/bin"
+_path_prepend "${HOME:-}/opt/rust/cargo/bin"
 _path_prepend "${CARGO_HOME}/bin"
+_path_prepend "${SSH_MESH_DEV}/bin"
 _path_prepend "${REPO_ROOT}/target/x86_64-unknown-linux-musl/release"
 export PATH
 
 _path_force_prepend "/nix/var/nix/profiles/default/bin"
 _path_force_prepend "${NIX_PROFILE}/bin"
+_path_force_prepend "${RUSTUP_HOME}/toolchains/stable-x86_64-unknown-linux-gnu/bin"
+_path_force_prepend "${HOME:-}/opt/rust/cargo/bin"
 _path_force_prepend "${CARGO_HOME}/bin"
+_path_force_prepend "${SSH_MESH_DEV}/bin"
 _path_force_prepend "${REPO_ROOT}/target/x86_64-unknown-linux-musl/release"
 export PATH
 

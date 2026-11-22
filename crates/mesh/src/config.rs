@@ -143,6 +143,9 @@ pub struct ServiceSection {
     /// Operator-provided, already mounted application root.
     #[serde(rename = "RootDirectory")]
     pub root_directory: Option<String>,
+    /// Overlay the root with a per-app writable upper layer (requires RootDirectory).
+    #[serde(default, rename = "RootOverlay")]
+    pub root_overlay: bool,
     #[serde(default, rename = "Restart")]
     pub restart: RestartPolicy,
     #[serde(rename = "RestartSec")]
@@ -523,6 +526,7 @@ pub struct AppConfig {
     pub group: Option<String>,
     pub working_directory: Option<String>,
     pub root_directory: Option<String>,
+    pub root_overlay: bool,
     pub restart: RestartPolicy,
     pub restart_sec: u64,
     pub timeout_start_sec: Option<u64>,
@@ -1197,6 +1201,11 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
             ));
         }
     }
+    if file.service.root_overlay && file.service.root_directory.is_none() {
+        return Err(ConfigError::Invalid(
+            "RootOverlay requires RootDirectory".into(),
+        ));
+    }
     let activation_socket = validate_activation_socket(file.service.activation_socket, &name)?;
     Ok(AppConfig {
         name,
@@ -1214,6 +1223,7 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         group: file.service.group,
         working_directory: file.service.working_directory,
         root_directory: file.service.root_directory,
+        root_overlay: file.service.root_overlay,
         restart: file.service.restart,
         restart_sec,
         timeout_start_sec,
