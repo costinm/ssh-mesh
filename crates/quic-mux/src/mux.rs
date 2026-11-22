@@ -958,10 +958,10 @@ impl<P: PacketPool> QuicMux<P> {
         egress: &mut impl AssociationEgress<P::Packet>,
     ) -> Result<usize, MuxSendError<P::Packet>> {
         let payload_len = data.len();
-        let (mut packet, caller_owned, orig_range) = match data {
+        let (opt_packet, orig_range, bytes_slice) = match data {
             TxStreamData::Packet(pkt) => {
                 let r = pkt.range();
-                (pkt, true, r)
+                (Some(pkt), Some(r), None)
             }
             TxStreamData::Bytes(slice) => {
                 if payload_len > self.pool.max_payload() {
@@ -970,66 +970,56 @@ impl<P: PacketPool> QuicMux<P> {
                         max_payload: self.pool.max_payload(),
                     });
                 }
-                let mut pkt = self.pool.alloc().map_err(|e| MuxSendError::Error {
-                    packet: None,
-                    error: MuxError::Pool(e),
-                })?;
-                if let Err(e) = pkt.append(slice) {
-                    return Err(MuxSendError::Error {
-                        packet: None,
-                        error: MuxError::Pool(e),
-                    });
-                }
-                let r = pkt.range();
-                (pkt, false, r)
+                (None, None, Some(slice))
             }
         };
 
+        let caller_owned = orig_range.is_some();
         let ret_pkt = |pkt: P::Packet| if caller_owned { Some(pkt) } else { None };
 
         if payload_len > 0 && self.device_capacity < payload_len {
-            return Err(MuxSendError::FlowControl(ret_pkt(packet)));
+            return Err(MuxSendError::FlowControl(opt_packet));
         }
 
         let Some(state) = self.associations.get_mut(&assoc) else {
             return Err(MuxSendError::Error {
-                packet: ret_pkt(packet),
+                packet: opt_packet,
                 error: MuxError::UnknownAssociation,
             });
         };
         if !state.has_local_send(stream) {
             return Err(MuxSendError::Error {
-                packet: ret_pkt(packet),
+                packet: opt_packet,
                 error: MuxError::InvalidStreamState,
             });
         }
         let Some(st) = state.streams.get_mut(&stream) else {
             return Err(MuxSendError::Error {
-                packet: ret_pkt(packet),
+                packet: opt_packet,
                 error: MuxError::UnknownStream,
             });
         };
         if st.send_stopped {
             return Err(MuxSendError::Error {
-                packet: ret_pkt(packet),
+                packet: opt_packet,
                 error: MuxError::StreamReset,
             });
         }
         if st.fin_sent {
             return Err(MuxSendError::Error {
-                packet: ret_pkt(packet),
+                packet: opt_packet,
                 error: MuxError::StreamFinished,
             });
         }
         if (payload_len as u64) > state.send_fc.available()
             || (payload_len as u64) > st.send_fc.available()
         {
-            return Err(MuxSendError::FlowControl(ret_pkt(packet)));
+            return Err(MuxSendError::FlowControl(opt_packet));
         }
 
         let max_frame = egress.max_writable_frame_len(assoc);
         if max_frame == 0 {
-            return Err(MuxSendError::Busy(ret_pkt(packet)));
+            return Err(MuxSendError::Busy(opt_packet));
         }
 
         // Build prefix header: [optional MAX_DATA | optional MAX_STREAM_DATA | STREAM header]
@@ -1069,7 +1059,7 @@ impl<P: PacketPool> QuicMux<P> {
             Ok(n) => n,
             Err(e) => {
                 return Err(MuxSendError::Error {
-                    packet: ret_pkt(packet),
+                    packet: opt_packet,
                     error: MuxError::Wire(e),
                 });
             }
@@ -1078,17 +1068,43 @@ impl<P: PacketPool> QuicMux<P> {
 
         if hdr_len + payload_len > max_frame {
             return Err(MuxSendError::PacketTooLarge {
-                packet: ret_pkt(packet),
+                packet: opt_packet,
                 max_payload: max_frame.saturating_sub(hdr_len),
             });
         }
 
-        if let Err(e) = packet.prepend(&hdr_buf[..hdr_len]) {
-            return Err(MuxSendError::Error {
-                packet: ret_pkt(packet),
-                error: MuxError::Pool(e),
-            });
-        }
+        let packet = match opt_packet {
+            Some(mut pkt) => {
+                if let Err(e) = pkt.prepend(&hdr_buf[..hdr_len]) {
+                    return Err(MuxSendError::Error {
+                        packet: Some(pkt),
+                        error: MuxError::Pool(e),
+                    });
+                }
+                pkt
+            }
+            None => {
+                let mut pkt = self.pool.alloc().map_err(|e| MuxSendError::Error {
+                    packet: None,
+                    error: MuxError::Pool(e),
+                })?;
+                if let Err(e) = pkt.append(&hdr_buf[..hdr_len]) {
+                    return Err(MuxSendError::Error {
+                        packet: None,
+                        error: MuxError::Pool(e),
+                    });
+                }
+                if let Some(slice) = bytes_slice {
+                    if let Err(e) = pkt.append(slice) {
+                        return Err(MuxSendError::Error {
+                            packet: None,
+                            error: MuxError::Pool(e),
+                        });
+                    }
+                }
+                pkt
+            }
+        };
 
         let tx_meta = TxPacketMeta {
             association: assoc,
@@ -1117,21 +1133,27 @@ impl<P: PacketPool> QuicMux<P> {
                 Ok(payload_len)
             }
             Err(LinkSendError::Busy(mut pkt)) => {
-                let _ = pkt.set_range(orig_range);
+                if let Some(orig) = orig_range {
+                    let _ = pkt.set_range(orig);
+                }
                 Err(MuxSendError::Busy(ret_pkt(pkt)))
             }
             Err(LinkSendError::TooLarge {
                 packet: mut pkt,
                 max_frame_len,
             }) => {
-                let _ = pkt.set_range(orig_range);
+                if let Some(orig) = orig_range {
+                    let _ = pkt.set_range(orig);
+                }
                 Err(MuxSendError::PacketTooLarge {
                     packet: ret_pkt(pkt),
                     max_payload: max_frame_len.saturating_sub(hdr_len),
                 })
             }
             Err(LinkSendError::NoAssociation(mut pkt)) => {
-                let _ = pkt.set_range(orig_range);
+                if let Some(orig) = orig_range {
+                    let _ = pkt.set_range(orig);
+                }
                 Err(MuxSendError::Error {
                     packet: ret_pkt(pkt),
                     error: MuxError::UnknownAssociation,
@@ -1876,7 +1898,7 @@ impl<P: PacketPool> QuicMux<P> {
 
         if needs_queue {
             if !self.ensure_rx_queue_capacity(assoc, stream_id, stream_prio, egress, cb) {
-                self.abort_stream_under_pressure(assoc, stream_id, egress, cb);
+                egress.drop_current_rx_ack(assoc);
                 return Ok(());
             }
             let state = self
@@ -1891,7 +1913,7 @@ impl<P: PacketPool> QuicMux<P> {
                     sf.fin,
                     meta.received_at_us,
                 ) {
-                    self.abort_stream_under_pressure(assoc, stream_id, egress, cb);
+                    egress.drop_current_rx_ack(assoc);
                 }
             }
             return Ok(());
@@ -1955,7 +1977,7 @@ impl<P: PacketPool> QuicMux<P> {
             if needs_new_unit
                 && !self.ensure_rx_queue_capacity(assoc, stream_id, stream_prio, egress, cb)
             {
-                self.abort_stream_under_pressure(assoc, stream_id, egress, cb);
+                egress.drop_current_rx_ack(assoc);
                 return Ok(());
             }
             let state = self
@@ -1969,7 +1991,7 @@ impl<P: PacketPool> QuicMux<P> {
                     sf.fin,
                     meta.received_at_us,
                 ) {
-                    self.abort_stream_under_pressure(assoc, stream_id, egress, cb);
+                    egress.drop_current_rx_ack(assoc);
                 }
             }
             return Ok(());

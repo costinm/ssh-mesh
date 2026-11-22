@@ -25,6 +25,56 @@ pub enum LinkFraming {
         /// Compact 1-byte CID (`0..=127`) used in the header.
         peer_cid: crate::wire::ConnectionId,
     },
+    /// TLS 1.3 Application Data record-framed byte-stream link (TCP):
+    /// The TCP driver prepends a 5-byte TLS 1.3 record header (`0x17 0x03 0x03 <len_u16_be>`)
+    /// around each complete ShortHeader/Initial packet (plaintext or AEAD-encrypted).
+    TlsRecord {
+        /// Destination CID to encode in outgoing `ShortHeader`s on this link.
+        peer_cid: crate::wire::ConnectionId,
+    },
+}
+
+/// Length in bytes of a TLS 1.3 record header (`type(1) | legacy_version(2) | length(2)`).
+pub const TLS_RECORD_HEADER_LEN: usize = 5;
+/// TLS 1.3 Application Data record content type (`0x17`).
+pub const TLS_RECORD_APP_DATA: u8 = 0x17;
+/// TLS 1.3 legacy record version (`0x03, 0x03`).
+pub const TLS_RECORD_LEGACY_VERSION: [u8; 2] = [0x03, 0x03];
+
+/// Encode a 5-byte TLS 1.3 Application Data record header for `payload_len` bytes.
+#[inline]
+pub fn encode_tls_record_header(payload_len: usize) -> Option<[u8; TLS_RECORD_HEADER_LEN]> {
+    let len = u16::try_from(payload_len).ok()?;
+    let [hi, lo] = len.to_be_bytes();
+    Some([
+        TLS_RECORD_APP_DATA,
+        TLS_RECORD_LEGACY_VERSION[0],
+        TLS_RECORD_LEGACY_VERSION[1],
+        hi,
+        lo,
+    ])
+}
+
+/// Decode a 5-byte TLS 1.3 Application Data record header.
+///
+/// Returns `Ok(None)` if `buf.len() < 5`, `Ok(Some(payload_len))` if valid, or `Err(())`
+/// if the record type/version is invalid or `payload_len == 0` / `> max_payload`.
+#[inline]
+pub fn decode_tls_record_header(buf: &[u8], max_payload: usize) -> Result<Option<usize>, ()> {
+    if buf.len() < TLS_RECORD_HEADER_LEN {
+        return Ok(None);
+    }
+    if buf[0] != TLS_RECORD_APP_DATA
+        || buf[1] != TLS_RECORD_LEGACY_VERSION[0]
+        || buf[2] != TLS_RECORD_LEGACY_VERSION[1]
+    {
+        return Err(());
+    }
+    let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    if len == 0 || len > max_payload {
+        return Err(());
+    }
+    Ok(Some(len))
 }
 
 impl Default for LinkFraming {
@@ -146,10 +196,21 @@ pub struct LinkProfile {
     pub congestion_mode: CongestionMode,
     /// Initial RTT estimate in microseconds before the first ACK sample arrives.
     pub initial_rtt_us: u64,
+    /// Whether `ShortHeader` packets transmitted/received on this link use per-association AEAD
+    /// encryption (`true` for UDP/Wi-Fi/NOW/BLE/LoRa when keys are configured; `false` for
+    /// PPP/UART/TCP or when encryption is disabled on Wi-Fi/NOW for testing).
+    pub encrypt: bool,
 }
 
 impl LinkProfile {
-    /// Profile for a local or gateway TCP / UDS / high-speed PPP stream link.
+    /// Return a copy of this profile with [`Self::encrypt`] set to `enabled`.
+    #[inline]
+    pub const fn with_encryption(mut self, enabled: bool) -> Self {
+        self.encrypt = enabled;
+        self
+    }
+
+    /// Profile for a local or gateway TCP / UDS / high-speed PPP stream link (`encrypt: false`).
     pub const fn stream_link(tier: u8, mtu: usize, max_inflight_bytes: u64) -> Self {
         Self {
             tier,
@@ -166,10 +227,12 @@ impl LinkProfile {
                 max_inflight_packets: 128,
             },
             initial_rtt_us: 10_000,
+            encrypt: false,
         }
     }
 
-    /// Profile for a standard UDP datagram link with NewReno congestion control and pacing.
+    /// Profile for a standard UDP datagram link with NewReno congestion control and pacing
+    /// (`encrypt: true` by default when keys are installed).
     pub const fn udp_datagram(tier: u8, mtu: usize, peer_cid: crate::wire::ConnectionId) -> Self {
         Self {
             tier,
@@ -181,13 +244,15 @@ impl LinkProfile {
                 pacing: PacingConfig::host(mtu),
             },
             initial_rtt_us: 25_000,
+            encrypt: true,
         }
     }
 
     /// Profile for a low-rate / long-range radio link (LoRa or multicast ESP-NOW without MAC ACK).
     ///
     /// By default, admits only `CRITICAL`, `HIGH`, and `NORMAL` short messaging streams and
-    /// high-priority datagrams (`max_priority = StreamPriority::NORMAL`), rejecting `LOW` and `BULK`.
+    /// high-priority datagrams (`max_priority = StreamPriority::NORMAL`), rejecting `LOW` and `BULK`,
+    /// with `encrypt: true`.
     pub const fn radio_short_messages(
         tier: u8,
         mtu: usize,
@@ -208,6 +273,7 @@ impl LinkProfile {
                 min_pto_us,
             },
             initial_rtt_us: min_pto_us / 2,
+            encrypt: true,
         }
     }
 }

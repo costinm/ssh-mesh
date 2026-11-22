@@ -138,7 +138,24 @@ impl<'a, K, V> IntoIterator for &'a mut LinkMap<K, V> {
     }
 }
 
-pub use quic_base::{flow, header as wire, link, pool, streams, wire::StreamId};
+pub use quic_base::{
+    AEAD_TAG_LEN, ASSOCIATION_RANDOM_LEN, CryptoError, CryptoProvider, CryptoRole,
+    DMESH_QUIC_VERSION, DirectionKeyMaterial, EndpointKeys, FLAG_PROTECTED, FRAME_CRYPTO,
+    INITIAL_VERIFIER_LEN, InitialHeader, LONG_PACKET_INITIAL, PUBLIC_KEY_COMPRESSED_LEN,
+    ProviderAeadKey, TP_DMESH_PUBLIC_KEY, TP_DMESH_RANDOM, TP_DMESH_VERIFIER, TP_INITIAL_MAX_DATA,
+    TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+    TP_INITIAL_MAX_STREAMS_BIDI, TP_INITIAL_MAX_STREAMS_UNI, TP_INITIAL_SCID, TP_MAX_IDLE_TIMEOUT,
+    TP_MAX_UDP_PAYLOAD_SIZE, TP_ORIGINAL_DCID, TP_STATELESS_RESET_TOKEN, TRAFFIC_IV_LEN,
+    TRAFFIC_KEY_LEN, TrafficKeys, TransportParameters, compute_initial_verifier_with, decode_crypto_frame_body,
+    derive_device_secret_with, derive_peer_api_key_with, derive_static_traffic_keys_with,
+    derive_traffic_keys_with, encode_crypto_frame, flow, header as wire, is_initial_packet, link,
+    pool, streams, verify_initial_verifier_with, vip6_from_public_key_with, wire::StreamId,
+};
+#[cfg(feature = "rust-crypto")]
+pub use quic_base::{
+    RustAes128Gcm, compute_initial_verifier, derive_device_secret, derive_peer_api_key,
+    derive_static_traffic_keys, derive_traffic_keys, verify_initial_verifier, vip6_from_public_key,
+};
 
 pub mod assoc;
 pub mod congestion;
@@ -158,12 +175,13 @@ pub use mesh_api::link::{
 };
 
 pub use assoc::{
-    AssocConfig, DemuxOutcome, LinkRecvError, OutboundLinkPacket, QuicLinkAssoc,
-    SingleStreamCallbacks, SingleStreamConfig, SingleStreamEndpoint,
+    AssocConfig, AssocCryptoConfig, DemuxOutcome, HandshakeMode, LinkRecvError, OutboundLinkPacket,
+    QuicLinkAssoc, SingleStreamCallbacks, SingleStreamConfig, SingleStreamEndpoint,
 };
 pub use congestion::{
     CongestionController, CongestionMode, LinkFraming, LinkId, LinkProfile, LinkState, LinkStats,
-    LinkTxOutcome, PacingConfig, RttEstimator,
+    LinkTxOutcome, PacingConfig, TLS_RECORD_APP_DATA, TLS_RECORD_HEADER_LEN,
+    TLS_RECORD_LEGACY_VERSION, decode_tls_record_header, encode_tls_record_header, RttEstimator,
 };
 pub use datagram::{DatagramConfig, DatagramSendError, prepend_datagram_frame_in_place};
 #[cfg(all(feature = "std", feature = "stateless-reset"))]

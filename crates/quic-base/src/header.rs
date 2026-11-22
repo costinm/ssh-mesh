@@ -5,7 +5,7 @@
 use core::cmp::{max, min};
 use core::ops::Range;
 
-use crate::wire::{WireError, decode_varint, encode_varint};
+use crate::wire::{WireError, decode_varint, encode_varint, varint_len};
 
 /// Fixed bit (`0x40`) required on QUIC short headers.
 pub const FLAG_FIXED: u8 = 0x40;
@@ -151,31 +151,48 @@ pub struct ShortHeaderPrefix {
     pub header_len: usize,
 }
 
+/// Reconstruct a full `u32` packet number nearest to `expected` using RFC 9000's sliding window rule.
+pub(crate) fn reconstruct_packet_number(
+    truncated_packet_number: u32,
+    packet_number_len: u8,
+    expected: u32,
+) -> Result<u32, WireError> {
+    if !matches!(packet_number_len, 1..=4) {
+        return Err(WireError::InvalidFrame);
+    }
+    let pn_len = packet_number_len as usize;
+    let window = 1u64 << (pn_len * 8);
+    let half_window = window / 2;
+    let truncated = u64::from(truncated_packet_number);
+    let expected = u64::from(expected);
+    let epoch = expected & !(window - 1);
+    let mut candidate = epoch | truncated;
+    if candidate + half_window <= expected && candidate + window <= u64::from(u32::MAX) {
+        candidate += window;
+    } else if candidate > expected + half_window {
+        if candidate < window {
+            return Err(WireError::InvalidFrame);
+        }
+        candidate -= window;
+    }
+    if candidate > u64::from(u32::MAX) {
+        return Err(WireError::InvalidFrame);
+    }
+    Ok(candidate as u32)
+}
+
 impl ShortHeaderPrefix {
     /// Reconstruct the full `u32` packet number nearest to `expected` using RFC 9000's sliding window rule.
     pub fn reconstruct(self, expected: u32) -> Result<ShortHeader, WireError> {
-        let pn_len = self.packet_number_len as usize;
-        let window = 1u64 << (pn_len * 8);
-        let half_window = window / 2;
-        let truncated = u64::from(self.truncated_packet_number);
-        let expected = u64::from(expected);
-        let epoch = expected & !(window - 1);
-        let mut candidate = epoch | truncated;
-        if candidate + half_window <= expected && candidate + window <= u64::from(u32::MAX) {
-            candidate += window;
-        } else if candidate > expected + half_window {
-            if candidate < window {
-                return Err(WireError::InvalidFrame);
-            }
-            candidate -= window;
-        }
-        if candidate > u64::from(u32::MAX) {
-            return Err(WireError::InvalidFrame);
-        }
+        let packet_number = reconstruct_packet_number(
+            self.truncated_packet_number,
+            self.packet_number_len,
+            expected,
+        )?;
         Ok(ShortHeader {
             flags: self.flags,
             dcid: self.dcid,
-            packet_number: candidate as u32,
+            packet_number,
             packet_number_len: self.packet_number_len,
         })
     }
@@ -382,6 +399,49 @@ impl<const N: usize> AckRanges<N> {
         self.insert_range(PacketAckRange { start: pn, end: pn })
     }
 
+    /// Remove a single packet number `pn` (e.g. when an out-of-order `STREAM` frame could not be
+    /// buffered and must be dropped without acknowledgement per RFC 9000 §13.2.1).
+    pub fn remove(&mut self, pn: u32) -> bool {
+        for i in 0..self.len {
+            let r = self.ranges[i];
+            if pn > r.end {
+                return false;
+            }
+            if pn >= r.start {
+                if r.start == pn && r.end == pn {
+                    for j in i + 1..self.len {
+                        self.ranges[j - 1] = self.ranges[j];
+                    }
+                    self.len -= 1;
+                } else if r.start == pn {
+                    self.ranges[i].start += 1;
+                } else if r.end == pn {
+                    self.ranges[i].end -= 1;
+                } else {
+                    let hi = PacketAckRange {
+                        start: pn + 1,
+                        end: r.end,
+                    };
+                    let lo = PacketAckRange {
+                        start: r.start,
+                        end: pn - 1,
+                    };
+                    self.ranges[i] = hi;
+                    if i + 1 < N {
+                        let new_len = (self.len + 1).min(N);
+                        for j in (i + 2..new_len).rev() {
+                            self.ranges[j] = self.ranges[j - 1];
+                        }
+                        self.ranges[i + 1] = lo;
+                        self.len = new_len;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Insert an inclusive range `new`, merging adjacent or overlapping ranges and returning `true`
     /// if the oldest range was dropped due to capacity `N`.
     pub fn insert_range(&mut self, mut new: PacketAckRange) -> bool {
@@ -515,6 +575,10 @@ pub enum LinkFrame {
 }
 
 /// Encode a QUIC `ACK` (`0x02`) frame into `out`, returning the number of bytes written.
+///
+/// If `out` is too small for all ranges in `ranges`, this encodes as many of the most
+/// recent (largest) ranges as fit in `out`, per RFC 9000 §13.2.4, rather than failing
+/// and suppressing ACKs altogether.
 pub fn encode_ack_frame(
     ranges: &AckRangeSet,
     delay_us: u64,
@@ -522,13 +586,37 @@ pub fn encode_ack_frame(
 ) -> Result<usize, WireError> {
     let first = ranges.get(0).ok_or(WireError::InvalidFrame)?;
     let largest = first.end;
+    let first_range_len = u64::from(first.end - first.start);
+    let mut need = varint_len(FRAME_ACK)?
+        + varint_len(u64::from(largest))?
+        + varint_len(delay_us)?
+        + 1 // range_count (< ACK_RANGE_CAPACITY == 32, always 1 byte)
+        + varint_len(first_range_len)?;
+    if need > out.len() {
+        return Err(WireError::BufferTooSmall);
+    }
+    let mut fit_count = 1usize;
+    for i in 1..ranges.len() {
+        let previous = ranges.get(i - 1).ok_or(WireError::InvalidFrame)?;
+        let current = ranges.get(i).ok_or(WireError::InvalidFrame)?;
+        let gap = u64::from(previous.start)
+            .checked_sub(u64::from(current.end) + 2)
+            .ok_or(WireError::InvalidFrame)?;
+        let pair_len = varint_len(gap)? + varint_len(u64::from(current.end - current.start))?;
+        if need + pair_len > out.len() {
+            break;
+        }
+        need += pair_len;
+        fit_count += 1;
+    }
+
     let mut p = 0;
     p += encode_varint(FRAME_ACK, &mut out[p..])?;
     p += encode_varint(u64::from(largest), &mut out[p..])?;
     p += encode_varint(delay_us, &mut out[p..])?;
-    p += encode_varint((ranges.len() - 1) as u64, &mut out[p..])?;
-    p += encode_varint(u64::from(first.end - first.start), &mut out[p..])?;
-    for i in 1..ranges.len() {
+    p += encode_varint((fit_count - 1) as u64, &mut out[p..])?;
+    p += encode_varint(first_range_len, &mut out[p..])?;
+    for i in 1..fit_count {
         let previous = ranges.get(i - 1).ok_or(WireError::InvalidFrame)?;
         let current = ranges.get(i).ok_or(WireError::InvalidFrame)?;
         let gap = u64::from(previous.start)

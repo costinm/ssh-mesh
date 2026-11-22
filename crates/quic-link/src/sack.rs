@@ -23,10 +23,36 @@ pub struct LinkRetransmitCandidate<P: PoolPacket> {
     pub original_link_id: LinkId,
     /// Original TX packet metadata.
     pub meta: TxPacketMeta,
-    /// Cloned `PoolPacket` lease with `range()` restored to `mux_range` (the inner frame boundary
-    /// prior to outer `ACK` / `ShortHeader` prepending) so it can be reframed on any link with
-    /// a fresh packet number and zero payload copy.
+    /// Byte range of the original inner `mux` frame(s) inside `packet`'s slot before prepending
+    /// any piggybacked `ACK` or outer QUIC header.
+    pub mux_range: Range<usize>,
+    /// Whether `packet` still contains an AEAD-sealed `ShortHeader` wire packet that must be
+    /// decrypted in-place using `keys.send` and `original_pkt_num` before restoring `mux_range`.
+    pub is_sealed: bool,
+    /// Retained `PoolPacket` lease positioned at `mux_range` when `is_sealed == false`, or at the
+    /// sealed `ShortHeader` wire range when `is_sealed == true`.
     pub packet: P,
+}
+
+fn build_retransmit_candidate<P: PoolPacket>(
+    original_pkt_num: u32,
+    original_link_id: LinkId,
+    meta: TxPacketMeta,
+    mux_range: Range<usize>,
+    is_sealed: bool,
+    mut packet: P,
+) -> LinkRetransmitCandidate<P> {
+    if !is_sealed {
+        let _ = packet.set_range(mux_range.clone());
+    }
+    LinkRetransmitCandidate {
+        original_pkt_num,
+        original_link_id,
+        meta,
+        mux_range,
+        is_sealed,
+        packet,
+    }
 }
 
 /// Summary returned after processing an incoming `ACK` frame.
@@ -49,6 +75,7 @@ struct SentPacketEntry<P: PoolPacket> {
     wire_bytes: usize,
     sent_at_us: u64,
     mux_range: Range<usize>,
+    is_sealed: bool,
     meta: TxPacketMeta,
     window_limited: bool,
     in_flight: bool,
@@ -158,6 +185,7 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
         wire_bytes: usize,
         sent_at_us: u64,
         mux_range: Range<usize>,
+        is_sealed: bool,
         meta: TxPacketMeta,
         window_limited: bool,
         packet: Option<P>,
@@ -185,6 +213,7 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
                 wire_bytes,
                 sent_at_us,
                 mux_range,
+                is_sealed,
                 meta,
                 window_limited,
                 in_flight: true,
@@ -205,6 +234,7 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
                 wire_bytes,
                 sent_at_us,
                 mux_range,
+                is_sealed,
                 meta,
                 window_limited,
                 in_flight: true,
@@ -351,10 +381,9 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
 
             let mut cloned_pkt = None;
             if !entry.retransmitted {
-                if let Some(mut pkt) = entry.packet.take() {
+                if let Some(pkt) = entry.packet.take() {
                     if pkt.is_unique() {
                         self.retained_packet_leases = self.retained_packet_leases.saturating_sub(1);
-                        let _ = pkt.set_range(entry.mux_range.clone());
                         cloned_pkt = Some(pkt);
                     } else {
                         // Driver still holds a reference; restore `entry.packet` and retry on next poll.
@@ -384,14 +413,16 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
                 }
             }
 
-            if let Some(restored) = cloned_pkt {
+            if let Some(pkt) = cloned_pkt {
                 entry.retransmitted = true;
-                candidates.push(LinkRetransmitCandidate {
-                    original_pkt_num: entry.pkt_num,
-                    original_link_id: entry.link_id,
-                    meta: entry.meta,
-                    packet: restored,
-                });
+                candidates.push(build_retransmit_candidate(
+                    entry.pkt_num,
+                    entry.link_id,
+                    entry.meta,
+                    entry.mux_range.clone(),
+                    entry.is_sealed,
+                    pkt,
+                ));
             }
         }
         candidates
@@ -419,10 +450,9 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
             }
 
             let mut cloned_pkt = None;
-            if let Some(mut pkt) = entry.packet.take() {
+            if let Some(pkt) = entry.packet.take() {
                 if pkt.is_unique() {
                     self.retained_packet_leases = self.retained_packet_leases.saturating_sub(1);
-                    let _ = pkt.set_range(entry.mux_range.clone());
                     cloned_pkt = Some(pkt);
                 } else {
                     // Driver still holds a reference; restore `entry.packet` and retry on next poll_timers.
@@ -438,14 +468,16 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
             entry.declared_lost = true;
             link.pto_backoff = (link.pto_backoff + 1).min(3);
 
-            if let Some(restored) = cloned_pkt {
+            if let Some(pkt) = cloned_pkt {
                 entry.retransmitted = true;
-                out.push(LinkRetransmitCandidate {
-                    original_pkt_num: entry.pkt_num,
-                    original_link_id: entry.link_id,
-                    meta: entry.meta,
-                    packet: restored,
-                });
+                out.push(build_retransmit_candidate(
+                    entry.pkt_num,
+                    entry.link_id,
+                    entry.meta,
+                    entry.mux_range.clone(),
+                    entry.is_sealed,
+                    pkt,
+                ));
             }
         }
         out
@@ -472,15 +504,16 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
                 link.congestion.remove_in_flight(entry.wire_bytes as u64);
             }
         }
-        let mut pkt = entry.packet.take()?;
+        let pkt = entry.packet.take()?;
         self.retained_packet_leases = self.retained_packet_leases.saturating_sub(1);
-        let _ = pkt.set_range(entry.mux_range);
-        Some(LinkRetransmitCandidate {
-            original_pkt_num: entry.pkt_num,
-            original_link_id: entry.link_id,
-            meta: entry.meta,
-            packet: pkt,
-        })
+        Some(build_retransmit_candidate(
+            entry.pkt_num,
+            entry.link_id,
+            entry.meta,
+            entry.mux_range,
+            entry.is_sealed,
+            pkt,
+        ))
     }
 
     /// Evacuate all unacknowledged packets from `failed_link_id` (e.g. when a TCP connection drops
@@ -505,15 +538,16 @@ impl<P: PoolPacket> MultiLinkSackLedger<P> {
                     link.congestion.remove_in_flight(entry.wire_bytes as u64);
                 }
             }
-            if let Some(mut pkt) = entry.packet.take() {
+            if let Some(pkt) = entry.packet.take() {
                 self.retained_packet_leases = self.retained_packet_leases.saturating_sub(1);
-                let _ = pkt.set_range(entry.mux_range);
-                out.push(LinkRetransmitCandidate {
-                    original_pkt_num: entry.pkt_num,
-                    original_link_id: failed_link_id,
-                    meta: entry.meta,
-                    packet: pkt,
-                });
+                out.push(build_retransmit_candidate(
+                    entry.pkt_num,
+                    failed_link_id,
+                    entry.meta,
+                    entry.mux_range,
+                    entry.is_sealed,
+                    pkt,
+                ));
             }
         }
         out

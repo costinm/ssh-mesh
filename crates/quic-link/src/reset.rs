@@ -128,7 +128,7 @@ mod key {
             {
                 *byte = digest[index % digest.len()] ^ (index as u8).wrapping_mul(0x9d);
             }
-            out[0] &= 0x3f;
+            out[0] = (out[0] & 0x3f) | 0x40;
             out[used - STATELESS_RESET_TOKEN_LEN..used].copy_from_slice(&token.0);
             Ok(Some(used))
         }

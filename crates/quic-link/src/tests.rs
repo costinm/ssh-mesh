@@ -1156,7 +1156,7 @@ fn stateless_reset_key_derives_and_matches_token_on_unknown_cid() {
         .expect("valid short packet >= 21 bytes produces stateless reset");
     assert_eq!(reset_len, 28);
     assert!(reset_len >= STATELESS_RESET_MIN_PACKET_LEN);
-    assert_eq!(reset_pkt[0] & 0xc0, 0);
+    assert_eq!(reset_pkt[0] & 0xc0, 0x40);
     assert!(token.matches_packet(&reset_pkt[..reset_len]));
     assert!(!other_token.matches_packet(&reset_pkt[..reset_len]));
 }
@@ -1348,4 +1348,990 @@ async fn tokio_mux_streams_over_udp_assoc_packet_link() {
     }
     server_task.await.unwrap();
     let _ = server_mux;
+}
+
+fn deliver_assoc_outbound<F>(
+    from: &mut QuicLinkAssoc<XipLazyPacket>,
+    to: &mut QuicLinkAssoc<XipLazyPacket>,
+    pool: &XipLazyPool,
+    now_us: u64,
+    drop_pred: F,
+) -> Vec<(Vec<u8>, Option<Vec<u8>>)>
+where
+    F: Fn(usize, &[u8]) -> bool,
+{
+    let mut delivered = Vec::new();
+    let mut idx = 0usize;
+    while let Some(out) = from.pop_outbound_packet() {
+        let raw = out.packet.bytes().to_vec();
+        from.on_driver_complete(out.link_id, out.packet_number, LinkTxOutcome::Sent, now_us);
+        let should_drop = drop_pred(idx, &raw);
+        idx += 1;
+        if should_drop {
+            continue;
+        }
+        let mut rx_pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+        rx_pkt.append(&raw).unwrap();
+        let outcome = to.receive_packet(out.link_id, rx_pkt, now_us).unwrap();
+        let mux_bytes = outcome.mux_packet.map(|p| p.bytes().to_vec());
+        delivered.push((raw, mux_bytes));
+    }
+    delivered
+}
+
+#[test]
+fn initial_handshake_standalone_and_public_key_exchange() {
+    use crate::{HandshakeMode, PUBLIC_KEY_COMPRESSED_LEN, TransportParameters, is_initial_packet};
+
+    let mut pool = XipLazyPool::with_default_geometry(32);
+    let client_cid = ConnectionId::new(7).unwrap();
+    let server_cid = ConnectionId::new(42).unwrap();
+    let client_pub = [0x02u8; PUBLIC_KEY_COMPRESSED_LEN];
+    let server_pub = [0x03u8; PUBLIC_KEY_COMPRESSED_LEN];
+    let client_rst = [0x11; 16];
+    let server_rst = [0x22; 16];
+
+    let mut client = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(client_cid),
+        default_peer_cid: ConnectionId::new(1).unwrap(),
+        handshake_mode: HandshakeMode::Client,
+        local_params: TransportParameters {
+            initial_scid: Some(client_cid),
+            public_key: Some(client_pub),
+            stateless_reset_token: Some(client_rst),
+            initial_max_data: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..AssocConfig::default()
+    });
+    let mut server = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(server_cid),
+        default_peer_cid: ConnectionId::new(1).unwrap(),
+        handshake_mode: HandshakeMode::Server,
+        local_params: TransportParameters {
+            initial_scid: Some(server_cid),
+            public_key: Some(server_pub),
+            stateless_reset_token: Some(server_rst),
+            initial_max_data: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..AssocConfig::default()
+    });
+
+    let udp = LinkId(1);
+    client.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+    server.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+
+    assert!(!client.is_handshake_complete());
+    assert!(!server.is_handshake_complete());
+
+    // 1. Client enqueues standalone Initial -> Server receives it and learns client CID + public_key.
+    client.enqueue_initial(&mut pool).unwrap();
+    let c2s = deliver_assoc_outbound(&mut client, &mut server, &pool, 1_000, |_, _| false);
+    assert_eq!(c2s.len(), 1);
+    assert!(is_initial_packet(&c2s[0].0));
+    assert_eq!(server.peer_scid(), Some(client_cid));
+    assert_eq!(server.peer_params().unwrap().public_key, Some(client_pub));
+    assert_eq!(
+        server.peer_stateless_reset_token().unwrap().as_bytes(),
+        &client_rst
+    );
+
+    // 2. Server poll_timers emits Server Initial (CRYPTO + piggybacked ACK) addressed to dcid = client_cid.
+    assert!(server.poll_timers(&mut pool, 2_000) >= 1);
+    let s2c = deliver_assoc_outbound(&mut server, &mut client, &pool, 3_000, |_, _| false);
+    assert_eq!(s2c.len(), 1);
+    assert!(is_initial_packet(&s2c[0].0));
+    assert!(client.is_handshake_complete());
+    assert_eq!(client.peer_scid(), Some(server_cid));
+    assert_eq!(client.peer_params().unwrap().public_key, Some(server_pub));
+    assert_eq!(
+        client.peer_stateless_reset_token().unwrap().as_bytes(),
+        &server_rst
+    );
+
+    // 3. Client poll_timers emits compact ShortHeader ACK addressed to dcid = server_cid -> Server completes!
+    assert!(client.poll_timers(&mut pool, 4_000) >= 1);
+    let c2s_ack = deliver_assoc_outbound(&mut client, &mut server, &pool, 5_000, |_, _| false);
+    assert_eq!(c2s_ack.len(), 1);
+    assert!(!is_initial_packet(&c2s_ack[0].0));
+    let (short_hdr, _) = ShortHeader::decode(&c2s_ack[0].0).unwrap();
+    assert_eq!(short_hdr.dcid, server_cid);
+    assert!(server.is_handshake_complete());
+}
+
+#[test]
+fn initial_handshake_coalesces_1rtt_stream_and_recovers_from_loss() {
+    use crate::{HandshakeMode, PUBLIC_KEY_COMPRESSED_LEN, TransportParameters, is_initial_packet};
+    use quic_base::{AssociationEgress, StreamId, TxPacketMeta, encode_stream_header};
+
+    let mut pool = XipLazyPool::with_default_geometry(32);
+    let client_cid = ConnectionId::new(15).unwrap();
+    let server_cid = ConnectionId::new(99).unwrap();
+
+    let mut client = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(client_cid),
+        default_peer_cid: ConnectionId::new(1).unwrap(),
+        handshake_mode: HandshakeMode::Client,
+        local_params: TransportParameters {
+            initial_scid: Some(client_cid),
+            public_key: Some([0x02; PUBLIC_KEY_COMPRESSED_LEN]),
+            initial_max_data: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..AssocConfig::default()
+    });
+    let mut server = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(server_cid),
+        default_peer_cid: ConnectionId::new(1).unwrap(),
+        handshake_mode: HandshakeMode::Server,
+        local_params: TransportParameters {
+            initial_scid: Some(server_cid),
+            public_key: Some([0x03; PUBLIC_KEY_COMPRESSED_LEN]),
+            initial_max_data: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..AssocConfig::default()
+    });
+    let udp = LinkId(1);
+    client.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+    server.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+
+    // Client writes STREAM(0) immediately without waiting for handshake!
+    let mut req_pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    let mut hdr = [0u8; 16];
+    let body = b"hello-1rtt";
+    let h_len = encode_stream_header(StreamId(0), 0, body.len(), true, true, &mut hdr).unwrap();
+    req_pkt.append(&hdr[..h_len]).unwrap();
+    req_pkt.append(body).unwrap();
+    client
+        .send_packet(
+            TxPacketMeta {
+                association: OWNER_ASSOC,
+                stream_id: Some(StreamId(0)),
+                priority: StreamPriority::NORMAL,
+                retransmittable: true,
+            },
+            req_pkt,
+        )
+        .unwrap();
+
+    // First transmission is dropped in flight! Verify PTO retransmits a valid Initial + STREAM(0).
+    let dropped = deliver_assoc_outbound(&mut client, &mut server, &pool, 1_000, |idx, _| idx == 0);
+    assert!(dropped.is_empty());
+
+    // Advance past PTO deadline so Client retransmits coalesced Initial + STREAM(0).
+    let pto_dl = client.next_deadline_us().expect("PTO scheduled");
+    assert!(client.poll_timers(&mut pool, pto_dl + 1) >= 1);
+    let delivered = deliver_assoc_outbound(&mut client, &mut server, &pool, pto_dl + 100, |_, _| false);
+    assert_eq!(delivered.len(), 1);
+    assert!(is_initial_packet(&delivered[0].0));
+    let mux_req = delivered[0].1.as_ref().expect("coalesced STREAM(0) delivered on packet 1");
+    assert!(mux_req.ends_with(body));
+
+    // Server sends coalesced Server Initial + STREAM(0) reply back, drop the first attempt too!
+    let mut resp_pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    let resp_body = b"world-1rtt";
+    let h_len = encode_stream_header(StreamId(0), 0, resp_body.len(), true, true, &mut hdr).unwrap();
+    resp_pkt.append(&hdr[..h_len]).unwrap();
+    resp_pkt.append(resp_body).unwrap();
+    server
+        .send_packet(
+            TxPacketMeta {
+                association: OWNER_ASSOC,
+                stream_id: Some(StreamId(0)),
+                priority: StreamPriority::NORMAL,
+                retransmittable: true,
+            },
+            resp_pkt,
+        )
+        .unwrap();
+
+    let s_dropped = deliver_assoc_outbound(&mut server, &mut client, &pool, pto_dl + 200, |idx, _| idx == 0);
+    assert!(s_dropped.is_empty());
+    let s_pto = server.next_deadline_us().expect("server PTO scheduled");
+    assert!(server.poll_timers(&mut pool, s_pto + 1) >= 1);
+    let s_delivered =
+        deliver_assoc_outbound(&mut server, &mut client, &pool, s_pto + 100, |_, _| false);
+    assert!(s_delivered.iter().any(|(wire, mux)| {
+        is_initial_packet(wire) && mux.as_ref().is_some_and(|m| m.ends_with(resp_body))
+    }));
+    assert!(client.is_handshake_complete());
+
+    // Subsequent Client STREAM packet uses compact ShortHeader with dcid = server_cid!
+    let mut next_pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    let next_body = b"steady-short";
+    let h_len = encode_stream_header(StreamId(4), 0, next_body.len(), true, true, &mut hdr).unwrap();
+    next_pkt.append(&hdr[..h_len]).unwrap();
+    next_pkt.append(next_body).unwrap();
+    client
+        .send_packet(
+            TxPacketMeta {
+                association: OWNER_ASSOC,
+                stream_id: Some(StreamId(4)),
+                priority: StreamPriority::NORMAL,
+                retransmittable: true,
+            },
+            next_pkt,
+        )
+        .unwrap();
+    let steady = deliver_assoc_outbound(&mut client, &mut server, &pool, s_pto + 500, |_, _| false);
+    assert_eq!(steady.len(), 1);
+    assert!(!is_initial_packet(&steady[0].0));
+    let (sh, _) = ShortHeader::decode(&steady[0].0).unwrap();
+    assert_eq!(sh.dcid, server_cid);
+    assert!(server.is_handshake_complete());
+}
+
+#[cfg(feature = "rust-crypto")]
+#[test]
+fn phase_a_initial_auth_derives_vip6_and_encrypts_short_packets_through_loss() {
+    use crate::{
+        AssocCryptoConfig, CryptoProvider, CryptoRole, FLAG_PROTECTED, HandshakeMode,
+        PUBLIC_KEY_COMPRESSED_LEN, TransportParameters, derive_device_secret, derive_peer_api_key,
+        is_initial_packet, vip6_from_public_key,
+    };
+    use quic_base::{AssociationEgress, StreamId, TxPacketMeta, encode_stream_header};
+
+    let mut pool = XipLazyPool::with_default_geometry(32);
+    let client_cid = ConnectionId::new(11).unwrap();
+    let server_cid = ConnectionId::new(77).unwrap();
+    let client_pub = [0x02u8; PUBLIC_KEY_COMPRESSED_LEN];
+    let server_pub = [0x03u8; PUBLIC_KEY_COMPRESSED_LEN];
+
+    let node_secret =
+        derive_device_secret(b"control-plane-root-secret-material", &server_pub).unwrap();
+    let client_send_api_key = derive_peer_api_key(&node_secret, &client_pub).unwrap();
+
+    let mut client = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(client_cid),
+        default_peer_cid: ConnectionId::new(1).unwrap(),
+        handshake_mode: HandshakeMode::Client,
+        local_params: TransportParameters {
+            initial_max_data: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..AssocConfig::default()
+    });
+    client
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Client,
+            local_public_key: Some(client_pub),
+            local_random: [0x1a; 32],
+            send_api_key: Some(client_send_api_key),
+            node_secret: None,
+        })
+        .unwrap();
+
+    let mut server = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(server_cid),
+        default_peer_cid: ConnectionId::new(1).unwrap(),
+        handshake_mode: HandshakeMode::Server,
+        local_params: TransportParameters {
+            initial_max_data: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..AssocConfig::default()
+    });
+    server
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Server,
+            local_public_key: Some(server_pub),
+            local_random: [0x2b; 32],
+            send_api_key: None,
+            node_secret: Some(node_secret),
+        })
+        .unwrap();
+
+    let udp = LinkId(1);
+    client.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+    server.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+
+    // 1. Authenticated Client Initial carries 8B ODCID + public_key + verifier -> Server derives client vip6 + keys.
+    client.enqueue_initial(&mut pool).unwrap();
+    let c2s = deliver_assoc_outbound(&mut client, &mut server, &pool, 1_000, |_, _| false);
+    assert_eq!(c2s.len(), 1);
+    let (c_hdr, _) = crate::InitialHeader::decode(&c2s[0].0).unwrap();
+    assert!(c_hdr.dcid.is_some());
+    assert_eq!(server.peer_vip6(), Some(vip6_from_public_key(&client_pub)));
+    assert!(server.has_packet_crypto());
+
+    // 2. Server replies with Server Initial echoing TP_ORIGINAL_DCID -> Client verifies & derives keys.
+    assert!(server.poll_timers(&mut pool, 2_000) >= 1);
+    let s2c = deliver_assoc_outbound(&mut server, &mut client, &pool, 3_000, |_, _| false);
+    assert_eq!(s2c.len(), 1);
+    assert!(is_initial_packet(&s2c[0].0));
+    assert!(client.is_handshake_complete());
+    assert!(client.has_packet_crypto());
+    assert_eq!(client.peer_vip6(), Some(vip6_from_public_key(&server_pub)));
+    assert_eq!(
+        client.peer_params().unwrap().original_dcid,
+        client.config().initial_dcid
+    );
+
+    // 3. All ShortHeader STREAM packets are encrypted (`FLAG_PROTECTED = 0x04`) and survive loss + PTO retransmission!
+    let mut pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    let secret_msg = b"confidential-phase-a-stream-payload";
+    let mut shdr = [0u8; 16];
+    let sh_len = encode_stream_header(StreamId(0), 0, secret_msg.len(), true, true, &mut shdr).unwrap();
+    pkt.append(&shdr[..sh_len]).unwrap();
+    pkt.append(secret_msg).unwrap();
+    client
+        .send_packet(
+            TxPacketMeta {
+                association: OWNER_ASSOC,
+                stream_id: Some(StreamId(0)),
+                priority: StreamPriority::NORMAL,
+                retransmittable: true,
+            },
+            pkt,
+        )
+        .unwrap();
+
+    // Verify wire packet has FLAG_PROTECTED set and ciphertext does not leak plaintext, then drop first TX.
+    let first_tx = client.pop_outbound_packet().unwrap();
+    let wire = first_tx.packet.bytes();
+    assert!(!is_initial_packet(wire));
+    assert_eq!(wire[0] & FLAG_PROTECTED, FLAG_PROTECTED);
+    assert!(!wire.windows(secret_msg.len()).any(|w| w == secret_msg));
+    client.on_driver_complete(first_tx.link_id, first_tx.packet_number, LinkTxOutcome::Sent, 4_000);
+    drop(first_tx);
+
+    // PTO expires -> QuicLinkAssoc unseals the retained buffer, reframes with new PN, re-seals, and delivers!
+    let pto_dl = client.next_deadline_us().expect("PTO scheduled");
+    assert!(client.poll_timers(&mut pool, pto_dl + 1) >= 1);
+    let delivered =
+        deliver_assoc_outbound(&mut client, &mut server, &pool, pto_dl + 100, |_, _| false);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].0[0] & FLAG_PROTECTED, FLAG_PROTECTED);
+    let mux = delivered[0].1.as_ref().expect("decrypted STREAM delivered after PTO");
+    assert!(mux.ends_with(secret_msg));
+    assert!(server.is_handshake_complete());
+}
+
+#[cfg(feature = "rust-crypto")]
+#[test]
+fn phase_a_rejects_wrong_api_key_verifier() {
+    use crate::{
+        AssocCryptoConfig, CryptoError, CryptoProvider, CryptoRole, HandshakeMode, LinkRecvError,
+        PUBLIC_KEY_COMPRESSED_LEN, TransportParameters, derive_device_secret,
+    };
+
+    let mut pool = XipLazyPool::with_default_geometry(16);
+    let client_cid = ConnectionId::new(12).unwrap();
+    let server_cid = ConnectionId::new(88).unwrap();
+    let client_pub = [0x02u8; PUBLIC_KEY_COMPRESSED_LEN];
+    let server_pub = [0x03u8; PUBLIC_KEY_COMPRESSED_LEN];
+    let node_secret = derive_device_secret(b"real-control-root-secret-material", &server_pub).unwrap();
+
+    let mut client = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(client_cid),
+        handshake_mode: HandshakeMode::Client,
+        local_params: TransportParameters::default(),
+        ..AssocConfig::default()
+    });
+    client
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Client,
+            local_public_key: Some(client_pub),
+            local_random: [0x55; 32],
+            send_api_key: Some([0x99; 32]), // wrong API key!
+            node_secret: None,
+        })
+        .unwrap();
+
+    let mut server = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(server_cid),
+        handshake_mode: HandshakeMode::Server,
+        local_params: TransportParameters::default(),
+        ..AssocConfig::default()
+    });
+    server
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Server,
+            local_public_key: Some(server_pub),
+            local_random: [0x66; 32],
+            send_api_key: None,
+            node_secret: Some(node_secret),
+        })
+        .unwrap();
+
+    let udp = LinkId(1);
+    client.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+    server.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, ConnectionId::new(1).unwrap()));
+
+    client.enqueue_initial(&mut pool).unwrap();
+    let out = client.pop_outbound_packet().unwrap();
+    let mut rx_pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    rx_pkt.append(out.packet.bytes()).unwrap();
+    let err = server.receive_packet(udp, rx_pkt, 1_000).unwrap_err();
+    assert_eq!(err, LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+    assert!(server.peer_scid().is_none());
+    assert!(!server.has_packet_crypto());
+}
+
+#[cfg(feature = "rust-crypto")]
+#[test]
+fn phase_a_prekeyed_short_header_only_session_without_initial() {
+    use crate::{
+        AssocCryptoConfig, CryptoError, CryptoProvider, CryptoRole, FLAG_PROTECTED, LinkRecvError,
+        derive_device_secret, derive_peer_api_key, is_initial_packet,
+    };
+    use quic_base::{AssociationEgress, StreamId, TxPacketMeta, encode_stream_header};
+
+    let pool = XipLazyPool::with_default_geometry(16);
+    let cid1 = ConnectionId::new(1).unwrap();
+    let node_secret = derive_device_secret(b"control-plane-root-secret-material", &[0x03; 33]).unwrap();
+    let owner_api_key = derive_peer_api_key(&node_secret, &[]).unwrap();
+
+    let mut client = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(cid1),
+        default_peer_cid: cid1,
+        ..AssocConfig::default()
+    });
+    client
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Client,
+            local_public_key: None,
+            local_random: [0; 32],
+            send_api_key: Some(owner_api_key),
+            node_secret: None,
+        })
+        .unwrap();
+
+    let mut esp32_server = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(cid1),
+        default_peer_cid: cid1,
+        ..AssocConfig::default()
+    });
+    esp32_server
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Server,
+            local_public_key: None,
+            local_random: [0; 32],
+            send_api_key: None,
+            node_secret: Some(node_secret),
+        })
+        .unwrap();
+
+    let udp = LinkId(1);
+    client.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, cid1));
+    esp32_server.upsert_link(udp, LinkProfile::udp_datagram(0, 1200, cid1));
+
+    let mut pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    let payload = b"esp32-prekeyed-command";
+    let mut shdr = [0u8; 16];
+    let hlen = encode_stream_header(StreamId(0), 0, payload.len(), true, true, &mut shdr).unwrap();
+    pkt.append(&shdr[..hlen]).unwrap();
+    pkt.append(payload).unwrap();
+    client
+        .send_packet(
+            TxPacketMeta {
+                association: OWNER_ASSOC,
+                stream_id: Some(StreamId(0)),
+                priority: StreamPriority::NORMAL,
+                retransmittable: true,
+            },
+            pkt,
+        )
+        .unwrap();
+
+    let out = client.pop_outbound_packet().unwrap();
+    let raw = out.packet.bytes().to_vec();
+    assert!(!is_initial_packet(&raw));
+    assert_eq!(raw[0] & FLAG_PROTECTED, FLAG_PROTECTED);
+    assert!(!raw.windows(payload.len()).any(|w| w == payload));
+
+    // Tampered byte must fail AEAD authentication.
+    let mut tampered = raw.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xff;
+    let mut bad_rx = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    bad_rx.append(&tampered).unwrap();
+    assert_eq!(
+        esp32_server.receive_packet(udp, bad_rx, 1_000).unwrap_err(),
+        LinkRecvError::Crypto(CryptoError::AuthenticationFailed)
+    );
+
+    // Authentic packet decrypts cleanly with zero Long Header Initial packets!
+    let mut good_rx = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    good_rx.append(&raw).unwrap();
+    let outcome = esp32_server.receive_packet(udp, good_rx, 1_100).unwrap();
+    assert!(!outcome.is_initial);
+    assert!(outcome.mux_packet.unwrap().bytes().ends_with(payload));
+}
+
+#[cfg(feature = "rust-crypto")]
+#[test]
+fn per_link_encryption_granularity_and_failover_between_encrypted_udp_and_unencrypted_uart() {
+    use crate::{
+        AssocCryptoConfig, CryptoError, CryptoProvider, CryptoRole, FLAG_PROTECTED, LinkRecvError,
+        derive_device_secret, derive_peer_api_key,
+    };
+    use quic_base::{AssociationEgress, StreamId, TxPacketMeta, encode_stream_header};
+
+    let pool = XipLazyPool::with_default_geometry(16);
+    let cid1 = ConnectionId::new(1).unwrap();
+    let node_secret = derive_device_secret(b"control-plane-root-secret-material", &[0x03; 33]).unwrap();
+    let owner_api_key = derive_peer_api_key(&node_secret, &[]).unwrap();
+
+    let mut client = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(cid1),
+        default_peer_cid: cid1,
+        ..AssocConfig::default()
+    });
+    client
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Client,
+            local_public_key: None,
+            local_random: [0; 32],
+            send_api_key: Some(owner_api_key),
+            node_secret: None,
+        })
+        .unwrap();
+
+    let mut server = QuicLinkAssoc::<XipLazyPacket>::new(AssocConfig {
+        local_cid: Some(cid1),
+        default_peer_cid: cid1,
+        ..AssocConfig::default()
+    });
+    server
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Server,
+            local_public_key: None,
+            local_random: [0; 32],
+            send_api_key: None,
+            node_secret: Some(node_secret),
+        })
+        .unwrap();
+
+    let udp = LinkId(1);
+    let uart = LinkId(2);
+    // UDP encrypts (`tier = 0`); PPP/UART never encrypts (`tier = 1, encrypt = false`).
+    let udp_prof = LinkProfile::udp_datagram(0, 1200, cid1);
+    assert!(udp_prof.encrypt);
+    let uart_prof = LinkProfile::udp_datagram(1, 1200, cid1).with_encryption(false);
+    assert!(!uart_prof.encrypt);
+    let tcp_prof = LinkProfile::stream_link(0, 1500, 64 * 1024);
+    assert!(!tcp_prof.encrypt);
+
+    client.upsert_link(udp, udp_prof);
+    client.upsert_link(uart, uart_prof);
+    server.upsert_link(udp, udp_prof);
+    server.upsert_link(uart, uart_prof);
+
+    // 1. Send packet -> selects tier 0 (UDP) -> encrypted with FLAG_PROTECTED.
+    let mut pkt = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    let msg = b"per-link-failover-payload";
+    let mut shdr = [0u8; 16];
+    let hlen = encode_stream_header(StreamId(0), 0, msg.len(), true, true, &mut shdr).unwrap();
+    pkt.append(&shdr[..hlen]).unwrap();
+    pkt.append(msg).unwrap();
+    client
+        .send_packet(
+            TxPacketMeta {
+                association: OWNER_ASSOC,
+                stream_id: Some(StreamId(0)),
+                priority: StreamPriority::NORMAL,
+                retransmittable: true,
+            },
+            pkt,
+        )
+        .unwrap();
+
+    let first_tx = client.pop_outbound_packet().unwrap();
+    assert_eq!(first_tx.link_id, udp);
+    assert_eq!(first_tx.packet.bytes()[0] & FLAG_PROTECTED, FLAG_PROTECTED);
+    assert!(!first_tx.packet.bytes().windows(msg.len()).any(|w| w == msg));
+
+    // Cleartext ShortHeader arriving on `udp` (`encrypt: true`) must be rejected.
+    let mut spoof = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    spoof.append(&[0x40, 0x01, 0x05, 0x01]).unwrap(); // flags=0x40 (no FLAG_PROTECTED), dcid=1, pn=5, PING
+    assert_eq!(
+        server.receive_packet(udp, spoof, 100).unwrap_err(),
+        LinkRecvError::Crypto(CryptoError::AuthenticationFailed)
+    );
+
+    // 2. Fail UDP link -> failover evacuates to `uart` (`encrypt: false`) -> unseals & sends cleartext!
+    let pn = first_tx.packet_number;
+    drop(first_tx);
+    client.on_driver_complete(udp, pn, LinkTxOutcome::Sent, 1_000);
+    assert_eq!(client.fail_link(udp, false, 1_100), 1);
+
+    let failover_tx = client.pop_outbound_packet().unwrap();
+    assert_eq!(failover_tx.link_id, uart);
+    assert_eq!(failover_tx.packet.bytes()[0] & FLAG_PROTECTED, 0);
+    assert!(failover_tx.packet.bytes().windows(msg.len()).any(|w| w == msg));
+
+    // Server accepts cleartext packet on `uart` (`encrypt: false`) even while keys are installed!
+    let mut rx_uart = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    rx_uart.append(failover_tx.packet.bytes()).unwrap();
+    let demux = server.receive_packet(uart, rx_uart, 1_200).unwrap();
+    assert!(demux.mux_packet.unwrap().bytes().ends_with(msg));
+
+    // 3. Re-configuring UDP with `.with_encryption(false)` allows cleartext UDP testing too!
+    client.upsert_link(udp, udp_prof.with_encryption(false));
+    server.upsert_link(udp, udp_prof.with_encryption(false));
+    let mut pkt2 = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    let msg2 = b"udp-test-unencrypted";
+    let hlen2 = encode_stream_header(StreamId(4), 0, msg2.len(), true, true, &mut shdr).unwrap();
+    pkt2.append(&shdr[..hlen2]).unwrap();
+    pkt2.append(msg2).unwrap();
+    client
+        .send_packet(
+            TxPacketMeta {
+                association: OWNER_ASSOC,
+                stream_id: Some(StreamId(4)),
+                priority: StreamPriority::NORMAL,
+                retransmittable: true,
+            },
+            pkt2,
+        )
+        .unwrap();
+    let tx2 = client.pop_outbound_packet().unwrap();
+    assert_eq!(tx2.link_id, udp);
+    assert_eq!(tx2.packet.bytes()[0] & FLAG_PROTECTED, 0);
+    assert!(tx2.packet.bytes().windows(msg2.len()).any(|w| w == msg2));
+    let mut rx2 = pool.alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+    rx2.append(tx2.packet.bytes()).unwrap();
+    let demux2 = server.receive_packet(udp, rx2, 1_500).unwrap();
+    assert!(demux2.mux_packet.unwrap().bytes().ends_with(msg2));
+}
+
+#[cfg(feature = "rust-crypto")]
+#[test]
+fn encrypted_transfer_exceeding_256_packets_and_retransmits_succeed() {
+    use crate::{
+        AssocCryptoConfig, CryptoProvider, CryptoRole, FLAG_PROTECTED, derive_device_secret,
+        derive_peer_api_key,
+    };
+
+    let pool_a = XipLazyPool::with_default_geometry(256);
+    let pool_b = XipLazyPool::with_default_geometry(256);
+    let cid = ConnectionId::new(1).unwrap();
+    let udp = LinkId(1);
+
+    let mut cfg = SingleStreamConfig::default();
+    cfg.initial_recv_window = 128 * 1024;
+    cfg.initial_send_window = 128 * 1024;
+    cfg.max_reassembly_chunks = 128;
+    cfg.assoc.max_retained_tx_packets = 128;
+    cfg.assoc.ack_eliciting_threshold = 4;
+
+    let mut ep_a = SingleStreamEndpoint::new(pool_a, cfg);
+    let mut ep_b = SingleStreamEndpoint::new(pool_b, cfg);
+
+    let mut prof = LinkProfile::udp_datagram(0, 244, cid);
+    prof.congestion_mode = crate::congestion::CongestionMode::NewRenoPaced {
+        initial_window_bytes: 8 * 1024,
+        pacing: crate::congestion::PacingConfig::disabled(244),
+    };
+    ep_a.assoc_mut().upsert_link(udp, prof);
+    ep_b.assoc_mut().upsert_link(udp, prof);
+
+    let node_secret =
+        derive_device_secret(b"control-plane-root-secret-material", &[0x03; 33]).unwrap();
+    let api_key = derive_peer_api_key(&node_secret, &[]).unwrap();
+    ep_a.assoc_mut()
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Client,
+            local_public_key: None,
+            local_random: [0; 32],
+            send_api_key: Some(api_key),
+            node_secret: None,
+        })
+        .unwrap();
+    ep_b.assoc_mut()
+        .set_crypto_config(AssocCryptoConfig {
+            provider: CryptoProvider::rust_crypto(),
+            role: CryptoRole::Server,
+            local_public_key: None,
+            local_random: [0; 32],
+            send_api_key: None,
+            node_secret: Some(node_secret),
+        })
+        .unwrap();
+
+    // Transfer 64 KiB across MTU=244 (~330 encrypted packets, crossing pn=128 and pn=256 with 1B PN)
+    // and drop packets around pn=256..=260 once to also exercise PTO retransmit decrypt+re-seal.
+    let total = 64 * 1024;
+    let payload: Vec<u8> = (0..total).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+    let mut cb_a = TestSingleReceiver::new();
+    let mut cb_b = TestSingleReceiver::new();
+    let max_pay = ep_a.max_writable_payload_len();
+    let mut sent = 0usize;
+    let mut dropped_256 = false;
+    let mut max_pn_seen = 0u32;
+    let mut now_us = 1_000u64;
+
+    for _ in 0..4_000 {
+        while sent < total {
+            let n = (total - sent).min(max_pay);
+            let fin = sent + n == total;
+            match ep_a.write_stream(TxStreamData::Bytes(&payload[sent..sent + n]), fin, now_us) {
+                Ok(w) if w > 0 => sent += w,
+                _ => break,
+            }
+        }
+        let mut did = false;
+        ep_a.poll_timers(now_us);
+        while let Some(out) = ep_a.assoc_mut().pop_outbound_packet() {
+            did = true;
+            max_pn_seen = max_pn_seen.max(out.packet_number);
+            assert_eq!(out.packet.bytes()[0] & FLAG_PROTECTED, FLAG_PROTECTED);
+            ep_a.assoc_mut()
+                .on_driver_complete(out.link_id, out.packet_number, LinkTxOutcome::Sent, now_us);
+            if !dropped_256 && (256..=257).contains(&out.packet_number) {
+                if out.packet_number == 257 {
+                    dropped_256 = true;
+                }
+                continue;
+            }
+            let mut rx = ep_b.pool().alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+            rx.append(out.packet.bytes()).unwrap();
+            ep_b.receive_packet(out.link_id, rx, now_us, &mut cb_b).unwrap();
+        }
+        ep_b.poll_timers(now_us);
+        while let Some(out) = ep_b.assoc_mut().pop_outbound_packet() {
+            did = true;
+            assert_eq!(out.packet.bytes()[0] & FLAG_PROTECTED, FLAG_PROTECTED);
+            ep_b.assoc_mut()
+                .on_driver_complete(out.link_id, out.packet_number, LinkTxOutcome::Sent, now_us);
+            let mut rx = ep_a.pool().alloc_with_headroom(quic_base::DEFAULT_HEADROOM).unwrap();
+            rx.append(out.packet.bytes()).unwrap();
+            ep_a.receive_packet(out.link_id, rx, now_us, &mut cb_a).unwrap();
+        }
+        if cb_b.fin && cb_b.received.len() == total {
+            break;
+        }
+        if !did {
+            now_us += 30_000;
+            ep_a.poll_timers(now_us);
+            ep_b.poll_timers(now_us);
+        } else {
+            now_us += 1_000;
+        }
+    }
+
+    assert!(max_pn_seen >= 300, "expected >=300 packets, saw max pn {max_pn_seen}");
+    assert!(cb_b.fin);
+    assert_eq!(cb_b.received, payload);
+}
+
+#[test]
+fn flow_control_10mib_lossy_both_directions() {
+    use alloc::boxed::Box;
+    use crate::{
+        AssocConfig, CongestionMode, ConnectionId, LinkFraming, LinkId, LinkProfile,
+        LinkTxOutcome, QuicLinkAssoc,
+        link::OWNER_ASSOC,
+        pool::{StaticPacketLease, StaticPacketPool},
+    };
+    use quic_mux::{
+        AssociationBrokenReason, AssociationId, MuxCallbacks, MuxLimits, QuicMux, RxMeta,
+        RxOutcome, RxStreamChunk, StreamCloseReason, StreamError, StreamId, TxStreamData,
+    };
+
+    #[derive(Default)]
+    struct CountingRx {
+        received: usize,
+        fin: bool,
+    }
+    impl<'a> MuxCallbacks<StaticPacketLease<'a, 32, 2048>> for CountingRx {
+        fn on_stream_data(
+            &mut self,
+            _assoc: AssociationId,
+            _stream_id: StreamId,
+            _offset: u64,
+            data: RxStreamChunk<'_, StaticPacketLease<'a, 32, 2048>>,
+            fin: bool,
+        ) -> Result<RxOutcome<StaticPacketLease<'a, 32, 2048>>, StreamError> {
+            self.received += data.len();
+            if fin {
+                self.fin = true;
+            }
+            Ok(RxOutcome::Consumed(data.len()))
+        }
+        fn on_stream_writable(&mut self, _: AssociationId, _: StreamId, _: usize) {}
+        fn on_association_writable(&mut self, _: AssociationId, _: u64) {}
+        fn on_device_writable(&mut self) {}
+        fn on_stream_closed(&mut self, _: AssociationId, sid: StreamId, reason: StreamCloseReason) {
+            std::eprintln!("  [CountingRx] on_stream_closed sid={sid:?} reason={reason:?}");
+        }
+        fn on_association_broken(&mut self, _: AssociationId, reason: AssociationBrokenReason) {
+            std::eprintln!("  [CountingRx] on_association_broken reason={reason:?}");
+        }
+    }
+
+    let limits = MuxLimits {
+        initial_max_data: 64 * 1024,
+        initial_max_stream_data: 32 * 1024,
+        initial_max_streams_bidi: 8,
+        initial_max_streams_uni: 8,
+        max_concurrent_streams: 8,
+        max_queued_chunks_per_stream: 6,
+        max_association_rx_packets: 8,
+        max_device_rx_packets: 10,
+        gap_timeout_us: 3_000_000,
+    };
+    let mut cfg_a = AssocConfig::default();
+    cfg_a.max_retained_tx_packets = 6;
+    cfg_a.ack_eliciting_threshold = 2;
+    cfg_a.max_ack_delay_us = 20_000;
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.max_retained_tx_packets = 8;
+
+    let pool_a: &'static StaticPacketPool<32, 2048> =
+        Box::leak(Box::new(StaticPacketPool::<32, 2048>::new()));
+    let pool_b: &'static StaticPacketPool<32, 2048> =
+        Box::leak(Box::new(StaticPacketPool::<32, 2048>::new()));
+    let mut mux_a = QuicMux::new(pool_a, limits.clone());
+    let mut mux_b = QuicMux::new(pool_b, limits);
+    mux_a.add_association(OWNER_ASSOC, true).unwrap();
+    mux_b.add_association(OWNER_ASSOC, false).unwrap();
+    let mut assoc_a = QuicLinkAssoc::new(cfg_a);
+    let mut assoc_b = QuicLinkAssoc::new(cfg_b);
+
+    let profile = LinkProfile {
+        tier: 0,
+        mtu: 1472,
+        max_priority: StreamPriority::BULK,
+        congestion_mode: CongestionMode::FlowControlled {
+            max_inflight_packets: 4,
+            max_inflight_bytes: 6 * 1024,
+        },
+        framing: LinkFraming::Datagram {
+            peer_cid: ConnectionId::new(1).unwrap(),
+        },
+        initial_rtt_us: 20_000,
+        encrypt: false,
+    };
+    assoc_a.upsert_link(LinkId(1), profile.clone());
+    assoc_b.upsert_link(LinkId(1), profile);
+
+    let stream_id = mux_a.open_stream(OWNER_ASSOC, true).unwrap();
+    let total: usize = 10 * 1024 * 1024;
+    let chunk = [0x5au8; 1024];
+    let mut sent = 0usize;
+    let mut cb_a = CountingRx::default();
+    let mut cb_b = CountingRx::default();
+    let mut now_us = 1_000u64;
+    let mut rng = 0x1234_5678_9abc_def0u64;
+    let mut next_rand = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut idle_ticks = 0usize;
+
+    for _ in 0..200_000 {
+        while sent < total {
+            let cap = mux_a
+                .stream_send_capacity(OWNER_ASSOC, stream_id, &assoc_a)
+                .unwrap_or_else(|e| panic!("stream_send_capacity err={e:?} sent={sent}/{total} recv={}", cb_b.received));
+            if !cap.can_send_now || cap.max_chunk_bytes == 0 {
+                break;
+            }
+            let n = (total - sent).min(chunk.len()).min(cap.max_chunk_bytes);
+            let fin = sent + n == total;
+            match mux_a.write_stream(
+                OWNER_ASSOC,
+                stream_id,
+                TxStreamData::Bytes(&chunk[..n]),
+                fin,
+                &mut assoc_a,
+            ) {
+                Ok(w) if w > 0 => sent += w,
+                _ => break,
+            }
+        }
+        let _ = mux_a.flush_control(OWNER_ASSOC, &mut assoc_a);
+        let _ = mux_b.flush_control(OWNER_ASSOC, &mut assoc_b);
+
+        let mut did = false;
+        let mut pr_a = pool_a;
+        assoc_a.poll_timers(&mut pr_a, now_us);
+        while let Some(out) = assoc_a.pop_outbound_packet() {
+            did = true;
+            assoc_a.on_driver_complete(out.link_id, out.packet_number, LinkTxOutcome::Sent, now_us);
+            if next_rand() % 50 == 0 {
+                continue; // 2% drop A->B
+            }
+            let mut rx = pool_b
+                .alloc_with_headroom(quic_base::DEFAULT_HEADROOM)
+                .unwrap();
+            rx.append(out.packet.bytes()).unwrap();
+            if let Ok(demux) = assoc_b.receive_packet(out.link_id, rx, now_us) {
+                if let Some(mp) = demux.mux_packet {
+                    let _ = mux_b.receive_packet(
+                        RxMeta {
+                            association: OWNER_ASSOC,
+                            received_at_us: now_us,
+                        },
+                        mp,
+                        &mut assoc_b,
+                        &mut cb_b,
+                    );
+                }
+            }
+        }
+        let mut pr_b = pool_b;
+        assoc_b.poll_timers(&mut pr_b, now_us);
+        while let Some(out) = assoc_b.pop_outbound_packet() {
+            did = true;
+            assoc_b.on_driver_complete(out.link_id, out.packet_number, LinkTxOutcome::Sent, now_us);
+            if next_rand() % 50 == 0 {
+                continue; // 2% drop B->A (drops ACKs + MAX_DATA + MAX_STREAM_DATA!)
+            }
+            let mut rx = pool_a
+                .alloc_with_headroom(quic_base::DEFAULT_HEADROOM)
+                .unwrap();
+            rx.append(out.packet.bytes()).unwrap();
+            if let Ok(demux) = assoc_a.receive_packet(out.link_id, rx, now_us) {
+                if let Some(mp) = demux.mux_packet {
+                    let _ = mux_a.receive_packet(
+                        RxMeta {
+                            association: OWNER_ASSOC,
+                            received_at_us: now_us,
+                        },
+                        mp,
+                        &mut assoc_a,
+                        &mut cb_a,
+                    );
+                }
+            }
+        }
+
+        if cb_b.fin && cb_b.received == total {
+            break;
+        }
+        if !did {
+            idle_ticks += 1;
+            assert!(
+                idle_ticks < 200,
+                "stalled at sent={sent}/{total} recv={}/{total} fin={} a_retx={} b_retx={}",
+                cb_b.received,
+                cb_b.fin,
+                assoc_a.pending_retransmits_len(),
+                assoc_b.pending_retransmits_len()
+            );
+            now_us += 25_000;
+        } else {
+            idle_ticks = 0;
+            now_us += 1_000;
+        }
+    }
+
+    assert!(cb_b.fin, "expected FIN, recv={}/{total}", cb_b.received);
+    assert_eq!(cb_b.received, total);
 }

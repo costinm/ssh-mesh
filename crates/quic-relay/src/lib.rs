@@ -58,6 +58,69 @@ mod tests {
     const FLAG_FIXED_BIT: u8 = 0x40;
 
     #[test]
+    fn quic_base_initial_header_interoperates_with_relay_long_header() {
+        use quic_base::{
+            DMESH_QUIC_VERSION, InitialHeader, TransportParameters, encode_crypto_frame,
+        };
+
+        let mut tp_buf = [0u8; 64];
+        let tp = TransportParameters {
+            initial_scid: ConnectionId::new(11),
+            initial_max_data: Some(65_536),
+            public_key: Some([0x02; 33]),
+            ..Default::default()
+        };
+        let tp_len = tp.encode(&mut tp_buf).unwrap();
+        let mut payload = [0u8; 80];
+        let payload_len = encode_crypto_frame(0, &tp_buf[..tp_len], &mut payload).unwrap();
+
+        let hdr = InitialHeader {
+            version: DMESH_QUIC_VERSION,
+            dcid: None,
+            scid: ConnectionId::new(11),
+            packet_number: 1,
+            packet_number_len: 1,
+            payload_len,
+        };
+        let mut wire = [0u8; 128];
+        let h_len = hdr.encode(&mut wire).unwrap();
+        wire[h_len..h_len + payload_len].copy_from_slice(&payload[..payload_len]);
+        let pkt = &wire[..h_len + payload_len];
+
+        // Decode with `quic-relay::router::decode_long_packet`
+        let (long_hdr, relay_off, relay_len) = decode_long_packet(pkt).unwrap();
+        assert_eq!(long_hdr.packet_type, LONG_PACKET_INITIAL);
+        assert_eq!(long_hdr.version, DMESH_LONG_HEADER_VERSION);
+        assert_eq!(long_hdr.dcid, None);
+        assert_eq!(long_hdr.scid, ConnectionId::new(11));
+        assert_eq!(long_hdr.packet_number, 1);
+        assert_eq!(relay_off, h_len);
+        assert_eq!(relay_len, payload_len);
+
+        // And encode with `quic-relay::router::encode_long_packet` -> decode with `InitialHeader`
+        let mut relay_wire = [0u8; 128];
+        let total = encode_long_packet(
+            LONG_PACKET_INITIAL,
+            ConnectionId::new(11),
+            ConnectionId::new(22),
+            5,
+            2,
+            &payload[..payload_len],
+            &mut relay_wire,
+        )
+        .unwrap();
+        let (dec_init, dec_off) = InitialHeader::decode_with_expected(&relay_wire[..total], 1).unwrap();
+        assert_eq!(dec_init.dcid, ConnectionId::new(11));
+        assert_eq!(dec_init.scid, ConnectionId::new(22));
+        assert_eq!(dec_init.packet_number, 5);
+        assert_eq!(dec_init.payload_len, payload_len);
+        assert_eq!(
+            &relay_wire[dec_off..dec_off + dec_init.payload_len],
+            &payload[..payload_len]
+        );
+    }
+
+    #[test]
     fn create_endpoint_hints_round_trip_and_keep_legacy_payloads() {
         let return_hints = NearbyRelayHints::new(&[
             NearbyRelayHint {

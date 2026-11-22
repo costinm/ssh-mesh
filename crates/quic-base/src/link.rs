@@ -89,6 +89,11 @@ pub trait AssociationEgress<P: PoolPacket> {
     /// (e.g. due to RX/TX resource pressure or gap timeout) so any unACKed TX packets retained
     /// for that stream can be dropped immediately.
     fn on_stream_aborted(&mut self, _assoc: AssociationId, _stream_id: StreamId) {}
+
+    /// Undo ACK recording for the packet currently being delivered to `QuicMux` when an
+    /// out-of-order `STREAM` frame cannot be buffered (RFC 9000 §13.2.1), so the sender
+    /// retransmits it once the gap drains.
+    fn drop_current_rx_ack(&mut self, _assoc: AssociationId) {}
 }
 
 /// Default maximum packet length (`mtu / 3`) eligible for link-layer TX coalescing while a link

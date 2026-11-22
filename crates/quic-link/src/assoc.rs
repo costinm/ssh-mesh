@@ -7,20 +7,29 @@ use core::cmp::min;
 use core::ops::Range;
 
 use quic_base::flow::{RecvFlowControl, RxOutcome, SendFlowControl};
+use quic_base::initial::{
+    DMESH_QUIC_VERSION, FRAME_CRYPTO, InitialHeader, TransportParameters, decode_crypto_frame_body,
+    encode_crypto_frame, is_initial_packet,
+};
 use quic_base::link::{default_coalesce_threshold, try_coalesce_tx_packet};
 use quic_base::pool::{PacketPool, PoolError, PoolPacket};
 use quic_base::streams::{OrderedStream, QueuedPayload, RxStreamChunk, TxStreamData};
 use quic_base::wire::{
     Frame, StreamId, WireError, decode_frame, decode_varint, encode_control_frame,
-    encode_stream_header,
+    encode_stream_header, varint_len,
 };
 use quic_base::{
-    AssociationEgress, AssociationId, LinkSendError, OWNER_ASSOC, StreamPriority, TxPacketMeta,
+    AEAD_TAG_LEN, ASSOCIATION_RANDOM_LEN, AssociationEgress, AssociationId, CryptoError,
+    CryptoProvider, CryptoRole, EndpointKeys, FLAG_PROTECTED, LinkSendError, OWNER_ASSOC,
+    PUBLIC_KEY_COMPRESSED_LEN, StreamPriority, TxPacketMeta, compute_initial_verifier_with,
+    derive_peer_api_key_with, derive_static_traffic_keys_with, derive_traffic_keys_with,
+    open_short_packet_in_place, seal_short_packet_in_place_with_pn, verify_initial_verifier_with,
 };
 
 use crate::LinkMap;
 use crate::congestion::{LinkFraming, LinkId, LinkProfile, LinkState, LinkTxOutcome};
 use crate::datagram::{DatagramConfig, DatagramSendError, prepend_datagram_frame_in_place};
+use crate::reset::StatelessResetToken;
 use crate::sack::{AckProcessOutcome, LinkRetransmitCandidate, MultiLinkSackLedger};
 use crate::wire::{
     AckFrequencyFrame, AckRangeSet, ConnectionId, FRAME_ACK, FRAME_ACK_FREQUENCY, FRAME_DATAGRAM,
@@ -50,6 +59,40 @@ pub struct OutboundLinkPacket<P: PoolPacket> {
     pub packet: P,
 }
 
+/// Initial handshake operating mode for a [`QuicLinkAssoc`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HandshakeMode {
+    /// Legacy or pre-keyed direct `ShortHeader` mode (no RFC 9000 `Initial` exchange).
+    #[default]
+    None,
+    /// Client role: emits RFC 9000 `Initial` + `CRYPTO` (`TransportParameters`) packets until
+    /// receiving Server `Initial`, adopting the server's `scid` as peer DCID.
+    Client,
+    /// Server role: accepts Client `Initial`, adopts client `scid`, emits Server `Initial`, and
+    /// transitions to `ShortHeader` once confirmed.
+    Server,
+}
+
+/// Phase A per-association authentication and per-link `ShortHeader` encryption configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssocCryptoConfig {
+    /// Cryptographic backend provider (`CryptoProvider::rust_crypto()` on Linux/Android, or native
+    /// PSA Crypto via `xip_abi::CryptoClient` on ESP32 modules).
+    pub provider: CryptoProvider,
+    /// Endpoint role (`CryptoRole::Client` or `CryptoRole::Server`) for key directionality.
+    pub role: CryptoRole,
+    /// Local 33-byte compressed SEC1 P-256 public key advertised in `Initial` (`TP_DMESH_PUBLIC_KEY`).
+    pub local_public_key: Option<[u8; PUBLIC_KEY_COMPRESSED_LEN]>,
+    /// Local 32-byte per-association random nonce advertised in `Initial` (`TP_DMESH_RANDOM`).
+    pub local_random: [u8; ASSOCIATION_RANDOM_LEN],
+    /// Pre-shared / provisioned 32-byte per-peer `api_key` (required on `Client` and on pre-keyed
+    /// `HandshakeMode::None` associations; optional on `Server` when `node_secret` is configured).
+    pub send_api_key: Option<[u8; 32]>,
+    /// Node's single 32-byte secret used to derive per-caller `api_key`s from an incoming peer
+    /// `public_key` (`derive_peer_api_key_with(&provider, node_secret, caller_public_key)`).
+    pub node_secret: Option<[u8; 32]>,
+}
+
 /// Configuration for a [`QuicLinkAssoc`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssocConfig {
@@ -67,6 +110,13 @@ pub struct AssocConfig {
     pub max_ack_delay_us: u64,
     /// Unreliable `DATAGRAM` (`0x30` / `0x31`) configuration.
     pub datagram: DatagramConfig,
+    /// RFC 9000 `Initial` handshake role (`HandshakeMode::None` by default for backwards compatibility).
+    pub handshake_mode: HandshakeMode,
+    /// Transport parameters advertised inside outgoing `Initial` `CRYPTO` (`0x06`) frames.
+    pub local_params: TransportParameters,
+    /// Optional DCID placed in Client `Initial` Long Headers (`None` for 1-hop direct, or
+    /// `Some(relay_cid)` when routed through a relay hop).
+    pub initial_dcid: Option<ConnectionId>,
 }
 
 impl Default for AssocConfig {
@@ -79,6 +129,9 @@ impl Default for AssocConfig {
             ack_eliciting_threshold: 2,
             max_ack_delay_us: 25_000,
             datagram: DatagramConfig::default(),
+            handshake_mode: HandshakeMode::None,
+            local_params: TransportParameters::default(),
+            initial_dcid: None,
         }
     }
 }
@@ -90,6 +143,12 @@ pub struct DemuxOutcome<P: PoolPacket> {
     pub packet_number: u32,
     /// Link on which the packet arrived.
     pub link_id: LinkId,
+    /// Whether the received packet carried an RFC 9000 `Initial` Long Header.
+    pub is_initial: bool,
+    /// Source CID parsed from an incoming `Initial` Long Header, if present.
+    pub peer_scid: Option<ConnectionId>,
+    /// Peer transport parameters decoded from a `CRYPTO` (`0x06`) frame in this packet, if any.
+    pub peer_params: Option<TransportParameters>,
     /// Whether the packet contained any `ACK` frame.
     pub had_ack: bool,
     /// Number of newly acknowledged TX packets if an `ACK` frame was processed.
@@ -114,6 +173,8 @@ pub enum LinkRecvError {
     DuplicatePacket(u32),
     /// Incoming `DATAGRAM` exceeded `max_recv_datagram_size`.
     DatagramTooLarge(usize),
+    /// Handshake `Initial` verifier check or `ShortHeader` AEAD decryption/authentication failed.
+    Crypto(CryptoError),
 }
 
 /// Multi-link QUIC association manager sitting below `QuicMux` (via [`AssociationEgress`]) or
@@ -138,6 +199,7 @@ pub struct QuicLinkAssoc<P: PoolPacket> {
     stream_affinity: LinkMap<StreamId, LinkId>,
     sack_ledger: MultiLinkSackLedger<P>,
     rx_ack_ranges: AckRangeSet,
+    last_rx_pkt_num: Option<u32>,
     rx_ack_eliciting_since_last_ack: u32,
     rx_immediate_ack_pending: bool,
     rx_ack_deadline_us: Option<u64>,
@@ -148,14 +210,29 @@ pub struct QuicLinkAssoc<P: PoolPacket> {
     outbound_queue: VecDeque<OutboundLinkPacket<P>>,
     evicted_streams: Vec<(AssociationId, StreamId)>,
     advisory_available_conn_window: u64,
+    handshake_complete: bool,
+    server_initial_needed: bool,
+    server_initial_sent: bool,
+    peer_scid: Option<ConnectionId>,
+    peer_params: Option<TransportParameters>,
+    crypto_config: Option<AssocCryptoConfig>,
+    endpoint_keys: Option<EndpointKeys>,
+    local_endpoint_dcid: ConnectionId,
+    peer_endpoint_dcid: ConnectionId,
 }
 
 impl<P: PoolPacket> QuicLinkAssoc<P> {
     /// Worst-case outer `ShortHeader` byte overhead reserved on every packet (`1` flag + `8` CID + `4` PN = `13` bytes).
     pub const MAX_OUTER_HEADER_OVERHEAD: usize = ShortHeader::MAX_LEN;
+    /// Outer overhead budget reserved when emitting RFC 9000 `InitialHeader + CRYPTO(TransportParameters)`
+    /// packets (right-shifted into slot tailroom automatically when exceeding `DEFAULT_HEADROOM`).
+    pub const MAX_INITIAL_OUTER_OVERHEAD: usize = 208;
 
     /// Create a new `QuicLinkAssoc` with `config`.
     pub fn new(config: AssocConfig) -> Self {
+        let handshake_complete = matches!(config.handshake_mode, HandshakeMode::None);
+        let local_endpoint_dcid = config.local_cid.unwrap_or_else(|| ConnectionId::new(1).unwrap());
+        let peer_endpoint_dcid = config.default_peer_cid;
         Self {
             sack_ledger: MultiLinkSackLedger::new(config.max_retained_tx_packets),
             config,
@@ -165,6 +242,7 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
             links: LinkMap::new(),
             stream_affinity: LinkMap::new(),
             rx_ack_ranges: AckRangeSet::new(),
+            last_rx_pkt_num: None,
             rx_ack_eliciting_since_last_ack: 0,
             rx_immediate_ack_pending: false,
             rx_ack_deadline_us: None,
@@ -175,7 +253,195 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
             outbound_queue: VecDeque::new(),
             evicted_streams: Vec::new(),
             advisory_available_conn_window: u64::MAX,
+            handshake_complete,
+            server_initial_needed: false,
+            server_initial_sent: false,
+            peer_scid: None,
+            peer_params: None,
+            crypto_config: None,
+            endpoint_keys: None,
+            local_endpoint_dcid,
+            peer_endpoint_dcid,
         }
+    }
+
+    /// Whether the RFC 9000 `Initial` handshake has completed (always `true` for `HandshakeMode::None`).
+    #[inline]
+    pub const fn is_handshake_complete(&self) -> bool {
+        self.handshake_complete
+    }
+
+    /// Peer source CID learned from an incoming `Initial` Long Header, if any.
+    #[inline]
+    pub const fn peer_scid(&self) -> Option<ConnectionId> {
+        self.peer_scid
+    }
+
+    /// Peer `TransportParameters` received in an `Initial` `CRYPTO` (`0x06`) frame, if any.
+    #[inline]
+    pub const fn peer_params(&self) -> Option<&TransportParameters> {
+        self.peer_params.as_ref()
+    }
+
+    /// Peer 16-byte ULA `vip6` derived directly from [`TransportParameters::public_key`] (`SHA-256`)
+    /// using `provider`.
+    #[inline]
+    pub fn peer_vip6_with(&self, provider: &CryptoProvider) -> Option<[u8; 16]> {
+        self.peer_params
+            .and_then(|p| p.peer_vip6_with(provider))
+    }
+
+    /// Peer 16-byte ULA `vip6` derived directly from [`TransportParameters::public_key`] (`SHA-256`)
+    /// using the configured `AssocCryptoConfig` / `EndpointKeys` provider (or `CryptoProvider::rust_crypto()`
+    /// on hosts when `feature = "rust-crypto"` is enabled).
+    #[inline]
+    pub fn peer_vip6(&self) -> Option<[u8; 16]> {
+        if let Some(ref cfg) = self.crypto_config {
+            return self.peer_vip6_with(&cfg.provider);
+        }
+        if let Some(ref keys) = self.endpoint_keys {
+            return self.peer_vip6_with(keys.send.provider());
+        }
+        #[cfg(feature = "rust-crypto")]
+        {
+            return self.peer_vip6_with(&CryptoProvider::rust_crypto());
+        }
+        #[cfg(not(feature = "rust-crypto"))]
+        None
+    }
+
+    /// Whether `ShortHeader` AEAD encryption/authentication keys are currently installed.
+    #[inline]
+    pub const fn has_packet_crypto(&self) -> bool {
+        self.endpoint_keys.is_some()
+    }
+
+    /// Directly install pre-derived directional `ShortHeader` [`EndpointKeys`] and canonical AAD CIDs.
+    pub fn set_endpoint_keys(
+        &mut self,
+        keys: EndpointKeys,
+        local_endpoint_dcid: ConnectionId,
+        peer_endpoint_dcid: ConnectionId,
+    ) {
+        self.endpoint_keys = Some(keys);
+        self.local_endpoint_dcid = local_endpoint_dcid;
+        self.peer_endpoint_dcid = peer_endpoint_dcid;
+    }
+
+    /// Clear installed association crypto configuration and derived directional keys (returning to
+    /// cleartext operation across all links).
+    pub fn clear_crypto(&mut self) {
+        self.crypto_config = None;
+        self.endpoint_keys = None;
+        self.config.local_params.verifier = None;
+    }
+
+    /// Configure Phase A `api_key` / `node_secret` authentication and per-link `ShortHeader` AEAD.
+    ///
+    /// Links whose [`LinkProfile::encrypt`] is `false` (such as PPP/UART/TCP or test-configured
+    /// Wi-Fi/NOW links) remain unencrypted even when keys are installed.
+    pub fn set_crypto_config(&mut self, cfg: AssocCryptoConfig) -> Result<(), CryptoError> {
+        let local_dcid = self
+            .config
+            .local_cid
+            .unwrap_or_else(|| ConnectionId::new(1).unwrap());
+        let peer_dcid = self.peer_scid.unwrap_or(self.config.default_peer_cid);
+        self.local_endpoint_dcid = local_dcid;
+        self.peer_endpoint_dcid = peer_dcid;
+        self.crypto_config = Some(cfg);
+        self.config.local_params.public_key = cfg.local_public_key;
+        self.config.local_params.random = Some(cfg.local_random);
+        if self.config.local_params.initial_scid.is_none() {
+            self.config.local_params.initial_scid = self.config.local_cid;
+        }
+        match self.config.handshake_mode {
+            HandshakeMode::Client => {
+                if self.config.initial_dcid.is_none() {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&cfg.local_random[..8]);
+                    let raw = (u64::from_be_bytes(bytes) & ConnectionId::MAX_VALUE) | 0x2000_0000;
+                    self.config.initial_dcid = ConnectionId::new(raw);
+                }
+                if let (Some(api_key), Some(pub_key)) = (cfg.send_api_key, cfg.local_public_key) {
+                    self.config.local_params.verifier = Some(compute_initial_verifier_with(
+                        &cfg.provider,
+                        &api_key,
+                        CryptoRole::Client,
+                        self.config.local_cid.or(self.config.local_params.initial_scid),
+                        self.config.initial_dcid,
+                        &pub_key,
+                        &cfg.local_random,
+                    )?);
+                }
+            }
+            HandshakeMode::Server => {}
+            HandshakeMode::None => {
+                let api_key = match (cfg.send_api_key, cfg.node_secret) {
+                    (Some(k), _) => k,
+                    (None, Some(secret)) => derive_peer_api_key_with(&cfg.provider, &secret, &[])?,
+                    (None, None) => return Err(CryptoError::Invalid),
+                };
+                let (client_cid, server_cid) = match cfg.role {
+                    CryptoRole::Client => (local_dcid, peer_dcid),
+                    CryptoRole::Server => (peer_dcid, local_dcid),
+                };
+                let keys = derive_static_traffic_keys_with(
+                    &cfg.provider,
+                    &api_key,
+                    client_cid,
+                    server_cid,
+                )?
+                .for_role(cfg.role);
+                self.endpoint_keys = Some(keys);
+            }
+        }
+        Ok(())
+    }
+
+    /// Peer 16-byte stateless reset token advertised inside [`TransportParameters::stateless_reset_token`].
+    #[inline]
+    pub fn peer_stateless_reset_token(&self) -> Option<StatelessResetToken> {
+        self.peer_params
+            .and_then(|p| p.stateless_reset_token)
+            .map(StatelessResetToken::new)
+    }
+
+    /// Configured local connection identifier expected on incoming packets, if any.
+    #[inline]
+    pub const fn local_cid(&self) -> Option<ConnectionId> {
+        self.config.local_cid
+    }
+
+    /// Update `default_peer_cid` and every attached link's destination `peer_cid` uniformly.
+    pub fn set_peer_cid_all_links(&mut self, cid: ConnectionId) {
+        self.config.default_peer_cid = cid;
+        for (_, link) in &mut self.links {
+            match &mut link.profile.framing {
+                LinkFraming::Datagram { peer_cid }
+                | LinkFraming::SelfDelimitingStream { peer_cid }
+                | LinkFraming::TlsRecord { peer_cid } => {
+                    *peer_cid = cid;
+                }
+            }
+        }
+    }
+
+    /// Enqueue a standalone retransmittable `Initial + CRYPTO + PING` packet when a client wants to
+    /// drive the handshake explicitly before opening a `STREAM`.
+    pub fn enqueue_initial<Pool: PacketPool<Packet = P>>(
+        &mut self,
+        pool: &mut Pool,
+    ) -> Result<(), PoolError> {
+        let mut pkt = pool.alloc()?;
+        pkt.append(&[FRAME_PING as u8])?;
+        let meta = TxPacketMeta {
+            association: self.config.assoc_id,
+            stream_id: None,
+            priority: StreamPriority::CRITICAL,
+            retransmittable: true,
+        };
+        let _ = self.send_packet(meta, pkt);
+        Ok(())
     }
 
     /// Current monotonic clock timestamp in microseconds.
@@ -353,19 +619,38 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         self.sack_ledger.can_admit(priority)
     }
 
+    #[inline]
+    fn link_crypto_overhead(&self, link_id: LinkId) -> usize {
+        if self.endpoint_keys.is_some() && self.links.get(&link_id).is_some_and(|l| l.profile.encrypt)
+        {
+            AEAD_TAG_LEN
+        } else {
+            0
+        }
+    }
+
     /// Maximum writable inner frame length (`quic-mux` frame or `DATAGRAM` frame) for a packet of
     /// `priority` at `self.now_us`.
     pub fn max_writable_len_for_priority(&self, priority: StreamPriority) -> usize {
+        let emit_initial = self.should_emit_initial(false);
+        let has_keys = self.endpoint_keys.is_some();
         let mut best_mtu = 0usize;
         for link in self.links.values() {
             if !link.enabled || !link.driver_ready || priority.is_lower_than(link.profile.max_priority)
             {
                 continue;
             }
-            let usable = link
-                .profile
-                .mtu
-                .saturating_sub(Self::MAX_OUTER_HEADER_OVERHEAD);
+            let overhead = if emit_initial {
+                Self::MAX_INITIAL_OUTER_OVERHEAD
+            } else {
+                Self::MAX_OUTER_HEADER_OVERHEAD
+                    + if has_keys && link.profile.encrypt {
+                        AEAD_TAG_LEN
+                    } else {
+                        0
+                    }
+            };
+            let usable = link.profile.mtu.saturating_sub(overhead);
             if usable > best_mtu {
                 best_mtu = usable;
             }
@@ -378,7 +663,7 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
     ///
     /// Selection policy:
     /// 1. **Priority filter:** Only considers links with `priority <= link.profile.max_priority`
-    ///    that can admit `frame_bytes + ShortHeader` at `self.now_us`.
+    ///    that can admit `frame_bytes + ShortHeader` (or `InitialHeader + CRYPTO`) at `self.now_us`.
     /// 2. **Stream affinity:** If `stream_id` is already pinned to an affinity link that can admit
     ///    the packet, keeps the stream on that link unless a strictly lower-tier link has `< 1/2`
     ///    the estimated arrival delay (preventing out-of-order HoL blocking across asymmetric links).
@@ -394,12 +679,42 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         is_pto_probe: bool,
     ) -> Option<LinkId> {
         let now_us = self.now_us;
+        let emit_initial = self.should_emit_initial(is_pto_probe);
+        let extra_initial_crypto = if emit_initial {
+            self.initial_crypto_frame_len().unwrap_or(0)
+        } else {
+            0
+        };
+        let has_keys = self.endpoint_keys.is_some();
+        let handshake_mode = self.config.handshake_mode;
+        let initial_dcid = self.config.initial_dcid;
+        let local_cid = self.config.local_cid;
+        let peer_scid = self.peer_scid;
 
         // Collect all eligible links and their `(tier, arrival_delay_us)`.
         let mut candidates: Vec<(LinkId, u8, u64)> = Vec::new();
         for (&id, link) in &mut self.links {
-            let hdr_len = Self::header_len_for_link(link, self.next_pkt_num);
-            let total_bytes = frame_bytes.saturating_add(hdr_len);
+            let hdr_len = if emit_initial {
+                Self::initial_header_len_for_link(
+                    handshake_mode,
+                    initial_dcid,
+                    local_cid,
+                    peer_scid,
+                    link,
+                    self.next_pkt_num,
+                    extra_initial_crypto.saturating_add(frame_bytes),
+                )
+            } else {
+                Self::header_len_for_link(link, self.next_pkt_num)
+            };
+            let extra_crypto = if emit_initial {
+                extra_initial_crypto
+            } else if has_keys && link.profile.encrypt {
+                AEAD_TAG_LEN
+            } else {
+                0
+            };
+            let total_bytes = frame_bytes.saturating_add(extra_crypto).saturating_add(hdr_len);
             if link.can_admit(total_bytes, priority, now_us, is_pto_probe) {
                 let delay = link.estimated_arrival_delay_us(now_us);
                 candidates.push((id, link.profile.tier, delay));
@@ -417,8 +732,10 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         }
 
         // Find the candidate with the best `(tier, delay)` overall, and also the minimum delay across all candidates.
-        candidates.sort_by_key(|&(_, tier, delay)| (tier, delay));
-        let (best_tier_id, best_tier, best_tier_delay) = candidates[0];
+        let (best_tier_id, best_tier, best_tier_delay) = *candidates
+            .iter()
+            .min_by_key(|&&(_, tier, delay)| (tier, delay))
+            .unwrap();
 
         // Check if a higher-tier link actually has a significantly smaller arrival delay than `best_tier_id`
         // (e.g. primary link has heavy queue delay).
@@ -537,24 +854,119 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
     ) -> Result<DemuxOutcome<P>, LinkRecvError> {
         self.now_us = self.now_us.max(now_us);
         let wire_slice = packet.bytes();
-        let (header, hdr_len) =
-            ShortHeader::decode_with_expected(wire_slice, self.expected_rx_pkt_num)
-                .map_err(LinkRecvError::Wire)?;
+        let incoming_is_initial = is_initial_packet(wire_slice);
 
-        if let Some(expected_cid) = self.config.local_cid {
-            if header.dcid != expected_cid {
-                return Err(LinkRecvError::UnknownConnectionId(header.dcid));
-            }
-        }
+        let (pn, hdr_len, mut total_len, incoming_scid, incoming_initial_dcid, short_flags, short_pn_len) =
+            if incoming_is_initial {
+                let (header, hdr_len) =
+                    InitialHeader::decode_with_expected(wire_slice, self.expected_rx_pkt_num)
+                        .map_err(LinkRecvError::Wire)?;
+                match self.config.handshake_mode {
+                    HandshakeMode::Server => {
+                        if let Some(bound) = self.peer_scid {
+                            if header.scid != Some(bound) {
+                                return Err(LinkRecvError::UnknownConnectionId(
+                                    header.scid.unwrap_or(ConnectionId::new(0).unwrap()),
+                                ));
+                            }
+                        } else if self.server_initial_sent {
+                            if let Some(expected_cid) = self.config.local_cid {
+                                if header.dcid != Some(expected_cid) {
+                                    return Err(LinkRecvError::UnknownConnectionId(
+                                        header.dcid.unwrap_or(ConnectionId::new(0).unwrap()),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    HandshakeMode::Client | HandshakeMode::None => {
+                        if let Some(expected_cid) = self.config.local_cid {
+                            if header.dcid != Some(expected_cid) {
+                                return Err(LinkRecvError::UnknownConnectionId(
+                                    header.dcid.unwrap_or(ConnectionId::new(0).unwrap()),
+                                ));
+                            }
+                        }
+                        if let Some(bound) = self.peer_scid {
+                            if header.scid != Some(bound) {
+                                return Err(LinkRecvError::UnknownConnectionId(
+                                    header.scid.unwrap_or(ConnectionId::new(0).unwrap()),
+                                ));
+                            }
+                        }
+                    }
+                }
+                (
+                    header.packet_number,
+                    hdr_len,
+                    hdr_len + header.payload_len,
+                    header.scid,
+                    header.dcid,
+                    0u8,
+                    header.packet_number_len,
+                )
+            } else {
+                let (header, hdr_len) =
+                    ShortHeader::decode_with_expected(wire_slice, self.expected_rx_pkt_num)
+                        .map_err(LinkRecvError::Wire)?;
+                if let Some(expected_cid) = self.config.local_cid {
+                    if header.dcid != expected_cid {
+                        return Err(LinkRecvError::UnknownConnectionId(header.dcid));
+                    }
+                }
+                (
+                    header.packet_number,
+                    hdr_len,
+                    wire_slice.len(),
+                    None,
+                    None,
+                    header.flags,
+                    header.packet_number_len,
+                )
+            };
 
-        let pn = header.packet_number;
         if self.rx_ack_ranges.contains(pn) {
             return Err(LinkRecvError::DuplicatePacket(pn));
         }
 
+        // Authenticate and/or decrypt BEFORE mutating any association state.
+        let link_requires_encrypt = self
+            .links
+            .get(&link_id)
+            .is_some_and(|l| l.profile.encrypt);
+        let verified_initial = if incoming_is_initial {
+            self.verify_initial_crypto(
+                link_requires_encrypt,
+                &packet.bytes()[hdr_len..total_len],
+                incoming_scid,
+                incoming_initial_dcid,
+            )?
+        } else {
+            if (short_flags & FLAG_PROTECTED) != 0 {
+                let Some(ref keys) = self.endpoint_keys else {
+                    return Err(LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+                };
+                open_short_packet_in_place(
+                    &mut packet,
+                    &keys.receive,
+                    short_flags,
+                    hdr_len,
+                    pn,
+                    short_pn_len,
+                    self.local_endpoint_dcid,
+                )
+                .map_err(LinkRecvError::Crypto)?;
+                total_len = packet.bytes().len();
+            } else if link_requires_encrypt
+                && (self.endpoint_keys.is_some() || self.crypto_config.is_some())
+            {
+                return Err(LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+            }
+            None
+        };
+
         let base_range = packet.range();
         let mut cursor = hdr_len;
-        let total_len = wire_slice.len();
 
         let mut had_ack = false;
         let mut newly_acked_packets = 0usize;
@@ -564,11 +976,12 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         let mut saw_fin = false;
         let mut first_mux_offset: Option<usize> = None;
         let mut last_mux_end: usize = total_len;
+        let mut parsed_peer_params: Option<TransportParameters> = None;
 
-        // Parse leading link-layer frames (`PADDING`, `PING`, `ACK`, `ACK_FREQUENCY`, `DATAGRAM`).
+        // Parse leading link-layer frames (`PADDING`, `PING`, `ACK`, `CRYPTO`, `ACK_FREQUENCY`, `DATAGRAM`).
         while cursor < total_len {
-            let (ty, n_ty) =
-                decode_varint(&packet.bytes()[cursor..]).map_err(LinkRecvError::Wire)?;
+            let (ty, n_ty) = decode_varint(&packet.bytes()[cursor..total_len])
+                .map_err(LinkRecvError::Wire)?;
             match ty {
                 FRAME_PADDING => {
                     cursor += n_ty;
@@ -576,6 +989,18 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
                 FRAME_PING => {
                     ack_eliciting = true;
                     cursor += n_ty;
+                }
+                FRAME_CRYPTO => {
+                    let (offset, data_range, next_at) =
+                        decode_crypto_frame_body(&packet.bytes()[..total_len], cursor + n_ty)
+                            .map_err(LinkRecvError::Wire)?;
+                    ack_eliciting = true;
+                    if offset == 0 {
+                        let params = TransportParameters::decode(&packet.bytes()[data_range])
+                            .map_err(LinkRecvError::Wire)?;
+                        parsed_peer_params = Some(params);
+                    }
+                    cursor = next_at;
                 }
                 FRAME_ACK => {
                     let (_largest, delay_us, ack_ranges, next_at) =
@@ -656,7 +1081,7 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
                     if first_mux_offset.is_none() {
                         first_mux_offset = Some(cursor);
                     }
-                    let slice = &packet.bytes()[cursor..];
+                    let slice = &packet.bytes()[cursor..total_len];
                     let (mux_frame, rel_next) =
                         decode_frame(slice, 0).map_err(LinkRecvError::Wire)?;
                     if let Frame::Stream(ref sf) = mux_frame {
@@ -673,11 +1098,62 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         // Packet validated: record in `rx_ack_ranges` and update `expected_rx_pkt_num`.
         let prev_largest = self.rx_ack_ranges.largest();
         self.rx_ack_ranges.insert(pn);
+        self.last_rx_pkt_num = Some(pn);
         if pn >= self.expected_rx_pkt_num {
             self.expected_rx_pkt_num = pn.saturating_add(1);
         }
         if prev_largest.is_none_or(|prev| pn > prev) {
             self.rx_largest_received_at_us = Some(self.now_us);
+        }
+
+        if let Some(params) = parsed_peer_params {
+            self.peer_params = Some(params);
+        }
+        if let Some(vi) = verified_initial {
+            self.endpoint_keys = Some(vi.keys);
+            self.local_endpoint_dcid = vi.local_dcid;
+            self.peer_endpoint_dcid = vi.peer_dcid;
+            if let Some((original_dcid, verifier)) = vi.server_response {
+                self.config.local_params.original_dcid = original_dcid;
+                self.config.local_params.verifier = verifier;
+            }
+        }
+        let learned_scid = incoming_scid.or_else(|| parsed_peer_params.and_then(|p| p.initial_scid));
+        match self.config.handshake_mode {
+            HandshakeMode::Server => {
+                if incoming_is_initial {
+                    if let Some(scid) = learned_scid {
+                        self.peer_scid = Some(scid);
+                        self.set_peer_cid_all_links(scid);
+                    }
+                    if !self.handshake_complete
+                        && (!self.server_initial_sent || self.outbound_queue.is_empty())
+                    {
+                        self.server_initial_needed = true;
+                        self.rx_immediate_ack_pending = true;
+                        self.rx_ack_deadline_us = Some(self.now_us);
+                    }
+                } else {
+                    self.handshake_complete = true;
+                    self.server_initial_needed = false;
+                }
+                if newly_acked_packets > 0 && self.peer_scid.is_some() {
+                    self.handshake_complete = true;
+                    self.server_initial_needed = false;
+                }
+            }
+            HandshakeMode::Client => {
+                if incoming_is_initial {
+                    if let Some(scid) = learned_scid {
+                        self.peer_scid = Some(scid);
+                        self.set_peer_cid_all_links(scid);
+                    }
+                    self.handshake_complete = true;
+                    self.rx_immediate_ack_pending = true;
+                    self.rx_ack_deadline_us = Some(self.now_us);
+                }
+            }
+            HandshakeMode::None => {}
         }
 
         if ack_eliciting {
@@ -722,6 +1198,9 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         Ok(DemuxOutcome {
             packet_number: pn,
             link_id,
+            is_initial: incoming_is_initial,
+            peer_scid: learned_scid,
+            peer_params: parsed_peer_params,
             had_ack,
             newly_acked_packets,
             retransmits_queued,
@@ -763,9 +1242,17 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         // 2. Flush any pending retransmits onto ready links.
         emitted += self.flush_pending_retransmits();
 
-        // 3. If an immediate or delayed ACK is due and wasn't already piggybacked onto an outbound
-        //    packet, emit a standalone ACK packet.
-        if self.should_send_standalone_ack(self.now_us) {
+        // 3. Emit Server `Initial` (`CRYPTO` + piggybacked `ACK`) before standalone ShortHeader ACKs
+        //    if a Server association has accepted Client `Initial` without yet sending its reply.
+        if self.config.handshake_mode == HandshakeMode::Server && self.server_initial_needed {
+            if self.enqueue_initial(pool).is_ok() {
+                emitted += 1;
+            }
+        }
+
+        // 4. If an immediate or delayed ACK is due and wasn't already piggybacked onto an outbound
+        //    packet, emit a standalone ACK packet once Initial exchange is not pending.
+        if !self.should_emit_initial(false) && self.should_send_standalone_ack(self.now_us) {
             if self.emit_standalone_ack(pool).is_ok() {
                 emitted += 1;
             }
@@ -779,9 +1266,48 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         let mut sent = 0usize;
         let count = self.pending_retransmits.len();
         for _ in 0..count {
-            let Some(cand) = self.pending_retransmits.pop_front() else {
+            let Some(mut cand) = self.pending_retransmits.pop_front() else {
                 break;
             };
+            if cand.is_sealed {
+                let Some(ref keys) = self.endpoint_keys else {
+                    continue;
+                };
+                if !cand.packet.is_unique() {
+                    self.pending_retransmits.push_back(cand);
+                    continue;
+                }
+                let Ok((sh, hdr_len)) =
+                    ShortHeader::decode_with_expected(cand.packet.bytes(), cand.original_pkt_num)
+                else {
+                    continue;
+                };
+                let pre_open_start = cand.packet.range().start;
+                if let Err(err) = open_short_packet_in_place(
+                    &mut cand.packet,
+                    &keys.send,
+                    sh.flags,
+                    hdr_len,
+                    cand.original_pkt_num,
+                    sh.packet_number_len,
+                    self.peer_endpoint_dcid,
+                ) {
+                    if matches!(
+                        err,
+                        CryptoError::BufferTooSmall | CryptoError::SharedPacket
+                    ) {
+                        self.pending_retransmits.push_back(cand);
+                    }
+                    continue;
+                }
+                let delta = cand.packet.range().start as isize - pre_open_start as isize;
+                cand.mux_range = ((cand.mux_range.start as isize + delta) as usize)
+                    ..((cand.mux_range.end as isize + delta) as usize);
+                cand.is_sealed = false;
+            }
+            if cand.packet.set_range(cand.mux_range.clone()).is_err() {
+                continue;
+            }
             let frame_len = cand.packet.bytes().len();
             let Some(link_id) = self.select_link(
                 frame_len,
@@ -805,6 +1331,8 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
                         original_pkt_num: cand.original_pkt_num,
                         original_link_id: cand.original_link_id,
                         meta: cand.meta,
+                        mux_range: cand.mux_range,
+                        is_sealed: false,
                         packet: pkt,
                     });
                 }
@@ -825,7 +1353,7 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         let delay_us = self
             .rx_largest_received_at_us
             .map_or(0, |t| self.now_us.saturating_sub(t));
-        let mut ack_buf = [0u8; 96];
+        let mut ack_buf = [0u8; 256];
         let Ok(ack_len) = encode_ack_frame(&self.rx_ack_ranges, delay_us, &mut ack_buf) else {
             return Ok(LinkId(0));
         };
@@ -841,8 +1369,9 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
             priority: StreamPriority::CRITICAL,
             retransmittable: false,
         };
-        let _ = self.emit_ack_only_on_link(link_id, meta, pkt);
-        self.clear_pending_ack_state();
+        if self.emit_ack_only_on_link(link_id, meta, pkt).is_ok() {
+            self.clear_pending_ack_state();
+        }
         Ok(link_id)
     }
 
@@ -901,17 +1430,83 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         self.rx_ack_deadline_us = None;
     }
 
+    fn should_emit_initial(&self, is_pto_probe: bool) -> bool {
+        match self.config.handshake_mode {
+            HandshakeMode::None => false,
+            HandshakeMode::Client => !self.handshake_complete,
+            HandshakeMode::Server => {
+                self.server_initial_needed
+                    || (is_pto_probe && !self.handshake_complete && self.peer_scid.is_some())
+            }
+        }
+    }
+
+    fn resolved_local_params(&self) -> TransportParameters {
+        let mut params = self.config.local_params;
+        if params.initial_scid.is_none() {
+            params.initial_scid = self.config.local_cid;
+        }
+        params
+    }
+
+    fn initial_crypto_frame_len(&self) -> Result<usize, WireError> {
+        let tp_len = self.resolved_local_params().encoded_len()?;
+        Ok(1 + 1 + varint_len(tp_len as u64)? + tp_len)
+    }
+
+    fn build_crypto_frame(&self, out: &mut [u8]) -> Result<usize, WireError> {
+        let mut tp_buf = [0u8; 192];
+        let tp_len = self.resolved_local_params().encode(&mut tp_buf)?;
+        encode_crypto_frame(0, &tp_buf[..tp_len], out)
+    }
+
+    fn initial_dcid_for_link(&self, link: &LinkState) -> Option<ConnectionId> {
+        match self.config.handshake_mode {
+            HandshakeMode::Client => self.config.initial_dcid,
+            HandshakeMode::Server => self.peer_scid.or_else(|| Some(self.peer_cid_for_link(link))),
+            HandshakeMode::None => None,
+        }
+    }
+
+    fn initial_header_len_for_link(
+        handshake_mode: HandshakeMode,
+        initial_dcid: Option<ConnectionId>,
+        local_cid: Option<ConnectionId>,
+        peer_scid: Option<ConnectionId>,
+        link: &LinkState,
+        pkt_num: u32,
+        payload_len: usize,
+    ) -> usize {
+        let resolved_dcid = match handshake_mode {
+            HandshakeMode::Client => initial_dcid,
+            HandshakeMode::Server => peer_scid.or(match link.profile.framing {
+                LinkFraming::Datagram { peer_cid }
+                | LinkFraming::SelfDelimitingStream { peer_cid }
+                | LinkFraming::TlsRecord { peer_cid } => Some(peer_cid),
+            }),
+            HandshakeMode::None => None,
+        };
+        let dcid_len = resolved_dcid.map_or(0, ConnectionId::encoded_len);
+        let scid_len = local_cid.map_or(0, ConnectionId::encoded_len);
+        let pn_len = packet_number_len(pkt_num, link.largest_acked_packet) as usize;
+        let body_len = (pn_len + payload_len.max(1)) as u64;
+        let len_bytes = varint_len(body_len).unwrap_or(2);
+        1 + 4 + 1 + dcid_len + 1 + scid_len + 1 + len_bytes + pn_len
+    }
+
     fn peer_cid_for_link(&self, link: &LinkState) -> ConnectionId {
         match link.profile.framing {
             LinkFraming::Datagram { peer_cid }
-            | LinkFraming::SelfDelimitingStream { peer_cid } => peer_cid,
+            | LinkFraming::SelfDelimitingStream { peer_cid }
+            | LinkFraming::TlsRecord { peer_cid } => peer_cid,
         }
     }
 
     fn header_len_for_link(link: &LinkState, pkt_num: u32) -> usize {
         let cid_len = match link.profile.framing {
             LinkFraming::Datagram { peer_cid }
-            | LinkFraming::SelfDelimitingStream { peer_cid } => peer_cid.encoded_len(),
+            | LinkFraming::SelfDelimitingStream { peer_cid }
+            | LinkFraming::TlsRecord { peer_cid } => peer_cid.encoded_len(),
         };
         let pn_len = packet_number_len(pkt_num, link.largest_acked_packet) as usize;
         1 + cid_len + pn_len
@@ -923,6 +1518,9 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         incoming_meta: TxPacketMeta,
         incoming: P,
     ) -> Result<(), P> {
+        if self.should_emit_initial(false) || self.link_crypto_overhead(link_id) > 0 {
+            return Err(incoming);
+        }
         let Some(link) = self.links.get(&link_id) else {
             return Err(incoming);
         };
@@ -943,7 +1541,7 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
             .outbound_queue
             .iter_mut()
             .rev()
-            .find(|p| p.link_id == link_id && p.packet.is_unique())
+            .find(|p| p.link_id == link_id && p.packet.is_unique() && !is_initial_packet(p.packet.bytes()))
         else {
             return Err(incoming);
         };
@@ -956,6 +1554,170 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
             mtu,
             coalesce_thresh,
         )
+    }
+
+    fn seal_short_header_packet(
+        &self,
+        link_id: LinkId,
+        pkt_num: u32,
+        packet: &mut P,
+    ) -> Result<bool, ()> {
+        if !self.links.get(&link_id).is_some_and(|l| l.profile.encrypt) {
+            return Ok(false);
+        }
+        if let Some(ref keys) = self.endpoint_keys {
+            return seal_short_packet_in_place_with_pn(
+                packet,
+                &keys.send,
+                pkt_num,
+                self.peer_endpoint_dcid,
+            )
+            .map(|()| true)
+            .map_err(|_| ());
+        }
+        if self.crypto_config.is_some() {
+            return Err(());
+        }
+        Ok(false)
+    }
+
+    fn verify_initial_crypto(
+        &self,
+        link_requires_encrypt: bool,
+        wire: &[u8],
+        incoming_scid: Option<ConnectionId>,
+        incoming_initial_dcid: Option<ConnectionId>,
+    ) -> Result<Option<VerifiedInitial>, LinkRecvError> {
+        let Some(cfg) = self.crypto_config else {
+            return Ok(None);
+        };
+        if self.config.handshake_mode == HandshakeMode::None {
+            return Err(LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+        }
+        let Some(peer_params) = find_initial_crypto_params(wire)? else {
+            if !link_requires_encrypt {
+                return Ok(None);
+            }
+            return Err(LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+        };
+        if !link_requires_encrypt && peer_params.verifier.is_none() {
+            return Ok(None);
+        }
+        let peer_pub = peer_params
+            .public_key
+            .ok_or(LinkRecvError::Crypto(CryptoError::AuthenticationFailed))?;
+        let peer_rand = peer_params
+            .random
+            .ok_or(LinkRecvError::Crypto(CryptoError::AuthenticationFailed))?;
+        let peer_verifier = peer_params
+            .verifier
+            .ok_or(LinkRecvError::Crypto(CryptoError::AuthenticationFailed))?;
+        let peer_scid = incoming_scid
+            .or(peer_params.initial_scid)
+            .ok_or(LinkRecvError::Crypto(CryptoError::Invalid))?;
+        let local_cid = self
+            .config
+            .local_cid
+            .ok_or(LinkRecvError::Crypto(CryptoError::Invalid))?;
+
+        match self.config.handshake_mode {
+            HandshakeMode::Server => {
+                let api_key = match (cfg.send_api_key, cfg.node_secret) {
+                    (Some(k), _) => k,
+                    (None, Some(ns)) => {
+                        derive_peer_api_key_with(&cfg.provider, &ns, &peer_pub)
+                            .map_err(LinkRecvError::Crypto)?
+                    }
+                    (None, None) => return Err(LinkRecvError::Crypto(CryptoError::Invalid)),
+                };
+                let ok = verify_initial_verifier_with(
+                    &cfg.provider,
+                    &api_key,
+                    CryptoRole::Client,
+                    Some(peer_scid),
+                    incoming_initial_dcid,
+                    &peer_pub,
+                    &peer_rand,
+                    &peer_verifier,
+                )
+                .map_err(LinkRecvError::Crypto)?;
+                if !ok {
+                    return Err(LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+                }
+                let keys = derive_traffic_keys_with(
+                    &cfg.provider,
+                    &api_key,
+                    &peer_rand,
+                    &cfg.local_random,
+                    peer_scid,
+                    local_cid,
+                )
+                .map_err(LinkRecvError::Crypto)?
+                .for_role(CryptoRole::Server);
+                let srv_verifier = match cfg.local_public_key {
+                    Some(srv_pub) => Some(
+                        compute_initial_verifier_with(
+                            &cfg.provider,
+                            &api_key,
+                            CryptoRole::Server,
+                            Some(local_cid),
+                            incoming_initial_dcid,
+                            &srv_pub,
+                            &cfg.local_random,
+                        )
+                        .map_err(LinkRecvError::Crypto)?,
+                    ),
+                    None => None,
+                };
+                Ok(Some(VerifiedInitial {
+                    keys,
+                    local_dcid: local_cid,
+                    peer_dcid: peer_scid,
+                    server_response: Some((incoming_initial_dcid, srv_verifier)),
+                }))
+            }
+            HandshakeMode::Client => {
+                let api_key = cfg
+                    .send_api_key
+                    .ok_or(LinkRecvError::Crypto(CryptoError::Invalid))?;
+                if self.config.initial_dcid.is_some()
+                    && peer_params.original_dcid != self.config.initial_dcid
+                {
+                    return Err(LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+                }
+                let ok = verify_initial_verifier_with(
+                    &cfg.provider,
+                    &api_key,
+                    CryptoRole::Server,
+                    Some(peer_scid),
+                    peer_params.original_dcid,
+                    &peer_pub,
+                    &peer_rand,
+                    &peer_verifier,
+                )
+                .map_err(LinkRecvError::Crypto)?;
+                if !ok {
+                    return Err(LinkRecvError::Crypto(CryptoError::AuthenticationFailed));
+                }
+                let keys = derive_traffic_keys_with(
+                    &cfg.provider,
+                    &api_key,
+                    &cfg.local_random,
+                    &peer_rand,
+                    local_cid,
+                    peer_scid,
+                )
+                .map_err(LinkRecvError::Crypto)?
+                .for_role(CryptoRole::Client);
+                Ok(Some(VerifiedInitial {
+                    keys,
+                    local_dcid: local_cid,
+                    peer_dcid: peer_scid,
+                    server_response: None,
+                }))
+            }
+            HandshakeMode::None => unreachable!(),
+        }
     }
 
     fn emit_on_link(
@@ -979,63 +1741,170 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
             return Err(packet);
         }
 
-        let inner_frame_range = packet.range();
         let pkt_num = self.next_pkt_num;
+        let emit_initial = self.should_emit_initial(is_pto_probe);
+        let mut crypto_buf = [0u8; 208];
+        let crypto_len = if emit_initial {
+            let Ok(len) = self.build_crypto_frame(&mut crypto_buf) else {
+                return Err(packet);
+            };
+            len
+        } else {
+            0
+        };
 
-        // 2. Opportunistically piggyback a pending ACK frame in headroom in front of `inner_frame_range`
-        //    if an ACK is pending (or whenever piggybacking fits on a radio link!) and fits in MTU/headroom.
         let is_stream_framed = matches!(
             self.links[&link_id].profile.framing,
             LinkFraming::SelfDelimitingStream { .. }
         );
-        let mut carries_ack = false;
         let want_piggyback_ack = !is_stream_framed
             && !self.rx_ack_ranges.is_empty()
             && (self.rx_immediate_ack_pending
                 || self.rx_ack_eliciting_since_last_ack > 0
                 || self.rx_ack_deadline_us.is_some());
 
+        let mut ack_buf = [0u8; 128];
+        let mut ack_len = 0usize;
         if want_piggyback_ack {
-            let link_mtu = self.links[&link_id].profile.mtu;
-            let hdr_len = Self::header_len_for_link(&self.links[&link_id], pkt_num);
             let delay_us = self
                 .rx_largest_received_at_us
                 .map_or(0, |t| self.now_us.saturating_sub(t));
-            let mut ack_buf = [0u8; 64];
-            if let Ok(ack_len) = encode_ack_frame(&self.rx_ack_ranges, delay_us, &mut ack_buf) {
-                let projected_len = hdr_len + ack_len + packet.bytes().len();
-                if projected_len <= link_mtu && packet.range().start >= hdr_len + ack_len {
-                    if packet.prepend(&ack_buf[..ack_len]).is_ok() {
-                        carries_ack = true;
-                        self.clear_pending_ack_state();
-                    }
+            if let Ok(n) = encode_ack_frame(&self.rx_ack_ranges, delay_us, &mut ack_buf) {
+                ack_len = n;
+            }
+        }
+
+        let link_mtu = self.links[&link_id].profile.mtu;
+        let hdr_len_est = if emit_initial {
+            Self::initial_header_len_for_link(
+                self.config.handshake_mode,
+                self.config.initial_dcid,
+                self.config.local_cid,
+                self.peer_scid,
+                &self.links[&link_id],
+                pkt_num,
+                crypto_len + packet.bytes().len() + ack_len,
+            )
+        } else {
+            Self::header_len_for_link(&self.links[&link_id], pkt_num)
+        };
+        let extra_tag = if emit_initial {
+            0
+        } else {
+            self.link_crypto_overhead(link_id)
+        };
+
+        // Ensure enough headroom in front of the inner payload when `emit_initial` exceeds
+        // `DEFAULT_HEADROOM`, right-shifting into slot tailroom if available.
+        let mut include_ack = false;
+        if ack_len > 0 {
+            let need_with_ack = hdr_len_est + crypto_len + ack_len;
+            let shift = need_with_ack.saturating_sub(packet.range().start);
+            let projected_with_ack = need_with_ack + packet.bytes().len() + extra_tag;
+            if projected_with_ack <= link_mtu
+                && (shift == 0 || (emit_initial && packet.tailroom() >= shift))
+            {
+                if shift == 0 || shift_packet_right(&mut packet, shift).is_ok() {
+                    include_ack = true;
+                }
+            }
+        }
+        if !include_ack && emit_initial {
+            let need = hdr_len_est + crypto_len;
+            let shift = need.saturating_sub(packet.range().start);
+            if shift > 0 {
+                if packet.tailroom() < shift || shift_packet_right(&mut packet, shift).is_err() {
+                    return Err(packet);
                 }
             }
         }
 
-        // 3. Prepend outer `ShortHeader` in-place.
-        let dcid = self.peer_cid_for_link(&self.links[&link_id]);
-        let largest_acked = self.links[&link_id].largest_acked_packet;
-        let pn_len = packet_number_len(pkt_num, largest_acked);
-        let short_hdr = ShortHeader {
-            flags: 0,
-            dcid,
-            packet_number: pkt_num,
-            packet_number_len: pn_len,
-        };
-        let mut hdr_buf = [0u8; ShortHeader::MAX_LEN];
-        let Ok(hdr_len) = short_hdr.encode(&mut hdr_buf) else {
-            let _ = packet.set_range(inner_frame_range);
-            return Err(packet);
-        };
-        if packet.prepend(&hdr_buf[..hdr_len]).is_err() {
-            let _ = packet.set_range(inner_frame_range);
-            return Err(packet);
+        let inner_frame_range = packet.range();
+        let mut carries_ack = false;
+        if include_ack && packet.prepend(&ack_buf[..ack_len]).is_ok() {
+            carries_ack = true;
+            self.clear_pending_ack_state();
         }
 
-        let wire_bytes = packet.bytes().len();
-        self.next_pkt_num = self.next_pkt_num.saturating_add(1);
+        // Prepend outer header (`InitialHeader + CRYPTO` or `ShortHeader`) and seal if enabled.
+        let largest_acked = self.links[&link_id].largest_acked_packet;
+        let pn_len = packet_number_len(pkt_num, largest_acked);
+        if emit_initial {
+            if packet.prepend(&crypto_buf[..crypto_len]).is_err() {
+                let _ = packet.set_range(inner_frame_range);
+                return Err(packet);
+            }
+            let dcid = self.initial_dcid_for_link(&self.links[&link_id]);
+            let init_hdr = InitialHeader {
+                version: DMESH_QUIC_VERSION,
+                dcid,
+                scid: self.config.local_cid,
+                packet_number: pkt_num,
+                packet_number_len: pn_len,
+                payload_len: packet.bytes().len(),
+            };
+            let mut hdr_buf = [0u8; InitialHeader::MAX_LEN];
+            let Ok(hdr_len) = init_hdr.encode(&mut hdr_buf) else {
+                let _ = packet.set_range(inner_frame_range);
+                return Err(packet);
+            };
+            if packet.prepend(&hdr_buf[..hdr_len]).is_err() {
+                let _ = packet.set_range(inner_frame_range);
+                return Err(packet);
+            }
+        } else {
+            let dcid = self.peer_cid_for_link(&self.links[&link_id]);
+            let short_hdr = ShortHeader {
+                flags: 0,
+                dcid,
+                packet_number: pkt_num,
+                packet_number_len: pn_len,
+            };
+            let mut hdr_buf = [0u8; ShortHeader::MAX_LEN];
+            let Ok(hdr_len) = short_hdr.encode(&mut hdr_buf) else {
+                let _ = packet.set_range(inner_frame_range);
+                return Err(packet);
+            };
+            if packet.prepend(&hdr_buf[..hdr_len]).is_err() {
+                let _ = packet.set_range(inner_frame_range);
+                return Err(packet);
+            }
+        }
 
+        let pre_seal_start = packet.range().start;
+        let is_sealed = if !emit_initial {
+            match self.seal_short_header_packet(link_id, pkt_num, &mut packet) {
+                Ok(sealed) => sealed,
+                Err(()) => {
+                    let _ = packet.set_range(inner_frame_range);
+                    return Err(packet);
+                }
+            }
+        } else {
+            false
+        };
+        let sealed_inner_range = if is_sealed {
+            let delta = packet.range().start as isize - pre_seal_start as isize;
+            ((inner_frame_range.start as isize + delta) as usize)
+                ..((inner_frame_range.end as isize + delta) as usize)
+        } else {
+            inner_frame_range.clone()
+        };
+
+        let wire_bytes = packet.bytes().len();
+        let retained_clone = if meta.retransmittable {
+            match packet.try_clone() {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    let _ = packet.set_range(sealed_inner_range);
+                    return Err(packet);
+                }
+            }
+        } else {
+            None
+        };
+
+        self.next_pkt_num = self.next_pkt_num.saturating_add(1);
         let (send_order, window_limited) = self.links.get_mut(&link_id).unwrap().record_packet_sent(
             pkt_num,
             wire_bytes,
@@ -1044,25 +1913,14 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
             is_pto_probe,
         );
 
-        let retained_clone = if meta.retransmittable {
-            match packet.try_clone() {
-                Ok(c) => Some(c),
-                Err(_) => {
-                    let _ = packet.set_range(inner_frame_range);
-                    return Err(packet);
-                }
-            }
-        } else {
-            None
-        };
-
         match self.sack_ledger.record_tx(
             pkt_num,
             link_id,
             send_order,
             wire_bytes,
             self.now_us,
-            inner_frame_range.clone(),
+            sealed_inner_range,
+            is_sealed,
             meta,
             window_limited,
             retained_clone,
@@ -1079,6 +1937,11 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
                 let _ = packet.set_range(inner_frame_range);
                 return Err(packet);
             }
+        }
+
+        if emit_initial && self.config.handshake_mode == HandshakeMode::Server {
+            self.server_initial_needed = false;
+            self.server_initial_sent = true;
         }
 
         self.outbound_queue.push_back(OutboundLinkPacket {
@@ -1117,6 +1980,13 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         if packet.prepend(&hdr_buf[..hdr_len]).is_err() {
             return Err(packet);
         }
+        if self
+            .seal_short_header_packet(link_id, pkt_num, &mut packet)
+            .is_err()
+        {
+            let _ = packet.set_range(inner_frame_range);
+            return Err(packet);
+        }
         let wire_bytes = packet.bytes().len();
         self.next_pkt_num = self.next_pkt_num.saturating_add(1);
         let _ = self.links.get_mut(&link_id).unwrap().record_packet_sent(
@@ -1137,6 +2007,83 @@ impl<P: PoolPacket> QuicLinkAssoc<P> {
         });
         Ok(())
     }
+}
+
+struct VerifiedInitial {
+    keys: EndpointKeys,
+    local_dcid: ConnectionId,
+    peer_dcid: ConnectionId,
+    server_response: Option<(Option<ConnectionId>, Option<[u8; quic_base::INITIAL_VERIFIER_LEN]>)>,
+}
+
+fn shift_packet_right<P: PoolPacket>(packet: &mut P, shift: usize) -> Result<(), ()> {
+    let r = packet.range();
+    let slot = packet.slot_slice_mut().map_err(|_| ())?;
+    if r.end + shift > slot.len() {
+        return Err(());
+    }
+    slot.copy_within(r.start..r.end, r.start + shift);
+    packet
+        .set_range((r.start + shift)..(r.end + shift))
+        .map_err(|_| ())
+}
+
+fn find_initial_crypto_params(wire: &[u8]) -> Result<Option<TransportParameters>, LinkRecvError> {
+    let mut cursor = 0usize;
+    while cursor < wire.len() {
+        let (ty, n_ty) = decode_varint(&wire[cursor..]).map_err(LinkRecvError::Wire)?;
+        match ty {
+            FRAME_PADDING | FRAME_PING => cursor += n_ty,
+            FRAME_CRYPTO => {
+                let (offset, data_range, next_at) =
+                    decode_crypto_frame_body(wire, cursor + n_ty).map_err(LinkRecvError::Wire)?;
+                if offset == 0 {
+                    let params = TransportParameters::decode(&wire[data_range])
+                        .map_err(LinkRecvError::Wire)?;
+                    return Ok(Some(params));
+                }
+                cursor = next_at;
+            }
+            FRAME_ACK => {
+                let (_, _, _, next_at) =
+                    decode_ack_frame_body(wire, cursor + n_ty).map_err(LinkRecvError::Wire)?;
+                cursor = next_at;
+            }
+            FRAME_ACK_FREQUENCY => {
+                let mut at = cursor + n_ty;
+                for _ in 0..4 {
+                    let (_, n) = decode_varint(
+                        wire.get(at..)
+                            .ok_or(LinkRecvError::Wire(WireError::UnexpectedEof))?,
+                    )
+                    .map_err(LinkRecvError::Wire)?;
+                    at += n;
+                }
+                cursor = at;
+            }
+            FRAME_DATAGRAM => return Ok(None),
+            FRAME_DATAGRAM_LEN => {
+                let mut at = cursor + n_ty;
+                let (l, nl) = decode_varint(
+                    wire.get(at..)
+                        .ok_or(LinkRecvError::Wire(WireError::UnexpectedEof))?,
+                )
+                .map_err(LinkRecvError::Wire)?;
+                at += nl;
+                let len =
+                    usize::try_from(l).map_err(|_| LinkRecvError::Wire(WireError::InvalidFrame))?;
+                cursor = at
+                    .checked_add(len)
+                    .ok_or(LinkRecvError::Wire(WireError::InvalidFrame))?;
+            }
+            _ => {
+                let (_, rel_next) =
+                    decode_frame(&wire[cursor..], 0).map_err(LinkRecvError::Wire)?;
+                cursor += rel_next;
+            }
+        }
+    }
+    Ok(None)
 }
 
 impl<P: PoolPacket> AssociationEgress<P> for QuicLinkAssoc<P> {
@@ -1178,6 +2125,14 @@ impl<P: PoolPacket> AssociationEgress<P> for QuicLinkAssoc<P> {
                 .retain(|c| c.meta.stream_id != Some(stream_id));
             self.sack_ledger
                 .purge_stream(assoc, stream_id, &mut self.links);
+        }
+    }
+
+    fn drop_current_rx_ack(&mut self, assoc: AssociationId) {
+        if assoc == self.config.assoc_id {
+            if let Some(pn) = self.last_rx_pkt_num.take() {
+                self.rx_ack_ranges.remove(pn);
+            }
         }
     }
 }
