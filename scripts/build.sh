@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Keep the Dockerfile in sync
 
@@ -9,6 +10,9 @@ cd "${REPO_ROOT}"
 # Keep Cargo, Rustup, HOME, and target selection repository-local.
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/env.sh"
+export CARGO_TARGET_DIR="${SSH_MESH_CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+export CARGO_NET_OFFLINE=true
+export RUSTUP_AUTO_INSTALL=0
 
 export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc 
@@ -213,11 +217,6 @@ ensure_musl_toolchain_profile() {
 
     target_profile="$(resolve_nix_profile "$target_profile")"
     prepend_nix_profile_path "$target_profile"
-    if ! command -v x86_64-unknown-linux-musl-gcc >/dev/null 2>&1 ||
-       ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
-        add_nix_profile_deps "$target_profile" musl-toolchain
-    fi
-
     configure_musl_toolchain "$target_profile"
 }
 
@@ -371,7 +370,7 @@ _all() {
     fi
     
     for bin in $CRATES; do
-        cargo build ${RUST_FLAGS} --target $target ${mode} -p $bin
+        cargo build ${RUST_FLAGS:-} --target "$target" ${mode} -p "$bin"
     done
 
 

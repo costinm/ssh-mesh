@@ -1,124 +1,66 @@
 #!/usr/bin/env bash
-# Populate the environment-specific writable dev workspace under $SSH_MESH_DEV
-# (default: $HOME/opt/ssh-mesh-dev) and keep generic SDKs ($HOME/opt/rust and
-# $HOME/opt/esp-idf) clean and versionless.
+# Explicit online setup. Normal builds never install dependencies.
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SSH_MESH_DIR="${SSH_MESH_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-
-find_sibling_repo() {
-    local var_val="$1"
-    shift
-    if [ -n "$var_val" ] && [ -d "$var_val" ]; then
-        cd "$var_val" && pwd -P
-        return 0
-    fi
-    for candidate in "$@"; do
-        if [ -d "$candidate" ]; then
-            cd "$candidate" && pwd -P
-            return 0
-        fi
-    done
-    return 1
-}
-
-DMESH_DIR="$(find_sibling_repo "${DMESH_DIR:-${DMESH_REPO:-}}" \
-    "$SSH_MESH_DIR/../dmesh" \
-    "$SSH_MESH_DIR/../../dmesh" \
-    /ws/dmesh || true)"
-ESP_XIP_DIR="$(find_sibling_repo "${ESP_XIP_DIR:-${XIP_REPO:-}}" \
-    "$SSH_MESH_DIR/../esp-xip-modules" \
-    "$SSH_MESH_DIR/../../esp-xip-modules" \
-    /ws/esp-xip-modules || true)"
-
-RUST_ROOT="${RUST_SDK_ROOT:-$HOME/opt/rust}"
-SSH_MESH_DEV="${SSH_MESH_DEV:-$HOME/opt/ssh-mesh-dev}"
-
-mkdir -p \
-    "$SSH_MESH_DEV/bin" \
-    "$SSH_MESH_DEV/etc/schemas" \
-    "$SSH_MESH_DEV/cargo" \
-    "$SSH_MESH_DEV/nix"
-
-# Keep $HOME/opt/android-sdk linked if materialized via dmesh flake/dev-env.
-if [ ! -e "$HOME/opt/android-sdk" ] && [ -e "$HOME/opt/dmesh-dev/android-sdk" ]; then
-    ln -sfn "$(readlink -f "$HOME/opt/dmesh-dev/android-sdk")" "$HOME/opt/android-sdk"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ $# -gt 1 || ${1:-} == --help || ${1:-} == -h ]]; then
+    echo "Usage: setup-dev.sh [DIR] (default: ~/opt)"
+    [[ $# -le 1 ]] && exit 0 || exit 2
 fi
-
-# Keep $HOME/opt/esp-idf -> $HOME/opt/esp-idf-6.0 aligned without referencing target/.
-if [ ! -e "$HOME/opt/esp-idf" ] && [ -d "$HOME/opt/esp-idf-6.0" ]; then
-    idf_target="$(readlink -f "$HOME/opt/esp-idf-6.0")"
-    ln -sfn "$idf_target" "$HOME/opt/esp-idf"
+mkdir -p "${1:-${DEV_ROOT:-$HOME/opt}}"
+export DEV_ROOT="$(cd "${1:-${DEV_ROOT:-$HOME/opt}}" && pwd)"
+export SSH_MESH_DEV="${SSH_MESH_DEV:-$DEV_ROOT/ssh-mesh-dev}"
+export RUST_SDK_ROOT="${RUST_SDK_ROOT:-$DEV_ROOT/rust}"
+export NIX_CONFIG="${NIX_CONFIG:-experimental-features = nix-command flakes}"
+flake="${SSH_MESH_FLAKE:-github:costinm/ssh-mesh}"
+mkdir -p "$SSH_MESH_DEV"/{bin,cargo,etc/schemas,nix} "$RUST_SDK_ROOT/rustup/toolchains" "$REPO/target"
+# rust-sdk is a plain Rust distribution (bin/, lib/), NOT a rustup home.
+# Keep the SDK root writable for the optional ESP toolchain link.
+nix build "$flake#rust-sdk" --out-link "$SSH_MESH_DEV/nix/rust-sdk"
+stable="$RUST_SDK_ROOT/rustup/toolchains/stable-x86_64-unknown-linux-gnu"
+if [[ -e "$stable" && ! -L "$stable" ]]; then
+    echo "Keeping existing Rust toolchain directory: $stable"
+else
+    ln -sfn "$SSH_MESH_DEV/nix/rust-sdk" "$stable"
 fi
-
-if [ -d "$HOME/opt/esp-idf/rustup/toolchains/esp" ] && [ -d "$RUST_ROOT/rustup/toolchains" ]; then
-    ln -sfn "$HOME/opt/esp-idf/rustup/toolchains/esp" "$RUST_ROOT/rustup/toolchains/esp"
+nix build "$flake#build-deps" --out-link "$SSH_MESH_DEV/nix/build-deps"
+nix build "$flake#runtime-deps" --out-link "$SSH_MESH_DEV/nix/runtime-deps"
+nix build "$flake#mesh-api-gen" --out-link "$SSH_MESH_DEV/nix/mesh-api-gen"
+ln -sfn "$SSH_MESH_DEV/nix/mesh-api-gen/bin/mesh-api-gen" "$SSH_MESH_DEV/bin/mesh-api-gen"
+esp="${XIP_ESP_ROOT:-$DEV_ROOT/esp-idf}/rustup/toolchains/esp"
+if [[ -d "$esp" && ! -e "$RUST_SDK_ROOT/rustup/toolchains/esp" ]]; then
+    ln -s "$esp" "$RUST_SDK_ROOT/rustup/toolchains/esp"
 fi
-
-# Migrate project-specific binary/schemas/config out of generic $HOME/opt/rust.
-if [ -f "$SSH_MESH_DIR/target/x86_64-unknown-linux-musl/release/mesh-api-gen" ]; then
-    cp -f "$SSH_MESH_DIR/target/x86_64-unknown-linux-musl/release/mesh-api-gen" "$SSH_MESH_DEV/bin/mesh-api-gen"
-    chmod +x "$SSH_MESH_DEV/bin/mesh-api-gen"
-elif [ -f "$RUST_ROOT/cargo/bin/mesh-api-gen" ]; then
-    mv -f "$RUST_ROOT/cargo/bin/mesh-api-gen" "$SSH_MESH_DEV/bin/mesh-api-gen"
-    chmod +x "$SSH_MESH_DEV/bin/mesh-api-gen"
+# Copy old schemas/caches only when absent; never delete user config or caches.
+if [[ -d "$RUST_SDK_ROOT/etc/schemas" ]]; then
+    cp -an "$RUST_SDK_ROOT/etc/schemas/." "$SSH_MESH_DEV/etc/schemas/"
 fi
-rm -f "$RUST_ROOT/cargo/bin/mesh-api-gen"
-rmdir "$RUST_ROOT/cargo/bin" 2>/dev/null || true
-
-if [ -d "$RUST_ROOT/etc/schemas" ]; then
-    mkdir -p "$SSH_MESH_DEV/etc/schemas"
-    cp -a "$RUST_ROOT/etc/schemas/." "$SSH_MESH_DEV/etc/schemas/"
-    rm -rf "$RUST_ROOT/etc"
-fi
-
-# Refresh schemas from sibling repos if present.
-if [ -n "$ESP_XIP_DIR" ] && [ -d "$ESP_XIP_DIR/target/nix/dmesh-cli/etc/schemas" ]; then
-    cp -a "$ESP_XIP_DIR/target/nix/dmesh-cli/etc/schemas/." "$SSH_MESH_DEV/etc/schemas/"
-fi
-if [ -n "$DMESH_DIR" ] && [ -f "$DMESH_DIR/crates/lmesh/resources/tools.json" ]; then
-    mkdir -p "$SSH_MESH_DEV/etc/schemas/lmesh"
-    cp -f "$DMESH_DIR/crates/lmesh/resources/tools.json" "$SSH_MESH_DEV/etc/schemas/lmesh/tools.json"
-fi
-
-# Move mutable Cargo caches out of $HOME/opt/rust/cargo so $HOME/opt/rust stays generic.
 for item in registry git .global-cache .package-cache .package-cache-mutate; do
-    if [ -e "$RUST_ROOT/cargo/$item" ]; then
-        if [ ! -e "$SSH_MESH_DEV/cargo/$item" ]; then
-            mv "$RUST_ROOT/cargo/$item" "$SSH_MESH_DEV/cargo/$item"
-        else
-            rm -rf "$RUST_ROOT/cargo/$item"
-        fi
+    if [[ -e "$RUST_SDK_ROOT/cargo/$item" && ! -e "$SSH_MESH_DEV/cargo/$item" ]]; then
+        cp -a "$RUST_SDK_ROOT/cargo/$item" "$SSH_MESH_DEV/cargo/$item"
     fi
 done
-rm -f "$RUST_ROOT/cargo/config.toml"
-
-# The shared CARGO_HOME config used to carry cross-repo Cargo [patch] blocks.
-# They polluted this workspace's Cargo.lock with [[patch.unused]] markers.
-# Per-repo patching now lives with the consumers: /ws/dmesh writes its own
-# .cargo/config.toml (scripts/build.sh) and /ws/esp-xip-modules keeps [patch]
-# tables in its workspace Cargo.toml files.
-rm -f "$SSH_MESH_DEV/cargo/config.toml"
-
-# Collect existing nix flake out-links under $SSH_MESH_DEV/nix/.
-if [ -e "$HOME/opt/android-sdk" ]; then
-    ln -sfn "$(readlink -f "$HOME/opt/android-sdk")" "$SSH_MESH_DEV/nix/android-sdk"
+dmesh="${DMESH_DIR:-${DMESH_REPO:-$REPO/../../dmesh}}"
+if [[ ! -d "$dmesh" ]]; then dmesh="$REPO/../dmesh"; fi
+if [[ -f "$dmesh/crates/lmesh/resources/tools.json" ]]; then
+    mkdir -p "$SSH_MESH_DEV/etc/schemas/lmesh"
+    cp "$dmesh/crates/lmesh/resources/tools.json" "$SSH_MESH_DEV/etc/schemas/lmesh/tools.json"
 fi
-if [ -e "$HOME/opt/esp-idf" ]; then
-    ln -sfn "$(readlink -f "$HOME/opt/esp-idf")" "$SSH_MESH_DEV/nix/esp-idf"
+xip="${ESP_XIP_DIR:-${XIP_REPO:-$REPO/../../esp-xip-modules}}"
+if [[ ! -d "$xip" ]]; then xip="$REPO/../esp-xip-modules"; fi
+if [[ -d "$xip/target/nix/dmesh-cli/etc/schemas" ]]; then
+    cp -a "$xip/target/nix/dmesh-cli/etc/schemas/." "$SSH_MESH_DEV/etc/schemas/"
 fi
-if [ -e "$HOME/opt/esp-dev" ]; then
-    ln -sfn "$(readlink -f "$HOME/opt/esp-dev")" "$SSH_MESH_DEV/nix/esp-dev"
-fi
-if [ -e "$HOME/opt/wasm-dev" ]; then
-    ln -sfn "$(readlink -f "$HOME/opt/wasm-dev")" "$SSH_MESH_DEV/nix/wasm-dev"
-fi
-if [ -e "$HOME/opt/dmesh-dev" ]; then
-    ln -sfn "$(readlink -f "$HOME/opt/dmesh-dev")" "$SSH_MESH_DEV/nix/dmesh-dev"
-fi
-if [ -n "$DMESH_DIR" ] && [ -e "$DMESH_DIR/target/nix/profile" ]; then
-    ln -sfn "$(readlink -f "$DMESH_DIR/target/nix/profile")" "$SSH_MESH_DEV/nix/dmesh-deps"
-fi
-
-echo "SSH_MESH_DEV ready at $SSH_MESH_DEV (RUST_SDK=$RUST_ROOT, ESP_IDF=$HOME/opt/esp-idf)"
+{
+    printf 'export DEV_ROOT=${DEV_ROOT:-%q}\n' "$DEV_ROOT"
+    printf 'export SSH_MESH_DEV=${SSH_MESH_DEV:-%q}\n' "$SSH_MESH_DEV"
+    printf 'export RUST_SDK_ROOT=${RUST_SDK_ROOT:-%q}\n' "$RUST_SDK_ROOT"
+    printf 'export SSH_MESH_NIX_PROFILE=${SSH_MESH_NIX_PROFILE:-%q}\n' "$SSH_MESH_DEV/nix/build-deps"
+    printf 'export SSH_MESH_BUSYBOX=${SSH_MESH_BUSYBOX:-%q}\n' "$SSH_MESH_DEV/nix/runtime-deps/opt/busybox/bin/busybox"
+} > "$REPO/target/setup-env.sh"
+(
+    cd "$REPO"
+    unset CARGO_TARGET_DIR
+    . ./env.sh
+    CARGO_NET_OFFLINE=false cargo fetch --target x86_64-unknown-linux-musl
+)
+echo "Ready. Run ./scripts/build.sh (SDKs: $DEV_ROOT)."

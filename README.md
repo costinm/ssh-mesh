@@ -10,6 +10,18 @@ socket-activated containers, bubblewrap sandboxes, or virtual machines.
 
 ---
 
+## Build
+
+With Nix installed, run:
+
+```sh
+./setup-dev.sh                 # downloads dependencies; optional SDK root: [DIR]
+./scripts/build.sh             # offline build; outputs under target/
+```
+
+Setup defaults to `~/opt` and remembers a custom root for subsequent builds.
+`SSH_MESH_FLAKE` can override the default `github:costinm/ssh-mesh`.
+
 ## Device connectivity
 
 [DMesh](https://github.com/costinm/dmesh) adds QUIC and Android connectivity. [esp-xip-modules](https://github.com/costinm/esp-xip-modules) provides modules for low-end devices such as lights, sensors and packet relays.

@@ -11,6 +11,11 @@ fi
 # This checkout owns its build/cache roots. Do not inherit another project's
 # REPO_ROOT when env.sh is sourced from a parent shell.
 export REPO_ROOT="${_env_dir}"
+if [ -f "${REPO_ROOT}/target/setup-env.sh" ]; then
+    . "${REPO_ROOT}/target/setup-env.sh"
+fi
+export DEV_ROOT="${DEV_ROOT:-${HOME}/opt}"
+export RUST_SDK_ROOT="${RUST_SDK_ROOT:-${DEV_ROOT}/rust}"
 export REAL_HOME="${REAL_HOME:-${HOME:-}}"
 
 if [ "${HOME:-}" = "${REPO_ROOT}/target/home" ]; then
@@ -43,9 +48,9 @@ export SSH_MESH_STATE_ROOT="${SSH_MESH_STATE_ROOT:-${HOME}/.local/share/ssh-mesh
 if [ "${TMPDIR:-}" = "${REPO_ROOT}/target/tmp" ]; then unset TMPDIR; fi
 export TMPDIR="${SSH_MESH_TMPDIR:-${TMPDIR:-/tmp}}"
 
-export SSH_MESH_DEV="${SSH_MESH_DEV:-${HOME:-}/opt/ssh-mesh-dev}"
-if [ -d "${HOME:-}/opt/rust" ]; then
-    export RUSTUP_HOME="${SSH_MESH_RUSTUP_HOME:-${HOME}/opt/rust/rustup}"
+export SSH_MESH_DEV="${SSH_MESH_DEV:-${DEV_ROOT}/ssh-mesh-dev}"
+if [ -d "${RUST_SDK_ROOT}" ]; then
+    export RUSTUP_HOME="${SSH_MESH_RUSTUP_HOME:-${RUST_SDK_ROOT}/rustup}"
 else
     export RUSTUP_HOME="${SSH_MESH_RUSTUP_HOME:-${REPO_ROOT}/target/rustup}"
 fi
@@ -92,6 +97,7 @@ _path_force_prepend() {
 _path_prepend "/nix/var/nix/profiles/default/bin"
 _path_prepend "${NIX_PROFILE}/bin"
 _path_prepend "${HOME:-}/opt/rust/cargo/bin"
+_path_prepend "${RUST_SDK_ROOT}/cargo/bin"
 _path_prepend "${CARGO_HOME}/bin"
 _path_prepend "${SSH_MESH_DEV}/bin"
 _path_prepend "${REPO_ROOT}/target/x86_64-unknown-linux-musl/release"
