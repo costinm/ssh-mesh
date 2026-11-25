@@ -131,7 +131,7 @@ async fn async_main(args: Args, access: mesh::logging::LogFileAccess) -> Result<
 /// merge defaults from a newer package without touching existing files.
 fn seed_command(args: &[String], config_dirs: &[String]) -> Result<()> {
     let preview = args.iter().any(|arg| arg == "--preview");
-    let Some(dest) = config_dirs.first() else {
+    let Some(dest) = config_dirs.last() else {
         anyhow::bail!("no mesh-init configuration directory configured");
     };
     let Some(defaults) = mesh_init::seed::defaults_dir() else {

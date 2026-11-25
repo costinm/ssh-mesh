@@ -8,6 +8,28 @@ When started as root and `MESH_INIT_DIR` is unset, core config is loaded from
 `/home/system/etc/mesh-init`. `MESH_INIT_DIR` replaces that default directory.
 Non-root `mesh-init` defaults to `$HOME/etc/mesh-init`.
 
+Set `MESH_INIT_FALLBACK_DIR` to a read-only directory of packaged `*.toml`
+units to load them in place, without copying or requiring a populated operator
+home. Unset or empty disables this layer and preserves legacy startup seeding.
+The operator directory (default above, or `MESH_INIT_DIR`) takes precedence by
+service filename: an operator unit replaces the entire fallback unit, never
+merging fields. Unique units in either directory are loaded. Missing directories
+are skipped. Root's default is independent of `HOME`, including unset/empty
+`HOME`; existing `MESH_HOME`/`MESH_HOME_BASE` layout overrides still apply.
+
+With a nonempty fallback setting, automatic startup seeding is disabled;
+neither directory is created or populated by the loader. `MESH_INIT_DEFAULTS_DIR`
+still controls only the legacy copy-based seed source, not this live layer.
+An explicit `mesh-init seed [--preview]` still targets the operator directory.
+The fallback is never a seed destination.
+
+At startup, a malformed/unreadable operator unit is warned about and omitted,
+not replaced with its fallback. Reload rejects the whole snapshot on such an
+error, retaining live configuration. Shadowed fallback files are not parsed.
+Use the reload RPC to pick up added/removed overrides; removing an override
+reveals the fallback unit again. An individual `start` retains its existing
+source-path refresh/cached-config behavior and is not a directory rescan.
+
 After editing, adding or removing a core service file, call the `reload` RPC
 (`mesh --rpc-format json-rpc unix:///run/mesh/mesh-init/mesh.sock mesh-init reload`).
 Reload reconciles the activation sockets in place, so it also works when

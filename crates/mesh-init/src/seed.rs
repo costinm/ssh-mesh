@@ -18,6 +18,8 @@
 //!   explicitly with `mesh-init seed [--preview]`.
 //!
 //! Every seeded or skipped file is logged.
+//! A nonempty `MESH_INIT_FALLBACK_DIR` disables automatic seeding: packaged
+//! units are then read in place, with mutable operator units overriding them.
 
 // TODO: move to mesh-cli, add a template function. This doesn't need to run at all times in mesh-init.
 
@@ -81,6 +83,12 @@ pub fn defaults_dir() -> Option<PathBuf> {
 /// Seed the first mutable configuration directory from the packaged defaults
 /// at daemon startup. Root-only: non-root users manage their own config.
 pub fn seed_on_startup(config_dirs: &[String]) {
+    // Live fallback units are read in place. Do not turn them into persistent
+    // overrides or write into the read-only fallback directory.
+    if std::env::var_os("MESH_INIT_FALLBACK_DIR").is_some_and(|dir| !dir.is_empty()) {
+        info!("seeding_skipped_live_fallback");
+        return;
+    }
     if unsafe { libc::getuid() } != 0 {
         debug!("seeding_skipped_non_root");
         return;
@@ -96,7 +104,7 @@ pub fn seed_on_startup(config_dirs: &[String]) {
         return;
     }
 
-    let Some(dest) = config_dirs.first() else {
+    let Some(dest) = config_dirs.last() else {
         return;
     };
     let Some(defaults) = defaults_dir() else {
@@ -303,6 +311,38 @@ fn write_marker(marker: &Path, defaults: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    #[ignore = "subprocess helper for isolated startup environment"]
+    fn live_fallback_startup_child() {
+        let fallback = std::env::var("MESH_INIT_FALLBACK_DIR").unwrap();
+        let operator = std::env::var("MESH_INIT_DIR").unwrap();
+        seed_on_startup(&[fallback, operator]);
+    }
+
+    #[test]
+    fn live_fallback_disables_startup_copying_without_creating_operator_home() {
+        let root = TempDir::new().unwrap();
+        write_defaults(root.path());
+        let fallback = root.path().join("share/mesh-init/defaults");
+        let operator = root.path().join("missing/home/system/etc/mesh-init");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "seed::tests::live_fallback_startup_child",
+            ])
+            .env("HOME", "")
+            .env("MESH_INIT_FALLBACK_DIR", &fallback)
+            .env("MESH_INIT_DEFAULTS_DIR", &fallback)
+            .env("MESH_INIT_DIR", &operator)
+            .env_remove("MESH_INIT_SEED")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!root.path().join("missing").exists());
+        assert!(!fallback.join(SEED_MARKER).exists());
+    }
 
     /// Copy a nested default set and a marker-decorated destination layout.
     fn write_defaults(root: &Path) {

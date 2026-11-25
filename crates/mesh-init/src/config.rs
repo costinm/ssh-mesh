@@ -71,10 +71,13 @@ pub fn load_app_config(path: &Path) -> Result<AppConfig, ConfigError> {
 ///
 /// Non-existent directories are silently skipped. Individual parse errors
 /// are logged as warnings but do not stop loading of other configs.
+/// Later directories replace whole units by filename, even if the winning file
+/// is malformed (a broken operator override must not enable a fallback unit).
 pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
     let mut configs = Vec::new();
+    let mut seen = HashSet::new();
 
-    for dir in dirs {
+    for dir in dirs.iter().rev() {
         let dir_path = Path::new(dir);
         if !dir_path.is_dir() {
             debug!(directory = %dir, "config_directory_missing_skipping");
@@ -91,7 +94,9 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            if path.extension().and_then(|e| e.to_str()) == Some("toml")
+                && seen.insert(entry.file_name())
+            {
                 match load_app_config(&path) {
                     Ok(config) => {
                         info!(service = %config.name, "service_config_loaded");
@@ -109,18 +114,23 @@ pub fn load_system_configs(dirs: &[&str]) -> Vec<AppConfig> {
 }
 
 /// Read a complete reload snapshot, failing before live state changes if any
-/// present configuration file cannot be read or parsed.
+/// selected configuration file cannot be read or parsed. Shadowed files are
+/// not parsed, matching startup's whole-unit precedence.
 pub(crate) fn load_system_configs_for_reload(dirs: &[&str]) -> Result<Vec<AppConfig>, ConfigError> {
     let mut configs = Vec::new();
-    for dir in dirs {
+    let mut seen = HashSet::new();
+    for dir in dirs.iter().rev() {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
         for entry in entries {
-            let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("toml")
+                && seen.insert(entry.file_name())
+            {
                 configs.push(load_app_config(&path)?);
             }
         }
@@ -145,15 +155,20 @@ where
     F: FnMut(&str) -> Option<std::ffi::OsString>,
     C: FnOnce() -> Option<PathBuf>,
 {
-    if let Some(dir) = env("MESH_INIT_DIR") {
-        return vec![PathBuf::from(dir)];
-    }
-    if uid == 0 {
+    let fallback = env("MESH_INIT_FALLBACK_DIR").filter(|dir| !dir.is_empty());
+    let operator = if let Some(dir) = env("MESH_INIT_DIR") {
+        PathBuf::from(dir)
+    } else if uid == 0 {
         let (home_base, _) = home_opt_bases(&mut env);
-        vec![home_base.join("system/etc/mesh-init")]
+        home_base.join("system/etc/mesh-init")
     } else {
-        vec![user_config_home(&mut env, current_dir).join("etc/mesh-init")]
-    }
+        user_config_home(&mut env, current_dir).join("etc/mesh-init")
+    };
+    fallback
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(std::iter::once(operator))
+        .collect()
 }
 
 /// Resolve on-demand config candidates for a service in precedence order.
@@ -487,6 +502,114 @@ mod tests {
             0,
         );
         assert_eq!(dirs, vec![std::path::PathBuf::from("/custom/etc")]);
+    }
+
+    #[test]
+    fn core_config_dirs_fallback_precedes_operator_with_or_without_home() {
+        for home in [None, Some(""), Some("/home/alice")] {
+            let mut vars = vec![("MESH_INIT_FALLBACK_DIR", "/readonly/units")];
+            if let Some(home) = home {
+                vars.push(("HOME", home));
+            }
+            let dirs = core_config_dirs_with_context(env_from(&vars), || None, 0);
+            assert_eq!(
+                dirs,
+                vec![
+                    PathBuf::from("/readonly/units"),
+                    PathBuf::from("/home/system/etc/mesh-init"),
+                ]
+            );
+        }
+        let dirs = core_config_dirs_with_context(
+            env_from(&[
+                ("MESH_INIT_DIR", "/operator/units"),
+                ("MESH_INIT_FALLBACK_DIR", "/readonly/units"),
+            ]),
+            || None,
+            1000,
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/readonly/units"),
+                PathBuf::from("/operator/units"),
+            ]
+        );
+        let dirs =
+            core_config_dirs_with_context(env_from(&[("MESH_INIT_FALLBACK_DIR", "")]), || None, 0);
+        assert_eq!(dirs, vec![PathBuf::from("/home/system/etc/mesh-init")]);
+    }
+
+    #[test]
+    fn layered_configs_missing_empty_and_populated_operator_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fallback = tmp.path().join("fallback");
+        let operator = tmp.path().join("operator");
+        std::fs::create_dir(&fallback).unwrap();
+        let fallback_text = "[Service]\nExecStart = '/bin/true'\n[Environment]\nFALLBACK = 'yes'\n";
+        std::fs::write(fallback.join("shared.toml"), fallback_text).unwrap();
+        let dirs = [fallback.to_str().unwrap(), operator.to_str().unwrap()];
+
+        for create_operator in [false, true] {
+            if create_operator {
+                std::fs::create_dir(&operator).unwrap();
+            }
+            let startup = load_system_configs(&dirs);
+            assert_eq!(startup.len(), 1);
+            assert_eq!(startup, load_system_configs_for_reload(&dirs).unwrap());
+            assert_eq!(
+                startup[0].source_path.as_deref(),
+                fallback.join("shared.toml").to_str()
+            );
+            assert!(!operator.join("shared.toml").exists());
+        }
+
+        let operator_text = "[Service]\nExecStart = '/bin/false'\n";
+        std::fs::write(operator.join("shared.toml"), operator_text).unwrap();
+        std::fs::write(operator.join("local.toml"), operator_text).unwrap();
+        std::fs::write(fallback.join("packaged.toml"), fallback_text).unwrap();
+        let configs = load_system_configs(&dirs);
+        assert_eq!(configs.len(), 3);
+        let shared = configs.iter().find(|cfg| cfg.name == "shared").unwrap();
+        assert_eq!(shared.command, "/bin/false");
+        assert!(!shared.env.contains_key("FALLBACK"));
+        assert_eq!(
+            shared.source_path.as_deref(),
+            operator.join("shared.toml").to_str()
+        );
+        let mut startup = configs;
+        let mut reload = load_system_configs_for_reload(&dirs).unwrap();
+        startup.sort_by(|a, b| a.name.cmp(&b.name));
+        reload.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(startup, reload);
+    }
+
+    #[test]
+    fn layered_configs_malformed_override_never_enables_fallback() {
+        let fallback = tempfile::tempdir().unwrap();
+        let operator = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fallback.path().join("shared.toml"),
+            "[Service]\nExecStart = '/bin/true'\n",
+        )
+        .unwrap();
+        std::fs::write(operator.path().join("shared.toml"), "[Service\n").unwrap();
+        let dirs = [
+            fallback.path().to_str().unwrap(),
+            operator.path().to_str().unwrap(),
+        ];
+        assert!(load_system_configs(&dirs).is_empty());
+        assert!(load_system_configs_for_reload(&dirs).is_err());
+
+        // A malformed shadowed package file is irrelevant to the selected unit.
+        std::fs::write(fallback.path().join("shared.toml"), "[Service\n").unwrap();
+        std::fs::write(
+            operator.path().join("shared.toml"),
+            "[Service]\nExecStart = '/bin/true'\n",
+        )
+        .unwrap();
+        assert_eq!(load_system_configs(&dirs).len(), 1);
+        assert_eq!(load_system_configs_for_reload(&dirs).unwrap().len(), 1);
     }
 
     #[test]

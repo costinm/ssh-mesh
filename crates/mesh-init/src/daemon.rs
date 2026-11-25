@@ -5223,6 +5223,38 @@ mod reload_tests {
     use std::os::fd::AsRawFd;
     use std::path::Path;
 
+    #[tokio::test]
+    async fn reload_switches_whole_units_between_fallback_and_operator() {
+        let fallback = tempfile::tempdir().unwrap();
+        let operator = tempfile::tempdir().unwrap();
+        write_service(fallback.path(), "layered", &[]);
+        let daemon = Daemon::new(DaemonConfig {
+            config_dirs: vec![
+                fallback.path().display().to_string(),
+                operator.path().display().to_string(),
+            ],
+            socket_path: operator.path().join("control.sock").display().to_string(),
+        });
+        assert!(daemon.handle_reload().await.success);
+        let packaged = daemon.configs.lock().get("layered").unwrap().clone();
+        std::fs::write(
+            operator.path().join("layered.toml"),
+            "[Service]\nExecStart = '/bin/true'\n",
+        )
+        .unwrap();
+        assert!(daemon.handle_reload().await.success);
+        let local = daemon.configs.lock().get("layered").unwrap().clone();
+        assert_eq!(local.command, "/bin/true");
+        assert!(!local.env.contains_key("HOME"));
+        std::fs::write(operator.path().join("layered.toml"), "[Service\n").unwrap();
+        assert!(!daemon.handle_reload().await.success);
+        assert_eq!(daemon.configs.lock().get("layered"), Some(&local));
+        std::fs::remove_file(operator.path().join("layered.toml")).unwrap();
+        assert!(daemon.handle_reload().await.success);
+        assert_eq!(daemon.configs.lock().get("layered"), Some(&packaged));
+        close(&daemon).await;
+    }
+
     fn daemon(dir: &Path) -> Arc<Daemon> {
         Daemon::new(DaemonConfig {
             config_dirs: vec![dir.display().to_string()],

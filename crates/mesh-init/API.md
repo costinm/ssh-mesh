@@ -79,7 +79,10 @@ are stopped and restarted with the new ordered `LISTEN_FDS`/`LISTEN_FDNAMES`.
 Removed core services are stopped and their stored listener FDs are released.
 On-demand service configs outside the core directories remain loaded.
 
-Unreadable or malformed config files reject the reload before changing live
+Core units use whole-file operator-over-fallback precedence when
+`MESH_INIT_FALLBACK_DIR` is set. Removing an operator override reveals the
+fallback; shadowed fallback files are not parsed.
+Unreadable or malformed selected config files reject the reload before changing live
 state. Binding, stopping, starting or `ExecReload` failures return an error;
 a bind failure can leave other successfully reconciled sockets active. After
 fixing a failed bind, call `reload` again even if the config is unchanged.
