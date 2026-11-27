@@ -8,7 +8,9 @@ When started as root and `MESH_INIT_DIR` is unset, core config is loaded from
 `/home/system/etc/mesh-init`. `MESH_INIT_DIR` replaces that default directory.
 Non-root `mesh-init` defaults to `$HOME/etc/mesh-init`.
 
-Set `MESH_INIT_FALLBACK_DIR` to a read-only directory of packaged `*.toml`
+Packages can install a read-only directory at `share/mesh-init/fallback`
+beside their `bin` directory. Mesh-init uses it automatically.
+Set `MESH_INIT_FALLBACK_DIR` to override it with another directory of packaged `*.toml`
 units to load them in place, without copying or requiring a populated operator
 home. Unset or empty disables this layer and preserves legacy startup seeding.
 The operator directory (default above, or `MESH_INIT_DIR`) takes precedence by

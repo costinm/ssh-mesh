@@ -18,7 +18,7 @@
 //!   explicitly with `mesh-init seed [--preview]`.
 //!
 //! Every seeded or skipped file is logged.
-//! A nonempty `MESH_INIT_FALLBACK_DIR` disables automatic seeding: packaged
+//! A configured or automatically discovered live fallback disables seeding: packaged
 //! units are then read in place, with mutable operator units overriding them.
 
 // TODO: move to mesh-cli, add a template function. This doesn't need to run at all times in mesh-init.
@@ -85,7 +85,7 @@ pub fn defaults_dir() -> Option<PathBuf> {
 pub fn seed_on_startup(config_dirs: &[String]) {
     // Live fallback units are read in place. Do not turn them into persistent
     // overrides or write into the read-only fallback directory.
-    if std::env::var_os("MESH_INIT_FALLBACK_DIR").is_some_and(|dir| !dir.is_empty()) {
+    if crate::config::live_fallback_dir().is_some() {
         info!("seeding_skipped_live_fallback");
         return;
     }
@@ -315,9 +315,10 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for isolated startup environment"]
     fn live_fallback_startup_child() {
-        let fallback = std::env::var("MESH_INIT_FALLBACK_DIR").unwrap();
-        let operator = std::env::var("MESH_INIT_DIR").unwrap();
-        seed_on_startup(&[fallback, operator]);
+        let dirs = crate::config::core_config_dirs();
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].is_dir());
+        seed_on_startup(&dirs.iter().map(|dir| dir.display().to_string()).collect::<Vec<_>>());
     }
 
     #[test]
@@ -341,6 +342,30 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert!(!root.path().join("missing").exists());
+        assert!(!fallback.join(SEED_MARKER).exists());
+    }
+
+    #[test]
+    fn packaged_fallback_disables_startup_seeding() {
+        let root = TempDir::new().unwrap();
+        write_defaults(root.path());
+        let bin = root.path().join("bin");
+        let fallback = root.path().join("share/mesh-init/fallback");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&fallback).unwrap();
+        let executable = bin.join("mesh-init-test");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let operator = root.path().join("operator");
+        let status = std::process::Command::new(executable)
+            .args(["--ignored", "--exact", "seed::tests::live_fallback_startup_child"])
+            .env("MESH_INIT_DIR", &operator)
+            .env_remove("MESH_INIT_FALLBACK_DIR")
+            .env_remove("MESH_INIT_DEFAULTS_DIR")
+            .env_remove("MESH_INIT_SEED")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!operator.exists());
         assert!(!fallback.join(SEED_MARKER).exists());
     }
 

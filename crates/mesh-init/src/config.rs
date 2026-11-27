@@ -147,15 +147,51 @@ pub fn core_config_dirs() -> Vec<PathBuf> {
         |key| std::env::var_os(key),
         || std::env::current_dir().ok(),
         unsafe { libc::getuid() },
+        packaged_fallback_dir,
     )
 }
 
-fn core_config_dirs_with_context<F, C>(mut env: F, current_dir: C, uid: u32) -> Vec<PathBuf>
+// Resolve relative to the executable, not HOME or the working directory.
+fn packaged_fallback_for(executable: &Path) -> Option<PathBuf> {
+    let path = executable
+        .parent()?
+        .parent()?
+        .join("share/mesh-init/fallback");
+    path.is_dir().then_some(path)
+}
+
+fn packaged_fallback_dir() -> Option<PathBuf> {
+    packaged_fallback_for(&std::env::current_exe().ok()?)
+}
+
+fn fallback_dir(
+    configured: Option<std::ffi::OsString>,
+    packaged: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match configured {
+        Some(dir) => (!dir.is_empty()).then(|| PathBuf::from(dir)),
+        None => packaged(),
+    }
+}
+
+pub(crate) fn live_fallback_dir() -> Option<PathBuf> {
+    fallback_dir(
+        std::env::var_os("MESH_INIT_FALLBACK_DIR"),
+        packaged_fallback_dir,
+    )
+}
+
+fn core_config_dirs_with_context<F, C>(
+    mut env: F,
+    current_dir: C,
+    uid: u32,
+    packaged: impl FnOnce() -> Option<PathBuf>,
+) -> Vec<PathBuf>
 where
     F: FnMut(&str) -> Option<std::ffi::OsString>,
     C: FnOnce() -> Option<PathBuf>,
 {
-    let fallback = env("MESH_INIT_FALLBACK_DIR").filter(|dir| !dir.is_empty());
+    let fallback = fallback_dir(env("MESH_INIT_FALLBACK_DIR"), packaged);
     let operator = if let Some(dir) = env("MESH_INIT_DIR") {
         PathBuf::from(dir)
     } else if uid == 0 {
@@ -165,7 +201,7 @@ where
         user_config_home(&mut env, current_dir).join("etc/mesh-init")
     };
     fallback
-        .map(PathBuf::from)
+        .filter(|dir| dir != &operator)
         .into_iter()
         .chain(std::iter::once(operator))
         .collect()
@@ -474,7 +510,7 @@ mod tests {
 
     #[test]
     fn core_config_dirs_root_uses_system_home() {
-        let dirs = core_config_dirs_with_context(env_from(&[]), || None, 0);
+        let dirs = core_config_dirs_with_context(env_from(&[]), || None, 0, || None);
         assert_eq!(
             dirs,
             vec![std::path::PathBuf::from("/home/system/etc/mesh-init")]
@@ -487,6 +523,7 @@ mod tests {
             env_from(&[("HOME", "/home/alice")]),
             || Some(std::path::PathBuf::from("/workspace/app")),
             1000,
+            || None,
         );
         assert_eq!(
             dirs,
@@ -500,6 +537,7 @@ mod tests {
             env_from(&[("MESH_INIT_DIR", "/custom/etc")]),
             || Some(std::path::PathBuf::from("/workspace/app")),
             0,
+            || None,
         );
         assert_eq!(dirs, vec![std::path::PathBuf::from("/custom/etc")]);
     }
@@ -511,7 +549,7 @@ mod tests {
             if let Some(home) = home {
                 vars.push(("HOME", home));
             }
-            let dirs = core_config_dirs_with_context(env_from(&vars), || None, 0);
+            let dirs = core_config_dirs_with_context(env_from(&vars), || None, 0, || None);
             assert_eq!(
                 dirs,
                 vec![
@@ -527,6 +565,7 @@ mod tests {
             ]),
             || None,
             1000,
+            || None,
         );
         assert_eq!(
             dirs,
@@ -535,9 +574,39 @@ mod tests {
                 PathBuf::from("/operator/units"),
             ]
         );
-        let dirs =
-            core_config_dirs_with_context(env_from(&[("MESH_INIT_FALLBACK_DIR", "")]), || None, 0);
+        let dirs = core_config_dirs_with_context(
+            env_from(&[("MESH_INIT_FALLBACK_DIR", "")]),
+            || None,
+            0,
+            || panic!("explicit empty override must skip packaged discovery"),
+        );
         assert_eq!(dirs, vec![PathBuf::from("/home/system/etc/mesh-init")]);
+    }
+
+    #[test]
+    fn packaged_fallback_precedes_operator_unless_overridden() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("bin/mesh-init");
+        let packaged = root.path().join("share/mesh-init/fallback");
+        assert!(packaged_fallback_for(&executable).is_none());
+        std::fs::create_dir_all(&packaged).unwrap();
+        let dirs = core_config_dirs_with_context(env_from(&[]), || None, 0, || {
+            packaged_fallback_for(&executable)
+        });
+        assert_eq!(
+            dirs,
+            [packaged, PathBuf::from("/home/system/etc/mesh-init")]
+        );
+        let dirs = core_config_dirs_with_context(
+            env_from(&[("MESH_INIT_FALLBACK_DIR", "/explicit")]),
+            || None,
+            0,
+            || panic!("explicit fallback takes precedence"),
+        );
+        assert_eq!(
+            dirs,
+            [PathBuf::from("/explicit"), PathBuf::from("/home/system/etc/mesh-init")]
+        );
     }
 
     #[test]

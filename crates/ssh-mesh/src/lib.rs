@@ -627,7 +627,9 @@ impl MeshNode {
     pub fn get_config(&self) -> server::Config {
         let mut config = server::Config::default();
         config.keys.push(self.keys.clone());
-        config.max_auth_attempts = 3;
+        // russh >= 0.62 enforces max_auth_attempts across total rejections
+        // (including initial `none` probes and any skipped/invalid keys or certs).
+        config.max_auth_attempts = 10;
         config.server_id =
             russh::SshId::Standard(std::borrow::Cow::Borrowed("SSH-2.0-Rust-SSH-Server"));
         config

@@ -4,7 +4,7 @@ use tracing::{debug, instrument, trace};
 
 use openpty::openpty;
 
-use russh::keys::{Certificate, HashAlg, PublicKey, PublicKeyBase64};
+use russh::keys::{Certificate, HashAlg, PublicKeyBase64};
 use russh::{ChannelId, MethodKind, server};
 
 use std::collections::HashMap;
@@ -1069,8 +1069,9 @@ impl SshHandler {
         &mut self,
         channel: russh::Channel<russh::server::Msg>,
         socket_path: &str,
+        reply: server::ChannelOpenHandle,
         session_handle: russh::server::Handle,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {
         let channel_id = channel.id();
         let sessions = self.sessions.clone();
         let channel_writers = self.channel_writers.clone();
@@ -1089,7 +1090,10 @@ impl SshHandler {
                  allow_direct_tcpip is false",
                 socket_path_str
             );
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
 
         trace!(
@@ -1139,6 +1143,7 @@ impl SshHandler {
         match UnixStream::connect(path).await {
             Ok(stream) => {
                 trace!("Successfully connected to UDS {}", socket_path_str);
+                reply.accept().await;
 
                 // Set up bidirectional data forwarding
                 let (uds_reader, uds_writer) = stream.into_split();
@@ -1174,14 +1179,15 @@ impl SshHandler {
                 });
 
                 info!("UDS forwarding established for {}", socket_path_str);
-                Ok(true)
+                Ok(())
             }
             Err(e) => {
                 error!(
                     "Failed to connect to UDS {}: {} (handler ID: {})",
                     socket_path_str, e, handler_id
                 );
-                Ok(false) // Reject the channel if we can't connect
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                Ok(())
             }
         }
     }
@@ -1727,12 +1733,13 @@ impl server::Handler for SshHandler {
         }
     }
 
-    #[instrument(skip(self, public_key), fields(user = %user))]
+    #[instrument(skip(self, key), fields(user = %user))]
     fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        key: server::VerifiedPublicKey<'_>,
     ) -> impl std::future::Future<Output = Result<server::Auth, Self::Error>> + Send {
+        let public_key = key.public_key;
         let authorized_keys = self.server.authorized_keys.clone();
         let ca_keys = self.server.ca_keys.clone();
         let config_dir = self.server.config_dir();
@@ -1780,8 +1787,9 @@ impl server::Handler for SshHandler {
 
                 let mut result =
                     crate::auth::validate_public_key(&user_str, &key_openssh, &authorized_keys)
-                        .await?;
-                if !matches!(result.status, server::Auth::Accept)
+                        .await;
+                if let Ok(ref res) = result
+                    && !matches!(res.status, server::Auth::Accept)
                     && let Some(ref safe_user) = user_part
                 {
                     let user_keys_path = config_dir
@@ -1793,60 +1801,66 @@ impl server::Handler for SshHandler {
                         &key_openssh,
                         &user_keys_path,
                     )
-                    .await?;
+                    .await;
                 }
-                Ok(result)
+                result
             };
 
-            if let Ok(ref auth_res) = auth_result {
-                if let server::Auth::Accept = auth_res.status {
-                    // B15: Apply identity only after auth is confirmed.
-                    self.user = user_str.clone();
-                    let mut clients = connected_clients.lock().await;
-                    let client_info = ConnectedClientInfo {
-                        id: handler_id,
-                        user: user_str.clone(),
-                        comment: auth_res.comment.clone(),
-                        options: auth_res.options.clone(),
-                        remote_forward_listeners: Vec::new(),
-                        connected_at: SystemTime::now(),
-                    };
-                    clients.insert(handler_id, client_info);
-                    self.comment = auth_res.comment.clone();
-                    self.options = auth_res.options.clone();
-
-                    // Notify listeners about the authenticated connection
-                    let listeners = self.server.listeners.clone();
-                    let id_val = handler_id;
-                    let u_str = user_str.clone();
-                    tokio::spawn(async move {
-                        let listeners = listeners.lock().await;
-                        for l in listeners.iter() {
-                            l.on_ssh_connection(id_val, &u_str);
-                        }
-                    });
-
-                    // Store a filesystem-safe version of the key fingerprint.
-                    // keyfp is like "SHA256:abc+/def="; keep only alphanumerics.
-                    self.peer_key_sha = keyfp
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric())
-                        .collect();
-                    self.authenticated_with_certificate = is_certificate;
-                    if is_certificate {
-                        self.cert_user = if auth_res.user.is_empty() {
-                            user_part.clone()
-                        } else {
-                            Some(auth_res.user.clone())
+            match auth_result {
+                Ok(auth_res) => {
+                    if let server::Auth::Accept = auth_res.status {
+                        // B15: Apply identity only after auth is confirmed.
+                        self.user = user_str.clone();
+                        let mut clients = connected_clients.lock().await;
+                        let client_info = ConnectedClientInfo {
+                            id: handler_id,
+                            user: user_str.clone(),
+                            comment: auth_res.comment.clone(),
+                            options: auth_res.options.clone(),
+                            remote_forward_listeners: Vec::new(),
+                            connected_at: SystemTime::now(),
                         };
-                    }
-                    self.terminal_user = user_part.clone();
-                }
-            } else {
-                error!("Auth failed {}", self.id)
-            }
+                        clients.insert(handler_id, client_info);
+                        self.comment = auth_res.comment.clone();
+                        self.options = auth_res.options.clone();
 
-            auth_result.map(|r| r.status)
+                        // Notify listeners about the authenticated connection
+                        let listeners = self.server.listeners.clone();
+                        let id_val = handler_id;
+                        let u_str = user_str.clone();
+                        tokio::spawn(async move {
+                            let listeners = listeners.lock().await;
+                            for l in listeners.iter() {
+                                l.on_ssh_connection(id_val, &u_str);
+                            }
+                        });
+
+                        // Store a filesystem-safe version of the key fingerprint.
+                        // keyfp is like "SHA256:abc+/def="; keep only alphanumerics.
+                        self.peer_key_sha = keyfp
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric())
+                            .collect();
+                        self.authenticated_with_certificate = is_certificate;
+                        if is_certificate {
+                            self.cert_user = if auth_res.user.is_empty() {
+                                user_part.clone()
+                            } else {
+                                Some(auth_res.user.clone())
+                            };
+                        }
+                        self.terminal_user = user_part.clone();
+                    }
+                    Ok(auth_res.status)
+                }
+                Err(e) => {
+                    error!("Auth failed {}: {}", self.id, e);
+                    Ok(server::Auth::Reject {
+                        proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
+                        partial_success: false,
+                    })
+                }
+            }
         }
     }
 
@@ -1886,47 +1900,53 @@ impl server::Handler for SshHandler {
                 )),
             };
 
-            if let Ok(ref auth_res) = auth_result {
-                if let server::Auth::Accept = auth_res.status {
-                    // B15: Apply identity only after auth is confirmed.
-                    self.user = user_str.clone();
-                    let mut clients = connected_clients.lock().await;
-                    clients.insert(
-                        handler_id,
-                        ConnectedClientInfo {
-                            id: handler_id,
-                            user: user_str.clone(),
-                            comment: auth_res.comment.clone(),
-                            options: auth_res.options.clone(),
-                            remote_forward_listeners: Vec::new(),
-                            connected_at: SystemTime::now(),
-                        },
-                    );
-                    self.comment = auth_res.comment.clone();
-                    self.options = auth_res.options.clone();
-                    self.authenticated_with_certificate = true;
-                    self.cert_user = if auth_res.user.is_empty() {
-                        user_part.clone()
-                    } else {
-                        Some(auth_res.user.clone())
-                    };
-                    self.terminal_user = user_part.clone();
+            match auth_result {
+                Ok(auth_res) => {
+                    if let server::Auth::Accept = auth_res.status {
+                        // B15: Apply identity only after auth is confirmed.
+                        self.user = user_str.clone();
+                        let mut clients = connected_clients.lock().await;
+                        clients.insert(
+                            handler_id,
+                            ConnectedClientInfo {
+                                id: handler_id,
+                                user: user_str.clone(),
+                                comment: auth_res.comment.clone(),
+                                options: auth_res.options.clone(),
+                                remote_forward_listeners: Vec::new(),
+                                connected_at: SystemTime::now(),
+                            },
+                        );
+                        self.comment = auth_res.comment.clone();
+                        self.options = auth_res.options.clone();
+                        self.authenticated_with_certificate = true;
+                        self.cert_user = if auth_res.user.is_empty() {
+                            user_part.clone()
+                        } else {
+                            Some(auth_res.user.clone())
+                        };
+                        self.terminal_user = user_part.clone();
 
-                    let listeners = self.server.listeners.clone();
-                    let id_val = handler_id;
-                    let u_str = user_str.clone();
-                    tokio::spawn(async move {
-                        let listeners = listeners.lock().await;
-                        for l in listeners.iter() {
-                            l.on_ssh_connection(id_val, &u_str);
-                        }
-                    });
+                        let listeners = self.server.listeners.clone();
+                        let id_val = handler_id;
+                        let u_str = user_str.clone();
+                        tokio::spawn(async move {
+                            let listeners = listeners.lock().await;
+                            for l in listeners.iter() {
+                                l.on_ssh_connection(id_val, &u_str);
+                            }
+                        });
+                    }
+                    Ok(auth_res.status)
                 }
-            } else {
-                error!("Certificate auth failed {}", self.id)
+                Err(e) => {
+                    error!("Certificate auth failed {}: {}", self.id, e);
+                    Ok(server::Auth::Reject {
+                        proceed_with_methods: Some((&[MethodKind::PublicKey][..]).into()),
+                        partial_success: false,
+                    })
+                }
             }
-
-            auth_result.map(|r| r.status)
         }
     }
 
@@ -1934,12 +1954,13 @@ impl server::Handler for SshHandler {
     ///
     /// This is usually a shell - message followed by env, pty - and ending
     /// with the actual shell or exec command, than data and close.
-    #[instrument(skip(self, _session), fields(channel_id = ?channel.id()))]
+    #[instrument(skip(self, reply, _session), fields(channel_id = ?channel.id()))]
     fn channel_open_session(
         &mut self,
         channel: russh::Channel<russh::server::Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut server::Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let channel_id = channel.id();
         let sessions = self.sessions.clone();
         let handler_id = self.id;
@@ -1964,14 +1985,15 @@ impl server::Handler for SshHandler {
                 "Created new session for channel {:?} in handler {}",
                 channel_id, handler_id
             );
-            Ok(true)
+            reply.accept().await;
+            Ok(())
         }
     }
 
     /// Connection forward from client.
     ///
     /// If port is [`UDS_FORWARD_PORT`], treat host as a UDS path.
-    #[instrument(skip(self, session), fields(channel_id = ?channel.id(), host_to_connect = %host_to_connect, port_to_connect = %port_to_connect, originator_ip = %originator_ip_address, originator_port = %originator_port))]
+    #[instrument(skip(self, reply, session), fields(channel_id = ?channel.id(), host_to_connect = %host_to_connect, port_to_connect = %port_to_connect, originator_ip = %originator_ip_address, originator_port = %originator_port))]
     fn channel_open_direct_tcpip(
         &mut self,
         channel: russh::Channel<russh::server::Msg>,
@@ -1979,8 +2001,9 @@ impl server::Handler for SshHandler {
         port_to_connect: u32,
         originator_ip_address: &str,
         originator_port: u32,
+        reply: server::ChannelOpenHandle,
         session: &mut server::Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         info!(
             "Direct TCP/IP connection request: {}:{} from {}:{} (handler ID: {})",
             host_to_connect, port_to_connect, originator_ip_address, originator_port, self.id
@@ -2010,7 +2033,7 @@ impl server::Handler for SshHandler {
         async move {
             // UDS support: the host field carries the socket path.
             if port == UDS_FORWARD_PORT {
-                return me.connect_uds(channel, &host, session_handle).await;
+                return me.connect_uds(channel, &host, reply, session_handle).await;
             }
 
             trace!(
@@ -2037,6 +2060,7 @@ impl server::Handler for SshHandler {
                 if let Ok(port) = u16::try_from(port) {
                     match me.mesh_routed_stream(&host, port).await {
                         Ok(Some(stream)) => {
+                            reply.accept().await;
                             Self::bridge_stream_to_channel(
                                 stream,
                                 channel_id,
@@ -2045,12 +2069,13 @@ impl server::Handler for SshHandler {
                                 format!("mesh route {host}:{port}"),
                             )
                             .await;
-                            return Ok(true);
+                            return Ok(());
                         }
                         Ok(None) => {} // preserve legacy jump/open-relay handling for unmatched targets
                         Err(error) => {
                             error!("SSH route {host}:{port} rejected: {error:#}");
-                            return Ok(false);
+                            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                            return Ok(());
                         }
                     }
                 }
@@ -2067,6 +2092,7 @@ impl server::Handler for SshHandler {
                 {
                     match Self::routed_trusted_uds_stream(&route, context).await {
                         Ok(stream) => {
+                            reply.accept().await;
                             Self::bridge_stream_to_channel(
                                 stream,
                                 channel_id,
@@ -2079,14 +2105,15 @@ impl server::Handler for SshHandler {
                                 "Routed jump established for {}:{} via activated trusted UDS route {}",
                                 host, incoming_port, route.name
                             );
-                            return Ok(true);
+                            return Ok(());
                         }
                         Err(e) => {
                             error!(
                                 "Failed routed jump for {}:{} via route '{}': {}",
                                 host, incoming_port, route.name, e
                             );
-                            return Ok(false);
+                            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                            return Ok(());
                         }
                     }
                 }
@@ -2101,6 +2128,7 @@ impl server::Handler for SshHandler {
                 .await
                 {
                     Ok(stream) => {
+                        reply.accept().await;
                         Self::bridge_stream_to_channel(
                             stream,
                             channel_id,
@@ -2116,14 +2144,15 @@ impl server::Handler for SshHandler {
                             "Routed jump established for {}:{} via {} to {}:{}",
                             host, incoming_port, route.name, target_host, target_port
                         );
-                        return Ok(true);
+                        return Ok(());
                     }
                     Err(e) => {
                         error!(
                             "Failed routed jump for {}:{} via route '{}': {}",
                             host, incoming_port, route.name, e
                         );
-                        return Ok(false);
+                        reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                        return Ok(());
                     }
                 }
             }
@@ -2131,6 +2160,7 @@ impl server::Handler for SshHandler {
             // Handle internal stream hosts - trigger callback.
             if host == "local" || host == "dmesh-msg" {
                 let (s1, s2) = tokio::io::duplex(64 * 1024);
+                reply.accept().await;
 
                 // Notify listeners
                 let listeners = me.server.listeners.clone();
@@ -2173,7 +2203,7 @@ impl server::Handler for SshHandler {
                     writers.remove(&channel_id);
                 });
 
-                return Ok(true);
+                return Ok(());
             }
 
             // Establish a TCP connection to the target host:port
@@ -2189,12 +2219,16 @@ impl server::Handler for SshHandler {
                      allow_direct_tcpip is false",
                     host, port
                 );
-                return Ok(false);
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
             }
             let target_addr = format!("{}:{}", host, port);
             match TcpStream::connect(&target_addr).await {
                 Ok(tcp_stream) => {
                     trace!("Successfully connected to target {}:{}", host, port);
+                    reply.accept().await;
 
                     // Set up bidirectional data forwarding between SSH channel and TCP connection
                     let (tcp_reader, tcp_writer) = tcp_stream.into_split();
@@ -2230,11 +2264,12 @@ impl server::Handler for SshHandler {
                         writers.remove(&channel_id);
                     });
 
-                    Ok(true)
+                    Ok(())
                 }
                 Err(e) => {
                     error!("Failed to connect to {}:{}: {}", host, port, e);
-                    Ok(false)
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    Ok(())
                 }
             }
         }
@@ -2244,8 +2279,9 @@ impl server::Handler for SshHandler {
         &mut self,
         channel: russh::Channel<russh::server::Msg>,
         socket_path: &str,
+        reply: server::ChannelOpenHandle,
         session: &mut server::Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         info!(
             "Direct streamlocal connection request: {} (handler ID: {})",
             socket_path, self.id
@@ -2268,6 +2304,7 @@ impl server::Handler for SshHandler {
                 .await
                 {
                     Ok(stream) => {
+                        reply.accept().await;
                         Self::bridge_stream_to_channel(
                             stream,
                             channel_id,
@@ -2280,25 +2317,26 @@ impl server::Handler for SshHandler {
                             "Routed streamlocal established for {} via {}",
                             socket_path, route.name
                         );
-                        return Ok(true);
+                        return Ok(());
                     }
                     Err(e) => {
                         error!(
                             "Failed routed streamlocal for {} via route '{}': {}",
                             socket_path, route.name, e
                         );
-                        return Ok(false);
+                        reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                        return Ok(());
                     }
                 }
             }
 
-            me.connect_uds(channel, &socket_path, handle).await
+            me.connect_uds(channel, &socket_path, reply, handle).await
         }
     }
 
     /// This is the message used by server to accept new streams on behalf of
     /// clients - not supported from clients (open_direct_tcpip does the same).
-    #[instrument(skip(self, _session), fields(channel_id = ?_channel.id(), host_to_connect = %_host_to_connect, port_to_connect = %_port_to_connect, originator_ip = %_originator_ip_address, originator_port = %_originator_port))]
+    #[instrument(skip(self, reply, _session), fields(channel_id = ?_channel.id(), host_to_connect = %_host_to_connect, port_to_connect = %_port_to_connect, originator_ip = %_originator_ip_address, originator_port = %_originator_port))]
     fn channel_open_forwarded_tcpip(
         &mut self,
         _channel: russh::Channel<russh::server::Msg>,
@@ -2306,10 +2344,16 @@ impl server::Handler for SshHandler {
         _port_to_connect: u32,
         _originator_ip_address: &str,
         _originator_port: u32,
+        reply: server::ChannelOpenHandle,
         _session: &mut server::Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         error!("Client-initiated forwarded-tcpip channel is not supported.");
-        async { Ok(false) }
+        async move {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            Ok(())
+        }
     }
 
     #[instrument(skip(self, session), fields(channel_id = ?channel, data_len = data.len()))]

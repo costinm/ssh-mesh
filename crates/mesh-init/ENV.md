@@ -133,7 +133,7 @@ Specialized:
 Config and identity:
 
 | `MESH_INIT_DIR` | root: `/home/system/etc/mesh-init`; non-root: `$HOME/etc/mesh-init` | Full replacement directory for core service configs. |
-| `MESH_INIT_FALLBACK_DIR` | unset | Optional read-only core unit directory, loaded in place below the operator directory. Nonempty disables automatic startup seeding; same-name operator files replace whole units, including malformed overrides. Empty preserves legacy behavior. |
+| `MESH_INIT_FALLBACK_DIR` | `share/mesh-init/fallback` relative to the executable’s install prefix, if present | Read-only core units loaded below the operator directory. A live fallback disables startup seeding. An explicit path overrides discovery; an empty value disables it and retains legacy seeding. |
 | `MESH_INIT_DEFAULTS_DIR` | executable-relative `../share/mesh-init/defaults` | Legacy copy-based seed source, not a live config layer. Explicit `mesh-init seed` copies only missing files into the operator directory. |
 | `MESH_INIT_SOCK` | `/run/mesh/mesh-init/mesh.sock` for root systems | Exact mesh-init control/API socket path. |
 | `MESH_INIT_SEQPACKET_SOCK` | `${MESH_INIT_SOCK}.cbor` | Tagged-CBOR `SOCK_SEQPACKET` control socket; pairs each CBOR record with any `SCM_RIGHTS` descriptors. |

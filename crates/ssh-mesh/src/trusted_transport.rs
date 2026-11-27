@@ -24,6 +24,7 @@ pub fn trusted_preferred() -> russh::Preferred {
     russh::Preferred {
         kex: russh::Preferred::DEFAULT.kex,
         key: russh::Preferred::DEFAULT.key,
+        host_key_certificates: russh::Preferred::DEFAULT.host_key_certificates,
         cipher: Cow::Borrowed(&[russh::cipher::NONE]),
         mac: Cow::Borrowed(&[russh::mac::NONE]),
         compression: Cow::Borrowed(&[russh::compression::NONE]),
@@ -375,7 +376,7 @@ impl client::Handler for TrustedClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }

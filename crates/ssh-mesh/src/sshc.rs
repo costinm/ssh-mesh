@@ -103,7 +103,7 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         if self.trust_server_key {
             return Ok(true);
@@ -111,12 +111,11 @@ impl client::Handler for ClientHandler {
 
         // 1. If we have CA keys, check if the server key is signed by one of them.
         if !self.ca_keys.is_empty() {
-            let key_str = server_public_key
-                .to_openssh()
-                .context("Failed to serialize server key")?;
-
             // If it's a certificate, validate it
-            if key_str.contains("-cert-v01@openssh.com") {
+            if let Some(cert) = server_public_key.certificate() {
+                let key_str = cert
+                    .to_openssh()
+                    .context("Failed to serialize server certificate")?;
                 info!("Server presented a certificate. Validating against CA keys.");
                 // We use self.host as the "principal" to validate.
                 match crate::auth::validate_certificate(&key_str, &self.host, &self.ca_keys).await {
@@ -146,9 +145,10 @@ impl client::Handler for ClientHandler {
         }
 
         // 2. Fallback to standard Expected Key / TOFU logic
+        let server_pk = server_public_key.public_key();
         if !self.expected_keys.is_empty() {
             // Validate against known keys: compare OpenSSH string representation
-            let actual_str = server_public_key
+            let actual_str = server_pk
                 .to_openssh()
                 .context("Failed to serialize server key")?;
             for expected in &self.expected_keys {
@@ -166,7 +166,7 @@ impl client::Handler for ClientHandler {
             Ok(false)
         } else {
             // TOFU: save the key for future connections
-            let actual_str = server_public_key
+            let actual_str = server_pk
                 .to_openssh()
                 .context("Failed to serialize server key for TOFU persistence")?;
             if let Some(ref path) = self.discovery_file {
@@ -214,6 +214,7 @@ impl client::Handler for ClientHandler {
         connected_port: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         info!(
@@ -227,6 +228,8 @@ impl client::Handler for ClientHandler {
             let conn_id = self.conn_id;
             let host = connected_address.to_string();
             let port = connected_port as u16;
+
+            reply.accept().await;
 
             if let Some(l) = listeners.first() {
                 l.on_forwarded_tcpip(conn_id, &host, port, s1);
@@ -282,6 +285,8 @@ impl client::Handler for ClientHandler {
                 target_host, target_port
             );
 
+            reply.accept().await;
+
             // Spawn a task to handle the connection effectively bridging the channel and local TCP
             tokio::spawn(async move {
                 // Connect to the local target
@@ -305,10 +310,10 @@ impl client::Handler for ClientHandler {
                 "No remote forward found for port {}. Rejecting channel.",
                 connected_port
             );
-            Err(anyhow::anyhow!(
-                "No forward found for port {}",
-                connected_port
-            ))
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            Ok(())
         }
     }
 }
